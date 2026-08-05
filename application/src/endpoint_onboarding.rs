@@ -8,6 +8,8 @@ use secrecy::SecretString;
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::TrustedEndpoint;
+
 /// A sendable boundary operation tied to the lifetime of its collaborators.
 pub type BoundaryFuture<'a, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'a>>;
 
@@ -165,8 +167,7 @@ impl EndpointDiscovery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OnboardEndpointRequest {
     display_name: EndpointDisplayName,
-    address: EndpointAddress,
-    trust: TlsTrust,
+    target: TrustedEndpoint,
     credential_id: CredentialId,
 }
 
@@ -174,14 +175,12 @@ impl OnboardEndpointRequest {
     #[must_use]
     pub fn new(
         display_name: EndpointDisplayName,
-        address: EndpointAddress,
-        trust: TlsTrust,
+        target: TrustedEndpoint,
         credential_id: CredentialId,
     ) -> Self {
         Self {
             display_name,
-            address,
-            trust,
+            target,
             credential_id,
         }
     }
@@ -253,10 +252,10 @@ where
     > {
         let OnboardEndpointRequest {
             display_name,
-            address,
-            trust,
+            target,
             credential_id,
         } = request;
+        let (address, trust) = target.into_parts();
         let credential = self
             .credentials
             .resolve(credential_id)
@@ -568,11 +567,13 @@ mod tests {
     ) -> Result<OnboardEndpointRequest, Box<dyn Error>> {
         Ok(OnboardEndpointRequest::new(
             EndpointDisplayName::parse("Rack A BMC")?,
-            EndpointAddress::parse("https://192.0.2.20")?,
-            TlsTrust::PinnedCertificate {
-                certificate: TlsCertificate::from_der(b"trusted certificate".to_vec())?,
-                trusted_at,
-            },
+            TrustedEndpoint::new(
+                EndpointAddress::parse("https://192.0.2.20")?,
+                TlsTrust::PinnedCertificate {
+                    certificate: TlsCertificate::from_der(b"trusted certificate".to_vec())?,
+                    trusted_at,
+                },
+            ),
             credential_id,
         ))
     }
