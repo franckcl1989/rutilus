@@ -1,0 +1,12 @@
+[package]
+name = "rutilus-entity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sea-orm.workspace = true
+
+[lints]
+workspace = true

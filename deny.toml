@@ -10,10 +10,13 @@ targets = [
 all-features = true
 
 [advisories]
+# cargo-audit also sees rust_decimal's inactive optional rkyv 0.7 lock entry.
+# RUSTSEC-2026-0235 is ignored only in the audit command after proving that
+# `cargo tree --workspace --target all -i rkyv` has no active dependency path.
 ignore = []
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.95
 private = { ignore = true }
 
@@ -32,6 +35,11 @@ deny = [
     { crate = "tokio-postgres", reason = "Rutilus uses embedded SQLite only" },
 ]
 skip = [
+    { crate = "block-buffer@0.10.4", reason = "SQLx 0.9 and the audited encryption stack use different digest generations" },
+    { crate = "cpufeatures@0.2.17", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
+    { crate = "crypto-common@0.1.6", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
+    { crate = "hashbrown@0.16.1", reason = "SQLx 0.9 currently uses two non-compatible hashbrown generations internally" },
+    { crate = "heck@0.4.1", reason = "SeaORM 2.0 macros have not fully converged on heck 0.5" },
     { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
 ]
 
