@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "domain", "entity", "infra-redfish", "migration", "persistence", "security"]
+members = ["app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "security"]
 default-members = ["app"]
 resolver = "3"
 
@@ -19,6 +19,7 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 rutilus-domain = { path = "domain", version = "0.1.0" }
+rutilus-application = { path = "application", version = "0.1.0" }
 rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
 rutilus-entity = { path = "entity", version = "0.1.0" }
 rutilus-migration = { path = "migration", version = "0.1.0" }
