@@ -9,6 +9,8 @@ const PRODUCT_DIRECTORY_NAME: &str = "rutilus";
 const PORTABLE_DIRECTORY_NAME: &str = "rutilus-data";
 const DATABASE_FILE_NAME: &str = "rutilus.db";
 const MASTER_KEY_FILE_NAME: &str = "master-key.rut";
+const INSTANCE_MARKER_FILE_NAME: &str = "instance.rut";
+const RUNTIME_LOCK_FILE_NAME: &str = ".rutilus.lock";
 
 /// User-scoped installed storage or storage carried beside the product binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +40,8 @@ pub struct RuntimePaths {
     data_directory: PathBuf,
     database_path: PathBuf,
     master_key_path: PathBuf,
+    instance_marker_path: PathBuf,
+    runtime_lock_path: PathBuf,
 }
 
 impl RuntimePaths {
@@ -108,6 +112,8 @@ impl RuntimePaths {
         Ok(Self {
             database_path: data_directory.join(DATABASE_FILE_NAME),
             master_key_path: data_directory.join(MASTER_KEY_FILE_NAME),
+            instance_marker_path: data_directory.join(INSTANCE_MARKER_FILE_NAME),
+            runtime_lock_path: data_directory.join(RUNTIME_LOCK_FILE_NAME),
             data_directory,
         })
     }
@@ -125,6 +131,16 @@ impl RuntimePaths {
     #[must_use]
     pub fn master_key_path(&self) -> &Path {
         &self.master_key_path
+    }
+
+    #[must_use]
+    pub fn instance_marker_path(&self) -> &Path {
+        &self.instance_marker_path
+    }
+
+    #[must_use]
+    pub fn runtime_lock_path(&self) -> &Path {
+        &self.runtime_lock_path
     }
 }
 
@@ -195,6 +211,14 @@ mod tests {
         assert_eq!(
             paths.master_key_path(),
             paths.data_directory().join(MASTER_KEY_FILE_NAME)
+        );
+        assert_eq!(
+            paths.instance_marker_path(),
+            paths.data_directory().join(INSTANCE_MARKER_FILE_NAME)
+        );
+        assert_eq!(
+            paths.runtime_lock_path(),
+            paths.data_directory().join(RUNTIME_LOCK_FILE_NAME)
         );
         Ok(())
     }
