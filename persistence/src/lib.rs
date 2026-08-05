@@ -14,12 +14,14 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 mod application_adapter;
+mod audit_repository;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
 mod resource_snapshot_repository;
 
 pub use application_adapter::EndpointRefreshPersistenceError;
+pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };

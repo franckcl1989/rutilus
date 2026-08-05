@@ -476,6 +476,12 @@ impl AuditSequence {
     }
 }
 
+impl fmt::Display for AuditSequence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// An audit sequence is zero or cannot advance without wrapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditSequenceError {
