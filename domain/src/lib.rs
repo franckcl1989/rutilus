@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod capability;
 mod credential;
 mod endpoint;
 mod endpoint_address;
 mod ids;
 
+pub use capability::{
+    CapabilityClassification, CapabilityState, CapabilityStateParseError, EndpointCapability,
+    EndpointCapabilityObservation, EndpointCapabilityParseError,
+};
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,
     CredentialUsernameError,
