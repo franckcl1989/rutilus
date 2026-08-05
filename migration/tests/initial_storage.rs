@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use rutilus_entity::{
-    credential, credential_version, endpoint, endpoint_address, endpoint_capability,
+    audit_event, credential, credential_version, endpoint, endpoint_address, endpoint_capability,
     endpoint_credential,
     endpoint_trust::{self, TrustMode},
     resource, resource_snapshot,
@@ -15,7 +15,8 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const STORAGE_TABLES: [&str; 9] = [
+const STORAGE_TABLES: [&str; 10] = [
+    "audit_events",
     "credentials",
     "credential_versions",
     "endpoints",
@@ -44,11 +45,130 @@ async fn migrations_preserve_storage_invariants() -> Result<(), Box<dyn Error>> 
     let credential_id = verify_credential_constraints(&database, now).await?;
     verify_endpoint_constraints(&database, now, credential_id).await?;
     verify_resource_snapshot_constraints(&database, now).await?;
+    verify_audit_event_constraints(&database, now).await?;
 
     Migrator::down(&database, None).await?;
     assert_storage_tables(&database, false).await?;
 
     Ok(())
+}
+
+async fn verify_audit_event_constraints(
+    database: &DatabaseConnection,
+    now: OffsetDateTime,
+) -> Result<(), Box<dyn Error>> {
+    let operation_id = Uuid::now_v7();
+    audit_event_model(operation_id, 1, "started", now)
+        .insert(database)
+        .await?;
+    let mut progress = audit_event_model(operation_id, 2, "progress", now);
+    progress.progress = Set(Some(String::from("endpoint-created")));
+    progress.insert(database).await?;
+    let mut succeeded = audit_event_model(operation_id, 3, "succeeded", now);
+    succeeded.verification = Set(Some(String::from("confirmed")));
+    succeeded.insert(database).await?;
+
+    assert!(
+        audit_event_model(operation_id, 1, "started", now)
+            .insert(database)
+            .await
+            .is_err()
+    );
+    assert!(
+        audit_event_model(Uuid::now_v7(), 0, "started", now)
+            .insert(database)
+            .await
+            .is_err()
+    );
+    assert!(
+        audit_event_model(Uuid::now_v7(), 2, "started", now)
+            .insert(database)
+            .await
+            .is_err()
+    );
+
+    let mut invalid_actor = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    invalid_actor.actor = Set(String::from("unknown"));
+    assert!(invalid_actor.insert(database).await.is_err());
+
+    let mut invalid_target = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    invalid_target.target_endpoint_address = Set(None);
+    assert!(invalid_target.insert(database).await.is_err());
+
+    let mut invalid_parameters = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    invalid_parameters.credential_id = Set(None);
+    assert!(invalid_parameters.insert(database).await.is_err());
+
+    let mut missing_trust = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    missing_trust.trust_mode = Set(None);
+    assert!(missing_trust.insert(database).await.is_err());
+
+    let mut invalid_action = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    invalid_action.redfish_operation = Set(String::from("none"));
+    assert!(invalid_action.insert(database).await.is_err());
+
+    let mut invalid_progress = audit_event_model(Uuid::now_v7(), 2, "progress", now);
+    invalid_progress.progress = Set(Some(String::from("row-validated")));
+    assert!(invalid_progress.insert(database).await.is_err());
+    assert!(
+        audit_event_model(Uuid::now_v7(), 2, "progress", now)
+            .insert(database)
+            .await
+            .is_err()
+    );
+
+    assert!(
+        audit_event_model(Uuid::now_v7(), 2, "succeeded", now)
+            .insert(database)
+            .await
+            .is_err()
+    );
+
+    let mut invalid_failure = audit_event_model(Uuid::now_v7(), 2, "failed", now);
+    invalid_failure.verification = Set(Some(String::from("inconclusive")));
+    assert!(invalid_failure.insert(database).await.is_err());
+
+    let mut missing_row_count = audit_event_model(Uuid::now_v7(), 1, "started", now);
+    missing_row_count.target_kind = Set(String::from("product"));
+    missing_row_count.target_endpoint_address = Set(None);
+    missing_row_count.parameter_kind = Set(String::from("csv-endpoint-import"));
+    missing_row_count.credential_id = Set(None);
+    missing_row_count.trust_mode = Set(None);
+    missing_row_count.permission = Set(String::from("manage-endpoints"));
+    missing_row_count.action = Set(String::from("import-endpoints"));
+    missing_row_count.redfish_operation = Set(String::from("none"));
+    assert!(missing_row_count.insert(database).await.is_err());
+    Ok(())
+}
+
+fn audit_event_model(
+    operation_id: Uuid,
+    event_sequence: i64,
+    outcome: &str,
+    occurred_at: OffsetDateTime,
+) -> audit_event::ActiveModel {
+    audit_event::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        operation_id: Set(operation_id),
+        event_sequence: Set(event_sequence),
+        actor: Set(String::from("local-operator")),
+        origin: Set(String::from("standalone")),
+        target_kind: Set(String::from("endpoint-address")),
+        target_endpoint_id: Set(None),
+        target_endpoint_address: Set(Some(String::from("https://192.0.2.90"))),
+        parameter_kind: Set(String::from("endpoint-enrollment")),
+        credential_id: Set(Some(Uuid::now_v7())),
+        trust_mode: Set(Some(String::from("pinned-certificate"))),
+        row_count: Set(None),
+        permission: Set(String::from("manage-endpoints")),
+        action: Set(String::from("enroll-endpoint")),
+        redfish_operation: Set(String::from("probe-core-capabilities")),
+        outcome: Set(String::from(outcome)),
+        progress: Set(None),
+        failure: Set(None),
+        verification: Set(None),
+        occurred_at: Set(occurred_at),
+    }
 }
 
 async fn verify_resource_snapshot_constraints(

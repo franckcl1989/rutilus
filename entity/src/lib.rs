@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod audit_event;
 pub mod credential;
 pub mod credential_version;
 pub mod endpoint;
