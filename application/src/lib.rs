@@ -25,7 +25,7 @@ pub use endpoint_refresh::{
     EndpointRefreshError, EndpointRefreshRepository, RefreshAuditStage, ResourceObservation,
 };
 pub use endpoint_trust::{
-    EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustTimelineError,
-    PendingEndpointTrust, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
-    TrustedEndpoint,
+    EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
+    EndpointTrustExpectationError, EndpointTrustTimelineError, PendingEndpointTrust,
+    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe, TrustedEndpoint,
 };

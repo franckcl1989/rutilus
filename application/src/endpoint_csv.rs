@@ -2,10 +2,12 @@ use std::collections::HashSet;
 
 use csv::{ReaderBuilder, StringRecord, Trim};
 use rutilus_domain::{
-    CertificateFingerprint, CertificateFingerprintParseError, CredentialId, EndpointAddress,
-    EndpointAddressError, EndpointDisplayName, EndpointDisplayNameError,
+    CertificateFingerprintParseError, CredentialId, EndpointAddress, EndpointAddressError,
+    EndpointDisplayName, EndpointDisplayNameError,
 };
 use thiserror::Error;
+
+use crate::endpoint_trust::EndpointTrustExpectation;
 
 /// The only accepted endpoint-import columns, in their required order.
 pub const ENDPOINT_CSV_HEADERS: [&str; 4] =
@@ -17,14 +19,8 @@ pub const ENDPOINT_CSV_MAX_BYTES: usize = 1024 * 1024;
 /// Defensive upper bound for endpoint records in one import document.
 pub const ENDPOINT_CSV_MAX_ROWS: usize = 10_000;
 
-/// The TLS identity that an operator explicitly expects for an imported row.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EndpointImportTrust {
-    /// The certificate must validate through the configured system CA roots.
-    SystemCaOnly,
-    /// A credential-free probe must present exactly this SHA-256 leaf identity.
-    ExplicitPin(CertificateFingerprint),
-}
+/// The TLS policy imported for one endpoint row.
+pub type EndpointImportTrust = EndpointTrustExpectation;
 
 /// A required column whose value is absent from one otherwise valid record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
