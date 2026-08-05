@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
 
 mod credential;
+mod endpoint;
 mod endpoint_address;
 mod ids;
 
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,
     CredentialUsernameError,
+};
+pub use endpoint::{
+    CertificateFingerprint, Endpoint, EndpointDisplayName, EndpointDisplayNameError,
+    EndpointTimelineError, PinnedCertificate, PinnedCertificateError, TlsTrust,
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{CredentialId, CredentialVersionId, EndpointId};

@@ -19,6 +19,7 @@ rutilus-migration = { path = "migration", version = "0.1.0" }
 sea-orm = { version = "2.0.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 sea-orm-migration = { version = "2.0.1", default-features = false, features = ["runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 secrecy = "0.10.3"
+sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = "0.3.55"
