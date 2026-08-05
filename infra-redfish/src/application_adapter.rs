@@ -1,11 +1,13 @@
 use rutilus_application::{
-    BoundaryFuture, EndpointDiscovery, RedfishDiscovery, SystemCaEvaluation,
-    TlsIdentityObservation, TlsIdentityProbe,
+    BoundaryFuture, CoreResourceReader, EndpointDiscovery, RedfishDiscovery, ResourceObservation,
+    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{CredentialUsername, EndpointAddress, TlsTrust};
 use secrecy::SecretString;
 
-use crate::{RedfishGateway, RedfishServiceRootError, SystemCaStatus, TlsProbeError};
+use crate::{
+    CoreResourceReadError, RedfishGateway, RedfishServiceRootError, SystemCaStatus, TlsProbeError,
+};
 
 impl TlsIdentityProbe for RedfishGateway {
     type Error = TlsProbeError;
@@ -45,9 +47,41 @@ impl RedfishDiscovery for RedfishGateway {
     }
 }
 
+impl CoreResourceReader for RedfishGateway {
+    type Error = CoreResourceReadError;
+
+    fn read_core_resources<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        Box::pin(async move {
+            let projections =
+                RedfishGateway::read_core_resources(self, address, trust, username, password)
+                    .await?;
+            Ok(projections
+                .into_iter()
+                .map(|projection| {
+                    let mut observation = ResourceObservation::new(
+                        projection.feature(),
+                        projection.odata_id().clone(),
+                        projection.payload().clone(),
+                    );
+                    if let Some(etag) = projection.etag() {
+                        observation = observation.with_etag(etag.clone());
+                    }
+                    observation
+                })
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use rutilus_application::{RedfishDiscovery, TlsIdentityProbe};
+    use rutilus_application::{CoreResourceReader, RedfishDiscovery, TlsIdentityProbe};
 
     use crate::RedfishGateway;
 
@@ -63,5 +97,12 @@ mod tests {
         fn assert_tls_identity_probe<Gateway: TlsIdentityProbe>() {}
 
         assert_tls_identity_probe::<RedfishGateway>();
+    }
+
+    #[test]
+    fn gateway_implements_the_application_core_resource_boundary() {
+        fn assert_core_resource_reader<Gateway: CoreResourceReader>() {}
+
+        assert_core_resource_reader::<RedfishGateway>();
     }
 }

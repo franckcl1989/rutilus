@@ -2532,6 +2532,7 @@ dependencies = [
  "rutilus-application",
  "rutilus-domain",
  "secrecy",
+ "serde",
  "serde_json",
  "thiserror",
  "time",

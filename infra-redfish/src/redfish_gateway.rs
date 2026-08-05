@@ -9,11 +9,12 @@ use std::{
 };
 
 use nv_redfish::{
-    ServiceRoot,
+    Resource as NvResource, ServiceRoot,
     bmc_http::{
         BmcCredentials, CacheSettings, HttpBmc,
         reqwest::{BmcError, Client as NvHttpClient},
     },
+    core::EntityTypeRef as _,
 };
 use reqwest::{Client as ReqwestClient, StatusCode, redirect::Policy as RedirectPolicy};
 use rustls::{
@@ -27,9 +28,12 @@ use rustls::{
 };
 use rutilus_domain::{
     CapabilityState, CertificateFingerprint, CredentialUsername, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, TlsIdentityChanged, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, ResourceEtag, ResourceEtagError,
+    ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
+    ResourceSnapshotPayloadError, TlsIdentityChanged, TlsTrust,
 };
 use secrecy::{ExposeSecret, SecretString};
+use serde::Serialize;
 use serde_json::error::Category as JsonErrorCategory;
 use thiserror::Error;
 
@@ -150,6 +154,79 @@ impl RedfishGateway {
         })
     }
 
+    /// Reads the complete advertised 0.1 core resource surface through public,
+    /// typed `nv-redfish` navigation and returns bounded domain projections.
+    ///
+    /// Collection links and member identifiers always come from the decoded
+    /// Service Root and collection types; the gateway never constructs a BMC
+    /// resource URI. An error aborts the complete read so the application
+    /// cannot commit a partial refresh Generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreResourceReadError`] when trusted Redfish access fails or
+    /// a decoded resource cannot be represented by the domain snapshot model.
+    pub async fn read_core_resources(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+    ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+        let root = ServiceRoot::new(bmc)
+            .await
+            .map_err(|source| classify_service_root_error(source, &identity, trust))?;
+        let mut resources = vec![service_root_projection(&root)?];
+
+        if let Some(collection) = root
+            .systems()
+            .await
+            .map_err(|source| classify_service_root_error(source, &identity, trust))?
+        {
+            let members = collection
+                .members()
+                .await
+                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
+            resources.reserve(members.len());
+            for system in members {
+                resources.push(computer_system_projection(&system)?);
+            }
+        }
+
+        if let Some(collection) = root
+            .chassis()
+            .await
+            .map_err(|source| classify_service_root_error(source, &identity, trust))?
+        {
+            let members = collection
+                .members()
+                .await
+                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
+            resources.reserve(members.len());
+            for chassis in members {
+                resources.push(chassis_projection(&chassis)?);
+            }
+        }
+
+        if let Some(collection) = root
+            .managers()
+            .await
+            .map_err(|source| classify_service_root_error(source, &identity, trust))?
+        {
+            let members = collection
+                .members()
+                .await
+                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
+            resources.reserve(members.len());
+            for manager in members {
+                resources.push(manager_projection(&manager)?);
+            }
+        }
+
+        Ok(resources)
+    }
+
     fn authenticated_bmc(
         &self,
         address: &EndpointAddress,
@@ -184,6 +261,41 @@ impl RedfishGateway {
             CacheSettings::with_capacity(0),
         ));
         Ok((bmc, identity))
+    }
+}
+
+/// One typed Redfish resource ready for the application refresh boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreResourceProjection {
+    feature: ResourceFeature,
+    odata_id: ResourceODataId,
+    etag: Option<ResourceEtag>,
+    payload: ResourceSnapshotPayload,
+}
+
+impl CoreResourceProjection {
+    /// Returns the typed feature that produced this resource.
+    #[must_use]
+    pub const fn feature(&self) -> ResourceFeature {
+        self.feature
+    }
+
+    /// Borrows the exact identifier discovered through typed navigation.
+    #[must_use]
+    pub const fn odata_id(&self) -> &ResourceODataId {
+        &self.odata_id
+    }
+
+    /// Borrows the optional entity tag retained by the upstream schema.
+    #[must_use]
+    pub const fn etag(&self) -> Option<&ResourceEtag> {
+        self.etag.as_ref()
+    }
+
+    /// Borrows the canonical JSON projection created from typed fields.
+    #[must_use]
+    pub const fn payload(&self) -> &ResourceSnapshotPayload {
+        &self.payload
     }
 }
 
@@ -246,6 +358,274 @@ impl ServiceRootSummary {
     }
 }
 
+#[derive(Serialize)]
+struct CommonResourcePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description", skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+impl CommonResourcePayload {
+    fn from_resource(resource: &impl NvResource) -> Self {
+        Self {
+            id: resource.id().to_string(),
+            name: resource.name().to_string(),
+            description: resource.description().map(|value| value.to_string()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResourceStatusPayload {
+    #[serde(rename = "State", skip_serializing_if = "Option::is_none")]
+    state: Option<nv_redfish::schema::resource::State>,
+    #[serde(rename = "Health", skip_serializing_if = "Option::is_none")]
+    health: Option<nv_redfish::schema::resource::Health>,
+    #[serde(rename = "HealthRollup", skip_serializing_if = "Option::is_none")]
+    health_rollup: Option<nv_redfish::schema::resource::Health>,
+}
+
+impl ResourceStatusPayload {
+    fn from_status(status: &nv_redfish::schema::resource::Status) -> Self {
+        Self {
+            state: status.state.as_ref().copied().flatten(),
+            health: status.health.as_ref().copied().flatten(),
+            health_rollup: status.health_rollup.as_ref().copied().flatten(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ServiceRootPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Vendor", skip_serializing_if = "Option::is_none")]
+    vendor: Option<String>,
+    #[serde(rename = "Product", skip_serializing_if = "Option::is_none")]
+    product: Option<String>,
+    #[serde(rename = "RedfishVersion", skip_serializing_if = "Option::is_none")]
+    redfish_version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ComputerSystemPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "SystemType", skip_serializing_if = "Option::is_none")]
+    system_type: Option<nv_redfish::schema::computer_system::SystemType>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "SKU", skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    #[serde(rename = "HostName", skip_serializing_if = "Option::is_none")]
+    host_name: Option<String>,
+    #[serde(rename = "BiosVersion", skip_serializing_if = "Option::is_none")]
+    bios_version: Option<String>,
+    #[serde(rename = "PowerState", skip_serializing_if = "Option::is_none")]
+    power_state: Option<nv_redfish::schema::resource::PowerState>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+#[derive(Serialize)]
+struct ChassisPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ChassisType")]
+    chassis_type: nv_redfish::schema::chassis::ChassisType,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "SKU", skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    #[serde(rename = "AssetTag", skip_serializing_if = "Option::is_none")]
+    asset_tag: Option<String>,
+    #[serde(rename = "PowerState", skip_serializing_if = "Option::is_none")]
+    power_state: Option<nv_redfish::schema::resource::PowerState>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+#[derive(Serialize)]
+struct ManagerPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ManagerType", skip_serializing_if = "Option::is_none")]
+    manager_type: Option<nv_redfish::schema::manager::ManagerType>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "FirmwareVersion", skip_serializing_if = "Option::is_none")]
+    firmware_version: Option<String>,
+    #[serde(rename = "Version", skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(rename = "PowerState", skip_serializing_if = "Option::is_none")]
+    power_state: Option<nv_redfish::schema::resource::PowerState>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+fn service_root_projection(
+    root: &ServiceRoot<UpstreamBmc>,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = ServiceRootPayload {
+        resource: CommonResourcePayload::from_resource(root),
+        vendor: root.vendor().map(|value| value.to_string()),
+        product: root.product().map(|value| value.to_string()),
+        redfish_version: root.redfish_version().map(|value| value.to_string()),
+    };
+    build_core_projection(
+        ResourceFeature::ServiceRoot,
+        root,
+        root.root.etag(),
+        &payload,
+    )
+}
+
+fn computer_system_projection(
+    system: &nv_redfish::computer_system::ComputerSystem<UpstreamBmc>,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let raw = system.raw();
+    let hardware = system.hardware_id();
+    let payload = ComputerSystemPayload {
+        resource: CommonResourcePayload::from_resource(system),
+        system_type: raw.system_type,
+        manufacturer: hardware.manufacturer.map(|value| value.to_string()),
+        model: hardware.model.map(|value| value.to_string()),
+        part_number: hardware.part_number.map(|value| value.to_string()),
+        serial_number: hardware.serial_number.map(|value| value.to_string()),
+        sku: system.sku().map(|value| value.to_string()),
+        host_name: optional_nullable_text(raw.host_name.as_ref()),
+        bios_version: optional_nullable_text(raw.bios_version.as_ref()),
+        power_state: system.power_state(),
+        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(ResourceFeature::Systems, system, raw.etag(), &payload)
+}
+
+fn chassis_projection(
+    chassis: &nv_redfish::chassis::Chassis<UpstreamBmc>,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let raw = chassis.raw();
+    let hardware = chassis.hardware_id();
+    let payload = ChassisPayload {
+        resource: CommonResourcePayload::from_resource(chassis),
+        chassis_type: raw.chassis_type,
+        manufacturer: hardware.manufacturer.map(|value| value.to_string()),
+        model: hardware.model.map(|value| value.to_string()),
+        part_number: hardware.part_number.map(|value| value.to_string()),
+        serial_number: hardware.serial_number.map(|value| value.to_string()),
+        sku: optional_nullable_text(raw.sku.as_ref()),
+        asset_tag: optional_nullable_text(raw.asset_tag.as_ref()),
+        power_state: raw.power_state.as_ref().copied().flatten(),
+        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(ResourceFeature::Chassis, chassis, raw.etag(), &payload)
+}
+
+fn manager_projection(
+    manager: &nv_redfish::manager::Manager<UpstreamBmc>,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let raw = manager.raw();
+    let payload = ManagerPayload {
+        resource: CommonResourcePayload::from_resource(manager),
+        manager_type: raw.manager_type,
+        manufacturer: optional_nullable_text(raw.manufacturer.as_ref()),
+        model: optional_nullable_text(raw.model.as_ref()),
+        part_number: optional_nullable_text(raw.part_number.as_ref()),
+        serial_number: optional_nullable_text(raw.serial_number.as_ref()),
+        firmware_version: optional_nullable_text(raw.firmware_version.as_ref()),
+        version: optional_nullable_text(raw.version.as_ref()),
+        power_state: raw.power_state.as_ref().copied().flatten(),
+        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(ResourceFeature::Managers, manager, raw.etag(), &payload)
+}
+
+fn optional_nullable_text(value: Option<&Option<String>>) -> Option<String> {
+    value.and_then(Option::as_ref).cloned()
+}
+
+fn build_core_projection(
+    feature: ResourceFeature,
+    resource: &impl NvResource,
+    etag: Option<&nv_redfish::core::ODataETag>,
+    payload: &impl Serialize,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let odata_id = ResourceODataId::parse(&resource.odata_id().to_string())
+        .map_err(|source| CoreResourceReadError::InvalidODataId { feature, source })?;
+    let etag = etag
+        .map(|value| ResourceEtag::parse(&value.to_string()))
+        .transpose()
+        .map_err(|source| CoreResourceReadError::InvalidEtag { feature, source })?;
+    let json = serde_json::to_string(payload)
+        .map_err(|source| CoreResourceReadError::SerializePayload { feature, source })?;
+    let payload = ResourceSnapshotPayload::parse(&json)
+        .map_err(|source| CoreResourceReadError::InvalidPayload { feature, source })?;
+    Ok(CoreResourceProjection {
+        feature,
+        odata_id,
+        etag,
+        payload,
+    })
+}
+
+/// A controlled failure while reading a complete typed core resource set.
+#[derive(Debug, Error)]
+pub enum CoreResourceReadError {
+    #[error(transparent)]
+    Redfish(Box<RedfishServiceRootError>),
+    #[error("{feature} returned an invalid @odata.id: {source}")]
+    InvalidODataId {
+        feature: ResourceFeature,
+        #[source]
+        source: ResourceODataIdError,
+    },
+    #[error("{feature} returned an invalid ETag: {source}")]
+    InvalidEtag {
+        feature: ResourceFeature,
+        #[source]
+        source: ResourceEtagError,
+    },
+    #[error("failed to serialize the typed {feature} projection: {source}")]
+    SerializePayload {
+        feature: ResourceFeature,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("the typed {feature} projection is not a valid snapshot payload: {source}")]
+    InvalidPayload {
+        feature: ResourceFeature,
+        #[source]
+        source: ResourceSnapshotPayloadError,
+    },
+}
+
+impl From<RedfishServiceRootError> for CoreResourceReadError {
+    fn from(source: RedfishServiceRootError) -> Self {
+        Self::Redfish(Box::new(source))
+    }
+}
+
 /// A controlled failure while reading an authenticated Redfish Service Root.
 #[derive(Debug, Error)]
 pub enum RedfishServiceRootError {
@@ -267,7 +647,7 @@ pub enum RedfishServiceRootError {
         #[source]
         source: BmcError,
     },
-    #[error("BMC credentials are valid but lack permission to read the Service Root")]
+    #[error("BMC credentials are valid but lack permission for the requested Redfish resource")]
     PermissionDenied {
         #[source]
         source: BmcError,
@@ -277,17 +657,17 @@ pub enum RedfishServiceRootError {
         #[source]
         source: BmcError,
     },
-    #[error("the Redfish Service Root was incompatible with the compiled schema")]
+    #[error("the Redfish response was incompatible with the compiled schema")]
     SchemaIncompatible {
         #[source]
         source: UpstreamServiceRootError,
     },
-    #[error("the Redfish Service Root request timed out")]
+    #[error("the Redfish request timed out")]
     NetworkTimeout {
         #[source]
         source: BmcError,
     },
-    #[error("the Redfish Service Root could not be reached")]
+    #[error("the Redfish resource could not be reached")]
     Network {
         #[source]
         source: BmcError,
@@ -674,8 +1054,16 @@ mod tests {
         "Product":"Fixture BMC"
     }"#;
 
+    const INVALID_SERVICE_ROOT_ID_BODY: &str = r#"{
+        "@odata.id":" /redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}}
+    }"#;
+
     const CORE_SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
         "Id":"RootService",
         "Name":"Root Service",
         "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
@@ -715,12 +1103,93 @@ mod tests {
         "Members":[]
     }"##;
 
+    const SYSTEMS_WITH_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",
+        "@odata.id":"/redfish/v1/Systems",
+        "Name":"Computer System Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1"}]
+    }"##;
+
+    const SYSTEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "Description":"Primary compute system",
+        "SystemType":"Physical",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model S",
+        "PartNumber":"SYS-PART-1",
+        "SerialNumber":"SYS-1",
+        "SKU":"SYS-SKU-1",
+        "HostName":"compute-1",
+        "BiosVersion":"2.3.4",
+        "PowerState":"On",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"#;
+
+    const CHASSIS_WITH_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#ChassisCollection.ChassisCollection",
+        "@odata.id":"/redfish/v1/Chassis",
+        "Name":"Chassis Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1"}]
+    }"##;
+
+    const CHASSIS_MEMBER_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model C",
+        "PartNumber":"CHA-PART-1",
+        "SerialNumber":"CHA-1",
+        "SKU":"CHA-SKU-1",
+        "AssetTag":"RACK-01",
+        "PowerState":"On",
+        "Status":{"State":"Enabled","Health":"Warning","HealthRollup":"OK"}
+    }"#;
+
+    const MANAGERS_WITH_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#ManagerCollection.ManagerCollection",
+        "@odata.id":"/redfish/v1/Managers",
+        "Name":"Manager Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1"}]
+    }"##;
+
+    const MANAGER_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model M",
+        "PartNumber":"MGR-PART-1",
+        "SerialNumber":"MGR-1",
+        "FirmwareVersion":"1.2.3",
+        "Version":"4.5.6",
+        "PowerState":"On",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"#;
+
     const CORE_REQUEST_PATHS: [&str; 5] = [
         "/redfish/v1",
         "/redfish/v1/SessionService",
         "/redfish/v1/Systems",
         "/redfish/v1/Chassis",
         "/redfish/v1/Managers",
+    ];
+
+    const CORE_RESOURCE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
     ];
 
     #[tokio::test]
@@ -874,6 +1343,167 @@ mod tests {
             ]
         );
         assert_authenticated_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_complete_core_resources_through_typed_navigation() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_sequence(&[
+            ("200 OK", CORE_SERVICE_ROOT_BODY),
+            ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+            ("200 OK", SYSTEM_BODY),
+            ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+            ("200 OK", CHASSIS_MEMBER_BODY),
+            ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+            ("200 OK", MANAGER_BODY),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_projection(
+            &resources[0],
+            "/redfish/v1/",
+            "W/\"root-1\"",
+            "Vendor",
+            "Rutilus Test",
+        )?;
+        assert_projection(
+            &resources[1],
+            "/redfish/v1/Systems/1",
+            "W/\"system-1\"",
+            "SystemType",
+            "Physical",
+        )?;
+        assert_projection(
+            &resources[2],
+            "/redfish/v1/Chassis/1",
+            "W/\"chassis-1\"",
+            "ChassisType",
+            "RackMount",
+        )?;
+        assert_projection(
+            &resources[3],
+            "/redfish/v1/Managers/1",
+            "W/\"manager-1\"",
+            "ManagerType",
+            "BMC",
+        )?;
+        let system_payload: serde_json::Value =
+            serde_json::from_str(resources[1].payload().as_str())?;
+        assert_eq!(system_payload["PowerState"], "On");
+        assert_eq!(system_payload["Status"]["Health"], "OK");
+        assert_eq!(system_payload["BiosVersion"], "2.3.4");
+        assert_authenticated_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_only_service_root_when_core_collections_are_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].feature(), ResourceFeature::ServiceRoot);
+        assert_authenticated_requests(&server.finish_all().await?, &["/redfish/v1"])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_typed_resource_metadata_without_normalizing_it()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start("200 OK", INVALID_SERVICE_ROOT_ID_BODY).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CoreResourceReadError::InvalidODataId {
+                feature: ResourceFeature::ServiceRoot,
+                source: ResourceODataIdError::SurroundingWhitespace,
+            })
+        ));
+        assert_authenticated_requests(&server.finish_all().await?, &["/redfish/v1"])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborts_complete_resource_read_on_incompatible_member_schema()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_sequence(&[
+            ("200 OK", CORE_SERVICE_ROOT_BODY),
+            ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+            ("200 OK", "{}"),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CoreResourceReadError::Redfish(source))
+                if matches!(*source, RedfishServiceRootError::SchemaIncompatible { .. })
+        ));
+        assert_authenticated_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+            ],
+        )?;
         Ok(())
     }
 
@@ -1101,6 +1731,23 @@ mod tests {
             assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
             assert!(!request.contains("password"));
         }
+        Ok(())
+    }
+
+    fn assert_projection(
+        projection: &CoreResourceProjection,
+        expected_odata_id: &str,
+        expected_etag: &str,
+        field: &str,
+        expected_value: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(projection.odata_id().as_str(), expected_odata_id);
+        assert_eq!(
+            projection.etag().map(ResourceEtag::as_str),
+            Some(expected_etag)
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload[field], expected_value);
         Ok(())
     }
 
