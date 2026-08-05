@@ -15,6 +15,7 @@ use nv_redfish::{
         reqwest::{BmcError, Client as NvHttpClient},
     },
     core::EntityTypeRef as _,
+    session_service::{Session, SessionCreate},
 };
 use reqwest::{Client as ReqwestClient, StatusCode, redirect::Policy as RedirectPolicy};
 use rustls::{
@@ -101,7 +102,7 @@ impl RedfishGateway {
         username: &CredentialUsername,
         password: &SecretString,
     ) -> Result<ServiceRootSummary, RedfishServiceRootError> {
-        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+        let (bmc, _, identity) = self.authenticated_bmc(address, trust, username, password)?;
 
         match ServiceRoot::new(bmc).await {
             Ok(root) => Ok(ServiceRootSummary::from_root(&root)),
@@ -111,6 +112,12 @@ impl RedfishGateway {
 
     /// Reads the Service Root and probes the 0.1 core capabilities through
     /// public, typed `nv-redfish` navigation methods.
+    ///
+    /// When `SessionService` is usable, the gateway creates an operation-scoped
+    /// Session, authenticates subsequent reads with its in-memory token, and
+    /// actively deletes the Session before returning. An unavailable or
+    /// unauthorized `SessionService` falls back to Basic authentication and is
+    /// retained as an explicit capability state.
     ///
     /// Capability reads are sequential. A TLS identity or validation failure
     /// stops the probe immediately, while endpoint-local authorization,
@@ -129,29 +136,38 @@ impl RedfishGateway {
         username: &CredentialUsername,
         password: &SecretString,
     ) -> Result<CoreEndpointDiscovery, RedfishServiceRootError> {
-        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+        let (bmc, http, identity) = self.authenticated_bmc(address, trust, username, password)?;
         let root = ServiceRoot::new(bmc)
             .await
             .map_err(|source| classify_service_root_error(source, &identity, trust))?;
-        let service_root = ServiceRootSummary::from_root(&root);
-        let session_service =
-            classify_capability_probe(root.session_service().await, &identity, trust)?;
-        let systems = classify_capability_probe(root.systems().await, &identity, trust)?;
-        let chassis = classify_capability_probe(root.chassis().await, &identity, trust)?;
-        let managers = classify_capability_probe(root.managers().await, &identity, trust)?;
+        let authenticated = establish_preferred_authentication(
+            root, http, address, username, password, &identity, trust,
+        )
+        .await?;
+        let service_root = ServiceRootSummary::from_root(&authenticated.root);
+        let result = async {
+            let systems =
+                classify_capability_probe(authenticated.root.systems().await, &identity, trust)?;
+            let chassis =
+                classify_capability_probe(authenticated.root.chassis().await, &identity, trust)?;
+            let managers =
+                classify_capability_probe(authenticated.root.managers().await, &identity, trust)?;
 
-        Ok(CoreEndpointDiscovery {
-            service_root,
-            capabilities: [
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::SessionService,
-                    session_service,
-                ),
-                EndpointCapabilityObservation::new(EndpointCapability::Systems, systems),
-                EndpointCapabilityObservation::new(EndpointCapability::Chassis, chassis),
-                EndpointCapabilityObservation::new(EndpointCapability::Managers, managers),
-            ],
-        })
+            Ok(CoreEndpointDiscovery {
+                service_root,
+                capabilities: [
+                    EndpointCapabilityObservation::new(
+                        EndpointCapability::SessionService,
+                        authenticated.session_state,
+                    ),
+                    EndpointCapabilityObservation::new(EndpointCapability::Systems, systems),
+                    EndpointCapabilityObservation::new(EndpointCapability::Chassis, chassis),
+                    EndpointCapabilityObservation::new(EndpointCapability::Managers, managers),
+                ],
+            })
+        }
+        .await;
+        finish_redfish_operation(result, authenticated.session, &identity, trust).await
     }
 
     /// Reads the complete advertised 0.1 core resource surface through public,
@@ -160,7 +176,8 @@ impl RedfishGateway {
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
     /// resource URI. An error aborts the complete read so the application
-    /// cannot commit a partial refresh Generation.
+    /// cannot commit a partial refresh Generation. Session tokens are scoped
+    /// to this call, kept only in memory, and actively cleaned up.
     ///
     /// # Errors
     ///
@@ -173,58 +190,16 @@ impl RedfishGateway {
         username: &CredentialUsername,
         password: &SecretString,
     ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
-        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+        let (bmc, http, identity) = self.authenticated_bmc(address, trust, username, password)?;
         let root = ServiceRoot::new(bmc)
             .await
             .map_err(|source| classify_service_root_error(source, &identity, trust))?;
-        let mut resources = vec![service_root_projection(&root)?];
-
-        if let Some(collection) = root
-            .systems()
-            .await
-            .map_err(|source| classify_service_root_error(source, &identity, trust))?
-        {
-            let members = collection
-                .members()
-                .await
-                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
-            resources.reserve(members.len());
-            for system in members {
-                resources.push(computer_system_projection(&system)?);
-            }
-        }
-
-        if let Some(collection) = root
-            .chassis()
-            .await
-            .map_err(|source| classify_service_root_error(source, &identity, trust))?
-        {
-            let members = collection
-                .members()
-                .await
-                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
-            resources.reserve(members.len());
-            for chassis in members {
-                resources.push(chassis_projection(&chassis)?);
-            }
-        }
-
-        if let Some(collection) = root
-            .managers()
-            .await
-            .map_err(|source| classify_service_root_error(source, &identity, trust))?
-        {
-            let members = collection
-                .members()
-                .await
-                .map_err(|source| classify_service_root_error(source, &identity, trust))?;
-            resources.reserve(members.len());
-            for manager in members {
-                resources.push(manager_projection(&manager)?);
-            }
-        }
-
-        Ok(resources)
+        let authenticated = establish_preferred_authentication(
+            root, http, address, username, password, &identity, trust,
+        )
+        .await?;
+        let result = read_authenticated_core_resources(&authenticated.root, &identity, trust).await;
+        finish_core_resource_read(result, authenticated.session, &identity, trust).await
     }
 
     fn authenticated_bmc(
@@ -233,7 +208,7 @@ impl RedfishGateway {
         trust: &TlsTrust,
         username: &CredentialUsername,
         password: &SecretString,
-    ) -> Result<(Arc<UpstreamBmc>, IdentityMonitor), RedfishServiceRootError> {
+    ) -> Result<(Arc<UpstreamBmc>, NvHttpClient, IdentityMonitor), RedfishServiceRootError> {
         let (tls_config, identity) = self
             .tls
             .trust_bound_client_config(trust)
@@ -254,13 +229,239 @@ impl RedfishGateway {
             username.as_str().to_owned(),
             password.expose_secret().to_owned(),
         );
-        let bmc = Arc::new(HttpBmc::new(
-            http,
-            address.as_url().clone(),
-            credentials,
-            CacheSettings::with_capacity(0),
-        ));
-        Ok((bmc, identity))
+        let bmc = build_bmc(address, http.clone(), credentials);
+        Ok((bmc, http, identity))
+    }
+}
+
+async fn read_authenticated_core_resources(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let mut resources = vec![service_root_projection(root)?];
+
+    if let Some(collection) = root
+        .systems()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+    {
+        let members = collection
+            .members()
+            .await
+            .map_err(|source| classify_service_root_error(source, identity, trust))?;
+        resources.reserve(members.len());
+        for system in members {
+            resources.push(computer_system_projection(&system)?);
+        }
+    }
+
+    if let Some(collection) = root
+        .chassis()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+    {
+        let members = collection
+            .members()
+            .await
+            .map_err(|source| classify_service_root_error(source, identity, trust))?;
+        resources.reserve(members.len());
+        for chassis in members {
+            resources.push(chassis_projection(&chassis)?);
+        }
+    }
+
+    if let Some(collection) = root
+        .managers()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+    {
+        let members = collection
+            .members()
+            .await
+            .map_err(|source| classify_service_root_error(source, identity, trust))?;
+        resources.reserve(members.len());
+        for manager in members {
+            resources.push(manager_projection(&manager)?);
+        }
+    }
+
+    Ok(resources)
+}
+
+fn build_bmc(
+    address: &EndpointAddress,
+    http: NvHttpClient,
+    credentials: BmcCredentials,
+) -> Arc<UpstreamBmc> {
+    Arc::new(HttpBmc::new(
+        http,
+        address.as_url().clone(),
+        credentials,
+        CacheSettings::with_capacity(0),
+    ))
+}
+
+struct AuthenticatedRoot {
+    root: ServiceRoot<UpstreamBmc>,
+    session: Option<Session<UpstreamBmc>>,
+    session_state: CapabilityState,
+}
+
+async fn establish_preferred_authentication(
+    root: ServiceRoot<UpstreamBmc>,
+    http: NvHttpClient,
+    address: &EndpointAddress,
+    username: &CredentialUsername,
+    password: &SecretString,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<AuthenticatedRoot, RedfishServiceRootError> {
+    let service = match root.session_service().await {
+        Ok(Some(service)) => service,
+        Ok(None) => {
+            return Ok(AuthenticatedRoot {
+                root,
+                session: None,
+                session_state: CapabilityState::NotAdvertised,
+            });
+        }
+        Err(source) => {
+            let session_state = session_fallback_state(source, identity, trust)?;
+            return Ok(AuthenticatedRoot {
+                root,
+                session: None,
+                session_state,
+            });
+        }
+    };
+    if matches!(service.raw().service_enabled, Some(Some(false))) {
+        return Ok(AuthenticatedRoot {
+            root,
+            session: None,
+            session_state: CapabilityState::TemporarilyUnavailable,
+        });
+    }
+    let sessions = match service.sessions().await {
+        Ok(Some(sessions)) => sessions,
+        Ok(None) => {
+            return Ok(AuthenticatedRoot {
+                root,
+                session: None,
+                session_state: CapabilityState::TemporarilyUnavailable,
+            });
+        }
+        Err(source) => {
+            let session_state = session_fallback_state(source, identity, trust)?;
+            return Ok(AuthenticatedRoot {
+                root,
+                session: None,
+                session_state,
+            });
+        }
+    };
+    let create = SessionCreate::builder(
+        username.as_str().to_owned(),
+        password.expose_secret().to_owned(),
+    )
+    .build();
+    let session = match sessions.create_session(&create).await {
+        Ok(session) => session,
+        Err(source) => {
+            let session_state = session_fallback_state(source, identity, trust)?;
+            return Ok(AuthenticatedRoot {
+                root,
+                session: None,
+                session_state,
+            });
+        }
+    };
+    let Some(token) = session
+        .auth_token()
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+    else {
+        cleanup_session(Some(session), identity, trust).await?;
+        return Ok(AuthenticatedRoot {
+            root,
+            session: None,
+            session_state: CapabilityState::SchemaIncompatible,
+        });
+    };
+    let token_bmc = build_bmc(address, http, BmcCredentials::token(token));
+    Ok(AuthenticatedRoot {
+        root: root.replace_bmc(token_bmc),
+        session: Some(session),
+        session_state: CapabilityState::Supported,
+    })
+}
+
+fn session_fallback_state(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CapabilityState, RedfishServiceRootError> {
+    classify_capability_probe::<()>(Err(source), identity, trust)
+}
+
+async fn cleanup_session(
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<(), RedfishServiceRootError> {
+    let Some(session) = session else {
+        return Ok(());
+    };
+    if session.delete().await.is_ok() {
+        return Ok(());
+    }
+    // Do not retain the upstream deletion error: a vendor may put opaque
+    // credentials in its Location URI, which the error chain could expose.
+    match identity.take_change(trust) {
+        Ok(Some(changed)) => Err(RedfishServiceRootError::TlsIdentityChanged(changed)),
+        Err(source) => Err(RedfishServiceRootError::TlsIdentityState(source)),
+        Ok(None) if identity.validation_rejected() => {
+            Err(RedfishServiceRootError::SessionCleanupTlsRejected)
+        }
+        Ok(None) => Err(RedfishServiceRootError::SessionCleanupFailed),
+    }
+}
+
+async fn finish_redfish_operation<T>(
+    operation: Result<T, RedfishServiceRootError>,
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<T, RedfishServiceRootError> {
+    let cleanup = cleanup_session(session, identity, trust).await;
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => {
+            Err(RedfishServiceRootError::OperationAndSessionCleanupFailed {
+                operation: Box::new(operation),
+                cleanup: Box::new(cleanup),
+            })
+        }
+    }
+}
+
+async fn finish_core_resource_read(
+    operation: Result<Vec<CoreResourceProjection>, CoreResourceReadError>,
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let cleanup = cleanup_session(session, identity, trust).await;
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Err(operation), Err(cleanup)) => Err(CoreResourceReadError::ReadAndSessionCleanupFailed {
+            read: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
     }
 }
 
@@ -618,6 +819,13 @@ pub enum CoreResourceReadError {
         #[source]
         source: ResourceSnapshotPayloadError,
     },
+    #[error(
+        "typed core read and transient Session cleanup both failed; read: {read}; cleanup: {cleanup}"
+    )]
+    ReadAndSessionCleanupFailed {
+        read: Box<CoreResourceReadError>,
+        cleanup: Box<RedfishServiceRootError>,
+    },
 }
 
 impl From<RedfishServiceRootError> for CoreResourceReadError {
@@ -679,6 +887,17 @@ pub enum RedfishServiceRootError {
     },
     #[error("the public nv-redfish Service Root operation failed: {0}")]
     Upstream(#[source] UpstreamServiceRootError),
+    #[error("TLS validation rejected transient Session cleanup")]
+    SessionCleanupTlsRejected,
+    #[error("transient Redfish Session cleanup failed")]
+    SessionCleanupFailed,
+    #[error(
+        "Redfish operation and transient Session cleanup both failed; operation: {operation}; cleanup: {cleanup}"
+    )]
+    OperationAndSessionCleanupFailed {
+        operation: Box<RedfishServiceRootError>,
+        cleanup: Box<RedfishServiceRootError>,
+    },
 }
 
 /// TLS identity evidence could not be retained because its synchronization
@@ -735,7 +954,10 @@ fn classify_capability_probe<T>(
         | RedfishServiceRootError::ClientBuild(_)
         | RedfishServiceRootError::TlsIdentityState(_)
         | RedfishServiceRootError::TlsIdentityChanged(_)
-        | RedfishServiceRootError::TlsRejected { .. }) => Err(source),
+        | RedfishServiceRootError::TlsRejected { .. }
+        | RedfishServiceRootError::SessionCleanupTlsRejected
+        | RedfishServiceRootError::SessionCleanupFailed
+        | RedfishServiceRootError::OperationAndSessionCleanupFailed { .. }) => Err(source),
     }
 }
 
@@ -1076,10 +1298,35 @@ mod tests {
         "Managers":{"@odata.id":"/redfish/v1/Managers"}
     }"#;
 
+    const SYSTEMS_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"}
+    }"#;
+
     const SESSION_SERVICE_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/SessionService",
         "Id":"SessionService",
-        "Name":"Session Service"
+        "Name":"Session Service",
+        "ServiceEnabled":true,
+        "Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}
+    }"#;
+
+    const SESSIONS_BODY: &str = r##"{
+        "@odata.type":"#SessionCollection.SessionCollection",
+        "@odata.id":"/redfish/v1/SessionService/Sessions",
+        "Name":"Session Collection",
+        "Members":[]
+    }"##;
+
+    const SESSION_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/SessionService/Sessions/1",
+        "Id":"1",
+        "Name":"Rutilus Session",
+        "UserName":"admin",
+        "Password":null
     }"#;
 
     const SYSTEMS_BODY: &str = r##"{
@@ -1174,7 +1421,18 @@ mod tests {
         "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"#;
 
-    const CORE_REQUEST_PATHS: [&str; 5] = [
+    const CORE_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Managers",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    const BASIC_FALLBACK_REQUEST_PATHS: [&str; 5] = [
         "/redfish/v1",
         "/redfish/v1/SessionService",
         "/redfish/v1/Systems",
@@ -1182,14 +1440,49 @@ mod tests {
         "/redfish/v1/Managers",
     ];
 
-    const CORE_RESOURCE_REQUEST_PATHS: [&str; 7] = [
+    const SESSION_CREATE_FALLBACK_REQUEST_PATHS: [&str; 7] = [
         "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Managers",
+    ];
+
+    const INVALID_SESSION_TOKEN_FALLBACK_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions/1",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Managers",
+    ];
+
+    const FAILED_RESOURCE_AND_CLEANUP_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    const CORE_RESOURCE_REQUEST_PATHS: [&str; 11] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
         "/redfish/v1/Systems",
         "/redfish/v1/Systems/1",
         "/redfish/v1/Chassis",
         "/redfish/v1/Chassis/1",
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
     ];
 
     #[tokio::test]
@@ -1226,13 +1519,11 @@ mod tests {
     #[tokio::test]
     async fn probes_every_advertised_core_capability_through_typed_navigation()
     -> Result<(), Box<dyn Error>> {
-        let server = TestRedfishServer::start_sequence(&[
-            ("200 OK", CORE_SERVICE_ROOT_BODY),
-            ("200 OK", SESSION_SERVICE_BODY),
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(&[
             ("200 OK", SYSTEMS_BODY),
             ("200 OK", CHASSIS_BODY),
             ("200 OK", MANAGERS_BODY),
-        ])
+        ]))
         .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
@@ -1268,7 +1559,7 @@ mod tests {
                 ),
             ]
         );
-        assert_authenticated_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        assert_session_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
         Ok(())
     }
 
@@ -1342,22 +1633,172 @@ mod tests {
                 ),
             ]
         );
-        assert_authenticated_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        assert_authenticated_requests(&server.finish_all().await?, &BASIC_FALLBACK_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_unavailable_session_creation_and_falls_back_to_basic()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(vec![
+            http_response("200 OK", CORE_SERVICE_ROOT_BODY),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response("501 Not Implemented", "{}"),
+            http_response("200 OK", SYSTEMS_BODY),
+            http_response("200 OK", CHASSIS_BODY),
+            http_response("200 OK", MANAGERS_BODY),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(
+            discovery.capabilities(),
+            &[
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::SessionService,
+                    CapabilityState::TemporarilyUnavailable,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Systems,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Chassis,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Managers,
+                    CapabilityState::Supported,
+                ),
+            ]
+        );
+        assert_session_creation_fallback_requests(
+            &server.finish_all().await?,
+            &SESSION_CREATE_FALLBACK_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_sanitized_transient_session_cleanup_failure() -> Result<(), Box<dyn Error>> {
+        let mut responses = session_response_sequence(&[
+            ("200 OK", SYSTEMS_BODY),
+            ("200 OK", CHASSIS_BODY),
+            ("200 OK", MANAGERS_BODY),
+        ]);
+        if let Some(cleanup) = responses.last_mut() {
+            *cleanup = http_response("500 Internal Server Error", "{}");
+        }
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        let Err(error) = result else {
+            return Err(io::Error::other("Session cleanup failure was accepted").into());
+        };
+        assert!(matches!(
+            error,
+            RedfishServiceRootError::SessionCleanupFailed
+        ));
+        let rendered = format!("{error}\n{error:?}");
+        assert!(!rendered.contains("test-session-token"));
+        assert!(!rendered.contains("password"));
+        assert_session_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleans_invalid_session_token_then_records_schema_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(vec![
+            http_response("200 OK", CORE_SERVICE_ROOT_BODY),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response_with_headers(
+                "201 Created",
+                SESSION_BODY,
+                &[
+                    ("X-Auth-Token", ""),
+                    ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                ],
+            ),
+            http_response("204 No Content", ""),
+            http_response("200 OK", SYSTEMS_BODY),
+            http_response("200 OK", CHASSIS_BODY),
+            http_response("200 OK", MANAGERS_BODY),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(
+            discovery.capabilities(),
+            &[
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::SessionService,
+                    CapabilityState::SchemaIncompatible,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Systems,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Chassis,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Managers,
+                    CapabilityState::Supported,
+                ),
+            ]
+        );
+        assert_invalid_session_token_fallback_requests(
+            &server.finish_all().await?,
+            &INVALID_SESSION_TOKEN_FALLBACK_REQUEST_PATHS,
+        )?;
         Ok(())
     }
 
     #[tokio::test]
     async fn reads_complete_core_resources_through_typed_navigation() -> Result<(), Box<dyn Error>>
     {
-        let server = TestRedfishServer::start_sequence(&[
-            ("200 OK", CORE_SERVICE_ROOT_BODY),
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(&[
             ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
             ("200 OK", SYSTEM_BODY),
             ("200 OK", CHASSIS_WITH_MEMBER_BODY),
             ("200 OK", CHASSIS_MEMBER_BODY),
             ("200 OK", MANAGERS_WITH_MEMBER_BODY),
             ("200 OK", MANAGER_BODY),
-        ])
+        ]))
         .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
@@ -1417,7 +1858,7 @@ mod tests {
         assert_eq!(system_payload["PowerState"], "On");
         assert_eq!(system_payload["Status"]["Health"], "OK");
         assert_eq!(system_payload["BiosVersion"], "2.3.4");
-        assert_authenticated_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
         Ok(())
     }
 
@@ -1474,7 +1915,7 @@ mod tests {
     async fn aborts_complete_resource_read_on_incompatible_member_schema()
     -> Result<(), Box<dyn Error>> {
         let server = TestRedfishServer::start_sequence(&[
-            ("200 OK", CORE_SERVICE_ROOT_BODY),
+            ("200 OK", SYSTEMS_SERVICE_ROOT_BODY),
             ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
             ("200 OK", "{}"),
         ])
@@ -1503,6 +1944,53 @@ mod tests {
                 "/redfish/v1/Systems",
                 "/redfish/v1/Systems/1",
             ],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_resource_and_sanitized_session_cleanup_failures()
+    -> Result<(), Box<dyn Error>> {
+        let mut responses =
+            session_response_sequence(&[("200 OK", SYSTEMS_WITH_MEMBER_BODY), ("200 OK", "{}")]);
+        if let Some(cleanup) = responses.last_mut() {
+            *cleanup = http_response("500 Internal Server Error", "{}");
+        }
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        let Err(CoreResourceReadError::ReadAndSessionCleanupFailed { read, cleanup }) = result
+        else {
+            return Err(io::Error::other(
+                "resource and Session cleanup failures were not both retained",
+            )
+            .into());
+        };
+        assert!(matches!(
+            read.as_ref(),
+            CoreResourceReadError::Redfish(source)
+                if matches!(source.as_ref(), RedfishServiceRootError::SchemaIncompatible { .. })
+        ));
+        assert!(matches!(
+            cleanup.as_ref(),
+            RedfishServiceRootError::SessionCleanupFailed
+        ));
+        let rendered = format!("{read}\n{read:?}\n{cleanup}\n{cleanup:?}");
+        assert!(!rendered.contains("test-session-token"));
+        assert!(!rendered.contains("password"));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &FAILED_RESOURCE_AND_CLEANUP_REQUEST_PATHS,
         )?;
         Ok(())
     }
@@ -1734,6 +2222,127 @@ mod tests {
         Ok(())
     }
 
+    fn assert_session_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        let last = requests.len().saturating_sub(1);
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = match index {
+                3 => "POST",
+                value if value == last => "DELETE",
+                _ => "GET",
+            };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n"))
+            );
+            let authorization = request_header(request, "authorization");
+            let token = request_header(request, "x-auth-token");
+            match index {
+                3 => {
+                    assert!(authorization.is_none());
+                    assert!(token.is_none());
+                }
+                4.. if index < last => {
+                    assert!(authorization.is_none());
+                    assert_eq!(token, Some("test-session-token"));
+                }
+                _ => {
+                    assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                    assert!(token.is_none());
+                }
+            }
+            if index != 3 {
+                assert!(!request.contains("password"));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_session_creation_fallback_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = if index == 3 { "POST" } else { "GET" };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n"))
+            );
+            let authorization = request_header(request, "authorization");
+            let token = request_header(request, "x-auth-token");
+            if index == 3 {
+                assert!(authorization.is_none());
+            } else {
+                assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                assert!(!request.contains("password"));
+            }
+            assert!(token.is_none());
+        }
+        Ok(())
+    }
+
+    fn assert_invalid_session_token_fallback_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = match index {
+                3 => "POST",
+                4 => "DELETE",
+                _ => "GET",
+            };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n"))
+            );
+            let authorization = request_header(request, "authorization");
+            if index == 3 {
+                assert!(authorization.is_none());
+            } else {
+                assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                assert!(!request.contains("password"));
+            }
+            assert!(request_header(request, "x-auth-token").is_none());
+        }
+        Ok(())
+    }
+
+    fn request_header<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then_some(value.trim())
+        })
+    }
+
+    fn session_response_sequence(after_session: &[(&str, &str)]) -> Vec<Vec<u8>> {
+        let mut responses = vec![
+            http_response("200 OK", CORE_SERVICE_ROOT_BODY),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response_with_headers(
+                "201 Created",
+                SESSION_BODY,
+                &[
+                    ("X-Auth-Token", "test-session-token"),
+                    ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                ],
+            ),
+        ];
+        responses.extend(
+            after_session
+                .iter()
+                .map(|(status, body)| http_response(status, body)),
+        );
+        responses.push(http_response("204 No Content", ""));
+        responses
+    }
+
     fn assert_projection(
         projection: &CoreResourceProjection,
         expected_odata_id: &str,
@@ -1764,6 +2373,16 @@ mod tests {
         }
 
         async fn start_sequence(responses: &[(&str, &str)]) -> Result<Self, Box<dyn Error>> {
+            Self::start_raw_sequence(
+                responses
+                    .iter()
+                    .map(|(status, body)| http_response(status, body))
+                    .collect(),
+            )
+            .await
+        }
+
+        async fn start_raw_sequence(responses: Vec<Vec<u8>>) -> Result<Self, Box<dyn Error>> {
             let CertifiedKey { cert, signing_key } =
                 generate_simple_self_signed([String::from("localhost")])?;
             let certificate = cert.der().clone();
@@ -1776,10 +2395,6 @@ mod tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let socket = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
-            let responses = responses
-                .iter()
-                .map(|(status, body)| http_response(status, body))
-                .collect();
             let task = tokio::spawn(run_server_sequence(listener, acceptor, responses));
             Ok(Self {
                 address: endpoint_address(socket, "localhost")?,
@@ -1816,8 +2431,19 @@ mod tests {
     }
 
     fn http_response(status: &str, body: &str) -> Vec<u8> {
+        http_response_with_headers(status, body, &[])
+    }
+
+    fn http_response_with_headers(status: &str, body: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        let mut response_headers = String::new();
+        for (name, value) in headers {
+            response_headers.push_str(name);
+            response_headers.push_str(": ");
+            response_headers.push_str(value);
+            response_headers.push_str("\r\n");
+        }
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\n{response_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
