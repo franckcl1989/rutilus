@@ -39,12 +39,13 @@ sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = "0.3.55"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["set-header"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
+webbrowser = { version = "1.2.4", features = ["hardened"] }
 zeroize = "1.9.0"
 
 [workspace.lints.rust]
