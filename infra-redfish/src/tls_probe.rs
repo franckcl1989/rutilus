@@ -58,8 +58,8 @@ impl TlsCertificateObservation {
 /// Performs a TLS-only, credential-free identity observation.
 #[derive(Clone)]
 pub struct TlsProbe {
-    system_verifier: Arc<WebPkiServerVerifier>,
-    provider: Arc<CryptoProvider>,
+    pub(crate) system_verifier: Arc<WebPkiServerVerifier>,
+    pub(crate) provider: Arc<CryptoProvider>,
     connect_timeout: Duration,
     handshake_timeout: Duration,
 }
@@ -149,7 +149,7 @@ impl TlsProbe {
         })
     }
 
-    fn from_root_store(
+    pub(crate) fn from_root_store(
         roots: RootCertStore,
         connect_timeout: Duration,
         handshake_timeout: Duration,

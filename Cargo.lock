@@ -2505,10 +2505,14 @@ version = "0.1.0"
 dependencies = [
  "nv-redfish",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-native-certs",
  "rutilus-domain",
+ "secrecy",
+ "serde_json",
  "thiserror",
+ "time",
  "tokio",
  "tokio-rustls",
 ]

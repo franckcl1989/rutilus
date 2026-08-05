@@ -2,8 +2,12 @@
 
 use std::marker::PhantomData;
 
+mod redfish_gateway;
 mod tls_probe;
 
+pub use redfish_gateway::{
+    RedfishGateway, RedfishServiceRootError, ServiceRootSummary, TlsIdentityStateError,
+};
 pub use tls_probe::{
     SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,
 };
