@@ -2,7 +2,7 @@ use rutilus_application::{
     BoundaryFuture, Clock, CredentialResolver, EndpointEnrollment, EndpointTrustEstablishment,
     ResolvedCredential,
 };
-use rutilus_domain::CredentialId;
+use rutilus_domain::{AuditActor, CredentialId, DeploymentPosture};
 use rutilus_infra_redfish::RedfishGateway;
 use rutilus_persistence::{CredentialRepositoryError, SqliteStore};
 use rutilus_security::{CredentialProtectionError, MasterKey, decrypt_credential};
@@ -80,12 +80,16 @@ pub fn trusted_endpoint_enrollment<'a>(
     store: &'a SqliteStore,
     master_key: &'a MasterKey,
     gateway: &'a RedfishGateway,
+    actor: AuditActor,
+    origin: DeploymentPosture,
 ) -> TrustedEndpointEnrollment<'a> {
     EndpointEnrollment::new(
         store,
         ActiveCredentialResolver::new(store, master_key),
         gateway,
         SystemClock,
+        actor,
+        origin,
     )
 }
 
@@ -130,6 +134,8 @@ mod tests {
                 &'a SqliteStore,
                 &'a MasterKey,
                 &'a RedfishGateway,
+                AuditActor,
+                DeploymentPosture,
             ) -> TrustedEndpointEnrollment<'a>,
         ) {
         }

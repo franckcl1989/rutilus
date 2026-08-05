@@ -1,12 +1,13 @@
 use std::error::Error;
 
-use rutilus_domain::{EndpointId, ResourceSnapshot};
+use rutilus_domain::{AuditActor, DeploymentPosture, EndpointId, ResourceSnapshot};
 use thiserror::Error;
 
 use crate::{
-    Clock, CoreResourceReader, CredentialResolver, DiscoveredEndpointRepository,
-    EndpointOnboarding, EndpointRefresh, EndpointRefreshError, EndpointRefreshRepository,
-    OnboardEndpointError, OnboardEndpointRequest, OnboardedEndpoint, RedfishDiscovery,
+    AuditEventWriter, AuditedEndpointOnboarding, AuditedEndpointRefresh,
+    AuditedEndpointRefreshError, AuditedOnboardEndpointError, Clock, CoreResourceReader,
+    CredentialResolver, DiscoveredEndpointRepository, EndpointRefreshRepository,
+    OnboardEndpointRequest, OnboardedEndpoint, RedfishDiscovery,
 };
 
 /// A newly persisted endpoint together with its first complete resource
@@ -31,19 +32,21 @@ impl EnrolledEndpoint {
     }
 }
 
-/// Coordinates the documented post-trust enrollment sequence through the
-/// existing onboarding and complete-refresh use cases.
+/// Coordinates the documented post-trust enrollment sequence through
+/// mandatory, independently closed onboarding and complete-refresh audits.
 pub struct EndpointEnrollment<Repository, Credentials, Gateway, Time> {
     repository: Repository,
     credentials: Credentials,
     gateway: Gateway,
     clock: Time,
+    actor: AuditActor,
+    origin: DeploymentPosture,
 }
 
 impl<Repository, Credentials, Gateway, Time>
     EndpointEnrollment<Repository, Credentials, Gateway, Time>
 where
-    Repository: DiscoveredEndpointRepository + EndpointRefreshRepository,
+    Repository: DiscoveredEndpointRepository + EndpointRefreshRepository + AuditEventWriter,
     Credentials: CredentialResolver,
     Gateway: RedfishDiscovery + CoreResourceReader,
     Time: Clock,
@@ -54,12 +57,16 @@ where
         credentials: Credentials,
         gateway: Gateway,
         clock: Time,
+        actor: AuditActor,
+        origin: DeploymentPosture,
     ) -> Self {
         Self {
             repository,
             credentials,
             gateway,
             clock,
+            actor,
+            origin,
         }
     }
 
@@ -73,8 +80,12 @@ where
     /// # Errors
     ///
     /// Returns [`EndpointEnrollmentError::Onboarding`] before an endpoint
-    /// exists, or [`EndpointEnrollmentError::InitialRefresh`] after the
-    /// endpoint exists but its first complete refresh failed.
+    /// exists, [`EndpointEnrollmentError::OnboardingAuditAfterCreation`] when
+    /// endpoint persistence precedes an onboarding-audit failure,
+    /// [`EndpointEnrollmentError::InitialRefresh`] when the first refresh does
+    /// not commit, or
+    /// [`EndpointEnrollmentError::InitialRefreshAuditAfterCommit`] when the
+    /// Generation commits but its audit cannot be finalized.
     pub async fn execute(
         &self,
         request: OnboardEndpointRequest,
@@ -86,29 +97,49 @@ where
             <Repository as DiscoveredEndpointRepository>::Error,
             <Repository as EndpointRefreshRepository>::Error,
             <Gateway as CoreResourceReader>::Error,
+            <Repository as AuditEventWriter>::Error,
         >,
     > {
-        let onboarding = EndpointOnboarding::new(
+        let onboarding = AuditedEndpointOnboarding::new(
             &self.repository,
             &self.credentials,
             &self.gateway,
+            &self.repository,
             &self.clock,
+            self.actor,
+            self.origin,
         );
-        let onboarded = onboarding
-            .execute(request)
-            .await
-            .map_err(|source| EndpointEnrollmentError::Onboarding(Box::new(source)))?;
+        let onboarded = onboarding.execute(request).await.map_err(|source| {
+            if let Some(endpoint_id) = source.persisted_endpoint_id() {
+                EndpointEnrollmentError::OnboardingAuditAfterCreation {
+                    endpoint_id,
+                    source: Box::new(source),
+                }
+            } else {
+                EndpointEnrollmentError::Onboarding(Box::new(source))
+            }
+        })?;
         let endpoint_id = onboarded.endpoint().id();
-        let refresh = EndpointRefresh::new(
+        let refresh = AuditedEndpointRefresh::new(
             &self.repository,
             &self.credentials,
             &self.gateway,
+            &self.repository,
             &self.clock,
+            self.actor,
+            self.origin,
         );
         let snapshots = refresh.execute(endpoint_id).await.map_err(|source| {
-            EndpointEnrollmentError::InitialRefresh {
-                endpoint_id,
-                source: Box::new(source),
+            if source.resources_committed() {
+                EndpointEnrollmentError::InitialRefreshAuditAfterCommit {
+                    endpoint_id,
+                    source: Box::new(source),
+                }
+            } else {
+                EndpointEnrollmentError::InitialRefresh {
+                    endpoint_id,
+                    source: Box::new(source),
+                }
             }
         })?;
         Ok(EnrolledEndpoint {
@@ -126,23 +157,69 @@ pub enum EndpointEnrollmentError<
     OnboardingRepositoryError,
     RefreshRepositoryError,
     ReaderError,
+    AuditError,
 > where
     CredentialError: Error + 'static,
     DiscoveryError: Error + 'static,
     OnboardingRepositoryError: Error + 'static,
     RefreshRepositoryError: Error + 'static,
     ReaderError: Error + 'static,
+    AuditError: Error + 'static,
 {
     #[error("endpoint onboarding failed before enrollment completed: {0}")]
     Onboarding(
         #[source]
-        Box<OnboardEndpointError<CredentialError, DiscoveryError, OnboardingRepositoryError>>,
+        Box<
+            AuditedOnboardEndpointError<
+                CredentialError,
+                DiscoveryError,
+                OnboardingRepositoryError,
+                AuditError,
+            >,
+        >,
     ),
+    #[error(
+        "endpoint {endpoint_id} was created but onboarding audit finalization failed: {source}"
+    )]
+    OnboardingAuditAfterCreation {
+        endpoint_id: EndpointId,
+        #[source]
+        source: Box<
+            AuditedOnboardEndpointError<
+                CredentialError,
+                DiscoveryError,
+                OnboardingRepositoryError,
+                AuditError,
+            >,
+        >,
+    },
     #[error("endpoint {endpoint_id} was created but its initial complete refresh failed: {source}")]
     InitialRefresh {
         endpoint_id: EndpointId,
         #[source]
-        source: Box<EndpointRefreshError<RefreshRepositoryError, CredentialError, ReaderError>>,
+        source: Box<
+            AuditedEndpointRefreshError<
+                RefreshRepositoryError,
+                CredentialError,
+                ReaderError,
+                AuditError,
+            >,
+        >,
+    },
+    #[error(
+        "endpoint {endpoint_id} committed its initial resource Generation but refresh audit finalization failed: {source}"
+    )]
+    InitialRefreshAuditAfterCommit {
+        endpoint_id: EndpointId,
+        #[source]
+        source: Box<
+            AuditedEndpointRefreshError<
+                RefreshRepositoryError,
+                CredentialError,
+                ReaderError,
+                AuditError,
+            >,
+        >,
     },
 }
 
@@ -151,16 +228,17 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use rutilus_domain::{
-        CapabilityState, CredentialId, CredentialUsername, Endpoint, EndpointAddress,
-        EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, RefreshGeneration,
-        ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshotPayload, TlsCertificate,
-        TlsTrust,
+        AuditAction, AuditEvent, CapabilityState, CredentialId, CredentialUsername, Endpoint,
+        EndpointAddress, EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName,
+        RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshotPayload,
+        TlsCertificate, TlsTrust,
     };
     use secrecy::SecretString;
     use time::OffsetDateTime;
 
     use crate::{
-        BoundaryFuture, EndpointDiscovery, ResolvedCredential, ResourceObservation, TrustedEndpoint,
+        AuditRecordError, BoundaryFuture, EndpointDiscovery, EndpointRefreshError,
+        OnboardEndpointError, ResolvedCredential, ResourceObservation, TrustedEndpoint,
     };
 
     use super::*;
@@ -175,6 +253,8 @@ mod tests {
             MockCredentials::available(Arc::clone(&state)),
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
         );
 
         let enrolled = service
@@ -189,14 +269,29 @@ mod tests {
         assert_eq!(
             events(&state)?,
             [
+                "audit",
                 "credential",
                 "discover",
                 "create",
+                "audit",
+                "audit",
+                "audit",
                 "load",
                 "credential",
                 "read",
                 "commit",
+                "audit",
             ]
+        );
+        let audit_events = audit_events(&state)?;
+        assert_eq!(audit_events.len(), 5);
+        assert_eq!(
+            audit_events[0].context().action(),
+            AuditAction::EnrollEndpoint
+        );
+        assert_eq!(
+            audit_events[3].context().action(),
+            AuditAction::RefreshEndpoint
         );
         Ok(())
     }
@@ -211,6 +306,8 @@ mod tests {
             MockCredentials::missing(Arc::clone(&state)),
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
         );
 
         let result = service.execute(request(credential_id, now)?).await;
@@ -218,11 +315,18 @@ mod tests {
         assert!(matches!(
             result,
             Err(EndpointEnrollmentError::Onboarding(source))
-                if matches!(*source, OnboardEndpointError::CredentialNotFound {
-                    credential_id: missing,
-                } if missing == credential_id)
+                if matches!(
+                    &*source,
+                    AuditedOnboardEndpointError::Onboarding(onboarding)
+                        if matches!(
+                            &**onboarding,
+                            OnboardEndpointError::CredentialNotFound {
+                                credential_id: missing,
+                            } if *missing == credential_id
+                        )
+                )
         ));
-        assert_eq!(events(&state)?, ["credential"]);
+        assert_eq!(events(&state)?, ["audit", "credential", "audit"]);
         assert!(lock_state(&state)?.endpoint.is_none());
         Ok(())
     }
@@ -236,6 +340,8 @@ mod tests {
             MockCredentials::available(Arc::clone(&state)),
             MockGateway::fail_read(Arc::clone(&state)),
             FixedClock(now),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
         );
 
         let result = service
@@ -253,26 +359,148 @@ mod tests {
                 endpoint_id,
                 source,
             }) if endpoint_id == persisted_id
-                && matches!(*source, EndpointRefreshError::Read(MockError::Read))
+                && matches!(
+                    &*source,
+                    AuditedEndpointRefreshError::Refresh {
+                        source: refresh,
+                        ..
+                    } if matches!(&**refresh, EndpointRefreshError::Read(MockError::Read))
+                )
         ));
         assert_eq!(
             events(&state)?,
             [
+                "audit",
                 "credential",
                 "discover",
                 "create",
+                "audit",
+                "audit",
+                "audit",
                 "load",
                 "credential",
                 "read",
+                "audit",
             ]
         );
         assert_eq!(lock_state(&state)?.commits, 0);
         Ok(())
     }
 
+    #[tokio::test]
+    async fn distinguishes_onboarding_audit_failure_after_endpoint_creation()
+    -> Result<(), Box<dyn Error>> {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        lock_state(&state)?.fail_audit_on = Some(2);
+        let now = OffsetDateTime::now_utc();
+        let service = EndpointEnrollment::new(
+            MockRepository::new(Arc::clone(&state)),
+            MockCredentials::available(Arc::clone(&state)),
+            MockGateway::succeed(Arc::clone(&state)),
+            FixedClock(now),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service
+            .execute(request(CredentialId::generate(), now)?)
+            .await;
+        let persisted_id = lock_state(&state)?
+            .endpoint
+            .as_ref()
+            .map(Endpoint::id)
+            .ok_or(MockError::State)?;
+
+        assert!(matches!(
+            result,
+            Err(EndpointEnrollmentError::OnboardingAuditAfterCreation {
+                endpoint_id,
+                source,
+            }) if endpoint_id == persisted_id
+                && matches!(
+                    &*source,
+                    AuditedOnboardEndpointError::Audit {
+                        source: AuditRecordError::Write(MockError::Audit),
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(
+            events(&state)?,
+            ["audit", "credential", "discover", "create", "audit"]
+        );
+        assert_eq!(audit_events(&state)?.len(), 1);
+        assert_eq!(lock_state(&state)?.commits, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinguishes_refresh_audit_failure_after_generation_commit()
+    -> Result<(), Box<dyn Error>> {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        lock_state(&state)?.fail_audit_on = Some(5);
+        let now = OffsetDateTime::now_utc();
+        let service = EndpointEnrollment::new(
+            MockRepository::new(Arc::clone(&state)),
+            MockCredentials::available(Arc::clone(&state)),
+            MockGateway::succeed(Arc::clone(&state)),
+            FixedClock(now),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service
+            .execute(request(CredentialId::generate(), now)?)
+            .await;
+        let persisted_id = lock_state(&state)?
+            .endpoint
+            .as_ref()
+            .map(Endpoint::id)
+            .ok_or(MockError::State)?;
+
+        assert!(matches!(
+            result,
+            Err(EndpointEnrollmentError::InitialRefreshAuditAfterCommit {
+                endpoint_id,
+                source,
+            }) if endpoint_id == persisted_id
+                && source.resources_committed()
+                && matches!(
+                    &*source,
+                    AuditedEndpointRefreshError::Audit {
+                        source: AuditRecordError::Write(MockError::Audit),
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(lock_state(&state)?.commits, 1);
+        assert_eq!(audit_events(&state)?.len(), 4);
+        assert_eq!(
+            events(&state)?,
+            [
+                "audit",
+                "credential",
+                "discover",
+                "create",
+                "audit",
+                "audit",
+                "audit",
+                "load",
+                "credential",
+                "read",
+                "commit",
+                "audit",
+            ]
+        );
+        Ok(())
+    }
+
     #[derive(Debug, Default)]
     struct MockState {
         events: Vec<&'static str>,
+        audit_events: Vec<AuditEvent>,
+        audit_attempts: usize,
+        fail_audit_on: Option<usize>,
         endpoint: Option<Endpoint>,
         commits: usize,
     }
@@ -283,6 +511,8 @@ mod tests {
         State,
         #[error("mock resource read failed")]
         Read,
+        #[error("mock audit append failed")]
+        Audit,
     }
 
     struct MockRepository {
@@ -292,6 +522,26 @@ mod tests {
     impl MockRepository {
         fn new(state: Arc<Mutex<MockState>>) -> Self {
             Self { state }
+        }
+    }
+
+    impl AuditEventWriter for MockRepository {
+        type Error = MockError;
+
+        fn append_audit_event<'a>(
+            &'a self,
+            event: &'a AuditEvent,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                let mut state = lock_state(&self.state)?;
+                state.events.push("audit");
+                state.audit_attempts += 1;
+                if state.fail_audit_on == Some(state.audit_attempts) {
+                    return Err(MockError::Audit);
+                }
+                state.audit_events.push(event.clone());
+                Ok(())
+            })
         }
     }
 
@@ -497,5 +747,9 @@ mod tests {
 
     fn events(state: &Mutex<MockState>) -> Result<Vec<&'static str>, MockError> {
         Ok(lock_state(state)?.events.clone())
+    }
+
+    fn audit_events(state: &Mutex<MockState>) -> Result<Vec<AuditEvent>, MockError> {
+        Ok(lock_state(state)?.audit_events.clone())
     }
 }
