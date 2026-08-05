@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use crate::{CredentialId, EndpointAddress, EndpointId};
 
 const FINGERPRINT_LENGTH: usize = 32;
+const FINGERPRINT_TEXT_LENGTH: usize = FINGERPRINT_LENGTH * 3 - 1;
 const MAX_DISPLAY_NAME_CHARS: usize = 128;
 const MAX_CERTIFICATE_DER_BYTES: usize = 1024 * 1024;
 
@@ -129,6 +130,65 @@ impl fmt::Debug for CertificateFingerprint {
         fmt::Display::fmt(self, formatter)
     }
 }
+
+impl FromStr for CertificateFingerprint {
+    type Err = CertificateFingerprintParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let encoded = value.as_bytes();
+        if encoded.len() != FINGERPRINT_TEXT_LENGTH {
+            return Err(CertificateFingerprintParseError::InvalidLength {
+                actual: encoded.len(),
+                expected: FINGERPRINT_TEXT_LENGTH,
+            });
+        }
+        let mut decoded = [0_u8; FINGERPRINT_LENGTH];
+        for (index, byte) in decoded.iter_mut().enumerate() {
+            let offset = index * 3;
+            if index > 0 && encoded[offset - 1] != b':' {
+                return Err(CertificateFingerprintParseError::InvalidEncoding);
+            }
+            let high = decode_hex(encoded[offset])
+                .ok_or(CertificateFingerprintParseError::InvalidEncoding)?;
+            let low = decode_hex(encoded[offset + 1])
+                .ok_or(CertificateFingerprintParseError::InvalidEncoding)?;
+            *byte = (high << 4) | low;
+        }
+        Ok(Self(decoded))
+    }
+}
+
+fn decode_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Why a textual SHA-256 certificate identity cannot be used as a Pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CertificateFingerprintParseError {
+    InvalidLength { actual: usize, expected: usize },
+    InvalidEncoding,
+}
+
+impl fmt::Display for CertificateFingerprintParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength { actual, expected } => write!(
+                formatter,
+                "TLS certificate fingerprint has {actual} bytes; expected {expected}"
+            ),
+            Self::InvalidEncoding => formatter.write_str(
+                "TLS certificate fingerprint must contain 32 colon-separated hexadecimal bytes",
+            ),
+        }
+    }
+}
+
+impl Error for CertificateFingerprintParseError {}
 
 /// A TLS leaf certificate and its verified SHA-256 identity.
 #[derive(Clone, Eq, PartialEq)]
@@ -504,6 +564,42 @@ mod tests {
         let (fingerprint, certificate_der) = certificate.into_parts();
         let reconstructed = TlsCertificate::from_parts(fingerprint, certificate_der)?;
         assert_eq!(reconstructed.certificate_der(), b"abc");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_only_canonical_colon_separated_sha256_pins() -> Result<(), Box<dyn Error>> {
+        let certificate = TlsCertificate::from_der(b"abc".to_vec())?;
+        let canonical = certificate.fingerprint().to_string();
+
+        assert_eq!(canonical.parse(), Ok(certificate.fingerprint()));
+        assert_eq!(
+            canonical.to_ascii_lowercase().parse(),
+            Ok(certificate.fingerprint())
+        );
+        assert_eq!(
+            "AA:BB".parse::<CertificateFingerprint>(),
+            Err(CertificateFingerprintParseError::InvalidLength {
+                actual: 5,
+                expected: FINGERPRINT_TEXT_LENGTH,
+            })
+        );
+        let mut invalid_separator = canonical.clone();
+        invalid_separator.replace_range(2..3, "-");
+        assert_eq!(
+            invalid_separator.parse::<CertificateFingerprint>(),
+            Err(CertificateFingerprintParseError::InvalidEncoding)
+        );
+        let mut invalid_hex = canonical;
+        invalid_hex.replace_range(0..1, "Z");
+        assert_eq!(
+            invalid_hex.parse::<CertificateFingerprint>(),
+            Err(CertificateFingerprintParseError::InvalidEncoding)
+        );
+        assert_eq!(
+            CertificateFingerprintParseError::InvalidEncoding.to_string(),
+            "TLS certificate fingerprint must contain 32 colon-separated hexadecimal bytes"
+        );
         Ok(())
     }
 

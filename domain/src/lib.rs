@@ -26,8 +26,9 @@ pub use credential::{
     CredentialUsernameError,
 };
 pub use endpoint::{
-    CertificateFingerprint, Endpoint, EndpointDisplayName, EndpointDisplayNameError,
-    EndpointTimelineError, TlsCertificate, TlsCertificateError, TlsIdentityChanged, TlsTrust,
+    CertificateFingerprint, CertificateFingerprintParseError, Endpoint, EndpointDisplayName,
+    EndpointDisplayNameError, EndpointTimelineError, TlsCertificate, TlsCertificateError,
+    TlsIdentityChanged, TlsTrust,
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{
