@@ -6,11 +6,11 @@ mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_trust;
 
-pub use audit_log::AuditEventWriter;
+pub use audit_log::{AuditEventWriter, AuditRecordError};
 pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
 pub use endpoint_onboarding::{
-    AuditRecordError, AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture,
-    Clock, CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery, EndpointOnboarding,
+    AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture, Clock,
+    CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery, EndpointOnboarding,
     OnboardEndpointError, OnboardEndpointRequest, OnboardedEndpoint, OnboardingAuditStage,
     RedfishDiscovery, ResolvedCredential,
 };

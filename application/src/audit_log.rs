@@ -1,6 +1,7 @@
 use std::error::Error;
 
-use rutilus_domain::AuditEvent;
+use rutilus_domain::{AuditEvent, AuditEventError, AuditOperationContextError, AuditSequenceError};
+use thiserror::Error;
 
 use crate::BoundaryFuture;
 
@@ -28,6 +29,22 @@ where
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Writer::append_audit_event(*self, event)
     }
+}
+
+/// A typed audit fact could not be constructed or durably appended.
+#[derive(Debug, Error)]
+pub enum AuditRecordError<AuditError>
+where
+    AuditError: Error + 'static,
+{
+    #[error("audit operation context is invalid: {0}")]
+    Context(#[source] AuditOperationContextError),
+    #[error("audit sequence cannot advance: {0}")]
+    Sequence(#[source] AuditSequenceError),
+    #[error("audit event is inconsistent: {0}")]
+    Event(#[source] AuditEventError),
+    #[error("audit append failed: {0}")]
+    Write(#[source] AuditError),
 }
 
 #[cfg(test)]

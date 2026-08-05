@@ -1,10 +1,10 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use rutilus_domain::{
-    AuditAction, AuditActor, AuditEvent, AuditEventError, AuditFailure, AuditFailureVerification,
+    AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
     AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
-    AuditProgress, AuditRedfishOperation, AuditSequence, AuditSequenceError, AuditTarget,
-    AuditTlsTrust, CredentialId, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
+    AuditProgress, AuditRedfishOperation, AuditSequence, AuditTarget, AuditTlsTrust, CredentialId,
+    CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
     EndpointCapabilityObservation, EndpointDisplayName, EndpointId, EndpointTimelineError,
     ProductPermission, TlsTrust,
 };
@@ -12,7 +12,7 @@ use secrecy::SecretString;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::{AuditEventWriter, TrustedEndpoint};
+use crate::{AuditEventWriter, AuditRecordError, TrustedEndpoint};
 
 /// A sendable boundary operation tied to the lifetime of its collaborators.
 pub type BoundaryFuture<'a, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'a>>;
@@ -594,22 +594,6 @@ impl fmt::Display for OnboardingAuditStage {
             Self::Completion => formatter.write_str("completion"),
         }
     }
-}
-
-/// A typed audit fact could not be constructed or durably appended.
-#[derive(Debug, Error)]
-pub enum AuditRecordError<AuditError>
-where
-    AuditError: Error + 'static,
-{
-    #[error("audit operation context is invalid: {0}")]
-    Context(#[source] AuditOperationContextError),
-    #[error("audit sequence cannot advance: {0}")]
-    Sequence(#[source] AuditSequenceError),
-    #[error("audit event is inconsistent: {0}")]
-    Event(#[source] AuditEventError),
-    #[error("audit append failed: {0}")]
-    Write(#[source] AuditError),
 }
 
 /// A controlled failure while onboarding an endpoint under mandatory audit.
