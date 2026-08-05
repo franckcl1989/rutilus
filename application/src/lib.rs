@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod audit_log;
 mod endpoint_enrollment;
 mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_trust;
 
+pub use audit_log::AuditEventWriter;
 pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
 pub use endpoint_onboarding::{
     BoundaryFuture, Clock, CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery,

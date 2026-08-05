@@ -1,13 +1,28 @@
 use rutilus_application::{
-    BoundaryFuture, DiscoveredEndpointRepository, EndpointRefreshRepository, ResourceObservation,
+    AuditEventWriter, BoundaryFuture, DiscoveredEndpointRepository, EndpointRefreshRepository,
+    ResourceObservation,
 };
-use rutilus_domain::{Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot};
+use rutilus_domain::{
+    AuditEvent, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    EndpointRepositoryError, NewResourceSnapshot, ResourceSnapshotRepositoryError, SqliteStore,
+    AuditRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
+    ResourceSnapshotRepositoryError, SqliteStore,
 };
+
+impl AuditEventWriter for SqliteStore {
+    type Error = AuditRepositoryError;
+
+    fn append_audit_event<'a>(
+        &'a self,
+        event: &'a AuditEvent,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::append_audit_event(self, event).await })
+    }
+}
 
 impl DiscoveredEndpointRepository for SqliteStore {
     type Error = EndpointRepositoryError;
@@ -84,11 +99,14 @@ mod tests {
     use std::error::Error;
 
     use rutilus_application::{
-        DiscoveredEndpointRepository, EndpointRefreshRepository, ResourceObservation,
+        AuditEventWriter, DiscoveredEndpointRepository, EndpointRefreshRepository,
+        ResourceObservation,
     };
     use rutilus_domain::{
-        CredentialId, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, ResourceFeature,
-        ResourceODataId, ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+        AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
+        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CredentialId, DeploymentPosture,
+        Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, ProductPermission,
+        ResourceFeature, ResourceODataId, ResourceSnapshotPayload, TlsCertificate, TlsTrust,
     };
     use time::OffsetDateTime;
 
@@ -96,6 +114,34 @@ mod tests {
         EndpointRefreshPersistenceError, EndpointRepositoryError, ResourceSnapshotRepositoryError,
         SqliteStore,
     };
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_append_only_audit_boundary() -> Result<(), Box<dyn Error>> {
+        fn assert_writer<Writer: AuditEventWriter>() {}
+        assert_writer::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let operation_id = AuditOperationId::generate();
+        let context = AuditOperationContext::try_new(
+            operation_id,
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuditTarget::Product,
+            AuditParameterSummary::csv_endpoint_import(1)?,
+            ProductPermission::ManageEndpoints,
+            AuditAction::ImportEndpoints,
+            AuditRedfishOperation::None,
+        )?;
+        let event = AuditEvent::started(context, OffsetDateTime::now_utc());
+
+        AuditEventWriter::append_audit_event(&store, &event).await?;
+
+        assert_eq!(store.find_audit_operation(operation_id).await?, [event]);
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn sqlite_store_implements_and_forwards_the_application_repository_boundary()
