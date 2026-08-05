@@ -255,8 +255,8 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// Returns [`EndpointTimelineError`] when the endpoint update time or trust
-    /// establishment time precedes endpoint creation.
+    /// Returns [`EndpointTimelineError`] when the endpoint update time precedes
+    /// creation or trust was established outside the endpoint timeline.
     pub fn try_new(
         id: EndpointId,
         display_name: EndpointDisplayName,
@@ -266,7 +266,11 @@ impl Endpoint {
         created_at: OffsetDateTime,
         updated_at: OffsetDateTime,
     ) -> Result<Self, EndpointTimelineError> {
-        if updated_at < created_at || trust.established_at() < created_at {
+        let trust_established_at = trust.established_at();
+        if updated_at < created_at
+            || trust_established_at < created_at
+            || trust_established_at > updated_at
+        {
             return Err(EndpointTimelineError);
         }
         Ok(Self {
@@ -322,7 +326,9 @@ pub struct EndpointTimelineError;
 
 impl fmt::Display for EndpointTimelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("endpoint update and trust times cannot precede creation")
+        formatter.write_str(
+            "endpoint update cannot precede creation and trust must fall within its timeline",
+        )
     }
 }
 
@@ -520,6 +526,19 @@ mod tests {
             EndpointDisplayName::parse("Rack A BMC")?,
             EndpointAddress::parse("https://192.0.2.10")?,
             TlsTrust::SystemCa {
+                verified_at: created_at + time::Duration::SECOND,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        );
+        assert_eq!(endpoint, Err(EndpointTimelineError));
+
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Rack A BMC")?,
+            EndpointAddress::parse("https://192.0.2.10")?,
+            TlsTrust::SystemCa {
                 verified_at: created_at,
             },
             CredentialId::generate(),
@@ -529,7 +548,7 @@ mod tests {
         assert_eq!(endpoint, Err(EndpointTimelineError));
         assert_eq!(
             EndpointTimelineError.to_string(),
-            "endpoint update and trust times cannot precede creation"
+            "endpoint update cannot precede creation and trust must fall within its timeline"
         );
         Ok(())
     }
