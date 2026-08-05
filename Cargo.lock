@@ -1958,10 +1958,13 @@ dependencies = [
 name = "rutilus-persistence"
 version = "0.1.0"
 dependencies = [
+ "rutilus-domain",
  "rutilus-entity",
  "rutilus-migration",
+ "rutilus-security",
  "sea-orm",
  "sea-orm-migration",
+ "secrecy",
  "tempfile",
  "thiserror",
  "time",

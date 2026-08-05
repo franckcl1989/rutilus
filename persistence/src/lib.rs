@@ -13,6 +13,12 @@ use sea_orm_migration::MigratorTrait;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+mod credential_repository;
+
+pub use credential_repository::{
+    CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
+};
+
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_CONNECTIONS: u32 = 4;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
