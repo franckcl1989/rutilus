@@ -18,6 +18,7 @@ mod audit_repository;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
+mod migration_backup;
 mod resource_snapshot_repository;
 
 pub use application_adapter::EndpointRefreshPersistenceError;
@@ -29,6 +30,7 @@ pub use endpoint_capability_repository::{
     EndpointCapabilityRepositoryError, StoredEndpointCapability, StoredEndpointCapabilityError,
 };
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
+pub use migration_backup::{MigrationBackup, MigrationBackupError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
 };
@@ -41,6 +43,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct SqliteStore {
     database: DatabaseConnection,
     database_path: PathBuf,
+    migration_backup: Option<MigrationBackup>,
     write_gate: Arc<Semaphore>,
 }
 
@@ -63,6 +66,12 @@ impl SqliteStore {
         &self.database_path
     }
 
+    /// Returns the recovery directory created before migrations during this open.
+    #[must_use]
+    pub fn migration_backup_path(&self) -> Option<&Path> {
+        self.migration_backup.as_ref().map(MigrationBackup::path)
+    }
+
     /// Waits for the active write to finish, then closes the connection pool.
     ///
     /// # Errors
@@ -73,6 +82,7 @@ impl SqliteStore {
         let Self {
             database,
             database_path,
+            migration_backup: _,
             write_gate,
         } = self;
         let _write_permit =
@@ -97,6 +107,15 @@ impl SqliteStore {
         settings: SqliteSettings,
     ) -> Result<Self, OpenStoreError> {
         validate_database_path(database_path)?;
+        let database_exists = existing_regular_database(database_path)?;
+        let migration_backup = if database_exists && migrations_are_pending(database_path).await? {
+            Some(
+                MigrationBackup::create(database_path)
+                    .map_err(OpenStoreError::CreateMigrationBackup)?,
+            )
+        } else {
+            None
+        };
         create_parent_directory(database_path)?;
 
         let mut options = sqlite_connect_options(database_path, settings);
@@ -113,12 +132,16 @@ impl SqliteStore {
             .await
             .map_err(|source| OpenStoreError::Migrate {
                 path: database_path.to_path_buf(),
+                recovery_backup: migration_backup
+                    .as_ref()
+                    .map(|backup| backup.path().to_path_buf()),
                 source,
             })?;
 
         Ok(Self {
             database,
             database_path: database_path.to_path_buf(),
+            migration_backup,
             write_gate: Arc::new(Semaphore::new(1)),
         })
     }
@@ -144,6 +167,14 @@ pub enum CloseStoreError {
 pub enum OpenStoreError {
     #[error("SQLite database path cannot be empty or name a directory root")]
     InvalidPath,
+    #[error("failed to inspect SQLite database path {path}: {source}")]
+    InspectDatabasePath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("SQLite database path is not a regular non-symlink file: {path}")]
+    DatabasePathNotRegular { path: PathBuf },
     #[error("failed to create SQLite data directory {path}: {source}")]
     CreateDataDirectory {
         path: PathBuf,
@@ -156,9 +187,26 @@ pub enum OpenStoreError {
         #[source]
         source: DbErr,
     },
-    #[error("failed to migrate SQLite database {path}: {source}")]
+    #[error("failed to inspect pending SQLite migrations for {path}: {source}")]
+    InspectMigrations {
+        path: PathBuf,
+        #[source]
+        source: DbErr,
+    },
+    #[error("failed to close read-only SQLite migration inspection for {path}: {source}")]
+    CloseMigrationInspection {
+        path: PathBuf,
+        #[source]
+        source: DbErr,
+    },
+    #[error("failed to create a pre-migration recovery backup: {0}")]
+    CreateMigrationBackup(#[source] MigrationBackupError),
+    #[error(
+        "failed to migrate SQLite database {path} (recovery backup: {recovery_backup:?}): {source}"
+    )]
     Migrate {
         path: PathBuf,
+        recovery_backup: Option<PathBuf>,
         #[source]
         source: DbErr,
     },
@@ -199,6 +247,51 @@ fn create_parent_directory(database_path: &Path) -> Result<(), OpenStoreError> {
     })
 }
 
+fn existing_regular_database(database_path: &Path) -> Result<bool, OpenStoreError> {
+    let metadata = match std::fs::symlink_metadata(database_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(OpenStoreError::InspectDatabasePath {
+                path: database_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(OpenStoreError::DatabasePathNotRegular {
+            path: database_path.to_path_buf(),
+        });
+    }
+    Ok(true)
+}
+
+async fn migrations_are_pending(database_path: &Path) -> Result<bool, OpenStoreError> {
+    let mut options = sqlite_read_only_connect_options(database_path);
+    options.sqlx_logging(false);
+    let database =
+        Database::connect(options)
+            .await
+            .map_err(|source| OpenStoreError::InspectMigrations {
+                path: database_path.to_path_buf(),
+                source,
+            })?;
+    let pending = Migrator::get_pending_migrations_read_only(&database)
+        .await
+        .map_err(|source| OpenStoreError::InspectMigrations {
+            path: database_path.to_path_buf(),
+            source,
+        })?;
+    database
+        .close()
+        .await
+        .map_err(|source| OpenStoreError::CloseMigrationInspection {
+            path: database_path.to_path_buf(),
+            source,
+        })?;
+    Ok(!pending.is_empty())
+}
+
 fn sqlite_connect_options(database_path: &Path, settings: SqliteSettings) -> ConnectOptions {
     let configured_path = database_path.to_path_buf();
     let mut options = ConnectOptions::new("sqlite://rutilus.db?mode=rwc");
@@ -216,6 +309,26 @@ fn sqlite_connect_options(database_path: &Path, settings: SqliteSettings) -> Con
                 .busy_timeout(settings.busy_timeout)
                 .pragma("journal_mode", "WAL")
                 .pragma("synchronous", "NORMAL")
+        });
+    options
+}
+
+fn sqlite_read_only_connect_options(database_path: &Path) -> ConnectOptions {
+    let configured_path = database_path.to_path_buf();
+    let mut options = ConnectOptions::new("sqlite://rutilus.db?mode=ro");
+    options
+        .min_connections(1)
+        .max_connections(1)
+        .connect_timeout(CONNECTION_TIMEOUT)
+        .acquire_timeout(CONNECTION_TIMEOUT)
+        .map_sqlx_sqlite_opts(move |sqlite| {
+            sqlite
+                .filename(configured_path.clone())
+                .read_only(true)
+                .create_if_missing(false)
+                .shared_cache(false)
+                .foreign_keys(true)
+                .busy_timeout(DEFAULT_BUSY_TIMEOUT)
         });
     options
 }
@@ -239,6 +352,7 @@ mod tests {
         let store = SqliteStore::open(&database_path).await?;
 
         assert_eq!(store.database_path(), database_path);
+        assert!(store.migration_backup_path().is_none());
         assert_eq!(store.write_gate.available_permits(), 1);
         let schema = SchemaManager::new(&store.database);
         assert!(schema.has_table("credentials").await?);
@@ -260,6 +374,71 @@ mod tests {
         assert_eq!(header.get(18), Some(&2));
         assert_eq!(header.get(19), Some(&2));
         store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backs_up_a_closed_database_before_applying_pending_migrations()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let mut options = sqlite_connect_options(&database_path, SqliteSettings::default());
+        options.sqlx_logging(false);
+        let partial = Database::connect(options).await?;
+        Migrator::up(&partial, Some(1)).await?;
+        partial.close().await?;
+
+        let store = SqliteStore::open(&database_path).await?;
+        let backup_directory = store
+            .migration_backup_path()
+            .ok_or("pending migrations did not create a recovery backup")?
+            .to_path_buf();
+        let backup_database = backup_directory.join("rutilus.db");
+        assert_eq!(
+            std::fs::read(backup_directory.join("complete.rut"))?,
+            b"RUTILUS-SQLITE-BACKUP-1"
+        );
+
+        let mut backup_options = sqlite_read_only_connect_options(&backup_database);
+        backup_options.sqlx_logging(false);
+        let backup = Database::connect(backup_options).await?;
+        assert_eq!(
+            Migrator::get_applied_migrations_read_only(&backup)
+                .await?
+                .len(),
+            1
+        );
+        assert_eq!(
+            Migrator::get_pending_migrations_read_only(&backup)
+                .await?
+                .len(),
+            Migrator::migrations().len() - 1
+        );
+        backup.close().await?;
+        assert_eq!(
+            Migrator::get_applied_migrations_read_only(&store.database)
+                .await?
+                .len(),
+            Migrator::migrations().len()
+        );
+        store.close().await?;
+
+        let reopened = SqliteStore::open(&database_path).await?;
+        assert!(reopened.migration_backup_path().is_none());
+        reopened.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_a_directory_as_an_existing_database() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+
+        let result = SqliteStore::open(directory.path()).await;
+
+        assert!(matches!(
+            result,
+            Err(OpenStoreError::DatabasePathNotRegular { .. })
+        ));
         Ok(())
     }
 
