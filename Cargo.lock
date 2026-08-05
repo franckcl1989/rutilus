@@ -2856,6 +2856,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rutilus-platform"
+version = "0.1.0"
+dependencies = [
+ "rutilus-security",
+ "secrecy",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rutilus-security"
 version = "0.1.0"
 dependencies = [
