@@ -137,6 +137,7 @@ stable_audit_codes! {
         CoreResourceReadFailed => "core-resource-read-failed",
         SnapshotPersistenceFailed => "snapshot-persistence-failed",
         CsvInvalid => "csv-invalid",
+        EndpointImportRowFailed => "endpoint-import-row-failed",
     }
 }
 
@@ -772,6 +773,7 @@ mod tests {
             AuditFailure::CoreResourceReadFailed,
             AuditFailure::SnapshotPersistenceFailed,
             AuditFailure::CsvInvalid,
+            AuditFailure::EndpointImportRowFailed,
         ]);
         assert_eq!(
             "unknown".parse::<AuditAction>(),

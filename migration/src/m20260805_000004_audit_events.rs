@@ -205,6 +205,7 @@ fn outcome_shape() -> SimpleExpr {
                 "core-resource-read-failed",
                 "snapshot-persistence-failed",
                 "csv-invalid",
+                "endpoint-import-row-failed",
             ]))
             .and(Expr::col(AuditEvent::Verification).is_not_null())
             .and(Expr::col(AuditEvent::Verification).is_in(["rejected", "inconclusive"])))
