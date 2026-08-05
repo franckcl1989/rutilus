@@ -17,6 +17,7 @@ mod application_adapter;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
+mod resource_snapshot_repository;
 
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
@@ -25,6 +26,9 @@ pub use endpoint_capability_repository::{
     EndpointCapabilityRepositoryError, StoredEndpointCapability, StoredEndpointCapabilityError,
 };
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
+pub use resource_snapshot_repository::{
+    NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
+};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_CONNECTIONS: u32 = 4;
