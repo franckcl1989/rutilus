@@ -13,6 +13,7 @@ use sea_orm_migration::MigratorTrait;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+mod application_adapter;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;

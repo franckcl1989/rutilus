@@ -2545,6 +2545,7 @@ dependencies = [
 name = "rutilus-persistence"
 version = "0.1.0"
 dependencies = [
+ "rutilus-application",
  "rutilus-domain",
  "rutilus-entity",
  "rutilus-migration",

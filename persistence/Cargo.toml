@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-entity.workspace = true
 rutilus-migration.workspace = true
