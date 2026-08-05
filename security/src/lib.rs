@@ -11,7 +11,8 @@ use secrecy::{ExposeSecret, SecretBox, SecretString};
 use zeroize::Zeroizing;
 
 const MASTER_KEY_LENGTH: usize = 32;
-const XNONCE_LENGTH: usize = 24;
+/// Byte length of every persisted `XChaCha20-Poly1305` credential nonce.
+pub const CREDENTIAL_NONCE_LENGTH: usize = 24;
 const AUTHENTICATION_TAG_LENGTH: usize = 16;
 
 /// A process-local master key used to protect persisted credentials.
@@ -53,8 +54,8 @@ impl fmt::Debug for MasterKey {
 
 /// Persistable authenticated ciphertext for one credential version.
 #[derive(Clone, Eq, PartialEq)]
-pub struct EncryptedCredential {
-    nonce: [u8; XNONCE_LENGTH],
+struct EncryptedCredential {
+    nonce: [u8; CREDENTIAL_NONCE_LENGTH],
     ciphertext: Vec<u8>,
 }
 
@@ -66,7 +67,7 @@ impl EncryptedCredential {
     /// Returns [`CredentialProtectionError::CiphertextTooShort`] when the ciphertext
     /// cannot contain an authentication tag.
     pub fn from_parts(
-        nonce: [u8; XNONCE_LENGTH],
+        nonce: [u8; CREDENTIAL_NONCE_LENGTH],
         ciphertext: Vec<u8>,
     ) -> Result<Self, CredentialProtectionError> {
         if ciphertext.len() < AUTHENTICATION_TAG_LENGTH {
@@ -78,7 +79,7 @@ impl EncryptedCredential {
 
     /// Returns the public, per-message nonce.
     #[must_use]
-    pub const fn nonce(&self) -> &[u8; XNONCE_LENGTH] {
+    pub const fn nonce(&self) -> &[u8; CREDENTIAL_NONCE_LENGTH] {
         &self.nonce
     }
 
@@ -90,7 +91,7 @@ impl EncryptedCredential {
 
     /// Consumes this value into persistence-ready parts.
     #[must_use]
-    pub fn into_parts(self) -> ([u8; XNONCE_LENGTH], Vec<u8>) {
+    pub fn into_parts(self) -> ([u8; CREDENTIAL_NONCE_LENGTH], Vec<u8>) {
         (self.nonce, self.ciphertext)
     }
 }
@@ -101,6 +102,79 @@ impl fmt::Debug for EncryptedCredential {
             .debug_struct("EncryptedCredential")
             .field("nonce", &"[REDACTED]")
             .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Authenticated credential ciphertext bound to its typed persistence identity.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProtectedCredentialVersion {
+    credential_id: CredentialId,
+    version_id: CredentialVersionId,
+    encrypted: EncryptedCredential,
+}
+
+impl ProtectedCredentialVersion {
+    /// Reconstructs a protected version from identity and persistence-ready parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialProtectionError::CiphertextTooShort`] when the
+    /// ciphertext cannot contain an authentication tag.
+    pub fn from_parts(
+        credential_id: CredentialId,
+        version_id: CredentialVersionId,
+        nonce: [u8; CREDENTIAL_NONCE_LENGTH],
+        ciphertext: Vec<u8>,
+    ) -> Result<Self, CredentialProtectionError> {
+        Ok(Self {
+            credential_id,
+            version_id,
+            encrypted: EncryptedCredential::from_parts(nonce, ciphertext)?,
+        })
+    }
+
+    #[must_use]
+    pub const fn credential_id(&self) -> CredentialId {
+        self.credential_id
+    }
+
+    #[must_use]
+    pub const fn version_id(&self) -> CredentialVersionId {
+        self.version_id
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> &[u8; CREDENTIAL_NONCE_LENGTH] {
+        self.encrypted.nonce()
+    }
+
+    #[must_use]
+    pub fn ciphertext(&self) -> &[u8] {
+        self.encrypted.ciphertext()
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        CredentialId,
+        CredentialVersionId,
+        [u8; CREDENTIAL_NONCE_LENGTH],
+        Vec<u8>,
+    ) {
+        let (nonce, ciphertext) = self.encrypted.into_parts();
+        (self.credential_id, self.version_id, nonce, ciphertext)
+    }
+}
+
+impl fmt::Debug for ProtectedCredentialVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtectedCredentialVersion")
+            .field("credential_id", &self.credential_id)
+            .field("version_id", &self.version_id)
+            .field("encrypted", &self.encrypted)
             .finish()
     }
 }
@@ -117,8 +191,8 @@ pub fn encrypt_credential(
     credential_id: CredentialId,
     version_id: CredentialVersionId,
     plaintext: &SecretString,
-) -> Result<EncryptedCredential, CredentialProtectionError> {
-    let mut nonce = [0_u8; XNONCE_LENGTH];
+) -> Result<ProtectedCredentialVersion, CredentialProtectionError> {
+    let mut nonce = [0_u8; CREDENTIAL_NONCE_LENGTH];
     getrandom::fill(&mut nonce).map_err(CredentialProtectionError::RandomnessUnavailable)?;
 
     let cipher = cipher(master_key)?;
@@ -134,7 +208,7 @@ pub fn encrypt_credential(
         )
         .map_err(|_| CredentialProtectionError::EncryptionFailed)?;
 
-    EncryptedCredential::from_parts(nonce.into(), ciphertext)
+    ProtectedCredentialVersion::from_parts(credential_id, version_id, nonce.into(), ciphertext)
 }
 
 /// Authenticates and decrypts one credential version.
@@ -147,19 +221,17 @@ pub fn encrypt_credential(
 /// is not valid UTF-8.
 pub fn decrypt_credential(
     master_key: &MasterKey,
-    credential_id: CredentialId,
-    version_id: CredentialVersionId,
-    encrypted: &EncryptedCredential,
+    protected: &ProtectedCredentialVersion,
 ) -> Result<SecretString, CredentialProtectionError> {
     let cipher = cipher(master_key)?;
-    let associated_data = associated_data(credential_id, version_id);
-    let nonce = XNonce::from(*encrypted.nonce());
+    let associated_data = associated_data(protected.credential_id, protected.version_id);
+    let nonce = XNonce::from(*protected.encrypted.nonce());
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(
                 &nonce,
                 Payload {
-                    msg: encrypted.ciphertext(),
+                    msg: protected.encrypted.ciphertext(),
                     aad: &associated_data,
                 },
             )
@@ -240,7 +312,7 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
 
     use super::{
-        CredentialProtectionError, EncryptedCredential, MasterKey, decrypt_credential,
+        CredentialProtectionError, MasterKey, ProtectedCredentialVersion, decrypt_credential,
         encrypt_credential,
     };
 
@@ -256,8 +328,10 @@ mod tests {
         let plaintext: SecretString = "correct horse battery staple".to_owned().into();
 
         let encrypted = encrypt_credential(&key, credential_id, version_id, &plaintext)?;
-        let decrypted = decrypt_credential(&key, credential_id, version_id, &encrypted)?;
+        let decrypted = decrypt_credential(&key, &encrypted)?;
 
+        assert_eq!(encrypted.credential_id(), credential_id);
+        assert_eq!(encrypted.version_id(), version_id);
         assert_ne!(encrypted.ciphertext(), plaintext.expose_secret().as_bytes());
         assert_eq!(decrypted.expose_secret(), plaintext.expose_secret());
         Ok(())
@@ -285,18 +359,26 @@ mod tests {
         let version_id = CredentialVersionId::generate();
         let plaintext: SecretString = "bound secret".to_owned().into();
         let encrypted = encrypt_credential(&key, credential_id, version_id, &plaintext)?;
+        let (_, _, nonce, ciphertext) = encrypted.clone().into_parts();
+        let rebound_credential = ProtectedCredentialVersion::from_parts(
+            CredentialId::generate(),
+            version_id,
+            nonce,
+            ciphertext.clone(),
+        )?;
+        let rebound_version = ProtectedCredentialVersion::from_parts(
+            credential_id,
+            CredentialVersionId::generate(),
+            nonce,
+            ciphertext,
+        )?;
 
         assert!(matches!(
-            decrypt_credential(&key, CredentialId::generate(), version_id, &encrypted),
+            decrypt_credential(&key, &rebound_credential),
             Err(CredentialProtectionError::AuthenticationFailed)
         ));
         assert!(matches!(
-            decrypt_credential(
-                &key,
-                credential_id,
-                CredentialVersionId::generate(),
-                &encrypted
-            ),
+            decrypt_credential(&key, &rebound_version),
             Err(CredentialProtectionError::AuthenticationFailed)
         ));
         Ok(())
@@ -309,12 +391,13 @@ mod tests {
         let version_id = CredentialVersionId::generate();
         let plaintext: SecretString = "unaltered".to_owned().into();
         let encrypted = encrypt_credential(&key, credential_id, version_id, &plaintext)?;
-        let (nonce, mut ciphertext) = encrypted.into_parts();
+        let (credential_id, version_id, nonce, mut ciphertext) = encrypted.into_parts();
         ciphertext[0] ^= 1;
-        let tampered = EncryptedCredential::from_parts(nonce, ciphertext)?;
+        let tampered =
+            ProtectedCredentialVersion::from_parts(credential_id, version_id, nonce, ciphertext)?;
 
         assert!(matches!(
-            decrypt_credential(&key, credential_id, version_id, &tampered),
+            decrypt_credential(&key, &tampered),
             Err(CredentialProtectionError::AuthenticationFailed)
         ));
         Ok(())
@@ -334,7 +417,11 @@ mod tests {
         assert_eq!(format!("{key:?}"), "MasterKey([REDACTED])");
         assert_eq!(
             format!("{encrypted:?}"),
-            "EncryptedCredential { nonce: \"[REDACTED]\", ciphertext: \"[REDACTED]\" }"
+            format!(
+                "ProtectedCredentialVersion {{ credential_id: {:?}, version_id: {:?}, encrypted: EncryptedCredential {{ nonce: \"[REDACTED]\", ciphertext: \"[REDACTED]\" }} }}",
+                encrypted.credential_id(),
+                encrypted.version_id()
+            )
         );
         assert!(!format!("{plaintext:?}").contains("never log this"));
         Ok(())
