@@ -247,7 +247,53 @@ impl TlsTrust {
             }
         }
     }
+
+    /// Confirms that a new TLS handshake presented the trusted leaf identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsIdentityChanged`] instead of accepting certificate rotation
+    /// when the observed SHA-256 identity differs from the stored decision.
+    pub fn verify_identity(&self, observed: &TlsCertificate) -> Result<(), TlsIdentityChanged> {
+        let expected = self.certificate().fingerprint();
+        let observed = observed.fingerprint();
+        if expected != observed {
+            return Err(TlsIdentityChanged { expected, observed });
+        }
+        Ok(())
+    }
 }
+
+/// A BMC presented a leaf certificate different from its explicit trust state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TlsIdentityChanged {
+    expected: CertificateFingerprint,
+    observed: CertificateFingerprint,
+}
+
+impl TlsIdentityChanged {
+    #[must_use]
+    pub const fn expected(self) -> CertificateFingerprint {
+        self.expected
+    }
+
+    #[must_use]
+    pub const fn observed(self) -> CertificateFingerprint {
+        self.observed
+    }
+}
+
+impl fmt::Display for TlsIdentityChanged {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "TLS identity changed from {} to {}",
+            self.expected, self.observed
+        )
+    }
+}
+
+impl Error for TlsIdentityChanged {}
 
 /// A fully validated, secret-free managed Redfish endpoint aggregate.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +565,33 @@ mod tests {
             trusted_at,
         };
         assert_eq!(trust.established_at(), trusted_at);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_tls_identity_change_without_accepting_rotation() -> Result<(), Box<dyn Error>> {
+        let trusted_at = OffsetDateTime::now_utc();
+        let trusted = TlsCertificate::from_der(b"trusted leaf".to_vec())?;
+        let trust = TlsTrust::PinnedCertificate {
+            certificate: trusted.clone(),
+            trusted_at,
+        };
+        trust.verify_identity(&trusted)?;
+
+        let replacement = TlsCertificate::from_der(b"replacement leaf".to_vec())?;
+        let Err(changed) = trust.verify_identity(&replacement) else {
+            return Err("changed identity was accepted".into());
+        };
+        assert_eq!(changed.expected(), trusted.fingerprint());
+        assert_eq!(changed.observed(), replacement.fingerprint());
+        assert_eq!(
+            changed.to_string(),
+            format!(
+                "TLS identity changed from {} to {}",
+                trusted.fingerprint(),
+                replacement.fingerprint()
+            )
+        );
         Ok(())
     }
 
