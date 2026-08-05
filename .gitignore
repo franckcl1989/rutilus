@@ -1,0 +1,15 @@
+/target/
+
+# Local runtime state must never enter source control.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/.rutilus/
+
+# Editor and operating-system metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
