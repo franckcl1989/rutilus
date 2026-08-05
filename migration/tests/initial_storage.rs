@@ -4,6 +4,7 @@ use rutilus_entity::{
     credential, credential_version, endpoint, endpoint_address, endpoint_capability,
     endpoint_credential,
     endpoint_trust::{self, TrustMode},
+    resource, resource_snapshot,
 };
 use rutilus_migration::Migrator;
 use sea_orm::{
@@ -14,7 +15,7 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const STORAGE_TABLES: [&str; 7] = [
+const STORAGE_TABLES: [&str; 9] = [
     "credentials",
     "credential_versions",
     "endpoints",
@@ -22,6 +23,8 @@ const STORAGE_TABLES: [&str; 7] = [
     "endpoint_capabilities",
     "endpoint_trust",
     "endpoint_credentials",
+    "resources",
+    "resource_snapshots",
 ];
 
 #[tokio::test]
@@ -40,11 +43,149 @@ async fn migrations_preserve_storage_invariants() -> Result<(), Box<dyn Error>> 
     let now = OffsetDateTime::now_utc();
     let credential_id = verify_credential_constraints(&database, now).await?;
     verify_endpoint_constraints(&database, now, credential_id).await?;
+    verify_resource_snapshot_constraints(&database, now).await?;
 
     Migrator::down(&database, None).await?;
     assert_storage_tables(&database, false).await?;
 
     Ok(())
+}
+
+async fn verify_resource_snapshot_constraints(
+    database: &DatabaseConnection,
+    now: OffsetDateTime,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint_id = Uuid::now_v7();
+    endpoint::ActiveModel {
+        id: Set(endpoint_id),
+        display_name: Set(String::from("Snapshot BMC")),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(database)
+    .await?;
+    let resource_id = Uuid::now_v7();
+    resource_model(
+        resource_id,
+        endpoint_id,
+        "/redfish/v1/Systems/1",
+        "systems",
+        now,
+    )
+    .insert(database)
+    .await?;
+    resource_snapshot::ActiveModel {
+        resource_id: Set(resource_id),
+        generation: Set(1),
+        odata_type: Set(Some(String::from("#ComputerSystem.v1_20_0.ComputerSystem"))),
+        etag: Set(Some(String::from("\"generation-one\""))),
+        typed_payload_json: Set(String::from(r#"{"Id":"1","Name":"System"}"#)),
+        observed_at: Set(now),
+    }
+    .insert(database)
+    .await?;
+    snapshot_model(resource_id, 2, now).insert(database).await?;
+    for (odata_id, feature) in [
+        ("/redfish/v1/", "service-root"),
+        ("/redfish/v1/Chassis/1", "chassis"),
+        ("/redfish/v1/Managers/1", "managers"),
+    ] {
+        resource_model(Uuid::now_v7(), endpoint_id, odata_id, feature, now)
+            .insert(database)
+            .await?;
+    }
+
+    let duplicate_resource = resource_model(
+        Uuid::now_v7(),
+        endpoint_id,
+        "/redfish/v1/Systems/1",
+        "systems",
+        now,
+    )
+    .insert(database)
+    .await;
+    assert!(duplicate_resource.is_err());
+
+    let invalid_feature = resource_model(
+        Uuid::now_v7(),
+        endpoint_id,
+        "/redfish/v1/Unknown/1",
+        "unknown",
+        now,
+    )
+    .insert(database)
+    .await;
+    assert!(invalid_feature.is_err());
+
+    let unknown_endpoint = resource_model(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "/redfish/v1/Managers/1",
+        "managers",
+        now,
+    )
+    .insert(database)
+    .await;
+    assert!(unknown_endpoint.is_err());
+
+    let duplicate_generation = snapshot_model(resource_id, 1, now).insert(database).await;
+    assert!(duplicate_generation.is_err());
+
+    let invalid_generation = snapshot_model(resource_id, 0, now).insert(database).await;
+    assert!(invalid_generation.is_err());
+
+    let unknown_resource = snapshot_model(Uuid::now_v7(), 1, now)
+        .insert(database)
+        .await;
+    assert!(unknown_resource.is_err());
+
+    endpoint::Entity::delete_by_id(endpoint_id)
+        .exec(database)
+        .await?;
+    assert!(
+        resource::Entity::find_by_id(resource_id)
+            .one(database)
+            .await?
+            .is_none()
+    );
+    assert!(
+        resource_snapshot::Entity::find_by_id((resource_id, 1))
+            .one(database)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+fn resource_model(
+    id: Uuid,
+    endpoint_id: Uuid,
+    odata_id: &str,
+    feature: &str,
+    created_at: OffsetDateTime,
+) -> resource::ActiveModel {
+    resource::ActiveModel {
+        id: Set(id),
+        endpoint_id: Set(endpoint_id),
+        odata_id: Set(String::from(odata_id)),
+        feature: Set(String::from(feature)),
+        created_at: Set(created_at),
+    }
+}
+
+fn snapshot_model(
+    resource_id: Uuid,
+    generation: i64,
+    observed_at: OffsetDateTime,
+) -> resource_snapshot::ActiveModel {
+    resource_snapshot::ActiveModel {
+        resource_id: Set(resource_id),
+        generation: Set(generation),
+        odata_type: Set(None),
+        etag: Set(None),
+        typed_payload_json: Set(String::from("{}")),
+        observed_at: Set(observed_at),
+    }
 }
 
 async fn assert_storage_tables(

@@ -18,6 +18,8 @@ pub enum Relation {
     Trust,
     #[sea_orm(has_one = "super::endpoint_credential::Entity")]
     CredentialBinding,
+    #[sea_orm(has_many = "super::resource::Entity")]
+    Resources,
 }
 
 impl Related<super::endpoint_address::Entity> for Entity {
@@ -35,6 +37,12 @@ impl Related<super::endpoint_trust::Entity> for Entity {
 impl Related<super::endpoint_credential::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::CredentialBinding.def()
+    }
+}
+
+impl Related<super::resource::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Resources.def()
     }
 }
 
