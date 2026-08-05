@@ -1929,6 +1929,7 @@ dependencies = [
 name = "rutilus-domain"
 version = "0.1.0"
 dependencies = [
+ "time",
  "url",
  "uuid",
 ]
