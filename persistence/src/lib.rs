@@ -14,10 +14,14 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 mod credential_repository;
+mod endpoint_capability_repository;
 mod endpoint_repository;
 
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
+};
+pub use endpoint_capability_repository::{
+    EndpointCapabilityRepositoryError, StoredEndpointCapability, StoredEndpointCapabilityError,
 };
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
 
