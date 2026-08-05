@@ -1954,6 +1954,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rutilus-persistence"
+version = "0.1.0"
+dependencies = [
+ "rutilus-entity",
+ "rutilus-migration",
+ "sea-orm",
+ "sea-orm-migration",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rutilus-security"
 version = "0.1.0"
 dependencies = [
