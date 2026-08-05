@@ -1,14 +1,18 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use rutilus_domain::{
-    CredentialId, CredentialUsername, Endpoint, EndpointAddress, EndpointCapabilityObservation,
-    EndpointDisplayName, EndpointId, EndpointTimelineError, TlsTrust,
+    AuditAction, AuditActor, AuditEvent, AuditEventError, AuditFailure, AuditFailureVerification,
+    AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
+    AuditProgress, AuditRedfishOperation, AuditSequence, AuditSequenceError, AuditTarget,
+    AuditTlsTrust, CredentialId, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, EndpointTimelineError,
+    ProductPermission, TlsTrust,
 };
 use secrecy::SecretString;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::TrustedEndpoint;
+use crate::{AuditEventWriter, TrustedEndpoint};
 
 /// A sendable boundary operation tied to the lifetime of its collaborators.
 pub type BoundaryFuture<'a, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'a>>;
@@ -184,6 +188,18 @@ impl OnboardEndpointRequest {
             credential_id,
         }
     }
+
+    /// Borrows the address-bound TLS decision without exposing credentials.
+    #[must_use]
+    pub const fn target(&self) -> &TrustedEndpoint {
+        &self.target
+    }
+
+    /// Returns the explicitly selected credential identifier.
+    #[must_use]
+    pub const fn credential_id(&self) -> CredentialId {
+        self.credential_id
+    }
 }
 
 /// A new endpoint and the exact capability snapshot persisted with it.
@@ -296,6 +312,353 @@ where
     }
 }
 
+/// Performs endpoint onboarding only inside a durable, append-only audit
+/// lifecycle.
+pub struct AuditedEndpointOnboarding<Repository, Credentials, Gateway, Audit, Time> {
+    repository: Repository,
+    credentials: Credentials,
+    gateway: Gateway,
+    audit: Audit,
+    clock: Time,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+}
+
+impl<Repository, Credentials, Gateway, Audit, Time>
+    AuditedEndpointOnboarding<Repository, Credentials, Gateway, Audit, Time>
+where
+    Repository: DiscoveredEndpointRepository,
+    Credentials: CredentialResolver,
+    Gateway: RedfishDiscovery,
+    Audit: AuditEventWriter,
+    Time: Clock,
+{
+    #[must_use]
+    pub fn new(
+        repository: Repository,
+        credentials: Credentials,
+        gateway: Gateway,
+        audit: Audit,
+        clock: Time,
+        actor: AuditActor,
+        origin: DeploymentPosture,
+    ) -> Self {
+        Self {
+            repository,
+            credentials,
+            gateway,
+            audit,
+            clock,
+            actor,
+            origin,
+        }
+    }
+
+    /// Writes the start fact before any credential or network activity, then
+    /// records either a typed failure or the Endpoint-created milestone and a
+    /// confirmed terminal result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditedOnboardEndpointError`] when audit preparation or
+    /// writing fails, or when the wrapped onboarding use case fails. When both
+    /// onboarding and its terminal audit append fail, both causes are retained.
+    pub async fn execute(
+        &self,
+        request: OnboardEndpointRequest,
+    ) -> Result<
+        OnboardedEndpoint,
+        AuditedOnboardEndpointError<
+            Credentials::Error,
+            Gateway::Error,
+            Repository::Error,
+            Audit::Error,
+        >,
+    > {
+        let context =
+            onboarding_audit_context(&request, self.actor, self.origin).map_err(|source| {
+                AuditedOnboardEndpointError::Audit {
+                    stage: OnboardingAuditStage::Start,
+                    endpoint_id: None,
+                    source: AuditRecordError::Context(source),
+                }
+            })?;
+        let second =
+            AuditSequence::FIRST
+                .next()
+                .map_err(|source| AuditedOnboardEndpointError::Audit {
+                    stage: OnboardingAuditStage::Start,
+                    endpoint_id: None,
+                    source: AuditRecordError::Sequence(source),
+                })?;
+        let third = second
+            .next()
+            .map_err(|source| AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::Start,
+                endpoint_id: None,
+                source: AuditRecordError::Sequence(source),
+            })?;
+        let started_at = self.clock.now();
+        let started = AuditEvent::started(context.clone(), started_at);
+        self.audit
+            .append_audit_event(&started)
+            .await
+            .map_err(|source| AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::Start,
+                endpoint_id: None,
+                source: AuditRecordError::Write(source),
+            })?;
+
+        let onboarding = EndpointOnboarding::new(
+            &self.repository,
+            &self.credentials,
+            &self.gateway,
+            &self.clock,
+        );
+        let onboarded = match onboarding.execute(request).await {
+            Ok(onboarded) => onboarded,
+            Err(source) => {
+                return Err(self
+                    .record_onboarding_failure(context, second, started_at, source)
+                    .await);
+            }
+        };
+
+        let endpoint_id = onboarded.endpoint().id();
+        self.record_onboarding_success(context, second, third, started_at, endpoint_id)
+            .await?;
+        Ok(onboarded)
+    }
+
+    async fn record_onboarding_failure(
+        &self,
+        context: AuditOperationContext,
+        sequence: AuditSequence,
+        started_at: OffsetDateTime,
+        onboarding: OnboardEndpointError<Credentials::Error, Gateway::Error, Repository::Error>,
+    ) -> AuditedOnboardEndpointError<
+        Credentials::Error,
+        Gateway::Error,
+        Repository::Error,
+        Audit::Error,
+    > {
+        let (failure, verification) = classify_onboarding_failure(&onboarding);
+        let failed = match AuditEvent::failed(
+            context,
+            sequence,
+            failure,
+            verification,
+            at_or_after(started_at, self.clock.now()),
+        ) {
+            Ok(failed) => failed,
+            Err(audit) => {
+                return AuditedOnboardEndpointError::OnboardingAndAudit {
+                    onboarding: Box::new(onboarding),
+                    audit: AuditRecordError::Event(audit),
+                };
+            }
+        };
+        match self.audit.append_audit_event(&failed).await {
+            Ok(()) => AuditedOnboardEndpointError::Onboarding(Box::new(onboarding)),
+            Err(audit) => AuditedOnboardEndpointError::OnboardingAndAudit {
+                onboarding: Box::new(onboarding),
+                audit: AuditRecordError::Write(audit),
+            },
+        }
+    }
+
+    async fn record_onboarding_success(
+        &self,
+        context: AuditOperationContext,
+        progress_sequence: AuditSequence,
+        completion_sequence: AuditSequence,
+        started_at: OffsetDateTime,
+        endpoint_id: EndpointId,
+    ) -> Result<
+        (),
+        AuditedOnboardEndpointError<
+            Credentials::Error,
+            Gateway::Error,
+            Repository::Error,
+            Audit::Error,
+        >,
+    > {
+        let progress_at = at_or_after(started_at, self.clock.now());
+        let progress = AuditEvent::progress(
+            context.clone(),
+            progress_sequence,
+            AuditProgress::EndpointCreated,
+            progress_at,
+        )
+        .map_err(|source| AuditedOnboardEndpointError::Audit {
+            stage: OnboardingAuditStage::EndpointCreated,
+            endpoint_id: Some(endpoint_id),
+            source: AuditRecordError::Event(source),
+        })?;
+        self.audit
+            .append_audit_event(&progress)
+            .await
+            .map_err(|source| AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::EndpointCreated,
+                endpoint_id: Some(endpoint_id),
+                source: AuditRecordError::Write(source),
+            })?;
+
+        let succeeded = AuditEvent::succeeded(
+            context,
+            completion_sequence,
+            at_or_after(progress_at, self.clock.now()),
+        )
+        .map_err(|source| AuditedOnboardEndpointError::Audit {
+            stage: OnboardingAuditStage::Completion,
+            endpoint_id: Some(endpoint_id),
+            source: AuditRecordError::Event(source),
+        })?;
+        self.audit
+            .append_audit_event(&succeeded)
+            .await
+            .map_err(|source| AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::Completion,
+                endpoint_id: Some(endpoint_id),
+                source: AuditRecordError::Write(source),
+            })?;
+        Ok(())
+    }
+}
+
+fn onboarding_audit_context(
+    request: &OnboardEndpointRequest,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+) -> Result<AuditOperationContext, AuditOperationContextError> {
+    let trust = match request.target().trust() {
+        TlsTrust::SystemCa { .. } => AuditTlsTrust::SystemCa,
+        TlsTrust::PinnedCertificate { .. } => AuditTlsTrust::PinnedCertificate,
+    };
+    AuditOperationContext::try_new(
+        AuditOperationId::generate(),
+        actor,
+        origin,
+        AuditTarget::EndpointAddress(request.target().address().clone()),
+        AuditParameterSummary::EndpointEnrollment {
+            credential_id: request.credential_id(),
+            trust,
+        },
+        ProductPermission::ManageEndpoints,
+        AuditAction::EnrollEndpoint,
+        AuditRedfishOperation::ProbeCoreCapabilities,
+    )
+}
+
+fn classify_onboarding_failure<CredentialError, DiscoveryError, RepositoryError>(
+    failure: &OnboardEndpointError<CredentialError, DiscoveryError, RepositoryError>,
+) -> (AuditFailure, AuditFailureVerification)
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    RepositoryError: Error + 'static,
+{
+    match failure {
+        OnboardEndpointError::CredentialNotFound { .. } | OnboardEndpointError::Credential(_) => (
+            AuditFailure::CredentialUnavailable,
+            AuditFailureVerification::Rejected,
+        ),
+        OnboardEndpointError::Discovery(_) => (
+            AuditFailure::RedfishDiscoveryFailed,
+            AuditFailureVerification::Inconclusive,
+        ),
+        OnboardEndpointError::InvalidTimeline(_) | OnboardEndpointError::Repository(_) => (
+            AuditFailure::EndpointPersistenceFailed,
+            AuditFailureVerification::Rejected,
+        ),
+    }
+}
+
+fn at_or_after(previous: OffsetDateTime, observed: OffsetDateTime) -> OffsetDateTime {
+    previous.max(observed)
+}
+
+/// The point in the onboarding audit lifecycle that could not be recorded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnboardingAuditStage {
+    Start,
+    EndpointCreated,
+    Completion,
+}
+
+impl fmt::Display for OnboardingAuditStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start => formatter.write_str("start"),
+            Self::EndpointCreated => formatter.write_str("Endpoint-created milestone"),
+            Self::Completion => formatter.write_str("completion"),
+        }
+    }
+}
+
+/// A typed audit fact could not be constructed or durably appended.
+#[derive(Debug, Error)]
+pub enum AuditRecordError<AuditError>
+where
+    AuditError: Error + 'static,
+{
+    #[error("audit operation context is invalid: {0}")]
+    Context(#[source] AuditOperationContextError),
+    #[error("audit sequence cannot advance: {0}")]
+    Sequence(#[source] AuditSequenceError),
+    #[error("audit event is inconsistent: {0}")]
+    Event(#[source] AuditEventError),
+    #[error("audit append failed: {0}")]
+    Write(#[source] AuditError),
+}
+
+/// A controlled failure while onboarding an endpoint under mandatory audit.
+#[derive(Debug, Error)]
+pub enum AuditedOnboardEndpointError<CredentialError, DiscoveryError, RepositoryError, AuditError>
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    RepositoryError: Error + 'static,
+    AuditError: Error + 'static,
+{
+    #[error("endpoint onboarding audit {stage} failed before a reliable result could be returned")]
+    Audit {
+        stage: OnboardingAuditStage,
+        endpoint_id: Option<EndpointId>,
+        #[source]
+        source: AuditRecordError<AuditError>,
+    },
+    #[error("audited endpoint onboarding failed: {0}")]
+    Onboarding(
+        #[source] Box<OnboardEndpointError<CredentialError, DiscoveryError, RepositoryError>>,
+    ),
+    #[error("endpoint onboarding failed and its terminal audit fact also failed: {audit}")]
+    OnboardingAndAudit {
+        #[source]
+        onboarding: Box<OnboardEndpointError<CredentialError, DiscoveryError, RepositoryError>>,
+        audit: AuditRecordError<AuditError>,
+    },
+}
+
+impl<CredentialError, DiscoveryError, RepositoryError, AuditError>
+    AuditedOnboardEndpointError<CredentialError, DiscoveryError, RepositoryError, AuditError>
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    RepositoryError: Error + 'static,
+    AuditError: Error + 'static,
+{
+    /// Returns the stable Endpoint identifier when persistence already
+    /// succeeded before an audit append failed.
+    #[must_use]
+    pub const fn persisted_endpoint_id(&self) -> Option<EndpointId> {
+        match self {
+            Self::Audit { endpoint_id, .. } => *endpoint_id,
+            Self::Onboarding(_) | Self::OnboardingAndAudit { .. } => None,
+        }
+    }
+}
+
 /// A controlled failure while onboarding one trusted BMC endpoint.
 #[derive(Debug, Error)]
 pub enum OnboardEndpointError<CredentialError, DiscoveryError, RepositoryError>
@@ -321,7 +684,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use rutilus_domain::{
-        CapabilityState, EndpointCapability, EndpointDisplayName, TlsCertificate,
+        AuditOutcomeKind, CapabilityState, EndpointCapability, EndpointDisplayName, TlsCertificate,
     };
     use secrecy::SecretString;
     use time::Duration;
@@ -422,6 +785,267 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn audited_onboarding_records_start_creation_and_confirmed_completion()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let observed_at = trusted_at + Duration::SECOND;
+        let credential_id = CredentialId::generate();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
+            FixedClock(observed_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let onboarded = service.execute(request(credential_id, trusted_at)?).await?;
+
+        assert_eq!(
+            recorded_events(&lifecycle)?,
+            [
+                "audit",
+                "credential",
+                "gateway",
+                "repository",
+                "audit",
+                "audit",
+            ]
+        );
+        let audit = recorded_audit_events(&audit_state)?;
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(
+            audit[1].outcome().progress(),
+            Some(AuditProgress::EndpointCreated)
+        );
+        assert_eq!(audit[2].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(audit[0].sequence(), AuditSequence::FIRST);
+        assert_eq!(audit[1].sequence(), AuditSequence::FIRST.next()?);
+        assert_eq!(audit[0].context(), audit[2].context());
+        assert_eq!(
+            audit[0].context().target(),
+            &AuditTarget::EndpointAddress(onboarded.endpoint().address().clone())
+        );
+        assert!(matches!(
+            audit[0].context().parameters(),
+            AuditParameterSummary::EndpointEnrollment {
+                credential_id: id,
+                trust: AuditTlsTrust::PinnedCertificate,
+            } if id == credential_id
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_start_failure_prevents_credentials_and_redfish() -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 1),
+            FixedClock(trusted_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service
+            .execute(request(CredentialId::generate(), trusted_at)?)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::Start,
+                endpoint_id: None,
+                source: AuditRecordError::Write(MockError::Audit),
+            })
+        ));
+        assert_eq!(recorded_events(&lifecycle)?, ["audit"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retains_business_and_audit_failures_when_terminal_append_fails()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let credential_id = CredentialId::generate();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::missing(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 2),
+            FixedClock(trusted_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service.execute(request(credential_id, trusted_at)?).await;
+
+        assert!(matches!(
+            result,
+            Err(AuditedOnboardEndpointError::OnboardingAndAudit {
+                onboarding,
+                audit: AuditRecordError::Write(MockError::Audit),
+            }) if matches!(
+                *onboarding,
+                OnboardEndpointError::CredentialNotFound { credential_id: id }
+                    if id == credential_id
+            )
+        ));
+        assert_eq!(
+            recorded_events(&lifecycle)?,
+            ["audit", "credential", "audit"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_typed_credential_failure_when_onboarding_is_rejected()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let credential_id = CredentialId::generate();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::missing(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
+            FixedClock(trusted_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service.execute(request(credential_id, trusted_at)?).await;
+
+        assert!(matches!(
+            result,
+            Err(AuditedOnboardEndpointError::Onboarding(onboarding))
+                if matches!(
+                    *onboarding,
+                    OnboardEndpointError::CredentialNotFound { credential_id: id }
+                        if id == credential_id
+                )
+        ));
+        let audit = recorded_audit_events(&audit_state)?;
+        assert_eq!(audit.len(), 2);
+        assert_eq!(
+            audit[1].outcome().failure(),
+            Some(AuditFailure::CredentialUnavailable)
+        );
+        assert_eq!(
+            audit[1].outcome().verification(),
+            Some(rutilus_domain::AuditVerification::Rejected)
+        );
+        assert_eq!(
+            recorded_events(&lifecycle)?,
+            ["audit", "credential", "audit"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_persisted_endpoint_when_creation_audit_append_fails()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 2),
+            FixedClock(trusted_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service
+            .execute(request(CredentialId::generate(), trusted_at)?)
+            .await;
+
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .and_then(AuditedOnboardEndpointError::persisted_endpoint_id)
+                .is_some()
+        );
+        assert!(matches!(
+            result,
+            Err(AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::EndpointCreated,
+                endpoint_id: Some(_),
+                source: AuditRecordError::Write(MockError::Audit),
+            })
+        ));
+        assert_eq!(
+            recorded_events(&lifecycle)?,
+            ["audit", "credential", "gateway", "repository", "audit"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_persisted_endpoint_when_completion_audit_append_fails()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let trusted_at = OffsetDateTime::now_utc();
+        let service = AuditedEndpointOnboarding::new(
+            MockRepository::succeed(Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockGateway::succeed(Arc::clone(&lifecycle)),
+            MockAudit::fail_on(Arc::clone(&lifecycle), Arc::clone(&audit_state), 3),
+            FixedClock(trusted_at),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+        );
+
+        let result = service
+            .execute(request(CredentialId::generate(), trusted_at)?)
+            .await;
+
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .and_then(AuditedOnboardEndpointError::persisted_endpoint_id)
+                .is_some()
+        );
+        assert!(matches!(
+            result,
+            Err(AuditedOnboardEndpointError::Audit {
+                stage: OnboardingAuditStage::Completion,
+                endpoint_id: Some(_),
+                source: AuditRecordError::Write(MockError::Audit),
+            })
+        ));
+        assert_eq!(recorded_audit_events(&audit_state)?.len(), 2);
+        assert_eq!(
+            recorded_events(&lifecycle)?,
+            [
+                "audit",
+                "credential",
+                "gateway",
+                "repository",
+                "audit",
+                "audit",
+            ]
+        );
+        Ok(())
+    }
+
     #[derive(Clone, Copy, Debug, Error)]
     enum MockError {
         #[error("mock event log is unavailable")]
@@ -430,6 +1054,65 @@ mod tests {
         Gateway,
         #[error("mock repository failure")]
         Repository,
+        #[error("mock audit failure")]
+        Audit,
+    }
+
+    #[derive(Default)]
+    struct MockAuditState {
+        attempts: usize,
+        events: Vec<AuditEvent>,
+    }
+
+    struct MockAudit {
+        lifecycle: Arc<Mutex<Vec<&'static str>>>,
+        state: Arc<Mutex<MockAuditState>>,
+        fail_on: Option<usize>,
+    }
+
+    impl MockAudit {
+        fn succeed(
+            lifecycle: Arc<Mutex<Vec<&'static str>>>,
+            state: Arc<Mutex<MockAuditState>>,
+        ) -> Self {
+            Self {
+                lifecycle,
+                state,
+                fail_on: None,
+            }
+        }
+
+        fn fail_on(
+            lifecycle: Arc<Mutex<Vec<&'static str>>>,
+            state: Arc<Mutex<MockAuditState>>,
+            attempt: usize,
+        ) -> Self {
+            Self {
+                lifecycle,
+                state,
+                fail_on: Some(attempt),
+            }
+        }
+    }
+
+    impl AuditEventWriter for MockAudit {
+        type Error = MockError;
+
+        fn append_audit_event<'a>(
+            &'a self,
+            event: &'a AuditEvent,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                record(&self.lifecycle, "audit")?;
+                let mut state = self.state.lock().map_err(|_| MockError::Events)?;
+                state.attempts += 1;
+                if self.fail_on == Some(state.attempts) {
+                    return Err(MockError::Audit);
+                }
+                state.events.push(event.clone());
+                Ok(())
+            })
+        }
     }
 
     struct MockCredentials {
@@ -603,6 +1286,13 @@ mod tests {
         events
             .lock()
             .map(|events| events.clone())
+            .map_err(|_| MockError::Events)
+    }
+
+    fn recorded_audit_events(state: &Mutex<MockAuditState>) -> Result<Vec<AuditEvent>, MockError> {
+        state
+            .lock()
+            .map(|state| state.events.clone())
             .map_err(|_| MockError::Events)
     }
 }

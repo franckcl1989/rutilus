@@ -9,8 +9,9 @@ mod endpoint_trust;
 pub use audit_log::AuditEventWriter;
 pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
 pub use endpoint_onboarding::{
-    BoundaryFuture, Clock, CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery,
-    EndpointOnboarding, OnboardEndpointError, OnboardEndpointRequest, OnboardedEndpoint,
+    AuditRecordError, AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture,
+    Clock, CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery, EndpointOnboarding,
+    OnboardEndpointError, OnboardEndpointRequest, OnboardedEndpoint, OnboardingAuditStage,
     RedfishDiscovery, ResolvedCredential,
 };
 pub use endpoint_refresh::{
