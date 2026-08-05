@@ -1,0 +1,39 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.95
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+allow-workspace = true
+deny = [
+    { crate = "lapin", reason = "Rutilus does not use an external message broker" },
+    { crate = "native-tls", reason = "Rutilus uses rustls for TLS" },
+    { crate = "openssl", reason = "Rutilus has no OpenSSL runtime dependency" },
+    { crate = "postgres", reason = "Rutilus uses embedded SQLite only" },
+    { crate = "rdkafka", reason = "Rutilus does not use an external message broker" },
+    { crate = "redis", reason = "Rutilus does not use an external cache or queue" },
+    { crate = "tokio-postgres", reason = "Rutilus uses embedded SQLite only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
