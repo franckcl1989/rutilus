@@ -89,6 +89,13 @@ impl Error for EndpointDisplayNameError {}
 pub struct CertificateFingerprint([u8; FINGERPRINT_LENGTH]);
 
 impl CertificateFingerprint {
+    /// Computes the SHA-256 identity of certificate DER without retaining the
+    /// certificate bytes.
+    #[must_use]
+    pub fn from_certificate_der(certificate_der: &[u8]) -> Self {
+        fingerprint(certificate_der)
+    }
+
     #[must_use]
     pub const fn from_bytes(bytes: [u8; FINGERPRINT_LENGTH]) -> Self {
         Self(bytes)
@@ -258,8 +265,20 @@ impl TlsTrust {
     /// Returns [`TlsIdentityChanged`] instead of accepting certificate rotation
     /// when the observed SHA-256 identity differs from the stored decision.
     pub fn verify_identity(&self, observed: &TlsCertificate) -> Result<(), TlsIdentityChanged> {
+        self.verify_fingerprint(observed.fingerprint())
+    }
+
+    /// Confirms a certificate fingerprint against the stored trust decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsIdentityChanged`] when the observed SHA-256 identity
+    /// differs from the stored decision.
+    pub fn verify_fingerprint(
+        &self,
+        observed: CertificateFingerprint,
+    ) -> Result<(), TlsIdentityChanged> {
         let expected = self.certificate().fingerprint();
-        let observed = observed.fingerprint();
         if expected != observed {
             return Err(TlsIdentityChanged { expected, observed });
         }
@@ -579,10 +598,15 @@ mod tests {
             certificate: trusted.clone(),
             trusted_at,
         };
+        assert_eq!(
+            CertificateFingerprint::from_certificate_der(b"trusted leaf"),
+            trusted.fingerprint()
+        );
         trust.verify_identity(&trusted)?;
+        trust.verify_fingerprint(trusted.fingerprint())?;
 
         let replacement = TlsCertificate::from_der(b"replacement leaf".to_vec())?;
-        let Err(changed) = trust.verify_identity(&replacement) else {
+        let Err(changed) = trust.verify_fingerprint(replacement.fingerprint()) else {
             return Err("changed identity was accepted".into());
         };
         assert_eq!(changed.expected(), trusted.fingerprint());
