@@ -7,6 +7,15 @@ publish.workspace = true
 
 [dependencies]
 nv-redfish.workspace = true
+rutilus-domain.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

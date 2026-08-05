@@ -14,6 +14,9 @@ chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["
 clap = { version = "4.6.5", features = ["derive"] }
 getrandom = "0.4.3"
 nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
 rutilus-domain = { path = "domain", version = "0.1.0" }
 rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
 rutilus-entity = { path = "entity", version = "0.1.0" }
@@ -25,7 +28,8 @@ sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = "0.3.55"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
 zeroize = "1.9.0"

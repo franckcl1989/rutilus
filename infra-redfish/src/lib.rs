@@ -2,6 +2,12 @@
 
 use std::marker::PhantomData;
 
+mod tls_probe;
+
+pub use tls_probe::{
+    SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,
+};
+
 /// The exact upstream version currently evaluated during product development.
 ///
 /// This remains movable until the 0.8.0 capability freeze.

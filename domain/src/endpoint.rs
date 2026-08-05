@@ -131,6 +131,9 @@ pub struct TlsCertificate {
 }
 
 impl TlsCertificate {
+    /// Maximum accepted leaf-certificate DER size.
+    pub const MAX_DER_BYTES: usize = MAX_CERTIFICATE_DER_BYTES;
+
     /// Computes the identity of certificate DER received from a TLS handshake.
     ///
     /// # Errors
