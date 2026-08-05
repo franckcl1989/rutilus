@@ -7,50 +7,19 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use rutilus_domain::{CredentialId, CredentialVersionId};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
-const MASTER_KEY_LENGTH: usize = 32;
+mod master_key;
+
+pub use master_key::{
+    MASTER_KEY_ENVELOPE_LENGTH, MasterKey, MasterKeyProtectionError, ProtectedMasterKey,
+    protect_master_key, recover_master_key,
+};
+
 /// Byte length of every persisted `XChaCha20-Poly1305` credential nonce.
 pub const CREDENTIAL_NONCE_LENGTH: usize = 24;
 const AUTHENTICATION_TAG_LENGTH: usize = 16;
-
-/// A process-local master key used to protect persisted credentials.
-pub struct MasterKey(SecretBox<[u8; MASTER_KEY_LENGTH]>);
-
-impl MasterKey {
-    /// Generates a master key from the operating system's cryptographic random source.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CredentialProtectionError::RandomnessUnavailable`] when the operating
-    /// system cannot supply cryptographically secure random bytes.
-    pub fn generate() -> Result<Self, CredentialProtectionError> {
-        let mut generation_result = Ok(());
-        let secret: SecretBox<[u8; MASTER_KEY_LENGTH]> =
-            SecretBox::init_with_mut(|bytes: &mut [u8; MASTER_KEY_LENGTH]| {
-                generation_result = getrandom::fill(bytes);
-            });
-        generation_result.map_err(CredentialProtectionError::RandomnessUnavailable)?;
-        Ok(Self(secret))
-    }
-
-    /// Takes ownership of an already protected, exactly sized key allocation.
-    #[must_use]
-    pub fn from_boxed_bytes(bytes: Box<[u8; MASTER_KEY_LENGTH]>) -> Self {
-        Self(SecretBox::new(bytes))
-    }
-
-    fn expose(&self) -> &[u8; MASTER_KEY_LENGTH] {
-        self.0.expose_secret()
-    }
-}
-
-impl fmt::Debug for MasterKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MasterKey([REDACTED])")
-    }
-}
 
 /// Persistable authenticated ciphertext for one credential version.
 #[derive(Clone, Eq, PartialEq)]
