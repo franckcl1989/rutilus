@@ -6,7 +6,8 @@ use rutilus_domain::{
 };
 use rutilus_entity::{endpoint, endpoint_capability};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    Set, TransactionTrait,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -31,7 +32,8 @@ impl SqliteStore {
         observations: &[EndpointCapabilityObservation],
         observed_at: OffsetDateTime,
     ) -> Result<(), EndpointCapabilityRepositoryError> {
-        validate_snapshot(endpoint_id, observations)?;
+        validate_snapshot(observations)
+            .map_err(|source| map_snapshot_error(endpoint_id, source))?;
 
         let _write_permit = self
             .write_gate
@@ -59,17 +61,9 @@ impl SqliteStore {
             .exec(&transaction)
             .await
             .map_err(EndpointCapabilityRepositoryError::Database)?;
-        for observation in observations {
-            endpoint_capability::ActiveModel {
-                endpoint_id: Set(endpoint_id.into_uuid()),
-                capability: Set(observation.capability().as_str().to_owned()),
-                state: Set(observation.state().as_str().to_owned()),
-                observed_at: Set(observed_at),
-            }
-            .insert(&transaction)
+        insert_capabilities(&transaction, endpoint_id, observations, observed_at)
             .await
             .map_err(EndpointCapabilityRepositoryError::Database)?;
-        }
         transaction
             .commit()
             .await
@@ -124,24 +118,65 @@ impl SqliteStore {
     }
 }
 
-fn validate_snapshot(
-    endpoint_id: EndpointId,
+pub(crate) fn validate_snapshot(
     observations: &[EndpointCapabilityObservation],
-) -> Result<(), EndpointCapabilityRepositoryError> {
+) -> Result<(), InvalidCapabilitySnapshot> {
     if observations.is_empty() {
-        return Err(EndpointCapabilityRepositoryError::EmptySnapshot { endpoint_id });
+        return Err(InvalidCapabilitySnapshot::Empty);
     }
     let mut capabilities = BTreeSet::new();
     for observation in observations {
         let capability = observation.capability();
         if !capabilities.insert(capability) {
-            return Err(EndpointCapabilityRepositoryError::DuplicateCapability {
-                endpoint_id,
-                capability,
-            });
+            return Err(InvalidCapabilitySnapshot::Duplicate { capability });
         }
     }
     Ok(())
+}
+
+pub(crate) async fn insert_capabilities<C>(
+    database: &C,
+    endpoint_id: EndpointId,
+    observations: &[EndpointCapabilityObservation],
+    observed_at: OffsetDateTime,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    for observation in observations {
+        endpoint_capability::ActiveModel {
+            endpoint_id: Set(endpoint_id.into_uuid()),
+            capability: Set(observation.capability().as_str().to_owned()),
+            state: Set(observation.state().as_str().to_owned()),
+            observed_at: Set(observed_at),
+        }
+        .insert(database)
+        .await?;
+    }
+    Ok(())
+}
+
+fn map_snapshot_error(
+    endpoint_id: EndpointId,
+    source: InvalidCapabilitySnapshot,
+) -> EndpointCapabilityRepositoryError {
+    match source {
+        InvalidCapabilitySnapshot::Empty => {
+            EndpointCapabilityRepositoryError::EmptySnapshot { endpoint_id }
+        }
+        InvalidCapabilitySnapshot::Duplicate { capability } => {
+            EndpointCapabilityRepositoryError::DuplicateCapability {
+                endpoint_id,
+                capability,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidCapabilitySnapshot {
+    Empty,
+    Duplicate { capability: EndpointCapability },
 }
 
 fn map_stored_capability(

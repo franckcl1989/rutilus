@@ -1,7 +1,8 @@
 use rutilus_domain::{
     CertificateFingerprint, CredentialId, Endpoint, EndpointAddress, EndpointAddressError,
-    EndpointDisplayName, EndpointDisplayNameError, EndpointId, EndpointTimelineError,
-    TlsCertificate, TlsCertificateError, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName,
+    EndpointDisplayNameError, EndpointId, EndpointTimelineError, TlsCertificate,
+    TlsCertificateError, TlsTrust,
 };
 use rutilus_entity::{credential, endpoint, endpoint_address, endpoint_credential, endpoint_trust};
 use sea_orm::{
@@ -10,7 +11,12 @@ use sea_orm::{
 };
 use thiserror::Error;
 
-use crate::SqliteStore;
+use crate::{
+    SqliteStore,
+    endpoint_capability_repository::{
+        InvalidCapabilitySnapshot, insert_capabilities, validate_snapshot,
+    },
+};
 
 const CERTIFICATE_FINGERPRINT_LENGTH: usize = 32;
 
@@ -30,8 +36,6 @@ impl SqliteStore {
         &self,
         domain: Endpoint,
     ) -> Result<Endpoint, EndpointRepositoryError> {
-        let endpoint_id = domain.id();
-        let credential_id = domain.credential_id();
         let _write_permit = self
             .write_gate
             .acquire()
@@ -42,78 +46,46 @@ impl SqliteStore {
             .begin()
             .await
             .map_err(EndpointRepositoryError::Database)?;
-
-        let bound_credential = credential::Entity::find_by_id(credential_id.into_uuid())
-            .one(&transaction)
+        insert_endpoint_aggregate(&transaction, &domain).await?;
+        transaction
+            .commit()
             .await
-            .map_err(EndpointRepositoryError::Database)?
-            .ok_or(EndpointRepositoryError::CredentialNotFound { credential_id })?;
-        if bound_credential.active_version_id.is_none() {
-            return Err(EndpointRepositoryError::CredentialInactive { credential_id });
-        }
+            .map_err(EndpointRepositoryError::Database)?;
+        Ok(domain)
+    }
 
-        endpoint::ActiveModel {
-            id: Set(endpoint_id.into_uuid()),
-            display_name: Set(domain.display_name().to_string()),
-            created_at: Set(domain.created_at()),
-            updated_at: Set(domain.updated_at()),
-        }
-        .insert(&transaction)
-        .await
-        .map_err(map_endpoint_insert_error)?;
-
-        endpoint_address::ActiveModel {
-            id: Set(uuid::Uuid::now_v7()),
-            endpoint_id: Set(endpoint_id.into_uuid()),
-            address: Set(domain.address().to_string()),
-            is_active: Set(true),
-            created_at: Set(domain.created_at()),
-            retired_at: Set(None),
-        }
-        .insert(&transaction)
-        .await
-        .map_err(map_endpoint_insert_error)?;
-
-        let (trust_mode, certificate_sha256, certificate_der, trusted_at) = match domain.trust() {
-            TlsTrust::SystemCa {
-                certificate,
-                verified_at,
-            } => (
-                endpoint_trust::TrustMode::SystemCa,
-                Some(certificate.fingerprint().into_bytes().to_vec()),
-                Some(certificate.certificate_der().to_vec()),
-                *verified_at,
-            ),
-            TlsTrust::PinnedCertificate {
-                certificate,
-                trusted_at,
-            } => (
-                endpoint_trust::TrustMode::PinnedCertificate,
-                Some(certificate.fingerprint().into_bytes().to_vec()),
-                Some(certificate.certificate_der().to_vec()),
-                *trusted_at,
-            ),
-        };
-        endpoint_trust::ActiveModel {
-            endpoint_id: Set(endpoint_id.into_uuid()),
-            trust_mode: Set(trust_mode),
-            certificate_sha256: Set(certificate_sha256),
-            certificate_der: Set(certificate_der),
-            trusted_at: Set(trusted_at),
-        }
-        .insert(&transaction)
-        .await
-        .map_err(map_endpoint_insert_error)?;
-
-        endpoint_credential::ActiveModel {
-            endpoint_id: Set(endpoint_id.into_uuid()),
-            credential_id: Set(credential_id.into_uuid()),
-            assigned_at: Set(domain.updated_at()),
-        }
-        .insert(&transaction)
-        .await
-        .map_err(map_endpoint_insert_error)?;
-
+    /// Atomically persists an endpoint and the capability snapshot that proved
+    /// it is a usable Redfish service.
+    ///
+    /// The observation time is the endpoint's update time, so its first
+    /// discovered state and aggregate timeline cannot diverge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointRepositoryError`] when the snapshot is empty or
+    /// duplicated, the bound credential is unavailable, an identity or address
+    /// conflicts, write coordination fails, or the transaction cannot commit.
+    pub async fn create_discovered_endpoint(
+        &self,
+        domain: Endpoint,
+        observations: &[EndpointCapabilityObservation],
+    ) -> Result<Endpoint, EndpointRepositoryError> {
+        validate_snapshot(observations).map_err(map_capability_snapshot_error)?;
+        let endpoint_id = domain.id();
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(EndpointRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(EndpointRepositoryError::Database)?;
+        insert_endpoint_aggregate(&transaction, &domain).await?;
+        insert_capabilities(&transaction, endpoint_id, observations, domain.updated_at())
+            .await
+            .map_err(EndpointRepositoryError::Database)?;
         transaction
             .commit()
             .await
@@ -155,6 +127,86 @@ impl SqliteStore {
             .map_err(EndpointRepositoryError::Database)?;
         Ok(Some(domain))
     }
+}
+
+async fn insert_endpoint_aggregate<C>(
+    database: &C,
+    domain: &Endpoint,
+) -> Result<(), EndpointRepositoryError>
+where
+    C: ConnectionTrait,
+{
+    let endpoint_id = domain.id();
+    let credential_id = domain.credential_id();
+    let bound_credential = credential::Entity::find_by_id(credential_id.into_uuid())
+        .one(database)
+        .await
+        .map_err(EndpointRepositoryError::Database)?
+        .ok_or(EndpointRepositoryError::CredentialNotFound { credential_id })?;
+    if bound_credential.active_version_id.is_none() {
+        return Err(EndpointRepositoryError::CredentialInactive { credential_id });
+    }
+
+    endpoint::ActiveModel {
+        id: Set(endpoint_id.into_uuid()),
+        display_name: Set(domain.display_name().to_string()),
+        created_at: Set(domain.created_at()),
+        updated_at: Set(domain.updated_at()),
+    }
+    .insert(database)
+    .await
+    .map_err(map_endpoint_insert_error)?;
+    endpoint_address::ActiveModel {
+        id: Set(uuid::Uuid::now_v7()),
+        endpoint_id: Set(endpoint_id.into_uuid()),
+        address: Set(domain.address().to_string()),
+        is_active: Set(true),
+        created_at: Set(domain.created_at()),
+        retired_at: Set(None),
+    }
+    .insert(database)
+    .await
+    .map_err(map_endpoint_insert_error)?;
+
+    let (trust_mode, certificate_sha256, certificate_der, trusted_at) = match domain.trust() {
+        TlsTrust::SystemCa {
+            certificate,
+            verified_at,
+        } => (
+            endpoint_trust::TrustMode::SystemCa,
+            Some(certificate.fingerprint().into_bytes().to_vec()),
+            Some(certificate.certificate_der().to_vec()),
+            *verified_at,
+        ),
+        TlsTrust::PinnedCertificate {
+            certificate,
+            trusted_at,
+        } => (
+            endpoint_trust::TrustMode::PinnedCertificate,
+            Some(certificate.fingerprint().into_bytes().to_vec()),
+            Some(certificate.certificate_der().to_vec()),
+            *trusted_at,
+        ),
+    };
+    endpoint_trust::ActiveModel {
+        endpoint_id: Set(endpoint_id.into_uuid()),
+        trust_mode: Set(trust_mode),
+        certificate_sha256: Set(certificate_sha256),
+        certificate_der: Set(certificate_der),
+        trusted_at: Set(trusted_at),
+    }
+    .insert(database)
+    .await
+    .map_err(map_endpoint_insert_error)?;
+    endpoint_credential::ActiveModel {
+        endpoint_id: Set(endpoint_id.into_uuid()),
+        credential_id: Set(credential_id.into_uuid()),
+        assigned_at: Set(domain.updated_at()),
+    }
+    .insert(database)
+    .await
+    .map_err(map_endpoint_insert_error)?;
+    Ok(())
 }
 
 async fn map_stored_endpoint<C>(
@@ -317,6 +369,15 @@ fn map_endpoint_insert_error(error: DbErr) -> EndpointRepositoryError {
     }
 }
 
+fn map_capability_snapshot_error(source: InvalidCapabilitySnapshot) -> EndpointRepositoryError {
+    match source {
+        InvalidCapabilitySnapshot::Empty => EndpointRepositoryError::EmptyCapabilitySnapshot,
+        InvalidCapabilitySnapshot::Duplicate { capability } => {
+            EndpointRepositoryError::DuplicateCapability { capability }
+        }
+    }
+}
+
 /// A controlled failure while creating or reading managed endpoints.
 #[derive(Debug, Error)]
 pub enum EndpointRepositoryError {
@@ -324,6 +385,10 @@ pub enum EndpointRepositoryError {
     Coordinate(#[source] tokio::sync::AcquireError),
     #[error("endpoint identity or address already exists")]
     AlreadyExists,
+    #[error("discovered endpoint capability snapshot cannot be empty")]
+    EmptyCapabilitySnapshot,
+    #[error("discovered endpoint capability snapshot repeats {capability}")]
+    DuplicateCapability { capability: EndpointCapability },
     #[error("credential {credential_id} was not found")]
     CredentialNotFound { credential_id: CredentialId },
     #[error("credential {credential_id} has no active encrypted version")]
@@ -380,7 +445,8 @@ mod tests {
     use std::error::Error;
 
     use rutilus_domain::{
-        CredentialName, CredentialUsername, CredentialVersionId, EndpointDisplayName,
+        CapabilityState, CredentialName, CredentialUsername, CredentialVersionId,
+        EndpointDisplayName,
     };
     use rutilus_security::{MasterKey, encrypt_credential};
     use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait};
@@ -411,6 +477,130 @@ mod tests {
         assert_eq!(store.find_endpoint(system_ca.id()).await?, Some(system_ca));
         assert_eq!(store.find_endpoint(pinned.id()).await?, Some(pinned));
         assert!(store.find_endpoint(EndpointId::generate()).await?.is_none());
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn creates_a_discovered_endpoint_and_capabilities_in_one_transaction()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, credential_id) =
+            store_with_credential("discovered endpoint").await?;
+        let endpoint = test_endpoint(
+            credential_id,
+            "Discovered BMC",
+            "https://192.0.2.12",
+            TrustFixture::SystemCa,
+        )?;
+        let observations = [
+            EndpointCapabilityObservation::new(
+                EndpointCapability::Systems,
+                CapabilityState::Supported,
+            ),
+            EndpointCapabilityObservation::new(
+                EndpointCapability::Managers,
+                CapabilityState::Unauthorized,
+            ),
+        ];
+
+        assert_eq!(
+            store
+                .create_discovered_endpoint(endpoint.clone(), &observations)
+                .await?,
+            endpoint
+        );
+        assert_eq!(
+            store.find_endpoint(endpoint.id()).await?,
+            Some(endpoint.clone())
+        );
+        let stored = store
+            .find_endpoint_capabilities(endpoint.id())
+            .await?
+            .ok_or("stored endpoint capabilities are missing")?;
+        assert_eq!(stored.len(), observations.len());
+        assert!(
+            stored
+                .iter()
+                .all(|capability| capability.observed_at() == endpoint.updated_at())
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| stored.iter().any(|item| item.observation() == *observation))
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_discovery_rolls_back_the_complete_endpoint() -> Result<(), Box<dyn Error>> {
+        let (directory, store, credential_id) = store_with_credential("atomic discovery").await?;
+        let existing = test_endpoint(
+            credential_id,
+            "Existing BMC",
+            "https://192.0.2.13",
+            TrustFixture::SystemCa,
+        )?;
+        store.create_endpoint(existing).await?;
+        let duplicate = test_endpoint(
+            credential_id,
+            "Duplicate BMC",
+            "https://192.0.2.13",
+            TrustFixture::Pinned,
+        )?;
+        let duplicate_id = duplicate.id();
+        let observation = EndpointCapabilityObservation::new(
+            EndpointCapability::Systems,
+            CapabilityState::Supported,
+        );
+
+        assert!(matches!(
+            store
+                .create_discovered_endpoint(duplicate, &[observation])
+                .await,
+            Err(EndpointRepositoryError::AlreadyExists)
+        ));
+        assert!(store.find_endpoint(duplicate_id).await?.is_none());
+        assert!(
+            store
+                .find_endpoint_capabilities(duplicate_id)
+                .await?
+                .is_none()
+        );
+
+        let invalid = test_endpoint(
+            credential_id,
+            "Invalid discovery",
+            "https://192.0.2.14",
+            TrustFixture::SystemCa,
+        )?;
+        let invalid_id = invalid.id();
+        assert!(matches!(
+            store.create_discovered_endpoint(invalid, &[]).await,
+            Err(EndpointRepositoryError::EmptyCapabilitySnapshot)
+        ));
+        assert!(store.find_endpoint(invalid_id).await?.is_none());
+
+        let repeated_capability = test_endpoint(
+            credential_id,
+            "Repeated capability",
+            "https://192.0.2.15",
+            TrustFixture::SystemCa,
+        )?;
+        let repeated_capability_id = repeated_capability.id();
+        assert!(matches!(
+            store
+                .create_discovered_endpoint(repeated_capability, &[observation, observation])
+                .await,
+            Err(EndpointRepositoryError::DuplicateCapability {
+                capability: EndpointCapability::Systems,
+            })
+        ));
+        assert!(store.find_endpoint(repeated_capability_id).await?.is_none());
 
         store.close().await?;
         drop(directory);
