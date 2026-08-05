@@ -1,12 +1,18 @@
 #![forbid(unsafe_code)]
 
 mod audit_log;
+mod endpoint_csv;
 mod endpoint_enrollment;
 mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_trust;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
+pub use endpoint_csv::{
+    ENDPOINT_CSV_HEADERS, ENDPOINT_CSV_MAX_BYTES, ENDPOINT_CSV_MAX_ROWS, EndpointCsvImport,
+    EndpointCsvImportError, EndpointCsvRequiredField, EndpointCsvRow, EndpointImportTrust,
+    parse_endpoint_csv,
+};
 pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
 pub use endpoint_onboarding::{
     AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture, Clock,
