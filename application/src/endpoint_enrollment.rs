@@ -5,10 +5,34 @@ use thiserror::Error;
 
 use crate::{
     AuditEventWriter, AuditedEndpointOnboarding, AuditedEndpointRefresh,
-    AuditedEndpointRefreshError, AuditedOnboardEndpointError, Clock, CoreResourceReader,
-    CredentialResolver, DiscoveredEndpointRepository, EndpointRefreshRepository,
-    OnboardEndpointRequest, OnboardedEndpoint, RedfishDiscovery,
+    AuditedEndpointRefreshError, AuditedOnboardEndpointError, BoundaryFuture, Clock,
+    CoreResourceReader, CredentialResolver, DiscoveredEndpointRepository,
+    EndpointRefreshRepository, OnboardEndpointRequest, OnboardedEndpoint, RedfishDiscovery,
 };
+
+/// Enrolls one already trusted endpoint and returns its stable identity.
+pub trait EndpointEnroller: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn enroll(
+        &self,
+        request: OnboardEndpointRequest,
+    ) -> BoundaryFuture<'_, Result<EndpointId, Self::Error>>;
+}
+
+impl<Enroller> EndpointEnroller for &Enroller
+where
+    Enroller: EndpointEnroller + ?Sized,
+{
+    type Error = Enroller::Error;
+
+    fn enroll(
+        &self,
+        request: OnboardEndpointRequest,
+    ) -> BoundaryFuture<'_, Result<EndpointId, Self::Error>> {
+        Enroller::enroll(*self, request)
+    }
+}
 
 /// A newly persisted endpoint together with its first complete resource
 /// Generation.
@@ -149,6 +173,35 @@ where
     }
 }
 
+impl<Repository, Credentials, Gateway, Time> EndpointEnroller
+    for EndpointEnrollment<Repository, Credentials, Gateway, Time>
+where
+    Repository: DiscoveredEndpointRepository + EndpointRefreshRepository + AuditEventWriter,
+    Credentials: CredentialResolver,
+    Gateway: RedfishDiscovery + CoreResourceReader,
+    Time: Clock,
+{
+    type Error = EndpointEnrollmentError<
+        Credentials::Error,
+        <Gateway as RedfishDiscovery>::Error,
+        <Repository as DiscoveredEndpointRepository>::Error,
+        <Repository as EndpointRefreshRepository>::Error,
+        <Gateway as CoreResourceReader>::Error,
+        <Repository as AuditEventWriter>::Error,
+    >;
+
+    fn enroll(
+        &self,
+        request: OnboardEndpointRequest,
+    ) -> BoundaryFuture<'_, Result<EndpointId, Self::Error>> {
+        Box::pin(async move {
+            self.execute(request)
+                .await
+                .map(|enrolled| enrolled.onboarded().endpoint().id())
+        })
+    }
+}
+
 /// A controlled failure before or after an endpoint becomes persistent.
 #[derive(Debug, Error)]
 pub enum EndpointEnrollmentError<
@@ -246,6 +299,8 @@ mod tests {
     #[tokio::test]
     async fn creates_endpoint_then_commits_its_first_complete_generation()
     -> Result<(), Box<dyn Error>> {
+        fn assert_enroller<Enroller: EndpointEnroller>(_enroller: &Enroller) {}
+
         let state = Arc::new(Mutex::new(MockState::default()));
         let now = OffsetDateTime::now_utc();
         let service = EndpointEnrollment::new(
@@ -256,6 +311,7 @@ mod tests {
             AuditActor::LocalOperator,
             DeploymentPosture::Standalone,
         );
+        assert_enroller(&service);
 
         let enrolled = service
             .execute(request(CredentialId::generate(), now)?)

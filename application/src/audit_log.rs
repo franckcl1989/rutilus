@@ -1,6 +1,9 @@
 use std::error::Error;
 
-use rutilus_domain::{AuditEvent, AuditEventError, AuditOperationContextError, AuditSequenceError};
+use rutilus_domain::{
+    AuditEvent, AuditEventError, AuditOperationContextError, AuditParameterSummaryError,
+    AuditSequenceError,
+};
 use thiserror::Error;
 
 use crate::BoundaryFuture;
@@ -37,6 +40,8 @@ pub enum AuditRecordError<AuditError>
 where
     AuditError: Error + 'static,
 {
+    #[error("audit operation parameters are invalid: {0}")]
+    Parameters(#[source] AuditParameterSummaryError),
     #[error("audit operation context is invalid: {0}")]
     Context(#[source] AuditOperationContextError),
     #[error("audit sequence cannot advance: {0}")]
@@ -113,6 +118,13 @@ mod tests {
         append_through(&&writer, &event).await?;
 
         assert_eq!(write_count.load(Ordering::Relaxed), 2);
+        let parameter_error = AuditParameterSummary::csv_endpoint_import(0)
+            .err()
+            .ok_or_else(|| std::io::Error::other("empty import parameters were accepted"))?;
+        assert_eq!(
+            AuditRecordError::<WriterError>::Parameters(parameter_error).to_string(),
+            "audit operation parameters are invalid: an audited CSV import must contain at least one row"
+        );
         Ok(())
     }
 }

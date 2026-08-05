@@ -80,17 +80,25 @@ impl EndpointCsvRow {
 
 /// A bounded endpoint import whose records have all passed domain validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EndpointCsvImport(Vec<EndpointCsvRow>);
+pub struct EndpointCsvImport {
+    row_count: u32,
+    rows: Vec<EndpointCsvRow>,
+}
 
 impl EndpointCsvImport {
     #[must_use]
+    pub const fn row_count(&self) -> u32 {
+        self.row_count
+    }
+
+    #[must_use]
     pub fn rows(&self) -> &[EndpointCsvRow] {
-        &self.0
+        &self.rows
     }
 
     #[must_use]
     pub fn into_rows(self) -> Vec<EndpointCsvRow> {
-        self.0
+        self.rows
     }
 }
 
@@ -150,7 +158,10 @@ pub fn parse_endpoint_csv(input: &[u8]) -> Result<EndpointCsvImport, EndpointCsv
     if rows.is_empty() {
         return Err(EndpointCsvImportError::NoDataRows);
     }
-    Ok(EndpointCsvImport(rows))
+    let row_count = u32::try_from(rows.len()).map_err(|_| EndpointCsvImportError::TooManyRows {
+        maximum: ENDPOINT_CSV_MAX_ROWS,
+    })?;
+    Ok(EndpointCsvImport { row_count, rows })
 }
 
 fn has_expected_headers(headers: &StringRecord) -> bool {
@@ -301,6 +312,7 @@ mod tests {
         );
 
         let parsed = parse_endpoint_csv(input.as_bytes())?;
+        assert_eq!(parsed.row_count(), 2);
         assert_eq!(parsed.rows().len(), 2);
         assert_eq!(parsed.rows()[0].record_number(), 2);
         assert_eq!(parsed.rows()[0].display_name().as_str(), "Rack, East");

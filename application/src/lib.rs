@@ -2,6 +2,7 @@
 
 mod audit_log;
 mod endpoint_csv;
+mod endpoint_csv_import;
 mod endpoint_enrollment;
 mod endpoint_onboarding;
 mod endpoint_refresh;
@@ -13,7 +14,13 @@ pub use endpoint_csv::{
     EndpointCsvImportError, EndpointCsvRequiredField, EndpointCsvRow, EndpointImportTrust,
     parse_endpoint_csv,
 };
-pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
+pub use endpoint_csv_import::{
+    EndpointCsvImportAuditStage, EndpointCsvImportExecutionError, EndpointCsvImportExecutor,
+    EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult,
+};
+pub use endpoint_enrollment::{
+    EndpointEnroller, EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint,
+};
 pub use endpoint_onboarding::{
     AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture, Clock,
     CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery, EndpointOnboarding,
