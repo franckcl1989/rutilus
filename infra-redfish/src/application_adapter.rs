@@ -1,8 +1,30 @@
-use rutilus_application::{BoundaryFuture, EndpointDiscovery, RedfishDiscovery};
+use rutilus_application::{
+    BoundaryFuture, EndpointDiscovery, RedfishDiscovery, SystemCaEvaluation,
+    TlsIdentityObservation, TlsIdentityProbe,
+};
 use rutilus_domain::{CredentialUsername, EndpointAddress, TlsTrust};
 use secrecy::SecretString;
 
-use crate::{RedfishGateway, RedfishServiceRootError};
+use crate::{RedfishGateway, RedfishServiceRootError, SystemCaStatus, TlsProbeError};
+
+impl TlsIdentityProbe for RedfishGateway {
+    type Error = TlsProbeError;
+
+    fn observe<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+    ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+        Box::pin(async move {
+            let observation = RedfishGateway::observe_tls(self, address).await?;
+            let (certificate, system_ca_status) = observation.into_parts();
+            let system_ca = match system_ca_status {
+                SystemCaStatus::Verified => SystemCaEvaluation::Verified,
+                SystemCaStatus::Rejected => SystemCaEvaluation::Rejected,
+            };
+            Ok(TlsIdentityObservation::new(certificate, system_ca))
+        })
+    }
+}
 
 impl RedfishDiscovery for RedfishGateway {
     type Error = RedfishServiceRootError;
@@ -25,7 +47,7 @@ impl RedfishDiscovery for RedfishGateway {
 
 #[cfg(test)]
 mod tests {
-    use rutilus_application::RedfishDiscovery;
+    use rutilus_application::{RedfishDiscovery, TlsIdentityProbe};
 
     use crate::RedfishGateway;
 
@@ -34,5 +56,12 @@ mod tests {
         fn assert_discovery<Gateway: RedfishDiscovery>() {}
 
         assert_discovery::<RedfishGateway>();
+    }
+
+    #[test]
+    fn gateway_implements_the_application_tls_identity_boundary() {
+        fn assert_tls_identity_probe<Gateway: TlsIdentityProbe>() {}
+
+        assert_tls_identity_probe::<RedfishGateway>();
     }
 }
