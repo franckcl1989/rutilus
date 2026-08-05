@@ -2479,7 +2479,16 @@ name = "rutilus"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rutilus-application",
+ "rutilus-domain",
  "rutilus-infra-redfish",
+ "rutilus-persistence",
+ "rutilus-security",
+ "secrecy",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
 ]
 
 [[package]]

@@ -50,6 +50,61 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
 
+impl<Resolver> CredentialResolver for &Resolver
+where
+    Resolver: CredentialResolver + ?Sized,
+{
+    type Error = Resolver::Error;
+
+    fn resolve(
+        &self,
+        credential_id: CredentialId,
+    ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
+        Resolver::resolve(*self, credential_id)
+    }
+}
+
+impl<Gateway> RedfishDiscovery for &Gateway
+where
+    Gateway: RedfishDiscovery + ?Sized,
+{
+    type Error = Gateway::Error;
+
+    fn probe_core_capabilities<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+        Gateway::probe_core_capabilities(*self, address, trust, username, password)
+    }
+}
+
+impl<Repository> DiscoveredEndpointRepository for &Repository
+where
+    Repository: DiscoveredEndpointRepository + ?Sized,
+{
+    type Error = Repository::Error;
+
+    fn create_discovered_endpoint<'a>(
+        &'a self,
+        endpoint: Endpoint,
+        observations: &'a [EndpointCapabilityObservation],
+    ) -> BoundaryFuture<'a, Result<Endpoint, Self::Error>> {
+        Repository::create_discovered_endpoint(*self, endpoint, observations)
+    }
+}
+
+impl<Time> Clock for &Time
+where
+    Time: Clock + ?Sized,
+{
+    fn now(&self) -> OffsetDateTime {
+        Time::now(*self)
+    }
+}
+
 /// A selected username and its in-memory-only plaintext secret.
 pub struct ResolvedCredential {
     username: CredentialUsername,

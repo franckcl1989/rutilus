@@ -7,7 +7,18 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+rutilus-application.workspace = true
+rutilus-domain.workspace = true
 rutilus-infra-redfish.workspace = true
+rutilus-persistence.workspace = true
+rutilus-security.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+secrecy.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
