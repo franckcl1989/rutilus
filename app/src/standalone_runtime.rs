@@ -1,13 +1,22 @@
 use std::{
     future::Future,
-    io,
+    io::{self, ErrorKind},
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
 };
 
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
+use rutilus_persistence::{CloseStoreError, OpenStoreError, SqliteStore};
+use rutilus_platform::{
+    InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
+    MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
+};
+use rutilus_security::{MasterKey, MasterKeyProtectionError, recover_master_key};
 use rutilus_web::WebProductInfo;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::oneshot};
+
+use crate::StandaloneUnlock;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,6 +42,91 @@ impl Default for StandaloneRunOptions {
     fn default() -> Self {
         Self::new(true)
     }
+}
+
+/// A fully authenticated Standalone instance held exclusively for one process.
+pub struct StandaloneInstance {
+    store: SqliteStore,
+    _master_key: MasterKey,
+    _runtime_lock: RuntimeLock,
+}
+
+impl StandaloneInstance {
+    /// Authenticates and opens a completed instance without recreating missing
+    /// database state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StandaloneInstanceError`] for lock contention, missing or invalid
+    /// initialization state, master-key authentication, or database open/migration.
+    pub async fn open(
+        paths: &RuntimePaths,
+        unlock: &StandaloneUnlock,
+    ) -> Result<Self, StandaloneInstanceError> {
+        let runtime_lock = RuntimeLock::acquire(paths.runtime_lock_path())
+            .map_err(StandaloneInstanceError::RuntimeLock)?;
+        let marker = InstanceMarkerFile::new(paths.instance_marker_path());
+        match marker.state().map_err(StandaloneInstanceError::Marker)? {
+            InstanceMarkerState::Missing => return Err(StandaloneInstanceError::NotInitialized),
+            InstanceMarkerState::Complete => {}
+        }
+        require_existing_database(paths.database_path())?;
+        let protected = MasterKeyFile::new(paths.master_key_path())
+            .load()
+            .map_err(StandaloneInstanceError::MasterKeyFile)?;
+        let master_key = recover_master_key(&protected, unlock.passphrase())
+            .map_err(StandaloneInstanceError::MasterKeyProtection)?;
+        let store = SqliteStore::open(paths.database_path())
+            .await
+            .map_err(StandaloneInstanceError::OpenStore)?;
+        Ok(Self {
+            store,
+            _master_key: master_key,
+            _runtime_lock: runtime_lock,
+        })
+    }
+
+    #[must_use]
+    pub fn database_path(&self) -> &std::path::Path {
+        self.store.database_path()
+    }
+
+    /// Closes `SQLite` before releasing the master key and process lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloseStoreError`] when coordinated `SQLite` shutdown fails.
+    pub async fn close(self) -> Result<(), CloseStoreError> {
+        let Self {
+            store,
+            _master_key,
+            _runtime_lock,
+        } = self;
+        store.close().await
+    }
+}
+
+fn require_existing_database(path: &std::path::Path) -> Result<(), StandaloneInstanceError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(StandaloneInstanceError::DatabaseMissing {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(StandaloneInstanceError::InspectDatabase {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StandaloneInstanceError::DatabaseNotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// A socket already bound to an OS-assigned port on IPv4 loopback only.
@@ -126,6 +220,31 @@ pub async fn run_standalone(options: StandaloneRunOptions) -> Result<(), Standal
     }
 }
 
+/// Opens an initialized instance, serves until Ctrl-C, closes `SQLite`, and only
+/// then releases the process lock and master key.
+///
+/// # Errors
+///
+/// Returns [`StandaloneExecutionError`] while preserving both server and close
+/// failures if they occur during the same shutdown.
+pub async fn run_initialized_standalone(
+    paths: &RuntimePaths,
+    unlock: &StandaloneUnlock,
+    options: StandaloneRunOptions,
+) -> Result<(), StandaloneExecutionError> {
+    let instance = StandaloneInstance::open(paths, unlock)
+        .await
+        .map_err(StandaloneExecutionError::Open)?;
+    let run_result = run_standalone(options).await;
+    let close_result = instance.close().await;
+    match (run_result, close_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(source), Ok(())) => Err(StandaloneExecutionError::Run(source)),
+        (Ok(()), Err(source)) => Err(StandaloneExecutionError::Close(source)),
+        (Err(run), Err(close)) => Err(StandaloneExecutionError::RunAndClose { run, close }),
+    }
+}
+
 async fn launch_browser(url: String) {
     let result = tokio::task::spawn_blocking(move || webbrowser::open(&url)).await;
     match result {
@@ -148,6 +267,49 @@ pub enum StandaloneRunError {
     Serve(#[source] io::Error),
 }
 
+/// A controlled failure while authenticating and opening an initialized instance.
+#[derive(Debug, Error)]
+pub enum StandaloneInstanceError {
+    #[error("failed to acquire exclusive runtime ownership: {0}")]
+    RuntimeLock(#[source] RuntimeLockError),
+    #[error("failed to read the instance completion marker: {0}")]
+    Marker(#[source] InstanceMarkerError),
+    #[error("Rutilus Standalone is not initialized in the selected data directory")]
+    NotInitialized,
+    #[error("initialized Standalone database is missing at {path}")]
+    DatabaseMissing { path: PathBuf },
+    #[error("failed to inspect initialized Standalone database at {path}: {source}")]
+    InspectDatabase {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("initialized Standalone database is not a regular non-symlink file: {path}")]
+    DatabaseNotRegular { path: PathBuf },
+    #[error("failed to load the protected Standalone master key: {0}")]
+    MasterKeyFile(#[source] MasterKeyFileError),
+    #[error("failed to authenticate the Standalone master key: {0}")]
+    MasterKeyProtection(#[source] MasterKeyProtectionError),
+    #[error("failed to open the initialized Standalone database: {0}")]
+    OpenStore(#[source] OpenStoreError),
+}
+
+/// A controlled failure across authenticated open, foreground serving, and close.
+#[derive(Debug, Error)]
+pub enum StandaloneExecutionError {
+    #[error("failed to open initialized Standalone state: {0}")]
+    Open(#[source] StandaloneInstanceError),
+    #[error("Standalone server failed: {0}")]
+    Run(#[source] StandaloneRunError),
+    #[error("Standalone server stopped but SQLite shutdown failed: {0}")]
+    Close(#[source] CloseStoreError),
+    #[error("Standalone server and SQLite shutdown both failed (server: {run}; close: {close})")]
+    RunAndClose {
+        run: StandaloneRunError,
+        close: CloseStoreError,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -158,6 +320,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::{StandaloneUnlock, initialize_standalone};
+    use secrecy::SecretString;
 
     #[tokio::test]
     async fn binds_only_loopback_and_serves_until_tracked_shutdown() -> Result<(), Box<dyn Error>> {
@@ -197,5 +361,108 @@ mod tests {
     fn standalone_options_default_to_browser_launch() {
         assert!(StandaloneRunOptions::default().open_browser());
         assert!(!StandaloneRunOptions::new(false).open_browser());
+    }
+
+    fn unlock(value: &str) -> Result<StandaloneUnlock, crate::StandaloneUnlockError> {
+        StandaloneUnlock::existing(SecretString::from(value.to_owned()))
+    }
+
+    #[tokio::test]
+    async fn opens_only_complete_authenticated_instance_state() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let correct = unlock("correct local unlock phrase")?;
+        let wrong = unlock("incorrect local unlock phrase")?;
+
+        assert!(matches!(
+            StandaloneInstance::open(&paths, &correct).await,
+            Err(StandaloneInstanceError::NotInitialized)
+        ));
+        assert!(matches!(
+            run_initialized_standalone(&paths, &correct, StandaloneRunOptions::new(false)).await,
+            Err(StandaloneExecutionError::Open(
+                StandaloneInstanceError::NotInitialized
+            ))
+        ));
+        initialize_standalone(&paths, &correct).await?;
+        assert!(matches!(
+            StandaloneInstance::open(&paths, &wrong).await,
+            Err(StandaloneInstanceError::MasterKeyProtection(
+                MasterKeyProtectionError::AuthenticationFailed
+            ))
+        ));
+
+        let instance = StandaloneInstance::open(&paths, &correct).await?;
+        assert_eq!(instance.database_path(), paths.database_path());
+        assert!(matches!(
+            StandaloneInstance::open(&paths, &correct).await,
+            Err(StandaloneInstanceError::RuntimeLock(
+                RuntimeLockError::AlreadyHeld { .. }
+            ))
+        ));
+        instance.close().await?;
+        StandaloneInstance::open(&paths, &correct)
+            .await?
+            .close()
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn never_recreates_a_missing_initialized_database() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        std::fs::remove_file(paths.database_path())?;
+
+        assert!(matches!(
+            StandaloneInstance::open(&paths, &unlock).await,
+            Err(StandaloneInstanceError::DatabaseMissing { .. })
+        ));
+        assert!(!paths.database_path().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_corrupt_or_incomplete_initialized_state() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let marker_paths = RuntimePaths::from_root(directory.path().join("invalid-marker"))?;
+        let key_paths = RuntimePaths::from_root(directory.path().join("missing-key"))?;
+        let database_paths = RuntimePaths::from_root(directory.path().join("invalid-database"))?;
+        let corrupt_database_paths =
+            RuntimePaths::from_root(directory.path().join("corrupt-database"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&marker_paths, &unlock).await?;
+        initialize_standalone(&key_paths, &unlock).await?;
+        initialize_standalone(&database_paths, &unlock).await?;
+        initialize_standalone(&corrupt_database_paths, &unlock).await?;
+
+        std::fs::write(marker_paths.instance_marker_path(), b"invalid marker")?;
+        std::fs::remove_file(key_paths.master_key_path())?;
+        std::fs::remove_file(database_paths.database_path())?;
+        std::fs::create_dir(database_paths.database_path())?;
+        std::fs::write(
+            corrupt_database_paths.database_path(),
+            b"not a SQLite database",
+        )?;
+
+        assert!(matches!(
+            StandaloneInstance::open(&marker_paths, &unlock).await,
+            Err(StandaloneInstanceError::Marker(_))
+        ));
+        assert!(matches!(
+            StandaloneInstance::open(&key_paths, &unlock).await,
+            Err(StandaloneInstanceError::MasterKeyFile(_))
+        ));
+        assert!(matches!(
+            StandaloneInstance::open(&database_paths, &unlock).await,
+            Err(StandaloneInstanceError::DatabaseNotRegular { .. })
+        ));
+        assert!(matches!(
+            StandaloneInstance::open(&corrupt_database_paths, &unlock).await,
+            Err(StandaloneInstanceError::OpenStore(_))
+        ));
+        Ok(())
     }
 }

@@ -22,6 +22,17 @@ const MAXIMUM_PASSPHRASE_BYTES: usize = 1024;
 pub struct StandaloneUnlock(SecretString);
 
 impl StandaloneUnlock {
+    /// Validates one passphrase entered to unlock an existing instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StandaloneUnlockError`] when the value falls outside the
+    /// bounded local-unlock policy.
+    pub fn existing(passphrase: SecretString) -> Result<Self, StandaloneUnlockError> {
+        validate_passphrase(&passphrase)?;
+        Ok(Self(passphrase))
+    }
+
     /// Validates two independently entered passphrases before any instance state
     /// is created or changed.
     ///
@@ -34,21 +45,27 @@ impl StandaloneUnlock {
         confirmation: &SecretString,
     ) -> Result<Self, StandaloneUnlockError> {
         let exposed = passphrase.expose_secret();
-        if exposed.len() > MAXIMUM_PASSPHRASE_BYTES {
-            return Err(StandaloneUnlockError::TooLong);
-        }
-        if exposed.chars().count() < MINIMUM_PASSPHRASE_CHARACTERS {
-            return Err(StandaloneUnlockError::TooShort);
-        }
+        validate_passphrase(&passphrase)?;
         if exposed != confirmation.expose_secret() {
             return Err(StandaloneUnlockError::ConfirmationMismatch);
         }
         Ok(Self(passphrase))
     }
 
-    fn passphrase(&self) -> &SecretString {
+    pub(crate) fn passphrase(&self) -> &SecretString {
         &self.0
     }
+}
+
+fn validate_passphrase(passphrase: &SecretString) -> Result<(), StandaloneUnlockError> {
+    let exposed = passphrase.expose_secret();
+    if exposed.len() > MAXIMUM_PASSPHRASE_BYTES {
+        return Err(StandaloneUnlockError::TooLong);
+    }
+    if exposed.chars().count() < MINIMUM_PASSPHRASE_CHARACTERS {
+        return Err(StandaloneUnlockError::TooShort);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for StandaloneUnlock {
@@ -313,6 +330,7 @@ mod tests {
         let long_value = "x".repeat(MAXIMUM_PASSPHRASE_BYTES + 1);
         let too_long = StandaloneUnlock::confirm(long_value.clone().into(), &long_value.into());
         let accepted = unlock("accepted local unlock phrase");
+        let existing = StandaloneUnlock::existing("existing local unlock phrase".to_owned().into());
 
         assert!(matches!(&too_short, Err(StandaloneUnlockError::TooShort)));
         assert!(matches!(
@@ -324,6 +342,7 @@ mod tests {
             format!("{:?}", accepted.as_ref().ok()),
             "Some(StandaloneUnlock([REDACTED]))"
         );
+        assert!(existing.is_ok());
         for message in [
             too_short.err().map(|error| error.to_string()),
             mismatch.err().map(|error| error.to_string()),

@@ -14,5 +14,6 @@ pub use onboarding_runtime::{
     trusted_endpoint_enrollment,
 };
 pub use standalone_runtime::{
-    StandaloneBinding, StandaloneRunError, StandaloneRunOptions, run_standalone,
+    StandaloneBinding, StandaloneExecutionError, StandaloneInstance, StandaloneInstanceError,
+    StandaloneRunError, StandaloneRunOptions, run_initialized_standalone, run_standalone,
 };
