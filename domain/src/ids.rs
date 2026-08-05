@@ -57,10 +57,14 @@ define_id!(
     CredentialVersionId,
     "The stable identity of one immutable encrypted credential version."
 );
+define_id!(
+    ResourceId,
+    "The stable local identity of one discovered Redfish resource."
+);
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialId, CredentialVersionId, EndpointId};
+    use super::{CredentialId, CredentialVersionId, EndpointId, ResourceId};
 
     #[test]
     fn generated_identifiers_are_unique_uuid_v7_values() {
@@ -88,6 +92,14 @@ mod tests {
 
         assert_eq!(credential.to_string().parse::<CredentialId>()?, credential);
         assert_eq!(version.to_string().parse::<CredentialVersionId>()?, version);
+        Ok(())
+    }
+
+    #[test]
+    fn resource_identifier_round_trips_through_text() -> Result<(), uuid::Error> {
+        let resource = ResourceId::generate();
+
+        assert_eq!(resource.to_string().parse::<ResourceId>()?, resource);
         Ok(())
     }
 }

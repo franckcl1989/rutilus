@@ -5,6 +5,7 @@ mod credential;
 mod endpoint;
 mod endpoint_address;
 mod ids;
+mod resource_snapshot;
 
 pub use capability::{
     CapabilityClassification, CapabilityState, CapabilityStateParseError, EndpointCapability,
@@ -19,7 +20,13 @@ pub use endpoint::{
     EndpointTimelineError, TlsCertificate, TlsCertificateError, TlsIdentityChanged, TlsTrust,
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
-pub use ids::{CredentialId, CredentialVersionId, EndpointId};
+pub use ids::{CredentialId, CredentialVersionId, EndpointId, ResourceId};
+pub use resource_snapshot::{
+    RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,
+    ResourceFeatureParseError, ResourceODataId, ResourceODataIdError, ResourceODataType,
+    ResourceODataTypeError, ResourceSnapshot, ResourceSnapshotPayload,
+    ResourceSnapshotPayloadError,
+};
 
 /// The execution boundary inside the single Rutilus binary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
