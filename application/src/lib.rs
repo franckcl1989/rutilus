@@ -15,8 +15,8 @@ pub use endpoint_onboarding::{
     RedfishDiscovery, ResolvedCredential,
 };
 pub use endpoint_refresh::{
-    CoreResourceReader, EndpointRefresh, EndpointRefreshError, EndpointRefreshRepository,
-    ResourceObservation,
+    AuditedEndpointRefresh, AuditedEndpointRefreshError, CoreResourceReader, EndpointRefresh,
+    EndpointRefreshError, EndpointRefreshRepository, RefreshAuditStage, ResourceObservation,
 };
 pub use endpoint_trust::{
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustTimelineError,
