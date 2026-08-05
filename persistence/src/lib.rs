@@ -19,6 +19,7 @@ mod endpoint_capability_repository;
 mod endpoint_repository;
 mod resource_snapshot_repository;
 
+pub use application_adapter::EndpointRefreshPersistenceError;
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };
