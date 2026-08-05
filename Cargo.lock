@@ -2803,6 +2803,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rutilus-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rutilus-application"
 version = "0.1.0"
 dependencies = [
@@ -2914,7 +2922,7 @@ dependencies = [
  "axum",
  "http-body-util",
  "rust-embed",
- "serde",
+ "rutilus-api",
  "serde_json",
  "tokio",
  "tower",

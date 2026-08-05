@@ -14,7 +14,7 @@ use axum::{
     routing::get,
 };
 use rust_embed::RustEmbed;
-use serde::Serialize;
+use rutilus_api::{AboutResponse, HealthResponse};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
@@ -88,28 +88,16 @@ pub fn router(product: WebProductInfo) -> Router {
         ))
 }
 
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-}
-
 async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
-}
-
-#[derive(Serialize)]
-struct AboutResponse {
-    product: &'static str,
-    product_version: &'static str,
-    nv_redfish_baseline: &'static str,
+    Json(HealthResponse::healthy())
 }
 
 async fn about(State(product): State<WebProductInfo>) -> Json<AboutResponse> {
-    Json(AboutResponse {
-        product: "rutilus",
-        product_version: product.product_version(),
-        nv_redfish_baseline: product.nv_redfish_baseline(),
-    })
+    Json(AboutResponse::new(
+        "rutilus".to_owned(),
+        product.product_version().to_owned(),
+        product.nv_redfish_baseline().to_owned(),
+    ))
 }
 
 async fn static_asset(uri: Uri) -> Response {
