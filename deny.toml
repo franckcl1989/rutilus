@@ -31,6 +31,9 @@ deny = [
     { crate = "redis", reason = "Rutilus does not use an external cache or queue" },
     { crate = "tokio-postgres", reason = "Rutilus uses embedded SQLite only" },
 ]
+skip = [
+    { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
+]
 
 [sources]
 unknown-registry = "deny"

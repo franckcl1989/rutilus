@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod endpoint_address;
 mod ids;
 
+pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{CredentialId, CredentialVersionId, EndpointId};
 
 /// The upstream version used as the starting point for product development.

@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 clap = { version = "4.6.5", features = ["derive"] }
 rutilus-domain = { path = "domain", version = "0.1.0" }
+url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
 
 [workspace.lints.rust]
