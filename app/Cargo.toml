@@ -8,19 +8,21 @@ publish.workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+console.workspace = true
 rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-infra-redfish.workspace = true
 rutilus-persistence.workspace = true
+rutilus-platform.workspace = true
 rutilus-security.workspace = true
 rutilus-web.workspace = true
+secrecy.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 webbrowser.workspace = true
 
 [dev-dependencies]
-secrecy.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

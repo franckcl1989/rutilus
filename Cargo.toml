@@ -14,6 +14,7 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "ze
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.5", features = ["derive"] }
+console = { version = "0.16.4", default-features = false, features = ["std"] }
 csv = "1.4.0"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 getrandom = "0.4.3"

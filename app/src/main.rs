@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::error::Error;
+use std::{error::Error, io};
 
 use clap::{Parser, Subcommand};
-use rutilus::{StandaloneRunOptions, run_standalone};
+use console::Term;
+use rutilus::{StandaloneRunOptions, StandaloneUnlock, initialize_standalone, run_standalone};
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
+use rutilus_platform::DataLocation;
+use secrecy::SecretString;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -17,6 +20,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize a protected Standalone data directory.
+    Init {
+        /// Store data beside the executable instead of the installed user-data location.
+        #[arg(long)]
+        portable: bool,
+    },
     /// Run the foreground Standalone Web console on an ephemeral loopback port.
     Run {
         /// Do not open the system default browser after binding succeeds.
@@ -32,12 +41,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Init { portable } => initialize(portable).await?,
         Command::Run { no_open } => {
             run_standalone(StandaloneRunOptions::new(!no_open)).await?;
         }
         Command::Version => print_version(),
     }
     Ok(())
+}
+
+async fn initialize(portable: bool) -> Result<(), Box<dyn Error>> {
+    let location = if portable {
+        DataLocation::Portable
+    } else {
+        DataLocation::Installed
+    };
+    let paths = location.resolve()?;
+    let terminal = Term::stderr();
+    let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+    let confirmation = prompt_secret(&terminal, "Confirm local unlock passphrase: ")?;
+    let unlock = StandaloneUnlock::confirm(passphrase, &confirmation)?;
+    let outcome = initialize_standalone(&paths, &unlock).await?;
+    println!(
+        "Rutilus Standalone initialization {outcome:?} at {}",
+        paths.data_directory().display()
+    );
+    Ok(())
+}
+
+fn prompt_secret(terminal: &Term, prompt: &str) -> io::Result<SecretString> {
+    if !terminal.is_term() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "local unlock requires an interactive terminal",
+        ));
+    }
+    terminal.write_str(prompt)?;
+    terminal.flush()?;
+    terminal.read_secure_line().map(SecretString::from)
 }
 
 fn print_version() {
@@ -71,6 +112,22 @@ mod tests {
             parsed,
             Ok(Cli {
                 command: Command::Run { no_open: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_installed_and_portable_initialization() {
+        assert!(matches!(
+            Cli::try_parse_from(["rutilus", "init"]),
+            Ok(Cli {
+                command: Command::Init { portable: false }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rutilus", "init", "--portable"]),
+            Ok(Cli {
+                command: Command::Init { portable: true }
             })
         ));
     }
