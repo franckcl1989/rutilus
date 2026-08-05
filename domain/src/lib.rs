@@ -11,7 +11,7 @@ pub use credential::{
 };
 pub use endpoint::{
     CertificateFingerprint, Endpoint, EndpointDisplayName, EndpointDisplayNameError,
-    EndpointTimelineError, PinnedCertificate, PinnedCertificateError, TlsTrust,
+    EndpointTimelineError, TlsCertificate, TlsCertificateError, TlsTrust,
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{CredentialId, CredentialVersionId, EndpointId};

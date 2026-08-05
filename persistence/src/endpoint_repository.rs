@@ -1,7 +1,7 @@
 use rutilus_domain::{
     CertificateFingerprint, CredentialId, Endpoint, EndpointAddress, EndpointAddressError,
     EndpointDisplayName, EndpointDisplayNameError, EndpointId, EndpointTimelineError,
-    PinnedCertificate, PinnedCertificateError, TlsTrust,
+    TlsCertificate, TlsCertificateError, TlsTrust,
 };
 use rutilus_entity::{credential, endpoint, endpoint_address, endpoint_credential, endpoint_trust};
 use sea_orm::{
@@ -75,10 +75,13 @@ impl SqliteStore {
         .map_err(map_endpoint_insert_error)?;
 
         let (trust_mode, certificate_sha256, certificate_der, trusted_at) = match domain.trust() {
-            TlsTrust::SystemCa { verified_at } => (
+            TlsTrust::SystemCa {
+                certificate,
+                verified_at,
+            } => (
                 endpoint_trust::TrustMode::SystemCa,
-                None,
-                None,
+                Some(certificate.fingerprint().into_bytes().to_vec()),
+                Some(certificate.certificate_der().to_vec()),
                 *verified_at,
             ),
             TlsTrust::PinnedCertificate {
@@ -254,39 +257,35 @@ where
 }
 
 fn map_trust(model: endpoint_trust::Model) -> Result<TlsTrust, StoredEndpointError> {
-    match model.trust_mode {
-        endpoint_trust::TrustMode::SystemCa => {
-            if model.certificate_sha256.is_some() || model.certificate_der.is_some() {
-                return Err(StoredEndpointError::UnexpectedSystemCaCertificate);
-            }
-            Ok(TlsTrust::SystemCa {
-                verified_at: model.trusted_at,
-            })
-        }
-        endpoint_trust::TrustMode::PinnedCertificate => {
-            let fingerprint = model
-                .certificate_sha256
-                .ok_or(StoredEndpointError::PinnedFingerprintMissing)?;
-            let actual = fingerprint.len();
-            let fingerprint = fingerprint.try_into().map_err(|_| {
-                StoredEndpointError::InvalidFingerprintLength {
-                    actual,
-                    expected: CERTIFICATE_FINGERPRINT_LENGTH,
-                }
+    let fingerprint = model
+        .certificate_sha256
+        .ok_or(StoredEndpointError::CertificateFingerprintMissing)?;
+    let actual = fingerprint.len();
+    let fingerprint =
+        fingerprint
+            .try_into()
+            .map_err(|_| StoredEndpointError::InvalidFingerprintLength {
+                actual,
+                expected: CERTIFICATE_FINGERPRINT_LENGTH,
             })?;
-            let certificate_der = model
-                .certificate_der
-                .ok_or(StoredEndpointError::PinnedCertificateMissing)?;
-            let certificate = PinnedCertificate::from_parts(
-                CertificateFingerprint::from_bytes(fingerprint),
-                certificate_der,
-            )
-            .map_err(StoredEndpointError::InvalidPinnedCertificate)?;
-            Ok(TlsTrust::PinnedCertificate {
-                certificate,
-                trusted_at: model.trusted_at,
-            })
-        }
+    let certificate_der = model
+        .certificate_der
+        .ok_or(StoredEndpointError::CertificateDerMissing)?;
+    let certificate = TlsCertificate::from_parts(
+        CertificateFingerprint::from_bytes(fingerprint),
+        certificate_der,
+    )
+    .map_err(StoredEndpointError::InvalidTlsCertificate)?;
+
+    match model.trust_mode {
+        endpoint_trust::TrustMode::SystemCa => Ok(TlsTrust::SystemCa {
+            certificate,
+            verified_at: model.trusted_at,
+        }),
+        endpoint_trust::TrustMode::PinnedCertificate => Ok(TlsTrust::PinnedCertificate {
+            certificate,
+            trusted_at: model.trusted_at,
+        }),
     }
 }
 
@@ -356,16 +355,14 @@ pub enum StoredEndpointError {
     AddressOutsideTimeline,
     #[error("endpoint has no TLS trust decision")]
     TrustMissing,
-    #[error("system CA trust unexpectedly stores pinned certificate data")]
-    UnexpectedSystemCaCertificate,
-    #[error("pinned certificate fingerprint is missing")]
-    PinnedFingerprintMissing,
-    #[error("pinned certificate DER is missing")]
-    PinnedCertificateMissing,
-    #[error("pinned certificate fingerprint has {actual} bytes; expected {expected}")]
+    #[error("trusted TLS certificate fingerprint is missing")]
+    CertificateFingerprintMissing,
+    #[error("trusted TLS certificate DER is missing")]
+    CertificateDerMissing,
+    #[error("trusted TLS certificate fingerprint has {actual} bytes; expected {expected}")]
     InvalidFingerprintLength { actual: usize, expected: usize },
-    #[error("pinned certificate data is invalid: {0}")]
-    InvalidPinnedCertificate(#[source] PinnedCertificateError),
+    #[error("trusted TLS certificate data is invalid: {0}")]
+    InvalidTlsCertificate(#[source] TlsCertificateError),
     #[error("endpoint has no credential binding")]
     CredentialBindingMissing,
     #[error("endpoint credential binding timestamp is outside the endpoint timeline")]
@@ -524,8 +521,8 @@ mod tests {
         assert!(matches!(
             store.find_endpoint(endpoint_id).await,
             Err(EndpointRepositoryError::Corrupt {
-                source: StoredEndpointError::InvalidPinnedCertificate(
-                    PinnedCertificateError::FingerprintMismatch
+                source: StoredEndpointError::InvalidTlsCertificate(
+                    TlsCertificateError::FingerprintMismatch
                 ),
                 ..
             })
@@ -552,10 +549,11 @@ mod tests {
         let updated_at = created_at + Duration::SECOND;
         let trust = match trust_fixture {
             TrustFixture::SystemCa => TlsTrust::SystemCa {
+                certificate: TlsCertificate::from_der(b"test leaf certificate".to_vec())?,
                 verified_at: updated_at,
             },
             TrustFixture::Pinned => TlsTrust::PinnedCertificate {
-                certificate: PinnedCertificate::from_der(b"test leaf certificate".to_vec())?,
+                certificate: TlsCertificate::from_der(b"test leaf certificate".to_vec())?,
                 trusted_at: updated_at,
             },
         };

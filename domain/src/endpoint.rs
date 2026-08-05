@@ -123,21 +123,21 @@ impl fmt::Debug for CertificateFingerprint {
     }
 }
 
-/// An administrator-approved leaf certificate and its verified fingerprint.
+/// A TLS leaf certificate and its verified SHA-256 identity.
 #[derive(Clone, Eq, PartialEq)]
-pub struct PinnedCertificate {
+pub struct TlsCertificate {
     fingerprint: CertificateFingerprint,
     certificate_der: Vec<u8>,
 }
 
-impl PinnedCertificate {
+impl TlsCertificate {
     /// Computes the identity of certificate DER received from a TLS handshake.
     ///
     /// # Errors
     ///
-    /// Returns [`PinnedCertificateError`] when the DER is empty or exceeds the
+    /// Returns [`TlsCertificateError`] when the DER is empty or exceeds the
     /// one-megabyte defensive storage limit.
-    pub fn from_der(certificate_der: Vec<u8>) -> Result<Self, PinnedCertificateError> {
+    pub fn from_der(certificate_der: Vec<u8>) -> Result<Self, TlsCertificateError> {
         validate_certificate_length(&certificate_der)?;
         Ok(Self {
             fingerprint: fingerprint(&certificate_der),
@@ -149,15 +149,15 @@ impl PinnedCertificate {
     ///
     /// # Errors
     ///
-    /// Returns [`PinnedCertificateError`] when the DER length is invalid or its
+    /// Returns [`TlsCertificateError`] when the DER length is invalid or its
     /// computed SHA-256 identity differs from the persisted fingerprint.
     pub fn from_parts(
         fingerprint: CertificateFingerprint,
         certificate_der: Vec<u8>,
-    ) -> Result<Self, PinnedCertificateError> {
+    ) -> Result<Self, TlsCertificateError> {
         validate_certificate_length(&certificate_der)?;
         if fingerprint != self::fingerprint(&certificate_der) {
-            return Err(PinnedCertificateError::FingerprintMismatch);
+            return Err(TlsCertificateError::FingerprintMismatch);
         }
         Ok(Self {
             fingerprint,
@@ -181,10 +181,10 @@ impl PinnedCertificate {
     }
 }
 
-impl fmt::Debug for PinnedCertificate {
+impl fmt::Debug for TlsCertificate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PinnedCertificate")
+            .debug_struct("TlsCertificate")
             .field("fingerprint", &self.fingerprint)
             .field("certificate_der_bytes", &self.certificate_der.len())
             .finish()
@@ -193,37 +193,38 @@ impl fmt::Debug for PinnedCertificate {
 
 /// Why a pinned certificate cannot become trusted product state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PinnedCertificateError {
+pub enum TlsCertificateError {
     Empty,
     TooLarge { actual: usize, maximum: usize },
     FingerprintMismatch,
 }
 
-impl fmt::Display for PinnedCertificateError {
+impl fmt::Display for TlsCertificateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => formatter.write_str("pinned certificate DER cannot be empty"),
+            Self::Empty => formatter.write_str("TLS certificate DER cannot be empty"),
             Self::TooLarge { actual, maximum } => write!(
                 formatter,
-                "pinned certificate DER has {actual} bytes; maximum is {maximum}"
+                "TLS certificate DER has {actual} bytes; maximum is {maximum}"
             ),
             Self::FingerprintMismatch => {
-                formatter.write_str("pinned certificate fingerprint does not match its DER")
+                formatter.write_str("TLS certificate fingerprint does not match its DER")
             }
         }
     }
 }
 
-impl Error for PinnedCertificateError {}
+impl Error for TlsCertificateError {}
 
 /// The explicit trust decision made before any BMC credential is transmitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TlsTrust {
     SystemCa {
+        certificate: TlsCertificate,
         verified_at: OffsetDateTime,
     },
     PinnedCertificate {
-        certificate: PinnedCertificate,
+        certificate: TlsCertificate,
         trusted_at: OffsetDateTime,
     },
 }
@@ -232,8 +233,18 @@ impl TlsTrust {
     #[must_use]
     pub const fn established_at(&self) -> OffsetDateTime {
         match self {
-            Self::SystemCa { verified_at } => *verified_at,
+            Self::SystemCa { verified_at, .. } => *verified_at,
             Self::PinnedCertificate { trusted_at, .. } => *trusted_at,
+        }
+    }
+
+    /// Borrows the leaf certificate identity approved by this trust decision.
+    #[must_use]
+    pub const fn certificate(&self) -> &TlsCertificate {
+        match self {
+            Self::SystemCa { certificate, .. } | Self::PinnedCertificate { certificate, .. } => {
+                certificate
+            }
         }
     }
 }
@@ -334,12 +345,12 @@ impl fmt::Display for EndpointTimelineError {
 
 impl Error for EndpointTimelineError {}
 
-fn validate_certificate_length(certificate_der: &[u8]) -> Result<(), PinnedCertificateError> {
+fn validate_certificate_length(certificate_der: &[u8]) -> Result<(), TlsCertificateError> {
     if certificate_der.is_empty() {
-        return Err(PinnedCertificateError::Empty);
+        return Err(TlsCertificateError::Empty);
     }
     if certificate_der.len() > MAX_CERTIFICATE_DER_BYTES {
-        return Err(PinnedCertificateError::TooLarge {
+        return Err(TlsCertificateError::TooLarge {
             actual: certificate_der.len(),
             maximum: MAX_CERTIFICATE_DER_BYTES,
         });
@@ -399,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn computes_and_formats_a_certificate_identity() -> Result<(), PinnedCertificateError> {
-        let certificate = PinnedCertificate::from_der(b"abc".to_vec())?;
+    fn computes_and_formats_a_certificate_identity() -> Result<(), TlsCertificateError> {
+        let certificate = TlsCertificate::from_der(b"abc".to_vec())?;
         assert_eq!(
             certificate.fingerprint().to_string(),
             "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD"
@@ -413,7 +424,7 @@ mod tests {
         assert_eq!(
             format!("{certificate:?}"),
             format!(
-                "PinnedCertificate {{ fingerprint: {:?}, certificate_der_bytes: 3 }}",
+                "TlsCertificate {{ fingerprint: {:?}, certificate_der_bytes: 3 }}",
                 certificate.fingerprint()
             )
         );
@@ -423,44 +434,44 @@ mod tests {
         assert_eq!(fingerprint.as_bytes(), &fingerprint_bytes);
 
         let (fingerprint, certificate_der) = certificate.into_parts();
-        let reconstructed = PinnedCertificate::from_parts(fingerprint, certificate_der)?;
+        let reconstructed = TlsCertificate::from_parts(fingerprint, certificate_der)?;
         assert_eq!(reconstructed.certificate_der(), b"abc");
         Ok(())
     }
 
     #[test]
     fn rejects_mismatched_or_unbounded_certificate_data() {
-        let mismatch = PinnedCertificate::from_parts(
+        let mismatch = TlsCertificate::from_parts(
             CertificateFingerprint::from_bytes([0_u8; FINGERPRINT_LENGTH]),
             b"certificate".to_vec(),
         );
-        assert_eq!(mismatch, Err(PinnedCertificateError::FingerprintMismatch));
+        assert_eq!(mismatch, Err(TlsCertificateError::FingerprintMismatch));
         assert_eq!(
-            PinnedCertificate::from_der(Vec::new()),
-            Err(PinnedCertificateError::Empty)
+            TlsCertificate::from_der(Vec::new()),
+            Err(TlsCertificateError::Empty)
         );
         assert!(matches!(
-            PinnedCertificate::from_der(vec![0_u8; MAX_CERTIFICATE_DER_BYTES + 1]),
-            Err(PinnedCertificateError::TooLarge {
+            TlsCertificate::from_der(vec![0_u8; MAX_CERTIFICATE_DER_BYTES + 1]),
+            Err(TlsCertificateError::TooLarge {
                 actual: 1_048_577,
                 maximum: 1_048_576,
             })
         ));
         assert_eq!(
-            PinnedCertificateError::Empty.to_string(),
-            "pinned certificate DER cannot be empty"
+            TlsCertificateError::Empty.to_string(),
+            "TLS certificate DER cannot be empty"
         );
         assert_eq!(
-            PinnedCertificateError::TooLarge {
+            TlsCertificateError::TooLarge {
                 actual: 1_048_577,
                 maximum: 1_048_576,
             }
             .to_string(),
-            "pinned certificate DER has 1048577 bytes; maximum is 1048576"
+            "TLS certificate DER has 1048577 bytes; maximum is 1048576"
         );
         assert_eq!(
-            PinnedCertificateError::FingerprintMismatch.to_string(),
-            "pinned certificate fingerprint does not match its DER"
+            TlsCertificateError::FingerprintMismatch.to_string(),
+            "TLS certificate fingerprint does not match its DER"
         );
     }
 
@@ -471,7 +482,10 @@ mod tests {
         let credential_id = CredentialId::generate();
         let display_name = EndpointDisplayName::parse("Rack A BMC")?;
         let address = EndpointAddress::parse("https://192.0.2.10/redfish")?;
-        let trust = TlsTrust::SystemCa { verified_at: now };
+        let trust = TlsTrust::SystemCa {
+            certificate: TlsCertificate::from_der(b"leaf certificate".to_vec())?,
+            verified_at: now,
+        };
         let endpoint = Endpoint::try_new(
             id,
             display_name.clone(),
@@ -487,6 +501,10 @@ mod tests {
         assert_eq!(endpoint.address(), &address);
         assert_eq!(endpoint.trust(), &trust);
         assert_eq!(endpoint.trust().established_at(), now);
+        assert_eq!(
+            endpoint.trust().certificate().certificate_der(),
+            b"leaf certificate"
+        );
         assert_eq!(endpoint.credential_id(), credential_id);
         assert_eq!(endpoint.created_at(), now);
         assert_eq!(endpoint.updated_at(), now);
@@ -494,10 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn exposes_the_pinned_trust_establishment_time() -> Result<(), PinnedCertificateError> {
+    fn exposes_the_pinned_trust_establishment_time() -> Result<(), TlsCertificateError> {
         let trusted_at = OffsetDateTime::now_utc();
         let trust = TlsTrust::PinnedCertificate {
-            certificate: PinnedCertificate::from_der(b"leaf certificate".to_vec())?,
+            certificate: TlsCertificate::from_der(b"leaf certificate".to_vec())?,
             trusted_at,
         };
         assert_eq!(trust.established_at(), trusted_at);
@@ -508,6 +526,7 @@ mod tests {
     fn rejects_endpoint_state_that_predates_creation() -> Result<(), Box<dyn Error>> {
         let created_at = OffsetDateTime::now_utc();
         let trust = TlsTrust::SystemCa {
+            certificate: TlsCertificate::from_der(b"leaf certificate".to_vec())?,
             verified_at: created_at - time::Duration::SECOND,
         };
         let endpoint = Endpoint::try_new(
@@ -526,6 +545,7 @@ mod tests {
             EndpointDisplayName::parse("Rack A BMC")?,
             EndpointAddress::parse("https://192.0.2.10")?,
             TlsTrust::SystemCa {
+                certificate: TlsCertificate::from_der(b"leaf certificate".to_vec())?,
                 verified_at: created_at + time::Duration::SECOND,
             },
             CredentialId::generate(),
@@ -539,6 +559,7 @@ mod tests {
             EndpointDisplayName::parse("Rack A BMC")?,
             EndpointAddress::parse("https://192.0.2.10")?,
             TlsTrust::SystemCa {
+                certificate: TlsCertificate::from_der(b"leaf certificate".to_vec())?,
                 verified_at: created_at,
             },
             CredentialId::generate(),
