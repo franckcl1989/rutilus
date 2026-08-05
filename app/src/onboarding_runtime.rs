@@ -1,6 +1,6 @@
 use rutilus_application::{
-    BoundaryFuture, Clock, CredentialResolver, EndpointEnrollment, EndpointTrustEstablishment,
-    ResolvedCredential,
+    BoundaryFuture, Clock, CredentialResolver, EndpointCsvImportExecutor, EndpointEnrollment,
+    EndpointTrustEstablishment, ResolvedCredential,
 };
 use rutilus_domain::{AuditActor, CredentialId, DeploymentPosture};
 use rutilus_infra_redfish::RedfishGateway;
@@ -64,6 +64,14 @@ pub type TrustedEndpointEnrollment<'a> = EndpointEnrollment<
     SystemClock,
 >;
 
+/// Concrete audited CSV-import composition used by Edge runtimes.
+pub type EndpointCsvImporter<'a> = EndpointCsvImportExecutor<
+    &'a RedfishGateway,
+    TrustedEndpointEnrollment<'a>,
+    &'a SqliteStore,
+    SystemClock,
+>;
+
 /// Wires the credential-free TLS probe into the first stage of endpoint
 /// onboarding.
 #[must_use]
@@ -87,6 +95,26 @@ pub fn trusted_endpoint_enrollment<'a>(
         store,
         ActiveCredentialResolver::new(store, master_key),
         gateway,
+        SystemClock,
+        actor,
+        origin,
+    )
+}
+
+/// Wires validated CSV rows through credential-free TLS verification, audited
+/// endpoint enrollment, and the mandatory first complete resource refresh.
+#[must_use]
+pub fn endpoint_csv_importer<'a>(
+    store: &'a SqliteStore,
+    master_key: &'a MasterKey,
+    gateway: &'a RedfishGateway,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+) -> EndpointCsvImporter<'a> {
+    EndpointCsvImportExecutor::new(
+        gateway,
+        trusted_endpoint_enrollment(store, master_key, gateway, actor, origin),
+        store,
         SystemClock,
         actor,
         origin,
@@ -141,6 +169,22 @@ mod tests {
         }
 
         assert_factory(trusted_endpoint_enrollment);
+    }
+
+    #[test]
+    fn exposes_the_complete_csv_import_composition() {
+        fn assert_factory(
+            _factory: for<'a> fn(
+                &'a SqliteStore,
+                &'a MasterKey,
+                &'a RedfishGateway,
+                AuditActor,
+                DeploymentPosture,
+            ) -> EndpointCsvImporter<'a>,
+        ) {
+        }
+
+        assert_factory(endpoint_csv_importer);
     }
 
     #[tokio::test]
