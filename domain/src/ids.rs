@@ -61,10 +61,20 @@ define_id!(
     ResourceId,
     "The stable local identity of one discovered Redfish resource."
 );
+define_id!(
+    AuditEventId,
+    "The immutable identity of one append-only audit event."
+);
+define_id!(
+    AuditOperationId,
+    "The correlation identity shared by one audited operation's events."
+);
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialId, CredentialVersionId, EndpointId, ResourceId};
+    use super::{
+        AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, ResourceId,
+    };
 
     #[test]
     fn generated_identifiers_are_unique_uuid_v7_values() {
@@ -100,6 +110,19 @@ mod tests {
         let resource = ResourceId::generate();
 
         assert_eq!(resource.to_string().parse::<ResourceId>()?, resource);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_identifiers_round_trip_through_text() -> Result<(), uuid::Error> {
+        let event = AuditEventId::generate();
+        let operation = AuditOperationId::generate();
+
+        assert_eq!(event.to_string().parse::<AuditEventId>()?, event);
+        assert_eq!(
+            operation.to_string().parse::<AuditOperationId>()?,
+            operation
+        );
         Ok(())
     }
 }
