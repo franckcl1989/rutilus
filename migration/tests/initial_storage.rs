@@ -1,7 +1,8 @@
 use std::error::Error;
 
 use rutilus_entity::{
-    credential, credential_version, endpoint, endpoint_address, endpoint_credential,
+    credential, credential_version, endpoint, endpoint_address, endpoint_capability,
+    endpoint_credential,
     endpoint_trust::{self, TrustMode},
 };
 use rutilus_migration::Migrator;
@@ -13,17 +14,18 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-const STORAGE_TABLES: [&str; 6] = [
+const STORAGE_TABLES: [&str; 7] = [
     "credentials",
     "credential_versions",
     "endpoints",
     "endpoint_addresses",
+    "endpoint_capabilities",
     "endpoint_trust",
     "endpoint_credentials",
 ];
 
 #[tokio::test]
-async fn migration_preserves_the_initial_storage_invariants() -> Result<(), Box<dyn Error>> {
+async fn migrations_preserve_storage_invariants() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database_path = directory.path().join("rutilus.db");
     let normalized_path = database_path.to_string_lossy().replace('\\', "/");
@@ -181,6 +183,8 @@ async fn verify_endpoint_constraints(
     .insert(database)
     .await?;
 
+    verify_endpoint_capability_constraints(database, endpoint_id, now).await?;
+
     let unknown_endpoint_binding = endpoint_credential::ActiveModel {
         endpoint_id: Set(Uuid::now_v7()),
         credential_id: Set(credential_id),
@@ -189,6 +193,63 @@ async fn verify_endpoint_constraints(
     .insert(database)
     .await;
     assert!(unknown_endpoint_binding.is_err());
+
+    Ok(())
+}
+
+async fn verify_endpoint_capability_constraints(
+    database: &DatabaseConnection,
+    endpoint_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), Box<dyn Error>> {
+    for (capability, state) in [
+        ("session-service", "supported"),
+        ("systems", "read-only"),
+        ("chassis", "unauthorized"),
+        ("managers", "temporarily-unavailable"),
+        ("event-service", "schema-incompatible"),
+        ("update-service", "not-advertised"),
+        ("telemetry-service", "not-compiled"),
+    ] {
+        endpoint_capability::ActiveModel {
+            endpoint_id: Set(endpoint_id),
+            capability: Set(String::from(capability)),
+            state: Set(String::from(state)),
+            observed_at: Set(now),
+        }
+        .insert(database)
+        .await?;
+    }
+
+    let duplicate_capability = endpoint_capability::ActiveModel {
+        endpoint_id: Set(endpoint_id),
+        capability: Set(String::from("systems")),
+        state: Set(String::from("supported")),
+        observed_at: Set(now),
+    }
+    .insert(database)
+    .await;
+    assert!(duplicate_capability.is_err());
+
+    let invalid_capability_state = endpoint_capability::ActiveModel {
+        endpoint_id: Set(endpoint_id),
+        capability: Set(String::from("chassis")),
+        state: Set(String::from("unknown")),
+        observed_at: Set(now),
+    }
+    .insert(database)
+    .await;
+    assert!(invalid_capability_state.is_err());
+
+    let unknown_endpoint_capability = endpoint_capability::ActiveModel {
+        endpoint_id: Set(Uuid::now_v7()),
+        capability: Set(String::from("managers")),
+        state: Set(String::from("not-advertised")),
+        observed_at: Set(now),
+    }
+    .insert(database)
+    .await;
+    assert!(unknown_endpoint_capability.is_err());
 
     Ok(())
 }
