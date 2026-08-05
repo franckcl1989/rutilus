@@ -26,7 +26,8 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rutilus_domain::{
-    CertificateFingerprint, CredentialUsername, EndpointAddress, TlsIdentityChanged, TlsTrust,
+    CapabilityState, CertificateFingerprint, CredentialUsername, EndpointAddress,
+    EndpointCapability, EndpointCapabilityObservation, TlsIdentityChanged, TlsTrust,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::error::Category as JsonErrorCategory;
@@ -96,6 +97,66 @@ impl RedfishGateway {
         username: &CredentialUsername,
         password: &SecretString,
     ) -> Result<ServiceRootSummary, RedfishServiceRootError> {
+        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+
+        match ServiceRoot::new(bmc).await {
+            Ok(root) => Ok(ServiceRootSummary::from_root(&root)),
+            Err(source) => Err(classify_service_root_error(source, &identity, trust)),
+        }
+    }
+
+    /// Reads the Service Root and probes the 0.1 core capabilities through
+    /// public, typed `nv-redfish` navigation methods.
+    ///
+    /// Capability reads are sequential. A TLS identity or validation failure
+    /// stops the probe immediately, while endpoint-local authorization,
+    /// availability, and schema failures become explicit capability states so
+    /// one limited feature does not erase the usable remainder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedfishServiceRootError`] when the trusted transport cannot be
+    /// created, the Service Root itself cannot be read, or TLS safety changes
+    /// during any capability request.
+    pub async fn probe_core_capabilities(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+    ) -> Result<CoreEndpointDiscovery, RedfishServiceRootError> {
+        let (bmc, identity) = self.authenticated_bmc(address, trust, username, password)?;
+        let root = ServiceRoot::new(bmc)
+            .await
+            .map_err(|source| classify_service_root_error(source, &identity, trust))?;
+        let service_root = ServiceRootSummary::from_root(&root);
+        let session_service =
+            classify_capability_probe(root.session_service().await, &identity, trust)?;
+        let systems = classify_capability_probe(root.systems().await, &identity, trust)?;
+        let chassis = classify_capability_probe(root.chassis().await, &identity, trust)?;
+        let managers = classify_capability_probe(root.managers().await, &identity, trust)?;
+
+        Ok(CoreEndpointDiscovery {
+            service_root,
+            capabilities: [
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::SessionService,
+                    session_service,
+                ),
+                EndpointCapabilityObservation::new(EndpointCapability::Systems, systems),
+                EndpointCapabilityObservation::new(EndpointCapability::Chassis, chassis),
+                EndpointCapabilityObservation::new(EndpointCapability::Managers, managers),
+            ],
+        })
+    }
+
+    fn authenticated_bmc(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+    ) -> Result<(Arc<UpstreamBmc>, IdentityMonitor), RedfishServiceRootError> {
         let (tls_config, identity) = self
             .tls
             .trust_bound_client_config(trust)
@@ -122,11 +183,28 @@ impl RedfishGateway {
             credentials,
             CacheSettings::with_capacity(0),
         ));
+        Ok((bmc, identity))
+    }
+}
 
-        match ServiceRoot::new(bmc).await {
-            Ok(root) => Ok(ServiceRootSummary::from_root(&root)),
-            Err(source) => Err(classify_service_root_error(source, &identity, trust)),
-        }
+/// Service metadata and the usable state of every 0.1 core capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreEndpointDiscovery {
+    service_root: ServiceRootSummary,
+    capabilities: [EndpointCapabilityObservation; 4],
+}
+
+impl CoreEndpointDiscovery {
+    /// Borrows the stable Service Root projection.
+    #[must_use]
+    pub const fn service_root(&self) -> &ServiceRootSummary {
+        &self.service_root
+    }
+
+    /// Borrows all core observations in stable capability order.
+    #[must_use]
+    pub const fn capabilities(&self) -> &[EndpointCapabilityObservation; 4] {
+        &self.capabilities
     }
 }
 
@@ -248,6 +326,36 @@ fn classify_service_root_error(
         nv_redfish::Error::Json(_) => RedfishServiceRootError::SchemaIncompatible { source },
         nv_redfish::Error::Bmc(source) => classify_bmc_error(source),
         source => RedfishServiceRootError::Upstream(source),
+    }
+}
+
+fn classify_capability_probe<T>(
+    result: Result<Option<T>, UpstreamServiceRootError>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CapabilityState, RedfishServiceRootError> {
+    let source = match result {
+        Ok(Some(_)) => return Ok(CapabilityState::Supported),
+        Ok(None) => return Ok(CapabilityState::NotAdvertised),
+        Err(source) => source,
+    };
+
+    match classify_service_root_error(source, identity, trust) {
+        RedfishServiceRootError::AuthenticationFailed { .. }
+        | RedfishServiceRootError::PermissionDenied { .. } => Ok(CapabilityState::Unauthorized),
+        RedfishServiceRootError::SchemaIncompatible { .. } => {
+            Ok(CapabilityState::SchemaIncompatible)
+        }
+        RedfishServiceRootError::NotRedfishService { .. }
+        | RedfishServiceRootError::NetworkTimeout { .. }
+        | RedfishServiceRootError::Network { .. }
+        | RedfishServiceRootError::RemoteResponse { .. }
+        | RedfishServiceRootError::Upstream(_) => Ok(CapabilityState::TemporarilyUnavailable),
+        source @ (RedfishServiceRootError::TlsConfiguration(_)
+        | RedfishServiceRootError::ClientBuild(_)
+        | RedfishServiceRootError::TlsIdentityState(_)
+        | RedfishServiceRootError::TlsIdentityChanged(_)
+        | RedfishServiceRootError::TlsRejected { .. }) => Err(source),
     }
 }
 
@@ -566,6 +674,55 @@ mod tests {
         "Product":"Fixture BMC"
     }"#;
 
+    const CORE_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    }"#;
+
+    const SESSION_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/SessionService",
+        "Id":"SessionService",
+        "Name":"Session Service"
+    }"#;
+
+    const SYSTEMS_BODY: &str = r##"{
+        "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",
+        "@odata.id":"/redfish/v1/Systems",
+        "Name":"Computer System Collection",
+        "Members":[]
+    }"##;
+
+    const CHASSIS_BODY: &str = r##"{
+        "@odata.type":"#ChassisCollection.ChassisCollection",
+        "@odata.id":"/redfish/v1/Chassis",
+        "Name":"Chassis Collection",
+        "Members":[]
+    }"##;
+
+    const MANAGERS_BODY: &str = r##"{
+        "@odata.type":"#ManagerCollection.ManagerCollection",
+        "@odata.id":"/redfish/v1/Managers",
+        "Name":"Manager Collection",
+        "Members":[]
+    }"##;
+
+    const CORE_REQUEST_PATHS: [&str; 5] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Managers",
+    ];
+
     #[tokio::test]
     async fn reads_service_root_through_system_ca_and_public_nv_redfish_api()
     -> Result<(), Box<dyn Error>> {
@@ -594,6 +751,129 @@ mod tests {
         });
         assert_eq!(authorization, Some("Basic YWRtaW46cGFzc3dvcmQ="));
         assert!(!request.contains("password"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probes_every_advertised_core_capability_through_typed_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_sequence(&[
+            ("200 OK", CORE_SERVICE_ROOT_BODY),
+            ("200 OK", SESSION_SERVICE_BODY),
+            ("200 OK", SYSTEMS_BODY),
+            ("200 OK", CHASSIS_BODY),
+            ("200 OK", MANAGERS_BODY),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(discovery.service_root().vendor(), Some("Rutilus Test"));
+        assert_eq!(
+            discovery.capabilities(),
+            &[
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::SessionService,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Systems,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Chassis,
+                    CapabilityState::Supported,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Managers,
+                    CapabilityState::Supported,
+                ),
+            ]
+        );
+        assert_authenticated_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_unadvertised_core_capabilities_without_guessing_paths()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert!(
+            discovery
+                .capabilities()
+                .iter()
+                .all(|observation| observation.state() == CapabilityState::NotAdvertised)
+        );
+        assert_authenticated_requests(&server.finish_all().await?, &["/redfish/v1"])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn isolates_limited_capabilities_and_continues_typed_probe() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_sequence(&[
+            ("200 OK", CORE_SERVICE_ROOT_BODY),
+            ("403 Forbidden", "{}"),
+            ("200 OK", "{}"),
+            ("404 Not Found", "{}"),
+            ("200 OK", MANAGERS_BODY),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("limited-reader")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(
+            discovery.capabilities(),
+            &[
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::SessionService,
+                    CapabilityState::Unauthorized,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Systems,
+                    CapabilityState::SchemaIncompatible,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Chassis,
+                    CapabilityState::TemporarilyUnavailable,
+                ),
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Managers,
+                    CapabilityState::Supported,
+                ),
+            ]
+        );
+        assert_authenticated_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
         Ok(())
     }
 
@@ -805,15 +1085,38 @@ mod tests {
         })
     }
 
+    fn assert_authenticated_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        for (request, expected_path) in requests.iter().zip(expected_paths) {
+            let request = std::str::from_utf8(request)?;
+            assert!(request.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+            let authorization = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then_some(value.trim())
+            });
+            assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+            assert!(!request.contains("password"));
+        }
+        Ok(())
+    }
+
     struct TestRedfishServer {
         address: EndpointAddress,
         socket: SocketAddr,
         certificate: CertificateDer<'static>,
-        task: JoinHandle<Result<Vec<u8>, io::Error>>,
+        task: JoinHandle<Result<Vec<Vec<u8>>, io::Error>>,
     }
 
     impl TestRedfishServer {
         async fn start(status: &str, body: &str) -> Result<Self, Box<dyn Error>> {
+            Self::start_sequence(&[(status, body)]).await
+        }
+
+        async fn start_sequence(responses: &[(&str, &str)]) -> Result<Self, Box<dyn Error>> {
             let CertifiedKey { cert, signing_key } =
                 generate_simple_self_signed([String::from("localhost")])?;
             let certificate = cert.der().clone();
@@ -826,8 +1129,11 @@ mod tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let socket = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
-            let response = http_response(status, body);
-            let task = tokio::spawn(run_server(listener, acceptor, response));
+            let responses = responses
+                .iter()
+                .map(|(status, body)| http_response(status, body))
+                .collect();
+            let task = tokio::spawn(run_server_sequence(listener, acceptor, responses));
             Ok(Self {
                 address: endpoint_address(socket, "localhost")?,
                 socket,
@@ -837,6 +1143,20 @@ mod tests {
         }
 
         async fn finish(self) -> Result<Vec<u8>, Box<dyn Error>> {
+            let mut requests = self.finish_all().await?;
+            if requests.len() != 1 {
+                return Err(io::Error::other(format!(
+                    "expected one test request, got {}",
+                    requests.len()
+                ))
+                .into());
+            }
+            requests
+                .pop()
+                .ok_or_else(|| io::Error::other("test request was not captured").into())
+        }
+
+        async fn finish_all(self) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
             Ok(self.task.await??)
         }
     }
@@ -856,22 +1176,29 @@ mod tests {
         .into_bytes()
     }
 
-    async fn run_server(
+    async fn run_server_sequence(
         listener: TcpListener,
         acceptor: TlsAcceptor,
-        response: Vec<u8>,
-    ) -> Result<Vec<u8>, io::Error> {
-        let (tcp, _) = listener.accept().await?;
-        let Ok(mut stream) = timeout(Duration::from_secs(5), acceptor.accept(tcp))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
-        else {
-            return Ok(Vec::new());
-        };
-        let request = read_request_headers(&mut stream).await?;
-        stream.write_all(&response).await?;
-        stream.shutdown().await?;
-        Ok(request)
+        responses: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, io::Error> {
+        let mut requests = Vec::with_capacity(responses.len());
+        for response in responses {
+            let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
+            let Ok(mut stream) = timeout(Duration::from_secs(5), acceptor.accept(tcp))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
+            else {
+                requests.push(Vec::new());
+                continue;
+            };
+            let request = read_request_headers(&mut stream).await?;
+            stream.write_all(&response).await?;
+            stream.shutdown().await?;
+            requests.push(request);
+        }
+        Ok(requests)
     }
 
     async fn read_request_headers(
