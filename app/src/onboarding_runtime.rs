@@ -1,5 +1,6 @@
 use rutilus_application::{
-    BoundaryFuture, Clock, CredentialResolver, EndpointOnboarding, ResolvedCredential,
+    BoundaryFuture, Clock, CredentialResolver, EndpointOnboarding, EndpointTrustEstablishment,
+    ResolvedCredential,
 };
 use rutilus_domain::CredentialId;
 use rutilus_infra_redfish::RedfishGateway;
@@ -55,6 +56,15 @@ impl Clock for SystemClock {
     }
 }
 
+/// Wires the credential-free TLS probe into the first stage of endpoint
+/// onboarding.
+#[must_use]
+pub fn endpoint_trust_establishment(
+    gateway: &RedfishGateway,
+) -> EndpointTrustEstablishment<&RedfishGateway, SystemClock> {
+    EndpointTrustEstablishment::new(gateway, SystemClock)
+}
+
 /// Wires the concrete Edge adapters into the trusted endpoint onboarding use
 /// case without exposing implementation types to the application crate.
 #[must_use]
@@ -89,13 +99,26 @@ pub enum ActiveCredentialResolverError {
 mod tests {
     use std::error::Error;
 
-    use rutilus_application::{Clock, CredentialResolver};
+    use rutilus_application::{Clock, CredentialResolver, EndpointTrustEstablishment};
     use rutilus_domain::{CredentialId, CredentialName, CredentialUsername, CredentialVersionId};
     use rutilus_persistence::NewCredential;
     use rutilus_security::encrypt_credential;
     use secrecy::{ExposeSecret, SecretString};
 
     use super::*;
+
+    #[test]
+    fn exposes_the_concrete_tls_trust_composition() {
+        fn assert_factory(
+            _factory: for<'a> fn(
+                &'a RedfishGateway,
+            )
+                -> EndpointTrustEstablishment<&'a RedfishGateway, SystemClock>,
+        ) {
+        }
+
+        assert_factory(endpoint_trust_establishment);
+    }
 
     #[tokio::test]
     async fn resolves_only_the_selected_active_credential() -> Result<(), Box<dyn Error>> {

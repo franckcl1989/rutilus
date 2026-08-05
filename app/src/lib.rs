@@ -4,5 +4,5 @@ mod onboarding_runtime;
 
 pub use onboarding_runtime::{
     ActiveCredentialResolver, ActiveCredentialResolverError, SystemClock,
-    trusted_endpoint_onboarding,
+    endpoint_trust_establishment, trusted_endpoint_onboarding,
 };
