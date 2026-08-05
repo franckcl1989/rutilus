@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "domain"]
+members = ["app", "domain", "security"]
 default-members = ["app"]
 resolver = "3"
 
@@ -10,10 +10,14 @@ rust-version = "1.97.1"
 publish = false
 
 [workspace.dependencies]
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.5", features = ["derive"] }
+getrandom = "0.4.3"
 rutilus-domain = { path = "domain", version = "0.1.0" }
+secrecy = "0.10.3"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
+zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
