@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use rutilus_domain::NV_REDFISH_DEVELOPMENT_BASELINE;
+use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 

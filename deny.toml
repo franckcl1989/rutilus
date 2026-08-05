@@ -13,10 +13,22 @@ all-features = true
 # cargo-audit also sees rust_decimal's inactive optional rkyv 0.7 lock entry.
 # RUSTSEC-2026-0235 is ignored only in the audit command after proving that
 # `cargo tree --workspace --target all -i rkyv` has no active dependency path.
-ignore = []
+# nv-redfish 0.13.0 pins quick-xml 0.38.4 only in its CSDL build compiler.
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195 cannot process runtime, device, or
+# user-controlled XML; remove both exceptions as soon as upstream accepts
+# quick-xml 0.41 or later.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
 confidence-threshold = 0.95
 private = { ignore = true }
 
@@ -38,9 +50,13 @@ skip = [
     { crate = "block-buffer@0.10.4", reason = "SQLx 0.9 and the audited encryption stack use different digest generations" },
     { crate = "cpufeatures@0.2.17", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
     { crate = "crypto-common@0.1.6", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
+    { crate = "getrandom@0.2.17", reason = "ring 0.17 uses its audited legacy RNG API while Rutilus and UUID use getrandom 0.4" },
     { crate = "hashbrown@0.16.1", reason = "SQLx 0.9 currently uses two non-compatible hashbrown generations internally" },
     { crate = "heck@0.4.1", reason = "SeaORM 2.0 macros have not fully converged on heck 0.5" },
     { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
+    { crate = "toml_datetime@0.7.5", reason = "nv-redfish's build-only CSDL compiler and tagged-types macros use incompatible TOML generations" },
+    { crate = "windows-sys@0.52.0", reason = "ring 0.17 retains its audited Windows bindings while Tokio and the CLI use windows-sys 0.61" },
+    { crate = "winnow@0.7.15", reason = "nv-redfish's build-only CSDL compiler and tagged-types macros use incompatible parser generations" },
 ]
 
 [sources]

@@ -16,9 +16,6 @@ pub use endpoint::{
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{CredentialId, CredentialVersionId, EndpointId};
 
-/// The upstream version used as the starting point for product development.
-pub const NV_REDFISH_DEVELOPMENT_BASELINE: &str = "0.12.1";
-
 /// The execution boundary inside the single Rutilus binary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeRole {

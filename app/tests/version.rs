@@ -10,7 +10,7 @@ fn version_reports_product_and_upstream_baseline() -> std::io::Result<()> {
     assert!(output.stderr.is_empty());
     assert_eq!(
         output.stdout,
-        b"rutilus 0.1.0\nnv-redfish development baseline 0.12.1\n"
+        b"rutilus 0.1.0\nnv-redfish development baseline 0.13.0\n"
     );
 
     Ok(())

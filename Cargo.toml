@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "domain", "entity", "migration", "persistence", "security"]
+members = ["app", "domain", "entity", "infra-redfish", "migration", "persistence", "security"]
 default-members = ["app"]
 resolver = "3"
 
@@ -13,7 +13,9 @@ publish = false
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.5", features = ["derive"] }
 getrandom = "0.4.3"
+nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
 rutilus-domain = { path = "domain", version = "0.1.0" }
+rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
 rutilus-entity = { path = "entity", version = "0.1.0" }
 rutilus-migration = { path = "migration", version = "0.1.0" }
 sea-orm = { version = "2.0.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }

@@ -1,13 +1,12 @@
 [package]
-name = "rutilus"
+name = "rutilus-infra-redfish"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-clap.workspace = true
-rutilus-infra-redfish.workspace = true
+nv-redfish.workspace = true
 
 [lints]
 workspace = true
