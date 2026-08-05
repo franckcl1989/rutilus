@@ -14,7 +14,8 @@ pub use audit::{
     AuditAction, AuditActor, AuditCodeParseError, AuditEvent, AuditEventError, AuditFailure,
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOutcome,
     AuditOutcomeKind, AuditParameterSummary, AuditParameterSummaryError, AuditProgress,
-    AuditRedfishOperation, AuditTarget, AuditTlsTrust, AuditVerification, ProductPermission,
+    AuditRedfishOperation, AuditSequence, AuditSequenceError, AuditTarget, AuditTlsTrust,
+    AuditVerification, ProductPermission,
 };
 pub use capability::{
     CapabilityClassification, CapabilityState, CapabilityStateParseError, EndpointCapability,

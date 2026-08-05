@@ -437,6 +437,63 @@ pub enum AuditOutcome {
     },
 }
 
+/// A positive, operation-local ordering key for append-only audit events.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AuditSequence(u32);
+
+impl AuditSequence {
+    pub const FIRST: Self = Self(1);
+
+    /// Validates a persisted audit sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditSequenceError::Zero`] when the value cannot identify an
+    /// event in an operation.
+    pub const fn try_new(value: u32) -> Result<Self, AuditSequenceError> {
+        if value == 0 {
+            return Err(AuditSequenceError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Returns the next contiguous operation-local sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditSequenceError::Exhausted`] instead of wrapping when an
+    /// operation has reached the representable event limit.
+    pub const fn next(self) -> Result<Self, AuditSequenceError> {
+        match self.0.checked_add(1) {
+            Some(value) => Ok(Self(value)),
+            None => Err(AuditSequenceError::Exhausted),
+        }
+    }
+}
+
+/// An audit sequence is zero or cannot advance without wrapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditSequenceError {
+    Zero,
+    Exhausted,
+}
+
+impl fmt::Display for AuditSequenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("audit event sequence must be positive"),
+            Self::Exhausted => formatter.write_str("audit event sequence is exhausted"),
+        }
+    }
+}
+
+impl Error for AuditSequenceError {}
+
 impl AuditOutcome {
     #[must_use]
     pub const fn kind(self) -> AuditOutcomeKind {
@@ -484,6 +541,7 @@ impl AuditOutcome {
 pub struct AuditEvent {
     id: AuditEventId,
     context: AuditOperationContext,
+    sequence: AuditSequence,
     outcome: AuditOutcome,
     occurred_at: OffsetDateTime,
 }
@@ -498,9 +556,19 @@ impl AuditEvent {
     pub fn try_from_parts(
         id: AuditEventId,
         context: AuditOperationContext,
+        sequence: AuditSequence,
         outcome: AuditOutcome,
         occurred_at: OffsetDateTime,
     ) -> Result<Self, AuditEventError> {
+        let sequence_matches_outcome = match outcome {
+            AuditOutcome::Started => sequence == AuditSequence::FIRST,
+            AuditOutcome::Progress(_) | AuditOutcome::Succeeded | AuditOutcome::Failed { .. } => {
+                sequence > AuditSequence::FIRST
+            }
+        };
+        if !sequence_matches_outcome {
+            return Err(AuditEventError::InvalidSequence);
+        }
         if let AuditOutcome::Progress(progress) = outcome {
             let consistent = matches!(
                 (context.action(), progress),
@@ -508,10 +576,10 @@ impl AuditEvent {
                     | (AuditAction::ImportEndpoints, AuditProgress::RowValidated)
             );
             if !consistent {
-                return Err(AuditEventError);
+                return Err(AuditEventError::InvalidProgress);
             }
         }
-        Ok(Self::new(id, context, outcome, occurred_at))
+        Ok(Self::new(id, context, sequence, outcome, occurred_at))
     }
 
     #[must_use]
@@ -519,6 +587,7 @@ impl AuditEvent {
         Self::new(
             AuditEventId::generate(),
             context,
+            AuditSequence::FIRST,
             AuditOutcome::Started,
             occurred_at,
         )
@@ -532,37 +601,54 @@ impl AuditEvent {
     /// product action.
     pub fn progress(
         context: AuditOperationContext,
+        sequence: AuditSequence,
         progress: AuditProgress,
         occurred_at: OffsetDateTime,
     ) -> Result<Self, AuditEventError> {
         Self::try_from_parts(
             AuditEventId::generate(),
             context,
+            sequence,
             AuditOutcome::Progress(progress),
             occurred_at,
         )
     }
 
-    #[must_use]
-    pub fn succeeded(context: AuditOperationContext, occurred_at: OffsetDateTime) -> Self {
-        Self::new(
+    /// Creates a confirmed terminal event after the start sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditEventError::InvalidSequence`] for the start sequence.
+    pub fn succeeded(
+        context: AuditOperationContext,
+        sequence: AuditSequence,
+        occurred_at: OffsetDateTime,
+    ) -> Result<Self, AuditEventError> {
+        Self::try_from_parts(
             AuditEventId::generate(),
             context,
+            sequence,
             AuditOutcome::Succeeded,
             occurred_at,
         )
     }
 
-    #[must_use]
+    /// Creates a failed terminal event after the start sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditEventError::InvalidSequence`] for the start sequence.
     pub fn failed(
         context: AuditOperationContext,
+        sequence: AuditSequence,
         failure: AuditFailure,
         verification: AuditFailureVerification,
         occurred_at: OffsetDateTime,
-    ) -> Self {
-        Self::new(
+    ) -> Result<Self, AuditEventError> {
+        Self::try_from_parts(
             AuditEventId::generate(),
             context,
+            sequence,
             AuditOutcome::Failed {
                 failure,
                 verification,
@@ -582,6 +668,11 @@ impl AuditEvent {
     }
 
     #[must_use]
+    pub const fn sequence(&self) -> AuditSequence {
+        self.sequence
+    }
+
+    #[must_use]
     pub const fn outcome(&self) -> AuditOutcome {
         self.outcome
     }
@@ -594,25 +685,37 @@ impl AuditEvent {
     const fn new(
         id: AuditEventId,
         context: AuditOperationContext,
+        sequence: AuditSequence,
         outcome: AuditOutcome,
         occurred_at: OffsetDateTime,
     ) -> Self {
         Self {
             id,
             context,
+            sequence,
             outcome,
             occurred_at,
         }
     }
 }
 
-/// An audit progress milestone did not belong to its product action.
+/// An audit event combined an outcome with an invalid sequence or action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AuditEventError;
+pub enum AuditEventError {
+    InvalidSequence,
+    InvalidProgress,
+}
 
 impl fmt::Display for AuditEventError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("audit progress does not belong to the operation action")
+        match self {
+            Self::InvalidSequence => {
+                formatter.write_str("audit outcome is invalid at this operation sequence")
+            }
+            Self::InvalidProgress => {
+                formatter.write_str("audit progress does not belong to the operation action")
+            }
+        }
     }
 }
 
@@ -739,14 +842,22 @@ mod tests {
         )?;
         let now = OffsetDateTime::now_utc();
         let started = AuditEvent::started(context.clone(), now);
-        let progress = AuditEvent::progress(context.clone(), AuditProgress::EndpointCreated, now)?;
-        let succeeded = AuditEvent::succeeded(context.clone(), now);
+        let progress_sequence = AuditSequence::FIRST.next()?;
+        let progress = AuditEvent::progress(
+            context.clone(),
+            progress_sequence,
+            AuditProgress::EndpointCreated,
+            now,
+        )?;
+        let terminal_sequence = progress_sequence.next()?;
+        let succeeded = AuditEvent::succeeded(context.clone(), terminal_sequence, now)?;
         let failed = AuditEvent::failed(
             context,
+            terminal_sequence,
             AuditFailure::CoreResourceReadFailed,
             AuditFailureVerification::Inconclusive,
             now,
-        );
+        )?;
 
         assert_eq!(started.outcome().kind(), AuditOutcomeKind::Started);
         assert!(!started.outcome().is_terminal());
@@ -764,16 +875,38 @@ mod tests {
             Some(AuditFailure::CoreResourceReadFailed)
         );
         assert_eq!(failed.occurred_at(), now);
+        assert_eq!(started.sequence(), AuditSequence::FIRST);
+        assert_eq!(progress.sequence(), progress_sequence);
         assert_ne!(started.id(), progress.id());
         assert_eq!(
             started.context().operation_id(),
             progress.context().operation_id()
         );
         assert_eq!(
-            AuditEvent::progress(context_for_refresh()?, AuditProgress::EndpointCreated, now),
-            Err(AuditEventError)
+            AuditEvent::progress(
+                context_for_refresh()?,
+                progress_sequence,
+                AuditProgress::EndpointCreated,
+                now,
+            ),
+            Err(AuditEventError::InvalidProgress)
+        );
+        assert_eq!(
+            AuditEvent::succeeded(context_for_refresh()?, AuditSequence::FIRST, now),
+            Err(AuditEventError::InvalidSequence)
         );
         Ok(())
+    }
+
+    #[test]
+    fn audit_sequences_are_positive_contiguous_and_non_wrapping() {
+        assert_eq!(AuditSequence::try_new(0), Err(AuditSequenceError::Zero));
+        assert_eq!(AuditSequence::FIRST.get(), 1);
+        assert_eq!(AuditSequence::FIRST.next(), AuditSequence::try_new(2));
+        assert_eq!(
+            AuditSequence::try_new(u32::MAX).and_then(AuditSequence::next),
+            Err(AuditSequenceError::Exhausted)
+        );
     }
 
     fn enrollment_context(
