@@ -1,5 +1,5 @@
 use rutilus_application::{
-    BoundaryFuture, Clock, CredentialResolver, EndpointOnboarding, EndpointTrustEstablishment,
+    BoundaryFuture, Clock, CredentialResolver, EndpointEnrollment, EndpointTrustEstablishment,
     ResolvedCredential,
 };
 use rutilus_domain::CredentialId;
@@ -56,6 +56,14 @@ impl Clock for SystemClock {
     }
 }
 
+/// Concrete post-trust enrollment composition used by Edge runtimes.
+pub type TrustedEndpointEnrollment<'a> = EndpointEnrollment<
+    &'a SqliteStore,
+    ActiveCredentialResolver<'a>,
+    &'a RedfishGateway,
+    SystemClock,
+>;
+
 /// Wires the credential-free TLS probe into the first stage of endpoint
 /// onboarding.
 #[must_use]
@@ -65,20 +73,15 @@ pub fn endpoint_trust_establishment(
     EndpointTrustEstablishment::new(gateway, SystemClock)
 }
 
-/// Wires the concrete Edge adapters into the trusted endpoint onboarding use
-/// case without exposing implementation types to the application crate.
+/// Wires endpoint discovery and the mandatory first complete refresh into one
+/// post-trust enrollment use case.
 #[must_use]
-pub fn trusted_endpoint_onboarding<'a>(
+pub fn trusted_endpoint_enrollment<'a>(
     store: &'a SqliteStore,
     master_key: &'a MasterKey,
     gateway: &'a RedfishGateway,
-) -> EndpointOnboarding<
-    &'a SqliteStore,
-    ActiveCredentialResolver<'a>,
-    &'a RedfishGateway,
-    SystemClock,
-> {
-    EndpointOnboarding::new(
+) -> TrustedEndpointEnrollment<'a> {
+    EndpointEnrollment::new(
         store,
         ActiveCredentialResolver::new(store, master_key),
         gateway,
@@ -118,6 +121,20 @@ mod tests {
         }
 
         assert_factory(endpoint_trust_establishment);
+    }
+
+    #[test]
+    fn exposes_the_complete_endpoint_enrollment_composition() {
+        fn assert_factory(
+            _factory: for<'a> fn(
+                &'a SqliteStore,
+                &'a MasterKey,
+                &'a RedfishGateway,
+            ) -> TrustedEndpointEnrollment<'a>,
+        ) {
+        }
+
+        assert_factory(trusted_endpoint_enrollment);
     }
 
     #[tokio::test]

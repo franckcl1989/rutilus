@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod endpoint_enrollment;
 mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_trust;
 
+pub use endpoint_enrollment::{EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint};
 pub use endpoint_onboarding::{
     BoundaryFuture, Clock, CredentialResolver, DiscoveredEndpointRepository, EndpointDiscovery,
     EndpointOnboarding, OnboardEndpointError, OnboardEndpointRequest, OnboardedEndpoint,
