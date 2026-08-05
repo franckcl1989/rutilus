@@ -2519,6 +2519,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-native-certs",
+ "rutilus-application",
  "rutilus-domain",
  "secrecy",
  "serde_json",

@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 
+mod application_adapter;
 mod redfish_gateway;
 mod tls_probe;
 
