@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Rutilus</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <main id="app" aria-live="polite">
+      <section class="shell">
+        <p class="eyebrow">Local Redfish management</p>
+        <h1>Rutilus</h1>
+        <p id="status">Starting the local management console…</p>
+        <dl id="build" hidden>
+          <div><dt>Product</dt><dd id="product-version"></dd></div>
+          <div><dt>nv-redfish</dt><dd id="redfish-version"></dd></div>
+        </dl>
+      </section>
+    </main>
+    <script type="module" src="/bootstrap.js"></script>
+  </body>
+</html>

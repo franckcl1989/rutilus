@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "security"]
+members = ["app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "security", "web"]
 default-members = ["app"]
 resolver = "3"
 
@@ -10,13 +10,16 @@ rust-version = "1.97.1"
 publish = false
 
 [workspace.dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.5", features = ["derive"] }
 csv = "1.4.0"
 getrandom = "0.4.3"
+http-body-util = "0.1.4"
 nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+rust-embed = { version = "=8.11.0", features = ["debug-embed", "deterministic-timestamps"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 rutilus-domain = { path = "domain", version = "0.1.0" }
@@ -26,6 +29,7 @@ rutilus-entity = { path = "entity", version = "0.1.0" }
 rutilus-migration = { path = "migration", version = "0.1.0" }
 rutilus-persistence = { path = "persistence", version = "0.1.0" }
 rutilus-security = { path = "security", version = "0.1.0" }
+rutilus-web = { path = "web", version = "0.1.0" }
 sea-orm = { version = "2.0.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 sea-orm-migration = { version = "2.0.1", default-features = false, features = ["runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 secrecy = "0.10.3"
@@ -37,6 +41,8 @@ thiserror = "2.0.19"
 time = "0.3.55"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["set-header"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
 zeroize = "1.9.0"

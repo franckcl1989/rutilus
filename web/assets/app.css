@@ -1,0 +1,69 @@
+:root {
+  color: #e8edf5;
+  background: #0c111b;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(circle at 18% 12%, rgb(47 94 150 / 28%), transparent 34rem),
+    linear-gradient(145deg, #0c111b 0%, #111a2a 100%);
+}
+
+#app {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.shell {
+  width: min(42rem, 100%);
+  padding: clamp(2rem, 7vw, 4.5rem);
+  border: 1px solid rgb(143 171 207 / 22%);
+  border-radius: 1.5rem;
+  background: rgb(16 25 40 / 82%);
+  box-shadow: 0 2rem 7rem rgb(0 0 0 / 36%);
+  backdrop-filter: blur(1rem);
+}
+
+.eyebrow {
+  margin: 0 0 0.75rem;
+  color: #7fb4f1;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(3rem, 12vw, 6rem);
+  font-weight: 650;
+  letter-spacing: -0.055em;
+}
+
+#status { color: #aebbd0; }
+
+dl { margin: 2rem 0 0; }
+dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 2rem;
+  padding: 0.8rem 0;
+  border-top: 1px solid rgb(143 171 207 / 14%);
+}
+dt { color: #8495ad; }
+dd { margin: 0; font-family: ui-monospace, "Cascadia Code", monospace; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .shell { animation: arrive 420ms ease-out both; }
+  @keyframes arrive {
+    from { opacity: 0; transform: translateY(0.7rem); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
