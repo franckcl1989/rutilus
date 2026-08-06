@@ -13,6 +13,7 @@ mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_resources;
 mod endpoint_trust;
+mod event_ingestion;
 mod operation_executor;
 mod operation_submission;
 mod task_monitor;
@@ -72,6 +73,9 @@ pub use endpoint_trust::{
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
     EndpointTrustExpectationError, EndpointTrustTimelineError, PendingEndpointTrust,
     SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe, TrustedEndpoint,
+};
+pub use event_ingestion::{
+    EventIngestion, EventRepository, EventStream, EventStreamPull, IngestionError,
 };
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
 pub use operation_submission::{OperationSubmission, SubmissionError};
