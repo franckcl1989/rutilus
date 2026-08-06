@@ -1062,6 +1062,125 @@ pub enum CoreResourceDetailsResponse {
         release_date: Option<OffsetDateTime>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `event-service` family member projected from the typed Redfish
+    /// event-service schema (`EventService_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `ServiceEnabled` and `Status` properties.
+    /// `DeliveryRetryAttempts` and `DeliveryRetryIntervalSeconds` were
+    /// considered, but this round projects service posture only: the retry
+    /// policy governs event delivery rather than a console-rendered surface.
+    /// Subscriptions are themselves separate `EventSubscription` resources in
+    /// the linked collection, so they are not folded into this variant.
+    EventService {
+        service_enabled: Option<bool>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One subscription under the §2.1 `event-service` family, projected from
+    /// the typed Redfish event-destination schema (`EventDestination_v1`,
+    /// nv-redfish-schema 0.13; DMTF models subscriptions as `EventDestination`
+    /// resources, and the nv-redfish 0.13 compile surface exposes the
+    /// subscription read surface through the `EventService` `Subscriptions`
+    /// navigation).
+    ///
+    /// Fields are the direct `Destination`, `Protocol`, `Context`, and
+    /// `EventTypes` properties and the `Status` property (present since
+    /// `v1_6_0`). `protocol` is the `EventDestinationProtocol` enumeration
+    /// (`Redfish`, `Kafka`, `SNMPv1`..`SNMPv3`, `SMTP`, `SyslogTLS`..`SyslogRELP`,
+    /// `OEM`) retained as a string so the console renders it without
+    /// re-parsing text; `event_types` mirrors the `EventTypes` array of
+    /// `EventType` values. `HttpHeaders` and the `MessageIds`/`RegistryPrefixes`/
+    /// `ResourceTypes` filters were considered but stay out of this first
+    /// strictly projectable field set.
+    EventSubscription {
+        destination: Option<String>,
+        protocol: Option<String>,
+        context: Option<String>,
+        event_types: Option<Vec<String>>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `telemetry-service` family member projected from the typed
+    /// Redfish telemetry-service schema (`TelemetryService_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Only `Status` is projected this round. The compiled `TelemetryService`
+    /// type also exposes `service_enabled` (`ServiceEnabled`, `Edm.Boolean`)
+    /// and the service-capacity fields `MaxReports`, `MinCollectionInterval`,
+    /// `SupportedCollectionFunctions`, and `SupportedTelemetryDataTypes`, but
+    /// the product defers them: the service-enabled posture and the telemetry
+    /// capability fields belong to the 0.4.0 telemetry-history iteration, and
+    /// projecting them now would widen this strictly projectable field set
+    /// ahead of the infra payload that must feed it.
+    TelemetryService {
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One metric definition under the §2.1 `telemetry-service` family,
+    /// projected from the typed Redfish metric-definition schema
+    /// (`MetricDefinition_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `MetricType` and `Units` properties. `metric_type`
+    /// is the `MetricType` enumeration (`Numeric`, `Discrete`, `Gauge`,
+    /// `Counter`, `Countdown`, `String`) retained as a string so the console
+    /// renders it without re-parsing text. `MetricDefinition_v1` declares no
+    /// `Status` property, so this family carries no status field either.
+    /// `MetricDataType`, `Precision`, `MinReadingRange`, `MaxReadingRange`,
+    /// and the calculation properties describe measurement semantics that the
+    /// telemetry-history iteration will render, and stay out of this first
+    /// strictly projectable field set.
+    MetricDefinition {
+        units: Option<String>,
+        metric_type: Option<String>,
+    },
+    /// One metric report under the §2.1 `telemetry-service` family, projected
+    /// from the typed Redfish metric-report schema (`MetricReport_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Only metadata is projected: `metric_values_count` is derived from the
+    /// length of the `MetricValues` array. The values themselves are
+    /// deliberately not projected — each `MetricValue` entry carries a
+    /// timestamped reading, which is the telemetry history of the 0.4.0
+    /// iteration, and carrying unbounded value arrays now would defeat the
+    /// strict `deny_unknown_fields` alignment with the infra payload.
+    /// `MetricReport_v1` declares no `Status` property (the report instead
+    /// carries `Timestamp` and `Context` metadata), so this family carries no
+    /// status field either.
+    MetricReport { metric_values_count: Option<u64> },
+    /// One §2.1 `task-service` family member projected from the typed Redfish
+    /// task-service schema (`TaskService_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `ServiceEnabled`, `CompletedTaskOverWritePolicy`,
+    /// and `Status` properties. `completed_task_overwrite_policy` is the
+    /// `OverWritePolicy` enumeration (`Manual`, `Oldest`) retained as a string
+    /// so the console renders it without re-parsing text. `DateTime` and
+    /// `LifeCycleEventOnTaskStateChange` were considered but describe service
+    /// plumbing rather than a console-rendered surface.
+    TaskService {
+        service_enabled: Option<bool>,
+        completed_task_overwrite_policy: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One task under the §2.1 `task-service` family, projected from the typed
+    /// Redfish task schema (`Task_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `TaskState`, `TaskStatus`, `PercentComplete`,
+    /// `StartTime`, and `EndTime` properties. `task_state` is the `TaskState`
+    /// enumeration (`New`, `Starting`, `Running`, `Suspended`, `Interrupted`,
+    /// `Pending`, `Stopping`, `Completed`, `Killed`, `Exception`, `Service`,
+    /// `Cancelling`, `Cancelled`) and `task_status` the `Resource.Health`
+    /// enumeration, both retained as strings so the console renders them
+    /// without re-parsing text. `start_time` and `end_time` stay RFC 3339
+    /// timestamps because both are `Edm.DateTimeOffset` in the schema, and
+    /// `percent_complete` stays numeric (`Edm.Int64`, present since `v1_6_0`).
+    /// `Messages` and the `Payload`/`TaskMonitor` links were considered but
+    /// stay out of this first strictly projectable field set.
+    Task {
+        task_state: Option<String>,
+        task_status: Option<String>,
+        percent_complete: Option<u64>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        start_time: Option<OffsetDateTime>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        end_time: Option<OffsetDateTime>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -3560,6 +3679,356 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn core_resource_contract_carries_event_service_wire_values() -> Result<(), Box<dyn Error>> {
+        let event_service = event_service_resource();
+
+        assert_eq!(
+            serde_json::to_value(&event_service)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e6",
+                    "odata_id": "/redfish/v1/EventService",
+                    "odata_type": "#EventService.v1_12_0.EventService",
+                    "etag": "W/\"event-service-1\""
+                },
+                "common": {
+                    "id": "EventService",
+                    "name": "Event Service",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "event_service",
+                    "details": {
+                        "service_enabled": true,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&event_service)?)?,
+            event_service
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "event_service",
+                "details": {
+                    "service_enabled": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_event_subscription_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let event_subscription = event_subscription_resource();
+
+        assert_eq!(
+            serde_json::to_value(&event_subscription)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e7",
+                    "odata_id": "/redfish/v1/EventService/Subscriptions/1",
+                    "odata_type": "#EventDestination.v1_16_0.EventDestination",
+                    "etag": "W/\"subscription-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Subscription One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "event_subscription",
+                    "details": {
+                        "destination": "https://subscriber.example.test/events",
+                        "protocol": "Redfish",
+                        "context": "Rack A",
+                        "event_types": ["Alert", "StatusChange"],
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &event_subscription
+            )?)?,
+            event_subscription
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "event_subscription",
+                "details": {
+                    "destination": null,
+                    "protocol": null,
+                    "context": null,
+                    "event_types": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_telemetry_service_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let telemetry_service = telemetry_service_resource();
+
+        assert_eq!(
+            serde_json::to_value(&telemetry_service)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e8",
+                    "odata_id": "/redfish/v1/TelemetryService",
+                    "odata_type": "#TelemetryService.v1_4_0.TelemetryService",
+                    "etag": null
+                },
+                "common": {
+                    "id": "TelemetryService",
+                    "name": "Telemetry Service",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "telemetry_service",
+                    "details": {
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &telemetry_service
+            )?)?,
+            telemetry_service
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "telemetry_service",
+                "details": {
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_metric_definition_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let metric_definition = metric_definition_resource();
+
+        assert_eq!(
+            serde_json::to_value(&metric_definition)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e9",
+                    "odata_id": "/redfish/v1/TelemetryService/MetricDefinitions/1",
+                    "odata_type": "#MetricDefinition.v1_3_5.MetricDefinition",
+                    "etag": null
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Inlet Temperature Definition",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "metric_definition",
+                    "details": {
+                        "units": "Cel",
+                        "metric_type": "Numeric"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &metric_definition
+            )?)?,
+            metric_definition
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "metric_definition",
+                "details": {
+                    "units": null,
+                    "metric_type": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_metric_report_wire_values() -> Result<(), Box<dyn Error>> {
+        let metric_report = metric_report_resource();
+
+        assert_eq!(
+            serde_json::to_value(&metric_report)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789ea",
+                    "odata_id": "/redfish/v1/TelemetryService/MetricReports/1",
+                    "odata_type": "#MetricReport.v1_5_2.MetricReport",
+                    "etag": "W/\"report-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Inlet Temperature Report",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "metric_report",
+                    "details": {
+                        "metric_values_count": 12
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&metric_report)?)?,
+            metric_report
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "metric_report",
+                "details": {
+                    "metric_values_count": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_task_service_wire_values() -> Result<(), Box<dyn Error>> {
+        let task_service = task_service_resource();
+
+        assert_eq!(
+            serde_json::to_value(&task_service)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789eb",
+                    "odata_id": "/redfish/v1/TaskService",
+                    "odata_type": "#TaskService.v1_3_0.TaskService",
+                    "etag": null
+                },
+                "common": {
+                    "id": "TaskService",
+                    "name": "Task Service",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "task_service",
+                    "details": {
+                        "service_enabled": true,
+                        "completed_task_overwrite_policy": "Oldest",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&task_service)?)?,
+            task_service
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "task_service",
+                "details": {
+                    "service_enabled": null,
+                    "completed_task_overwrite_policy": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_task_wire_values() -> Result<(), Box<dyn Error>> {
+        let task = task_resource()?;
+
+        assert_eq!(
+            serde_json::to_value(&task)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789ec",
+                    "odata_id": "/redfish/v1/TaskService/Tasks/1",
+                    "odata_type": "#Task.v1_7_4.Task",
+                    "etag": "W/\"task-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Firmware Update Task",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "task",
+                    "details": {
+                        "task_state": "Running",
+                        "task_status": "OK",
+                        "percent_complete": 42,
+                        "start_time": "2026-08-05T10:20:00Z",
+                        "end_time": null
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&task)?)?,
+            task
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "task",
+                "details": {
+                    "task_state": null,
+                    "task_status": null,
+                    "percent_complete": null,
+                    "start_time": null,
+                    "end_time": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
     fn pcie_device_resource() -> CoreResourceResponse {
         CoreResourceResponse::new(
             CoreResourceSourceResponse::new(
@@ -3626,6 +4095,165 @@ mod tests {
                     Some("OK".to_owned()),
                     Some("OK".to_owned()),
                 )),
+            },
+        ))
+    }
+
+    fn event_service_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e6"),
+                "/redfish/v1/EventService".to_owned(),
+                Some("#EventService.v1_12_0.EventService".to_owned()),
+                Some("W/\"event-service-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "EventService".to_owned(),
+                "Event Service".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::EventService {
+                service_enabled: Some(true),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn event_subscription_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e7"),
+                "/redfish/v1/EventService/Subscriptions/1".to_owned(),
+                Some("#EventDestination.v1_16_0.EventDestination".to_owned()),
+                Some("W/\"subscription-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("1".to_owned(), "Subscription One".to_owned(), None),
+            CoreResourceDetailsResponse::EventSubscription {
+                destination: Some("https://subscriber.example.test/events".to_owned()),
+                protocol: Some("Redfish".to_owned()),
+                context: Some("Rack A".to_owned()),
+                event_types: Some(vec!["Alert".to_owned(), "StatusChange".to_owned()]),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn telemetry_service_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e8"),
+                "/redfish/v1/TelemetryService".to_owned(),
+                Some("#TelemetryService.v1_4_0.TelemetryService".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "TelemetryService".to_owned(),
+                "Telemetry Service".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::TelemetryService {
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn metric_definition_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e9"),
+                "/redfish/v1/TelemetryService/MetricDefinitions/1".to_owned(),
+                Some("#MetricDefinition.v1_3_5.MetricDefinition".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Inlet Temperature Definition".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::MetricDefinition {
+                units: Some("Cel".to_owned()),
+                metric_type: Some("Numeric".to_owned()),
+            },
+        )
+    }
+
+    fn metric_report_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789ea"),
+                "/redfish/v1/TelemetryService/MetricReports/1".to_owned(),
+                Some("#MetricReport.v1_5_2.MetricReport".to_owned()),
+                Some("W/\"report-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Inlet Temperature Report".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::MetricReport {
+                metric_values_count: Some(12),
+            },
+        )
+    }
+
+    fn task_service_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789eb"),
+                "/redfish/v1/TaskService".to_owned(),
+                Some("#TaskService.v1_3_0.TaskService".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "TaskService".to_owned(),
+                "Task Service".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::TaskService {
+                service_enabled: Some(true),
+                completed_task_overwrite_policy: Some("Oldest".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn task_resource() -> Result<CoreResourceResponse, &'static str> {
+        let start_time = OffsetDateTime::parse("2026-08-05T10:20:00Z", &Rfc3339)
+            .map_err(|_| "test start time must parse")?;
+        Ok(CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789ec"),
+                "/redfish/v1/TaskService/Tasks/1".to_owned(),
+                Some("#Task.v1_7_4.Task".to_owned()),
+                Some("W/\"task-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Firmware Update Task".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Task {
+                task_state: Some("Running".to_owned()),
+                task_status: Some("OK".to_owned()),
+                percent_complete: Some(42),
+                start_time: Some(start_time),
+                end_time: None,
             },
         ))
     }
