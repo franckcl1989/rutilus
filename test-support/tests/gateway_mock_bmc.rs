@@ -32,7 +32,7 @@ const MOCK_PASSWORD: &str = "password";
 /// only the inventory count and the core capability states are pinned here;
 /// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -56,6 +56,11 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
     EndpointCapability::PcieDevices,
     EndpointCapability::Assembly,
     EndpointCapability::UpdateService,
+    // The 0.2 service-family read surface: the Service Root advertises the
+    // `event-service`, `telemetry-service`, and `task-service` root services.
+    EndpointCapability::EventService,
+    EndpointCapability::TelemetryService,
+    EndpointCapability::TaskService,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -188,10 +193,11 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
     // PCIe device; one Chassis with its Power and Thermal singletons plus one
     // Sensor, one Control member, and one Assembly member; one Manager with
     // its LogServices, NetworkProtocol, and HostInterfaces surface; one
-    // Account; and one SoftwareInventory member under the UpdateService;
-    // typed navigation must visit every family exactly in the documented
-    // read order.
-    assert_eq!(resources.len(), 21);
+    // Account; one SoftwareInventory member under the UpdateService; and the
+    // event, telemetry, and task service families (one subscription, one
+    // metric definition, one metric report, and one task); typed navigation
+    // must visit every family exactly in the documented read order.
+    assert_eq!(resources.len(), 28);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -220,6 +226,13 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
             ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
             ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
         ]
     );
 
@@ -311,6 +324,59 @@ fn assert_family_payloads(resources: &[CoreResourceProjection]) -> Result<(), Bo
     assert_projection_payload(&resources[20], "SoftwareId", "BIOS-2026-1")?;
     assert_projection_payload(&resources[20], "Version", "2.7.0")?;
     assert_projection_payload(&resources[20], "ReleaseDate", "2026-05-01T00:00:00Z")?;
+    assert_service_family_payloads(resources)
+}
+
+/// Asserts the typed field projections of the event, telemetry, and task
+/// service families, keeping `assert_family_payloads` short by moving the
+/// service-family assertions behind one call.
+fn assert_service_family_payloads(
+    resources: &[CoreResourceProjection],
+) -> Result<(), Box<dyn Error>> {
+    // The service-family projections carry the direct properties exactly as
+    // published: the event service its enable flag and status, the
+    // subscription its destination, protocol, context, and event types, the
+    // telemetry service only status, the metric definition its units and
+    // type, the metric report its derived value count, the task service its
+    // enable flag and overwrite policy, and the task its state, progress,
+    // and timeline.
+    let event_service_payload: serde_json::Value =
+        serde_json::from_str(resources[21].payload().as_str())?;
+    assert_eq!(event_service_payload["ServiceEnabled"], true);
+    assert_eq!(event_service_payload["Status"]["Health"], "OK");
+    let subscription_payload: serde_json::Value =
+        serde_json::from_str(resources[22].payload().as_str())?;
+    assert_eq!(
+        subscription_payload["Destination"],
+        "https://events.example.com/hook-1"
+    );
+    assert_eq!(subscription_payload["Protocol"], "Redfish");
+    assert_eq!(subscription_payload["Context"], "hook-one");
+    assert_eq!(
+        subscription_payload["EventTypes"],
+        serde_json::json!(["StatusChange", "Alert"])
+    );
+    let telemetry_payload: serde_json::Value =
+        serde_json::from_str(resources[23].payload().as_str())?;
+    assert_eq!(telemetry_payload["Status"]["State"], "Enabled");
+    let definition_payload: serde_json::Value =
+        serde_json::from_str(resources[24].payload().as_str())?;
+    assert_eq!(definition_payload["MetricType"], "Numeric");
+    assert_eq!(definition_payload["Units"], "W");
+    let report_payload: serde_json::Value = serde_json::from_str(resources[25].payload().as_str())?;
+    assert_eq!(report_payload["MetricValuesCount"], 2);
+    let task_service_payload: serde_json::Value =
+        serde_json::from_str(resources[26].payload().as_str())?;
+    assert_eq!(task_service_payload["ServiceEnabled"], true);
+    assert_eq!(
+        task_service_payload["CompletedTaskOverWritePolicy"],
+        "Oldest"
+    );
+    let task_payload: serde_json::Value = serde_json::from_str(resources[27].payload().as_str())?;
+    assert_eq!(task_payload["TaskState"], "Running");
+    assert_eq!(task_payload["TaskStatus"], "OK");
+    assert_eq!(task_payload["PercentComplete"], 42);
+    assert_eq!(task_payload["StartTime"], "2026-08-01T09:30:00Z");
     Ok(())
 }
 
@@ -342,6 +408,13 @@ fn assert_resource_identifiers(resources: &[CoreResourceProjection]) {
         "/redfish/v1/Managers/1/HostInterfaces/1",
         "/redfish/v1/AccountService/Accounts/admin",
         "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions/1",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions/1",
+        "/redfish/v1/TelemetryService/MetricReports/1",
+        "/redfish/v1/TaskService",
+        "/redfish/v1/TaskService/Tasks/1",
     ];
     for (resource, expected) in resources.iter().zip(odata_ids) {
         assert_eq!(resource.odata_id().as_str(), expected);
@@ -417,6 +490,17 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/UpdateService"),
             ("GET", "/redfish/v1/UpdateService/SoftwareInventory"),
             ("GET", "/redfish/v1/UpdateService/SoftwareInventory/BIOS"),
+            ("GET", "/redfish/v1/EventService"),
+            ("GET", "/redfish/v1/EventService/Subscriptions"),
+            ("GET", "/redfish/v1/EventService/Subscriptions/1"),
+            ("GET", "/redfish/v1/TelemetryService"),
+            ("GET", "/redfish/v1/TelemetryService/MetricDefinitions"),
+            ("GET", "/redfish/v1/TelemetryService/MetricDefinitions/1"),
+            ("GET", "/redfish/v1/TelemetryService/MetricReports"),
+            ("GET", "/redfish/v1/TelemetryService/MetricReports/1"),
+            ("GET", "/redfish/v1/TaskService"),
+            ("GET", "/redfish/v1/TaskService/Tasks"),
+            ("GET", "/redfish/v1/TaskService/Tasks/1"),
             ("DELETE", "/redfish/v1/SessionService/Sessions/1"),
         ],
     );

@@ -32,6 +32,12 @@ const DEFAULT_USER_NAME: &str = "admin";
 /// The target is normalized by trimming a trailing slash so hand-typed URLs
 /// behave like the links the product decodes. Paths the fixture tree does
 /// not serve fall through to the 404 arm instead of failing the connection.
+// The dispatch table is a pure (method, path) match whose arm count grows
+// with the fixture tree, and the arms must stay in one place so the served
+// surface reads as a single table; splitting the service-family routes into
+// a helper would scatter the routing logic. The infra crate allows the same
+// lint on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn dispatch(
     method: HttpMethod,
     target: &str,
@@ -123,6 +129,29 @@ pub(crate) fn dispatch(
         (HttpMethod::Get, "/redfish/v1/UpdateService/SoftwareInventory/BIOS") => {
             json_ok(fixtures::SOFTWARE_INVENTORY_BIOS)
         }
+        (HttpMethod::Get, "/redfish/v1/EventService") => json_ok(fixtures::EVENT_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/EventService/Subscriptions") => {
+            json_ok(fixtures::EVENT_SUBSCRIPTIONS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/EventService/Subscriptions/1") => {
+            json_ok(fixtures::EVENT_SUBSCRIPTION_1)
+        }
+        (HttpMethod::Get, "/redfish/v1/TelemetryService") => json_ok(fixtures::TELEMETRY_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/TelemetryService/MetricDefinitions") => {
+            json_ok(fixtures::METRIC_DEFINITIONS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/TelemetryService/MetricDefinitions/1") => {
+            json_ok(fixtures::METRIC_DEFINITION_1)
+        }
+        (HttpMethod::Get, "/redfish/v1/TelemetryService/MetricReports") => {
+            json_ok(fixtures::METRIC_REPORTS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/TelemetryService/MetricReports/1") => {
+            json_ok(fixtures::METRIC_REPORT_1)
+        }
+        (HttpMethod::Get, "/redfish/v1/TaskService") => json_ok(fixtures::TASK_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/TaskService/Tasks") => json_ok(fixtures::TASKS_COLLECTION),
+        (HttpMethod::Get, "/redfish/v1/TaskService/Tasks/1") => json_ok(fixtures::TASK_1),
         _ => not_found(),
     }
 }

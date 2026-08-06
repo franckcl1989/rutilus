@@ -63,14 +63,17 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
    and the GPU1 PCIe device; Chassis 1 with its Power and Thermal singletons
    plus one Sensor, one Control member, and the Fan Assembly member; Manager
    1 with its event LogService, Network Protocol metadata, and Host
-   Interface; the built-in `admin` account; and the System BIOS software
-   inventory under the UpdateService); the capability page shows the
-   30-capability probe result:
+   Interface; the built-in `admin` account; the System BIOS software
+   inventory under the UpdateService; the EventService with its webhook
+   subscription, the TelemetryService with its power-consumption metric
+   definition and power report, and the TaskService with its running
+   firmware-update task); the capability page shows the 30-capability probe
+   result:
    SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
    BootOptions/SecureBoot/Power/Thermal/Sensors/Controls/HostInterfaces/
-   LogServices/ManagerNetworkProtocol/PcieDevices/Assembly/UpdateService
-   `Supported`, everything the fixture does not serve honestly
-   `NotAdvertised`.
+   LogServices/ManagerNetworkProtocol/PcieDevices/Assembly/UpdateService/
+   EventService/TelemetryService/TaskService `Supported`, everything the
+   fixture does not serve honestly `NotAdvertised`.
 5. Refresh the endpoint: the same tree is re-read through a fresh transient
    Session, which the product deletes before returning.
 
@@ -78,7 +81,7 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers/AccountService/UpdateService) |
+| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers/AccountService/UpdateService/EventService/TelemetryService/TaskService) |
 | GET | `/redfish/v1/SessionService` | Session Service, `ServiceEnabled: true` |
 | GET | `/redfish/v1/SessionService/Sessions` | Session collection listing the active ledger |
 | POST | `/redfish/v1/SessionService/Sessions` | `201` + `X-Auth-Token: test-session-token` + `Location` + Session document (echoes `UserName`) |
@@ -118,6 +121,17 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/UpdateService` | Firmware update service advertising its SoftwareInventory collection |
 | GET | `/redfish/v1/UpdateService/SoftwareInventory` | Software inventory collection (BIOS) |
 | GET | `/redfish/v1/UpdateService/SoftwareInventory/BIOS` | System BIOS (SoftwareId "BIOS-2026-1", Version "2.7.0", ReleaseDate) |
+| GET | `/redfish/v1/EventService` | Event service (ServiceEnabled, Subscriptions link) |
+| GET | `/redfish/v1/EventService/Subscriptions` | Event destination collection (subscription 1) |
+| GET | `/redfish/v1/EventService/Subscriptions/1` | Webhook subscription (Destination, Protocol Redfish, EventTypes StatusChange/Alert) |
+| GET | `/redfish/v1/TelemetryService` | Telemetry service advertising MetricDefinitions/MetricReports links |
+| GET | `/redfish/v1/TelemetryService/MetricDefinitions` | Metric definition collection (1) |
+| GET | `/redfish/v1/TelemetryService/MetricDefinitions/1` | Power Consumption definition (MetricType Numeric, Units W) |
+| GET | `/redfish/v1/TelemetryService/MetricReports` | Metric report collection (1) |
+| GET | `/redfish/v1/TelemetryService/MetricReports/1` | Power report (2 metric values; the snapshot carries only the derived count) |
+| GET | `/redfish/v1/TaskService` | Task service (ServiceEnabled, CompletedTaskOverWritePolicy Oldest, Tasks link) |
+| GET | `/redfish/v1/TaskService/Tasks` | Task collection (1) |
+| GET | `/redfish/v1/TaskService/Tasks/1` | Firmware Update Task (Running, 42%, StartTime) |
 | any other | | `404` with a Redfish-shaped `error` body (`Base.1.0.ResourceMissingAtURI`) |
 
 Fixture field sets and `@odata.type` spellings mirror the documents

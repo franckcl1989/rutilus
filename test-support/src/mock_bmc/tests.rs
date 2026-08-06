@@ -26,7 +26,7 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -50,6 +50,12 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
     EndpointCapability::PcieDevices,
     EndpointCapability::Assembly,
     EndpointCapability::UpdateService,
+    // The 0.2 service-family read surface: `event-service`,
+    // `telemetry-service`, and `task-service` are probed through their
+    // root-level service documents advertised by the Service Root.
+    EndpointCapability::EventService,
+    EndpointCapability::TelemetryService,
+    EndpointCapability::TaskService,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
@@ -68,8 +74,12 @@ const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 1] =
 /// member, `LogServices` collection with member, `NetworkProtocol`
 /// singleton, `HostInterfaces` collection with member, `AccountService` with
 /// Accounts collection and member, `UpdateService` document with
-/// `SoftwareInventory` collection and member, Session delete.
-const RESOURCE_READ_REQUEST_COUNT: u64 = 40;
+/// `SoftwareInventory` collection and member, the `EventService` document
+/// with its `Subscriptions` collection and member, the `TelemetryService`
+/// document with its `MetricDefinitions` and `MetricReports` collections and
+/// members, the `TaskService` document with its `Tasks` collection and
+/// member, and the Session delete.
+const RESOURCE_READ_REQUEST_COUNT: u64 = 51;
 
 /// The gateway's request count for one complete `probe_core_capabilities`
 /// flow with this fixture: root, `SessionService`, Sessions collection,
@@ -84,11 +94,13 @@ const RESOURCE_READ_REQUEST_COUNT: u64 = 40;
 /// wrapper's `log_services()` accessor eagerly fetches members, unlike the
 /// lazy `host_interfaces()` collection wrapper), the `NetworkProtocol`
 /// document, the `HostInterfaces` collection document, the `AccountService`
-/// document, the `Assembly` document and the `UpdateService` document (the
-/// probe fetches each advertised document; `pcie-devices` is presence-only
-/// and adds no request), and the Session delete. Unadvertised features add
-/// no requests.
-const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 31;
+/// document, the `EventService`, `TaskService`, and `TelemetryService`
+/// documents (each advertised root service is probed through its document),
+/// the `Assembly` document and the `UpdateService` document (the probe
+/// fetches each advertised document; `pcie-devices` is presence-only and
+/// adds no request), and the Session delete. Unadvertised features add no
+/// requests.
+const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 34;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -321,6 +333,13 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
             ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
         ]
     );
     let odata_ids: Vec<&str> = resources
@@ -353,6 +372,13 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             "/redfish/v1/Managers/1/HostInterfaces/1",
             "/redfish/v1/AccountService/Accounts/admin",
             "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+            "/redfish/v1/EventService",
+            "/redfish/v1/EventService/Subscriptions/1",
+            "/redfish/v1/TelemetryService",
+            "/redfish/v1/TelemetryService/MetricDefinitions/1",
+            "/redfish/v1/TelemetryService/MetricReports/1",
+            "/redfish/v1/TaskService",
+            "/redfish/v1/TaskService/Tasks/1",
         ]
     );
 }
@@ -424,6 +450,50 @@ fn assert_surface_payloads(resources: &[CoreResourceProjection]) -> Result<(), B
     assert_eq!(software_payload["SoftwareId"], "BIOS-2026-1");
     assert_eq!(software_payload["Version"], "2.7.0");
     assert_eq!(software_payload["ReleaseDate"], "2026-05-01T00:00:00Z");
+    // The service-family projections carry the direct properties exactly as
+    // published: the event service its enable flag and status, the
+    // subscription its destination, protocol, context, and event types, the
+    // telemetry service only status, the metric definition its units and
+    // type, the metric report its derived value count, the task service its
+    // enable flag and overwrite policy, and the task its state, progress,
+    // and timeline.
+    let event_service_payload: serde_json::Value =
+        serde_json::from_str(resources[21].payload().as_str())?;
+    assert_eq!(event_service_payload["ServiceEnabled"], true);
+    assert_eq!(event_service_payload["Status"]["Health"], "OK");
+    let subscription_payload: serde_json::Value =
+        serde_json::from_str(resources[22].payload().as_str())?;
+    assert_eq!(
+        subscription_payload["Destination"],
+        "https://events.example.com/hook-1"
+    );
+    assert_eq!(subscription_payload["Protocol"], "Redfish");
+    assert_eq!(subscription_payload["Context"], "hook-one");
+    assert_eq!(
+        subscription_payload["EventTypes"],
+        serde_json::json!(["StatusChange", "Alert"])
+    );
+    let telemetry_payload: serde_json::Value =
+        serde_json::from_str(resources[23].payload().as_str())?;
+    assert_eq!(telemetry_payload["Status"]["State"], "Enabled");
+    let definition_payload: serde_json::Value =
+        serde_json::from_str(resources[24].payload().as_str())?;
+    assert_eq!(definition_payload["MetricType"], "Numeric");
+    assert_eq!(definition_payload["Units"], "W");
+    let report_payload: serde_json::Value = serde_json::from_str(resources[25].payload().as_str())?;
+    assert_eq!(report_payload["MetricValuesCount"], 2);
+    let task_service_payload: serde_json::Value =
+        serde_json::from_str(resources[26].payload().as_str())?;
+    assert_eq!(task_service_payload["ServiceEnabled"], true);
+    assert_eq!(
+        task_service_payload["CompletedTaskOverWritePolicy"],
+        "Oldest"
+    );
+    let task_payload: serde_json::Value = serde_json::from_str(resources[27].payload().as_str())?;
+    assert_eq!(task_payload["TaskState"], "Running");
+    assert_eq!(task_payload["TaskStatus"], "OK");
+    assert_eq!(task_payload["PercentComplete"], 42);
+    assert_eq!(task_payload["StartTime"], "2026-08-01T09:30:00Z");
     Ok(())
 }
 

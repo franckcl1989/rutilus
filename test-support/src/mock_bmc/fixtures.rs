@@ -9,17 +9,21 @@
 //! Power and one Thermal singleton plus one Sensor and one Control member
 //! and one `Assembly` document with a single assembly member; one Manager
 //! with its `LogServices`, `NetworkProtocol`, and `HostInterfaces` surface;
-//! the `SessionService`; one `AccountService` with a single account; and
-//! one `UpdateService` with a single software-inventory member. Links the
-//! tree does not serve are omitted entirely, so the capability probe reports
-//! `NotAdvertised` for them instead of guessing paths.
+//! the `SessionService`; one `AccountService` with a single account; one
+//! `UpdateService` with a single software-inventory member; and the three
+//! root services behind the 0.2 event, telemetry, and task families
+//! (`EventService` with one subscription, `TelemetryService` with one metric
+//! definition and one metric report, and `TaskService` with one task). Links
+//! the tree does not serve are omitted entirely, so the capability probe
+//! reports `NotAdvertised` for them instead of guessing paths.
 
 /// `GET /redfish/v1` -- the Service Root.
 ///
-/// The core navigation links, the 0.2 `AccountService` root service, and the
-/// `UpdateService` root service behind the `software-inventory` family are
-/// advertised; the remaining root services (`EventService`, `TaskService`,
-/// and friends) stay absent so the probe reports them as `NotAdvertised`.
+/// The core navigation links and the 0.2 root services behind the
+/// `software-inventory`, `event-service`, `telemetry-service`, and
+/// `task-service` read surfaces are advertised; the remaining root services
+/// (`PowerEquipment`, `UpdateService` operations, and friends) stay absent
+/// so the probe reports them as `NotAdvertised`.
 pub(crate) const SERVICE_ROOT: &str = r##"{
     "@odata.id":"/redfish/v1/",
     "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
@@ -35,7 +39,10 @@ pub(crate) const SERVICE_ROOT: &str = r##"{
     "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
     "Managers":{"@odata.id":"/redfish/v1/Managers"},
     "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
-    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"}
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
 }"##;
 
 /// `GET /redfish/v1/SessionService` -- the session service, enabled so the
@@ -616,6 +623,193 @@ pub(crate) const SOFTWARE_INVENTORY_BIOS: &str = r##"{
     "Updateable":true,
     "Manufacturer":"Rutilus Test",
     "LowestSupportedVersion":"2.0.0"
+}"##;
+
+/// `GET /redfish/v1/EventService` -- the root event service, advertising its
+/// `Subscriptions` collection behind the 0.2 `event-subscription` family; the
+/// event-delivery fields are decoded by the schema but stay outside the
+/// strictly projectable field set, exactly like the
+/// `rutilus-infra-redfish` fixture the product's decoder accepts.
+pub(crate) const EVENT_SERVICE: &str = r##"{
+    "@odata.type":"#EventService.v1_7_0.EventService",
+    "@odata.id":"/redfish/v1/EventService",
+    "@odata.etag":"W/\"event-service-1\"",
+    "Id":"EventService",
+    "Name":"Event Service",
+    "Description":"Event subscription and delivery",
+    "ServiceEnabled":true,
+    "DeliveryRetryAttempts":3,
+    "DeliveryRetryIntervalSeconds":30,
+    "ServerSentEventUri":"/redfish/v1/EventService/SSE",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Subscriptions":{"@odata.id":"/redfish/v1/EventService/Subscriptions"}
+}"##;
+
+/// `GET /redfish/v1/EventService/Subscriptions` -- the event destination
+/// collection with the single webhook subscription member.
+pub(crate) const EVENT_SUBSCRIPTIONS_COLLECTION: &str = r##"{
+    "@odata.type":"#EventDestinationCollection.EventDestinationCollection",
+    "@odata.id":"/redfish/v1/EventService/Subscriptions",
+    "Name":"Event Subscription Collection",
+    "Members":[{"@odata.id":"/redfish/v1/EventService/Subscriptions/1"}]
+}"##;
+
+/// `GET /redfish/v1/EventService/Subscriptions/1` -- the single webhook
+/// subscription member with every optional contract field populated; the
+/// delivery and filtering fields are decoded but stay outside the strictly
+/// projectable field set, exactly like the `rutilus-infra-redfish` fixture
+/// the product's decoder accepts.
+pub(crate) const EVENT_SUBSCRIPTION_1: &str = r##"{
+    "@odata.type":"#EventDestination.v1_14_0.EventDestination",
+    "@odata.id":"/redfish/v1/EventService/Subscriptions/1",
+    "@odata.etag":"W/\"subscription-1\"",
+    "Id":"1",
+    "Name":"Webhook Subscription One",
+    "Description":"Primary webhook subscription",
+    "Destination":"https://events.example.com/hook-1",
+    "Protocol":"Redfish",
+    "Context":"hook-one",
+    "EventTypes":["StatusChange","Alert"],
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HttpHeaders":[{"Key":"X-Example","Value":"1"}],
+    "MessageIds":["Base.1.0.Success"]
+}"##;
+
+/// `GET /redfish/v1/TelemetryService` -- the root telemetry service,
+/// advertising the `MetricDefinitions` and `MetricReports` collections
+/// behind the 0.2 `metric-definition` and `metric-report` families. The
+/// `ServiceEnabled` and capacity fields are decoded by the schema but stay
+/// outside the strictly projectable field set: the product defers the
+/// service-enabled posture and the service-capacity fields to the 0.4.0
+/// telemetry iteration.
+pub(crate) const TELEMETRY_SERVICE: &str = r##"{
+    "@odata.type":"#TelemetryService.v1_4_0.TelemetryService",
+    "@odata.id":"/redfish/v1/TelemetryService",
+    "@odata.etag":"W/\"telemetry-service-1\"",
+    "Id":"TelemetryService",
+    "Name":"Telemetry Service",
+    "Description":"Telemetry collection and reporting",
+    "ServiceEnabled":true,
+    "MaxReports":256,
+    "MinCollectionInterval":"PT1S",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "MetricDefinitions":{"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions"},
+    "MetricReports":{"@odata.id":"/redfish/v1/TelemetryService/MetricReports"}
+}"##;
+
+/// `GET /redfish/v1/TelemetryService/MetricDefinitions` -- the metric
+/// definition collection with the single power-consumption member.
+pub(crate) const METRIC_DEFINITIONS_COLLECTION: &str = r##"{
+    "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+    "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+    "Name":"Metric Definition Collection",
+    "Members":[{"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/1"}]
+}"##;
+
+/// `GET /redfish/v1/TelemetryService/MetricDefinitions/1` -- the power
+/// consumption definition member with every optional contract field
+/// populated; the measurement-semantics fields are decoded but stay outside
+/// the strictly projectable field set, exactly like the
+/// `rutilus-infra-redfish` fixture the product's decoder accepts.
+pub(crate) const METRIC_DEFINITION_1: &str = r##"{
+    "@odata.type":"#MetricDefinition.v1_2_0.MetricDefinition",
+    "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/1",
+    "@odata.etag":"W/\"metric-definition-1\"",
+    "Id":"1",
+    "Name":"Power Consumption",
+    "Description":"Instantaneous power consumption",
+    "MetricType":"Numeric",
+    "MetricDataType":"Integer",
+    "Units":"W",
+    "Precision":1,
+    "MetricProperties":["/redfish/v1/Chassis/1/Power#/0/PowerConsumedWatts"]
+}"##;
+
+/// `GET /redfish/v1/TelemetryService/MetricReports` -- the metric report
+/// collection with the single power-report member.
+pub(crate) const METRIC_REPORTS_COLLECTION: &str = r##"{
+    "@odata.type":"#MetricReportCollection.MetricReportCollection",
+    "@odata.id":"/redfish/v1/TelemetryService/MetricReports",
+    "Name":"Metric Report Collection",
+    "Members":[{"@odata.id":"/redfish/v1/TelemetryService/MetricReports/1"}]
+}"##;
+
+/// `GET /redfish/v1/TelemetryService/MetricReports/1` -- the power report
+/// member: the `MetricValues` array and the `Timestamp`/`Context` metadata
+/// are decoded by the schema, but the projection carries only the derived
+/// `MetricValuesCount`, exactly like the `rutilus-infra-redfish` fixture the
+/// product's decoder accepts (`Status` is not a `MetricReport_v1` property
+/// and stays out).
+pub(crate) const METRIC_REPORT_1: &str = r##"{
+    "@odata.type":"#MetricReport.v1_4_0.MetricReport",
+    "@odata.id":"/redfish/v1/TelemetryService/MetricReports/1",
+    "@odata.etag":"W/\"metric-report-1\"",
+    "Id":"1",
+    "Name":"Power Report",
+    "Description":"Average platform power usage",
+    "ReportSequence":"1",
+    "Timestamp":"2026-08-01T09:30:00Z",
+    "Context":"power-context",
+    "MetricValues":[
+        {
+            "MetricId":"AverageConsumedWatts",
+            "MetricValue":"100",
+            "Timestamp":"2026-08-01T09:30:00Z"
+        },
+        {
+            "MetricId":"AverageConsumedWatts",
+            "MetricValue":"94",
+            "Timestamp":"2026-08-01T09:31:00Z"
+        }
+    ]
+}"##;
+
+/// `GET /redfish/v1/TaskService` -- the root task service, advertising its
+/// `Tasks` collection behind the 0.2 `task` family; the service-plumbing
+/// fields are decoded by the schema but stay outside the strictly
+/// projectable field set.
+pub(crate) const TASK_SERVICE: &str = r##"{
+    "@odata.type":"#TaskService.v1_2_0.TaskService",
+    "@odata.id":"/redfish/v1/TaskService",
+    "@odata.etag":"W/\"task-service-1\"",
+    "Id":"TaskService",
+    "Name":"Task Service",
+    "Description":"Asynchronous task tracking",
+    "ServiceEnabled":true,
+    "CompletedTaskOverWritePolicy":"Oldest",
+    "TaskAutoDeleteTimeoutMinutes":60,
+    "DateTime":"2026-08-01T09:30:00Z",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService/Tasks"}
+}"##;
+
+/// `GET /redfish/v1/TaskService/Tasks` -- the task collection with the
+/// single firmware-update member.
+pub(crate) const TASKS_COLLECTION: &str = r##"{
+    "@odata.type":"#TaskCollection.TaskCollection",
+    "@odata.id":"/redfish/v1/TaskService/Tasks",
+    "Name":"Task Collection",
+    "Members":[{"@odata.id":"/redfish/v1/TaskService/Tasks/1"}]
+}"##;
+
+/// `GET /redfish/v1/TaskService/Tasks/1` -- the running firmware-update task
+/// member with every optional contract field populated; the task plumbing
+/// fields are decoded but stay outside the strictly projectable field set,
+/// exactly like the `rutilus-infra-redfish` fixture the product's decoder
+/// accepts.
+pub(crate) const TASK_1: &str = r##"{
+    "@odata.type":"#Task.v1_7_0.Task",
+    "@odata.id":"/redfish/v1/TaskService/Tasks/1",
+    "@odata.etag":"W/\"task-1\"",
+    "Id":"1",
+    "Name":"Firmware Update Task",
+    "Description":"Applying firmware update",
+    "TaskState":"Running",
+    "TaskStatus":"OK",
+    "PercentComplete":42,
+    "StartTime":"2026-08-01T09:30:00Z",
+    "TaskMonitor":"/redfish/v1/TaskService/Tasks/1/Monitor",
+    "HidePayload":false
 }"##;
 
 /// The Redfish-shaped error body for unregistered paths.
