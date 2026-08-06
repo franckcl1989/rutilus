@@ -9,6 +9,7 @@ mod endpoint;
 mod endpoint_address;
 mod ids;
 mod operation;
+mod redfish_command;
 mod resource_snapshot;
 
 pub use audit::{
@@ -40,6 +41,12 @@ pub use ids::{
 pub use operation::{
     InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,
     OperationState, OperationStateParseError, OperationTarget, OperationTimelineError, transition,
+};
+pub use redfish_command::{
+    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
+    CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol,
+    EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType, ResetType,
+    SecureBootCommand, SetBootSourceOverride, SystemCommand,
 };
 pub use resource_snapshot::{
     RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,

@@ -1,8 +1,9 @@
 //! The unified persisted operation model (§13).
 //!
 //! Every write request — from the Standalone GUI, the Site GUI, or the Center
-//! — is converted into one persisted [`Operation`] (§13.1). The operation
-//! lifecycle is driven exclusively by the §13.2 state machine through the pure
+//! — is converted into one persisted [`Operation`] (§13.1) that carries the
+//! typed [`RedfishCommand`] (§7.5) to execute. The operation lifecycle is
+//! driven exclusively by the §13.2 state machine through the pure
 //! [`transition`] function; there is no other path that changes an operation's
 //! state (§7.1). A string stored in the database is rehydrated with
 //! [`Operation::try_from_parts`], but changing it still requires a legal
@@ -12,7 +13,7 @@ use std::{error::Error, fmt, str::FromStr};
 
 use time::OffsetDateTime;
 
-use crate::{EndpointId, OperationId, TargetId};
+use crate::{EndpointId, OperationId, RedfishCommand, TargetId};
 
 /// The lifecycle phase of one persisted operation (§13.2).
 ///
@@ -453,6 +454,7 @@ pub struct Operation {
     id: OperationId,
     source: OperationSource,
     targets: Vec<OperationTarget>,
+    command: RedfishCommand,
     state: OperationState,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -461,6 +463,8 @@ pub struct Operation {
 impl Operation {
     /// Creates a persisted operation in the `Queued` phase.
     ///
+    /// Every operation carries exactly one typed [`RedfishCommand`] (§13.1)
+    /// — the write intent that the §13.3 step 7 dispatch executes — and
     /// `targets` must contain at least one target: a batch (§13.7) is a list
     /// of targets and a zero-target operation cannot be executed, so callers
     /// never construct one.
@@ -469,12 +473,14 @@ impl Operation {
         id: OperationId,
         source: OperationSource,
         targets: Vec<OperationTarget>,
+        command: RedfishCommand,
         created_at: OffsetDateTime,
     ) -> Self {
         Self {
             id,
             source,
             targets,
+            command,
             state: OperationState::Queued,
             created_at,
             updated_at: created_at,
@@ -485,8 +491,10 @@ impl Operation {
     ///
     /// This is the only way to construct an operation in a non-`Queued`
     /// state; it is reserved for persistence loading, which must accept
-    /// whatever the database stored. Transitions still go through the §13.2
-    /// state machine.
+    /// whatever the database stored. The command comes from the persisted
+    /// serde JSON deserialized back through [`RedfishCommand`]; a stored
+    /// payload this build cannot deserialize is refused as a corrupt
+    /// aggregate. Transitions still go through the §13.2 state machine.
     ///
     /// # Errors
     ///
@@ -496,6 +504,7 @@ impl Operation {
         id: OperationId,
         source: OperationSource,
         targets: Vec<OperationTarget>,
+        command: RedfishCommand,
         state: OperationState,
         created_at: OffsetDateTime,
         updated_at: OffsetDateTime,
@@ -507,6 +516,7 @@ impl Operation {
             id,
             source,
             targets,
+            command,
             state,
             created_at,
             updated_at,
@@ -553,6 +563,16 @@ impl Operation {
         &self.targets
     }
 
+    /// Returns the typed write command the operation must execute (§13.1,
+    /// §13.3 step 7).
+    ///
+    /// Each call clones the command because it is a value type carrying
+    /// payload data; the caller owns the clone.
+    #[must_use]
+    pub fn command(&self) -> RedfishCommand {
+        self.command.clone()
+    }
+
     #[must_use]
     pub const fn state(&self) -> OperationState {
         self.state
@@ -591,6 +611,12 @@ impl Error for OperationTimelineError {}
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode,
+        CreateSubscription, EventCommand, EventDestinationProtocol, EventType, RedfishCommand,
+        ResetType, SetBootSourceOverride, SystemCommand,
+    };
+
     use super::*;
 
     /// Every state, so the matrix tests cannot silently miss a variant.
@@ -967,10 +993,12 @@ mod tests {
     fn new_operations_start_queued_with_matching_timestamps() {
         let created_at = OffsetDateTime::now_utc();
         let target = OperationTarget::new(TargetId::generate(), EndpointId::generate());
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle));
         let operation = Operation::new(
             OperationId::generate(),
             OperationSource::Center,
             vec![target],
+            command.clone(),
             created_at,
         );
 
@@ -980,6 +1008,7 @@ mod tests {
         assert_eq!(operation.updated_at(), created_at);
         assert_eq!(operation.source(), OperationSource::Center);
         assert_eq!(operation.targets(), &[target]);
+        assert_eq!(operation.command(), command);
     }
 
     #[test]
@@ -1018,11 +1047,19 @@ mod tests {
         let created_at = OffsetDateTime::now_utc();
         let updated_at = created_at + time::Duration::SECOND;
         let target = OperationTarget::new(TargetId::generate(), EndpointId::generate());
+        let command = RedfishCommand::Event(EventCommand::CreateSubscription(
+            CreateSubscription::try_new(
+                "https://192.0.2.10/events".to_owned(),
+                EventDestinationProtocol::Redfish,
+                vec![EventType::Alert],
+            )?,
+        ));
 
         let restored = Operation::try_from_parts(
             OperationId::generate(),
             OperationSource::Standalone,
             vec![target],
+            command.clone(),
             OperationState::WaitingRemote,
             created_at,
             updated_at,
@@ -1030,6 +1067,7 @@ mod tests {
         assert_eq!(restored.state(), OperationState::WaitingRemote);
         assert_eq!(restored.created_at(), created_at);
         assert_eq!(restored.updated_at(), updated_at);
+        assert_eq!(restored.command(), command);
 
         let inverted = created_at - time::Duration::SECOND;
         assert_eq!(
@@ -1037,12 +1075,42 @@ mod tests {
                 OperationId::generate(),
                 OperationSource::Standalone,
                 vec![target],
+                RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
                 OperationState::Running,
                 created_at,
                 inverted,
             ),
             Err(OperationTimelineError)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operations_always_carry_their_typed_command() -> Result<(), Box<dyn Error>> {
+        let created_at = OffsetDateTime::now_utc();
+        let command = RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+            SetBootSourceOverride::new(
+                BootSource::Pxe,
+                BootSourceOverrideEnabled::Once,
+                BootSourceOverrideMode::Uefi,
+            ),
+        ));
+        let mut operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Center,
+            vec![OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            command.clone(),
+            created_at,
+        );
+
+        // The command survives the full §13.2 lifecycle: it is a fact of the
+        // operation record, never recomputed by the state machine.
+        let started_at = created_at + time::Duration::SECOND;
+        operation.apply(OperationEvent::ValidationStarted, started_at)?;
+        assert_eq!(operation.command(), command);
         Ok(())
     }
 
@@ -1054,6 +1122,7 @@ mod tests {
                 TargetId::generate(),
                 EndpointId::generate(),
             )],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
             created_at,
         )
     }
