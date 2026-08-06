@@ -735,10 +735,11 @@ fn project_enrollment(
             ResourceFeature::Chassis => chassis += 1,
             ResourceFeature::Managers => managers += 1,
             // The 0.2 resource families (Processors, Memory, Storage,
-            // Network, Accounts, Bios, BootOptions, SecureBoot, and the
-            // Power/Thermal/Sensors/Controls telemetry families)
-            // intentionally stay out of the three-field enrollment counts;
-            // the typed resource-inventory route carries their full
+            // Network, Accounts, Bios, BootOptions, SecureBoot, the
+            // Power/Thermal/Sensors/Controls telemetry families, and the
+            // LogServices/ManagerNetworkProtocol/HostInterfaces manager
+            // surface) intentionally stay out of the three-field enrollment
+            // counts; the typed resource-inventory route carries their full
             // snapshots instead.
             ResourceFeature::ServiceRoot
             | ResourceFeature::Processors
@@ -753,7 +754,10 @@ fn project_enrollment(
             | ResourceFeature::Power
             | ResourceFeature::Thermal
             | ResourceFeature::Sensors
-            | ResourceFeature::Controls => {}
+            | ResourceFeature::Controls
+            | ResourceFeature::LogServices
+            | ResourceFeature::ManagerNetworkProtocol
+            | ResourceFeature::HostInterfaces => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1153,6 +1157,11 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::Thermal { .. } => project_thermal_details(details),
         CoreResourceDetails::Sensor { .. } => project_sensor_details(details),
         CoreResourceDetails::Control { .. } => project_control_details(details),
+        CoreResourceDetails::LogService { .. } => project_log_service_details(details),
+        CoreResourceDetails::ManagerNetworkProtocol { .. } => {
+            project_manager_network_protocol_details(details)
+        }
+        CoreResourceDetails::HostInterface { .. } => project_host_interface_details(details),
     }
 }
 
@@ -1638,6 +1647,88 @@ fn project_control_details(details: &CoreResourceDetails) -> CoreResourceDetails
     CoreResourceDetailsResponse::Control {
         control_type: control_type.clone(),
         set_point: *set_point,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 log-services family into the shared wire contract,
+/// preserving the service-enabled flag and the numeric record capacity so
+/// clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `LogService` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_log_service_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::LogService {
+        service_enabled,
+        max_log_entries,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::LogService {
+            service_enabled: None,
+            max_log_entries: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::LogService {
+        service_enabled: *service_enabled,
+        max_log_entries: *max_log_entries,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 manager-network-protocol family into the shared wire
+/// contract, carrying the direct `HostName` and `FQDN` metadata properties
+/// and the resource-level status values.
+///
+/// The dispatcher guarantees this receives the `ManagerNetworkProtocol`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_manager_network_protocol_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::ManagerNetworkProtocol {
+        host_name,
+        fqdn,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::ManagerNetworkProtocol {
+            host_name: None,
+            fqdn: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::ManagerNetworkProtocol {
+        host_name: host_name.clone(),
+        fqdn: fqdn.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 host-interfaces family into the shared wire contract,
+/// preserving the interface-enabled flag; the `HostInterfaceType`
+/// enumeration stays internal to the persisted payload exactly like the
+/// `Account` family's `UserName`, because the shared wire contract carries
+/// only the interface state.
+///
+/// The dispatcher guarantees this receives the `HostInterface` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_host_interface_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::HostInterface {
+        interface_enabled,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::HostInterface {
+            interface_enabled: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::HostInterface {
+        interface_enabled: *interface_enabled,
         status: status.as_ref().map(project_resource_status),
     }
 }
@@ -2229,6 +2320,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_log_services_manager_network_protocol_and_host_interfaces_typed_resources()
+    -> Result<(), Box<dyn Error>> {
+        let item = manager_surface_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the manager host
+        // interface sorts before the log service, which sorts before the
+        // network protocol singleton.
+        assert_eq!(resources[1]["resource"]["resource_type"], "host_interface");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/HostInterfaces/1"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Host Interface One");
+        assert_eq!(
+            resources[1]["resource"]["details"]["interface_enabled"],
+            true
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        assert_eq!(resources[2]["resource"]["resource_type"], "log_service");
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/LogServices/1"
+        );
+        assert_eq!(resources[2]["common"]["name"], "BMC Event Log");
+        assert_eq!(resources[2]["resource"]["details"]["service_enabled"], true);
+        assert_eq!(resources[2]["resource"]["details"]["max_log_entries"], 1000);
+        assert_eq!(
+            resources[3]["resource"]["resource_type"],
+            "manager_network_protocol"
+        );
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/NetworkProtocol"
+        );
+        assert_eq!(resources[3]["resource"]["details"]["host_name"], "bmc-1");
+        assert_eq!(
+            resources[3]["resource"]["details"]["fqdn"],
+            "bmc-1.example.com"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_power_thermal_sensors_and_controls_typed_resources()
     -> Result<(), Box<dyn Error>> {
         let item = telemetry_inventory_item()?;
@@ -2690,6 +2840,68 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, power, thermal, sensor, control],
+        )?)
+    }
+
+    fn manager_surface_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Manager surface BMC")?,
+            EndpointAddress::parse("https://192.0.2.34")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![34])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(7)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let log_service = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::LogServices,
+            "/redfish/v1/Managers/1/LogServices/1",
+            r#"{"Id":"1","Name":"BMC Event Log","Description":"Manager event log","ServiceEnabled":true,"MaxNumberOfRecords":1000,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#LogService.v1_9_0.LogService")?)
+        .with_etag(ResourceEtag::parse("W/\"log-service-1\"")?);
+        let network_protocol = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ManagerNetworkProtocol,
+            "/redfish/v1/Managers/1/NetworkProtocol",
+            r#"{"Id":"NetworkProtocol","Name":"Manager Network Protocol","HostName":"bmc-1","FQDN":"bmc-1.example.com","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"network-protocol-1\"")?);
+        let host_interface = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::HostInterfaces,
+            "/redfish/v1/Managers/1/HostInterfaces/1",
+            r#"{"Id":"1","Name":"Host Interface One","Description":"Manager host interface","InterfaceEnabled":true,"HostInterfaceType":"NetworkHostInterface","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#HostInterface.v1_3_3.HostInterface")?)
+        .with_etag(ResourceEtag::parse("W/\"host-interface-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, log_service, network_protocol, host_interface],
         )?)
     }
 
