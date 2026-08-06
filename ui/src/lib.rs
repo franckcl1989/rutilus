@@ -251,7 +251,11 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
             | CoreResourceDetailsResponse::NetworkAdapter { .. }
-            | CoreResourceDetailsResponse::EthernetInterface { .. } => {}
+            | CoreResourceDetailsResponse::EthernetInterface { .. }
+            | CoreResourceDetailsResponse::Account { .. }
+            | CoreResourceDetailsResponse::Bios { .. }
+            | CoreResourceDetailsResponse::BootOption { .. }
+            | CoreResourceDetailsResponse::SecureBoot { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -315,6 +319,10 @@ fn card_facts(
         CoreResourceDetailsResponse::EthernetInterface { .. } => {
             ethernet_interface_card_facts(resource)
         }
+        CoreResourceDetailsResponse::Account { .. } => account_card_facts(resource),
+        CoreResourceDetailsResponse::Bios { .. } => bios_card_facts(resource),
+        CoreResourceDetailsResponse::BootOption { .. } => boot_option_card_facts(resource),
+        CoreResourceDetailsResponse::SecureBoot { .. } => secure_boot_card_facts(resource),
     }
 }
 
@@ -623,6 +631,119 @@ fn ethernet_interface_card_facts(
     );
     push_status_facts(&mut facts, status.as_ref());
     ("Ethernet interface", facts)
+}
+
+/// Facts for a §2.1 accounts card (a `ManagerAccount`); the enabled and
+/// locked flags render only when the BMC published them, and the
+/// manager-account schema has no status facts.
+///
+/// The dispatcher guarantees this receives the `Account` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Account {
+        enabled,
+        role_id,
+        locked,
+    } = resource
+    else {
+        return ("Account", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Enabled",
+        enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_fact(&mut facts, "Role", role_id.as_deref());
+    push_fact(
+        &mut facts,
+        "Locked",
+        locked.map(|locked| if locked { "Yes" } else { "No" }),
+    );
+    ("Account", facts)
+}
+
+/// Facts for a §2.1 bios card; only the attribute-registry metadata that
+/// names the BIOS attribute set is rendered, because the full attribute
+/// bag is a vendor-specific dynamic map of unbounded size.
+///
+/// The dispatcher guarantees this receives the `Bios` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn bios_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Bios { attribute_registry } = resource else {
+        return ("BIOS", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Attribute registry",
+        attribute_registry.as_deref(),
+    );
+    ("BIOS", facts)
+}
+
+/// Facts for a §2.1 boot-option card; `boot_option_enabled` stays a Boolean
+/// so the card renders the flag without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `BootOption` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn boot_option_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::BootOption {
+        display_name,
+        boot_option_enabled,
+        uefi_device_path,
+    } = resource
+    else {
+        return ("Boot option", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Display name", display_name.as_deref());
+    push_fact(
+        &mut facts,
+        "Enabled",
+        boot_option_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_fact(&mut facts, "UEFI device path", uefi_device_path.as_deref());
+    ("Boot option", facts)
+}
+
+/// Facts for a §2.1 secure-boot card; `secure_boot_mode` stays the original
+/// schema enumeration string so the card renders it without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `SecureBoot` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn secure_boot_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::SecureBoot {
+        secure_boot_enable,
+        secure_boot_mode,
+    } = resource
+    else {
+        return ("Secure Boot", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Secure boot enabled",
+        secure_boot_enable.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_fact(&mut facts, "Secure boot mode", secure_boot_mode.as_deref());
+    ("Secure Boot", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3698,7 +3819,11 @@ mod tests {
                             memory_resource(),
                             storage_resource(),
                             network_adapter_resource(),
-                            ethernet_interface_resource()
+                            ethernet_interface_resource(),
+                            account_resource(),
+                            bios_resource(),
+                            boot_option_resource(),
+                            secure_boot_resource()
                         ]
                     }
                 }
@@ -3946,6 +4071,99 @@ mod tests {
         })
     }
 
+    fn account_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d9",
+                "odata_id": "/redfish/v1/AccountService/Accounts/admin",
+                "odata_type": "#ManagerAccount.v1_14_1.ManagerAccount",
+                "etag": "W/\"account-1\""
+            },
+            "common": {
+                "id": "admin",
+                "name": "Administrator Account",
+                "description": "Built-in administrator account"
+            },
+            "resource": {
+                "resource_type": "account",
+                "details": {
+                    "enabled": true,
+                    "role_id": "Administrator",
+                    "locked": false
+                }
+            }
+        })
+    }
+
+    fn bios_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789da",
+                "odata_id": "/redfish/v1/Systems/1/Bios",
+                "odata_type": "#Bios.v1_2_3.Bios",
+                "etag": "W/\"bios-1\""
+            },
+            "common": {
+                "id": "BIOS",
+                "name": "BIOS Configuration",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "bios",
+                "details": {
+                    "attribute_registry": "BiosAttributeRegistry.v1_0_0"
+                }
+            }
+        })
+    }
+
+    fn boot_option_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789db",
+                "odata_id": "/redfish/v1/Systems/1/BootOptions/PXE-1",
+                "odata_type": "#BootOption.v1_0_6.BootOption",
+                "etag": null
+            },
+            "common": {
+                "id": "PXE-1",
+                "name": "Network Boot Option",
+                "description": "PXE boot option"
+            },
+            "resource": {
+                "resource_type": "boot_option",
+                "details": {
+                    "display_name": "PXE Network Boot",
+                    "boot_option_enabled": true,
+                    "uefi_device_path": "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)"
+                }
+            }
+        })
+    }
+
+    fn secure_boot_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789dc",
+                "odata_id": "/redfish/v1/Systems/1/SecureBoot",
+                "odata_type": "#SecureBoot.v1_1_2.SecureBoot",
+                "etag": "W/\"secure-boot-1\""
+            },
+            "common": {
+                "id": "SecureBoot",
+                "name": "Secure Boot",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "secure_boot",
+                "details": {
+                    "secure_boot_enable": true,
+                    "secure_boot_mode": "DeployedMode"
+                }
+            }
+        })
+    }
+
     fn ethernet_interface_resource() -> serde_json::Value {
         json!({
             "source": {
@@ -4118,7 +4336,7 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 9);
+        assert_eq!(current.resources.len(), 13);
         let system = current
             .resources
             .iter()
@@ -4305,6 +4523,95 @@ mod tests {
         assert!(ethernet.facts.contains(&ResourceFactProjection {
             label: "Interface enabled",
             value: "Yes".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accounts_bios_boot_options_and_secure_boot_cards_render_family_facts()
+    -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let account = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Account")
+            .ok_or("account resource must exist")?;
+        assert_eq!(account.name, "Administrator Account");
+        assert_eq!(account.source, "/redfish/v1/AccountService/Accounts/admin");
+        assert!(account.facts.contains(&ResourceFactProjection {
+            label: "Enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(account.facts.contains(&ResourceFactProjection {
+            label: "Role",
+            value: "Administrator".to_owned(),
+        }));
+        assert!(account.facts.contains(&ResourceFactProjection {
+            label: "Locked",
+            value: "No".to_owned(),
+        }));
+        assert!(!account.facts.iter().any(|fact| fact.label == "State"));
+        let bios = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "BIOS")
+            .ok_or("bios resource must exist")?;
+        assert_eq!(bios.name, "BIOS Configuration");
+        assert_eq!(bios.source, "/redfish/v1/Systems/1/Bios");
+        assert!(bios.facts.contains(&ResourceFactProjection {
+            label: "Attribute registry",
+            value: "BiosAttributeRegistry.v1_0_0".to_owned(),
+        }));
+        let boot_option = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Boot option")
+            .ok_or("boot option resource must exist")?;
+        assert_eq!(boot_option.name, "Network Boot Option");
+        assert_eq!(
+            boot_option.source,
+            "/redfish/v1/Systems/1/BootOptions/PXE-1"
+        );
+        assert!(boot_option.facts.contains(&ResourceFactProjection {
+            label: "Display name",
+            value: "PXE Network Boot".to_owned(),
+        }));
+        assert!(boot_option.facts.contains(&ResourceFactProjection {
+            label: "Enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(boot_option.facts.contains(&ResourceFactProjection {
+            label: "UEFI device path",
+            value: "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)".to_owned(),
+        }));
+        let secure_boot = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Secure Boot")
+            .ok_or("secure boot resource must exist")?;
+        assert_eq!(secure_boot.name, "Secure Boot");
+        assert_eq!(secure_boot.source, "/redfish/v1/Systems/1/SecureBoot");
+        assert!(secure_boot.facts.contains(&ResourceFactProjection {
+            label: "Secure boot enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(secure_boot.facts.contains(&ResourceFactProjection {
+            label: "Secure boot mode",
+            value: "DeployedMode".to_owned(),
         }));
         assert_eq!(
             current.resource_counts,
