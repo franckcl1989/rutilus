@@ -16,6 +16,30 @@
 //!   reports the operations left in a recoverable state after a restart.
 //! - [`EngineError`] wraps the store's own error type so every persistence
 //!   failure keeps its context while the engine adds its own verdicts.
+//! - [`RemoteTask`], [`RemoteTaskState`], and [`TaskUri`] are the §13.6
+//!   observation model: one record per operation that reached
+//!   `WaitingRemote`, carrying the Task and `TaskMonitor` URIs plus the
+//!   newest observed state, message, and progress.
+//! - [`RemoteTaskStore`] is the observation persistence boundary, also
+//!   implemented by `rutilus-persistence` in production and by an in-memory
+//!   fake in tests. Saving an observation never moves the operation state
+//!   machine — that is always [`OperationEngine::apply`]'s job.
+//!
+//! # Driving the Task flow (§13.6)
+//!
+//! The Task acceptance and completion events (`RemoteTaskStarted`,
+//! `RemoteTaskCompleted`) are ordinary
+//! [`OperationEvent`](rutilus_domain::OperationEvent)s already driven
+//! through [`OperationEngine::apply`]; no separate Task engine API exists.
+//! The application's Task monitor composes the two boundaries: on
+//! acceptance and on every poll it saves the newest observation through
+//! [`RemoteTaskStore::save_remote_task`], and when the observation is
+//! terminal it applies the corresponding event. The composition needs no
+//! atomicity: both halves are idempotent, so a crash between them leaves
+//! the terminal observation persisted and the §13.6 restart scan resumes by
+//! re-reading the row and applying the event. The scan itself is
+//! [`OperationEngine::recover_pending`] plus a `RemoteTaskStore` read per
+//! `WaitingRemote` operation.
 //!
 //! Executing BMC actions is deliberately out of scope for this crate: the
 //! engine persists and advances state, and the future scheduler in
@@ -26,6 +50,12 @@
 
 mod operation_engine;
 mod operation_store;
+mod remote_task;
+mod remote_task_store;
 
 pub use operation_engine::{EngineError, OperationEngine, RECOVERABLE_STATES};
 pub use operation_store::{BoundaryFuture, OperationStore};
+pub use remote_task::{
+    RemoteTask, RemoteTaskError, RemoteTaskState, RemoteTaskStateParseError, TaskUri, TaskUriError,
+};
+pub use remote_task_store::RemoteTaskStore;

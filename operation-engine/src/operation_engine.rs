@@ -252,7 +252,7 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use super::*;
-    use crate::BoundaryFuture;
+    use crate::{BoundaryFuture, RemoteTask, RemoteTaskState, RemoteTaskStore, TaskUri};
 
     /// One recorded store call, in order.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +261,9 @@ mod tests {
         Find(OperationId),
         ApplyTransition(OperationId, OperationState),
         List(Option<OperationState>),
+        SaveRemoteTask(OperationId),
+        FindRemoteTask(OperationId),
+        ListRemoteTasks(RemoteTaskState),
     }
 
     /// A recorded state step, with the exact timestamp the engine supplied.
@@ -285,9 +288,13 @@ mod tests {
     /// `apply_transition` models the trait contract from `operation_store.rs`:
     /// it rejects unknown ids and any write onto a terminal state with
     /// [`FakeStoreError::Conflict`], so tests can verify the engine propagates
-    /// store conflicts unchanged.
+    /// store conflicts unchanged. The fake also implements
+    /// [`RemoteTaskStore`] on separate rows, exactly like the production
+    /// `SqliteStore`, so the §13.6 Task flow can be driven through one test
+    /// object.
     struct FakeStore {
         rows: Mutex<HashMap<OperationId, Operation>>,
+        remote_rows: Mutex<HashMap<OperationId, RemoteTask>>,
         calls: Mutex<Vec<Call>>,
         steps: Mutex<Vec<TransitionStep>>,
         fail_next_write: Mutex<bool>,
@@ -297,6 +304,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 rows: Mutex::new(HashMap::new()),
+                remote_rows: Mutex::new(HashMap::new()),
                 calls: Mutex::new(Vec::new()),
                 steps: Mutex::new(Vec::new()),
                 fail_next_write: Mutex::new(false),
@@ -436,6 +444,65 @@ mod tests {
                     .map_err(|_| FakeStoreError::Failure)?
                     .values()
                     .filter(|operation| state.is_none_or(|state| operation.state() == state))
+                    .cloned()
+                    .collect())
+            })
+        }
+    }
+
+    impl RemoteTaskStore for FakeStore {
+        type Error = FakeStoreError;
+
+        fn save_remote_task<'a>(
+            &'a self,
+            task: &'a RemoteTask,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::SaveRemoteTask(task.operation_id()));
+                self.remote_rows
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .insert(task.operation_id(), task.clone());
+                Ok(())
+            })
+        }
+
+        fn find_remote_task(
+            &self,
+            operation_id: OperationId,
+        ) -> BoundaryFuture<'_, Result<Option<RemoteTask>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::FindRemoteTask(operation_id));
+                Ok(self
+                    .remote_rows
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .get(&operation_id)
+                    .cloned())
+            })
+        }
+
+        fn list_remote_tasks_by_state(
+            &self,
+            state: RemoteTaskState,
+        ) -> BoundaryFuture<'_, Result<Vec<RemoteTask>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::ListRemoteTasks(state));
+                Ok(self
+                    .remote_rows
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .values()
+                    .filter(|task| task.last_state() == state)
                     .cloned()
                     .collect())
             })
@@ -755,6 +822,119 @@ mod tests {
         let mut expected = vec![running.id(), validating.id(), verifying.id()];
         expected.sort();
         assert_eq!(recovered_ids, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_remote_flow_persists_observations_and_resumes_verification()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+        let endpoint_id = created.targets()[0].endpoint_id();
+        let task_uri = TaskUri::parse("/redfish/v1/TaskService/Tasks/42")?;
+        let monitor_uri = TaskUri::parse("/redfish/v1/TaskService/TaskMonitors/42")?;
+        let mut occurred_at = now;
+
+        // Queued → Validating → Running → WaitingRemote (§13.3 steps 6-8):
+        // the 202 acceptance path of the operation state machine, driven by
+        // the existing engine API.
+        for event in [
+            OperationEvent::ValidationStarted,
+            OperationEvent::ValidationPassed,
+            OperationEvent::RemoteTaskStarted,
+        ] {
+            occurred_at += Duration::SECOND;
+            engine.apply(created.id(), event, occurred_at).await?;
+        }
+        let waiting = store
+            .find_owned(created.id())?
+            .ok_or_else(|| io::Error::other("the operation must be stored"))?;
+        assert_eq!(waiting.state(), OperationState::WaitingRemote);
+
+        // The acceptance observation is persisted right after the event, so
+        // a crash before the first poll still leaves the URIs (§13.6).
+        let accepted_at = occurred_at + Duration::SECOND;
+        let acceptance = RemoteTask::new(
+            created.id(),
+            endpoint_id,
+            task_uri.clone(),
+            Some(monitor_uri.clone()),
+            accepted_at,
+        );
+        store.save_remote_task(&acceptance).await?;
+        assert_eq!(
+            store.find_remote_task(created.id()).await?,
+            Some(acceptance)
+        );
+
+        // §13.6 recovery: after a restart the scan reports the operation,
+        // and its observation row is re-readable for the URIs.
+        let recovered = engine.recover_pending().await?;
+        assert_eq!(recovered, [waiting]);
+
+        // The poll observed the terminal state; the newest observation is
+        // saved, then the event drives WaitingRemote → Verifying.
+        let polled_at = accepted_at + Duration::SECOND;
+        let observed = RemoteTask::try_from_parts(
+            created.id(),
+            endpoint_id,
+            task_uri,
+            Some(monitor_uri),
+            RemoteTaskState::Completed,
+            Some("the power cycle completed".to_owned()),
+            Some(100),
+            polled_at,
+        )?;
+        store.save_remote_task(&observed).await?;
+        assert_eq!(store.find_remote_task(created.id()).await?, Some(observed));
+
+        // WaitingRemote → Verifying → Succeeded through the engine.
+        occurred_at = polled_at;
+        for event in [
+            OperationEvent::RemoteTaskCompleted,
+            OperationEvent::VerificationPassed,
+        ] {
+            occurred_at += Duration::SECOND;
+            engine.apply(created.id(), event, occurred_at).await?;
+        }
+        let finished = store
+            .find_owned(created.id())?
+            .ok_or_else(|| io::Error::other("the operation must be stored"))?;
+        assert_eq!(finished.state(), OperationState::Succeeded);
+        assert!(finished.is_terminal());
+
+        // The full call order: operation steps interleave with observation
+        // saves and reads exactly as the §13.6 flow prescribes.
+        assert_eq!(
+            store.calls()?,
+            [
+                Call::Create(created.id()),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Validating),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Running),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::WaitingRemote),
+                Call::SaveRemoteTask(created.id()),
+                Call::FindRemoteTask(created.id()),
+                Call::List(None),
+                Call::SaveRemoteTask(created.id()),
+                Call::FindRemoteTask(created.id()),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Verifying),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Succeeded),
+            ]
+        );
         Ok(())
     }
 
