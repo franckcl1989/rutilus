@@ -15,15 +15,17 @@ use rutilus_application::{
     CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
     CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
     DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery,
-    ResolvedCredential, ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
+    EndpointRefreshRepository, EventIngestion, EventRepository, EventStream, EventStreamPull,
+    OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
     CredentialVersionId, DeploymentPosture, Endpoint, EndpointCapabilityObservation, EndpointId,
-    Operation, OperationId, OperationState, ResourceSnapshot,
+    Event, Operation, OperationId, OperationState, ResourceSnapshot,
 };
 use rutilus_infra_redfish::{
+    EventStream as GatewayEventStream, EventStreamError, EventStreamOpenError,
     NV_REDFISH_DEVELOPMENT_BASELINE, RedfishCommandExecutor, RedfishGateway, TlsProbeInitError,
 };
 use rutilus_operation_engine::{
@@ -33,8 +35,8 @@ use rutilus_operation_engine::{
 use rutilus_persistence::{
     ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
-    NewCredential, OpenStoreError, OperationRepositoryError, RemoteTaskRepositoryError,
-    SqliteStore,
+    EventRepositoryError, NewCredential, OpenStoreError, OperationRepositoryError,
+    RemoteTaskRepositoryError, SqliteStore,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
@@ -49,8 +51,11 @@ use secrecy::SecretString;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
+use tokio_util::sync::CancellationToken;
 
-use crate::{ActiveCredentialResolverError, StandaloneUnlock, SystemClock, scheduler};
+use crate::{
+    ActiveCredentialResolverError, StandaloneUnlock, SystemClock, event_listener, scheduler,
+};
 
 /// Defensive upper bound for the in-memory recent-audit tail served by the
 /// Standalone console until persistence exposes a bounded listing query.
@@ -436,6 +441,67 @@ impl CapabilitySnapshotRepository for StandaloneState {
     }
 }
 
+impl EventRepository for StandaloneState {
+    type Error = EventRepositoryError;
+
+    /// Delegates the §14.4 event lifecycle to the same `SqliteStore` that
+    /// owns every other aggregate, so the `EventService` listeners (which
+    /// append through the application ingestion use case) and the console's
+    /// event query (which composes the `EventRepository` boundary of the
+    /// product-services bundle) always observe one authoritative record —
+    /// the same row whose §14.4 dedup unique index absorbs redelivered SSE
+    /// frames.
+    fn append_event<'a>(&'a self, event: &'a Event) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.store.append_event(event).await })
+    }
+
+    fn list_recent_events(
+        &self,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async move {
+            // The store's bounded listing takes a plain `usize` (its own
+            // contract: `0` lists nothing); the Web layer already caps every
+            // query limit at EVENT_QUERY_MAX_LIMIT, so a limit this large
+            // cannot be unrepresentable on any supported pointer width — the
+            // saturation fallback is the audit projection's precedent.
+            let limit = usize::try_from(limit.get()).unwrap_or(usize::MAX);
+            self.store.list_recent_events(limit).await
+        })
+    }
+}
+
+/// The `'static` event-repository role shared by the listener tasks.
+///
+/// # Why the wrapper exists
+///
+/// The `EventService` listener tasks are spawned with `'static` bounds
+/// (design §7.8: every task is tracked), so the ingestion use case they
+/// share cannot hold a borrow of the instance — it owns its repository
+/// through an `Arc`. An `Arc<StandaloneState>` cannot implement the
+/// application boundary directly (the orphan rule: neither the trait nor the
+/// outer type is local), so this crate-local wrapper is the owned role,
+/// exactly like the listener supervisor owns its stream boundary and sink.
+struct SharedEventRepository(Arc<StandaloneState>);
+
+impl EventRepository for SharedEventRepository {
+    type Error = EventRepositoryError;
+
+    fn append_event<'a>(&'a self, event: &'a Event) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.0.store.append_event(event).await })
+    }
+
+    fn list_recent_events(
+        &self,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async move {
+            let limit = usize::try_from(limit.get()).unwrap_or(usize::MAX);
+            self.0.store.list_recent_events(limit).await
+        })
+    }
+}
+
 /// A controlled failure while durably appending one audit fact.
 #[derive(Debug, Error)]
 pub enum StandaloneAuditWriteError {
@@ -667,10 +733,14 @@ where
 /// Besides the console, the foreground Standalone run starts the operation
 /// scheduling loop (design sections 13.3 and 13.6): one background task
 /// sweeps the persisted operations every [`scheduler::TICK_INTERVAL`] while
-/// the HTTP server serves. Both stop through one stop signal, drained in the
-/// design §7.8 order — scheduling first (the in-flight tick finishes), then
-/// the server — before `SQLite` closes, so no task ever touches the store
-/// after shutdown begins.
+/// the HTTP server serves — and, from §14.4, the per-endpoint `EventService`
+/// listeners: one background task per enrolled endpoint consumes the
+/// endpoint's SSE stream and records every event through the ingestion use
+/// case. All of them stop through one stop signal, drained in the design
+/// §7.8 order — scheduling first (the in-flight tick finishes), then the
+/// event listeners (each in-flight event finishes), then the server —
+/// before `SQLite` closes, so no task ever touches the store after shutdown
+/// begins.
 ///
 /// # Errors
 ///
@@ -690,12 +760,23 @@ pub async fn run_initialized_standalone(
     let gateway = Arc::new(gateway);
     let run_result = async {
         let binding = StandaloneBinding::bind().await?;
-        // One stop signal stops the scheduler and drains the server in
-        // order; the loop task owns its own Arc clones of the authenticated
-        // state and the gateway, so it is `'static` and spawnable.
+        // One stop signal stops the scheduler, the event listeners, and the
+        // server in order; each task owns its own Arc clones of the
+        // authenticated state and the gateway, so it is `'static` and
+        // spawnable.
         let (stop_signal, stop_watch) = scheduler::StopSignal::new();
         let scheduler = tokio::spawn(run_operation_scheduler(
             stop_watch.clone(),
+            Arc::clone(&instance.state),
+            gateway.clone(),
+        ));
+        // §14.4: one EventService listener per enrolled endpoint. The 0.4.0
+        // cut is a startup sweep — a failed inventory listing starts with no
+        // listeners and records the failure; re-arming later is a later
+        // iteration.
+        let listeners = tokio::spawn(run_event_listeners(
+            stop_watch.clone(),
+            list_enrolled_endpoint_ids(instance.state.as_ref()).await,
             Arc::clone(&instance.state),
             gateway.clone(),
         ));
@@ -707,6 +788,7 @@ pub async fn run_initialized_standalone(
             stop_watch,
             stop_signal,
             scheduler,
+            listeners,
         )
         .await
     }
@@ -718,6 +800,162 @@ pub async fn run_initialized_standalone(
         (Ok(()), Err(source)) => Err(StandaloneExecutionError::Close(source)),
         (Err(run), Err(close)) => Err(StandaloneExecutionError::RunAndClose { run, close }),
     }
+}
+
+/// Lists the ids of every enrolled endpoint for the §14.4 listeners.
+///
+/// # Why a failed listing starts with no listeners
+///
+/// The listing failure is recorded and the listeners simply do not start:
+/// a store that cannot list endpoints cannot serve the console either, and
+/// the listener sweep is re-attempted at the next process start. A later
+/// iteration can retry the sweep in place.
+async fn list_enrolled_endpoint_ids(state: &StandaloneState) -> Vec<EndpointId> {
+    match EndpointInventoryRepository::list_endpoint_inventory(state).await {
+        Ok(items) => items.iter().map(|item| item.endpoint().id()).collect(),
+        Err(error) => {
+            eprintln!("could not list enrolled endpoints for event listeners: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Assembles the §14.4 `EventService` listeners over the authenticated
+/// Standalone state and runs them until the stop watch fires.
+///
+/// # Why the composition lives here
+///
+/// Like [`run_operation_scheduler`]: the listeners compose the concrete
+/// `StandaloneState` (through the `EventIngestion` use case over its
+/// `EventRepository` role) and the `RedfishGateway` (through the
+/// [`StandaloneEventStream`] adapter), and the state type is private to this
+/// module. The task owns its Arc clones, so the composition is `'static` and
+/// spawnable. The task returns when every per-endpoint listener has stopped
+/// (the stop signal) or given up (the bounded reconnect budget), and the
+/// runtime joins it before closing `SQLite` — no listener ever touches the
+/// store after shutdown begins.
+async fn run_event_listeners(
+    stop: scheduler::StopWatch,
+    endpoint_ids: Vec<EndpointId>,
+    state: Arc<StandaloneState>,
+    gateway: Arc<RedfishGateway>,
+) {
+    let stream = Arc::new(StandaloneEventStream {
+        state: Arc::clone(&state),
+        gateway: Arc::clone(&gateway),
+    });
+    let sink = Arc::new(EventIngestion::new(SharedEventRepository(Arc::clone(
+        &state,
+    ))));
+    let listeners = event_listener::EventListeners::start(
+        endpoint_ids,
+        &stop,
+        &stream,
+        &sink,
+        event_listener::ReconnectPolicy::default(),
+    );
+    listeners.drain_all().await;
+}
+
+/// The §14.4 `EventStream` boundary over the concrete Standalone
+/// composition.
+///
+/// The adapter owns the pieces the gateway boundary cannot see: it resolves
+/// the endpoint's address, trust decision, and active credential through the
+/// state's application roles, then opens the endpoint's `EventService` SSE
+/// stream through the gateway's credentialed open — the same resolution the
+/// scheduler's command executor performs for writes.
+struct StandaloneEventStream {
+    state: Arc<StandaloneState>,
+    gateway: Arc<RedfishGateway>,
+}
+
+impl EventStream for StandaloneEventStream {
+    type Error = StandaloneEventStreamError;
+    type Stream = GatewayEventPull;
+
+    fn open_stream(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Self::Stream, Self::Error>> {
+        Box::pin(async move {
+            let endpoint =
+                EndpointRefreshRepository::find_endpoint(self.state.as_ref(), endpoint_id)
+                    .await
+                    .map_err(StandaloneEventStreamError::Endpoint)?
+                    .ok_or(StandaloneEventStreamError::UnknownEndpoint { endpoint_id })?;
+            let Some(resolved) =
+                CredentialResolver::resolve(self.state.as_ref(), endpoint.credential_id())
+                    .await
+                    .map_err(StandaloneEventStreamError::Credential)?
+            else {
+                return Err(StandaloneEventStreamError::MissingCredential { endpoint_id });
+            };
+            // The gateway stream owns its cancellation token (§7.8: every
+            // long-lived connection has a shutdown signal); the listener
+            // fires it through the pull handle's graceful close.
+            let cancel = CancellationToken::new();
+            let stream = self
+                .gateway
+                .open_event_stream(
+                    endpoint.address(),
+                    endpoint.trust(),
+                    resolved.username(),
+                    resolved.password(),
+                    endpoint_id,
+                    cancel,
+                )
+                .await
+                .map_err(StandaloneEventStreamError::Open)?;
+            Ok(GatewayEventPull { stream })
+        })
+    }
+}
+
+/// The pull handle of one opened gateway stream.
+///
+/// `pull` forwards to the gateway stream's `next`, which delivers each
+/// endpoint-bound event, then the terminal error item once, and finally
+/// `None`; `close` runs the gateway's graceful `shutdown` — cancel, close
+/// the connection, delete the transient Session — which is the boundary's
+/// §7.8 drain contract.
+struct GatewayEventPull {
+    stream: GatewayEventStream,
+}
+
+impl EventStreamPull for GatewayEventPull {
+    type Error = StandaloneEventStreamError;
+
+    fn pull(&mut self) -> BoundaryFuture<'_, Result<Option<Event>, Self::Error>> {
+        Box::pin(async move {
+            match self.stream.next().await {
+                Some(Ok(endpoint_event)) => Ok(Some(endpoint_event.event().clone())),
+                Some(Err(error)) => Err(StandaloneEventStreamError::Stream(error)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn close(&mut self) -> BoundaryFuture<'_, ()> {
+        Box::pin(async move { self.stream.shutdown().await })
+    }
+}
+
+/// A controlled failure while opening one endpoint's event stream.
+#[derive(Debug, Error)]
+enum StandaloneEventStreamError {
+    #[error("the endpoint could not be resolved for its event stream: {0}")]
+    Endpoint(#[source] EndpointRefreshPersistenceError),
+    #[error("endpoint {endpoint_id} is not a managed endpoint")]
+    UnknownEndpoint { endpoint_id: EndpointId },
+    #[error("the endpoint's credential could not be resolved: {0}")]
+    Credential(#[source] ActiveCredentialResolverError),
+    #[error("endpoint {endpoint_id} has no active credential to open its event stream")]
+    MissingCredential { endpoint_id: EndpointId },
+    #[error("the endpoint's event stream could not be opened: {0}")]
+    Open(#[source] EventStreamOpenError),
+    #[error("the endpoint's event stream failed: {0}")]
+    Stream(#[source] EventStreamError),
 }
 
 /// Assembles the operation scheduling loop over the authenticated Standalone
@@ -776,16 +1014,22 @@ async fn run_operation_scheduler(
     .await;
 }
 
-/// Serves the Standalone console with the operation scheduling loop until
-/// Ctrl-C, then drains in the design §7.8 order: stop scheduling first (the
-/// loop finishes its in-flight tick), drain the HTTP server, and only then
-/// return so `SQLite` can close.
+/// Serves the Standalone console with the operation scheduling loop and the
+/// §14.4 event listeners until Ctrl-C, then drains in the design §7.8 order:
+/// stop scheduling first (the loop finishes its in-flight tick), then the
+/// event listeners (each in-flight event finishes), then the HTTP server,
+/// and only then return so `SQLite` can close.
 ///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when loopback binding, signal registration,
-/// or HTTP serving fails; the scheduler's own shutdown is always awaited
-/// before the store close.
+/// or HTTP serving fails; the scheduler's and the listeners' own shutdowns
+/// are always awaited before the store close.
+///
+/// The function carries the whole shutdown orchestration (binding, options,
+/// both background tasks, and both stop handles), so the argument count is
+/// inherent to the §7.8 drain order it coordinates.
+#[allow(clippy::too_many_arguments)]
 async fn run_standalone_with_scheduler(
     binding: StandaloneBinding,
     options: StandaloneRunOptions,
@@ -794,10 +1038,11 @@ async fn run_standalone_with_scheduler(
     stop_watch: scheduler::StopWatch,
     stop_signal: scheduler::StopSignal,
     mut scheduler: tokio::task::JoinHandle<()>,
+    mut listeners: tokio::task::JoinHandle<()>,
 ) -> Result<(), StandaloneRunError> {
-    // The server's graceful drain waits for the scheduler to have fully
-    // stopped first (design §7.8: stop scheduling, then serve): the channel
-    // is fired only after the loop task is joined.
+    // The server's graceful drain waits for the background tasks to have
+    // fully stopped first (design §7.8: stop scheduling and listening, then
+    // serve): the channel is fired only after both tasks are joined.
     let (scheduler_done_sender, scheduler_done_receiver) = oneshot::channel();
     let server = binding.serve_until(options, services, gateway, SystemClock, async move {
         let mut stop = stop_watch;
@@ -808,9 +1053,11 @@ async fn run_standalone_with_scheduler(
     tokio::select! {
         result = &mut server => {
             // The server stopped on its own (a serving failure): stop the
-            // scheduler too, and wait for its drain before closing the store.
+            // background tasks too, and wait for their drains before closing
+            // the store.
             stop_signal.signal();
             drain_scheduler(&mut scheduler).await;
+            drain_listeners(&mut listeners).await;
             let _ = scheduler_done_sender.send(());
             result.map_err(StandaloneRunError::Serve)
         }
@@ -819,6 +1066,8 @@ async fn run_standalone_with_scheduler(
             // §7.8: stop the scheduler first; its in-flight tick finishes.
             stop_signal.signal();
             drain_scheduler(&mut scheduler).await;
+            // The listeners drain next; each in-flight event finishes.
+            drain_listeners(&mut listeners).await;
             let _ = scheduler_done_sender.send(());
             // The server's shutdown future resolves now; await its drain.
             server.await.map_err(StandaloneRunError::Serve)
@@ -835,6 +1084,18 @@ async fn run_standalone_with_scheduler(
 async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = scheduler.await {
         eprintln!("The operation scheduling loop failed: {join_error}");
+    }
+}
+
+/// Waits for the event-listener task and reports an unexpected failure.
+///
+/// The listeners never return an error — each task exits on the stop signal
+/// or on a terminal reconnect give-up — so a `JoinError` means the wrapper
+/// panicked or was cancelled, a programming defect worth surfacing but not a
+/// blocker for the `SQLite` close that follows.
+async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
+    if let Err(join_error) = listeners.await {
+        eprintln!("The event listener task failed: {join_error}");
     }
 }
 

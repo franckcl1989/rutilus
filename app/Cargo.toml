@@ -9,6 +9,11 @@ publish.workspace = true
 axum.workspace = true
 clap.workspace = true
 console.workspace = true
+# The §14.4 EventService stream adapter owns the gateway stream's
+# `CancellationToken` (the gateway's open contract requires one); tokio-util
+# is already pinned at the same version by infra-redfish, which defines the
+# gateway stream.
+tokio-util = { version = "0.7.19", default-features = false }
 rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-infra-redfish.workspace = true

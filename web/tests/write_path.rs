@@ -21,17 +21,17 @@ use rutilus_application::{
     CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
     CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
     DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, OperationStore, ProtectedCredentialCreation, RedfishDiscovery,
-    ResolvedCredential, ResourceObservation, StoredCapability, SystemCaEvaluation,
-    TlsIdentityObservation, TlsIdentityProbe,
+    EndpointRefreshRepository, EventRepository, OperationStore, ProtectedCredentialCreation,
+    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
+    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityState, Credential,
     CredentialId, CredentialName, CredentialUsername, CredentialVersionId, DeploymentPosture,
     Endpoint, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
-    EndpointDisplayName, EndpointId, Operation, OperationId, OperationState, RefreshGeneration,
-    ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot, ResourceSnapshotPayload,
-    TlsCertificate, TlsTrust,
+    EndpointDisplayName, EndpointId, Event, Operation, OperationId, OperationState,
+    RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot,
+    ResourceSnapshotPayload, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -318,6 +318,24 @@ impl AuditEventQuery for MockServices {
                 .cloned()
                 .collect())
         })
+    }
+}
+
+impl EventRepository for MockServices {
+    type Error = MockError;
+
+    fn append_event<'a>(
+        &'a self,
+        _event: &'a Event,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_recent_events(
+        &self,
+        _limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 

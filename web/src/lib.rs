@@ -28,10 +28,11 @@ use rutilus_api::{
     EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
     EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, HealthResponse,
-    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
-    OperationTargetResponse, ResourceStatusResponse, TlsTrustModeResponse, TrustRejectedResponse,
-    TrustedEndpointResponse, UiLocationResponse,
+    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, EventListResponse,
+    EventResponse, HealthResponse, OperationListResponse, OperationResponse,
+    OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
+    ResourceStatusResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
+    UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -47,15 +48,15 @@ use rutilus_application::{
     EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
     EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
     EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
-    EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
-    OperationStore, OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError,
-    TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    EnrolledEndpoint, EventRepository, NewCredentialRequest, OnboardEndpointError,
+    OnboardEndpointRequest, OperationStore, OperationSubmission, RedfishDiscovery,
+    ResourceStatusSummary, SubmissionError, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityClassification,
     CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
     CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
-    EndpointId, Operation, OperationId, OperationSource, OperationState, OperationTarget,
+    EndpointId, Event, Operation, OperationId, OperationSource, OperationState, OperationTarget,
     ResourceFeature, ResourceSnapshot, TargetId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -173,6 +174,7 @@ pub trait ProductServices:
     + CapabilityQueryRepository
     + OperationStore
     + ArtifactRepository
+    + EventRepository
 {
 }
 
@@ -190,6 +192,7 @@ impl<T> ProductServices for T where
         + CapabilityQueryRepository
         + OperationStore
         + ArtifactRepository
+        + EventRepository
 {
 }
 
@@ -281,6 +284,10 @@ where
             post(import_endpoints_csv::<Services, Gateway, Time>),
         )
         .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/events",
+            get(event_query::<Services, Gateway, Time>),
+        )
         .route(
             "/api/v1/operations",
             post(create_operation::<Services, Gateway, Time>),
@@ -729,6 +736,40 @@ where
     };
     let mut response = Json(AuditQueryResponse::new(
         events.iter().map(project_audit_event).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Maximum accepted `limit` for one bounded event query.
+const EVENT_QUERY_MAX_LIMIT: u64 = 1000;
+/// Default `limit` for one bounded event query without an explicit value.
+const EVENT_QUERY_DEFAULT_LIMIT: u64 = 100;
+
+/// Returns recent persisted BMC events, newest first, bounded by `limit`
+/// (§14.4 Event History).
+///
+/// The response carries the BMC-reported `MessageId` and the stable severity
+/// code verbatim, so the console renders exactly what the endpoint reported.
+async fn event_query<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    uri: Uri,
+) -> Response
+where
+    Services: EventRepository,
+{
+    let Ok(limit) = parse_event_limit(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("event limit must be between 1 and {EVENT_QUERY_MAX_LIMIT}"),
+        );
+    };
+    let Ok(events) = state.services.list_recent_events(limit).await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut response = Json(EventListResponse::new(
+        events.iter().map(project_event).collect(),
     ))
     .into_response();
     no_store(&mut response);
@@ -1432,6 +1473,44 @@ fn audit_message(event: &AuditEvent) -> String {
         None => format!("{base} (sequence {})", event.sequence().get()),
     }
 }
+
+fn project_event(event: &Event) -> EventResponse {
+    EventResponse::new(
+        event.id().into_uuid(),
+        event.endpoint_id().into_uuid(),
+        event.message_id().as_str().to_owned(),
+        event.severity().as_str().to_owned(),
+        event.message().map(str::to_owned),
+        event.event_timestamp(),
+        event.observed_at(),
+    )
+}
+
+fn parse_event_limit(query: Option<&str>) -> Result<NonZeroU64, ParseEventLimitError> {
+    let Some(query) = query else {
+        return default_event_limit();
+    };
+    let Some(value) = query.strip_prefix("limit=") else {
+        return Err(ParseEventLimitError);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseEventLimitError);
+    }
+    let Ok(limit) = value.parse::<u64>() else {
+        return Err(ParseEventLimitError);
+    };
+    if limit == 0 || limit > EVENT_QUERY_MAX_LIMIT {
+        return Err(ParseEventLimitError);
+    }
+    NonZeroU64::new(limit).ok_or(ParseEventLimitError)
+}
+
+fn default_event_limit() -> Result<NonZeroU64, ParseEventLimitError> {
+    NonZeroU64::new(EVENT_QUERY_DEFAULT_LIMIT).ok_or(ParseEventLimitError)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParseEventLimitError;
 
 fn parse_audit_limit(query: Option<&str>) -> Result<NonZeroU64, ParseAuditLimitError> {
     let Some(query) = query else {
@@ -4497,6 +4576,24 @@ mod tests {
 
         fn artifact_file_path(&self, _artifact_id: ArtifactId) -> std::path::PathBuf {
             std::path::PathBuf::from("unused-artifact-path")
+        }
+    }
+
+    impl EventRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn append_event<'a>(
+            &'a self,
+            _event: &'a Event,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_recent_events(
+            &self,
+            _limit: NonZeroU64,
+        ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

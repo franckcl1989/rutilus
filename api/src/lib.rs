@@ -1882,6 +1882,117 @@ impl AuditQueryResponse {
     }
 }
 
+/// One persisted BMC event for the local console (§14.4).
+///
+/// All values are stable product codes or the BMC-reported fields, kept
+/// verbatim: the raw Redfish `MessageId`, the product severity code (see
+/// [`EventResponse::severity`]), the original `Message` text when the BMC
+/// provided one, the BMC's own event timestamp, and the product-side receive
+/// time — so the viewer always sees the two clocks side by side. No
+/// credential, token, or certificate material can be represented.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventResponse {
+    id: Uuid,
+    endpoint_id: Uuid,
+    message_id: String,
+    severity: String,
+    message: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    event_timestamp: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    observed_at: OffsetDateTime,
+}
+
+impl EventResponse {
+    #[must_use]
+    pub const fn new(
+        id: Uuid,
+        endpoint_id: Uuid,
+        message_id: String,
+        severity: String,
+        message: Option<String>,
+        event_timestamp: OffsetDateTime,
+        observed_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            endpoint_id,
+            message_id,
+            severity,
+            message,
+            event_timestamp,
+            observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// Returns the source endpoint (§14.4 记录事件来源).
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    /// Returns the raw Redfish `MessageId`, exactly as the BMC reported it.
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    /// Returns the stable product severity code.
+    ///
+    /// The vocabulary is the three Redfish `Event_v1` CSDL severities with
+    /// the product's stable lowercase spellings: `ok`, `warning`, and
+    /// `critical`. An event whose severity this build cannot classify is
+    /// refused at ingestion, so the console never renders an unknown code.
+    #[must_use]
+    pub fn severity(&self) -> &str {
+        &self.severity
+    }
+
+    /// Returns the original Redfish `Message` text, when the BMC provided
+    /// one.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    /// Returns the BMC's own event timestamp.
+    #[must_use]
+    pub const fn event_timestamp(&self) -> OffsetDateTime {
+        self.event_timestamp
+    }
+
+    /// Returns when the product received the event.
+    #[must_use]
+    pub const fn observed_at(&self) -> OffsetDateTime {
+        self.observed_at
+    }
+}
+
+/// Stable envelope for a bounded, newest-first event query (§14.4).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventListResponse {
+    events: Vec<EventResponse>,
+}
+
+impl EventListResponse {
+    #[must_use]
+    pub const fn new(events: Vec<EventResponse>) -> Self {
+        Self { events }
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[EventResponse] {
+        &self.events
+    }
+}
+
 /// The stable §13.1 product source of one persisted operation.
 ///
 /// The three wire values mirror the domain source codes exactly, so the
@@ -5614,6 +5725,58 @@ mod tests {
                 &failure
             )?,)?,
             failure
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_contract_is_bmc_faithful_and_strict() -> Result<(), Box<dyn Error>> {
+        let event_timestamp = OffsetDateTime::parse("2026-08-07T03:21:00Z", &Rfc3339)?;
+        let observed_at = OffsetDateTime::parse("2026-08-07T03:21:05Z", &Rfc3339)?;
+        let event = EventResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789001"),
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789002"),
+            "Alert.1.0.PowerSupplyFailure".to_owned(),
+            "critical".to_owned(),
+            Some("Power supply 1 lost input".to_owned()),
+            event_timestamp,
+            observed_at,
+        );
+        let response = EventListResponse::new(vec![event]);
+
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "events": [{
+                    "id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789001"),
+                    "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789002"),
+                    "message_id": "Alert.1.0.PowerSupplyFailure",
+                    "severity": "critical",
+                    "message": "Power supply 1 lost input",
+                    "event_timestamp": "2026-08-07T03:21:00Z",
+                    "observed_at": "2026-08-07T03:21:05Z"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<EventListResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        let encoded = serde_json::to_string(&response)?;
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("secret"));
+        assert!(
+            serde_json::from_value::<EventResponse>(json!({
+                "id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789001"),
+                "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789002"),
+                "message_id": "Alert.1.0.PowerSupplyFailure",
+                "severity": "critical",
+                "message": null,
+                "event_timestamp": "2026-08-07T03:21:00Z",
+                "observed_at": "2026-08-07T03:21:05Z",
+                "extra": true
+            }))
+            .is_err()
         );
         Ok(())
     }
