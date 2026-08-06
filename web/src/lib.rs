@@ -735,7 +735,8 @@ fn project_enrollment(
             ResourceFeature::Chassis => chassis += 1,
             ResourceFeature::Managers => managers += 1,
             // The 0.2 resource families (Processors, Memory, Storage,
-            // Network, Accounts, Bios, BootOptions, and SecureBoot)
+            // Network, Accounts, Bios, BootOptions, SecureBoot, and the
+            // Power/Thermal/Sensors/Controls telemetry families)
             // intentionally stay out of the three-field enrollment counts;
             // the typed resource-inventory route carries their full
             // snapshots instead.
@@ -748,7 +749,11 @@ fn project_enrollment(
             | ResourceFeature::Accounts
             | ResourceFeature::Bios
             | ResourceFeature::BootOptions
-            | ResourceFeature::SecureBoot => {}
+            | ResourceFeature::SecureBoot
+            | ResourceFeature::Power
+            | ResourceFeature::Thermal
+            | ResourceFeature::Sensors
+            | ResourceFeature::Controls => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1144,6 +1149,10 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::Bios { .. } => project_bios_details(details),
         CoreResourceDetails::BootOption { .. } => project_boot_option_details(details),
         CoreResourceDetails::SecureBoot { .. } => project_secure_boot_details(details),
+        CoreResourceDetails::Power { .. } => project_power_details(details),
+        CoreResourceDetails::Thermal { .. } => project_thermal_details(details),
+        CoreResourceDetails::Sensor { .. } => project_sensor_details(details),
+        CoreResourceDetails::Control { .. } => project_control_details(details),
     }
 }
 
@@ -1546,6 +1555,90 @@ fn project_secure_boot_details(details: &CoreResourceDetails) -> CoreResourceDet
     CoreResourceDetailsResponse::SecureBoot {
         secure_boot_enable: *secure_boot_enable,
         secure_boot_mode: secure_boot_mode.clone(),
+    }
+}
+
+/// Projects the §2.1 power family into the shared wire contract. The
+/// `Power_v1` projection carries no details, so the wire variant is empty.
+///
+/// The dispatcher guarantees this receives the `Power` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_power_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Power {} = details else {
+        return CoreResourceDetailsResponse::Power {};
+    };
+    CoreResourceDetailsResponse::Power {}
+}
+
+/// Projects the §2.1 thermal family into the shared wire contract, carrying
+/// only the resource-level status values.
+///
+/// The dispatcher guarantees this receives the `Thermal` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_thermal_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Thermal { status } = details else {
+        return CoreResourceDetailsResponse::Thermal { status: None };
+    };
+    CoreResourceDetailsResponse::Thermal {
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 sensors family into the shared wire contract,
+/// preserving the numeric reading and its UCUM units so clients never
+/// re-parse text.
+///
+/// The dispatcher guarantees this receives the `Sensor` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_sensor_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Sensor {
+        reading,
+        reading_units,
+        reading_type,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Sensor {
+            reading: None,
+            reading_units: None,
+            reading_type: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Sensor {
+        reading: *reading,
+        reading_units: reading_units.clone(),
+        reading_type: reading_type.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 controls family into the shared wire contract,
+/// preserving the numeric set point so clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `Control` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_control_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Control {
+        control_type,
+        set_point,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Control {
+            control_type: None,
+            set_point: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Control {
+        control_type: control_type.clone(),
+        set_point: *set_point,
+        status: status.as_ref().map(project_resource_status),
     }
 }
 
@@ -2136,6 +2229,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_power_thermal_sensors_and_controls_typed_resources()
+    -> Result<(), Box<dyn Error>> {
+        let item = telemetry_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 5);
+        // The inventory orders snapshots by `@odata.id`, so the root service
+        // sorts first and the chassis telemetry members sort before the
+        // Power singleton ("Controls" < "Power" < "Sensors" < "Thermal").
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        assert_eq!(resources[0]["common"]["name"], "Root Service");
+        assert_eq!(resources[1]["resource"]["resource_type"], "control");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/Controls/FanDuty"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Chassis Fan Duty");
+        assert_eq!(
+            resources[1]["resource"]["details"]["control_type"],
+            "DutyCycle"
+        );
+        assert_eq!(resources[1]["resource"]["details"]["set_point"], 30.0);
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["state"],
+            "Enabled"
+        );
+        assert_eq!(resources[2]["resource"]["resource_type"], "power");
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/Power"
+        );
+        assert_eq!(resources[2]["common"]["name"], "Power");
+        assert_eq!(
+            resources[2]["resource"]["details"],
+            json!({}),
+            "the Power projection carries no details"
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "sensor");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/Sensors/InletTemp"
+        );
+        assert_eq!(resources[3]["common"]["name"], "Chassis Inlet Temperature");
+        assert_eq!(
+            resources[3]["resource"]["details"]["reading_type"],
+            "Temperature"
+        );
+        assert_eq!(resources[3]["resource"]["details"]["reading"], 27.5);
+        assert_eq!(resources[3]["resource"]["details"]["reading_units"], "Cel");
+        assert_eq!(resources[4]["resource"]["resource_type"], "thermal");
+        assert_eq!(
+            resources[4]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/Thermal"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn distinguishes_core_resource_route_states() -> Result<(), Box<dyn Error>> {
         let waiting = inventory_item("Waiting BMC", "https://192.0.2.20", 20, false)?;
         let endpoint_id = waiting.endpoint().id();
@@ -2456,6 +2622,74 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, account, bios, boot_option, secure_boot],
+        )?)
+    }
+
+    fn telemetry_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Telemetry BMC")?,
+            EndpointAddress::parse("https://192.0.2.33")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![33])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let power = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Power,
+            "/redfish/v1/Chassis/1/Power",
+            r#"{"Id":"Power","Name":"Power","Description":"Chassis power control"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Power.v1_17_0.Power")?)
+        .with_etag(ResourceEtag::parse("W/\"power-1\"")?);
+        let thermal = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Thermal,
+            "/redfish/v1/Chassis/1/Thermal",
+            r#"{"Id":"Thermal","Name":"Thermal","Description":"Chassis temperature and fan monitoring","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Thermal.v1_7_2.Thermal")?);
+        let sensor = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Sensors,
+            "/redfish/v1/Chassis/1/Sensors/InletTemp",
+            r#"{"Id":"InletTemp","Name":"Chassis Inlet Temperature","ReadingType":"Temperature","Reading":27.5,"ReadingUnits":"Cel","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Sensor.v1_9_0.Sensor")?)
+        .with_etag(ResourceEtag::parse("W/\"sensor-inlet-1\"")?);
+        let control = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Controls,
+            "/redfish/v1/Chassis/1/Controls/FanDuty",
+            r#"{"Id":"FanDuty","Name":"Chassis Fan Duty","ControlType":"DutyCycle","SetPoint":30.0,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Control.v1_3_0.Control")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, power, thermal, sensor, control],
         )?)
     }
 
