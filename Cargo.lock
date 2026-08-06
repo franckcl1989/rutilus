@@ -3444,6 +3444,8 @@ dependencies = [
  "csv",
  "rutilus-domain",
  "secrecy",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "time",
  "tokio",

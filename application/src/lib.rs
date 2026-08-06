@@ -7,6 +7,7 @@ mod endpoint_enrollment;
 mod endpoint_inventory;
 mod endpoint_onboarding;
 mod endpoint_refresh;
+mod endpoint_resources;
 mod endpoint_trust;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
@@ -35,6 +36,10 @@ pub use endpoint_onboarding::{
 pub use endpoint_refresh::{
     AuditedEndpointRefresh, AuditedEndpointRefreshError, CoreResourceReader, EndpointRefresh,
     EndpointRefreshError, EndpointRefreshRepository, RefreshAuditStage, ResourceObservation,
+};
+pub use endpoint_resources::{
+    CoreResourceCommon, CoreResourceDetails, CoreResourceSummary, EndpointResourceInventory,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, ResourceStatusSummary,
 };
 pub use endpoint_trust::{
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
