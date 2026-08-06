@@ -62,6 +62,10 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "bios",
                         "boot-options",
                         "secure-boot",
+                        "power",
+                        "thermal",
+                        "sensors",
+                        "controls",
                     ]),
                 ))
                 .to_owned(),
