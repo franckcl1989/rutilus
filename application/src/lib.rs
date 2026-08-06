@@ -14,8 +14,10 @@ mod endpoint_refresh;
 mod endpoint_resources;
 mod endpoint_trust;
 mod event_ingestion;
+mod group_management;
 mod operation_executor;
 mod operation_submission;
+mod tag_management;
 mod task_monitor;
 mod telemetry_sampler;
 mod update_executor;
@@ -79,8 +81,10 @@ pub use endpoint_trust::{
 pub use event_ingestion::{
     EventIngestion, EventRepository, EventStream, EventStreamPull, IngestionError,
 };
+pub use group_management::{GroupManagement, GroupManagementError, GroupRepository};
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
 pub use operation_submission::{OperationSubmission, SubmissionError};
+pub use tag_management::{TagManagement, TagManagementError, TagRepository};
 pub use task_monitor::{
     MonitorAuditStage, TaskMonitor, TaskMonitorError, TaskObservation, TaskPoll, TaskReader,
 };
