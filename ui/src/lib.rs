@@ -243,7 +243,12 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
     };
     for resource in resources {
         match resource.resource() {
-            CoreResourceDetailsResponse::ServiceRoot { .. } => {}
+            // The 0.2 resource families mirror the server-side counts
+            // contract: they render as cards in the resource list, while the
+            // three-line counts summary keeps its 0.1 wire shape.
+            CoreResourceDetailsResponse::ServiceRoot { .. }
+            | CoreResourceDetailsResponse::Processor { .. }
+            | CoreResourceDetailsResponse::Memory { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -276,95 +281,8 @@ impl From<&CoreResourceResponse> for CoreResourceCardProjection {
             label: "Redfish ID",
             value: resource.common().id().to_owned(),
         }];
-        let type_label = match resource.resource() {
-            CoreResourceDetailsResponse::ServiceRoot {
-                vendor,
-                product,
-                redfish_version,
-            } => {
-                push_fact(&mut facts, "Vendor", vendor.as_deref());
-                push_fact(&mut facts, "Product", product.as_deref());
-                push_fact(&mut facts, "Redfish version", redfish_version.as_deref());
-                "Service Root"
-            }
-            CoreResourceDetailsResponse::System {
-                system_type,
-                manufacturer,
-                model,
-                part_number,
-                serial_number,
-                sku,
-                host_name,
-                bios_version,
-                power_state,
-                status,
-            } => {
-                push_fact(&mut facts, "System type", system_type.as_deref());
-                push_hardware_facts(
-                    &mut facts,
-                    manufacturer.as_deref(),
-                    model.as_deref(),
-                    part_number.as_deref(),
-                    serial_number.as_deref(),
-                );
-                push_fact(&mut facts, "SKU", sku.as_deref());
-                push_fact(&mut facts, "Host name", host_name.as_deref());
-                push_fact(&mut facts, "BIOS version", bios_version.as_deref());
-                push_fact(&mut facts, "Power state", power_state.as_deref());
-                push_status_facts(&mut facts, status.as_ref());
-                "System"
-            }
-            CoreResourceDetailsResponse::Chassis {
-                chassis_type,
-                manufacturer,
-                model,
-                part_number,
-                serial_number,
-                sku,
-                asset_tag,
-                power_state,
-                status,
-            } => {
-                push_fact(&mut facts, "Chassis type", Some(chassis_type));
-                push_hardware_facts(
-                    &mut facts,
-                    manufacturer.as_deref(),
-                    model.as_deref(),
-                    part_number.as_deref(),
-                    serial_number.as_deref(),
-                );
-                push_fact(&mut facts, "SKU", sku.as_deref());
-                push_fact(&mut facts, "Asset tag", asset_tag.as_deref());
-                push_fact(&mut facts, "Power state", power_state.as_deref());
-                push_status_facts(&mut facts, status.as_ref());
-                "Chassis"
-            }
-            CoreResourceDetailsResponse::Manager {
-                manager_type,
-                manufacturer,
-                model,
-                part_number,
-                serial_number,
-                firmware_version,
-                version,
-                power_state,
-                status,
-            } => {
-                push_fact(&mut facts, "Manager type", manager_type.as_deref());
-                push_hardware_facts(
-                    &mut facts,
-                    manufacturer.as_deref(),
-                    model.as_deref(),
-                    part_number.as_deref(),
-                    serial_number.as_deref(),
-                );
-                push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
-                push_fact(&mut facts, "Version", version.as_deref());
-                push_fact(&mut facts, "Power state", power_state.as_deref());
-                push_status_facts(&mut facts, status.as_ref());
-                "Manager"
-            }
-        };
+        let (type_label, family_facts) = card_facts(resource.resource());
+        facts.extend(family_facts);
         Self {
             type_label,
             name: resource.common().name().to_owned(),
@@ -373,6 +291,241 @@ impl From<&CoreResourceResponse> for CoreResourceCardProjection {
             facts,
         }
     }
+}
+
+/// Projects one resource into its card identity and family facts; the From
+/// implementation stays a thin assembly so the per-family projections remain
+/// readable and individually testable.
+#[cfg(any(target_arch = "wasm32", test))]
+fn card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    match resource {
+        CoreResourceDetailsResponse::ServiceRoot { .. } => service_root_card_facts(resource),
+        CoreResourceDetailsResponse::System { .. } => system_card_facts(resource),
+        CoreResourceDetailsResponse::Chassis { .. } => chassis_card_facts(resource),
+        CoreResourceDetailsResponse::Manager { .. } => manager_card_facts(resource),
+        CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
+        CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
+    }
+}
+
+/// Facts for the Service Root card; every optional value renders only when
+/// the BMC published it.
+///
+/// The dispatcher guarantees this receives the `ServiceRoot` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn service_root_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::ServiceRoot {
+        vendor,
+        product,
+        redfish_version,
+    } = resource
+    else {
+        return ("Service Root", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Vendor", vendor.as_deref());
+    push_fact(&mut facts, "Product", product.as_deref());
+    push_fact(&mut facts, "Redfish version", redfish_version.as_deref());
+    ("Service Root", facts)
+}
+
+/// Facts for the System card.
+///
+/// The dispatcher guarantees this receives the `System` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn system_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::System {
+        system_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        sku,
+        host_name,
+        bios_version,
+        power_state,
+        status,
+    } = resource
+    else {
+        return ("System", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "System type", system_type.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "SKU", sku.as_deref());
+    push_fact(&mut facts, "Host name", host_name.as_deref());
+    push_fact(&mut facts, "BIOS version", bios_version.as_deref());
+    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("System", facts)
+}
+
+/// Facts for the Chassis card.
+///
+/// The dispatcher guarantees this receives the `Chassis` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn chassis_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Chassis {
+        chassis_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        sku,
+        asset_tag,
+        power_state,
+        status,
+    } = resource
+    else {
+        return ("Chassis", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Chassis type", Some(chassis_type.as_str()));
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "SKU", sku.as_deref());
+    push_fact(&mut facts, "Asset tag", asset_tag.as_deref());
+    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Chassis", facts)
+}
+
+/// Facts for the Manager card.
+///
+/// The dispatcher guarantees this receives the `Manager` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn manager_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Manager {
+        manager_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        firmware_version,
+        version,
+        power_state,
+        status,
+    } = resource
+    else {
+        return ("Manager", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Manager type", manager_type.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_fact(&mut facts, "Version", version.as_deref());
+    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Manager", facts)
+}
+
+/// Facts for a §2.1 processor card; part and serial numbers are not part of
+/// the processor schema projection, so hardware facts render without them.
+///
+/// The dispatcher guarantees this receives the `Processor` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn processor_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Processor {
+        processor_type,
+        socket,
+        manufacturer,
+        model,
+        total_cores,
+        status,
+    } = resource
+    else {
+        return ("Processor", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Processor type", processor_type.as_deref());
+    push_fact(&mut facts, "Socket", socket.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        None,
+        None,
+    );
+    push_u64_fact(&mut facts, "Total cores", *total_cores);
+    push_status_facts(&mut facts, status.as_ref());
+    ("Processor", facts)
+}
+
+/// Facts for a §2.1 memory card; part and serial numbers are not part of the
+/// memory schema projection, so hardware facts render without them.
+///
+/// The dispatcher guarantees this receives the `Memory` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn memory_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Memory {
+        memory_device_type,
+        capacity_mib,
+        manufacturer,
+        model,
+        status,
+    } = resource
+    else {
+        return ("Memory", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Memory device type",
+        memory_device_type.as_deref(),
+    );
+    push_u64_fact(&mut facts, "Capacity (MiB)", *capacity_mib);
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        None,
+        None,
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Memory", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -398,6 +551,18 @@ fn push_status_facts(
         push_fact(facts, "State", status.state());
         push_fact(facts, "Health", status.health());
         push_fact(facts, "Health rollup", status.health_rollup());
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders one numeric resource fact only when a value exists, keeping the
+/// facts list free of placeholder text for absent observations.
+fn push_u64_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value: Option<u64>) {
+    if let Some(value) = value {
+        facts.push(ResourceFactProjection {
+            label,
+            value: value.to_string(),
+        });
     }
 }
 
@@ -3431,7 +3596,9 @@ mod tests {
                             service_root_resource(),
                             system_resource(),
                             chassis_resource(),
-                            manager_resource()
+                            manager_resource(),
+                            processor_resource(),
+                            memory_resource()
                         ]
                     }
                 }
@@ -3556,6 +3723,67 @@ mod tests {
                     "firmware_version": "4.5.6",
                     "version": "1.2.3",
                     "power_state": "On",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": null
+                    }
+                }
+            }
+        })
+    }
+
+    fn processor_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d4",
+                "odata_id": "/redfish/v1/Systems/1/Processors/CPU1",
+                "odata_type": "#Processor.v1_15_0.Processor",
+                "etag": "W/\"cpu-7\""
+            },
+            "common": {
+                "id": "CPU1",
+                "name": "Processor One",
+                "description": "Primary compute processor"
+            },
+            "resource": {
+                "resource_type": "processor",
+                "details": {
+                    "processor_type": "CPU",
+                    "socket": "LGA4189",
+                    "manufacturer": "Vendor A",
+                    "model": "Model P",
+                    "total_cores": 64,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn memory_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d5",
+                "odata_id": "/redfish/v1/Systems/1/Memory/DIMM1",
+                "odata_type": "#Memory.v1_15_0.Memory",
+                "etag": null
+            },
+            "common": {
+                "id": "DIMM1",
+                "name": "Memory Module One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "memory",
+                "details": {
+                    "memory_device_type": "DDR4",
+                    "capacity_mib": 32768,
+                    "manufacturer": "Vendor B",
+                    "model": "Model MEM",
                     "status": {
                         "state": "Enabled",
                         "health": "OK",
@@ -3709,7 +3937,7 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 4);
+        assert_eq!(current.resources.len(), 6);
         let system = current
             .resources
             .iter()
@@ -3729,6 +3957,91 @@ mod tests {
             label: "Health",
             value: "OK".to_owned(),
         }));
+        let processor = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Processor")
+            .ok_or("processor resource must exist")?;
+        assert_eq!(processor.name, "Processor One");
+        assert_eq!(processor.source, "/redfish/v1/Systems/1/Processors/CPU1");
+        assert!(processor.facts.contains(&ResourceFactProjection {
+            label: "Processor type",
+            value: "CPU".to_owned(),
+        }));
+        assert!(processor.facts.contains(&ResourceFactProjection {
+            label: "Socket",
+            value: "LGA4189".to_owned(),
+        }));
+        assert!(processor.facts.contains(&ResourceFactProjection {
+            label: "Total cores",
+            value: "64".to_owned(),
+        }));
+        assert!(
+            !processor
+                .facts
+                .iter()
+                .any(|fact| fact.label == "Part number")
+        );
+        let memory = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Memory")
+            .ok_or("memory resource must exist")?;
+        assert_eq!(memory.name, "Memory Module One");
+        assert_eq!(memory.source, "/redfish/v1/Systems/1/Memory/DIMM1");
+        assert!(memory.facts.contains(&ResourceFactProjection {
+            label: "Memory device type",
+            value: "DDR4".to_owned(),
+        }));
+        assert!(memory.facts.contains(&ResourceFactProjection {
+            label: "Capacity (MiB)",
+            value: "32768".to_owned(),
+        }));
+        assert!(memory.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Vendor B".to_owned(),
+        }));
+        assert!(memory.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn processor_and_memory_cards_keep_the_counts_summary_unchanged() -> Result<(), Box<dyn Error>>
+    {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        assert_eq!(
+            current
+                .resources
+                .iter()
+                .filter(|resource| resource.type_label == "Processor")
+                .count(),
+            1
+        );
+        assert_eq!(
+            current
+                .resources
+                .iter()
+                .filter(|resource| resource.type_label == "Memory")
+                .count(),
+            1
+        );
         Ok(())
     }
 
