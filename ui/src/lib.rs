@@ -16,14 +16,14 @@ use rutilus_api::{
     CredentialSummaryResponse, DeleteSubscription, EndpointCapabilityInventoryResponse,
     EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
+    EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
-    EventDestinationProtocol, EventListResponse, EventResponse, EventType, ManagerCommand,
-    MetricValueResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
-    RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand,
-    SetBootSourceOverride, StartUpdate, SystemCommand, TelemetrySampleListResponse,
-    TelemetrySampleResponse, TelemetrySeriesResponse, TlsTrustModeResponse, UiLocationResponse,
-    UpdateCommand,
+    EventDestinationProtocol, EventListResponse, EventResponse, EventType, GroupResponse,
+    ManagerCommand, MetricValueResponse, OperationResponse, OperationSourceResponse,
+    OperationStateResponse, RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
+    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
+    TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -190,6 +190,18 @@ struct EndpointCardProjection {
     snapshot_label: String,
     resource_counts: Option<ResourceCountsProjection>,
     resources: Vec<CoreResourceCardProjection>,
+    /// The §12.3 unified vendor of the endpoint, projected from the Service
+    /// Root resource the BMC published (absent until a complete refresh
+    /// observed one). Drives the §14.2 vendor filter.
+    vendor: Option<String>,
+    /// The §12.3 unified health of the endpoint: the worst status health
+    /// across its System, Chassis, and Manager resources. Drives the §14.2
+    /// health filter.
+    health_level: HealthLevel,
+    /// The raw text of the worst health status (§12.3 keeps the vendor's
+    /// original value beside the unified value), absent when no resource
+    /// published a health yet.
+    health_label: Option<String>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -221,6 +233,19 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
                     .collect(),
             ),
         };
+        let (vendor, health_level, health_label) = match endpoint.snapshot() {
+            EndpointResourceSnapshotResponse::AwaitingFirstRefresh => {
+                (None, HealthLevel::Unknown, None)
+            }
+            EndpointResourceSnapshotResponse::Current { resources, .. } => {
+                let health = worst_endpoint_health(resources);
+                (
+                    endpoint_vendor(resources),
+                    aggregate_health(resources),
+                    health.map(|(_, raw)| raw.to_owned()),
+                )
+            }
+        };
         Self {
             endpoint_id: identity.endpoint_id().to_string(),
             display_name: identity.display_name().to_owned(),
@@ -229,6 +254,9 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
             snapshot_label,
             resource_counts,
             resources,
+            vendor,
+            health_level,
+            health_label,
         }
     }
 }
@@ -1353,6 +1381,7 @@ fn push_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsoleView {
     Overview,
+    Groups,
     Credentials,
     AddEndpoint,
     Import,
@@ -1366,8 +1395,9 @@ enum ConsoleView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 10] = [
+    const ALL: [ConsoleView; 11] = [
         Self::Overview,
+        Self::Groups,
         Self::Credentials,
         Self::AddEndpoint,
         Self::Import,
@@ -1382,6 +1412,7 @@ impl ConsoleView {
     const fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Groups => "Groups",
             Self::Credentials => "Credentials",
             Self::AddEndpoint => "Add endpoint",
             Self::Import => "Import",
@@ -4777,8 +4808,848 @@ impl From<&OperationResponse> for OperationCardProjection {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §12.3 unified health of one endpoint, ordered from best to worst.
+///
+/// The ordering drives both the aggregation (an endpoint's level is the
+/// worst of its System/Chassis/Manager statuses) and the §14.2 health filter
+/// comparisons. `Unknown` ranks lowest because it means "no health observed
+/// yet", not "healthy".
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum HealthLevel {
+    Unknown,
+    Ok,
+    Warning,
+    Critical,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The canonical §12.3 label of one unified health level, used for the §14.2
+/// health filter chips. The endpoint-card badge instead shows the vendor's
+/// raw text (§12.3 保留厂商原始值), so the two surfaces stay distinct.
+#[must_use]
+const fn health_level_label(level: HealthLevel) -> &'static str {
+    match level {
+        HealthLevel::Unknown => "Unknown",
+        HealthLevel::Ok => "OK",
+        HealthLevel::Warning => "Warning",
+        HealthLevel::Critical => "Critical",
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Badge styling of one unified health level; the endpoint card pairs it
+/// with the raw text of the worst status.
+#[must_use]
+const fn health_badge_class(level: HealthLevel) -> &'static str {
+    match level {
+        HealthLevel::Unknown => "health-badge health-unknown",
+        HealthLevel::Ok => "health-badge health-ok",
+        HealthLevel::Warning => "health-badge health-warn",
+        HealthLevel::Critical => "health-badge health-critical",
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Maps one raw Redfish status-health text (§12.3 original value) to the
+/// unified §12.3 level.
+///
+/// An unknown spelling maps to `None`: it neither invents a level nor
+/// distorts the aggregation — the resource simply contributes no health, and
+/// its raw text stays on the card.
+fn health_level_of(health: &str) -> Option<HealthLevel> {
+    if health.eq_ignore_ascii_case("ok") {
+        Some(HealthLevel::Ok)
+    } else if health.eq_ignore_ascii_case("warning") {
+        Some(HealthLevel::Warning)
+    } else if health.eq_ignore_ascii_case("critical") {
+        Some(HealthLevel::Critical)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The worst §12.3 health across an endpoint's System, Chassis, and Manager
+/// statuses, together with the raw text that produced it.
+///
+/// Only the 0.1 triad participates: those are the health-carrying resources
+/// of the unified endpoint posture (§12.3), while the 0.2 families
+/// (Processors, Memory, Storage, ...) publish component health that belongs
+/// to the component card, not the endpoint badge.
+fn worst_endpoint_health(resources: &[CoreResourceResponse]) -> Option<(HealthLevel, &str)> {
+    resources
+        .iter()
+        .filter_map(|resource| match resource.resource() {
+            CoreResourceDetailsResponse::System { status, .. }
+            | CoreResourceDetailsResponse::Chassis { status, .. }
+            | CoreResourceDetailsResponse::Manager { status, .. } => status.as_ref(),
+            _ => None,
+        })
+        .filter_map(|status| {
+            status
+                .health()
+                .and_then(|health| health_level_of(health).map(|level| (level, health)))
+        })
+        .max_by_key(|(level, _)| *level)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The unified §12.3 health level of one endpoint's resource set.
+fn aggregate_health(resources: &[CoreResourceResponse]) -> HealthLevel {
+    worst_endpoint_health(resources).map_or(HealthLevel::Unknown, |(level, _)| level)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §12.3 unified vendor of one endpoint, from its Service Root resource.
+///
+/// Only the Service Root publishes the product vendor, so an endpoint
+/// awaiting its first refresh has no vendor yet and never matches a §14.2
+/// vendor filter until a refresh observed one.
+fn endpoint_vendor(resources: &[CoreResourceResponse]) -> Option<String> {
+    resources
+        .iter()
+        .find_map(|resource| match resource.resource() {
+            CoreResourceDetailsResponse::ServiceRoot { vendor, .. } => vendor.clone(),
+            _ => None,
+        })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §14.2 home-page filter selections, combined with AND semantics.
+///
+/// Each dimension is optional: an empty selection does not constrain.
+/// Within the tag, vendor, and health dimensions the selected values are
+/// `ORed` (an endpoint matches the tag dimension when it carries at least one
+/// selected tag), and the four dimensions are `ANDed` together — the
+/// documented §14.2 combination model. A vendor-less or health-less endpoint
+/// matches only when the corresponding dimension is unconstrained.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OverviewFilterSelections {
+    search: String,
+    tags: BTreeSet<String>,
+    vendors: BTreeSet<String>,
+    health: BTreeSet<HealthLevel>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OverviewFilterSelections {
+    /// Whether every dimension is empty, so no card can be filtered out.
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.search.trim().is_empty()
+            && self.tags.is_empty()
+            && self.vendors.is_empty()
+            && self.health.is_empty()
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Toggles one value in a selection set: present values are removed, absent
+/// ones inserted. Keeps the checkbox-chip interactions (Overview filters,
+/// group member add) on one pure primitive.
+fn toggle_set_membership<T: Ord + Clone>(set: &mut BTreeSet<T>, value: T) {
+    if set.contains(&value) {
+        set.remove(&value);
+    } else {
+        set.insert(value);
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The distinct §14.2 vendor choices in the loaded endpoint cards, sorted
+/// for a stable filter bar.
+fn vendor_choices(cards: &[EndpointCardProjection]) -> Vec<String> {
+    cards
+        .iter()
+        .filter_map(|card| card.vendor.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The distinct §14.2 health choices present in the loaded endpoint cards,
+/// worst-first so the operator reads the critical option before OK.
+fn health_choices(cards: &[EndpointCardProjection]) -> Vec<HealthLevel> {
+    cards
+        .iter()
+        .map(|card| card.health_level)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Every tag name carried by one endpoint, from the §14.2 tag inventory.
+///
+/// The inventory maps tag → endpoints (the tag-list surface), so the
+/// endpoint-side lookup inverts it; the Overview tag filter uses the result
+/// for membership checks.
+fn endpoint_tags(endpoint_id: &str, tags: &TagInventoryView) -> BTreeSet<String> {
+    tags.tags()
+        .iter()
+        .filter(|tag| tag.endpoint_ids().iter().any(|id| id == endpoint_id))
+        .map(|tag| tag.name().to_owned())
+        .collect()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Applies the §14.2 filter bar to the loaded endpoint cards with AND
+/// semantics across the four dimensions.
+///
+/// The filtering is deliberately client-side: the inventory response already
+/// carries every managed endpoint, the 200-endpoint scale the console is
+/// designed for fits a substring scan per keystroke, and server-side
+/// filtering would add a query contract for no latency gain at that scale.
+fn apply_overview_filters(
+    cards: &[EndpointCardProjection],
+    tags: &TagInventoryView,
+    selections: &OverviewFilterSelections,
+) -> Vec<EndpointCardProjection> {
+    let needle = selections.search.trim().to_ascii_lowercase();
+    let matches_search = |card: &EndpointCardProjection| {
+        needle.is_empty()
+            || card.display_name.to_ascii_lowercase().contains(&needle)
+            || card.address.to_ascii_lowercase().contains(&needle)
+    };
+    let matches_tags = |card: &EndpointCardProjection| {
+        selections.tags.is_empty()
+            || !selections
+                .tags
+                .is_disjoint(&endpoint_tags(&card.endpoint_id, tags))
+    };
+    let matches_vendors = |card: &EndpointCardProjection| {
+        selections.vendors.is_empty()
+            || card
+                .vendor
+                .as_deref()
+                .is_some_and(|vendor| selections.vendors.contains(vendor))
+    };
+    let matches_health = |card: &EndpointCardProjection| {
+        selections.health.is_empty() || selections.health.contains(&card.health_level)
+    };
+    cards
+        .iter()
+        .filter(|card| {
+            matches_search(card)
+                && matches_tags(card)
+                && matches_vendors(card)
+                && matches_health(card)
+        })
+        .cloned()
+        .collect()
+}
+
+// §14.2 grouping projections. The wire DTOs (`GroupResponse`,
+// `GroupListResponse`, `TagResponse`, `TagListResponse`) are the shared
+// contract of the api crate; the projections below render them without the
+// console ever re-parsing text, and the browser fetch layer maps the wire
+// shapes straight onto them.
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One §14.2 tag with every endpoint that carries it.
+///
+/// The endpoint-side mapping (tag → endpoints) is what both the tag list and
+/// the Overview tag filter need: the list renders the endpoints under each
+/// tag, and the filter inverts the mapping to test membership per endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TagView {
+    name: String,
+    endpoint_ids: Vec<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagView {
+    #[must_use]
+    pub const fn new(name: String, endpoint_ids: Vec<String>) -> Self {
+        Self { name, endpoint_ids }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn endpoint_ids(&self) -> &[String] {
+        &self.endpoint_ids
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §14.2 tag inventory as the console consumes it.
+///
+/// The wire `TagListResponse` is a flat list of one-name-one-endpoint
+/// bindings; the inventory groups the bindings by name so the tag list and
+/// the per-endpoint membership lookup both have the tag → endpoints shape.
+/// `Default` is the "no tags loaded" fallback the Overview filter pass uses
+/// while the inventory is still loading or failed — an empty inventory
+/// constrains nothing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TagInventoryView {
+    tags: Vec<TagView>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagInventoryView {
+    #[must_use]
+    pub const fn new(tags: Vec<TagView>) -> Self {
+        Self { tags }
+    }
+
+    #[must_use]
+    pub fn tags(&self) -> &[TagView] {
+        &self.tags
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&TagListResponse> for TagInventoryView {
+    fn from(response: &TagListResponse) -> Self {
+        let mut tags: Vec<TagView> = Vec::new();
+        for binding in response.tags() {
+            // Bindings arrive in deterministic product order; grouping keeps
+            // the first-seen order and appends endpoints in wire order.
+            let endpoint_id = binding.endpoint_id().to_string();
+            match tags.iter_mut().find(|tag| tag.name() == binding.name()) {
+                Some(tag) => tag.endpoint_ids.push(endpoint_id),
+                None => tags.push(TagView::new(binding.name().to_owned(), vec![endpoint_id])),
+            }
+        }
+        Self::new(tags)
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One §14.2 group card: the name, the member count, and the short ids of
+/// the member endpoints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupCardProjection {
+    group_id: String,
+    name: String,
+    member_count_text: String,
+    member_short_ids: Vec<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&GroupResponse> for GroupCardProjection {
+    fn from(group: &GroupResponse) -> Self {
+        let members = group.member_endpoint_ids();
+        Self {
+            group_id: group.group_id().to_string(),
+            name: group.name().to_owned(),
+            member_count_text: match members.len() {
+                1 => "1 member".to_owned(),
+                _ => format!("{} members", members.len()),
+            },
+            member_short_ids: members
+                .iter()
+                .map(|endpoint_id| short_endpoint_id(&endpoint_id.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The lazy-loading state of the §14.2 group list section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupsListState {
+    Idle,
+    Loading,
+    Ready(Vec<GroupCardProjection>),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl GroupsListState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn has_empty_list(&self) -> bool {
+        matches!(self, Self::Ready(groups) if groups.is_empty())
+    }
+
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(groups) => groups.len(),
+            Self::Idle | Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 group".to_owned(),
+            _ => format!("{count} groups"),
+        }
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The group list is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn group_cards(&self) -> Vec<GroupCardProjection> {
+        match self {
+            Self::Ready(groups) => groups.clone(),
+            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One member of a §14.2 group, joined with the managed-endpoint inventory
+/// so the member row renders the display name and address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupMemberProjection {
+    endpoint_id: String,
+    short_id: String,
+    display_name: String,
+    address: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One §14.2 group detail: the group plus every member joined against the
+/// loaded endpoint inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupDetailProjection {
+    group_id: String,
+    name: String,
+    members: Vec<GroupMemberProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl GroupDetailProjection {
+    /// Projects the detail from the wire `GroupResponse` (the same DTO the
+    /// list uses, since the group-detail route returns the full group) and
+    /// joins the member ids against the loaded endpoint inventory.
+    fn from_response(group: &GroupResponse, inventory: &[EndpointSummaryResponse]) -> Self {
+        let members = group
+            .member_endpoint_ids()
+            .iter()
+            .map(|endpoint_id| {
+                let endpoint_id_text = endpoint_id.to_string();
+                let summary = inventory
+                    .iter()
+                    .find(|summary| summary.identity().endpoint_id() == *endpoint_id);
+                GroupMemberProjection {
+                    endpoint_id: endpoint_id_text.clone(),
+                    short_id: short_endpoint_id(&endpoint_id_text),
+                    // A member that left the inventory (deleted endpoint)
+                    // still renders its row defensively instead of dropping
+                    // it from the group.
+                    display_name: summary.map_or_else(
+                        || "Unknown endpoint".to_owned(),
+                        |summary| summary.identity().display_name().to_owned(),
+                    ),
+                    address: summary.map_or_else(String::new, |summary| {
+                        summary.identity().address().to_owned()
+                    }),
+                }
+            })
+            .collect();
+        Self {
+            group_id: group.group_id().to_string(),
+            name: group.name().to_owned(),
+            members,
+        }
+    }
+
+    #[must_use]
+    const fn has_no_members(&self) -> bool {
+        self.members.is_empty()
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One endpoint the operator can add to the §14.2 group being managed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupMemberChoice {
+    endpoint_id: String,
+    display_name: String,
+    address: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The managed endpoints not yet in the group, in inventory order.
+///
+/// The detail fetch and the inventory come from the same product snapshot in
+/// the common flow; a member id absent from the inventory is never offered
+/// again, because it cannot be re-added.
+fn group_member_choices(
+    inventory: &[EndpointSummaryResponse],
+    detail: &GroupDetailProjection,
+) -> Vec<GroupMemberChoice> {
+    inventory
+        .iter()
+        .filter(|summary| {
+            !detail
+                .members
+                .iter()
+                .any(|member| member.endpoint_id == summary.identity().endpoint_id().to_string())
+        })
+        .map(|summary| GroupMemberChoice {
+            endpoint_id: summary.identity().endpoint_id().to_string(),
+            display_name: summary.identity().display_name().to_owned(),
+            address: summary.identity().address().to_owned(),
+        })
+        .collect()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The lazy-loading state of the selected §14.2 group detail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupDetailState {
+    Idle,
+    Loading,
+    Ready(GroupDetailProjection),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl GroupDetailState {
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The group detail is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn ready_projection(&self) -> Option<&GroupDetailProjection> {
+        match self {
+            Self::Ready(detail) => Some(detail),
+            Self::Idle | Self::Loading | Self::Failed => None,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One §14.2 tag card row: the full endpoint id (the untag action target)
+/// beside its short display form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TagEndpointRow {
+    endpoint_id: String,
+    short_id: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One §14.2 tag card: the tag name and the endpoints that carry it, each
+/// row keeping its full id so the untag action can target it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TagCardProjection {
+    name: String,
+    endpoint_count_text: String,
+    endpoints: Vec<TagEndpointRow>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagCardProjection {
+    fn from_view(tag: &TagView) -> Self {
+        let endpoints = tag.endpoint_ids();
+        Self {
+            name: tag.name().to_owned(),
+            endpoint_count_text: match endpoints.len() {
+                1 => "1 endpoint".to_owned(),
+                _ => format!("{} endpoints", endpoints.len()),
+            },
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint_id| TagEndpointRow {
+                    endpoint_id: endpoint_id.clone(),
+                    short_id: short_endpoint_id(endpoint_id),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The lazy-loading state of the §14.2 tag inventory.
+///
+/// The Overview filter bar and the Groups view both consume this state; each
+/// owns its own copy so a refresh in one view never disturbs the other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagsListState {
+    Idle,
+    Loading,
+    Ready(TagInventoryView),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagsListState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn has_empty_tags(&self) -> bool {
+        matches!(self, Self::Ready(tags) if tags.is_empty())
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The tag inventory is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn tag_names(&self) -> Vec<String> {
+        match self {
+            Self::Ready(tags) => {
+                let mut names = tags
+                    .tags()
+                    .iter()
+                    .map(|tag| tag.name().to_owned())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            }
+            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+
+    fn inventory(&self) -> Option<&TagInventoryView> {
+        match self {
+            Self::Ready(tags) => Some(tags),
+            Self::Idle | Self::Loading | Self::Failed => None,
+        }
+    }
+
+    fn tag_cards(&self) -> Vec<TagCardProjection> {
+        match self {
+            Self::Ready(tags) => tags
+                .tags()
+                .iter()
+                .map(TagCardProjection::from_view)
+                .collect(),
+            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The maximum §14.2 group-name length; the server remains authoritative.
+const MAX_GROUP_NAME_CHARS: usize = 64;
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Why a §14.2 group name cannot be submitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupNameDraftError {
+    Required,
+    ControlCharacter,
+    TooLong,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl GroupNameDraftError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Required => "A group name is required.",
+            Self::ControlCharacter => "The group name cannot contain control characters.",
+            Self::TooLong => "The group name cannot exceed 64 characters.",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Client-side mirror of the static-group name rules; the server remains
+/// authoritative when the group is created.
+fn group_name_draft_error(value: &str) -> Result<(), GroupNameDraftError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(GroupNameDraftError::Required);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(GroupNameDraftError::ControlCharacter);
+    }
+    if trimmed.chars().count() > MAX_GROUP_NAME_CHARS {
+        return Err(GroupNameDraftError::TooLong);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §14.2 create-group form draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupDraft {
+    name: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl GroupDraft {
+    #[must_use]
+    const fn new() -> Self {
+        Self {
+            name: String::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), GroupNameDraftError> {
+        group_name_draft_error(&self.name)
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The maximum §14.2 tag-name length.
+const MAX_TAG_NAME_CHARS: usize = 64;
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Why a §14.2 tag cannot be applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TagDraftError {
+    EndpointRequired,
+    NameRequired,
+    ControlCharacter,
+    TooLong,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagDraftError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::EndpointRequired => "Select the endpoint to tag.",
+            Self::NameRequired => "A tag name is required.",
+            Self::ControlCharacter => "A tag name cannot contain control characters.",
+            Self::TooLong => "A tag name cannot exceed 64 characters.",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Client-side mirror of the §14.2 tag-name rules.
+///
+/// Spaces and slashes are deliberately allowed: the domain `TagName` accepts
+/// them, and the tag route percent-encodes the name when it is removed (the
+/// web route percent-decodes it back). The server remains authoritative.
+fn tag_draft_error(endpoint_id: Option<&str>, name: &str) -> Result<(), TagDraftError> {
+    if endpoint_id.is_none() {
+        return Err(TagDraftError::EndpointRequired);
+    }
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(TagDraftError::NameRequired);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(TagDraftError::ControlCharacter);
+    }
+    if trimmed.chars().count() > MAX_TAG_NAME_CHARS {
+        return Err(TagDraftError::TooLong);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The uppercase hex digits of one percent-encoded byte.
+const PERCENT_HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Percent-encodes one tag name for the removal route path.
+///
+/// The route (`/api/v1/endpoints/{endpoint_id}/tags/{tag_name}`) percent-
+/// decodes the segment, so every byte outside the RFC 3986 unreserved set is
+/// encoded — spaces, slashes, and non-ASCII names all round-trip exactly.
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(PERCENT_HEX_DIGITS[(byte >> 4) as usize] as char);
+            encoded.push(PERCENT_HEX_DIGITS[(byte & 0x0F) as usize] as char);
+        }
+    }
+    encoded
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §14.2 tag-management form draft: the endpoint to tag and the tag
+/// name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TagDraft {
+    endpoint_id: Option<String>,
+    name: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TagDraft {
+    #[must_use]
+    const fn new() -> Self {
+        Self {
+            endpoint_id: None,
+            name: String::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), TagDraftError> {
+        tag_draft_error(self.endpoint_id.as_deref(), &self.name)
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The progression of one §14.2 group creation submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupCreateState {
+    Idle,
+    InFlight,
+    Created,
+    Failed(String),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The progression of one §14.2 group member add/remove submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupMemberActionState {
+    Idle,
+    InFlight,
+    Succeeded,
+    Failed(String),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The progression of one §14.2 tag apply/remove submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TagApplyState {
+    Idle,
+    InFlight,
+    Applied,
+    Failed(String),
+}
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
+    use std::collections::BTreeSet;
+
     use gloo_net::http::Request;
     use leptos::{
         mount::mount_to_body,
@@ -4788,14 +5659,16 @@ mod browser {
     };
     use rutilus_api::{
         AboutResponse, AppendArtifactChunkRequest, ArtifactListResponse, ArtifactProgressResponse,
-        ArtifactResponse, AuditQueryResponse, BeginEndpointTrustRequest,
+        ArtifactResponse, AssignTagRequest, AuditQueryResponse, BeginEndpointTrustRequest,
         ConfirmEndpointTrustRequest, CreateArtifactRequest, CreateCredentialRequest,
-        CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
-        EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
-        EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-        EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-        EventListResponse, OperationListResponse, OperationResponse, TelemetrySampleListResponse,
-        TelemetrySeriesListResponse, TelemetrySeriesResponse, TrustedEndpointResponse,
+        CreateGroupRequest, CreateOperationRequest, CredentialInventoryResponse,
+        CredentialSummaryResponse, EndpointCapabilityInventoryResponse, EndpointCsvImportRequest,
+        EndpointCsvImportResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+        EndpointResourceInventoryResponse, EndpointTrustChallengeResponse,
+        EndpointTrustExpectationRequest, EnrollEndpointRequest, EventListResponse,
+        GroupListResponse, GroupResponse, OperationListResponse, OperationResponse,
+        TagListResponse, TelemetrySampleListResponse, TelemetrySeriesListResponse,
+        TelemetrySeriesResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -4810,14 +5683,20 @@ mod browser {
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
         EventActionView, EventCardProjection, EventProtocolView, EventTypeView, EventsListState,
-        ImportFailure, ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
+        GroupCardProjection, GroupCreateState, GroupDetailProjection, GroupDetailState, GroupDraft,
+        GroupMemberActionState, GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure,
+        ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
         OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
         OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
-        ResetKeysTypeView, ResetTypeView, SecureBootActionView, TelemetryCardProjection,
-        TelemetryListState, TrustChallengeProjection, UpdateArtifactChoice,
-        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
-        command_summary, endpoint_address_draft_error, format_artifact_size,
-        operation_endpoint_choices, sha256_hex, trust_mode_label, update_artifact_choices,
+        OverviewFilterSelections, ResetKeysTypeView, ResetTypeView, SecureBootActionView,
+        TagApplyState, TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
+        TelemetryCardProjection, TelemetryListState, TrustChallengeProjection,
+        UpdateArtifactChoice, apply_overview_filters, artifact_chunk_range_at,
+        artifact_upload_status_text, base64_encode, build_command, command_summary,
+        endpoint_address_draft_error, format_artifact_size, group_member_choices,
+        group_name_draft_error, health_badge_class, health_choices, health_level_label,
+        operation_endpoint_choices, percent_encode_path_segment, sha256_hex, tag_draft_error,
+        toggle_set_membership, trust_mode_label, update_artifact_choices, vendor_choices,
     };
 
     #[wasm_bindgen(start)]
@@ -4854,11 +5733,103 @@ mod browser {
             set_view.set(ConsoleView::Overview);
         });
 
+        // The §14.2 filter bar state lives at the shell level because the
+        // Overview section renders here. Every dimension is an optional
+        // AND-constraint (an empty selection does not constrain), and the
+        // chips of the tag dimension come from the shared tag inventory.
+        let (filter_search, set_filter_search) = signal(String::new());
+        let (filter_tags, set_filter_tags) = signal(BTreeSet::<String>::new());
+        let (filter_vendors, set_filter_vendors) = signal(BTreeSet::<String>::new());
+        let (filter_health, set_filter_health) = signal(BTreeSet::<HealthLevel>::new());
+        // The tag inventory feeds both the filter choices and the per-endpoint
+        // membership checks; it is fetched once the inventory is ready and
+        // again on every inventory refresh, because the Groups view can
+        // change tags independently of endpoint data.
+        let (tags_state, set_tags_state) = signal(TagsListState::Idle);
+        let (tags_triggered, set_tags_triggered) = signal(false);
+
+        Effect::new(move |_| {
+            if state.with(ConsoleLoadState::is_ready) && !tags_triggered.get() {
+                set_tags_triggered.set(true);
+                set_tags_state.set(TagsListState::Loading);
+                spawn_local(async move {
+                    set_tags_state.set(fetch_tags().await);
+                });
+            }
+        });
+
         let on_refresh_inventory = move |_| {
             set_state.set(ConsoleLoadState::Loading);
             spawn_local(async move {
                 set_state.set(fetch_console().await);
             });
+            // Re-arming the trigger lets the ready-effect above fetch the tag
+            // inventory once the refreshed console data lands.
+            set_tags_triggered.set(false);
+            set_tags_state.set(TagsListState::Loading);
+        };
+
+        let on_search_input = move |event| {
+            set_filter_search.set(event_target_value(&event));
+        };
+
+        let on_toggle_tag = move |tag: String| {
+            set_filter_tags.update(|set| toggle_set_membership(set, tag));
+        };
+
+        let on_toggle_vendor = move |vendor: String| {
+            set_filter_vendors.update(|set| toggle_set_membership(set, vendor));
+        };
+
+        let on_toggle_health = move |level: HealthLevel| {
+            set_filter_health.update(|set| toggle_set_membership(set, level));
+        };
+
+        let on_clear_filters = move |_| {
+            set_filter_search.set(String::new());
+            set_filter_tags.set(BTreeSet::new());
+            set_filter_vendors.set(BTreeSet::new());
+            set_filter_health.set(BTreeSet::new());
+        };
+
+        let filters_active = move || {
+            !OverviewFilterSelections {
+                search: filter_search.get(),
+                tags: filter_tags.get(),
+                vendors: filter_vendors.get(),
+                health: filter_health.get(),
+            }
+            .is_empty()
+        };
+
+        // The §14.2 client-side filter pass: the inventory response already
+        // carries every managed endpoint, so the four dimensions apply to the
+        // loaded cards without another server round-trip.
+        let filtered_endpoint_cards = move || {
+            let cards = state.with(ConsoleLoadState::endpoint_cards);
+            let tags = tags_state.get().inventory().cloned().unwrap_or_default();
+            let selections = OverviewFilterSelections {
+                search: filter_search.get(),
+                tags: filter_tags.get(),
+                vendors: filter_vendors.get(),
+                health: filter_health.get(),
+            };
+            apply_overview_filters(&cards, &tags, &selections)
+        };
+
+        let filter_summary_text = move || {
+            let shown = filtered_endpoint_cards().len();
+            let total = state.with(ConsoleLoadState::endpoint_cards).len();
+            match shown {
+                1 => format!("1 of {total} endpoints shown"),
+                _ => format!("{shown} of {total} endpoints shown"),
+            }
+        };
+
+        let has_filtered_empty_result = move || {
+            !state.with(ConsoleLoadState::has_empty_inventory)
+                && filters_active()
+                && filtered_endpoint_cards().is_empty()
         };
 
         view! {
@@ -4942,16 +5913,134 @@ mod browser {
                             "Refresh inventory"
                         </button>
                     </div>
+                    <div class="overview-filter-bar">
+                        <div class="filter-field filter-field-search">
+                            <label for="overview-search">"Search"</label>
+                            <input
+                                id="overview-search"
+                                class="filter-search"
+                                type="search"
+                                autocomplete="off"
+                                placeholder="Name or address"
+                                prop:value=move || filter_search.get()
+                                on:input=on_search_input
+                            />
+                        </div>
+                        <div class="filter-field">
+                            <span class="filter-field-label">"Tags"</span>
+                            <div class="filter-chip-list">
+                                {move || {
+                                    tags_state
+                                        .get()
+                                        .tag_names()
+                                        .into_iter()
+                                        .map(|tag| {
+                                            let tag_for_check = tag.clone();
+                                            let tag_for_toggle = tag.clone();
+                                            view! {
+                                                <label class="filter-chip">
+                                                    <input
+                                                        type="checkbox"
+                                                        prop:checked=move || {
+                                                            filter_tags.get().contains(&tag_for_check)
+                                                        }
+                                                        on:change=move |_| {
+                                                            on_toggle_tag(tag_for_toggle.clone());
+                                                        }
+                                                    />
+                                                    <span>{tag}</span>
+                                                </label>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                            <p
+                                class="form-hint"
+                                hidden=move || !tags_state.get().is_failed()
+                            >
+                                "The tag list is temporarily unavailable."
+                            </p>
+                        </div>
+                        <div class="filter-field">
+                            <span class="filter-field-label">"Vendor"</span>
+                            <div class="filter-chip-list">
+                                {move || {
+                                    let cards = state.with(ConsoleLoadState::endpoint_cards);
+                                    vendor_choices(&cards)
+                                        .into_iter()
+                                        .map(|vendor| {
+                                            let vendor_for_check = vendor.clone();
+                                            let vendor_for_toggle = vendor.clone();
+                                            view! {
+                                                <label class="filter-chip">
+                                                    <input
+                                                        type="checkbox"
+                                                        prop:checked=move || {
+                                                            filter_vendors.get().contains(&vendor_for_check)
+                                                        }
+                                                        on:change=move |_| {
+                                                            on_toggle_vendor(vendor_for_toggle.clone());
+                                                        }
+                                                    />
+                                                    <span>{vendor}</span>
+                                                </label>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                        </div>
+                        <div class="filter-field">
+                            <span class="filter-field-label">"Health"</span>
+                            <div class="filter-chip-list">
+                                {move || {
+                                    let cards = state.with(ConsoleLoadState::endpoint_cards);
+                                    health_choices(&cards)
+                                        .into_iter()
+                                        .map(|level| {
+                                            let level_for_check = level;
+                                            let level_for_toggle = level;
+                                            view! {
+                                                <label class="filter-chip">
+                                                    <input
+                                                        type="checkbox"
+                                                        prop:checked=move || {
+                                                            filter_health.get().contains(&level_for_check)
+                                                        }
+                                                        on:change=move |_| {
+                                                            on_toggle_health(level_for_toggle);
+                                                        }
+                                                    />
+                                                    <span>{health_level_label(level)}</span>
+                                                </label>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                        </div>
+                        <div class="filter-field filter-field-actions">
+                            <button type="button" class="btn" on:click=on_clear_filters>
+                                "Clear filters"
+                            </button>
+                        </div>
+                    </div>
+                    <p class="filter-summary" hidden=move || !filters_active()>
+                        {move || filter_summary_text()}
+                    </p>
                     <p
                         class="empty-inventory"
                         hidden=move || !state.with(ConsoleLoadState::has_empty_inventory)
                     >
                         "No endpoints are managed yet. Add a trusted BMC endpoint to begin."
                     </p>
+                    <p class="empty-inventory" hidden=move || !has_filtered_empty_result()>
+                        "No endpoints match the current filters."
+                    </p>
                     <div class="endpoint-grid">
                         {move || {
-                            state
-                                .with(ConsoleLoadState::endpoint_cards)
+                            filtered_endpoint_cards()
                                 .into_iter()
                                 .map(|card| {
                                     view! {
@@ -4983,6 +6072,7 @@ mod browser {
                 <EventsView view=view />
                 <TelemetryView view=view />
                 <ArtifactsView view=view />
+                <GroupsView view=view load_state=state />
             </main>
         }
     }
@@ -5001,6 +6091,12 @@ mod browser {
         } else {
             "status-dot"
         };
+        // The §12.3 health badge shows the vendor's raw text with the unified
+        // level's styling; no raw text means no health observed yet, and the
+        // badge stays hidden instead of rendering a placeholder.
+        let health_badge_class = health_badge_class(card.health_level);
+        let health_badge_hidden = card.health_label.is_none();
+        let health_badge_text = card.health_label.clone();
         let resources = card.resources;
         let capability_target = CapabilityTargetProjection {
             endpoint_id: card.endpoint_id.clone(),
@@ -5015,6 +6111,13 @@ mod browser {
                         <h3>{card.display_name}</h3>
                         <p class="endpoint-address">{card.address}</p>
                     </div>
+                    <span
+                        class=health_badge_class
+                        hidden=health_badge_hidden
+                        title="Unified endpoint health"
+                    >
+                        {health_badge_text.unwrap_or_default()}
+                    </span>
                     <span class="trust-badge">{card.trust_label}</span>
                 </div>
                 <div class="snapshot-heading">
@@ -5104,6 +6207,920 @@ mod browser {
                 </p>
             </article>
         }
+    }
+
+    #[component]
+    fn GroupsView(
+        view: ReadSignal<ConsoleView>,
+        load_state: ReadSignal<ConsoleLoadState>,
+    ) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Groups;
+        let (list_state, set_list_state) = signal(GroupsListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (selected_group, set_selected_group) = signal(None::<String>);
+        let (detail_state, set_detail_state) = signal(GroupDetailState::Idle);
+        let (group_draft, set_group_draft) = signal(GroupDraft::new());
+        let (group_draft_error, set_group_draft_error) = signal(None::<GroupNameDraftError>);
+        let (create_state, set_create_state) = signal(GroupCreateState::Idle);
+        let (selected_members, set_selected_members) = signal(BTreeSet::<String>::new());
+        let (member_action, set_member_action) = signal(GroupMemberActionState::Idle);
+        let (tags_state, set_tags_state) = signal(TagsListState::Idle);
+        let (tags_triggered, set_tags_triggered) = signal(false);
+        let (tag_draft, set_tag_draft) = signal(TagDraft::new());
+        let (tag_error, set_tag_error) = signal(None::<TagDraftError>);
+        let (tag_action, set_tag_action) = signal(TagApplyState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(GroupsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(fetch_groups().await);
+                });
+            }
+        });
+
+        Effect::new(move |_| {
+            if active() && !tags_triggered.get() {
+                set_tags_triggered.set(true);
+                set_tags_state.set(TagsListState::Loading);
+                spawn_local(async move {
+                    set_tags_state.set(fetch_tags().await);
+                });
+            }
+        });
+
+        // Selecting a group fetches its detail; clearing the selection leaves
+        // the stale detail behind until the next selection, which is safe
+        // because the detail panel is hidden while no group is selected.
+        Effect::new(move |_| {
+            if let Some(group_id) = selected_group.get() {
+                set_detail_state.set(GroupDetailState::Loading);
+                let load = load_state.get();
+                spawn_local(async move {
+                    set_detail_state.set(fetch_group_detail(&group_id, load).await);
+                });
+            }
+        });
+
+        let on_group_name_input = move |event| {
+            let value = event_target_value(&event);
+            set_group_draft.update(|draft| draft.name.clone_from(&value));
+            set_group_draft_error.set(group_name_draft_error(&value).err());
+            set_create_state.set(GroupCreateState::Idle);
+        };
+
+        let on_create_group = move |_| {
+            let draft = group_draft.get();
+            if let Err(error) = draft.validate() {
+                set_group_draft_error.set(Some(error));
+                return;
+            }
+            set_group_draft_error.set(None);
+            set_create_state.set(GroupCreateState::InFlight);
+            let name = draft.name.trim().to_owned();
+            spawn_local(async move {
+                if create_group(&name).await {
+                    set_create_state.set(GroupCreateState::Created);
+                    set_group_draft.set(GroupDraft::new());
+                    set_group_draft_error.set(None);
+                    set_list_state.set(GroupsListState::Loading);
+                    set_list_state.set(fetch_groups().await);
+                } else {
+                    set_create_state.set(GroupCreateState::Failed(
+                        "The group could not be created.".to_owned(),
+                    ));
+                }
+            });
+        };
+
+        let on_open_group = Callback::new(move |group_id: String| {
+            set_selected_members.set(BTreeSet::new());
+            set_member_action.set(GroupMemberActionState::Idle);
+            set_selected_group.set(Some(group_id));
+        });
+
+        let on_back_to_list = Callback::new(move |()| {
+            set_selected_group.set(None);
+            set_detail_state.set(GroupDetailState::Idle);
+            set_selected_members.set(BTreeSet::new());
+            set_member_action.set(GroupMemberActionState::Idle);
+        });
+
+        let on_delete_group = Callback::new(move |group_id: String| {
+            spawn_local(async move {
+                if delete_group(&group_id).await {
+                    // Deleting the group that is currently open returns the
+                    // operator to the list instead of leaving a stale detail.
+                    if selected_group.get().as_deref() == Some(group_id.as_str()) {
+                        set_selected_group.set(None);
+                        set_detail_state.set(GroupDetailState::Idle);
+                    }
+                    set_list_state.set(GroupsListState::Loading);
+                    set_list_state.set(fetch_groups().await);
+                }
+            });
+        });
+
+        let on_refresh = move |_| {
+            set_list_state.set(GroupsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(fetch_groups().await);
+            });
+            set_tags_state.set(TagsListState::Loading);
+            spawn_local(async move {
+                set_tags_state.set(fetch_tags().await);
+            });
+        };
+
+        let on_toggle_member = Callback::new(move |endpoint_id: String| {
+            set_selected_members.update(|set| toggle_set_membership(set, endpoint_id));
+            set_member_action.set(GroupMemberActionState::Idle);
+        });
+
+        let on_add_members = Callback::new(move |()| {
+            let Some(group_id) = selected_group.get() else {
+                return;
+            };
+            let members = selected_members.get();
+            if members.is_empty() {
+                return;
+            }
+            set_member_action.set(GroupMemberActionState::InFlight);
+            spawn_local(async move {
+                // The adds are sequential, mirroring the per-endpoint member
+                // route; a partial failure still refetches the detail so the
+                // member list reflects exactly which adds succeeded.
+                let mut all_added = true;
+                for endpoint_id in members {
+                    all_added = all_added && put_group_member(&group_id, &endpoint_id).await;
+                }
+                set_member_action.set(if all_added {
+                    GroupMemberActionState::Succeeded
+                } else {
+                    GroupMemberActionState::Failed(
+                        "One or more endpoints could not be added to the group.".to_owned(),
+                    )
+                });
+                set_selected_members.set(BTreeSet::new());
+                let load = load_state.get();
+                set_detail_state.set(GroupDetailState::Loading);
+                set_detail_state.set(fetch_group_detail(&group_id, load).await);
+                set_list_state.set(GroupsListState::Loading);
+                set_list_state.set(fetch_groups().await);
+            });
+        });
+
+        let on_remove_member = Callback::new(move |endpoint_id: String| {
+            let Some(group_id) = selected_group.get() else {
+                return;
+            };
+            set_member_action.set(GroupMemberActionState::InFlight);
+            let load = load_state.get();
+            spawn_local(async move {
+                set_member_action.set(if delete_group_member(&group_id, &endpoint_id).await {
+                    GroupMemberActionState::Succeeded
+                } else {
+                    GroupMemberActionState::Failed(
+                        "The member could not be removed from the group.".to_owned(),
+                    )
+                });
+                set_detail_state.set(GroupDetailState::Loading);
+                set_detail_state.set(fetch_group_detail(&group_id, load).await);
+                set_list_state.set(GroupsListState::Loading);
+                set_list_state.set(fetch_groups().await);
+            });
+        });
+
+        let on_tag_endpoint_change = move |event| {
+            let value = event_target_value(&event);
+            let endpoint_id = if value.is_empty() { None } else { Some(value) };
+            set_tag_draft.update(|draft| draft.endpoint_id = endpoint_id);
+            let draft = tag_draft.get();
+            set_tag_error.set(tag_draft_error(draft.endpoint_id.as_deref(), &draft.name).err());
+            set_tag_action.set(TagApplyState::Idle);
+        };
+
+        let on_tag_name_input = move |event| {
+            let value = event_target_value(&event);
+            set_tag_draft.update(|draft| draft.name.clone_from(&value));
+            let draft = tag_draft.get();
+            set_tag_error.set(tag_draft_error(draft.endpoint_id.as_deref(), &value).err());
+            set_tag_action.set(TagApplyState::Idle);
+        };
+
+        let on_apply_tag = Callback::new(move |()| {
+            let draft = tag_draft.get();
+            if let Err(error) = draft.validate() {
+                set_tag_error.set(Some(error));
+                return;
+            }
+            set_tag_error.set(None);
+            set_tag_action.set(TagApplyState::InFlight);
+            let Some(endpoint_id) = draft.endpoint_id.clone() else {
+                return;
+            };
+            let name = draft.name.trim().to_owned();
+            let load = load_state.get();
+            spawn_local(async move {
+                if put_endpoint_tag(&endpoint_id, &name, &load).await {
+                    set_tag_action.set(TagApplyState::Applied);
+                    set_tag_draft.set(TagDraft::new());
+                    set_tag_error.set(None);
+                    set_tags_state.set(TagsListState::Loading);
+                    set_tags_state.set(fetch_tags().await);
+                } else {
+                    set_tag_action.set(TagApplyState::Failed(
+                        "The tag could not be applied.".to_owned(),
+                    ));
+                }
+            });
+        });
+
+        let on_remove_tag = Callback::new(move |(endpoint_id, name): (String, String)| {
+            set_tag_action.set(TagApplyState::InFlight);
+            spawn_local(async move {
+                set_tag_action.set(if delete_endpoint_tag(&endpoint_id, &name).await {
+                    TagApplyState::Applied
+                } else {
+                    TagApplyState::Failed("The tag could not be removed.".to_owned())
+                });
+                set_tags_state.set(TagsListState::Loading);
+                set_tags_state.set(fetch_tags().await);
+            });
+        });
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Groups"</p>
+                        <h2>{move || list_state.get().count_text()}</h2>
+                    </div>
+                    <p>"Static groups for organizing managed endpoints"</p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || list_state.get().is_loading()
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !list_state.get().is_loading()>
+                    "Loading groups..."
+                </p>
+                <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                    {move || list_state.get().failure_message()}
+                </p>
+                <div class="group-list" hidden=move || selected_group.get().is_some()>
+                    <p
+                        class="empty-inventory"
+                        hidden=move || {
+                            !list_state.get().is_ready() || !list_state.get().has_empty_list()
+                        }
+                    >
+                        "No groups have been created yet. Create a group to organize endpoints."
+                    </p>
+                    <div class="resource-list">
+                        {move || {
+                            list_state
+                                .get()
+                                .group_cards()
+                                .into_iter()
+                                .map(|card| {
+                                    view! {
+                                        <GroupCard
+                                            card=card
+                                            on_open=on_open_group
+                                            on_delete=on_delete_group
+                                        />
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </div>
+                </div>
+                <div class="group-detail" hidden=move || selected_group.get().is_none()>
+                    <GroupDetailPanel
+                        detail_state=detail_state
+                        load_state=load_state
+                        selected_members=selected_members
+                        member_action=member_action
+                        on_back=on_back_to_list
+                        on_toggle_member=on_toggle_member
+                        on_add_members=on_add_members
+                        on_remove_member=on_remove_member
+                    />
+                </div>
+                <div class="form-panel">
+                    <div class="form-panel-heading">
+                        <div>
+                            <p class="section-label">"Create group"</p>
+                            <p class="form-hint">
+                                "A static group collects managed endpoints for the Overview
+                                filter and bulk actions."
+                            </p>
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-field">
+                            <label for="group-name-input">"Group name"</label>
+                            <input
+                                id="group-name-input"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                prop:value=move || group_draft.get().name
+                                on:input=on_group_name_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || group_draft_error.get().is_none()
+                            >
+                                {move || {
+                                    group_draft_error.get().map_or("", GroupNameDraftError::message)
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-actions">
+                            <button
+                                type="button"
+                                class="btn btn-primary"
+                                disabled=move || {
+                                    matches!(create_state.get(), GroupCreateState::InFlight)
+                                }
+                                on:click=on_create_group
+                            >
+                                "Create group"
+                            </button>
+                        </div>
+                    </div>
+                    <p
+                        class="inline-status success"
+                        hidden=move || !matches!(create_state.get(), GroupCreateState::Created)
+                    >
+                        "Group created."
+                    </p>
+                    <p
+                        class="form-error"
+                        hidden=move || !matches!(create_state.get(), GroupCreateState::Failed(_))
+                    >
+                        {move || match create_state.get() {
+                            GroupCreateState::Failed(message) => message,
+                            GroupCreateState::Idle
+                            | GroupCreateState::InFlight
+                            | GroupCreateState::Created => String::new(),
+                        }}
+                    </p>
+                </div>
+                <div class="form-panel">
+                    <div class="form-panel-heading">
+                        <div>
+                            <p class="section-label">"Tags"</p>
+                            <p class="form-hint">
+                                "Tags label endpoints for the Overview tag filter."
+                            </p>
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-field">
+                            <label for="tag-endpoint-select">"Endpoint"</label>
+                            <select
+                                id="tag-endpoint-select"
+                                class="form-input"
+                                prop:value=move || {
+                                    tag_draft.get().endpoint_id.clone().unwrap_or_default()
+                                }
+                                on:change=on_tag_endpoint_change
+                            >
+                                <option value="">"Select an endpoint..."</option>
+                                {move || {
+                                    let load = load_state.get();
+                                    let inventory = match &load {
+                                        ConsoleLoadState::Ready(data) => {
+                                            data.inventory.endpoints()
+                                        }
+                                        ConsoleLoadState::Loading
+                                        | ConsoleLoadState::Failed(_) => return Vec::new(),
+                                    };
+                                    inventory
+                                        .iter()
+                                        .map(|summary| {
+                                            let endpoint_id = summary
+                                                .identity()
+                                                .endpoint_id()
+                                                .to_string();
+                                            let display_name = summary
+                                                .identity()
+                                                .display_name()
+                                                .to_owned();
+                                            view! {
+                                                <option value=endpoint_id>{display_name}</option>
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                }}
+                            </select>
+                        </div>
+                        <div class="form-field">
+                            <label for="tag-name-input">"Tag name"</label>
+                            <input
+                                id="tag-name-input"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                prop:value=move || tag_draft.get().name
+                                on:input=on_tag_name_input
+                            />
+                            <p class="form-error" hidden=move || tag_error.get().is_none()>
+                                {move || tag_error.get().map_or("", TagDraftError::message)}
+                            </p>
+                        </div>
+                        <div class="form-actions">
+                            <button
+                                type="button"
+                                class="btn btn-primary"
+                                disabled=move || matches!(tag_action.get(), TagApplyState::InFlight)
+                                on:click=move |_| on_apply_tag.run(())
+                            >
+                                "Apply tag"
+                            </button>
+                        </div>
+                    </div>
+                    <p
+                        class="inline-status success"
+                        hidden=move || !matches!(tag_action.get(), TagApplyState::Applied)
+                    >
+                        "Tag updated."
+                    </p>
+                    <p
+                        class="form-error"
+                        hidden=move || !matches!(tag_action.get(), TagApplyState::Failed(_))
+                    >
+                        {move || match tag_action.get() {
+                            TagApplyState::Failed(message) => message,
+                            TagApplyState::Idle
+                            | TagApplyState::InFlight
+                            | TagApplyState::Applied => String::new(),
+                        }}
+                    </p>
+                    <p class="inline-status" hidden=move || !tags_state.get().is_loading()>
+                        "Loading tags..."
+                    </p>
+                    <p class="form-error" hidden=move || !tags_state.get().is_failed()>
+                        {move || tags_state.get().failure_message()}
+                    </p>
+                    <p
+                        class="empty-inventory"
+                        hidden=move || {
+                            !tags_state.get().is_ready() || !tags_state.get().has_empty_tags()
+                        }
+                    >
+                        "No tags have been applied yet."
+                    </p>
+                    <div class="resource-list">
+                        {move || {
+                            tags_state
+                                .get()
+                                .tag_cards()
+                                .into_iter()
+                                .map(|card| view! { <TagCard card=card on_remove=on_remove_tag /> })
+                                .collect_view()
+                        }}
+                    </div>
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn GroupCard(
+        card: GroupCardProjection,
+        on_open: Callback<String>,
+        on_delete: Callback<String>,
+    ) -> impl IntoView {
+        let members_hidden = card.member_short_ids.is_empty();
+        let manage_group_id = card.group_id.clone();
+        let delete_group_id = card.group_id.clone();
+        view! {
+            <article class="credential-card">
+                <div class="credential-title">
+                    <div>
+                        <h3>{card.name}</h3>
+                        <p class="credential-username">{card.member_count_text}</p>
+                    </div>
+                </div>
+                <p class="section-label" hidden=members_hidden>"Members"</p>
+                <ul class="short-id-list" hidden=members_hidden>
+                    {card
+                        .member_short_ids
+                        .into_iter()
+                        .map(|short_id| {
+                            view! { <li><code>{short_id}</code></li> }
+                        })
+                        .collect_view()}
+                </ul>
+                <div class="endpoint-card-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_open.run(manage_group_id.clone())
+                    >
+                        "Manage members"
+                    </button>
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_delete.run(delete_group_id.clone())
+                    >
+                        "Delete"
+                    </button>
+                </div>
+            </article>
+        }
+    }
+
+    #[component]
+    fn GroupDetailPanel(
+        detail_state: ReadSignal<GroupDetailState>,
+        load_state: ReadSignal<ConsoleLoadState>,
+        selected_members: ReadSignal<BTreeSet<String>>,
+        member_action: ReadSignal<GroupMemberActionState>,
+        on_back: Callback<()>,
+        on_toggle_member: Callback<String>,
+        on_add_members: Callback<()>,
+        on_remove_member: Callback<String>,
+    ) -> impl IntoView {
+        // The add-choices are the managed endpoints not yet in the group,
+        // joined against the inventory the shell already loaded. The load
+        // state is bound to a named local so its borrow outlives the match.
+        let member_choices = move || {
+            let state = detail_state.get();
+            let Some(detail) = state.ready_projection() else {
+                return Vec::new();
+            };
+            let load = load_state.get();
+            let inventory = match &load {
+                ConsoleLoadState::Ready(data) => data.inventory.endpoints(),
+                ConsoleLoadState::Loading | ConsoleLoadState::Failed(_) => return Vec::new(),
+            };
+            group_member_choices(inventory, detail)
+        };
+
+        view! {
+            <div class="form-panel">
+                <div class="group-detail-heading">
+                    <div>
+                        <p class="section-label">"Group detail"</p>
+                        <h3>
+                            {move || {
+                                let state = detail_state.get();
+                                state
+                                    .ready_projection()
+                                    .map_or_else(|| "Group".to_owned(), |detail| detail.name.clone())
+                            }}
+                        </h3>
+                    </div>
+                    <button type="button" class="btn" on:click=move |_| on_back.run(())>
+                        "Back to groups"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !detail_state.get().is_loading()>
+                    "Loading group detail..."
+                </p>
+                <p class="form-error" hidden=move || !detail_state.get().is_failed()>
+                    {move || detail_state.get().failure_message()}
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        let state = detail_state.get();
+                        let Some(detail) = state.ready_projection() else {
+                            return true;
+                        };
+                        !detail.has_no_members()
+                    }
+                >
+                    "No members yet. Add endpoints below."
+                </p>
+                <div class="member-list">
+                    {move || {
+                        let state = detail_state.get();
+                        let members = state
+                            .ready_projection()
+                            .map_or_else(Vec::new, |detail| detail.members.clone());
+                        members
+                            .into_iter()
+                            .map(|member| {
+                                let endpoint_id = member.endpoint_id.clone();
+                                view! {
+                                    <div class="member-row">
+                                        <div>
+                                            <h4>{member.display_name}</h4>
+                                            <p class="endpoint-address">{member.address}</p>
+                                            <code class="member-short-id">{member.short_id}</code>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            class="btn"
+                                            on:click=move |_| {
+                                                on_remove_member.run(endpoint_id.clone());
+                                            }
+                                        >
+                                            "Remove"
+                                        </button>
+                                    </div>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </div>
+                <p class="section-label">"Add members"</p>
+                <div class="member-choice-grid">
+                    {move || {
+                        let choices = member_choices();
+                        if choices.is_empty() {
+                            return view! {
+                                <p class="form-hint">
+                                    "Every managed endpoint is already in this group."
+                                </p>
+                            }
+                            .into_any();
+                        }
+                        choices
+                            .into_iter()
+                            .map(|choice| {
+                                let endpoint_id_for_check = choice.endpoint_id.clone();
+                                let endpoint_id_for_toggle = choice.endpoint_id.clone();
+                                view! {
+                                    <label class="member-chip">
+                                        <input
+                                            type="checkbox"
+                                            prop:checked=move || {
+                                                selected_members
+                                                    .get()
+                                                    .contains(&endpoint_id_for_check)
+                                            }
+                                            on:change=move |_| {
+                                                on_toggle_member.run(endpoint_id_for_toggle.clone());
+                                            }
+                                        />
+                                        <span>{choice.display_name}</span>
+                                        <code>{choice.address}</code>
+                                    </label>
+                                }
+                            })
+                            .collect_view()
+                            .into_any()
+                    }}
+                </div>
+                <div class="form-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || {
+                            selected_members.get().is_empty()
+                                || matches!(
+                                    member_action.get(),
+                                    GroupMemberActionState::InFlight
+                                )
+                        }
+                        on:click=move |_| on_add_members.run(())
+                    >
+                        "Add selected"
+                    </button>
+                </div>
+                <p
+                    class="inline-status success"
+                    hidden=move || {
+                        !matches!(member_action.get(), GroupMemberActionState::Succeeded)
+                    }
+                >
+                    "Members updated."
+                </p>
+                <p
+                    class="form-error"
+                    hidden=move || !matches!(member_action.get(), GroupMemberActionState::Failed(_))
+                >
+                    {move || match member_action.get() {
+                        GroupMemberActionState::Failed(message) => message,
+                        GroupMemberActionState::Idle
+                        | GroupMemberActionState::InFlight
+                        | GroupMemberActionState::Succeeded => String::new(),
+                    }}
+                </p>
+            </div>
+        }
+    }
+
+    #[component]
+    fn TagCard(card: TagCardProjection, on_remove: Callback<(String, String)>) -> impl IntoView {
+        let rows_hidden = card.endpoints.is_empty();
+        let tag_name = card.name.clone();
+        view! {
+            <article class="credential-card">
+                <div class="credential-title">
+                    <div>
+                        <h3>{card.name}</h3>
+                        <p class="credential-username">{card.endpoint_count_text}</p>
+                    </div>
+                </div>
+                <ul class="tag-endpoint-list" hidden=rows_hidden>
+                    {card
+                        .endpoints
+                        .into_iter()
+                        .map(|row| {
+                            let target = (row.endpoint_id.clone(), tag_name.clone());
+                            view! {
+                                <li>
+                                    <code class="member-short-id">{row.short_id}</code>
+                                    <span>{row.endpoint_id}</span>
+                                    <button
+                                        type="button"
+                                        class="btn"
+                                        on:click=move |_| on_remove.run(target.clone())
+                                    >
+                                        "Untag"
+                                    </button>
+                                </li>
+                            }
+                        })
+                        .collect_view()}
+                </ul>
+                <p class="form-hint" hidden=!rows_hidden>
+                    "No endpoints carry this tag yet."
+                </p>
+            </article>
+        }
+    }
+
+    /// Fetches the §14.2 group inventory from `GET /api/v1/groups`.
+    ///
+    /// Any transport failure, non-2xx status, or contract violation reports
+    /// the unavailable state so the view renders its failure copy.
+    async fn fetch_groups() -> GroupsListState {
+        let Some(response) = Request::get("/api/v1/groups")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()
+        else {
+            return GroupsListState::Failed;
+        };
+        if !response.ok() {
+            return GroupsListState::Failed;
+        }
+        let Some(inventory) = response.json::<GroupListResponse>().await.ok() else {
+            return GroupsListState::Failed;
+        };
+        GroupsListState::Ready(
+            inventory
+                .groups()
+                .iter()
+                .map(GroupCardProjection::from)
+                .collect(),
+        )
+    }
+
+    /// Creates one §14.2 group through `POST /api/v1/groups`; `false` means
+    /// the submission failed (transport, rejection, or the duplicate-name
+    /// 409 verdict).
+    async fn create_group(name: &str) -> bool {
+        let request = CreateGroupRequest::new(name.to_owned());
+        let Some(prepared) = Request::post("/api/v1/groups").json(&request).ok() else {
+            return false;
+        };
+        let Some(response) = prepared.send().await.ok() else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Fetches one §14.2 group from `GET /api/v1/groups/{group_id}` and
+    /// joins its members against the loaded endpoint inventory; a failed or
+    /// inventory-less load reports the unavailable state.
+    async fn fetch_group_detail(group_id: &str, load_state: ConsoleLoadState) -> GroupDetailState {
+        let ConsoleLoadState::Ready(data) = load_state else {
+            return GroupDetailState::Failed;
+        };
+        let path = format!("/api/v1/groups/{group_id}");
+        let Some(response) = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()
+        else {
+            return GroupDetailState::Failed;
+        };
+        if !response.ok() {
+            return GroupDetailState::Failed;
+        }
+        let Some(group) = response.json::<GroupResponse>().await.ok() else {
+            return GroupDetailState::Failed;
+        };
+        GroupDetailState::Ready(GroupDetailProjection::from_response(
+            &group,
+            data.inventory.endpoints(),
+        ))
+    }
+
+    /// Deletes one §14.2 group through `DELETE /api/v1/groups/{group_id}`.
+    async fn delete_group(group_id: &str) -> bool {
+        let path = format!("/api/v1/groups/{group_id}");
+        let Some(response) = Request::delete(&path).send().await.ok() else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Adds one member to one group through the idempotent
+    /// `PUT /api/v1/groups/{group_id}/members/{endpoint_id}`.
+    async fn put_group_member(group_id: &str, endpoint_id: &str) -> bool {
+        let path = format!("/api/v1/groups/{group_id}/members/{endpoint_id}");
+        let Some(response) = Request::put(&path).send().await.ok() else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Removes one member from one group through the idempotent
+    /// `DELETE /api/v1/groups/{group_id}/members/{endpoint_id}`.
+    async fn delete_group_member(group_id: &str, endpoint_id: &str) -> bool {
+        let path = format!("/api/v1/groups/{group_id}/members/{endpoint_id}");
+        let Some(response) = Request::delete(&path).send().await.ok() else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Fetches the §14.2 tag inventory from `GET /api/v1/tags` and groups
+    /// the flat binding list by tag name.
+    async fn fetch_tags() -> TagsListState {
+        let Some(response) = Request::get("/api/v1/tags")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()
+        else {
+            return TagsListState::Failed;
+        };
+        if !response.ok() {
+            return TagsListState::Failed;
+        }
+        let Some(list) = response.json::<TagListResponse>().await.ok() else {
+            return TagsListState::Failed;
+        };
+        TagsListState::Ready(TagInventoryView::from(&list))
+    }
+
+    /// Binds one tag name to one endpoint through the idempotent
+    /// `PUT /api/v1/tags` body route.
+    ///
+    /// The endpoint id is resolved against the loaded inventory instead of
+    /// re-parsed, so the wire request always carries the exact managed
+    /// endpoint identity the product persisted.
+    async fn put_endpoint_tag(
+        endpoint_id: &str,
+        tag_name: &str,
+        load_state: &ConsoleLoadState,
+    ) -> bool {
+        let ConsoleLoadState::Ready(data) = load_state else {
+            return false;
+        };
+        let Some(summary) = data
+            .inventory
+            .endpoints()
+            .iter()
+            .find(|summary| summary.identity().endpoint_id().to_string() == endpoint_id)
+        else {
+            return false;
+        };
+        let request = AssignTagRequest::new(summary.identity().endpoint_id(), tag_name.to_owned());
+        let Some(prepared) = Request::put("/api/v1/tags").json(&request).ok() else {
+            return false;
+        };
+        let Some(response) = prepared.send().await.ok() else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Removes one tag binding through the idempotent
+    /// `DELETE /api/v1/endpoints/{endpoint_id}/tags/{tag_name}`.
+    ///
+    /// The tag name is percent-encoded because it is a path segment: names
+    /// with spaces, slashes, or non-ASCII characters (all valid for the
+    /// domain `TagName`) must round-trip exactly through the route.
+    async fn delete_endpoint_tag(endpoint_id: &str, tag_name: &str) -> bool {
+        let encoded_name = percent_encode_path_segment(tag_name);
+        let path = format!("/api/v1/endpoints/{endpoint_id}/tags/{encoded_name}");
+        let Some(response) = Request::delete(&path).send().await.ok() else {
+            return false;
+        };
+        response.ok()
     }
 
     async fn fetch_console() -> ConsoleLoadState {
@@ -11356,6 +13373,7 @@ mod tests {
             ConsoleView::ALL,
             [
                 ConsoleView::Overview,
+                ConsoleView::Groups,
                 ConsoleView::Credentials,
                 ConsoleView::AddEndpoint,
                 ConsoleView::Import,
@@ -11368,6 +13386,7 @@ mod tests {
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
+        assert_eq!(ConsoleView::Groups.label(), "Groups");
         assert_eq!(ConsoleView::Credentials.label(), "Credentials");
         assert_eq!(ConsoleView::AddEndpoint.label(), "Add endpoint");
         assert_eq!(ConsoleView::Import.label(), "Import");
@@ -12896,6 +14915,614 @@ mod tests {
             let command = build_command(&draft).map_err(|error| error.message().to_owned())?;
             assert_eq!(serde_json::to_value(&command)?, golden);
         }
+        Ok(())
+    }
+
+    fn overview_card(
+        endpoint_id: &str,
+        display_name: &str,
+        address: &str,
+        vendor: Option<&str>,
+        health_level: HealthLevel,
+    ) -> EndpointCardProjection {
+        EndpointCardProjection {
+            endpoint_id: endpoint_id.to_owned(),
+            display_name: display_name.to_owned(),
+            address: address.to_owned(),
+            trust_label: "System CA",
+            snapshot_label: "Generation 1 · observed 2026-08-05T09:12:13Z".to_owned(),
+            resource_counts: Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            }),
+            resources: Vec::new(),
+            vendor: vendor.map(str::to_owned),
+            health_level,
+            health_label: None,
+        }
+    }
+
+    fn group_response(
+        group_id: &str,
+        name: &str,
+        members: &[&str],
+    ) -> Result<GroupResponse, serde_json::Error> {
+        serde_json::from_value(json!({
+            "group_id": group_id,
+            "name": name,
+            "member_endpoint_ids": members,
+            "created_at": "2026-08-05T09:10:11Z",
+            "updated_at": "2026-08-05T09:12:13Z"
+        }))
+    }
+
+    fn tag_list_response(
+        bindings: &[(&str, &str, &str)],
+    ) -> Result<TagListResponse, serde_json::Error> {
+        let tags = bindings
+            .iter()
+            .map(|(tag_id, endpoint_id, name)| {
+                json!({ "tag_id": tag_id, "endpoint_id": endpoint_id, "name": name })
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({ "tags": tags }))
+    }
+
+    fn selections(
+        search: &str,
+        tags: &[&str],
+        vendors: &[&str],
+        health: &[HealthLevel],
+    ) -> OverviewFilterSelections {
+        OverviewFilterSelections {
+            search: search.to_owned(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            vendors: vendors.iter().map(|vendor| (*vendor).to_owned()).collect(),
+            health: health.iter().copied().collect(),
+        }
+    }
+
+    fn resource_with_health(
+        resource_type: &str,
+        health: Option<&str>,
+    ) -> Result<CoreResourceResponse, serde_json::Error> {
+        let status = health
+            .map(|health| json!({ "state": "Enabled", "health": health, "health_rollup": null }));
+        let details = if resource_type == "chassis" {
+            json!({ "chassis_type": "RackMount", "status": status })
+        } else {
+            json!({ "status": status })
+        };
+        serde_json::from_value(json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f0",
+                "odata_id": "/redfish/v1/Systems/1",
+                "odata_type": null,
+                "etag": null
+            },
+            "common": { "id": "1", "name": "One", "description": null },
+            "resource": {
+                "resource_type": resource_type,
+                "details": details
+            }
+        }))
+    }
+
+    #[test]
+    fn overview_search_filters_by_name_and_address_substrings() {
+        let cards = vec![
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ab",
+                "Rack A BMC",
+                "https://192.0.2.10/",
+                Some("Vendor A"),
+                HealthLevel::Ok,
+            ),
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ac",
+                "Rack B BMC",
+                "https://192.0.2.11/",
+                Some("Vendor B"),
+                HealthLevel::Warning,
+            ),
+        ];
+        let tags = TagInventoryView::new(Vec::new());
+
+        // The search matches display-name and address substrings,
+        // case-insensitively.
+        let by_name = apply_overview_filters(&cards, &tags, &selections("rack b", &[], &[], &[]));
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].display_name, "Rack B BMC");
+
+        let by_address =
+            apply_overview_filters(&cards, &tags, &selections("192.0.2.10", &[], &[], &[]));
+        assert_eq!(by_address.len(), 1);
+        assert_eq!(by_address[0].display_name, "Rack A BMC");
+
+        // Whitespace around the needle is ignored; an unmatched needle
+        // filters everything out.
+        assert_eq!(
+            apply_overview_filters(&cards, &tags, &selections("  RACK A  ", &[], &[], &[])).len(),
+            1
+        );
+        assert!(
+            apply_overview_filters(&cards, &tags, &selections("nowhere", &[], &[], &[])).is_empty()
+        );
+        assert_eq!(
+            apply_overview_filters(&cards, &tags, &selections("", &[], &[], &[])).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn overview_filters_combine_with_and_semantics() {
+        let first = "01989abc-def0-7abc-8def-0123456789ab";
+        let second = "01989abc-def0-7abc-8def-0123456789ac";
+        let third = "01989abc-def0-7abc-8def-0123456789ad";
+        let cards = vec![
+            overview_card(
+                first,
+                "Rack A BMC",
+                "https://192.0.2.10/",
+                Some("Vendor A"),
+                HealthLevel::Ok,
+            ),
+            overview_card(
+                second,
+                "Rack B BMC",
+                "https://192.0.2.11/",
+                Some("Vendor A"),
+                HealthLevel::Warning,
+            ),
+            overview_card(
+                third,
+                "Rack C BMC",
+                "https://192.0.2.12/",
+                Some("Vendor B"),
+                HealthLevel::Critical,
+            ),
+        ];
+        let tags = TagInventoryView::new(vec![
+            TagView::new(
+                "tier-1".to_owned(),
+                vec![first.to_owned(), second.to_owned()],
+            ),
+            TagView::new("edge".to_owned(), vec![third.to_owned()]),
+        ]);
+
+        // Within a dimension the selected values are `ORed`.
+        let by_tag = apply_overview_filters(&cards, &tags, &selections("", &["tier-1"], &[], &[]));
+        assert_eq!(by_tag.len(), 2);
+        let by_vendor =
+            apply_overview_filters(&cards, &tags, &selections("", &[], &["Vendor A"], &[]));
+        assert_eq!(by_vendor.len(), 2);
+        let by_health = apply_overview_filters(
+            &cards,
+            &tags,
+            &selections("", &[], &[], &[HealthLevel::Critical]),
+        );
+        assert_eq!(by_health.len(), 1);
+
+        // Across dimensions the constraints are `ANDed`: Rack B is Vendor A
+        // but not OK, and no card is both tier-1 and Vendor B.
+        let combined = apply_overview_filters(
+            &cards,
+            &tags,
+            &selections("", &["tier-1"], &["Vendor A"], &[HealthLevel::Ok]),
+        );
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].display_name, "Rack A BMC");
+        assert!(
+            apply_overview_filters(
+                &cards,
+                &tags,
+                &selections("", &["tier-1"], &["Vendor B"], &[]),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn overview_empty_result_when_filters_exclude_every_card() {
+        let cards = vec![overview_card(
+            "01989abc-def0-7abc-8def-0123456789ab",
+            "Rack A BMC",
+            "https://192.0.2.10/",
+            Some("Vendor A"),
+            HealthLevel::Ok,
+        )];
+        let tags = TagInventoryView::new(Vec::new());
+        let selections = selections("", &[], &["Vendor B"], &[]);
+        assert!(!selections.is_empty());
+        assert!(
+            apply_overview_filters(&cards, &tags, &selections).is_empty(),
+            "a vendor that no card carries filters the whole list out"
+        );
+        assert!(
+            OverviewFilterSelections::default().is_empty(),
+            "an untouched filter bar constrains nothing"
+        );
+    }
+
+    #[test]
+    fn overview_vendor_and_health_choices_derive_from_cards() {
+        let cards = vec![
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ab",
+                "Rack A BMC",
+                "https://192.0.2.10/",
+                Some("Vendor A"),
+                HealthLevel::Ok,
+            ),
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ac",
+                "Rack B BMC",
+                "https://192.0.2.11/",
+                Some("Vendor B"),
+                HealthLevel::Warning,
+            ),
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ad",
+                "Rack C BMC",
+                "https://192.0.2.12/",
+                Some("Vendor A"),
+                HealthLevel::Unknown,
+            ),
+            overview_card(
+                "01989abc-def0-7abc-8def-0123456789ae",
+                "Rack D BMC",
+                "https://192.0.2.13/",
+                None,
+                HealthLevel::Unknown,
+            ),
+        ];
+        assert_eq!(
+            vendor_choices(&cards),
+            vec!["Vendor A".to_owned(), "Vendor B".to_owned()]
+        );
+        assert_eq!(
+            health_choices(&cards),
+            vec![HealthLevel::Warning, HealthLevel::Ok, HealthLevel::Unknown]
+        );
+    }
+
+    #[test]
+    fn aggregate_health_takes_the_worst_status_across_resource_families()
+    -> Result<(), Box<dyn Error>> {
+        let ok_system = resource_with_health("system", Some("OK"))?;
+        let warning_chassis = resource_with_health("chassis", Some("Warning"))?;
+        let critical_manager = resource_with_health("manager", Some("Critical"))?;
+        assert_eq!(
+            aggregate_health(&[ok_system.clone(), warning_chassis.clone(), critical_manager]),
+            HealthLevel::Critical
+        );
+        assert_eq!(
+            aggregate_health(&[ok_system, warning_chassis]),
+            HealthLevel::Warning
+        );
+
+        // A family without a health status contributes nothing, and a
+        // vendor's unknown spelling neither invents a level nor distorts the
+        // aggregation.
+        assert_eq!(
+            aggregate_health(&[resource_with_health("system", Some("Degraded"))?]),
+            HealthLevel::Unknown
+        );
+        assert_eq!(
+            aggregate_health(&[resource_with_health("system", None)?]),
+            HealthLevel::Unknown
+        );
+        assert_eq!(aggregate_health(&[]), HealthLevel::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_card_projection_extracts_vendor_and_unified_health() -> Result<(), Box<dyn Error>> {
+        let state =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?);
+        let cards = state.endpoint_cards();
+        let waiting = cards.first().ok_or("waiting endpoint must exist")?;
+        let current = cards.get(1).ok_or("current endpoint must exist")?;
+
+        // The awaiting endpoint has no Service Root observation yet.
+        assert_eq!(waiting.vendor, None);
+        assert_eq!(waiting.health_level, HealthLevel::Unknown);
+        assert_eq!(waiting.health_label, None);
+
+        // The current endpoint publishes a Service Root vendor and a System
+        // status; the raw health text is retained beside the unified level.
+        assert_eq!(current.vendor.as_deref(), Some("Vendor A"));
+        assert_eq!(current.health_level, HealthLevel::Ok);
+        assert_eq!(current.health_label.as_deref(), Some("OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn groups_list_projects_name_count_and_member_short_ids() -> Result<(), Box<dyn Error>> {
+        let group = group_response(
+            "01989abc-def0-7abc-8def-0123456789ab",
+            "Production",
+            &[
+                "01989abc-def0-7abc-8def-0123456789ac",
+                "01989abc-def0-7abc-8def-0123456789ad",
+            ],
+        )?;
+        let card = GroupCardProjection::from(&group);
+        assert_eq!(card.group_id, "01989abc-def0-7abc-8def-0123456789ab");
+        assert_eq!(card.name, "Production");
+        assert_eq!(card.member_count_text, "2 members");
+        assert_eq!(
+            card.member_short_ids,
+            vec!["01989abc".to_owned(), "01989abc".to_owned()]
+        );
+
+        let single = GroupCardProjection::from(&group_response(
+            "01989abc-def0-7abc-8def-0123456789ae",
+            "Solo",
+            &["01989abc-def0-7abc-8def-0123456789af"],
+        )?);
+        assert_eq!(single.member_count_text, "1 member");
+
+        let state = GroupsListState::Ready(vec![card, single]);
+        assert_eq!(state.count_text(), "2 groups");
+        assert!(!state.has_empty_list());
+        assert_eq!(state.group_cards().len(), 2);
+        assert!(GroupsListState::Ready(Vec::new()).has_empty_list());
+        Ok(())
+    }
+
+    #[test]
+    fn group_name_draft_rejects_blank_control_and_overlong_names() {
+        assert_eq!(
+            group_name_draft_error("   "),
+            Err(GroupNameDraftError::Required)
+        );
+        assert_eq!(
+            group_name_draft_error("bad\u{0}name"),
+            Err(GroupNameDraftError::ControlCharacter)
+        );
+        let overlong = "a".repeat(MAX_GROUP_NAME_CHARS + 1);
+        assert_eq!(
+            group_name_draft_error(&overlong),
+            Err(GroupNameDraftError::TooLong)
+        );
+        assert_eq!(
+            group_name_draft_error(&"a".repeat(MAX_GROUP_NAME_CHARS)),
+            Ok(())
+        );
+        assert_eq!(group_name_draft_error("Production"), Ok(()));
+    }
+
+    #[test]
+    fn group_detail_joins_members_and_offers_only_unassigned_endpoints()
+    -> Result<(), Box<dyn Error>> {
+        let inventory = inventory()?;
+        let endpoints = inventory.endpoints();
+        let first_id = "01989abc-def0-7abc-8def-0123456789ab";
+        let detail = group_response(
+            "01989abc-def0-7abc-8def-0123456789e0",
+            "Rack A",
+            &[first_id, "01989abc-def0-7abc-8def-0123456789ff"],
+        )?;
+        let projection = GroupDetailProjection::from_response(&detail, endpoints);
+
+        // The inventory join renders the managed member with its display
+        // name and address; a member that left the inventory renders
+        // defensively instead of dropping the row.
+        assert_eq!(projection.members.len(), 2);
+        assert_eq!(projection.members[0].display_name, "Rack A BMC");
+        assert_eq!(projection.members[0].address, "https://192.0.2.10/");
+        assert_eq!(projection.members[1].display_name, "Unknown endpoint");
+        assert!(!projection.has_no_members());
+
+        // Only the managed endpoint not yet in the group is offered as an
+        // add choice; toggling it into the selection set and back simulates
+        // the checkbox interaction state.
+        let choices = group_member_choices(endpoints, &projection);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].display_name, "Rack B BMC");
+        let mut selection = BTreeSet::new();
+        toggle_set_membership(&mut selection, choices[0].endpoint_id.clone());
+        assert!(selection.contains(&choices[0].endpoint_id));
+        toggle_set_membership(&mut selection, choices[0].endpoint_id.clone());
+        assert!(selection.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tag_inventory_projects_cards_and_supports_endpoint_membership_lookup()
+    -> Result<(), Box<dyn Error>> {
+        let first = "01989abc-def0-7abc-8def-0123456789ab";
+        let second = "01989abc-def0-7abc-8def-0123456789ac";
+        let response = tag_list_response(&[
+            ("01989abc-def0-7abc-8def-0123456789b1", first, "tier-1"),
+            ("01989abc-def0-7abc-8def-0123456789b2", second, "tier-1"),
+            ("01989abc-def0-7abc-8def-0123456789b3", second, "edge"),
+        ])?;
+        let tags = TagInventoryView::from(&response);
+
+        // The flat binding list is grouped by tag name, preserving the wire
+        // order within each tag.
+        assert_eq!(tags.tags().len(), 2);
+        assert_eq!(tags.tags()[0].name(), "tier-1");
+        assert_eq!(
+            tags.tags()[0].endpoint_ids(),
+            &[first.to_owned(), second.to_owned()]
+        );
+        assert_eq!(tags.tags()[1].name(), "edge");
+
+        // The membership lookup inverts the tag → endpoints mapping for the
+        // Overview tag filter.
+        assert_eq!(
+            endpoint_tags(first, &tags),
+            BTreeSet::from(["tier-1".to_owned()])
+        );
+        assert_eq!(
+            endpoint_tags(second, &tags),
+            BTreeSet::from(["tier-1".to_owned(), "edge".to_owned()])
+        );
+        assert!(endpoint_tags("01989abc-def0-7abc-8def-0123456789ad", &tags).is_empty());
+
+        let state = TagsListState::Ready(tags);
+        let cards = state.tag_cards();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].name, "tier-1");
+        assert_eq!(cards[0].endpoint_count_text, "2 endpoints");
+        assert_eq!(cards[0].endpoints[0].short_id, "01989abc");
+        assert_eq!(cards[0].endpoints[0].endpoint_id, first);
+        assert_eq!(cards[1].endpoint_count_text, "1 endpoint");
+
+        // The tag names feed the filter chips in a stable sorted order.
+        assert_eq!(
+            state.tag_names(),
+            vec!["edge".to_owned(), "tier-1".to_owned()]
+        );
+        assert!(!state.has_empty_tags());
+        Ok(())
+    }
+
+    #[test]
+    fn percent_encoding_keeps_unreserved_characters_and_encodes_the_rest() {
+        assert_eq!(percent_encode_path_segment("tier-1"), "tier-1");
+        assert_eq!(percent_encode_path_segment("Rack A"), "Rack%20A");
+        assert_eq!(percent_encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_path_segment("réservé"), "r%C3%A9serv%C3%A9");
+    }
+
+    #[test]
+    fn tag_draft_requires_an_endpoint_and_a_valid_tag_name() {
+        let endpoint = Some("01989abc-def0-7abc-8def-0123456789ab");
+        assert_eq!(
+            tag_draft_error(None, "tier-1"),
+            Err(TagDraftError::EndpointRequired)
+        );
+        assert_eq!(
+            tag_draft_error(endpoint, "  "),
+            Err(TagDraftError::NameRequired)
+        );
+        assert_eq!(
+            tag_draft_error(endpoint, "bad\u{0}tag"),
+            Err(TagDraftError::ControlCharacter)
+        );
+        let overlong = "a".repeat(MAX_TAG_NAME_CHARS + 1);
+        assert_eq!(
+            tag_draft_error(endpoint, &overlong),
+            Err(TagDraftError::TooLong)
+        );
+        // Spaces and slashes are valid tag characters: the domain `TagName`
+        // accepts them and the removal route percent-encodes them.
+        assert_eq!(tag_draft_error(endpoint, "tier-1"), Ok(()));
+        assert_eq!(tag_draft_error(endpoint, "Rack A"), Ok(()));
+        assert_eq!(tag_draft_error(endpoint, "a/b"), Ok(()));
+    }
+
+    #[test]
+    fn grouping_states_render_typed_progress_copy() -> Result<(), Box<dyn Error>> {
+        // The wire group DTO carries the full member set the projections
+        // consume.
+        let group = group_response(
+            "01989abc-def0-7abc-8def-0123456789ab",
+            "Prod",
+            &["01989abc-def0-7abc-8def-0123456789ac"],
+        )?;
+        assert_eq!(group.name(), "Prod");
+        assert_eq!(group.member_endpoint_ids().len(), 1);
+
+        // Every group-list phase renders a distinct static status.
+        assert!(!GroupsListState::Idle.is_ready());
+        assert!(GroupsListState::Loading.is_loading());
+        assert!(!GroupsListState::Loading.is_ready());
+        assert!(GroupsListState::Failed.is_failed());
+        assert_eq!(
+            GroupsListState::Failed.failure_message(),
+            "The group list is temporarily unavailable."
+        );
+        assert_eq!(GroupsListState::Ready(Vec::new()).count_text(), "0 groups");
+
+        // The group-detail phases mirror the list phases.
+        assert!(!GroupDetailState::Idle.is_loading());
+        assert!(GroupDetailState::Loading.is_loading());
+        assert!(GroupDetailState::Failed.is_failed());
+        assert_eq!(
+            GroupDetailState::Failed.failure_message(),
+            "The group detail is temporarily unavailable."
+        );
+        assert!(
+            GroupDetailState::Ready(GroupDetailProjection::from_response(
+                &group,
+                inventory()?.endpoints(),
+            ))
+            .ready_projection()
+            .is_some()
+        );
+
+        // The tag phases, including the shared inventory accessor.
+        assert!(TagsListState::Loading.is_loading());
+        assert!(TagsListState::Failed.is_failed());
+        assert_eq!(
+            TagsListState::Failed.failure_message(),
+            "The tag inventory is temporarily unavailable."
+        );
+        assert!(TagsListState::Idle.inventory().is_none());
+        let tags_ready = TagsListState::Ready(TagInventoryView::new(Vec::new()));
+        assert!(tags_ready.is_ready());
+        assert!(tags_ready.inventory().is_some());
+        assert!(tags_ready.has_empty_tags());
+        assert!(tags_ready.tag_names().is_empty());
+
+        // The submission-progress states carry the typed progression the
+        // forms render.
+        let create_progress = [
+            GroupCreateState::Idle,
+            GroupCreateState::InFlight,
+            GroupCreateState::Created,
+            GroupCreateState::Failed("boom".to_owned()),
+        ];
+        assert_eq!(create_progress.len(), 4);
+        let member_progress = [
+            GroupMemberActionState::Idle,
+            GroupMemberActionState::InFlight,
+            GroupMemberActionState::Succeeded,
+            GroupMemberActionState::Failed("boom".to_owned()),
+        ];
+        assert_eq!(member_progress.len(), 4);
+        let tag_progress = [
+            TagApplyState::Idle,
+            TagApplyState::InFlight,
+            TagApplyState::Applied,
+            TagApplyState::Failed("boom".to_owned()),
+        ];
+        assert_eq!(tag_progress.len(), 4);
+
+        // The create and tag drafts validate through the shared rules.
+        let mut group_draft = GroupDraft::new();
+        assert_eq!(group_draft.validate(), Err(GroupNameDraftError::Required));
+        group_draft.name = "Prod".to_owned();
+        assert_eq!(group_draft.validate(), Ok(()));
+        let mut tag_draft = TagDraft::new();
+        assert_eq!(tag_draft.validate(), Err(TagDraftError::EndpointRequired));
+        tag_draft.endpoint_id = Some("01989abc-def0-7abc-8def-0123456789ab".to_owned());
+        tag_draft.name = "tier-1".to_owned();
+        assert_eq!(tag_draft.validate(), Ok(()));
+
+        // The health badge vocabulary stays closed and labelled.
+        assert_eq!(health_level_label(HealthLevel::Unknown), "Unknown");
+        assert_eq!(health_level_label(HealthLevel::Ok), "OK");
+        assert_eq!(health_level_label(HealthLevel::Warning), "Warning");
+        assert_eq!(health_level_label(HealthLevel::Critical), "Critical");
+        assert_eq!(
+            health_badge_class(HealthLevel::Critical),
+            "health-badge health-critical"
+        );
+        assert_eq!(
+            GroupNameDraftError::Required.message(),
+            "A group name is required."
+        );
+        assert_eq!(
+            TagDraftError::EndpointRequired.message(),
+            "Select the endpoint to tag."
+        );
         Ok(())
     }
 }
