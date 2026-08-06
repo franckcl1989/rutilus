@@ -438,6 +438,185 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn round_trips_the_complete_capability_snapshot() -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let observed_at = created_at + Duration::SECOND;
+        let full = all_capabilities();
+        store
+            .replace_endpoint_capabilities(endpoint_id, &full, observed_at)
+            .await?;
+
+        let stored = store
+            .find_endpoint_capabilities(endpoint_id)
+            .await?
+            .ok_or("stored endpoint capabilities are missing")?;
+        assert_eq!(stored.len(), full.len());
+        assert!(
+            stored
+                .iter()
+                .all(|capability| capability.observed_at() == observed_at)
+        );
+        let mut expected = full;
+        expected.sort_by_key(|observation| observation.capability().as_str());
+        assert_eq!(
+            stored
+                .iter()
+                .map(|capability| capability.observation())
+                .collect::<Vec<_>>(),
+            expected,
+            "every compiled capability must survive the round-trip in stable capability-code order"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_replacement_drops_every_absent_capability() -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let first_observed_at = created_at + Duration::SECOND;
+        let full = all_capabilities();
+        store
+            .replace_endpoint_capabilities(endpoint_id, &full, first_observed_at)
+            .await?;
+
+        // A later, smaller probe must replace the complete snapshot rather than
+        // merge with it, so a capability that stopped advertising disappears.
+        let second_observed_at = first_observed_at + Duration::SECOND;
+        let subset = subset_capabilities();
+        store
+            .replace_endpoint_capabilities(endpoint_id, &subset, second_observed_at)
+            .await?;
+        let stored_subset = store
+            .find_endpoint_capabilities(endpoint_id)
+            .await?
+            .ok_or("stored endpoint capabilities are missing")?;
+        assert_eq!(stored_subset.len(), subset.len());
+        assert!(stored_subset.iter().all(|capability| {
+            capability.observed_at() == second_observed_at
+                && subset.contains(&capability.observation())
+        }));
+
+        // The full surface must be restorable without residue from either
+        // earlier snapshot, proving every replace is a fresh generation.
+        let third_observed_at = second_observed_at + Duration::SECOND;
+        store
+            .replace_endpoint_capabilities(endpoint_id, &full, third_observed_at)
+            .await?;
+        let stored_full = store
+            .find_endpoint_capabilities(endpoint_id)
+            .await?
+            .ok_or("stored endpoint capabilities are missing")?;
+        assert_eq!(stored_full.len(), full.len());
+        assert!(stored_full.iter().all(|capability| {
+            capability.observed_at() == third_observed_at
+                && full.contains(&capability.observation())
+        }));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_code_rejects_the_entire_read_back() -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let observed_at = created_at + Duration::SECOND;
+        store
+            .replace_endpoint_capabilities(endpoint_id, &all_capabilities(), observed_at)
+            .await?;
+        endpoint_capability::ActiveModel {
+            endpoint_id: Set(endpoint_id.into_uuid()),
+            capability: Set(String::from("oem-future-capability")),
+            state: Set(String::from("supported")),
+            observed_at: Set(observed_at),
+        }
+        .insert(&store.database)
+        .await?;
+
+        // One unknown persisted code fails the complete read: callers must
+        // never see a silently truncated capability snapshot.
+        assert!(matches!(
+            store.find_endpoint_capabilities(endpoint_id).await,
+            Err(EndpointCapabilityRepositoryError::Corrupt {
+                source: StoredEndpointCapabilityError::UnknownCapability(_),
+                ..
+            })
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// Every `EndpointCapability` variant of the §2.1 standard-feature
+    /// inventory, each with a deterministic state, so the round-trip proves
+    /// both the capability code and the final state survive persistence.
+    ///
+    /// The enumeration mirrors the domain's `CAPABILITIES` test constant; when
+    /// the compiled ledger grows, both lists must grow together so the
+    /// round-trip always covers the complete compiled surface instead of a
+    /// hand-picked subset.
+    fn all_capabilities() -> Vec<EndpointCapabilityObservation> {
+        const CAPABILITIES: [EndpointCapability; 30] = [
+            EndpointCapability::Accounts,
+            EndpointCapability::Assembly,
+            EndpointCapability::Bios,
+            EndpointCapability::BootOptions,
+            EndpointCapability::Chassis,
+            EndpointCapability::Systems,
+            EndpointCapability::Controls,
+            EndpointCapability::EnvironmentMetrics,
+            EndpointCapability::EthernetInterfaces,
+            EndpointCapability::EventService,
+            EndpointCapability::HostInterfaces,
+            EndpointCapability::LogServices,
+            EndpointCapability::ManagerNetworkProtocol,
+            EndpointCapability::Managers,
+            EndpointCapability::Memory,
+            EndpointCapability::NetworkAdapters,
+            EndpointCapability::NetworkDeviceFunctions,
+            EndpointCapability::PcieDevices,
+            EndpointCapability::Power,
+            EndpointCapability::PowerEquipment,
+            EndpointCapability::PowerSupplies,
+            EndpointCapability::Processors,
+            EndpointCapability::SecureBoot,
+            EndpointCapability::Sensors,
+            EndpointCapability::SessionService,
+            EndpointCapability::Storages,
+            EndpointCapability::TaskService,
+            EndpointCapability::TelemetryService,
+            EndpointCapability::Thermal,
+            EndpointCapability::UpdateService,
+        ];
+        const STATES: [CapabilityState; 7] = [
+            CapabilityState::Supported,
+            CapabilityState::ReadOnly,
+            CapabilityState::Unauthorized,
+            CapabilityState::TemporarilyUnavailable,
+            CapabilityState::SchemaIncompatible,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotCompiled,
+        ];
+        CAPABILITIES
+            .into_iter()
+            .enumerate()
+            .map(|(index, capability)| {
+                EndpointCapabilityObservation::new(capability, STATES[index % STATES.len()])
+            })
+            .collect()
+    }
+
+    /// A smaller snapshot whose capabilities all belong to the full set, so
+    /// the partial-replacement assertions prove that a reduced probe removes
+    /// every absent capability instead of merging with the previous snapshot.
+    fn subset_capabilities() -> Vec<EndpointCapabilityObservation> {
+        all_capabilities().into_iter().take(5).collect()
+    }
+
     fn observation(
         capability: EndpointCapability,
         state: CapabilityState,
