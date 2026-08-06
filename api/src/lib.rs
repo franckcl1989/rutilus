@@ -2,6 +2,16 @@
 
 use std::{fmt, num::NonZeroU64};
 
+// The §7.5 typed write vocabulary is part of the wire contract: the operation
+// DTOs carry `RedfishCommand` and its payloads, so consumers of this crate
+// must be able to name those types (E0603 otherwise). The re-export mirrors
+// the domain's own surface exactly.
+pub use rutilus_domain::{
+    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
+    CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol, EventType,
+    ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
+    SetBootSourceOverride, SystemCommand,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
@@ -1872,10 +1882,231 @@ impl AuditQueryResponse {
     }
 }
 
+/// The stable §13.1 product source of one persisted operation.
+///
+/// The three wire values mirror the domain source codes exactly, so the
+/// console echoes the source it submitted and never sees an unknown one.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationSourceResponse {
+    /// A write submitted from a standalone local GUI.
+    Standalone,
+    /// A write submitted from a site GUI.
+    Site,
+    /// A write dispatched by the Center.
+    Center,
+}
+
+/// The §13.2 lifecycle phase of one persisted operation.
+///
+/// The wire values are `snake_case` by console contract and match the domain's
+/// stable codes in every phase except the asynchronous acceptance phase,
+/// which the domain codes `waiting-remote` (its persistence vocabulary) and
+/// the console wire carries as `waiting_remote`; the Web projection
+/// translates between the two vocabularies in both directions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStateResponse {
+    /// Persisted but not yet picked up for pre-flight checks (§13.3 step 6).
+    Queued,
+    /// Pre-flight checks are in progress (§13.3 steps 1–5).
+    Validating,
+    /// The typed Redfish method call is being dispatched (§13.3 step 7).
+    Running,
+    /// An asynchronous BMC Task is being monitored (§13.3 step 8, §13.6).
+    WaitingRemote,
+    /// The target is being re-read and the result verified (§13.3 steps 9–10).
+    Verifying,
+    /// Verification confirmed the expected result (§13.3 step 11).
+    Succeeded,
+    /// A provable failure ended the operation.
+    Failed,
+    /// The final result cannot currently be proven (§13.5).
+    Unknown,
+    /// The product proved that the operation stopped.
+    Cancelled,
+}
+
+/// Secret-free input that converts one typed Redfish write into a persisted
+/// operation (§13.1).
+///
+/// `source` is optional and defaults to `standalone`; the accepted values are
+/// the three §13.1 sources (`standalone`, `site`, `center`). `targets` is a
+/// list of managed endpoint UUIDs; the non-empty check happens in the
+/// application submission use case so the wire contract stays a pure
+/// projection. `command` is the domain's own typed write surface (§7.5),
+/// serialized with its canonical serde shape — the §9.4 typed-payload rule
+/// applied to the API boundary, so the wire command is exactly the persisted
+/// command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateOperationRequest {
+    source: Option<String>,
+    targets: Vec<Uuid>,
+    command: RedfishCommand,
+}
+
+impl CreateOperationRequest {
+    /// Constructs a submission request; `None` source means `standalone`.
+    #[must_use]
+    pub const fn new(source: Option<String>, targets: Vec<Uuid>, command: RedfishCommand) -> Self {
+        Self {
+            source,
+            targets,
+            command,
+        }
+    }
+
+    /// Returns the requested source, defaulting to `standalone` at the
+    /// boundary when absent.
+    #[must_use]
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Returns the target endpoint UUIDs in submission order.
+    #[must_use]
+    pub fn targets(&self) -> &[Uuid] {
+        &self.targets
+    }
+
+    /// Returns the typed write command the operation must execute.
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+}
+
+/// One object an operation acts on, bound to the endpoint that receives the
+/// Redfish request (§13.1).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationTargetResponse {
+    target_id: Uuid,
+    endpoint_id: Uuid,
+}
+
+impl OperationTargetResponse {
+    #[must_use]
+    pub const fn new(target_id: Uuid, endpoint_id: Uuid) -> Self {
+        Self {
+            target_id,
+            endpoint_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn target_id(self) -> Uuid {
+        self.target_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(self) -> Uuid {
+        self.endpoint_id
+    }
+}
+
+/// One persisted operation projection for the console (§13.1).
+///
+/// The command echoes the submitted typed write in its canonical serde shape,
+/// so the console renders exactly what will be dispatched (§13.3 step 7).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationResponse {
+    operation_id: Uuid,
+    source: OperationSourceResponse,
+    targets: Vec<OperationTargetResponse>,
+    command: RedfishCommand,
+    state: OperationStateResponse,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl OperationResponse {
+    #[must_use]
+    pub const fn new(
+        operation_id: Uuid,
+        source: OperationSourceResponse,
+        targets: Vec<OperationTargetResponse>,
+        command: RedfishCommand,
+        state: OperationStateResponse,
+        created_at: OffsetDateTime,
+        updated_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            operation_id,
+            source,
+            targets,
+            command,
+            state,
+            created_at,
+            updated_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> OperationSourceResponse {
+        self.source
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[OperationTargetResponse] {
+        &self.targets
+    }
+
+    /// Returns the typed write command of the operation.
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> OperationStateResponse {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> OffsetDateTime {
+        self.updated_at
+    }
+}
+
+/// Stable envelope for one operation listing, optionally filtered by state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationListResponse {
+    operations: Vec<OperationResponse>,
+}
+
+impl OperationListResponse {
+    #[must_use]
+    pub const fn new(operations: Vec<OperationResponse>) -> Self {
+        Self { operations }
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[OperationResponse] {
+        &self.operations
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
 
+    use rutilus_domain::{ResetType, SecureBootCommand, SystemCommand};
     use serde_json::json;
     use time::format_description::well_known::Rfc3339;
     use uuid::uuid;
@@ -4699,6 +4930,208 @@ mod tests {
             serde_json::from_value::<ErrorResponse>(json!({
                 "message": "failed",
                 "secret": "must not leak"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_state_and_source_vocabularies_are_exact() -> Result<(), Box<dyn Error>> {
+        // The nine §13.2 phases with their exact console wire values; the
+        // Web state filter accepts exactly this vocabulary.
+        let states = [
+            (OperationStateResponse::Queued, "queued"),
+            (OperationStateResponse::Validating, "validating"),
+            (OperationStateResponse::Running, "running"),
+            (OperationStateResponse::WaitingRemote, "waiting_remote"),
+            (OperationStateResponse::Verifying, "verifying"),
+            (OperationStateResponse::Succeeded, "succeeded"),
+            (OperationStateResponse::Failed, "failed"),
+            (OperationStateResponse::Unknown, "unknown"),
+            (OperationStateResponse::Cancelled, "cancelled"),
+        ];
+        for (state, wire) in states {
+            assert_eq!(serde_json::to_value(state)?, json!(wire));
+            assert_eq!(
+                serde_json::from_value::<OperationStateResponse>(json!(wire))?,
+                state
+            );
+        }
+        // The domain persistence code is deliberately not a wire value here.
+        assert!(serde_json::from_value::<OperationStateResponse>(json!("waiting-remote")).is_err());
+        assert!(serde_json::from_value::<OperationStateResponse>(json!("done")).is_err());
+
+        let sources = [
+            (OperationSourceResponse::Standalone, "standalone"),
+            (OperationSourceResponse::Site, "site"),
+            (OperationSourceResponse::Center, "center"),
+        ];
+        for (source, wire) in sources {
+            assert_eq!(serde_json::to_value(source)?, json!(wire));
+            assert_eq!(
+                serde_json::from_value::<OperationSourceResponse>(json!(wire))?,
+                source
+            );
+        }
+        assert!(serde_json::from_value::<OperationSourceResponse>(json!("cluster")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn create_operation_contract_round_trips_the_typed_command() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = uuid!("01989abc-def0-7abc-8def-0123456789ab");
+        let request = CreateOperationRequest::new(
+            None,
+            vec![endpoint_id],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+        );
+
+        assert_eq!(request.source(), None);
+        assert_eq!(request.targets(), &[endpoint_id]);
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "source": null,
+                "targets": [endpoint_id],
+                "command": { "System": { "Reset": "PowerCycle" } }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateOperationRequest>(serde_json::to_value(&request)?)?,
+            request
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateOperationRequest>(json!({
+                "source": "center",
+                "targets": [endpoint_id],
+                "command": { "Boot": {
+                    "SetBootSourceOverride": {
+                        "source": "Pxe",
+                        "enabled": "Once",
+                        "mode": "UEFI"
+                    }
+                } }
+            }))?
+            .source(),
+            Some("center")
+        );
+        // Unknown request fields and unknown command families are rejected.
+        assert!(
+            serde_json::from_value::<CreateOperationRequest>(json!({
+                "source": "standalone",
+                "targets": [endpoint_id],
+                "command": { "System": { "Reset": "On" } },
+                "remember": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CreateOperationRequest>(json!({
+                "source": "standalone",
+                "targets": [endpoint_id],
+                "command": { "Account": { "Create": {} } }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_response_contract_pins_the_wire_projection() -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let operation_id = uuid!("01989abc-def0-7abc-8def-0123456789d1");
+        let target_id = uuid!("01989abc-def0-7abc-8def-0123456789d2");
+        let endpoint_id = uuid!("01989abc-def0-7abc-8def-0123456789d3");
+        let response = OperationResponse::new(
+            operation_id,
+            OperationSourceResponse::Standalone,
+            vec![OperationTargetResponse::new(target_id, endpoint_id)],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            OperationStateResponse::WaitingRemote,
+            observed_at,
+            observed_at,
+        );
+
+        assert_eq!(response.operation_id(), operation_id);
+        assert_eq!(response.source(), OperationSourceResponse::Standalone);
+        assert_eq!(
+            response.targets(),
+            &[OperationTargetResponse::new(target_id, endpoint_id)]
+        );
+        assert_eq!(
+            response.command(),
+            &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle))
+        );
+        assert_eq!(response.state(), OperationStateResponse::WaitingRemote);
+        assert_eq!(response.created_at(), observed_at);
+        assert_eq!(response.updated_at(), observed_at);
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "operation_id": operation_id,
+                "source": "standalone",
+                "targets": [
+                    { "target_id": target_id, "endpoint_id": endpoint_id }
+                ],
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "waiting_remote",
+                "created_at": "2026-08-05T10:11:12Z",
+                "updated_at": "2026-08-05T10:11:12Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert!(
+            serde_json::from_value::<OperationResponse>(json!({
+                "operation_id": operation_id,
+                "source": "standalone",
+                "targets": [],
+                "command": { "System": { "Reset": "On" } },
+                "state": "waiting_remote",
+                "created_at": "2026-08-05T10:11:12Z",
+                "updated_at": "2026-08-05T10:11:12Z",
+                "next_page": null
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_list_envelope_round_trips() -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let operation = OperationResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789d4"),
+            OperationSourceResponse::Site,
+            Vec::new(),
+            RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+            OperationStateResponse::Succeeded,
+            observed_at,
+            observed_at,
+        );
+        let list = OperationListResponse::new(vec![operation]);
+        let encoded = serde_json::to_value(&list)?;
+
+        assert_eq!(encoded["operations"][0]["state"], json!("succeeded"));
+        assert_eq!(
+            encoded["operations"][0]["command"],
+            json!({ "SecureBoot": "Enable" })
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationListResponse>(encoded)?,
+            list
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationListResponse>(json!({ "operations": [] }))?,
+            OperationListResponse::new(Vec::new())
+        );
+        assert!(
+            serde_json::from_value::<OperationListResponse>(json!({
+                "operations": [],
+                "total": 0
             }))
             .is_err()
         );
