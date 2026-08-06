@@ -25,13 +25,18 @@ use nv_redfish::{
         chassis_collection::ChassisCollection as ChassisCollectionSchema,
         computer_system::ComputerSystem as ComputerSystemSchema,
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
+        ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
+        ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
         manager::Manager as ManagerSchema,
         manager_collection::ManagerCollection as ManagerCollectionSchema,
         memory::Memory as MemorySchema,
         memory_collection::MemoryCollection as MemoryCollectionSchema,
+        network_adapter::NetworkAdapter as NetworkAdapterSchema,
+        network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
-        resource::Resource as ResourceSchema,
+        resource::Resource as ResourceSchema, storage::Storage as StorageSchema,
+        storage_collection::StorageCollection as StorageCollectionSchema,
     },
     session_service::{Session, SessionCreate},
 };
@@ -210,9 +215,10 @@ impl RedfishGateway {
     }
 
     /// Reads the complete advertised core resource surface (the 0.1
-    /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors and
-    /// Memory families) through public, typed `nv-redfish` navigation and
-    /// returns bounded domain projections.
+    /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors,
+    /// Memory, Storage, `NetworkAdapters`, and `EthernetInterfaces` families)
+    /// through public, typed `nv-redfish` navigation and returns bounded
+    /// domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
@@ -309,32 +315,14 @@ async fn read_authenticated_core_resources(
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let mut resources = vec![service_root_projection(root)?];
     resources.extend(read_systems_resources(bmc, root, identity, trust).await?);
-    resources.extend(
-        read_collection_resources(
-            root.root.chassis.as_ref(),
-            bmc,
-            identity,
-            trust,
-            chassis_projection,
-        )
-        .await?,
-    );
-    resources.extend(
-        read_collection_resources(
-            root.root.managers.as_ref(),
-            bmc,
-            identity,
-            trust,
-            manager_projection,
-        )
-        .await?,
-    );
+    resources.extend(read_chassis_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
     Ok(resources)
 }
 
 /// Reads the Systems collection and, for every decoded System member, its
-/// Processors and Memory collections, so the 0.2 families follow their
-/// parent through the same typed navigation.
+/// Processors, Memory, and Storage collections, so the 0.2 families follow
+/// their parent through the same typed navigation.
 ///
 /// A missing Systems link leaves the whole family absent without an error
 /// ("资源存在才呈现"); a failed Systems collection document aborts the read
@@ -380,6 +368,102 @@ async fn read_systems_resources(
                 identity,
                 trust,
                 memory_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                system.storage.as_ref(),
+                bmc,
+                identity,
+                trust,
+                storage_projection,
+            )
+            .await?,
+        );
+    }
+    Ok(resources)
+}
+
+/// Reads the Chassis collection and, for every decoded Chassis member, its
+/// `NetworkAdapters` collection, so the 0.2 network family follows its parent
+/// through the same typed navigation.
+///
+/// A missing Chassis link leaves the whole family absent without an error; a
+/// failed Chassis collection document aborts the read with the existing
+/// classified error semantics. Only individual members are skippable.
+async fn read_chassis_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(chassis) = root.root.chassis.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let collection = chassis
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in &collection.members {
+        let Some(chassis) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        let Some(projection) = member_projection(chassis_projection(&chassis))? else {
+            continue;
+        };
+        resources.push(projection);
+        resources.extend(
+            read_collection_resources(
+                chassis.network_adapters.as_ref(),
+                bmc,
+                identity,
+                trust,
+                network_adapter_projection,
+            )
+            .await?,
+        );
+    }
+    Ok(resources)
+}
+
+/// Reads the Managers collection and, for every decoded Manager member, its
+/// `EthernetInterfaces` collection, so the 0.2 network family follows its
+/// parent through the same typed navigation.
+///
+/// A missing Managers link leaves the whole family absent without an error; a
+/// failed Managers collection document aborts the read with the existing
+/// classified error semantics. Only individual members are skippable.
+async fn read_manager_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(managers) = root.root.managers.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let collection = managers
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in &collection.members {
+        let Some(manager) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        let Some(projection) = member_projection(manager_projection(&manager))? else {
+            continue;
+        };
+        resources.push(projection);
+        resources.extend(
+            read_collection_resources(
+                manager.ethernet_interfaces.as_ref(),
+                bmc,
+                identity,
+                trust,
+                ethernet_interface_projection,
             )
             .await?,
         );
@@ -430,6 +514,30 @@ impl MemberCollection for ProcessorCollectionSchema {
 
 impl MemberCollection for MemoryCollectionSchema {
     type Member = MemorySchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for StorageCollectionSchema {
+    type Member = StorageSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for NetworkAdapterCollectionSchema {
+    type Member = NetworkAdapterSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for EthernetInterfaceCollectionSchema {
+    type Member = EthernetInterfaceSchema;
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
@@ -1030,6 +1138,68 @@ struct MemoryPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `storages` family projection.
+///
+/// The field set is exactly the `StoragePayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. `ControllerCount` and
+/// `DriveCount` are derived from the `StorageControllers` and `Drives`
+/// navigations of the typed schema and stay numeric so the console can render
+/// counts without re-parsing text.
+#[derive(Serialize)]
+struct StoragePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ControllerCount", skip_serializing_if = "Option::is_none")]
+    controller_count: Option<usize>,
+    #[serde(rename = "DriveCount", skip_serializing_if = "Option::is_none")]
+    drive_count: Option<usize>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `network-adapters` family projection.
+///
+/// The field set is exactly the `NetworkAdapterPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. Only the direct
+/// `Manufacturer`, `Model`, and `Status` properties of the adapter resource
+/// are projectable; `FirmwareVersion` exists only inside `Controllers[]` and
+/// is deliberately not flattened here.
+#[derive(Serialize)]
+struct NetworkAdapterPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `ethernet-interfaces` family projection.
+///
+/// The field set is exactly the `EthernetInterfacePayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. Only the direct
+/// `MACAddress`, `SpeedMbps`, `InterfaceEnabled`, and `Status` properties are
+/// projectable; `SpeedMbps` stays numeric so the console can render the link
+/// speed without re-parsing text.
+#[derive(Serialize)]
+struct EthernetInterfacePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "MACAddress", skip_serializing_if = "Option::is_none")]
+    mac_address: Option<String>,
+    #[serde(rename = "SpeedMbps", skip_serializing_if = "Option::is_none")]
+    speed_mbps: Option<i64>,
+    #[serde(rename = "InterfaceEnabled", skip_serializing_if = "Option::is_none")]
+    interface_enabled: Option<bool>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
 fn service_root_projection(
     root: &ServiceRoot<UpstreamBmc>,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -1167,6 +1337,67 @@ fn memory_projection(
         ResourceFeature::Memory,
         memory.odata_id(),
         memory.etag(),
+        &payload,
+    )
+}
+
+fn storage_projection(
+    storage: &StorageSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = StoragePayload {
+        resource: CommonResourcePayload::from_schema_base(&storage.base),
+        controller_count: storage.storage_controllers.as_ref().map(Vec::len),
+        drive_count: storage.drives.as_ref().map(Vec::len),
+        status: storage
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Storages,
+        storage.odata_id(),
+        storage.etag(),
+        &payload,
+    )
+}
+
+fn network_adapter_projection(
+    adapter: &NetworkAdapterSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NetworkAdapterPayload {
+        resource: CommonResourcePayload::from_schema_base(&adapter.base),
+        manufacturer: optional_nullable_text(adapter.manufacturer.as_ref()),
+        model: optional_nullable_text(adapter.model.as_ref()),
+        status: adapter
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::NetworkAdapters,
+        adapter.odata_id(),
+        adapter.etag(),
+        &payload,
+    )
+}
+
+fn ethernet_interface_projection(
+    interface: &EthernetInterfaceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = EthernetInterfacePayload {
+        resource: CommonResourcePayload::from_schema_base(&interface.base),
+        mac_address: optional_nullable_text(interface.mac_address.as_ref()),
+        speed_mbps: interface.speed_mbps.as_ref().copied().flatten(),
+        interface_enabled: interface.interface_enabled.as_ref().copied().flatten(),
+        status: interface
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::EthernetInterfaces,
+        interface.odata_id(),
+        interface.etag(),
         &payload,
     )
 }
@@ -2546,6 +2777,136 @@ mod tests {
         "Members":[]
     }"##;
 
+    /// A System member that advertises only the 0.2 Storage family, so the
+    /// family read tests exercise one navigation per parent instead of the
+    /// combined Processors/Memory fixture.
+    const SYSTEM_WITH_STORAGE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "Description":"Primary compute system",
+        "SystemType":"Physical",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model S",
+        "Storage":{"@odata.id":"/redfish/v1/Systems/1/Storage"}
+    }"#;
+
+    const STORAGE_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#StorageCollection.StorageCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Storage",
+        "Name":"Storage Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1/Storage/1"}]
+    }"##;
+
+    const STORAGE_WITH_TWO_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#StorageCollection.StorageCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Storage",
+        "Name":"Storage Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/1"},
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/2"}
+        ]
+    }"##;
+
+    /// The Storage member projection carries only the two collection counts
+    /// and the status; the drives and controllers are counted from the typed
+    /// navigation arrays without fetching them.
+    const STORAGE_SUBSYSTEM_BODY: &str = r##"{
+        "@odata.type":"#Storage.v1_17_0.Storage",
+        "@odata.id":"/redfish/v1/Systems/1/Storage/1",
+        "@odata.etag":"W/\"storage-1\"",
+        "Id":"1",
+        "Name":"Storage Subsystem One",
+        "Description":"Primary storage subsystem",
+        "StorageControllers":[
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/1/Controllers/0"},
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/1/Controllers/1"}
+        ],
+        "Drives":[
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/1/Drives/0"},
+            {"@odata.id":"/redfish/v1/Systems/1/Storage/1/Drives/1"}
+        ],
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A Chassis member that advertises the 0.2 `NetworkAdapters` family.
+    const CHASSIS_WITH_NETWORK_ADAPTERS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "NetworkAdapters":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters"}
+    }"#;
+
+    /// The full `NetworkAdapter` member projection the family read asserts,
+    /// with every optional inventory field the schema carries populated.
+    const NETWORK_ADAPTER_FULL_BODY: &str = r##"{
+        "@odata.type":"#NetworkAdapter.v1_11_0.NetworkAdapter",
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "@odata.etag":"W/\"nic-1\"",
+        "Id":"1",
+        "Name":"Adapter One",
+        "Description":"Primary network adapter",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model NIC",
+        "PartNumber":"NIC-PART-1",
+        "SerialNumber":"NIC-1",
+        "SKU":"NIC-SKU-1",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A Manager member that advertises the 0.2 `EthernetInterfaces` family.
+    const MANAGER_WITH_ETHERNET_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "EthernetInterfaces":{"@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces"}
+    }"#;
+
+    const ETHERNET_INTERFACES_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#EthernetInterfaceCollection.EthernetInterfaceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces",
+        "Name":"Ethernet Interface Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces/1"},
+            {"@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces/2"}
+        ]
+    }"##;
+
+    /// The full `EthernetInterface` member projection with every optional
+    /// field the schema carries populated.
+    const ETHERNET_INTERFACE_ONE_BODY: &str = r##"{
+        "@odata.type":"#EthernetInterface.v1_6_0.EthernetInterface",
+        "@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces/1",
+        "@odata.etag":"W/\"eth-1\"",
+        "Id":"1",
+        "Name":"Ethernet Interface One",
+        "Description":"Management network interface",
+        "InterfaceEnabled":true,
+        "PermanentMACAddress":"AA:BB:CC:DD:EE:01",
+        "MACAddress":"AA:BB:CC:DD:EE:01",
+        "SpeedMbps":1000,
+        "MTUSize":1500,
+        "HostName":"bmc-mgmt",
+        "FQDN":"bmc-mgmt.example.test",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A minimal `EthernetInterface` member: absent optional fields must be
+    /// omitted from the projection, never emitted as null.
+    const ETHERNET_INTERFACE_TWO_BODY: &str = r##"{
+        "@odata.type":"#EthernetInterface.v1_6_0.EthernetInterface",
+        "@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces/2",
+        "@odata.etag":"W/\"eth-2\"",
+        "Id":"2",
+        "Name":"Ethernet Interface Two",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
     const ASSEMBLY_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/Chassis/1/Assembly",
         "Id":"Assembly",
@@ -2765,6 +3126,74 @@ mod tests {
         "/redfish/v1/Chassis/1",
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one member per core collection when every 0.2
+    /// family is populated: Storage follows its System member, `NetworkAdapters`
+    /// follows its Chassis member, `EthernetInterfaces` follows its Manager
+    /// member.
+    const FAMILY_RESOURCE_REQUEST_PATHS: [&str; 18] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Storage",
+        "/redfish/v1/Systems/1/Storage/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/NetworkAdapters",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/EthernetInterfaces",
+        "/redfish/v1/Managers/1/EthernetInterfaces/1",
+        "/redfish/v1/Managers/1/EthernetInterfaces/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the Storage collection is advertised but empty
+    /// and the Chassis and Manager members advertise no network links: the
+    /// empty collection document is still read, no member is.
+    const EMPTY_FAMILY_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Storage",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the second Storage member is undecodable: its
+    /// URI is still requested (that is how the skip is observed), then the
+    /// remaining families complete.
+    const FAMILY_MEMBER_SKIP_REQUEST_PATHS: [&str; 19] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Storage",
+        "/redfish/v1/Systems/1/Storage/1",
+        "/redfish/v1/Systems/1/Storage/2",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/NetworkAdapters",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/EthernetInterfaces",
+        "/redfish/v1/Managers/1/EthernetInterfaces/1",
+        "/redfish/v1/Managers/1/EthernetInterfaces/2",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -3754,6 +4183,228 @@ mod tests {
             ]
         );
         assert_session_requests(&server.finish_all().await?, &MEMBER_SKIP_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_storage_network_and_ethernet_families_through_typed_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_STORAGE_BODY),
+                ("200 OK", STORAGE_WITH_MEMBERS_BODY),
+                ("200 OK", STORAGE_SUBSYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTER_FULL_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_ETHERNET_BODY),
+                ("200 OK", ETHERNET_INTERFACES_WITH_MEMBERS_BODY),
+                ("200 OK", ETHERNET_INTERFACE_ONE_BODY),
+                ("200 OK", ETHERNET_INTERFACE_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 8);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Storages,
+                ResourceFeature::Chassis,
+                ResourceFeature::NetworkAdapters,
+                ResourceFeature::Managers,
+                ResourceFeature::EthernetInterfaces,
+                ResourceFeature::EthernetInterfaces,
+            ]
+        );
+        assert_projection(
+            &resources[2],
+            "/redfish/v1/Systems/1/Storage/1",
+            "W/\"storage-1\"",
+            "Id",
+            "1",
+        )?;
+        let storage_payload: serde_json::Value =
+            serde_json::from_str(resources[2].payload().as_str())?;
+        assert_eq!(storage_payload["ControllerCount"], 2);
+        assert_eq!(storage_payload["DriveCount"], 2);
+        assert_eq!(storage_payload["Status"]["Health"], "OK");
+        // Only the contract fields may leave the gateway; the decoded schema
+        // fields that are not part of the contract must stay out of the
+        // snapshot or the strict application decoder rejects it.
+        assert_eq!(storage_payload.get("EncryptionMode"), None);
+        assert_projection(
+            &resources[4],
+            "/redfish/v1/Chassis/1/NetworkAdapters/1",
+            "W/\"nic-1\"",
+            "Model",
+            "Model NIC",
+        )?;
+        let adapter_payload: serde_json::Value =
+            serde_json::from_str(resources[4].payload().as_str())?;
+        assert_eq!(adapter_payload["Manufacturer"], "Rutilus Test");
+        assert_eq!(adapter_payload["Status"]["State"], "Enabled");
+        assert_eq!(adapter_payload.get("PartNumber"), None);
+        assert_eq!(adapter_payload.get("SerialNumber"), None);
+        assert_eq!(adapter_payload.get("SKU"), None);
+        assert_projection(
+            &resources[6],
+            "/redfish/v1/Managers/1/EthernetInterfaces/1",
+            "W/\"eth-1\"",
+            "MACAddress",
+            "AA:BB:CC:DD:EE:01",
+        )?;
+        let interface_payload: serde_json::Value =
+            serde_json::from_str(resources[6].payload().as_str())?;
+        assert_eq!(interface_payload["InterfaceEnabled"], true);
+        assert_eq!(interface_payload["SpeedMbps"], 1000);
+        assert_eq!(interface_payload["Status"]["Health"], "OK");
+        assert_eq!(interface_payload.get("PermanentMACAddress"), None);
+        assert_eq!(interface_payload.get("MTUSize"), None);
+        assert_eq!(interface_payload.get("HostName"), None);
+        assert_eq!(interface_payload.get("FQDN"), None);
+        // The second interface carries none of the optional contract fields:
+        // they are omitted from the projection, not emitted as null, so the
+        // strict application decoder accepts the snapshot.
+        let minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[7].payload().as_str())?;
+        assert_eq!(minimal_payload.get("MACAddress"), None);
+        assert_eq!(minimal_payload.get("SpeedMbps"), None);
+        assert_eq!(minimal_payload.get("InterfaceEnabled"), None);
+        assert_session_requests(&server.finish_all().await?, &FAMILY_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_advertised_families_produce_no_member_snapshots() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_STORAGE_BODY),
+                ("200 OK", STORAGE_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The advertised-but-empty Storage collection produces no snapshot,
+        // and the Chassis and Manager members without network links produce
+        // none either ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &EMPTY_FAMILY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_one_undecodable_family_member_without_aborting_the_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_STORAGE_BODY),
+                ("200 OK", STORAGE_WITH_TWO_MEMBERS_BODY),
+                ("200 OK", STORAGE_SUBSYSTEM_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTER_FULL_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_ETHERNET_BODY),
+                ("200 OK", ETHERNET_INTERFACES_WITH_MEMBERS_BODY),
+                ("200 OK", ETHERNET_INTERFACE_ONE_BODY),
+                ("200 OK", ETHERNET_INTERFACE_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // Storage/2 returns an undecodable body and is skipped; the first
+        // Storage member and the complete network families still produce
+        // snapshots (§0.2.0 acceptance).
+        assert_eq!(resources.len(), 8);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Storages,
+                ResourceFeature::Chassis,
+                ResourceFeature::NetworkAdapters,
+                ResourceFeature::Managers,
+                ResourceFeature::EthernetInterfaces,
+                ResourceFeature::EthernetInterfaces,
+            ]
+        );
+        assert_eq!(
+            resources[2].odata_id().as_str(),
+            "/redfish/v1/Systems/1/Storage/1"
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &FAMILY_MEMBER_SKIP_REQUEST_PATHS,
+        )?;
         Ok(())
     }
 
