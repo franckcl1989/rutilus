@@ -18,8 +18,9 @@ pub use audit::{
     AuditVerification, ProductPermission,
 };
 pub use capability::{
-    CapabilityClassification, CapabilityState, CapabilityStateParseError, EndpointCapability,
-    EndpointCapabilityObservation, EndpointCapabilityParseError, UiLocation, UiLocationParseError,
+    CAPABILITY_LEDGER_ORDER, CapabilityClassification, CapabilityState, CapabilityStateParseError,
+    EndpointCapability, EndpointCapabilityObservation, EndpointCapabilityParseError, UiLocation,
+    UiLocationParseError,
 };
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,

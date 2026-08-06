@@ -208,6 +208,47 @@ impl EndpointCapability {
     }
 }
 
+/// The complete §2.1 standard-feature inventory in design-document order.
+///
+/// This is the canonical enumeration for every ledger projection: the 0.2
+/// Endpoint capability page renders exactly these 30 entries, and an entry
+/// without a persisted observation still appears so the UI can explain why
+/// the feature is missing instead of hiding it. The order must stay aligned
+/// with §2.1, so queries, persistence round-trips, and the capability page
+/// all enumerate the ledger identically.
+pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 30] = [
+    EndpointCapability::Accounts,
+    EndpointCapability::Assembly,
+    EndpointCapability::Bios,
+    EndpointCapability::BootOptions,
+    EndpointCapability::Chassis,
+    EndpointCapability::Systems,
+    EndpointCapability::Controls,
+    EndpointCapability::EnvironmentMetrics,
+    EndpointCapability::EthernetInterfaces,
+    EndpointCapability::EventService,
+    EndpointCapability::HostInterfaces,
+    EndpointCapability::LogServices,
+    EndpointCapability::ManagerNetworkProtocol,
+    EndpointCapability::Managers,
+    EndpointCapability::Memory,
+    EndpointCapability::NetworkAdapters,
+    EndpointCapability::NetworkDeviceFunctions,
+    EndpointCapability::PcieDevices,
+    EndpointCapability::Power,
+    EndpointCapability::PowerEquipment,
+    EndpointCapability::PowerSupplies,
+    EndpointCapability::Processors,
+    EndpointCapability::SecureBoot,
+    EndpointCapability::Sensors,
+    EndpointCapability::SessionService,
+    EndpointCapability::Storages,
+    EndpointCapability::TaskService,
+    EndpointCapability::TelemetryService,
+    EndpointCapability::Thermal,
+    EndpointCapability::UpdateService,
+];
+
 impl fmt::Display for EndpointCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -552,40 +593,6 @@ mod tests {
         "update-service",
     ];
 
-    /// Every capability variant, in §2.1 order.
-    const CAPABILITIES: [EndpointCapability; 30] = [
-        EndpointCapability::Accounts,
-        EndpointCapability::Assembly,
-        EndpointCapability::Bios,
-        EndpointCapability::BootOptions,
-        EndpointCapability::Chassis,
-        EndpointCapability::Systems,
-        EndpointCapability::Controls,
-        EndpointCapability::EnvironmentMetrics,
-        EndpointCapability::EthernetInterfaces,
-        EndpointCapability::EventService,
-        EndpointCapability::HostInterfaces,
-        EndpointCapability::LogServices,
-        EndpointCapability::ManagerNetworkProtocol,
-        EndpointCapability::Managers,
-        EndpointCapability::Memory,
-        EndpointCapability::NetworkAdapters,
-        EndpointCapability::NetworkDeviceFunctions,
-        EndpointCapability::PcieDevices,
-        EndpointCapability::Power,
-        EndpointCapability::PowerEquipment,
-        EndpointCapability::PowerSupplies,
-        EndpointCapability::Processors,
-        EndpointCapability::SecureBoot,
-        EndpointCapability::Sensors,
-        EndpointCapability::SessionService,
-        EndpointCapability::Storages,
-        EndpointCapability::TaskService,
-        EndpointCapability::TelemetryService,
-        EndpointCapability::Thermal,
-        EndpointCapability::UpdateService,
-    ];
-
     /// Every §12.2 Endpoint page, in navigation order.
     const UI_LOCATIONS: [UiLocation; 25] = [
         UiLocation::Overview,
@@ -627,9 +634,9 @@ mod tests {
 
     #[test]
     fn capability_ledger_covers_every_standard_feature_exactly_once() {
-        assert_eq!(CAPABILITIES.len(), STANDARD_FEATURES.len());
+        assert_eq!(CAPABILITY_LEDGER_ORDER.len(), STANDARD_FEATURES.len());
         let mut upstream_features = Vec::new();
-        for capability in CAPABILITIES {
+        for capability in CAPABILITY_LEDGER_ORDER {
             let feature = capability.upstream_feature();
             assert!(
                 !feature.is_empty(),
@@ -648,7 +655,7 @@ mod tests {
         }
         for feature in STANDARD_FEATURES {
             assert!(
-                CAPABILITIES
+                CAPABILITY_LEDGER_ORDER
                     .iter()
                     .any(|capability| capability.upstream_feature() == feature),
                 "§2.1 feature {feature} has no capability variant"
@@ -659,7 +666,7 @@ mod tests {
     #[test]
     fn capability_codes_are_unique_non_empty_and_round_trip() {
         let mut seen = Vec::new();
-        for capability in CAPABILITIES {
+        for capability in CAPABILITY_LEDGER_ORDER {
             let code = capability.as_str();
             assert!(!code.is_empty(), "capability codes must not be empty");
             assert!(
@@ -677,7 +684,7 @@ mod tests {
 
     #[test]
     fn classification_is_stable_and_matches_the_design() {
-        for capability in CAPABILITIES {
+        for capability in CAPABILITY_LEDGER_ORDER {
             let expected = match capability {
                 EndpointCapability::SessionService | EndpointCapability::TaskService => {
                     CapabilityClassification::Infrastructure
@@ -699,7 +706,7 @@ mod tests {
 
     #[test]
     fn every_capability_maps_to_a_stable_ui_location() {
-        for capability in CAPABILITIES {
+        for capability in CAPABILITY_LEDGER_ORDER {
             let location = capability.ui_location();
             assert_eq!(location.as_str().parse(), Ok(location));
         }
