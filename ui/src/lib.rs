@@ -246,9 +246,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // The 0.2 resource families mirror the server-side counts
             // contract: they render as cards in the resource list, while the
             // three-line counts summary keeps its 0.1 wire shape. The
-            // Power/Thermal/Sensors/Controls telemetry families and the
+            // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface follow the same rule.
+            // surface, and the PcieDevice/Assembly/SoftwareInventory read
+            // families follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
@@ -265,7 +266,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Control { .. }
             | CoreResourceDetailsResponse::LogService { .. }
             | CoreResourceDetailsResponse::ManagerNetworkProtocol { .. }
-            | CoreResourceDetailsResponse::HostInterface { .. } => {}
+            | CoreResourceDetailsResponse::HostInterface { .. }
+            | CoreResourceDetailsResponse::PcieDevice { .. }
+            | CoreResourceDetailsResponse::Assembly { .. }
+            | CoreResourceDetailsResponse::SoftwareInventory { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -342,6 +346,11 @@ fn card_facts(
             manager_network_protocol_card_facts(resource)
         }
         CoreResourceDetailsResponse::HostInterface { .. } => host_interface_card_facts(resource),
+        CoreResourceDetailsResponse::PcieDevice { .. } => pcie_device_card_facts(resource),
+        CoreResourceDetailsResponse::Assembly { .. } => assembly_card_facts(resource),
+        CoreResourceDetailsResponse::SoftwareInventory { .. } => {
+            software_inventory_card_facts(resource)
+        }
     }
 }
 
@@ -937,6 +946,93 @@ fn host_interface_card_facts(
     );
     push_status_facts(&mut facts, status.as_ref());
     ("Host Interface", facts)
+}
+
+/// Facts for a §2.1 pcie-device card; the `DeviceType` enumeration and the
+/// direct hardware identifiers render only when the BMC published them.
+///
+/// The dispatcher guarantees this receives the `PcieDevice` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn pcie_device_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::PcieDevice {
+        device_type,
+        manufacturer,
+        model,
+        status,
+    } = resource
+    else {
+        return ("PCIe device", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Device type", device_type.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        None,
+        None,
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("PCIe device", facts)
+}
+
+/// Facts for a §2.1 assembly card (one `AssemblyData` member); the `Producer`
+/// is the only direct hardware identifier the member schema projects, so the
+/// card renders it together with the resource-level status.
+///
+/// The dispatcher guarantees this receives the `Assembly` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn assembly_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Assembly { producer, status } = resource else {
+        return ("Assembly", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Producer", producer.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Assembly", facts)
+}
+
+/// Facts for a `software-inventory` card under the §2.1 `update-service`
+/// feature; the typed `ReleaseDate` instant renders as RFC 3339 so the card
+/// never re-parses text, and a formatting failure simply omits the fact.
+///
+/// The dispatcher guarantees this receives the `SoftwareInventory` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn software_inventory_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::SoftwareInventory {
+        software_id,
+        version,
+        release_date,
+        status,
+    } = resource
+    else {
+        return ("Software inventory", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Software ID", software_id.as_deref());
+    push_fact(&mut facts, "Version", version.as_deref());
+    push_fact(
+        &mut facts,
+        "Release date",
+        release_date
+            .as_ref()
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .as_deref(),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Software inventory", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -4036,7 +4132,10 @@ mod tests {
                             control_resource(),
                             log_service_resource(),
                             manager_network_protocol_resource(),
-                            host_interface_resource()
+                            host_interface_resource(),
+                            pcie_device_resource(),
+                            assembly_resource(),
+                            software_inventory_resource()
                         ]
                     }
                 }
@@ -4662,6 +4761,91 @@ mod tests {
         })
     }
 
+    fn pcie_device_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e3",
+                "odata_id": "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+                "odata_type": "#PCIeDevice.v1_12_0.PCIeDevice",
+                "etag": "W/\"pcie-device-1\""
+            },
+            "common": {
+                "id": "GPU1",
+                "name": "PCIe Device One",
+                "description": "GPU accelerator"
+            },
+            "resource": {
+                "resource_type": "pcie_device",
+                "details": {
+                    "device_type": "SingleFunction",
+                    "manufacturer": "Vendor C",
+                    "model": "PCIE-GEN4-X16",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn assembly_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e4",
+                "odata_id": "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+                "odata_type": "#Assembly.v1_5_0.AssemblyData",
+                "etag": "W/\"assembly-data-0\""
+            },
+            "common": {
+                "id": "0",
+                "name": "Fan Assembly",
+                "description": "Cooling fan"
+            },
+            "resource": {
+                "resource_type": "assembly",
+                "details": {
+                    "producer": "Vendor D",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn software_inventory_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e5",
+                "odata_id": "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+                "odata_type": "#SoftwareInventory.v1_7_0.SoftwareInventory",
+                "etag": "W/\"sw-1\""
+            },
+            "common": {
+                "id": "BIOS",
+                "name": "System BIOS",
+                "description": "Host firmware"
+            },
+            "resource": {
+                "resource_type": "software_inventory",
+                "details": {
+                    "software_id": "BIOS-2026-1",
+                    "version": "2.7.0",
+                    "release_date": "2026-05-01T00:00:00Z",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
     fn capability_inventory(
         states: &[Option<&str>],
     ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
@@ -4735,7 +4919,11 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 20);
+        // The complete fixture tree carries every typed family: the 0.1
+        // triad, the 0.2 configuration, storage/network, telemetry, and
+        // manager surfaces, plus the pcie-devices, assembly, and
+        // software-inventory read families.
+        assert_eq!(current.resources.len(), 23);
         let system = current
             .resources
             .iter()
@@ -5853,6 +6041,86 @@ mod tests {
         assert!(host_interface.facts.contains(&ResourceFactProjection {
             label: "State",
             value: "Enabled".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pcie_devices_assembly_and_software_inventory_cards_render_family_facts()
+    -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let pcie_device = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "PCIe device")
+            .ok_or("pcie device resource must exist")?;
+        assert_eq!(pcie_device.name, "PCIe Device One");
+        assert_eq!(pcie_device.source, "/redfish/v1/Systems/1/PCIeDevices/GPU1");
+        assert!(pcie_device.facts.contains(&ResourceFactProjection {
+            label: "Device type",
+            value: "SingleFunction".to_owned(),
+        }));
+        assert!(pcie_device.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Vendor C".to_owned(),
+        }));
+        assert!(pcie_device.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PCIE-GEN4-X16".to_owned(),
+        }));
+        let assembly = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Assembly")
+            .ok_or("assembly resource must exist")?;
+        assert_eq!(assembly.name, "Fan Assembly");
+        assert_eq!(
+            assembly.source,
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0"
+        );
+        assert!(assembly.facts.contains(&ResourceFactProjection {
+            label: "Producer",
+            value: "Vendor D".to_owned(),
+        }));
+        assert!(assembly.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let software_inventory = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Software inventory")
+            .ok_or("software inventory resource must exist")?;
+        assert_eq!(software_inventory.name, "System BIOS");
+        assert_eq!(
+            software_inventory.source,
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS"
+        );
+        assert!(software_inventory.facts.contains(&ResourceFactProjection {
+            label: "Software ID",
+            value: "BIOS-2026-1".to_owned(),
+        }));
+        assert!(software_inventory.facts.contains(&ResourceFactProjection {
+            label: "Version",
+            value: "2.7.0".to_owned(),
+        }));
+        assert!(software_inventory.facts.contains(&ResourceFactProjection {
+            label: "Release date",
+            value: "2026-05-01T00:00:00Z".to_owned(),
         }));
         assert_eq!(
             current.resource_counts,
