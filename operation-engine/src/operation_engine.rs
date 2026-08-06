@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rutilus_domain::{
     InvalidTransition, Operation, OperationEvent, OperationId, OperationSource, OperationState,
-    OperationTarget,
+    OperationTarget, RedfishCommand,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -82,6 +82,15 @@ where
     /// targets, not an empty one). The domain constructor documents this
     /// contract; the engine enforces it before persisting anything.
     ///
+    /// # Why the command is persisted with the operation
+    ///
+    /// The record must stand alone: the future execution scheduler reads the
+    /// operation back and dispatches the exact typed `nv-redfish` method from
+    /// `command` (design section 13.3 step 7), and the design section 13.6
+    /// restart recovery scans the same records to resume unfinished work. The
+    /// command is a fact of the operation, not a session detail, so it is
+    /// persisted from the first step and never recomputed by the caller.
+    ///
     /// The operation id is generated fresh here, so two calls never produce
     /// the same record. [`OperationStore::create_operation`] is still
     /// idempotent on the id (design section 15.4) as the guard for the future
@@ -96,12 +105,13 @@ where
         &self,
         source: OperationSource,
         targets: Vec<OperationTarget>,
+        command: RedfishCommand,
         now: OffsetDateTime,
     ) -> Result<Operation, EngineError<Store::Error>> {
         if targets.is_empty() {
             return Err(EngineError::EmptyTargets);
         }
-        let operation = Operation::new(OperationId::generate(), source, targets, now);
+        let operation = Operation::new(OperationId::generate(), source, targets, command, now);
         self.store
             .create_operation(&operation)
             .await
@@ -234,7 +244,10 @@ where
 mod tests {
     use std::{collections::HashMap, io, sync::Mutex};
 
-    use rutilus_domain::{EndpointId, OperationId, OperationState, OperationTarget, TargetId};
+    use rutilus_domain::{
+        EndpointId, OperationId, OperationState, OperationTarget, ResetType, SystemCommand,
+        TargetId,
+    };
     use thiserror::Error;
     use time::{Duration, OffsetDateTime};
 
@@ -390,6 +403,7 @@ mod tests {
                     row.id(),
                     row.source(),
                     row.targets().to_vec(),
+                    row.command(),
                     new_state,
                     row.created_at(),
                     occurred_at,
@@ -450,7 +464,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         let error = engine
-            .create(OperationSource::Standalone, Vec::new(), now)
+            .create(OperationSource::Standalone, Vec::new(), one_command(), now)
             .await
             .err()
             .ok_or_else(|| io::Error::other("empty-target create must fail"))?;
@@ -471,7 +485,12 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         let operation = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
             .await?;
 
         assert_eq!(operation.state(), OperationState::Queued);
@@ -485,12 +504,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_persists_the_operation_together_with_its_command() -> Result<(), Box<dyn Error>>
+    {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+
+        let operation = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+
+        // The command is part of the persisted record from the first step:
+        // the scheduler reads it back to dispatch the typed Redfish method
+        // (design section 13.3 step 7) and restart recovery resumes the same
+        // command (design section 13.6), so the read-back must be identical.
+        assert_eq!(operation.command(), one_command());
+        let stored = store
+            .find_owned(operation.id())?
+            .ok_or_else(|| io::Error::other("created operation must be stored"))?;
+        assert_eq!(stored.command(), one_command());
+        assert_eq!(stored, operation);
+        assert_eq!(store.calls()?, vec![Call::Create(operation.id())]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn apply_runs_find_transition_write_round_trip() -> Result<(), Box<dyn Error>> {
         let store = FakeStore::new();
         let engine = OperationEngine::new(&store);
         let now = OffsetDateTime::now_utc();
         let created = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
             .await?;
 
         let later = now + Duration::SECOND;
@@ -502,6 +556,10 @@ mod tests {
         // exact occurrence time the store recorded.
         assert_eq!(updated.state(), OperationState::Validating);
         assert_eq!(updated.updated_at(), later);
+        // The command survives the find-transition-write round trip: the
+        // transitioned record is rehydrated from the stored row, so a step
+        // must never lose what the operation is supposed to execute.
+        assert_eq!(updated.command(), one_command());
         assert_eq!(
             store.calls()?,
             vec![
@@ -548,7 +606,12 @@ mod tests {
         let engine = OperationEngine::new(&store);
         let now = OffsetDateTime::now_utc();
         let created = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
             .await?;
         let validating = engine
             .apply(
@@ -603,7 +666,12 @@ mod tests {
         let engine = OperationEngine::new(&store);
         let now = OffsetDateTime::now_utc();
         let created = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
             .await?;
         store.arm_write_failure()?;
 
@@ -637,84 +705,39 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         // `running` ends in Running: the BMC write was in flight, recoverable.
-        let created_running = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
-            .await?;
-        let validating_step = engine
-            .apply(
-                created_running.id(),
+        let running = advance_to(
+            &engine,
+            now,
+            &[
                 OperationEvent::ValidationStarted,
-                now + Duration::SECOND,
-            )
-            .await?;
-        let running = engine
-            .apply(
-                created_running.id(),
                 OperationEvent::ValidationPassed,
-                now + Duration::SECOND * 2,
-            )
-            .await?;
+            ],
+        )
+        .await?;
         // `validating` stays Validating: in flight, recoverable.
-        let created_validating = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
-            .await?;
-        let validating = engine
-            .apply(
-                created_validating.id(),
-                OperationEvent::ValidationStarted,
-                now + Duration::SECOND,
-            )
-            .await?;
+        let validating = advance_to(&engine, now, &[OperationEvent::ValidationStarted]).await?;
         // `verifying` ends in Verifying: the write landed and only the final
         // re-read was in flight; recovery re-reads and decides (§13.5).
-        let created_verifying = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
-            .await?;
-        engine
-            .apply(
-                created_verifying.id(),
+        let verifying = advance_to(
+            &engine,
+            now,
+            &[
                 OperationEvent::ValidationStarted,
-                now + Duration::SECOND,
-            )
-            .await?;
-        engine
-            .apply(
-                created_verifying.id(),
                 OperationEvent::ValidationPassed,
-                now + Duration::SECOND * 2,
-            )
-            .await?;
-        let verifying = engine
-            .apply(
-                created_verifying.id(),
                 OperationEvent::ExecutionAccepted,
-                now + Duration::SECOND * 3,
-            )
-            .await?;
+            ],
+        )
+        .await?;
         // `failed` ends in Failed: terminal, excluded from recovery.
-        let created_failed = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
-            .await?;
-        engine
-            .apply(
-                created_failed.id(),
-                OperationEvent::ValidationStarted,
-                now + Duration::SECOND,
-            )
-            .await?;
-        let failed = engine
-            .apply(
-                created_failed.id(),
-                OperationEvent::Failed,
-                now + Duration::SECOND * 2,
-            )
-            .await?;
+        let failed = advance_to(
+            &engine,
+            now,
+            &[OperationEvent::ValidationStarted, OperationEvent::Failed],
+        )
+        .await?;
         // `queued` never started: excluded from recovery (normal scheduling).
-        let queued = engine
-            .create(OperationSource::Standalone, vec![one_target()], now)
-            .await?;
+        let queued = advance_to(&engine, now, &[]).await?;
 
-        assert_eq!(validating_step.state(), OperationState::Validating);
         assert_eq!(running.state(), OperationState::Running);
         assert_eq!(validating.state(), OperationState::Validating);
         assert_eq!(verifying.state(), OperationState::Verifying);
@@ -729,14 +752,38 @@ mod tests {
             .collect();
         recovered_ids.sort();
 
-        let mut expected = vec![
-            created_running.id(),
-            created_validating.id(),
-            created_verifying.id(),
-        ];
+        let mut expected = vec![running.id(), validating.id(), verifying.id()];
         expected.sort();
         assert_eq!(recovered_ids, expected);
         Ok(())
+    }
+
+    /// Creates one operation and advances it through the given events.
+    ///
+    /// Each event fires one second after the previous one so the timeline
+    /// stays strictly increasing; an empty step list leaves the operation
+    /// `Queued`. The recovery test parks operations in each state this way
+    /// because every advance is a separate engine round trip (create then
+    /// apply), exactly like the production scheduler's persisted steps.
+    async fn advance_to(
+        engine: &OperationEngine<&FakeStore>,
+        created_at: OffsetDateTime,
+        steps: &[OperationEvent],
+    ) -> Result<Operation, Box<dyn Error>> {
+        let mut operation = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                created_at,
+            )
+            .await?;
+        let mut occurred_at = created_at;
+        for &event in steps {
+            occurred_at += Duration::SECOND;
+            operation = engine.apply(operation.id(), event, occurred_at).await?;
+        }
+        Ok(operation)
     }
 
     /// Builds one engine-friendly target value.
@@ -745,5 +792,13 @@ mod tests {
     /// enough for every test.
     fn one_target() -> OperationTarget {
         OperationTarget::new(TargetId::generate(), EndpointId::generate())
+    }
+
+    /// Builds one engine-friendly command value.
+    ///
+    /// The engine only forwards commands, so a single representative value is
+    /// enough for every test; the domain owns the command vocabulary.
+    fn one_command() -> RedfishCommand {
+        RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle))
     }
 }
