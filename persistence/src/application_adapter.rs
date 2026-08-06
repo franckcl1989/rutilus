@@ -1,5 +1,6 @@
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, DiscoveredEndpointRepository, EndpointRefreshRepository,
+    AuditEventWriter, BoundaryFuture, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryItemError, EndpointInventoryRepository, EndpointRefreshRepository,
     ResourceObservation,
 };
 use rutilus_domain::{
@@ -70,6 +71,35 @@ impl EndpointRefreshRepository for SqliteStore {
     }
 }
 
+impl EndpointInventoryRepository for SqliteStore {
+    type Error = EndpointInventoryPersistenceError;
+
+    fn list_endpoint_inventory(
+        &self,
+    ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
+        Box::pin(async move {
+            let endpoints = SqliteStore::list_endpoints(self)
+                .await
+                .map_err(EndpointInventoryPersistenceError::Endpoint)?;
+            let mut inventory = Vec::with_capacity(endpoints.len());
+            for endpoint in endpoints {
+                let endpoint_id = endpoint.id();
+                let resources = SqliteStore::find_current_resource_generation(self, endpoint_id)
+                    .await
+                    .map_err(EndpointInventoryPersistenceError::Snapshot)?
+                    .ok_or(EndpointInventoryPersistenceError::EndpointDisappeared {
+                        endpoint_id,
+                    })?;
+                inventory.push(
+                    EndpointInventoryItem::try_new(endpoint, resources)
+                        .map_err(EndpointInventoryPersistenceError::Inventory)?,
+                );
+            }
+            Ok(inventory)
+        })
+    }
+}
+
 fn project_observation(observation: &ResourceObservation) -> NewResourceSnapshot {
     let mut snapshot = NewResourceSnapshot::new(
         observation.feature(),
@@ -94,25 +124,41 @@ pub enum EndpointRefreshPersistenceError {
     Snapshot(#[source] ResourceSnapshotRepositoryError),
 }
 
+/// A persistence failure while projecting the complete endpoint inventory.
+#[derive(Debug, Error)]
+pub enum EndpointInventoryPersistenceError {
+    #[error("failed to list endpoint aggregates: {0}")]
+    Endpoint(#[source] EndpointRepositoryError),
+    #[error("failed to load an endpoint's current resource Generation: {0}")]
+    Snapshot(#[source] ResourceSnapshotRepositoryError),
+    #[error("endpoint {endpoint_id} disappeared while loading its inventory")]
+    EndpointDisappeared { endpoint_id: EndpointId },
+    #[error("persisted endpoint inventory violates application invariants: {0}")]
+    Inventory(#[source] EndpointInventoryItemError),
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
     use rutilus_application::{
-        AuditEventWriter, DiscoveredEndpointRepository, EndpointRefreshRepository,
-        ResourceObservation,
+        AuditEventWriter, DiscoveredEndpointRepository, EndpointInventoryQuery,
+        EndpointInventoryRepository, EndpointRefreshRepository, ResourceObservation,
     };
     use rutilus_domain::{
         AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
-        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CredentialId, DeploymentPosture,
-        Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, ProductPermission,
-        ResourceFeature, ResourceODataId, ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CredentialId, CredentialName,
+        CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
+        EndpointDisplayName, EndpointId, ProductPermission, ResourceFeature, ResourceODataId,
+        ResourceSnapshotPayload, TlsCertificate, TlsTrust,
     };
+    use rutilus_security::{MasterKey, encrypt_credential};
+    use secrecy::SecretString;
     use time::OffsetDateTime;
 
     use crate::{
-        EndpointRefreshPersistenceError, EndpointRepositoryError, ResourceSnapshotRepositoryError,
-        SqliteStore,
+        EndpointRefreshPersistenceError, EndpointRepositoryError, NewCredential,
+        ResourceSnapshotRepositoryError, SqliteStore,
     };
 
     #[tokio::test]
@@ -209,5 +255,101 @@ mod tests {
         store.close().await?;
         drop(directory);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_projects_complete_endpoint_inventory() -> Result<(), Box<dyn Error>> {
+        fn assert_repository<Repository: EndpointInventoryRepository>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        assert!(
+            EndpointInventoryQuery::new(&store)
+                .execute()
+                .await?
+                .is_empty()
+        );
+        let (endpoint, observed_at) = inventory_endpoint(&store).await?;
+        store.create_endpoint(endpoint.clone()).await?;
+
+        let before_refresh = EndpointInventoryQuery::new(&store).execute().await?;
+        assert_eq!(before_refresh.len(), 1);
+        assert_eq!(before_refresh[0].endpoint(), &endpoint);
+        assert_eq!(before_refresh[0].generation(), None);
+
+        let observations = [
+            ResourceObservation::new(
+                ResourceFeature::Systems,
+                ResourceODataId::parse("/redfish/v1/Systems/1")?,
+                ResourceSnapshotPayload::parse(r#"{"Name":"System"}"#)?,
+            ),
+            ResourceObservation::new(
+                ResourceFeature::ServiceRoot,
+                ResourceODataId::parse("/redfish/v1")?,
+                ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)?,
+            ),
+        ];
+        EndpointRefreshRepository::commit_resource_generation(
+            &store,
+            endpoint.id(),
+            &observations,
+            observed_at,
+        )
+        .await?;
+
+        let after_refresh = EndpointInventoryQuery::new(&store).execute().await?;
+        assert_eq!(after_refresh.len(), 1);
+        assert_eq!(
+            after_refresh[0]
+                .generation()
+                .map(rutilus_domain::RefreshGeneration::get),
+            Some(1)
+        );
+        assert_eq!(
+            after_refresh[0].last_successful_refresh_at(),
+            Some(observed_at)
+        );
+        assert_eq!(after_refresh[0].resource_count(ResourceFeature::Systems), 1);
+        assert_eq!(
+            after_refresh[0].resources()[0].odata_id().as_str(),
+            "/redfish/v1"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    async fn inventory_endpoint(
+        store: &SqliteStore,
+    ) -> Result<(Endpoint, OffsetDateTime), Box<dyn Error>> {
+        let credential_id = CredentialId::generate();
+        let version_id = CredentialVersionId::generate();
+        let key = MasterKey::from_boxed_bytes(Box::new([0x61; 32]));
+        let secret = SecretString::from(String::from("inventory test secret"));
+        let protected = encrypt_credential(&key, credential_id, version_id, &secret)?;
+        store
+            .create_credential(NewCredential::new(
+                CredentialName::parse("Inventory credential")?,
+                CredentialUsername::parse("administrator")?,
+                protected,
+            ))
+            .await?;
+        let created_at = OffsetDateTime::now_utc();
+        let observed_at = created_at + time::Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Inventory BMC")?,
+            EndpointAddress::parse("https://192.0.2.81")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(b"inventory certificate".to_vec())?,
+                trusted_at: created_at,
+            },
+            credential_id,
+            created_at,
+            created_at,
+        )?;
+        Ok((endpoint, observed_at))
     }
 }

@@ -21,7 +21,7 @@ mod endpoint_repository;
 mod migration_backup;
 mod resource_snapshot_repository;
 
-pub use application_adapter::EndpointRefreshPersistenceError;
+pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,

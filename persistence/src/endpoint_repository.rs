@@ -6,8 +6,8 @@ use rutilus_domain::{
 };
 use rutilus_entity::{credential, endpoint, endpoint_address, endpoint_credential, endpoint_trust};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set, SqlErr,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    Set, SqlErr, TransactionTrait,
 };
 use thiserror::Error;
 
@@ -126,6 +126,37 @@ impl SqliteStore {
             .await
             .map_err(EndpointRepositoryError::Database)?;
         Ok(Some(domain))
+    }
+
+    /// Lists every complete, secret-free endpoint aggregate from one read
+    /// transaction in deterministic display-name and identity order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointRepositoryError`] when the query fails or any
+    /// persisted endpoint component violates domain invariants.
+    pub async fn list_endpoints(&self) -> Result<Vec<Endpoint>, EndpointRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(EndpointRepositoryError::Database)?;
+        let models = endpoint::Entity::find()
+            .order_by_asc(endpoint::Column::DisplayName)
+            .order_by_asc(endpoint::Column::Id)
+            .all(&transaction)
+            .await
+            .map_err(EndpointRepositoryError::Database)?;
+        let mut endpoints = Vec::with_capacity(models.len());
+        for model in models {
+            let endpoint_id = EndpointId::from_uuid(model.id);
+            endpoints.push(map_stored_endpoint(&transaction, endpoint_id, model).await?);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(EndpointRepositoryError::Database)?;
+        Ok(endpoints)
     }
 }
 
@@ -474,8 +505,15 @@ mod tests {
 
         assert_eq!(store.create_endpoint(system_ca.clone()).await?, system_ca);
         assert_eq!(store.create_endpoint(pinned.clone()).await?, pinned);
-        assert_eq!(store.find_endpoint(system_ca.id()).await?, Some(system_ca));
-        assert_eq!(store.find_endpoint(pinned.id()).await?, Some(pinned));
+        assert_eq!(
+            store.find_endpoint(system_ca.id()).await?,
+            Some(system_ca.clone())
+        );
+        assert_eq!(
+            store.find_endpoint(pinned.id()).await?,
+            Some(pinned.clone())
+        );
+        assert_eq!(store.list_endpoints().await?, vec![system_ca, pinned]);
         assert!(store.find_endpoint(EndpointId::generate()).await?.is_none());
 
         store.close().await?;
