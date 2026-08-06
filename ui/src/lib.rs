@@ -9,13 +9,14 @@ use std::{collections::BTreeSet, fmt};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
-    AboutResponse, AuditEventResponse, AuditQueryResponse, CoreResourceDetailsResponse,
-    CoreResourceResponse, CredentialInventoryResponse, CredentialSummaryResponse,
+    AboutResponse, AuditEventResponse, AuditQueryResponse, CapabilityEntryResponse,
+    CapabilityStateResponse, CoreResourceDetailsResponse, CoreResourceResponse,
+    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
     EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, ResourceStatusResponse,
-    TlsTrustModeResponse,
+    TlsTrustModeResponse, UiLocationResponse,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -175,6 +176,7 @@ struct ResourceCountsProjection {
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EndpointCardProjection {
+    endpoint_id: String,
     display_name: String,
     address: String,
     trust_label: &'static str,
@@ -213,6 +215,7 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
             ),
         };
         Self {
+            endpoint_id: identity.endpoint_id().to_string(),
             display_name: identity.display_name().to_owned(),
             address: identity.address().to_owned(),
             trust_label,
@@ -410,6 +413,10 @@ fn push_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value
 
 #[cfg(any(target_arch = "wasm32", test))]
 /// One of the top-level console sections reachable from the navigation bar.
+///
+/// `Capabilities` is a per-endpoint drill-down: the navigation entry only
+/// appears while a capability target is selected, and entering it from an
+/// endpoint card always carries that endpoint's identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConsoleView {
     Overview,
@@ -417,16 +424,18 @@ enum ConsoleView {
     AddEndpoint,
     Import,
     Audit,
+    Capabilities,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 5] = [
+    const ALL: [ConsoleView; 6] = [
         Self::Overview,
         Self::Credentials,
         Self::AddEndpoint,
         Self::Import,
         Self::Audit,
+        Self::Capabilities,
     ];
 
     const fn label(self) -> &'static str {
@@ -436,7 +445,254 @@ impl ConsoleView {
             Self::AddEndpoint => "Add endpoint",
             Self::Import => "Import",
             Self::Audit => "Audit",
+            Self::Capabilities => "Capabilities",
         }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Why the capability matrix of one endpoint could not be loaded.
+///
+/// The three variants map the route contract (404, transport/other status,
+/// unparseable body) to static copy. A 400 cannot originate from this UI
+/// because endpoint ids always come from the local inventory, so it folds
+/// into `Unavailable` like 503.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilityLoadFailure {
+    /// The route answered 404: the endpoint does not exist in the product.
+    EndpointNotFound,
+    /// The request failed on the network or the route answered 4xx/5xx.
+    Unavailable,
+    /// The route answered 200 with a body that violates the shared strict
+    /// capability-inventory contract.
+    Malformed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl CapabilityLoadFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::EndpointNotFound => "This endpoint no longer exists.",
+            Self::Unavailable => "The capability list is temporarily unavailable.",
+            Self::Malformed => "The server response could not be parsed.",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The lazy-loading state of one endpoint's capability matrix section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CapabilityMatrixState {
+    Idle,
+    Loading,
+    Ready(CapabilityMatrixProjection),
+    Failed(CapabilityLoadFailure),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl CapabilityMatrixState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed(failure) => failure.message(),
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn has_empty_matrix(&self) -> bool {
+        matches!(self, Self::Ready(matrix) if matrix.groups.is_empty())
+    }
+
+    /// One-line summary of the loaded matrix, e.g. "30 capabilities across
+    /// 22 pages".
+    fn summary_text(&self) -> String {
+        match self {
+            Self::Ready(matrix) => {
+                let entries = matrix
+                    .groups
+                    .iter()
+                    .map(|group| group.entries.len())
+                    .sum::<usize>();
+                format!(
+                    "{entries} capabilities across {} pages",
+                    matrix.groups.len()
+                )
+            }
+            Self::Idle | Self::Loading | Self::Failed(_) => String::new(),
+        }
+    }
+
+    fn groups(&self) -> Vec<CapabilityGroupProjection> {
+        match self {
+            Self::Ready(matrix) => matrix.groups.clone(),
+            Self::Idle | Self::Loading | Self::Failed(_) => Vec::new(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The endpoint whose capability matrix is shown. Captured at entry time so
+/// the header keeps its identity even if the inventory refreshes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityTargetProjection {
+    endpoint_id: String,
+    display_name: String,
+    address: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Static label for a capability that has never been observed on this
+/// endpoint. Kept distinct from the `not_advertised` label so missing data
+/// is never disguised as a probe result.
+const NOT_OBSERVED_STATE_LABEL: &str = "Not yet observed";
+
+#[cfg(any(target_arch = "wasm32", test))]
+const fn capability_state_label(state: CapabilityStateResponse) -> &'static str {
+    match state {
+        CapabilityStateResponse::Supported => "Supported",
+        CapabilityStateResponse::ReadOnly => "Read only",
+        CapabilityStateResponse::Unauthorized => "Unauthorized",
+        CapabilityStateResponse::TemporarilyUnavailable => "Temporarily unavailable",
+        CapabilityStateResponse::SchemaIncompatible => "Schema incompatible",
+        CapabilityStateResponse::NotAdvertised => "Not advertised",
+        CapabilityStateResponse::NotCompiled => "Not compiled",
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Badge styling for one observed state: usable surfaces are ok, advertised
+/// but unusable surfaces warn, absent surfaces are off.
+const fn capability_state_class(state: CapabilityStateResponse) -> &'static str {
+    match state {
+        CapabilityStateResponse::Supported | CapabilityStateResponse::ReadOnly => {
+            "capability-state capability-ok"
+        }
+        CapabilityStateResponse::Unauthorized
+        | CapabilityStateResponse::TemporarilyUnavailable
+        | CapabilityStateResponse::SchemaIncompatible => "capability-state capability-warn",
+        CapabilityStateResponse::NotAdvertised | CapabilityStateResponse::NotCompiled => {
+            "capability-state capability-off"
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One capability-ledger row projected for the matrix: the stable product
+/// code, its upstream feature, and the static state badge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityEntryProjection {
+    product_code: String,
+    upstream_feature: String,
+    state_label: &'static str,
+    state_class: &'static str,
+    observed_at_text: Option<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&CapabilityEntryResponse> for CapabilityEntryProjection {
+    fn from(entry: &CapabilityEntryResponse) -> Self {
+        let (state_label, state_class) = match entry.state() {
+            Some(state) => (capability_state_label(state), capability_state_class(state)),
+            None => (NOT_OBSERVED_STATE_LABEL, "capability-state capability-none"),
+        };
+        Self {
+            product_code: entry.capability().to_owned(),
+            upstream_feature: entry.upstream_feature().to_owned(),
+            state_label,
+            state_class,
+            observed_at_text: entry
+                .observed_at()
+                .map(|observed_at| format_observed_at(&observed_at)),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §12.2 Endpoint page name for one wire `ui_location` value, matching
+/// the design document's navigation list. The mapping is a bijection on the
+/// closed `UiLocationResponse` enum, so grouping by page title is exactly
+/// grouping by `ui_location`.
+fn page_title(ui_location: UiLocationResponse) -> &'static str {
+    match ui_location {
+        UiLocationResponse::Overview => "Overview",
+        UiLocationResponse::Systems => "Systems",
+        UiLocationResponse::Chassis => "Chassis",
+        UiLocationResponse::Managers => "Managers",
+        UiLocationResponse::Assembly => "Assembly",
+        UiLocationResponse::Processors => "Processors",
+        UiLocationResponse::Memory => "Memory",
+        UiLocationResponse::Pcie => "PCIe",
+        UiLocationResponse::Network => "Network",
+        UiLocationResponse::Power => "Power",
+        UiLocationResponse::Thermal => "Thermal",
+        UiLocationResponse::Sensors => "Sensors",
+        UiLocationResponse::Bios => "BIOS",
+        UiLocationResponse::Boot => "Boot",
+        UiLocationResponse::SecureBoot => "Secure Boot",
+        UiLocationResponse::Storage => "Storage",
+        UiLocationResponse::Accounts => "Accounts",
+        UiLocationResponse::Logs => "Logs",
+        UiLocationResponse::Events => "Events",
+        UiLocationResponse::Telemetry => "Telemetry",
+        UiLocationResponse::Update => "Update",
+        UiLocationResponse::Tasks => "Tasks",
+        UiLocationResponse::Oem => "OEM",
+        UiLocationResponse::Diagnostics => "Diagnostics",
+        UiLocationResponse::Infrastructure => "Infrastructure",
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// All entries presented on one §12.2 Endpoint page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityGroupProjection {
+    page_title: &'static str,
+    entries: Vec<CapabilityEntryProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The complete §2.1 capability matrix of one endpoint, grouped by §12.2
+/// page in ledger appearance order. The response arrives in ledger order;
+/// grouping preserves that stable order instead of re-sorting by page name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityMatrixProjection {
+    groups: Vec<CapabilityGroupProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&EndpointCapabilityInventoryResponse> for CapabilityMatrixProjection {
+    fn from(inventory: &EndpointCapabilityInventoryResponse) -> Self {
+        let mut groups: Vec<CapabilityGroupProjection> = Vec::new();
+        for entry in inventory.entries() {
+            let page_title = page_title(entry.ui_location());
+            let group_index = if let Some(index) = groups
+                .iter()
+                .position(|group| group.page_title == page_title)
+            {
+                index
+            } else {
+                groups.push(CapabilityGroupProjection {
+                    page_title,
+                    entries: Vec::new(),
+                });
+                groups.len() - 1
+            };
+            groups[group_index]
+                .entries
+                .push(CapabilityEntryProjection::from(entry));
+        }
+        Self { groups }
     }
 }
 
@@ -1161,8 +1417,8 @@ mod browser {
     use rutilus_api::{
         AboutResponse, AuditQueryResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
         CreateCredentialRequest, CredentialInventoryResponse, CredentialSummaryResponse,
-        EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointEnrollmentResponse,
-        EndpointInventoryResponse, EndpointResourceInventoryResponse,
+        EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
+        EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
         TrustedEndpointResponse,
     };
@@ -1170,7 +1426,9 @@ mod browser {
     use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     use super::{
-        AuditEventCardProjection, AuditListState, ConsoleLoadFailure, ConsoleLoadState,
+        AuditEventCardProjection, AuditListState, CapabilityEntryProjection,
+        CapabilityGroupProjection, CapabilityLoadFailure, CapabilityMatrixProjection,
+        CapabilityMatrixState, CapabilityTargetProjection, ConsoleLoadFailure, ConsoleLoadState,
         ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
@@ -1190,6 +1448,27 @@ mod browser {
             set_state.set(fetch_console().await);
         });
         let (view, set_view) = signal(ConsoleView::Overview);
+
+        // The capability drill-down keeps its target and matrix state at the
+        // shell level so the endpoint-card entry can reset them; the view
+        // itself only reads and refreshes them.
+        let (capability_target, set_capability_target) = signal(None::<CapabilityTargetProjection>);
+        let (capability_state, set_capability_state) = signal(CapabilityMatrixState::Idle);
+        let (capability_triggered, set_capability_triggered) = signal(false);
+
+        let on_view_capabilities = Callback::new(move |target: CapabilityTargetProjection| {
+            set_capability_target.set(Some(target));
+            set_capability_state.set(CapabilityMatrixState::Idle);
+            set_capability_triggered.set(false);
+            set_view.set(ConsoleView::Capabilities);
+        });
+
+        let on_back_to_overview = Callback::new(move |()| {
+            set_capability_target.set(None);
+            set_capability_state.set(CapabilityMatrixState::Idle);
+            set_capability_triggered.set(false);
+            set_view.set(ConsoleView::Overview);
+        });
 
         let on_refresh_inventory = move |_| {
             set_state.set(ConsoleLoadState::Loading);
@@ -1234,10 +1513,18 @@ mod browser {
                                     "view-nav-item"
                                 }
                             };
+                            // The capability drill-down needs an endpoint
+                            // chosen from a card first, so its navigation
+                            // entry stays hidden until a target is selected.
+                            let hidden = move || {
+                                candidate == ConsoleView::Capabilities
+                                    && capability_target.get().is_none()
+                            };
                             view! {
                                 <button
                                     type="button"
                                     class=class
+                                    hidden=hidden
                                     on:click=move |_| set_view.set(candidate)
                                 >
                                     {candidate.label()}
@@ -1282,7 +1569,14 @@ mod browser {
                             state
                                 .with(ConsoleLoadState::endpoint_cards)
                                 .into_iter()
-                                .map(|card| view! { <EndpointCard card=card /> })
+                                .map(|card| {
+                                    view! {
+                                        <EndpointCard
+                                            card=card
+                                            on_view_capabilities=on_view_capabilities
+                                        />
+                                    }
+                                })
                                 .collect_view()
                         }}
                     </div>
@@ -1292,12 +1586,24 @@ mod browser {
                 <AddEndpointView view=view />
                 <ImportView view=view />
                 <AuditView view=view />
+                <CapabilitiesView
+                    view=view
+                    target=capability_target
+                    state=capability_state
+                    set_state=set_capability_state
+                    triggered=capability_triggered
+                    set_triggered=set_capability_triggered
+                    on_back=on_back_to_overview
+                />
             </main>
         }
     }
 
     #[component]
-    fn EndpointCard(card: EndpointCardProjection) -> impl IntoView {
+    fn EndpointCard(
+        card: EndpointCardProjection,
+        on_view_capabilities: Callback<CapabilityTargetProjection>,
+    ) -> impl IntoView {
         let systems = card.resource_counts.map_or(0, |counts| counts.systems);
         let chassis = card.resource_counts.map_or(0, |counts| counts.chassis);
         let managers = card.resource_counts.map_or(0, |counts| counts.managers);
@@ -1308,6 +1614,11 @@ mod browser {
             "status-dot"
         };
         let resources = card.resources;
+        let capability_target = CapabilityTargetProjection {
+            endpoint_id: card.endpoint_id.clone(),
+            display_name: card.display_name.clone(),
+            address: card.address.clone(),
+        };
 
         view! {
             <article class="endpoint-card">
@@ -1321,6 +1632,15 @@ mod browser {
                 <div class="snapshot-heading">
                     <span class=status_dot_class aria-hidden="true"></span>
                     <span>{card.snapshot_label}</span>
+                </div>
+                <div class="endpoint-card-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_view_capabilities.run(capability_target.clone())
+                    >
+                        "View capabilities"
+                    </button>
                 </div>
                 <p class="awaiting-refresh" hidden=!awaiting_refresh>
                     "No resource counts are published until a complete refresh succeeds."
@@ -2656,6 +2976,190 @@ mod browser {
         }
     }
 
+    #[component]
+    fn CapabilitiesView(
+        view: ReadSignal<ConsoleView>,
+        target: ReadSignal<Option<CapabilityTargetProjection>>,
+        state: ReadSignal<CapabilityMatrixState>,
+        set_state: WriteSignal<CapabilityMatrixState>,
+        triggered: ReadSignal<bool>,
+        set_triggered: WriteSignal<bool>,
+        on_back: Callback<()>,
+    ) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Capabilities;
+
+        // Fetches exactly once per target: the endpoint-card entry resets the
+        // triggered flag, and the nav re-entry keeps the cached matrix.
+        Effect::new(move |_| {
+            if !active() {
+                return;
+            }
+            let Some(target) = target.get() else {
+                return;
+            };
+            if triggered.get() {
+                return;
+            }
+            set_triggered.set(true);
+            set_state.set(CapabilityMatrixState::Loading);
+            let endpoint_id = target.endpoint_id;
+            spawn_local(async move {
+                set_state.set(fetch_capabilities(&endpoint_id).await);
+            });
+        });
+
+        let on_refresh = move |_| {
+            set_state.set(CapabilityMatrixState::Loading);
+            let Some(target) = target.get() else {
+                return;
+            };
+            let endpoint_id = target.endpoint_id;
+            spawn_local(async move {
+                set_state.set(fetch_capabilities(&endpoint_id).await);
+            });
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Capabilities"</p>
+                        <h2>
+                            {move || {
+                                target
+                                    .get()
+                                    .map_or_else(String::new, |target| target.display_name)
+                            }}
+                        </h2>
+                    </div>
+                    <p class="endpoint-address">
+                        {move || {
+                            target
+                                .get()
+                                .map_or_else(String::new, |target| target.address)
+                        }}
+                    </p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_back.run(())
+                    >
+                        "Back to overview"
+                    </button>
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || state.get().is_loading()
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !state.get().is_loading()>
+                    "Loading capability list..."
+                </p>
+                <p class="form-error" hidden=move || !state.get().is_failed()>
+                    {move || state.get().failure_message()}
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !state.get().is_ready() || !state.get().has_empty_matrix()
+                    }
+                >
+                    "No capability data is available for this endpoint yet."
+                </p>
+                <p class="capability-summary" hidden=move || !state.get().is_ready()>
+                    {move || state.get().summary_text()}
+                </p>
+                <div class="capability-groups">
+                    {move || {
+                        state
+                            .get()
+                            .groups()
+                            .into_iter()
+                            .map(|group| view! { <CapabilityGroup group=group /> })
+                            .collect_view()
+                    }}
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn CapabilityGroup(group: CapabilityGroupProjection) -> impl IntoView {
+        let page_title = group.page_title;
+        let entry_count = group.entries.len();
+        view! {
+            <section class="capability-group">
+                <div class="capability-group-heading">
+                    <h4>{page_title}</h4>
+                    <span>{entry_count}</span>
+                </div>
+                <div class="capability-item-grid">
+                    {group
+                        .entries
+                        .into_iter()
+                        .map(|entry| view! { <CapabilityItem entry=entry /> })
+                        .collect_view()}
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn CapabilityItem(entry: CapabilityEntryProjection) -> impl IntoView {
+        let has_observed_at = entry.observed_at_text.is_some();
+        view! {
+            <article class="capability-item">
+                <div class="capability-item-title">
+                    <code class="capability-code">{entry.product_code}</code>
+                    <span class=entry.state_class>{entry.state_label}</span>
+                </div>
+                <p class="capability-feature">
+                    <span>"Upstream feature"</span>
+                    <code>{entry.upstream_feature}</code>
+                </p>
+                <p class="capability-observed" hidden=!has_observed_at>
+                    <span>"Observed at"</span>
+                    {entry.observed_at_text}
+                </p>
+            </article>
+        }
+    }
+
+    /// Loads the complete capability matrix of one endpoint.
+    ///
+    /// A 404 means the endpoint no longer exists. Any other non-200 status —
+    /// including 503 and the 400 that cannot originate from this UI, whose
+    /// endpoint ids always come from the local inventory — maps to the
+    /// generic unavailable message; a 200 body that violates the strict
+    /// shared contract maps to the malformed message.
+    async fn fetch_capabilities(endpoint_id: &str) -> CapabilityMatrixState {
+        let path = format!("/api/v1/endpoints/{endpoint_id}/capabilities");
+        let Ok(response) = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return CapabilityMatrixState::Failed(CapabilityLoadFailure::Unavailable);
+        };
+        if response.status() == 404 {
+            return CapabilityMatrixState::Failed(CapabilityLoadFailure::EndpointNotFound);
+        }
+        if !response.ok() {
+            return CapabilityMatrixState::Failed(CapabilityLoadFailure::Unavailable);
+        }
+        match response.json::<EndpointCapabilityInventoryResponse>().await {
+            Ok(inventory) => {
+                CapabilityMatrixState::Ready(CapabilityMatrixProjection::from(&inventory))
+            }
+            Err(_) => CapabilityMatrixState::Failed(CapabilityLoadFailure::Malformed),
+        }
+    }
+
     async fn fetch_audit() -> Option<AuditQueryResponse> {
         let response = Request::get("/api/v1/audit")
             .header("Accept", "application/json")
@@ -3060,6 +3564,85 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// The §2.1 capability ledger in design-document order: product code,
+    /// upstream feature, and wire `ui_location` value of the shared contract.
+    const LEDGER_FIXTURE: [(&str, &str, &str); 30] = [
+        ("accounts", "accounts", "accounts"),
+        ("assembly", "assembly", "assembly"),
+        ("bios", "bios", "bios"),
+        ("boot-options", "boot-options", "boot"),
+        ("chassis", "chassis", "chassis"),
+        ("systems", "computer-systems", "systems"),
+        ("controls", "controls", "power"),
+        ("environment-metrics", "environment-metrics", "sensors"),
+        ("ethernet-interfaces", "ethernet-interfaces", "network"),
+        ("event-service", "event-service", "events"),
+        ("host-interfaces", "host-interfaces", "network"),
+        ("log-services", "log-services", "logs"),
+        (
+            "manager-network-protocol",
+            "manager-network-protocol",
+            "managers",
+        ),
+        ("managers", "managers", "managers"),
+        ("memory", "memory", "memory"),
+        ("network-adapters", "network-adapters", "network"),
+        (
+            "network-device-functions",
+            "network-device-functions",
+            "network",
+        ),
+        ("pcie-devices", "pcie-devices", "pcie"),
+        ("power", "power", "power"),
+        ("power-equipment", "power-equipment", "power"),
+        ("power-supplies", "power-supplies", "power"),
+        ("processors", "processors", "processors"),
+        ("secure-boot", "secure-boot", "secure_boot"),
+        ("sensors", "sensors", "sensors"),
+        ("session-service", "session-service", "infrastructure"),
+        ("storages", "storages", "storage"),
+        ("task-service", "task-service", "tasks"),
+        ("telemetry-service", "telemetry-service", "telemetry"),
+        ("thermal", "thermal", "thermal"),
+        ("update-service", "update-service", "update"),
+    ];
+
+    /// Wire classification for one capability code, mirroring the shared
+    /// contract: session and task services are infrastructure.
+    fn fixture_classification(capability: &str) -> &'static str {
+        match capability {
+            "session-service" | "task-service" => "infrastructure",
+            _ => "user_facing",
+        }
+    }
+
+    fn ledger_entries(states: &[Option<&str>]) -> Vec<serde_json::Value> {
+        LEDGER_FIXTURE
+            .iter()
+            .enumerate()
+            .map(|(index, &(capability, feature, location))| {
+                let state = states.get(index).copied().flatten();
+                json!({
+                    "capability": capability,
+                    "upstream_feature": feature,
+                    "classification": fixture_classification(capability),
+                    "ui_location": location,
+                    "state": state,
+                    "observed_at": state.map(|_| "2026-08-05T09:12:13Z")
+                })
+            })
+            .collect()
+    }
+
+    fn capability_inventory(
+        states: &[Option<&str>],
+    ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
+        serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789e1",
+            "entries": ledger_entries(states),
+        }))
     }
 
     #[test]
@@ -3824,6 +4407,7 @@ mod tests {
                 ConsoleView::AddEndpoint,
                 ConsoleView::Import,
                 ConsoleView::Audit,
+                ConsoleView::Capabilities,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -3831,6 +4415,7 @@ mod tests {
         assert_eq!(ConsoleView::AddEndpoint.label(), "Add endpoint");
         assert_eq!(ConsoleView::Import.label(), "Import");
         assert_eq!(ConsoleView::Audit.label(), "Audit");
+        assert_eq!(ConsoleView::Capabilities.label(), "Capabilities");
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(
@@ -3841,5 +4426,219 @@ mod tests {
             )
             .is_loading()
         );
+    }
+
+    #[test]
+    fn capability_matrix_projection_preserves_ledger_order_and_grouping()
+    -> Result<(), Box<dyn Error>> {
+        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let projection = CapabilityMatrixProjection::from(&capability_inventory(&states)?);
+
+        assert_eq!(projection.groups.len(), 22);
+        let accounts = projection
+            .groups
+            .first()
+            .ok_or("accounts group must exist")?;
+        assert_eq!(accounts.page_title, "Accounts");
+        let entry = accounts
+            .entries
+            .first()
+            .ok_or("accounts entry must exist")?;
+        assert_eq!(entry.product_code, "accounts");
+        assert_eq!(entry.upstream_feature, "accounts");
+        assert_eq!(entry.state_label, "Supported");
+        assert_eq!(entry.state_class, "capability-state capability-ok");
+        assert_eq!(
+            entry.observed_at_text.as_deref(),
+            Some("2026-08-05T09:12:13Z")
+        );
+
+        let network = projection
+            .groups
+            .iter()
+            .find(|group| group.page_title == "Network")
+            .ok_or("network group must exist")?;
+        let network_codes = network
+            .entries
+            .iter()
+            .map(|entry| entry.product_code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            network_codes,
+            [
+                "ethernet-interfaces",
+                "host-interfaces",
+                "network-adapters",
+                "network-device-functions",
+            ]
+        );
+        let power = projection
+            .groups
+            .iter()
+            .find(|group| group.page_title == "Power")
+            .ok_or("power group must exist")?;
+        let power_codes = power
+            .entries
+            .iter()
+            .map(|entry| entry.product_code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            power_codes,
+            ["controls", "power", "power-equipment", "power-supplies"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capability_group_order_follows_ui_location_appearance_not_string_sort()
+    -> Result<(), Box<dyn Error>> {
+        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let projection = CapabilityMatrixProjection::from(&capability_inventory(&states)?);
+        let titles = projection
+            .groups
+            .iter()
+            .map(|group| group.page_title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            [
+                "Accounts",
+                "Assembly",
+                "BIOS",
+                "Boot",
+                "Chassis",
+                "Systems",
+                "Power",
+                "Sensors",
+                "Network",
+                "Events",
+                "Logs",
+                "Managers",
+                "Memory",
+                "PCIe",
+                "Processors",
+                "Secure Boot",
+                "Infrastructure",
+                "Storage",
+                "Tasks",
+                "Telemetry",
+                "Thermal",
+                "Update",
+            ]
+        );
+        // The grouping follows ledger appearance order, not page-name order:
+        // a lexicographic sort would place "Events" and "Infrastructure"
+        // near the start and "Systems" far past "Power".
+        let mut sorted = titles.clone();
+        sorted.sort_unstable();
+        assert_ne!(titles, sorted);
+        Ok(())
+    }
+
+    #[test]
+    fn capability_none_state_renders_not_observed_without_fabricated_reason()
+    -> Result<(), Box<dyn Error>> {
+        let mut states: [Option<&str>; 30] = [None; 30];
+        states[0] = Some("supported");
+        states[1] = Some("read_only");
+        states[2] = Some("unauthorized");
+        states[3] = Some("temporarily_unavailable");
+        states[4] = Some("schema_incompatible");
+        states[5] = Some("not_advertised");
+        states[6] = Some("not_compiled");
+        let projection = CapabilityMatrixProjection::from(&capability_inventory(&states)?);
+        let entries = projection
+            .groups
+            .iter()
+            .flat_map(|group| group.entries.iter())
+            .collect::<Vec<_>>();
+
+        assert_eq!(entries.len(), 30);
+        let accounts = entries.first().ok_or("accounts entry must exist")?;
+        assert_eq!(accounts.state_label, "Supported");
+        assert_eq!(
+            accounts.observed_at_text.as_deref(),
+            Some("2026-08-05T09:12:13Z")
+        );
+        let assembly = entries.get(1).ok_or("assembly entry must exist")?;
+        assert_eq!(assembly.state_label, "Read only");
+        let bios = entries.get(2).ok_or("bios entry must exist")?;
+        assert_eq!(bios.state_label, "Unauthorized");
+        let boot = entries.get(3).ok_or("boot-options entry must exist")?;
+        assert_eq!(boot.state_label, "Temporarily unavailable");
+        let chassis = entries.get(4).ok_or("chassis entry must exist")?;
+        assert_eq!(chassis.state_label, "Schema incompatible");
+        let systems = entries.get(5).ok_or("systems entry must exist")?;
+        assert_eq!(systems.state_label, "Not advertised");
+        assert_eq!(systems.state_class, "capability-state capability-off");
+        let controls = entries.get(6).ok_or("controls entry must exist")?;
+        assert_eq!(controls.state_label, "Not compiled");
+        assert_eq!(controls.state_class, "capability-state capability-off");
+        let environment_metrics = entries
+            .get(7)
+            .ok_or("environment-metrics entry must exist")?;
+        assert_eq!(environment_metrics.state_label, "Not yet observed");
+        assert_eq!(environment_metrics.observed_at_text, None);
+        assert_eq!(
+            environment_metrics.state_class,
+            "capability-state capability-none"
+        );
+        let session_service = entries.get(24).ok_or("session-service entry must exist")?;
+        assert_eq!(session_service.state_label, "Not yet observed");
+        assert_eq!(session_service.observed_at_text, None);
+        Ok(())
+    }
+
+    #[test]
+    fn capability_load_failures_render_distinct_static_messages() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            CapabilityLoadFailure::EndpointNotFound.message(),
+            "This endpoint no longer exists."
+        );
+        assert_eq!(
+            CapabilityLoadFailure::Unavailable.message(),
+            "The capability list is temporarily unavailable."
+        );
+        assert_eq!(
+            CapabilityLoadFailure::Malformed.message(),
+            "The server response could not be parsed."
+        );
+        assert_eq!(
+            CapabilityMatrixState::Failed(CapabilityLoadFailure::Unavailable).failure_message(),
+            "The capability list is temporarily unavailable."
+        );
+        assert_eq!(CapabilityMatrixState::Idle.failure_message(), "");
+        assert!(CapabilityMatrixState::Loading.is_loading());
+        assert!(CapabilityMatrixState::Failed(CapabilityLoadFailure::Malformed).is_failed());
+
+        let empty = CapabilityMatrixState::Ready(CapabilityMatrixProjection { groups: Vec::new() });
+        assert!(empty.is_ready());
+        assert!(empty.has_empty_matrix());
+        assert_eq!(empty.summary_text(), "0 capabilities across 0 pages");
+        assert_eq!(empty.groups().len(), 0);
+        assert_eq!(empty.failure_message(), "");
+
+        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let ready = CapabilityMatrixState::Ready(CapabilityMatrixProjection::from(
+            &capability_inventory(&states)?,
+        ));
+        assert!(!ready.has_empty_matrix());
+        assert_eq!(ready.groups().len(), 22);
+        assert_eq!(ready.summary_text(), "30 capabilities across 22 pages");
+        assert_eq!(ready.failure_message(), "");
+        Ok(())
+    }
+
+    #[test]
+    fn capability_target_projection_carries_the_drill_down_identity() {
+        let target = CapabilityTargetProjection {
+            endpoint_id: "01989abc-def0-7abc-8def-0123456789ac".to_owned(),
+            display_name: "Rack B BMC".to_owned(),
+            address: "https://192.0.2.11/".to_owned(),
+        };
+
+        assert_eq!(target.endpoint_id, "01989abc-def0-7abc-8def-0123456789ac");
+        assert_eq!(target.display_name, "Rack B BMC");
+        assert_eq!(target.address, "https://192.0.2.11/");
     }
 }
