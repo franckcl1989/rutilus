@@ -21,13 +21,16 @@ use nv_redfish::{
     core::{EntityTypeRef, NavProperty},
     manager::{Manager, ManagerCollection},
     schema::{
+        bios::Bios as BiosSchema, boot_option::BootOption as BootOptionSchema,
+        boot_option_collection::BootOptionCollection as BootOptionCollectionSchema,
         chassis::Chassis as ChassisSchema,
         chassis_collection::ChassisCollection as ChassisCollectionSchema,
         computer_system::ComputerSystem as ComputerSystemSchema,
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
-        manager::Manager as ManagerSchema,
+        manager::Manager as ManagerSchema, manager_account::ManagerAccount as ManagerAccountSchema,
+        manager_account_collection::ManagerAccountCollection as ManagerAccountCollectionSchema,
         manager_collection::ManagerCollection as ManagerCollectionSchema,
         memory::Memory as MemorySchema,
         memory_collection::MemoryCollection as MemoryCollectionSchema,
@@ -35,7 +38,8 @@ use nv_redfish::{
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
-        resource::Resource as ResourceSchema, storage::Storage as StorageSchema,
+        resource::Resource as ResourceSchema, secure_boot::SecureBoot as SecureBootSchema,
+        storage::Storage as StorageSchema,
         storage_collection::StorageCollection as StorageCollectionSchema,
     },
     session_service::{Session, SessionCreate},
@@ -216,9 +220,9 @@ impl RedfishGateway {
 
     /// Reads the complete advertised core resource surface (the 0.1
     /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors,
-    /// Memory, Storage, `NetworkAdapters`, and `EthernetInterfaces` families)
-    /// through public, typed `nv-redfish` navigation and returns bounded
-    /// domain projections.
+    /// Memory, Storage, `NetworkAdapters`, `EthernetInterfaces`, `Accounts`,
+    /// `Bios`, `BootOptions`, and `SecureBoot` families) through public,
+    /// typed `nv-redfish` navigation and returns bounded domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
@@ -317,17 +321,19 @@ async fn read_authenticated_core_resources(
     resources.extend(read_systems_resources(bmc, root, identity, trust).await?);
     resources.extend(read_chassis_resources(bmc, root, identity, trust).await?);
     resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_account_resources(bmc, root, identity, trust).await?);
     Ok(resources)
 }
 
 /// Reads the Systems collection and, for every decoded System member, its
-/// Processors, Memory, and Storage collections, so the 0.2 families follow
-/// their parent through the same typed navigation.
+/// `Bios`, `BootOptions`, and `SecureBoot` configuration surfaces plus the
+/// `Processors`, `Memory`, and `Storage` collections, so the 0.2 families
+/// follow their parent through the same typed navigation.
 ///
 /// A missing Systems link leaves the whole family absent without an error
 /// ("资源存在才呈现"); a failed Systems collection document aborts the read
-/// with the existing classified error semantics. Only individual members are
-/// skippable.
+/// with the existing classified error semantics. Only individual members and
+/// singletons are skippable.
 async fn read_systems_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
@@ -351,6 +357,33 @@ async fn read_systems_resources(
             continue;
         };
         resources.push(system_projection);
+        resources.extend(
+            read_singleton_resources(system.bios.as_ref(), bmc, identity, trust, bios_projection)
+                .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                system
+                    .boot
+                    .as_ref()
+                    .and_then(|boot| boot.boot_options.as_ref()),
+                bmc,
+                identity,
+                trust,
+                boot_option_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_singleton_resources(
+                system.secure_boot.as_ref(),
+                bmc,
+                identity,
+                trust,
+                secure_boot_projection,
+            )
+            .await?,
+        );
         resources.extend(
             read_collection_resources(
                 system.processors.as_ref(),
@@ -471,6 +504,38 @@ async fn read_manager_resources(
     Ok(resources)
 }
 
+/// Reads the `Accounts` family through the root-level `AccountService` link,
+/// so account members are discovered from the decoded Service Root instead of
+/// a guessed path.
+///
+/// The `AccountService` document itself is a singleton and follows the
+/// singleton decision: a missing link leaves the family absent and a failed
+/// document is skipped with the member-level semantics instead of aborting
+/// the read. The `Accounts` collection below it keeps the normal collection
+/// semantics: a failed collection document aborts, only individual members
+/// are skippable.
+async fn read_account_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(account_service) = root.root.account_service.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(service) = fetch_member(account_service, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_collection_resources(
+        service.accounts.as_ref(),
+        bmc,
+        identity,
+        trust,
+        manager_account_projection,
+    )
+    .await
+}
+
 /// A decoded Redfish collection schema that exposes its member navigation
 /// properties, so members can be fetched individually and one failing member
 /// cannot erase its peers.
@@ -542,6 +607,48 @@ impl MemberCollection for EthernetInterfaceCollectionSchema {
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
     }
+}
+
+impl MemberCollection for ManagerAccountCollectionSchema {
+    type Member = ManagerAccountSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for BootOptionCollectionSchema {
+    type Member = BootOptionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+/// Projects one advertised singleton with the member-level skip semantics.
+///
+/// `Bios` and `SecureBoot` are singletons, not collections, so they share
+/// the fetch and representation skip rules of a single member: a missing
+/// link leaves the family absent ("资源存在才呈现"), a failed fetch is
+/// endpoint-local and skips only that singleton, and a failed projection
+/// skips it as well. There is no collection document to abort the read over.
+async fn read_singleton_resources<T>(
+    nav: Option<&NavProperty<T>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    project: impl Fn(&T) -> Result<CoreResourceProjection, CoreResourceReadError>,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
+where
+    T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(resource) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(member_projection(project(&resource))?.into_iter().collect())
 }
 
 /// Projects one typed collection with per-member skip semantics.
@@ -1200,6 +1307,114 @@ struct EthernetInterfacePayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `accounts` family projection.
+///
+/// The field set is exactly the `AccountPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct
+/// `UserName`, `RoleId`, `Enabled`, `Locked`, and `AccountTypes` properties
+/// of the `ManagerAccount` schema are all projectable; `UserName` and
+/// `AccountTypes` are retained in the persisted payload but stay internal
+/// (the API surface exposes only `Enabled`, `RoleId`, and `Locked`). The
+/// password lifecycle fields (`PasswordExpiration`, `AccountExpiration`,
+/// `PasswordChangeRequired`) and SNMP/OEM sections stay out, and the schema
+/// declares no `Status` property.
+#[derive(Serialize)]
+struct AccountsPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "UserName", skip_serializing_if = "Option::is_none")]
+    user_name: Option<String>,
+    #[serde(rename = "RoleId", skip_serializing_if = "Option::is_none")]
+    role_id: Option<String>,
+    #[serde(rename = "Enabled", skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(rename = "Locked", skip_serializing_if = "Option::is_none")]
+    locked: Option<bool>,
+    #[serde(rename = "AccountTypes", skip_serializing_if = "Option::is_none")]
+    account_types: Option<Vec<nv_redfish::schema::manager_account::AccountTypes>>,
+}
+
+/// The §0.2.0 `bios` family projection.
+///
+/// The field set is exactly the `BiosPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. Only the metadata
+/// properties of the `Bios` schema are projectable: `AttributeRegistry`
+/// names the attribute registry and `ResetBiosToDefaultsPending` exposes the
+/// pending-reset flag. The full `Attributes` map is deliberately not
+/// projected, so a BIOS attribute change cannot invalidate the snapshot
+/// contract, and the schema declares no `Status` property.
+#[derive(Serialize)]
+struct BiosPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "AttributeRegistry", skip_serializing_if = "Option::is_none")]
+    attribute_registry: Option<String>,
+    #[serde(
+        rename = "ResetBiosToDefaultsPending",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reset_bios_to_defaults_pending: Option<bool>,
+}
+
+/// The §0.2.0 `boot-options` family projection.
+///
+/// The field set is exactly the `BootOptionPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct
+/// `BootOptionReference`, `DisplayName`, `BootOptionEnabled`,
+/// `UefiDevicePath`, and `Alias` properties of the `BootOption` schema are
+/// all projectable; `BootOptionReference` and `Alias` are retained in the
+/// persisted payload but stay internal (the API surface exposes only
+/// `DisplayName`, `BootOptionEnabled`, and `UefiDevicePath`). `Alias` keeps
+/// the typed `BootSource` value so the console renders the boot source
+/// without re-parsing text, and the schema declares no `Status` property.
+#[derive(Serialize)]
+struct BootOptionsPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(
+        rename = "BootOptionReference",
+        skip_serializing_if = "Option::is_none"
+    )]
+    boot_option_reference: Option<String>,
+    #[serde(rename = "DisplayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(rename = "BootOptionEnabled", skip_serializing_if = "Option::is_none")]
+    boot_option_enabled: Option<bool>,
+    #[serde(rename = "UefiDevicePath", skip_serializing_if = "Option::is_none")]
+    uefi_device_path: Option<String>,
+    #[serde(rename = "Alias", skip_serializing_if = "Option::is_none")]
+    alias: Option<nv_redfish::schema::computer_system::BootSource>,
+}
+
+/// The §0.2.0 `secure-boot` family projection.
+///
+/// The field set is exactly the `SecureBootPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct
+/// `SecureBootEnable`, `SecureBootCurrentBoot`, and `SecureBootMode`
+/// properties of the `SecureBoot` schema are all projectable;
+/// `SecureBootCurrentBoot` is retained in the persisted payload but stays
+/// internal (the API surface exposes only `SecureBootEnable` and
+/// `SecureBootMode`). The `SecureBootDatabases` link stays out, and the
+/// schema declares no `Status` property.
+#[derive(Serialize)]
+struct SecureBootPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "SecureBootEnable", skip_serializing_if = "Option::is_none")]
+    secure_boot_enable: Option<bool>,
+    #[serde(
+        rename = "SecureBootCurrentBoot",
+        skip_serializing_if = "Option::is_none"
+    )]
+    secure_boot_current_boot: Option<nv_redfish::schema::secure_boot::SecureBootCurrentBootType>,
+    #[serde(rename = "SecureBootMode", skip_serializing_if = "Option::is_none")]
+    secure_boot_mode: Option<nv_redfish::schema::secure_boot::SecureBootModeType>,
+}
+
 fn service_root_projection(
     root: &ServiceRoot<UpstreamBmc>,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -1398,6 +1613,83 @@ fn ethernet_interface_projection(
         ResourceFeature::EthernetInterfaces,
         interface.odata_id(),
         interface.etag(),
+        &payload,
+    )
+}
+
+fn manager_account_projection(
+    account: &ManagerAccountSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = AccountsPayload {
+        resource: CommonResourcePayload::from_schema_base(&account.base),
+        user_name: account.user_name.clone(),
+        role_id: account.role_id.clone(),
+        enabled: account.enabled.as_ref().copied(),
+        locked: account.locked.as_ref().copied(),
+        account_types: account.account_types.clone(),
+    };
+    build_core_projection(
+        ResourceFeature::Accounts,
+        account.odata_id(),
+        account.etag(),
+        &payload,
+    )
+}
+
+fn bios_projection(bios: &BiosSchema) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = BiosPayload {
+        resource: CommonResourcePayload::from_schema_base(&bios.base),
+        attribute_registry: optional_nullable_text(bios.attribute_registry.as_ref()),
+        reset_bios_to_defaults_pending: bios
+            .reset_bios_to_defaults_pending
+            .as_ref()
+            .copied()
+            .flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::Bios,
+        bios.odata_id(),
+        bios.etag(),
+        &payload,
+    )
+}
+
+fn boot_option_projection(
+    option: &BootOptionSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = BootOptionsPayload {
+        resource: CommonResourcePayload::from_schema_base(&option.base),
+        boot_option_reference: option.boot_option_reference.clone(),
+        display_name: optional_nullable_text(option.display_name.as_ref()),
+        boot_option_enabled: option.boot_option_enabled.as_ref().copied().flatten(),
+        uefi_device_path: optional_nullable_text(option.uefi_device_path.as_ref()),
+        alias: option.alias.as_ref().copied().flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::BootOptions,
+        option.odata_id(),
+        option.etag(),
+        &payload,
+    )
+}
+
+fn secure_boot_projection(
+    secure_boot: &SecureBootSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = SecureBootPayload {
+        resource: CommonResourcePayload::from_schema_base(&secure_boot.base),
+        secure_boot_enable: secure_boot.secure_boot_enable.as_ref().copied().flatten(),
+        secure_boot_current_boot: secure_boot
+            .secure_boot_current_boot
+            .as_ref()
+            .copied()
+            .flatten(),
+        secure_boot_mode: secure_boot.secure_boot_mode.as_ref().copied().flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::SecureBoot,
+        secure_boot.odata_id(),
+        secure_boot.etag(),
         &payload,
     )
 }
@@ -2684,6 +2976,170 @@ mod tests {
         "Name":"Secure Boot"
     }"#;
 
+    /// A Service Root that also advertises the 0.2 `Accounts` family through
+    /// the root-level `AccountService` link.
+    const CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "AccountService":{"@odata.id":"/redfish/v1/AccountService"}
+    }"#;
+
+    /// The `AccountService` document that advertises the `Accounts`
+    /// collection; the service-level password policy fields are decoded but
+    /// stay outside the projection contract.
+    const ACCOUNT_SERVICE_WITH_ACCOUNTS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/AccountService",
+        "@odata.etag":"W/\"account-service-1\"",
+        "Id":"AccountService",
+        "Name":"Account Service",
+        "Description":"Local account management",
+        "ServiceEnabled":true,
+        "MinPasswordLength":8,
+        "Accounts":{"@odata.id":"/redfish/v1/AccountService/Accounts"}
+    }"#;
+
+    const ACCOUNTS_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id":"/redfish/v1/AccountService/Accounts",
+        "Name":"Accounts Collection",
+        "Members":[]
+    }"##;
+
+    const ACCOUNTS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id":"/redfish/v1/AccountService/Accounts",
+        "Name":"Accounts Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/AccountService/Accounts/1"},
+            {"@odata.id":"/redfish/v1/AccountService/Accounts/2"}
+        ]
+    }"##;
+
+    /// The full `ManagerAccount` member projection with every optional
+    /// contract field populated; the password lifecycle fields are decoded
+    /// but stay outside the projection contract.
+    const ACCOUNT_ONE_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/1",
+        "@odata.etag":"W/\"account-1\"",
+        "Id":"1",
+        "Name":"Account One",
+        "Description":"Primary administrator account",
+        "UserName":"admin",
+        "RoleId":"Administrator",
+        "Enabled":true,
+        "Locked":false,
+        "AccountTypes":["Redfish","IPMI"],
+        "PasswordChangeRequired":false,
+        "AccountExpiration":null
+    }"##;
+
+    /// A minimal `ManagerAccount` member: `AccountTypes` is `Redfish.Required`
+    /// in the schema and must stay present to decode, while every optional
+    /// field is absent so the projection omits it instead of emitting null.
+    const ACCOUNT_TWO_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/2",
+        "@odata.etag":"W/\"account-2\"",
+        "Id":"2",
+        "Name":"Account Two",
+        "UserName":"viewer",
+        "AccountTypes":["Redfish"]
+    }"##;
+
+    /// A System member that advertises the 0.2 `Bios`, `BootOptions` (inside
+    /// the `Boot` property), and `SecureBoot` configuration surfaces.
+    const SYSTEM_WITH_CONFIG_FEATURES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "Description":"Primary compute system",
+        "SystemType":"Physical",
+        "Bios":{"@odata.id":"/redfish/v1/Systems/1/Bios"},
+        "Boot":{"BootOptions":{"@odata.id":"/redfish/v1/Systems/1/BootOptions"}},
+        "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"}
+    }"#;
+
+    /// The full `Bios` singleton projection: `Attributes` is decoded by the
+    /// schema but must stay out of the snapshot, because it is not part of
+    /// the contract and the strict application decoder rejects it.
+    const BIOS_FULL_BODY: &str = r##"{
+        "@odata.type":"#Bios.v1_2_0.Bios",
+        "@odata.id":"/redfish/v1/Systems/1/Bios",
+        "@odata.etag":"W/\"bios-1\"",
+        "Id":"Bios",
+        "Name":"BIOS Configuration",
+        "Description":"BIOS attribute registry",
+        "AttributeRegistry":"BiosAttributeRegistryP11.v1_2_0",
+        "ResetBiosToDefaultsPending":false,
+        "Attributes":{"BootMode":"Uefi","QuietBoot":"Enabled"}
+    }"##;
+
+    const BOOT_OPTIONS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#BootOptionCollection.BootOptionCollection",
+        "@odata.id":"/redfish/v1/Systems/1/BootOptions",
+        "Name":"Boot Option Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Systems/1/BootOptions/1"},
+            {"@odata.id":"/redfish/v1/Systems/1/BootOptions/2"}
+        ]
+    }"##;
+
+    /// The full `BootOption` member projection with every optional contract
+    /// field populated; `RelatedItem` is decoded but stays outside the
+    /// projection contract.
+    const BOOT_OPTION_ONE_BODY: &str = r##"{
+        "@odata.type":"#BootOption.v1_1_0.BootOption",
+        "@odata.id":"/redfish/v1/Systems/1/BootOptions/1",
+        "@odata.etag":"W/\"boot-option-1\"",
+        "Id":"1",
+        "Name":"Boot Option One",
+        "Description":"UEFI PXE boot option",
+        "BootOptionReference":"Boot0001",
+        "DisplayName":"UEFI PXE IP4 Intel",
+        "BootOptionEnabled":true,
+        "UefiDevicePath":"PciRoot(0x0)/Pci(0x1C,0x4)",
+        "Alias":"Pxe",
+        "RelatedItem":[{"@odata.id":"/redfish/v1/Systems/1"}]
+    }"##;
+
+    /// A minimal `BootOption` member carrying only the required
+    /// `BootOptionReference`.
+    const BOOT_OPTION_TWO_BODY: &str = r##"{
+        "@odata.type":"#BootOption.v1_1_0.BootOption",
+        "@odata.id":"/redfish/v1/Systems/1/BootOptions/2",
+        "@odata.etag":"W/\"boot-option-2\"",
+        "Id":"2",
+        "Name":"Boot Option Two",
+        "BootOptionReference":"Boot0002"
+    }"##;
+
+    /// The full `SecureBoot` singleton projection with every optional
+    /// contract field populated; `SecureBootDatabases` stays outside the
+    /// projection contract.
+    const SECURE_BOOT_FULL_BODY: &str = r##"{
+        "@odata.type":"#SecureBoot.v1_1_0.SecureBoot",
+        "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+        "@odata.etag":"W/\"secure-boot-1\"",
+        "Id":"SecureBoot",
+        "Name":"Secure Boot",
+        "Description":"UEFI Secure Boot configuration",
+        "SecureBootEnable":true,
+        "SecureBootCurrentBoot":"Enabled",
+        "SecureBootMode":"UserMode"
+    }"##;
+
     const PROCESSORS_BODY: &str = r##"{
         "@odata.type":"#ProcessorCollection.ProcessorCollection",
         "@odata.id":"/redfish/v1/Systems/1/Processors",
@@ -3194,6 +3650,153 @@ mod tests {
         "/redfish/v1/Managers/1/EthernetInterfaces",
         "/redfish/v1/Managers/1/EthernetInterfaces/1",
         "/redfish/v1/Managers/1/EthernetInterfaces/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one System member that carries populated
+    /// `Bios`, `BootOptions`, and `SecureBoot` surfaces: the configuration
+    /// families are read right after their parent, before the sibling
+    /// collections.
+    const CONFIG_FAMILY_REQUEST_PATHS: [&str; 16] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Bios",
+        "/redfish/v1/Systems/1/BootOptions",
+        "/redfish/v1/Systems/1/BootOptions/1",
+        "/redfish/v1/Systems/1/BootOptions/2",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for the root-level `Accounts` family read: the
+    /// `AccountService` document and its `Accounts` collection are requested
+    /// after the manager families, before the Session cleanup.
+    const ACCOUNTS_RESOURCE_REQUEST_PATHS: [&str; 15] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts/1",
+        "/redfish/v1/AccountService/Accounts/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `AccountService` advertises no `Accounts`
+    /// link: the `AccountService` document is still read, no account member
+    /// is.
+    const ABSENT_FAMILY_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `BootOptions` and `Accounts` collections
+    /// are advertised but empty: the collection documents are still read, no
+    /// member is.
+    const EMPTY_CONFIG_FAMILY_REQUEST_PATHS: [&str; 16] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Bios",
+        "/redfish/v1/Systems/1/BootOptions",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `Bios` singleton and the second
+    /// `BootOption` member are undecodable: their URIs are still requested
+    /// (that is how the skip is observed), then the remaining configuration
+    /// families complete.
+    const SINGLETON_SKIP_REQUEST_PATHS: [&str; 16] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Bios",
+        "/redfish/v1/Systems/1/BootOptions",
+        "/redfish/v1/Systems/1/BootOptions/1",
+        "/redfish/v1/Systems/1/BootOptions/2",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `AccountService` document is undecodable:
+    /// the failing singleton URI is still requested, the whole `Accounts`
+    /// family is skipped with the member-level semantics, and the read
+    /// completes.
+    const ACCOUNT_SERVICE_SKIP_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the first account member is undecodable: its
+    /// URI is still requested (that is how the skip is observed), then the
+    /// second account member completes the family.
+    const ACCOUNT_MEMBER_SKIP_REQUEST_PATHS: [&str; 15] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts/1",
+        "/redfish/v1/AccountService/Accounts/2",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -4404,6 +5007,463 @@ mod tests {
         assert_session_requests(
             &server.finish_all().await?,
             &FAMILY_MEMBER_SKIP_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_configuration_families_through_typed_system_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_CONFIG_FEATURES_BODY),
+                ("200 OK", BIOS_FULL_BODY),
+                ("200 OK", BOOT_OPTIONS_WITH_MEMBERS_BODY),
+                ("200 OK", BOOT_OPTION_ONE_BODY),
+                ("200 OK", BOOT_OPTION_TWO_BODY),
+                ("200 OK", SECURE_BOOT_FULL_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 8);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Bios,
+                ResourceFeature::BootOptions,
+                ResourceFeature::BootOptions,
+                ResourceFeature::SecureBoot,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_projection(
+            &resources[2],
+            "/redfish/v1/Systems/1/Bios",
+            "W/\"bios-1\"",
+            "AttributeRegistry",
+            "BiosAttributeRegistryP11.v1_2_0",
+        )?;
+        let bios_payload: serde_json::Value =
+            serde_json::from_str(resources[2].payload().as_str())?;
+        assert_eq!(bios_payload["ResetBiosToDefaultsPending"], false);
+        // Only the contract fields may leave the gateway; the decoded
+        // schema fields that are not part of the contract must stay out of
+        // the snapshot or the strict application decoder rejects it.
+        assert_eq!(bios_payload.get("Attributes"), None);
+        assert_projection(
+            &resources[3],
+            "/redfish/v1/Systems/1/BootOptions/1",
+            "W/\"boot-option-1\"",
+            "BootOptionReference",
+            "Boot0001",
+        )?;
+        let option_payload: serde_json::Value =
+            serde_json::from_str(resources[3].payload().as_str())?;
+        assert_eq!(option_payload["DisplayName"], "UEFI PXE IP4 Intel");
+        assert_eq!(option_payload["BootOptionEnabled"], true);
+        assert_eq!(
+            option_payload["UefiDevicePath"],
+            "PciRoot(0x0)/Pci(0x1C,0x4)"
+        );
+        assert_eq!(option_payload["Alias"], "Pxe");
+        assert_eq!(option_payload.get("RelatedItem"), None);
+        // The second boot option carries none of the optional contract
+        // fields: they are omitted from the projection, never emitted as
+        // null, so the strict application decoder accepts the snapshot.
+        let minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[4].payload().as_str())?;
+        assert_eq!(minimal_payload["BootOptionReference"], "Boot0002");
+        assert_eq!(minimal_payload.get("DisplayName"), None);
+        assert_eq!(minimal_payload.get("BootOptionEnabled"), None);
+        assert_eq!(minimal_payload.get("UefiDevicePath"), None);
+        assert_eq!(minimal_payload.get("Alias"), None);
+        assert_projection(
+            &resources[5],
+            "/redfish/v1/Systems/1/SecureBoot",
+            "W/\"secure-boot-1\"",
+            "SecureBootMode",
+            "UserMode",
+        )?;
+        let secure_payload: serde_json::Value =
+            serde_json::from_str(resources[5].payload().as_str())?;
+        assert_eq!(secure_payload["SecureBootEnable"], true);
+        assert_eq!(secure_payload["SecureBootCurrentBoot"], "Enabled");
+        assert_eq!(secure_payload.get("SecureBootDatabases"), None);
+        assert_session_requests(&server.finish_all().await?, &CONFIG_FAMILY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_accounts_through_typed_root_navigation() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", ACCOUNT_SERVICE_WITH_ACCOUNTS_BODY),
+                ("200 OK", ACCOUNTS_WITH_MEMBERS_BODY),
+                ("200 OK", ACCOUNT_ONE_BODY),
+                ("200 OK", ACCOUNT_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::Accounts,
+                ResourceFeature::Accounts,
+            ]
+        );
+        assert_projection(
+            &resources[4],
+            "/redfish/v1/AccountService/Accounts/1",
+            "W/\"account-1\"",
+            "UserName",
+            "admin",
+        )?;
+        let account_payload: serde_json::Value =
+            serde_json::from_str(resources[4].payload().as_str())?;
+        assert_eq!(account_payload["RoleId"], "Administrator");
+        assert_eq!(account_payload["Enabled"], true);
+        assert_eq!(account_payload["Locked"], false);
+        assert_eq!(
+            account_payload["AccountTypes"],
+            serde_json::json!(["Redfish", "IPMI"])
+        );
+        // Only the contract fields may leave the gateway; the decoded
+        // schema fields that are not part of the contract must stay out of
+        // the snapshot or the strict application decoder rejects it.
+        assert_eq!(account_payload.get("PasswordChangeRequired"), None);
+        assert_eq!(account_payload.get("AccountExpiration"), None);
+        assert_eq!(account_payload.get("HostBootstrapAccount"), None);
+        assert_eq!(account_payload.get("SNMP"), None);
+        // The second account carries none of the optional contract fields:
+        // they are omitted, never emitted as null.
+        let minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[5].payload().as_str())?;
+        assert_eq!(minimal_payload["UserName"], "viewer");
+        assert_eq!(
+            minimal_payload["AccountTypes"],
+            serde_json::json!(["Redfish"])
+        );
+        assert_eq!(minimal_payload.get("RoleId"), None);
+        assert_eq!(minimal_payload.get("Enabled"), None);
+        assert_eq!(minimal_payload.get("Locked"), None);
+        assert_session_requests(
+            &server.finish_all().await?,
+            &ACCOUNTS_RESOURCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_configuration_links_produce_no_family_snapshots() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", ACCOUNT_SERVICE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The System member advertises no Bios, BootOptions, or SecureBoot
+        // links and the AccountService advertises no Accounts collection, so
+        // none of the four families produce snapshots ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &ABSENT_FAMILY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_configuration_collections_produce_no_member_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_CONFIG_FEATURES_BODY),
+                ("200 OK", BIOS_FULL_BODY),
+                ("200 OK", BOOT_OPTIONS_BODY),
+                ("200 OK", SECURE_BOOT_FULL_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", ACCOUNT_SERVICE_WITH_ACCOUNTS_BODY),
+                ("200 OK", ACCOUNTS_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The advertised-but-empty BootOptions and Accounts collections
+        // produce no member snapshots; the Bios and SecureBoot singletons
+        // still do ("资源存在才呈现").
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Bios,
+                ResourceFeature::SecureBoot,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &EMPTY_CONFIG_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_undecodable_configuration_singletons_and_members_without_aborting()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_CONFIG_FEATURES_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", BOOT_OPTIONS_WITH_MEMBERS_BODY),
+                ("200 OK", BOOT_OPTION_ONE_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", SECURE_BOOT_FULL_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The undecodable Bios singleton and the second BootOption member
+        // are skipped; the remaining configuration families still produce
+        // snapshots (§0.2.0 acceptance, singleton failure treated as
+        // member-level skip).
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::BootOptions,
+                ResourceFeature::SecureBoot,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_eq!(
+            resources[2].odata_id().as_str(),
+            "/redfish/v1/Systems/1/BootOptions/1"
+        );
+        assert_session_requests(&server.finish_all().await?, &SINGLETON_SKIP_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_failing_account_service_and_account_members_without_aborting()
+    -> Result<(), Box<dyn Error>> {
+        let absent_service = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(absent_service.certificate.clone())?;
+        let trust = system_ca_trust(&absent_service.certificate)?;
+        let resources = gateway
+            .read_core_resources(
+                &absent_service.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+        // The undecodable AccountService document is a singleton failure: it
+        // skips the whole Accounts family with the member-level semantics
+        // instead of aborting the read.
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &absent_service.finish_all().await?,
+            &ACCOUNT_SERVICE_SKIP_REQUEST_PATHS,
+        )?;
+
+        let failing_member = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_ACCOUNTS_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", ACCOUNT_SERVICE_WITH_ACCOUNTS_BODY),
+                ("200 OK", ACCOUNTS_WITH_MEMBERS_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", ACCOUNT_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(failing_member.certificate.clone())?;
+        let trust = system_ca_trust(&failing_member.certificate)?;
+        let resources = gateway
+            .read_core_resources(
+                &failing_member.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+        // The undecodable first account member is skipped; the second
+        // account member still produces a snapshot (§0.2.0 acceptance).
+        assert_eq!(resources.len(), 5);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::Accounts,
+            ]
+        );
+        assert_eq!(
+            resources[4].odata_id().as_str(),
+            "/redfish/v1/AccountService/Accounts/2"
+        );
+        assert_session_requests(
+            &failing_member.finish_all().await?,
+            &ACCOUNT_MEMBER_SKIP_REQUEST_PATHS,
         )?;
         Ok(())
     }
