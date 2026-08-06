@@ -4317,24 +4317,43 @@ struct MetricDefinitionPayload {
     metric_type: Option<nv_redfish::schema::metric_definition::MetricType>,
 }
 
-/// The §0.2.0 `metric-report` family projection.
+/// The §0.2.0 `metric-report` family projection, extended by the 0.4.0
+/// telemetry value-array read.
 ///
 /// The field set is exactly the `MetricReport` variant the application
 /// boundary decodes with `deny_unknown_fields`, so an extra field here would
-/// make every stored snapshot unreadable at projection time. Only metadata
-/// is projected: `metric_values_count` is derived from the length of the
-/// `MetricValues` array, which is decoded by the schema but deliberately
-/// never projected — each `MetricValue` entry is a timestamped reading, the
-/// telemetry history of the 0.4.0 iteration, and carrying unbounded value
-/// arrays now would defeat the strict decoder alignment. The `Timestamp`,
-/// `Context`, and `ReportSequence` metadata and the (schema-absent) `Status`
-/// stay out too, so the projection carries only the derived count.
+/// make every stored snapshot unreadable at projection time. `metric_values`
+/// now carries each timestamped reading of the `MetricValues` array — the
+/// current-value surface of the telemetry-history iteration — alongside the
+/// derived `metric_values_count`. Snapshots persisted by the 0.2.0 iteration
+/// lack the array, so the application decodes it as `Option` (missing reads
+/// as `None`) instead of failing the strict decoder. The report-level
+/// `Timestamp`, `Context`, and `ReportSequence` metadata and the
+/// (schema-absent) `Status` stay out.
 #[derive(Serialize)]
 struct MetricReportPayload {
     #[serde(flatten)]
     resource: CommonResourcePayload,
     #[serde(rename = "MetricValuesCount", skip_serializing_if = "Option::is_none")]
     metric_values_count: Option<usize>,
+    #[serde(rename = "MetricValues", skip_serializing_if = "Option::is_none")]
+    metric_values: Option<Vec<MetricValuePayload>>,
+}
+
+/// One timestamped reading of a `MetricReport` member, kept exactly as the
+/// compiled schema decodes it: `Timestamp` serializes as the RFC 3339 string
+/// of the `Edm.DateTimeOffset` type and `MetricValue` stays the original
+/// text of the `Edm.String` type (the DMTF schema represents numeric values
+/// as strings, so a `f64` projection would lose the non-numeric boolean and
+/// array representations). The `MetricId`, `MetricProperty`, `Oem`, and
+/// `MetricDefinition` link of the schema entry stay out of the strictly
+/// projectable field set.
+#[derive(Serialize)]
+struct MetricValuePayload {
+    #[serde(rename = "Timestamp", skip_serializing_if = "Option::is_none")]
+    timestamp: Option<nv_redfish::schema::edm::DateTimeOffset>,
+    #[serde(rename = "MetricValue", skip_serializing_if = "Option::is_none")]
+    metric_value: Option<String>,
 }
 
 /// The §0.2.0 `task-service` singleton projection.
@@ -4977,6 +4996,15 @@ fn metric_report_projection(
     let payload = MetricReportPayload {
         resource: CommonResourcePayload::from_schema_base(&report.base),
         metric_values_count: report.metric_values.as_ref().map(Vec::len),
+        metric_values: report.metric_values.as_ref().map(|values| {
+            values
+                .iter()
+                .map(|value| MetricValuePayload {
+                    timestamp: value.timestamp.flatten(),
+                    metric_value: optional_nullable_text(value.metric_value.as_ref()),
+                })
+                .collect()
+        }),
     };
     build_core_projection(
         ResourceFeature::MetricReport,
@@ -7479,11 +7507,13 @@ mod tests {
         ]
     }"##;
 
-    /// The full `MetricReport` member fixture: the `MetricValues` array and
-    /// the `Timestamp`/`Context` metadata are decoded by the schema, but the
-    /// projection carries only the derived `MetricValuesCount`, so every
-    /// value-array and metadata key must stay out of the snapshot. `Status`
-    /// is not a `MetricReport_v1` property and must stay out as well.
+    /// The full `MetricReport` member fixture: the `MetricValues` array is
+    /// decoded by the schema and projected as the timestamped readings of the
+    /// 0.4.0 value-array read, while the report-level `Timestamp`/`Context`/
+    /// `ReportSequence` metadata stays out of the snapshot. `Status` is not a
+    /// `MetricReport_v1` property and must stay out as well, and the
+    /// per-entry `MetricId` is not part of the strictly projectable field
+    /// set.
     const METRIC_REPORT_ONE_BODY: &str = r##"{
         "@odata.type":"#MetricReport.v1_4_0.MetricReport",
         "@odata.id":"/redfish/v1/TelemetryService/MetricReports/1",
@@ -11634,9 +11664,10 @@ mod tests {
     /// minimal members, and the absence of every decoded schema field that is
     /// not part of the contract — an extra key would make the stored snapshot
     /// unreadable to the strict application decoder. The `MetricReport`
-    /// snapshots in particular carry only the derived `MetricValuesCount`;
-    /// the `MetricValues` value array and the `Status` key of the fixture
-    /// must never leave the gateway.
+    /// snapshots in particular carry the derived `MetricValuesCount` and the
+    /// timestamped `MetricValues` readings; the `Status` key and the
+    /// report-level `Timestamp`/`Context`/`ReportSequence` metadata of the
+    /// fixture must never leave the gateway.
     // All seven families are asserted in one place so the contract field set
     // stays auditable side by side; splitting per family would duplicate the
     // common absent-key checks. The domain crate's round-trip tests and the
@@ -11711,9 +11742,21 @@ mod tests {
         assert_eq!(report_payload["MetricValuesCount"], 2);
         assert_eq!(report_payload["Id"], "1");
         assert_eq!(report_payload["Name"], "Power Report");
-        // The fixture carries a two-entry `MetricValues` array and a `Status`
-        // object; neither may leave the gateway, only the derived count may.
-        assert_eq!(report_payload.get("MetricValues"), None);
+        // The fixture carries a two-entry `MetricValues` array: every reading
+        // keeps its RFC 3339 `Timestamp` and the original `MetricValue` text,
+        // while the per-entry `MetricId` stays out of the strictly
+        // projectable field set. The report-level `Timestamp`/`Context`/
+        // `ReportSequence` metadata and the (schema-absent) `Status` object
+        // of the fixture never leave the gateway either.
+        let report_values = report_payload["MetricValues"]
+            .as_array()
+            .ok_or("MetricValues must be an array")?;
+        assert_eq!(report_values.len(), 2);
+        assert_eq!(report_values[0]["Timestamp"], "2026-08-01T09:30:00Z");
+        assert_eq!(report_values[0]["MetricValue"], "100");
+        assert_eq!(report_values[0].get("MetricId"), None);
+        assert_eq!(report_values[1]["Timestamp"], "2026-08-01T09:31:00Z");
+        assert_eq!(report_values[1]["MetricValue"], "94");
         assert_eq!(report_payload.get("Status"), None);
         assert_eq!(report_payload.get("Timestamp"), None);
         assert_eq!(report_payload.get("Context"), None);
@@ -11721,6 +11764,12 @@ mod tests {
         let report_minimal_payload: serde_json::Value =
             serde_json::from_str(resources[11].payload().as_str())?;
         assert_eq!(report_minimal_payload["MetricValuesCount"], 0);
+        // The empty `MetricValues` array of the minimal member is projected
+        // as an empty array, not omitted, mirroring the derived zero count.
+        assert_eq!(
+            report_minimal_payload["MetricValues"],
+            serde_json::json!([])
+        );
         let task_service_payload: serde_json::Value =
             serde_json::from_str(resources[12].payload().as_str())?;
         assert_eq!(task_service_payload["ServiceEnabled"], true);

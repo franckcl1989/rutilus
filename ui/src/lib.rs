@@ -19,9 +19,11 @@ use rutilus_api::{
     EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
     EventDestinationProtocol, EventListResponse, EventResponse, EventType, ManagerCommand,
-    OperationResponse, OperationSourceResponse, OperationStateResponse, RedfishCommand,
-    ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride,
-    StartUpdate, SystemCommand, TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
+    MetricValueResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, TelemetrySampleListResponse,
+    TelemetrySampleResponse, TelemetrySeriesResponse, TlsTrustModeResponse, UiLocationResponse,
+    UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1169,8 +1171,10 @@ fn metric_definition_card_facts(
 }
 
 /// Facts for one metric report under the §2.1 `telemetry-service` family; the
-/// derived metric-values count stays numeric as published so the card renders
-/// the sample size without re-parsing text.
+/// derived metric-values count stays numeric as published, and the latest
+/// reading renders as the newest value of the `MetricValues` array. The card
+/// stays concise — the full timestamped history belongs to the 0.4.0
+/// Telemetry view, not the resource card.
 ///
 /// The dispatcher guarantees this receives the `MetricReport` variant; the
 /// fallback keeps a stable empty facts list instead of panicking if that
@@ -1181,12 +1185,22 @@ fn metric_report_card_facts(
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::MetricReport {
         metric_values_count,
+        metric_values,
     } = resource
     else {
         return ("Metric report", Vec::new());
     };
     let mut facts = Vec::new();
     push_u64_fact(&mut facts, "Metric values", *metric_values_count);
+    // The latest reading is the newest entry that still carries a value;
+    // readings without a value (explicit null) are skipped.
+    push_fact(
+        &mut facts,
+        "Latest value",
+        metric_values
+            .as_ref()
+            .and_then(|values| values.iter().rev().find_map(MetricValueResponse::value)),
+    );
     ("Metric report", facts)
 }
 
@@ -1347,11 +1361,12 @@ enum ConsoleView {
     Operations,
     Events,
     Artifacts,
+    Telemetry,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 9] = [
+    const ALL: [ConsoleView; 10] = [
         Self::Overview,
         Self::Credentials,
         Self::AddEndpoint,
@@ -1361,6 +1376,7 @@ impl ConsoleView {
         Self::Operations,
         Self::Events,
         Self::Artifacts,
+        Self::Telemetry,
     ];
 
     const fn label(self) -> &'static str {
@@ -1374,6 +1390,7 @@ impl ConsoleView {
             Self::Operations => "Operations",
             Self::Events => "Events",
             Self::Artifacts => "Artifacts",
+            Self::Telemetry => "Telemetry",
         }
     }
 }
@@ -2507,6 +2524,147 @@ impl From<&EventResponse> for EventCardProjection {
 #[cfg(any(target_arch = "wasm32", test))]
 fn short_endpoint_id(endpoint_id: &str) -> String {
     endpoint_id.chars().take(8).collect()
+}
+
+/// One reading of the bounded §14.4 history, newest first, pre-formatted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TelemetryReadingProjection {
+    observed_at_text: String,
+    value_text: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&TelemetrySampleResponse> for TelemetryReadingProjection {
+    fn from(sample: &TelemetrySampleResponse) -> Self {
+        Self {
+            observed_at_text: format_observed_at(&sample.observed_at()),
+            value_text: sample.value().to_string(),
+        }
+    }
+}
+
+/// One telemetry series card: the current value, the bounded-history size,
+/// and the newest readings.
+///
+/// The presentation boundary of §14.4 不把产品变成通用时序数据库: the card
+/// renders the current value and a bounded newest-first reading list — no
+/// chart, no time-series visualization machinery, exactly the "current value
+/// and bounded history" surface the API serves. The full series id stays
+/// available as the card title attribute while the header shows the series
+/// key and the endpoint's short id.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TelemetryCardProjection {
+    series_id_title: String,
+    endpoint_short_id: String,
+    series_key: String,
+    /// The newest retained reading, absent when the series has no samples
+    /// yet (an upsert whose append failed, or the first tick pending).
+    latest_value_text: Option<String>,
+    /// The product-clock instant of the newest retained reading, present
+    /// exactly when the value is.
+    latest_observed_at_text: Option<String>,
+    sample_count_text: String,
+    history: Vec<TelemetryReadingProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TelemetryCardProjection {
+    /// Projects the series card from the series DTO; the history is attached
+    /// by [`Self::with_history`] once the bounded sample query returns.
+    fn from_series(series: &TelemetrySeriesResponse) -> Self {
+        Self {
+            series_id_title: series.series_id().to_string(),
+            endpoint_short_id: short_endpoint_id(&series.endpoint_id().to_string()),
+            series_key: series.series_key().to_owned(),
+            // Absent latest fields render no facts instead of a placeholder
+            // (the facts-list precedent).
+            latest_value_text: series.latest_value().map(|value| value.to_string()),
+            latest_observed_at_text: series
+                .latest_observed_at()
+                .map(|observed_at| format_observed_at(&observed_at)),
+            sample_count_text: series.sample_count().to_string(),
+            history: Vec::new(),
+        }
+    }
+
+    /// Attaches the bounded newest-first history, when the sample query
+    /// returned one; a failed or empty query renders the card without a
+    /// history list, keeping the current value visible.
+    fn with_history(mut self, samples: Option<&TelemetrySampleListResponse>) -> Self {
+        if let Some(samples) = samples {
+            self.history = samples
+                .samples()
+                .iter()
+                .map(TelemetryReadingProjection::from)
+                .collect();
+        }
+        self
+    }
+}
+
+/// The lazy-loading state of the §14.4 telemetry view.
+///
+/// The view fetches the series inventory, then the bounded newest-first
+/// history of every series through the per-series sample query. The two
+/// query surfaces fail differently: a failed series fetch fails the whole
+/// view (there is nothing to render, so the section shows the failure copy),
+/// while a failed per-series history fetch degrades to that card alone —
+/// the readings list is omitted and the current-value facts stay visible
+/// ([`TelemetryCardProjection::with_history`]).
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TelemetryListState {
+    Idle,
+    Loading,
+    Ready(Vec<TelemetryCardProjection>),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TelemetryListState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn has_empty_series(&self) -> bool {
+        matches!(self, Self::Ready(cards) if cards.is_empty())
+    }
+
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(cards) => cards.len(),
+            Self::Idle | Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 series".to_owned(),
+            _ => format!("{count} series"),
+        }
+    }
+
+    /// Static failure copy for the whole-section error state.
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The telemetry history is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn cards(&self) -> Vec<TelemetryCardProjection> {
+        match self {
+            Self::Ready(cards) => cards.clone(),
+            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
 }
 
 /// The §13.2 lifecycle phase of one persisted operation, as display vocabulary.
@@ -4636,7 +4794,8 @@ mod browser {
         EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
         EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-        EventListResponse, OperationListResponse, OperationResponse, TrustedEndpointResponse,
+        EventListResponse, OperationListResponse, OperationResponse, TelemetrySampleListResponse,
+        TelemetrySeriesListResponse, TelemetrySeriesResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -4654,9 +4813,10 @@ mod browser {
         ImportFailure, ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
         OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
         OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
-        ResetKeysTypeView, ResetTypeView, SecureBootActionView, TrustChallengeProjection,
-        UpdateArtifactChoice, artifact_chunk_range_at, artifact_upload_status_text, base64_encode,
-        build_command, command_summary, endpoint_address_draft_error, format_artifact_size,
+        ResetKeysTypeView, ResetTypeView, SecureBootActionView, TelemetryCardProjection,
+        TelemetryListState, TrustChallengeProjection, UpdateArtifactChoice,
+        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
+        command_summary, endpoint_address_draft_error, format_artifact_size,
         operation_endpoint_choices, sha256_hex, trust_mode_label, update_artifact_choices,
     };
 
@@ -4821,6 +4981,7 @@ mod browser {
                 />
                 <OperationsView view=view load_state=state />
                 <EventsView view=view />
+                <TelemetryView view=view />
                 <ArtifactsView view=view />
             </main>
         }
@@ -6346,6 +6507,142 @@ mod browser {
     }
 
     #[component]
+    fn TelemetryView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Telemetry;
+        let (state, set_state) = signal(TelemetryListState::Idle);
+        let (triggered, set_triggered) = signal(false);
+
+        Effect::new(move |_| {
+            if active() && !triggered.get() {
+                set_triggered.set(true);
+                set_state.set(TelemetryListState::Loading);
+                spawn_local(async move {
+                    let state = match fetch_telemetry().await {
+                        Some(cards) => TelemetryListState::Ready(cards),
+                        None => TelemetryListState::Failed,
+                    };
+                    set_state.set(state);
+                });
+            }
+        });
+
+        let on_refresh = move |_| {
+            set_state.set(TelemetryListState::Loading);
+            spawn_local(async move {
+                let state = match fetch_telemetry().await {
+                    Some(cards) => TelemetryListState::Ready(cards),
+                    None => TelemetryListState::Failed,
+                };
+                set_state.set(state);
+            });
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Telemetry"</p>
+                        <h2>{move || state.get().count_text()}</h2>
+                    </div>
+                    <p>"Current values and bounded history, newest first"</p>
+                </div>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !state.get().is_ready() || !state.get().has_empty_series()
+                    }
+                >
+                    "No telemetry series have been sampled yet. Refresh the endpoint inventory to capture readings."
+                </p>
+                <div class="resource-list">
+                    {move || {
+                        state
+                            .get()
+                            .cards()
+                            .into_iter()
+                            .map(|card| view! { <TelemetrySeriesCard card=card /> })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || state.get().is_loading()
+                        hidden=move || {
+                            !state.get().is_ready() && !state.get().is_failed()
+                        }
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="form-error" hidden=move || !state.get().is_failed()>
+                    {move || state.get().failure_message()}
+                </p>
+            </section>
+        }
+    }
+
+    #[component]
+    fn TelemetrySeriesCard(card: TelemetryCardProjection) -> impl IntoView {
+        let TelemetryCardProjection {
+            series_id_title,
+            endpoint_short_id,
+            series_key,
+            latest_value_text,
+            latest_observed_at_text,
+            sample_count_text,
+            history,
+        } = card;
+        // Absent current value renders no facts instead of a placeholder
+        // (the facts-list precedent); the rows are pre-formatted.
+        let value_empty = latest_value_text.is_none() || latest_observed_at_text.is_none();
+        let value_text = latest_value_text.unwrap_or_default();
+        let observed_at_text = latest_observed_at_text.unwrap_or_default();
+        let history_empty = history.is_empty();
+
+        view! {
+            <article class="credential-card">
+                <div class="credential-title">
+                    <div>
+                        <h3 class="event-message-id" title=series_id_title>{series_key}</h3>
+                        <p class="credential-username">"endpoint "{endpoint_short_id}</p>
+                    </div>
+                </div>
+                <dl class="resource-facts">
+                    <div hidden=value_empty>
+                        <dt>"Current value"</dt>
+                        <dd>{value_text}</dd>
+                    </div>
+                    <div hidden=value_empty>
+                        <dt>"Latest observed at"</dt>
+                        <dd>{observed_at_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Samples retained"</dt>
+                        <dd>{sample_count_text}</dd>
+                    </div>
+                </dl>
+                <p class="section-label" hidden=history_empty>"Latest readings"</p>
+                <ol class="telemetry-history" hidden=history_empty>
+                    {history
+                        .into_iter()
+                        .map(|reading| {
+                            view! {
+                                <li>
+                                    <span class="telemetry-history-value">{reading.value_text}</span>
+                                    <span class="telemetry-history-time">{reading.observed_at_text}</span>
+                                </li>
+                            }
+                        })
+                        .collect_view()}
+                </ol>
+            </article>
+        }
+    }
+
+    #[component]
     fn CapabilitiesView(
         view: ReadSignal<ConsoleView>,
         target: ReadSignal<Option<CapabilityTargetProjection>>,
@@ -6547,6 +6844,12 @@ mod browser {
     /// actually returned.
     const EVENT_QUERY_LIMIT: u32 = 50;
 
+    /// How many readings the console requests per series from the bounded
+    /// §14.4 history query. The presentation boundary of 不把产品变成通用时序
+    /// 数据库: a bounded newest-first list per card, not a chart or an
+    /// unbounded scroll.
+    const TELEMETRY_SAMPLE_LIMIT: u32 = 20;
+
     async fn fetch_events() -> Option<EventListResponse> {
         let url = format!("/api/v1/events?limit={EVENT_QUERY_LIMIT}");
         let response = Request::get(&url)
@@ -6558,6 +6861,47 @@ mod browser {
             return None;
         }
         response.json::<EventListResponse>().await.ok()
+    }
+
+    /// Fetches the §14.4 telemetry surface: the series inventory, then the
+    /// bounded newest-first history of every series. A series without
+    /// samples keeps its card with the current-value facts absent.
+    async fn fetch_telemetry() -> Option<Vec<TelemetryCardProjection>> {
+        let response = Request::get("/api/v1/telemetry")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        let series = response.json::<TelemetrySeriesListResponse>().await.ok()?;
+        let mut cards = Vec::with_capacity(series.series().len());
+        for item in series.series() {
+            let samples = fetch_telemetry_samples(item).await;
+            cards.push(TelemetryCardProjection::from_series(item).with_history(samples.as_ref()));
+        }
+        Some(cards)
+    }
+
+    async fn fetch_telemetry_samples(
+        series: &TelemetrySeriesResponse,
+    ) -> Option<TelemetrySampleListResponse> {
+        // The series id renders through its `Display`; the id type itself
+        // stays serialization-free in this crate.
+        let url = format!(
+            "/api/v1/telemetry/{}/samples?limit={TELEMETRY_SAMPLE_LIMIT}",
+            series.series_id()
+        );
+        let response = Request::get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        response.json::<TelemetrySampleListResponse>().await.ok()
     }
 
     async fn fetch_credentials() -> Option<CredentialInventoryResponse> {
@@ -8221,6 +8565,7 @@ mod browser {
 mod tests {
     use std::error::Error;
 
+    use rutilus_api::TelemetrySeriesListResponse;
     use serde_json::json;
 
     use super::*;
@@ -9169,7 +9514,17 @@ mod tests {
             "resource": {
                 "resource_type": "metric_report",
                 "details": {
-                    "metric_values_count": 12
+                    "metric_values_count": 2,
+                    "metric_values": [
+                        {
+                            "timestamp": "2026-08-05T10:20:00Z",
+                            "value": "31.5"
+                        },
+                        {
+                            "timestamp": "2026-08-05T10:21:00Z",
+                            "value": "32.0"
+                        }
+                    ]
                 }
             }
         })
@@ -10073,6 +10428,129 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_projection_renders_current_value_and_bounded_history() -> Result<(), Box<dyn Error>>
+    {
+        let series = serde_json::from_value::<TelemetrySeriesListResponse>(json!({
+            "series": [
+                {
+                    "series_id": "01989abc-def0-7abc-8def-0123456789c1",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "series_key": "PowerMetrics",
+                    "sample_count": 1440,
+                    "latest_value": 94.0,
+                    "latest_observed_at": "2026-08-06T11:12:14Z"
+                },
+                {
+                    "series_id": "01989abc-def0-7abc-8def-0123456789c2",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "series_key": "ThermalMetrics",
+                    "sample_count": 0,
+                    "latest_value": null,
+                    "latest_observed_at": null
+                }
+            ]
+        }))?;
+        let samples = serde_json::from_value::<TelemetrySampleListResponse>(json!({
+            "samples": [
+                {
+                    "series_id": "01989abc-def0-7abc-8def-0123456789c1",
+                    "observed_at": "2026-08-06T11:12:14Z",
+                    "bmc_timestamp": "2026-08-06T11:12:13Z",
+                    "value": 94.0
+                },
+                {
+                    "series_id": "01989abc-def0-7abc-8def-0123456789c1",
+                    "observed_at": "2026-08-06T11:11:14Z",
+                    "bmc_timestamp": "2026-08-06T11:11:13Z",
+                    "value": 100.0
+                }
+            ]
+        }))?;
+
+        let first = TelemetryCardProjection::from_series(
+            series.series().first().ok_or("series card must exist")?,
+        )
+        .with_history(Some(&samples));
+        assert_eq!(first.series_key, "PowerMetrics");
+        assert_eq!(first.endpoint_short_id, "01989abc");
+        assert_eq!(
+            first.series_id_title,
+            "01989abc-def0-7abc-8def-0123456789c1"
+        );
+        assert_eq!(first.latest_value_text.as_deref(), Some("94"));
+        assert_eq!(
+            first.latest_observed_at_text.as_deref(),
+            Some("2026-08-06T11:12:14Z")
+        );
+        assert_eq!(first.sample_count_text, "1440");
+        // The bounded history renders newest first, exactly as the server
+        // listed it — the presentation boundary of 不把产品变成通用时序数据库.
+        assert_eq!(
+            first.history,
+            [
+                TelemetryReadingProjection {
+                    observed_at_text: "2026-08-06T11:12:14Z".to_owned(),
+                    value_text: "94".to_owned(),
+                },
+                TelemetryReadingProjection {
+                    observed_at_text: "2026-08-06T11:11:14Z".to_owned(),
+                    value_text: "100".to_owned(),
+                },
+            ]
+        );
+
+        // A series whose upsert preceded its first append has no current
+        // value: the card renders no value facts instead of a placeholder.
+        let empty = TelemetryCardProjection::from_series(
+            series
+                .series()
+                .get(1)
+                .ok_or("empty series card must exist")?,
+        )
+        .with_history(None);
+        assert_eq!(empty.series_key, "ThermalMetrics");
+        assert_eq!(empty.latest_value_text, None);
+        assert_eq!(empty.latest_observed_at_text, None);
+        assert_eq!(empty.sample_count_text, "0");
+        assert!(empty.history.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_list_state_counts_and_reports_failures() -> Result<(), Box<dyn Error>> {
+        let series = serde_json::from_value::<TelemetrySeriesListResponse>(json!({
+            "series": [
+                {
+                    "series_id": "01989abc-def0-7abc-8def-0123456789c1",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "series_key": "PowerMetrics",
+                    "sample_count": 1,
+                    "latest_value": 94.0,
+                    "latest_observed_at": "2026-08-06T11:12:14Z"
+                }
+            ]
+        }))?;
+        let card = TelemetryCardProjection::from_series(
+            series.series().first().ok_or("series card must exist")?,
+        );
+        let state = TelemetryListState::Ready(vec![card]);
+        assert!(state.is_ready());
+        assert!(!state.is_failed());
+        assert!(!state.has_empty_series());
+        assert_eq!(state.count_text(), "1 series");
+        assert_eq!(state.cards().len(), 1);
+
+        assert!(!TelemetryListState::Idle.is_loading());
+        assert!(TelemetryListState::Loading.is_loading());
+        assert_eq!(
+            TelemetryListState::Failed.failure_message(),
+            "The telemetry history is temporarily unavailable."
+        );
+        assert!(TelemetryListState::Ready(Vec::new()).has_empty_series());
+        Ok(())
+    }
+
+    #[test]
     fn event_cards_reestablish_newest_first_order() -> Result<(), Box<dyn Error>> {
         // The fixture deliberately arrives out of order, and its BMC event
         // timestamps run against the receive times: the bounded history
@@ -10852,7 +11330,14 @@ mod tests {
         );
         assert!(report.facts.contains(&ResourceFactProjection {
             label: "Metric values",
-            value: "12".to_owned(),
+            value: "2".to_owned(),
+        }));
+        // The card stays concise: only the latest reading of the value array
+        // renders as a fact; the timestamped history belongs to the Telemetry
+        // view.
+        assert!(report.facts.contains(&ResourceFactProjection {
+            label: "Latest value",
+            value: "32.0".to_owned(),
         }));
         assert_eq!(
             current.resource_counts,
@@ -10879,6 +11364,7 @@ mod tests {
                 ConsoleView::Operations,
                 ConsoleView::Events,
                 ConsoleView::Artifacts,
+                ConsoleView::Telemetry,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -10890,6 +11376,7 @@ mod tests {
         assert_eq!(ConsoleView::Operations.label(), "Operations");
         assert_eq!(ConsoleView::Events.label(), "Events");
         assert_eq!(ConsoleView::Artifacts.label(), "Artifacts");
+        assert_eq!(ConsoleView::Telemetry.label(), "Telemetry");
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(

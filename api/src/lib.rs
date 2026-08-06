@@ -1144,16 +1144,20 @@ pub enum CoreResourceDetailsResponse {
     /// from the typed Redfish metric-report schema (`MetricReport_v1`,
     /// nv-redfish-schema 0.13).
     ///
-    /// Only metadata is projected: `metric_values_count` is derived from the
-    /// length of the `MetricValues` array. The values themselves are
-    /// deliberately not projected — each `MetricValue` entry carries a
-    /// timestamped reading, which is the telemetry history of the 0.4.0
-    /// iteration, and carrying unbounded value arrays now would defeat the
-    /// strict `deny_unknown_fields` alignment with the infra payload.
-    /// `MetricReport_v1` declares no `Status` property (the report instead
-    /// carries `Timestamp` and `Context` metadata), so this family carries no
-    /// status field either.
-    MetricReport { metric_values_count: Option<u64> },
+    /// `metric_values_count` is derived from the length of the `MetricValues`
+    /// array and `metric_values` carries the timestamped readings themselves —
+    /// the current-value surface of the 0.4.0 telemetry-history iteration,
+    /// which the Telemetry view renders (the resource card shows only the
+    /// latest reading). Both stay optional for backward compatibility: the
+    /// count is absent when the report carries no value array, and the
+    /// readings are absent for snapshots persisted by the 0.2.0 iteration,
+    /// which projected only the derived count. `MetricReport_v1` declares no
+    /// `Status` property (the report instead carries `Timestamp` and
+    /// `Context` metadata), so this family carries no status field either.
+    MetricReport {
+        metric_values_count: Option<u64>,
+        metric_values: Option<Vec<MetricValueResponse>>,
+    },
     /// One §2.1 `task-service` family member projected from the typed Redfish
     /// task-service schema (`TaskService_v1`, nv-redfish-schema 0.13).
     ///
@@ -1191,6 +1195,37 @@ pub enum CoreResourceDetailsResponse {
         #[serde(with = "time::serde::rfc3339::option")]
         end_time: Option<OffsetDateTime>,
     },
+}
+
+/// One timestamped reading of a `MetricReport`, retained without
+/// normalization loss: `timestamp` keeps the RFC 3339 instant of the compiled
+/// `Edm.DateTimeOffset` type and `value` the original text of the compiled
+/// `Edm.String` type (the DMTF schema represents numeric readings as
+/// strings, so a numeric projection would lose the non-numeric boolean and
+/// array representations).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricValueResponse {
+    #[serde(with = "time::serde::rfc3339::option")]
+    timestamp: Option<OffsetDateTime>,
+    value: Option<String>,
+}
+
+impl MetricValueResponse {
+    #[must_use]
+    pub const fn new(timestamp: Option<OffsetDateTime>, value: Option<String>) -> Self {
+        Self { timestamp, value }
+    }
+
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<OffsetDateTime> {
+        self.timestamp
+    }
+
+    #[must_use]
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -1990,6 +2025,180 @@ impl EventListResponse {
     #[must_use]
     pub fn events(&self) -> &[EventResponse] {
         &self.events
+    }
+}
+
+/// One telemetry series with the aggregates of the §14.4 current-value
+/// surface.
+///
+/// `series_key` is the product's stable series identity text (the report
+/// identity the sampler derived; see the domain `SeriesKey` doc), `sample_count`
+/// the size of the bounded history the persistence maintains, and
+/// `latest_value`/`latest_observed_at` the newest retained sample — both
+/// present or both absent, since a series created by an upsert whose append
+/// failed has no samples yet. The product is deliberately not a general-purpose
+/// time-series database (§14.4): this is the whole series surface, bounded by
+/// the retention policy.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySeriesResponse {
+    series_id: Uuid,
+    endpoint_id: Uuid,
+    series_key: String,
+    sample_count: u64,
+    latest_value: Option<f64>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    latest_observed_at: Option<OffsetDateTime>,
+}
+
+impl TelemetrySeriesResponse {
+    #[must_use]
+    pub const fn new(
+        series_id: Uuid,
+        endpoint_id: Uuid,
+        series_key: String,
+        sample_count: u64,
+        latest_value: Option<f64>,
+        latest_observed_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            series_id,
+            endpoint_id,
+            series_key,
+            sample_count,
+            latest_value,
+            latest_observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn series_id(&self) -> Uuid {
+        self.series_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn series_key(&self) -> &str {
+        &self.series_key
+    }
+
+    #[must_use]
+    pub const fn sample_count(&self) -> u64 {
+        self.sample_count
+    }
+
+    #[must_use]
+    pub const fn latest_value(&self) -> Option<f64> {
+        self.latest_value
+    }
+
+    #[must_use]
+    pub const fn latest_observed_at(&self) -> Option<OffsetDateTime> {
+        self.latest_observed_at
+    }
+}
+
+/// Stable envelope for the telemetry series query (§14.4).
+///
+/// `PartialEq` (not `Eq`) because the series items carry `f64` readings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySeriesListResponse {
+    series: Vec<TelemetrySeriesResponse>,
+}
+
+impl TelemetrySeriesListResponse {
+    #[must_use]
+    pub const fn new(series: Vec<TelemetrySeriesResponse>) -> Self {
+        Self { series }
+    }
+
+    #[must_use]
+    pub fn series(&self) -> &[TelemetrySeriesResponse] {
+        &self.series
+    }
+}
+
+/// One persisted telemetry reading for the local console (§14.4).
+///
+/// `observed_at` is the product clock's sampling time — the ordering and
+/// bounded-history key — and `bmc_timestamp` optionally preserves the BMC's
+/// own `MetricValue.Timestamp` beside it, exactly like the events model
+/// keeps the two clocks side by side. The value is finite by construction
+/// (the domain refuses non-finite readings).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySampleResponse {
+    series_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    observed_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    bmc_timestamp: Option<OffsetDateTime>,
+    value: f64,
+}
+
+impl TelemetrySampleResponse {
+    #[must_use]
+    pub const fn new(
+        series_id: Uuid,
+        observed_at: OffsetDateTime,
+        bmc_timestamp: Option<OffsetDateTime>,
+        value: f64,
+    ) -> Self {
+        Self {
+            series_id,
+            observed_at,
+            bmc_timestamp,
+            value,
+        }
+    }
+
+    #[must_use]
+    pub const fn series_id(&self) -> Uuid {
+        self.series_id
+    }
+
+    /// Returns when the product's sampler took this reading.
+    #[must_use]
+    pub const fn observed_at(&self) -> OffsetDateTime {
+        self.observed_at
+    }
+
+    /// Returns the BMC's own `MetricValue.Timestamp`, when the source
+    /// reported one.
+    #[must_use]
+    pub const fn bmc_timestamp(&self) -> Option<OffsetDateTime> {
+        self.bmc_timestamp
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> f64 {
+        self.value
+    }
+}
+
+/// Stable envelope for a bounded, newest-first sample query (§14.4).
+///
+/// `PartialEq` (not `Eq`) because the sample items carry `f64` readings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySampleListResponse {
+    samples: Vec<TelemetrySampleResponse>,
+}
+
+impl TelemetrySampleListResponse {
+    #[must_use]
+    pub const fn new(samples: Vec<TelemetrySampleResponse>) -> Self {
+        Self { samples }
+    }
+
+    #[must_use]
+    pub fn samples(&self) -> &[TelemetrySampleResponse] {
+        &self.samples
     }
 }
 
@@ -4487,7 +4696,7 @@ mod tests {
 
     #[test]
     fn core_resource_contract_carries_metric_report_wire_values() -> Result<(), Box<dyn Error>> {
-        let metric_report = metric_report_resource();
+        let metric_report = metric_report_resource()?;
 
         assert_eq!(
             serde_json::to_value(&metric_report)?,
@@ -4506,7 +4715,17 @@ mod tests {
                 "resource": {
                     "resource_type": "metric_report",
                     "details": {
-                        "metric_values_count": 12
+                        "metric_values_count": 2,
+                        "metric_values": [
+                            {
+                                "timestamp": "2026-08-05T10:20:00Z",
+                                "value": "31.5"
+                            },
+                            {
+                                "timestamp": "2026-08-05T10:21:00Z",
+                                "value": null
+                            }
+                        ]
                     }
                 }
             })
@@ -4515,6 +4734,10 @@ mod tests {
             serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&metric_report)?)?,
             metric_report
         );
+        // The strict decoder rejects both an unknown top-level key and an
+        // unknown entry key inside `metric_values` — the entry contract is as
+        // strict as the report contract, so a future projection cannot
+        // silently widen the wire shape.
         assert!(
             serde_json::from_value::<CoreResourceDetailsResponse>(json!({
                 "resource_type": "metric_report",
@@ -4525,6 +4748,32 @@ mod tests {
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "metric_report",
+                "details": {
+                    "metric_values_count": null,
+                    "metric_values": [{"timestamp": null, "value": "100", "arbitrary": true}]
+                }
+            }))
+            .is_err()
+        );
+        // A report without readings (the 0.2.0 snapshot shape) decodes with
+        // `metric_values: None` instead of failing, keeping old wire payloads
+        // readable.
+        let legacy: CoreResourceDetailsResponse = serde_json::from_value(json!({
+            "resource_type": "metric_report",
+            "details": {
+                "metric_values_count": 12
+            }
+        }))?;
+        assert!(matches!(
+            legacy,
+            CoreResourceDetailsResponse::MetricReport {
+                metric_values_count: Some(12),
+                metric_values: None,
+            }
+        ));
         Ok(())
     }
 
@@ -4790,8 +5039,8 @@ mod tests {
         )
     }
 
-    fn metric_report_resource() -> CoreResourceResponse {
-        CoreResourceResponse::new(
+    fn metric_report_resource() -> Result<CoreResourceResponse, &'static str> {
+        Ok(CoreResourceResponse::new(
             CoreResourceSourceResponse::new(
                 uuid!("01989abc-def0-7abc-8def-0123456789ea"),
                 "/redfish/v1/TelemetryService/MetricReports/1".to_owned(),
@@ -4804,9 +5053,25 @@ mod tests {
                 None,
             ),
             CoreResourceDetailsResponse::MetricReport {
-                metric_values_count: Some(12),
+                metric_values_count: Some(2),
+                metric_values: Some(vec![
+                    MetricValueResponse::new(
+                        Some(
+                            OffsetDateTime::from_unix_timestamp(1_785_925_200)
+                                .map_err(|_| "fixture timestamp must convert")?,
+                        ),
+                        Some("31.5".to_owned()),
+                    ),
+                    MetricValueResponse::new(
+                        Some(
+                            OffsetDateTime::from_unix_timestamp(1_785_925_260)
+                                .map_err(|_| "fixture timestamp must convert")?,
+                        ),
+                        None,
+                    ),
+                ]),
             },
-        )
+        ))
     }
 
     fn task_service_resource() -> CoreResourceResponse {
@@ -5774,6 +6039,137 @@ mod tests {
                 "message": null,
                 "event_timestamp": "2026-08-07T03:21:00Z",
                 "observed_at": "2026-08-07T03:21:05Z",
+                "extra": true
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_series_contract_pins_the_current_value_wire_shape() -> Result<(), Box<dyn Error>> {
+        let latest_observed_at = OffsetDateTime::parse("2026-08-07T03:21:00Z", &Rfc3339)?;
+        let sampled = TelemetrySeriesResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789102"),
+            "PowerMetrics/PowerConsumedWatts".to_owned(),
+            1440,
+            Some(421.5),
+            Some(latest_observed_at),
+        );
+        // A series whose upsert preceded its first successful append has no
+        // samples: both latest fields are absent together.
+        let empty = TelemetrySeriesResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789103"),
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789102"),
+            "ThermalMetrics/Temperature".to_owned(),
+            0,
+            None,
+            None,
+        );
+        let response = TelemetrySeriesListResponse::new(vec![sampled, empty]);
+
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "series": [
+                    {
+                        "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+                        "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789102"),
+                        "series_key": "PowerMetrics/PowerConsumedWatts",
+                        "sample_count": 1440,
+                        "latest_value": 421.5,
+                        "latest_observed_at": "2026-08-07T03:21:00Z"
+                    },
+                    {
+                        "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789103"),
+                        "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789102"),
+                        "series_key": "ThermalMetrics/Temperature",
+                        "sample_count": 0,
+                        "latest_value": null,
+                        "latest_observed_at": null
+                    }
+                ]
+            })
+        );
+        assert!(
+            serde_json::from_value::<TelemetrySeriesListResponse>(serde_json::to_value(
+                &response
+            )?)? == response,
+            "the series contract must round-trip"
+        );
+        let encoded = serde_json::to_string(&response)?;
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("secret"));
+        assert!(
+            serde_json::from_value::<TelemetrySeriesResponse>(json!({
+                "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+                "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789102"),
+                "series_key": "PowerMetrics/PowerConsumedWatts",
+                "sample_count": 1440,
+                "latest_value": null,
+                "latest_observed_at": null,
+                "extra": true
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_sample_contract_pins_the_two_clock_wire_shape() -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-07T03:21:00Z", &Rfc3339)?;
+        let bmc_reported = OffsetDateTime::parse("2026-08-07T03:20:55Z", &Rfc3339)?;
+        let sample = TelemetrySampleResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+            observed_at,
+            Some(bmc_reported),
+            32.5,
+        );
+        // The BMC clock is optional display metadata: a reading without one
+        // serializes the timestamp as null.
+        let without_bmc = TelemetrySampleResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+            observed_at,
+            None,
+            33.0,
+        );
+        let response = TelemetrySampleListResponse::new(vec![sample, without_bmc]);
+
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "samples": [
+                    {
+                        "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+                        "observed_at": "2026-08-07T03:21:00Z",
+                        "bmc_timestamp": "2026-08-07T03:20:55Z",
+                        "value": 32.5
+                    },
+                    {
+                        "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+                        "observed_at": "2026-08-07T03:21:00Z",
+                        "bmc_timestamp": null,
+                        "value": 33.0
+                    }
+                ]
+            })
+        );
+        assert!(
+            serde_json::from_value::<TelemetrySampleListResponse>(serde_json::to_value(
+                &response
+            )?)? == response,
+            "the sample contract must round-trip"
+        );
+        let encoded = serde_json::to_string(&response)?;
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("secret"));
+        assert!(
+            serde_json::from_value::<TelemetrySampleResponse>(json!({
+                "series_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789101"),
+                "observed_at": "2026-08-07T03:21:00Z",
+                "bmc_timestamp": null,
+                "value": 32.5,
                 "extra": true
             }))
             .is_err()

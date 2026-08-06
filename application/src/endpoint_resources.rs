@@ -60,6 +60,35 @@ impl ResourceStatusSummary {
     }
 }
 
+/// One timestamped reading of a `MetricReport` member, retained without
+/// normalization loss: `timestamp` keeps the RFC 3339 instant of the compiled
+/// `Edm.DateTimeOffset` type and `value` the original text of the compiled
+/// `Edm.String` type (the DMTF schema represents numeric readings as
+/// strings, so a numeric projection would lose the non-numeric boolean and
+/// array representations).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricValueSummary {
+    timestamp: Option<OffsetDateTime>,
+    value: Option<String>,
+}
+
+impl MetricValueSummary {
+    #[must_use]
+    pub const fn new(timestamp: Option<OffsetDateTime>, value: Option<String>) -> Self {
+        Self { timestamp, value }
+    }
+
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<OffsetDateTime> {
+        self.timestamp
+    }
+
+    #[must_use]
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+}
+
 /// Feature-specific fields from one public `nv-redfish` typed projection.
 ///
 /// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
@@ -320,13 +349,19 @@ pub enum CoreResourceDetails {
         metric_type: Option<String>,
     },
     /// One metric report under the §2.1 `telemetry-service` feature (a
-    /// `MetricReport_v1` collection member). Only metadata is projected:
-    /// `metric_values_count` is derived from the length of the `MetricValues`
-    /// array, because each entry carries a timestamped reading that belongs to
-    /// the telemetry-history iteration, and the schema declares no `Status`
-    /// property (the report instead carries `Timestamp` and `Context`
-    /// metadata).
-    MetricReport { metric_values_count: Option<u64> },
+    /// `MetricReport_v1` collection member). `metric_values_count` is derived
+    /// from the length of the `MetricValues` array and `metric_values` carries
+    /// the timestamped readings themselves — the current-value surface of the
+    /// telemetry-history iteration, rendered by the 0.4.0 Telemetry view.
+    /// Both stay optional: the array is absent when the report carries no
+    /// values, and snapshots persisted by the 0.2.0 iteration carry only the
+    /// derived count, so a missing array must decode as `None` instead of
+    /// failing the strict decoder. The schema declares no `Status` property
+    /// (the report instead carries `Timestamp` and `Context` metadata).
+    MetricReport {
+        metric_values_count: Option<u64>,
+        metric_values: Option<Vec<MetricValueSummary>>,
+    },
     /// One §2.1 `task-service` family member (a `TaskService_v1` root
     /// singleton). `completed_task_overwrite_policy` stays the
     /// `OverWritePolicy` enumeration string so the console renders it without
@@ -1106,6 +1141,12 @@ where
     project_typed::<MetricReportPayload, _, RepositoryError>(snapshot, payload, |parsed| {
         CoreResourceDetails::MetricReport {
             metric_values_count: parsed.metric_values_count,
+            metric_values: parsed.metric_values.map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| MetricValueSummary::new(value.timestamp, value.metric_value))
+                    .collect()
+            }),
         }
     })
 }
@@ -2001,6 +2042,12 @@ struct MetricReportPayload {
     description: Option<String>,
     #[serde(rename = "MetricValuesCount")]
     metric_values_count: Option<u64>,
+    /// The timestamped readings of the `MetricValues` array, projected since
+    /// 0.4.0. Snapshots persisted by the 0.2.0 iteration carry only
+    /// `MetricValuesCount`, so the field must be `Option`: a missing array
+    /// decodes as `None` instead of failing the strict decoder.
+    #[serde(rename = "MetricValues")]
+    metric_values: Option<Vec<MetricValuePayload>>,
 }
 
 impl CommonPayload for MetricReportPayload {
@@ -2011,6 +2058,21 @@ impl CommonPayload for MetricReportPayload {
             description: self.description.clone(),
         }
     }
+}
+
+/// One timestamped reading of a `MetricReport` snapshot, kept exactly as the
+/// infra projection wrote it: `Timestamp` stays the RFC 3339 instant of the
+/// compiled `Edm.DateTimeOffset` type and `MetricValue` the original text of
+/// the compiled `Edm.String` type. `deny_unknown_fields` keeps the snapshot
+/// contract strict, so a future extra entry key would make stored snapshots
+/// unreadable exactly like an extra top-level key would.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricValuePayload {
+    #[serde(rename = "Timestamp", with = "time::serde::rfc3339::option")]
+    timestamp: Option<OffsetDateTime>,
+    #[serde(rename = "MetricValue")]
+    metric_value: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3151,11 +3213,75 @@ mod tests {
             "/redfish/v1/TelemetryService/MetricReports/1"
         );
         assert_eq!(report.common().name(), "Inlet Temperature Report");
+        // The snapshot payload is the 0.2.0 shape (only the derived count):
+        // the missing `MetricValues` array must decode as `None` instead of
+        // failing the strict decoder, so pre-0.4.0 snapshots stay readable.
         assert!(matches!(
             report.details(),
             CoreResourceDetails::MetricReport {
                 metric_values_count: Some(12),
+                metric_values: None,
             }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_metric_report_value_arrays() -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(23)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::MetricReport,
+                    "/redfish/v1/TelemetryService/MetricReports/1",
+                    // The 0.4.0 snapshot shape: the `MetricValues` array of
+                    // timestamped readings beside the derived count, with an
+                    // explicit null value exercising the nullable decode.
+                    r#"{"Id":"1","Name":"Inlet Temperature Report","Description":"Latest inlet temperature report","MetricValuesCount":2,"MetricValues":[{"Timestamp":"2026-08-05T10:20:00Z","MetricValue":"31.5"},{"Timestamp":"2026-08-05T10:21:00Z","MetricValue":null}]}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let report = &result.resources()[1];
+        assert_eq!(report.feature(), ResourceFeature::MetricReport);
+        assert_eq!(report.common().name(), "Inlet Temperature Report");
+        assert!(matches!(
+            report.details(),
+            CoreResourceDetails::MetricReport {
+                metric_values_count: Some(2),
+                metric_values: Some(values),
+            } if values.len() == 2
+                // The typed `Timestamp` instants of the fixture timestamps
+                // (epoch seconds 1785925200 and 1785925260) survive the
+                // projection unchanged, and the explicit null value decodes
+                // as `None` while the text `MetricValue` stays untouched.
+                && values[0].timestamp()
+                    == Some(OffsetDateTime::from_unix_timestamp(1_785_925_200)
+                        .map_err(|_| "fixture timestamp must convert")?)
+                && values[0].value() == Some("31.5")
+                && values[1].timestamp()
+                    == Some(OffsetDateTime::from_unix_timestamp(1_785_925_260)
+                        .map_err(|_| "fixture timestamp must convert")?)
+                && values[1].value().is_none()
         ));
         Ok(())
     }

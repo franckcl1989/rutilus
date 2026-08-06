@@ -17,6 +17,7 @@ mod event_ingestion;
 mod operation_executor;
 mod operation_submission;
 mod task_monitor;
+mod telemetry_sampler;
 mod update_executor;
 
 pub use artifact_store::{
@@ -67,7 +68,8 @@ pub use endpoint_refresh::{
 };
 pub use endpoint_resources::{
     CoreResourceCommon, CoreResourceDetails, CoreResourceSummary, EndpointResourceInventory,
-    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, ResourceStatusSummary,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, MetricValueSummary,
+    ResourceStatusSummary,
 };
 pub use endpoint_trust::{
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
@@ -81,6 +83,11 @@ pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecut
 pub use operation_submission::{OperationSubmission, SubmissionError};
 pub use task_monitor::{
     MonitorAuditStage, TaskMonitor, TaskMonitorError, TaskObservation, TaskPoll, TaskReader,
+};
+pub use telemetry_sampler::{
+    EndpointSampling, MetricReportReadError, MetricReportReader, MetricReportReading,
+    MetricReportSnapshotReader, MetricReportValues, MetricReportValuesError, TelemetryRepository,
+    TelemetrySampler, TelemetrySamplerError,
 };
 pub use update_executor::{UpdateArtifactPayload, UpdateExecutor};
 

@@ -29,10 +29,11 @@ use rutilus_api::{
     EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
     EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
     EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, EventListResponse,
-    EventResponse, HealthResponse, OperationListResponse, OperationResponse,
+    EventResponse, HealthResponse, MetricValueResponse, OperationListResponse, OperationResponse,
     OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    ResourceStatusResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
-    UiLocationResponse,
+    ResourceStatusResponse, TelemetrySampleListResponse, TelemetrySampleResponse,
+    TelemetrySeriesListResponse, TelemetrySeriesResponse, TlsTrustModeResponse,
+    TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -50,14 +51,16 @@ use rutilus_application::{
     EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
     EnrolledEndpoint, EventRepository, NewCredentialRequest, OnboardEndpointError,
     OnboardEndpointRequest, OperationStore, OperationSubmission, RedfishDiscovery,
-    ResourceStatusSummary, SubmissionError, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    ResourceStatusSummary, SubmissionError, TelemetryRepository, TlsIdentityProbe, TrustedEndpoint,
+    parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityClassification,
     CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
     CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
     EndpointId, Event, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-    ResourceFeature, ResourceSnapshot, TargetId, TlsTrust, UiLocation,
+    ResourceFeature, ResourceSnapshot, TargetId, TelemetrySample, TelemetrySeries,
+    TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -175,6 +178,7 @@ pub trait ProductServices:
     + OperationStore
     + ArtifactRepository
     + EventRepository
+    + TelemetryRepository
 {
 }
 
@@ -193,6 +197,7 @@ impl<T> ProductServices for T where
         + OperationStore
         + ArtifactRepository
         + EventRepository
+        + TelemetryRepository
 {
 }
 
@@ -287,6 +292,14 @@ where
         .route(
             "/api/v1/events",
             get(event_query::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/telemetry",
+            get(telemetry_series::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/telemetry/{series_id}/samples",
+            get(telemetry_samples::<Services, Gateway, Time>),
         )
         .route(
             "/api/v1/operations",
@@ -746,6 +759,80 @@ where
 const EVENT_QUERY_MAX_LIMIT: u64 = 1000;
 /// Default `limit` for one bounded event query without an explicit value.
 const EVENT_QUERY_DEFAULT_LIMIT: u64 = 100;
+
+/// Maximum accepted `limit` for one bounded sample query (§14.4 有界历史).
+const TELEMETRY_QUERY_MAX_LIMIT: u64 = 1000;
+/// Default `limit` for one bounded sample query without an explicit value.
+const TELEMETRY_QUERY_DEFAULT_LIMIT: u64 = 100;
+
+/// Returns every telemetry series with its §14.4 current-value aggregates.
+///
+/// The current value of a series is its newest retained sample, fetched
+/// through the repository's bounded newest-first listing with limit one —
+/// the product's "current value and bounded history" is deliberately served
+/// by one primitive, not a separate time-series surface (§14.4 不把产品变成
+/// 通用时序数据库). A series whose upsert preceded its first successful
+/// append reports `None` for both latest fields.
+async fn telemetry_series<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: TelemetryRepository,
+{
+    let Ok(series) = state.services.list_series().await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut projected = Vec::with_capacity(series.len());
+    for series_item in &series {
+        let Ok(samples) = state
+            .services
+            .list_samples(series_item.id(), NonZeroU64::MIN)
+            .await
+        else {
+            return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        projected.push(project_series(series_item, samples.first().copied()));
+    }
+    let mut response = Json(TelemetrySeriesListResponse::new(projected)).into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Returns one series' bounded history, newest first (§14.4).
+///
+/// An unknown series id lists no samples — the store's bounded listing has
+/// no existence check, and an empty bounded history is indistinguishable
+/// from (and as valid as) a series whose samples were all pruned.
+async fn telemetry_samples<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(series_id): AxumPath<String>,
+    uri: Uri,
+) -> Response
+where
+    Services: TelemetryRepository,
+{
+    let Ok(series_id) = series_id.parse::<TelemetrySeriesId>() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "series id must be a valid uuid".to_owned(),
+        );
+    };
+    let Ok(limit) = parse_telemetry_limit(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("sample limit must be between 1 and {TELEMETRY_QUERY_MAX_LIMIT}"),
+        );
+    };
+    let Ok(samples) = state.services.list_samples(series_id, limit).await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut response = Json(TelemetrySampleListResponse::new(
+        samples.iter().map(project_sample).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
 
 /// Returns recent persisted BMC events, newest first, bounded by `limit`
 /// (§14.4 Event History).
@@ -1485,6 +1572,55 @@ fn project_event(event: &Event) -> EventResponse {
         event.observed_at(),
     )
 }
+
+fn project_series(
+    series: &TelemetrySeries,
+    latest: Option<TelemetrySample>,
+) -> TelemetrySeriesResponse {
+    TelemetrySeriesResponse::new(
+        series.id().into_uuid(),
+        series.endpoint_id().into_uuid(),
+        series.series_key().as_str().to_owned(),
+        series.sample_count(),
+        latest.as_ref().map(TelemetrySample::value),
+        latest.as_ref().map(TelemetrySample::observed_at),
+    )
+}
+
+fn project_sample(sample: &TelemetrySample) -> TelemetrySampleResponse {
+    TelemetrySampleResponse::new(
+        sample.series_id().into_uuid(),
+        sample.observed_at(),
+        sample.bmc_timestamp(),
+        sample.value(),
+    )
+}
+
+fn parse_telemetry_limit(query: Option<&str>) -> Result<NonZeroU64, ParseTelemetryLimitError> {
+    let Some(query) = query else {
+        return default_telemetry_limit();
+    };
+    let Some(value) = query.strip_prefix("limit=") else {
+        return Err(ParseTelemetryLimitError);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseTelemetryLimitError);
+    }
+    let Ok(limit) = value.parse::<u64>() else {
+        return Err(ParseTelemetryLimitError);
+    };
+    if limit == 0 || limit > TELEMETRY_QUERY_MAX_LIMIT {
+        return Err(ParseTelemetryLimitError);
+    }
+    NonZeroU64::new(limit).ok_or(ParseTelemetryLimitError)
+}
+
+fn default_telemetry_limit() -> Result<NonZeroU64, ParseTelemetryLimitError> {
+    NonZeroU64::new(TELEMETRY_QUERY_DEFAULT_LIMIT).ok_or(ParseTelemetryLimitError)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParseTelemetryLimitError;
 
 fn parse_event_limit(query: Option<&str>) -> Result<NonZeroU64, ParseEventLimitError> {
     let Some(query) = query else {
@@ -2564,8 +2700,9 @@ fn project_metric_definition_details(details: &CoreResourceDetails) -> CoreResou
 }
 
 /// Projects one metric report under the §2.1 `telemetry-service` family into
-/// the shared wire contract, carrying the derived metric-values count so
-/// clients never re-parse text.
+/// the shared wire contract, carrying the derived metric-values count and
+/// each timestamped reading so clients render the latest value without
+/// re-parsing text.
 ///
 /// The dispatcher guarantees this receives the `MetricReport` variant; the
 /// fallback keeps a stable empty projection instead of panicking if that
@@ -2573,14 +2710,24 @@ fn project_metric_definition_details(details: &CoreResourceDetails) -> CoreResou
 fn project_metric_report_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
     let CoreResourceDetails::MetricReport {
         metric_values_count,
+        metric_values,
     } = details
     else {
         return CoreResourceDetailsResponse::MetricReport {
             metric_values_count: None,
+            metric_values: None,
         };
     };
     CoreResourceDetailsResponse::MetricReport {
         metric_values_count: *metric_values_count,
+        metric_values: metric_values.as_ref().map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    MetricValueResponse::new(value.timestamp(), value.value().map(str::to_owned))
+                })
+                .collect()
+        }),
     }
 }
 
@@ -2802,7 +2949,8 @@ mod tests {
         CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
         EndpointCapabilityObservation, EndpointDisplayName, EndpointId, RefreshGeneration,
         ResourceEtag, ResourceId, ResourceODataId, ResourceODataType, ResourceSnapshot,
-        ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+        ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+        TlsCertificate, TlsTrust,
     };
     use secrecy::SecretString;
     use serde_json::{Value, json};
@@ -3495,7 +3643,21 @@ mod tests {
         );
         assert_eq!(
             resources[3]["resource"]["details"]["metric_values_count"],
-            12
+            2
+        );
+        // The timestamped readings survive the projection with their RFC 3339
+        // instants and original text values.
+        assert_eq!(
+            resources[3]["resource"]["details"]["metric_values"][0]["timestamp"],
+            "2026-08-05T10:20:00Z"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["metric_values"][0]["value"],
+            "31.5"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["metric_values"][1]["value"],
+            "32.0"
         );
         Ok(())
     }
@@ -4259,7 +4421,7 @@ mod tests {
             endpoint.id(),
             ResourceFeature::MetricReport,
             "/redfish/v1/TelemetryService/MetricReports/1",
-            r#"{"Id":"1","Name":"Inlet Temperature Report","MetricValuesCount":12}"#,
+            r#"{"Id":"1","Name":"Inlet Temperature Report","MetricValuesCount":2,"MetricValues":[{"Timestamp":"2026-08-05T10:20:00Z","MetricValue":"31.5"},{"Timestamp":"2026-08-05T10:21:00Z","MetricValue":"32.0"}]}"#,
             observed_at,
             generation,
         )?
@@ -4594,6 +4756,44 @@ mod tests {
             _limit: NonZeroU64,
         ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    impl TelemetryRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn upsert_series<'a>(
+            &'a self,
+            _endpoint_id: EndpointId,
+            _series_key: &'a SeriesKey,
+        ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn append_sample<'a>(
+            &'a self,
+            _sample: &'a TelemetrySample,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn list_samples(
+            &self,
+            _series_id: TelemetrySeriesId,
+            _limit: NonZeroU64,
+        ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn prune_before(
+            &self,
+            _cutoff: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
         }
     }
 
