@@ -896,6 +896,160 @@ impl EndpointResourceInventoryResponse {
     }
 }
 
+/// The final capability state exposed by the same-origin product API.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStateResponse {
+    Supported,
+    ReadOnly,
+    Unauthorized,
+    TemporarilyUnavailable,
+    SchemaIncompatible,
+    NotAdvertised,
+    NotCompiled,
+}
+
+/// The §2.4 capability-ledger classification of one entry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityClassificationResponse {
+    UserFacing,
+    Infrastructure,
+    LegacyCompatibility,
+    Internal,
+}
+
+/// The §12.2 Endpoint page that presents one capability entry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLocationResponse {
+    Overview,
+    Systems,
+    Chassis,
+    Managers,
+    Assembly,
+    Processors,
+    Memory,
+    Pcie,
+    Network,
+    Power,
+    Thermal,
+    Sensors,
+    Bios,
+    Boot,
+    SecureBoot,
+    Storage,
+    Accounts,
+    Logs,
+    Events,
+    Telemetry,
+    Update,
+    Tasks,
+    Oem,
+    Diagnostics,
+    Infrastructure,
+}
+
+/// One capability-ledger entry for a managed endpoint.
+///
+/// `state` and `observed_at` are both present or both absent: `None` means the
+/// endpoint has no observation for this capability yet, which is never
+/// disguised as a `not_advertised` probe result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityEntryResponse {
+    capability: String,
+    upstream_feature: String,
+    classification: CapabilityClassificationResponse,
+    ui_location: UiLocationResponse,
+    state: Option<CapabilityStateResponse>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    observed_at: Option<OffsetDateTime>,
+}
+
+impl CapabilityEntryResponse {
+    #[must_use]
+    pub const fn new(
+        capability: String,
+        upstream_feature: String,
+        classification: CapabilityClassificationResponse,
+        ui_location: UiLocationResponse,
+        state: Option<CapabilityStateResponse>,
+        observed_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            capability,
+            upstream_feature,
+            classification,
+            ui_location,
+            state,
+            observed_at,
+        }
+    }
+
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    #[must_use]
+    pub fn upstream_feature(&self) -> &str {
+        &self.upstream_feature
+    }
+
+    #[must_use]
+    pub const fn classification(&self) -> CapabilityClassificationResponse {
+        self.classification
+    }
+
+    #[must_use]
+    pub const fn ui_location(&self) -> UiLocationResponse {
+        self.ui_location
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> Option<CapabilityStateResponse> {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn observed_at(&self) -> Option<OffsetDateTime> {
+        self.observed_at
+    }
+}
+
+/// Stable envelope for one endpoint's complete §2.1 capability ledger.
+///
+/// `entries` always contains all 30 standard capabilities in design-document
+/// order, even when none has been observed yet, so the UI can show a reason
+/// for every feature instead of hiding it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCapabilityInventoryResponse {
+    endpoint_id: Uuid,
+    entries: Vec<CapabilityEntryResponse>,
+}
+
+impl EndpointCapabilityInventoryResponse {
+    #[must_use]
+    pub const fn new(endpoint_id: Uuid, entries: Vec<CapabilityEntryResponse>) -> Self {
+        Self {
+            endpoint_id,
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[CapabilityEntryResponse] {
+        &self.entries
+    }
+}
+
 /// Binds a predeclared trust policy to the address that must satisfy it. The
 /// server re-observes TLS without credentials and verifies this exact
 /// expectation before any credential is selected or transmitted.
@@ -1898,6 +2052,167 @@ mod tests {
             serde_json::from_value::<CoreResourceDetailsResponse>(json!({
                 "resource_type": "unknown",
                 "details": {}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capability_inventory_contract_serializes_observed_and_unobserved_entries()
+    -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:12:13Z", &Rfc3339)?;
+        let endpoint_id = uuid!("01989abc-def0-7abc-8def-0123456789e1");
+        let response = EndpointCapabilityInventoryResponse::new(
+            endpoint_id,
+            vec![
+                CapabilityEntryResponse::new(
+                    "accounts".to_owned(),
+                    "accounts".to_owned(),
+                    CapabilityClassificationResponse::UserFacing,
+                    UiLocationResponse::Accounts,
+                    Some(CapabilityStateResponse::Supported),
+                    Some(observed_at),
+                ),
+                CapabilityEntryResponse::new(
+                    "session-service".to_owned(),
+                    "session-service".to_owned(),
+                    CapabilityClassificationResponse::Infrastructure,
+                    UiLocationResponse::Infrastructure,
+                    None,
+                    None,
+                ),
+            ],
+        );
+        let encoded = serde_json::to_value(&response)?;
+        let decoded: EndpointCapabilityInventoryResponse = serde_json::from_value(encoded.clone())?;
+
+        assert_eq!(decoded, response);
+        assert_eq!(decoded.endpoint_id(), endpoint_id);
+        assert_eq!(decoded.entries()[0].capability(), "accounts");
+        assert_eq!(decoded.entries()[0].upstream_feature(), "accounts");
+        assert_eq!(
+            decoded.entries()[0].classification(),
+            CapabilityClassificationResponse::UserFacing
+        );
+        assert_eq!(
+            decoded.entries()[0].ui_location(),
+            UiLocationResponse::Accounts
+        );
+        assert_eq!(
+            decoded.entries()[0].state(),
+            Some(CapabilityStateResponse::Supported)
+        );
+        assert_eq!(decoded.entries()[0].observed_at(), Some(observed_at));
+        assert_eq!(decoded.entries()[1].state(), None);
+        assert_eq!(decoded.entries()[1].observed_at(), None);
+        assert_eq!(
+            encoded,
+            json!({
+                "endpoint_id": endpoint_id,
+                "entries": [
+                    {
+                        "capability": "accounts",
+                        "upstream_feature": "accounts",
+                        "classification": "user_facing",
+                        "ui_location": "accounts",
+                        "state": "supported",
+                        "observed_at": "2026-08-05T10:12:13Z"
+                    },
+                    {
+                        "capability": "session-service",
+                        "upstream_feature": "session-service",
+                        "classification": "infrastructure",
+                        "ui_location": "infrastructure",
+                        "state": null,
+                        "observed_at": null
+                    }
+                ]
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capability_inventory_contract_rejects_unknown_values_and_fields() {
+        let observed = json!({
+            "capability": "accounts",
+            "upstream_feature": "accounts",
+            "classification": "user_facing",
+            "ui_location": "accounts",
+            "state": "supported",
+            "observed_at": "2026-08-05T10:12:13Z"
+        });
+        let unobserved = json!({
+            "capability": "session-service",
+            "upstream_feature": "session-service",
+            "classification": "infrastructure",
+            "ui_location": "infrastructure",
+            "state": null,
+            "observed_at": null
+        });
+        let envelope = json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789e1",
+            "entries": [observed.clone(), unobserved.clone()]
+        });
+
+        assert!(serde_json::from_value::<EndpointCapabilityInventoryResponse>(envelope).is_ok());
+        assert!(
+            serde_json::from_value::<CapabilityEntryResponse>(json!({
+                "capability": "accounts",
+                "upstream_feature": "accounts",
+                "classification": "untrusted",
+                "ui_location": "accounts",
+                "state": null,
+                "observed_at": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CapabilityEntryResponse>(json!({
+                "capability": "accounts",
+                "upstream_feature": "accounts",
+                "classification": "user_facing",
+                "ui_location": "hidden",
+                "state": null,
+                "observed_at": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CapabilityEntryResponse>(json!({
+                "capability": "accounts",
+                "upstream_feature": "accounts",
+                "classification": "user_facing",
+                "ui_location": "accounts",
+                "state": "permanently_broken",
+                "observed_at": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CapabilityEntryResponse>(json!({
+                "capability": "accounts",
+                "upstream_feature": "accounts",
+                "classification": "user_facing",
+                "ui_location": "accounts",
+                "state": "supported",
+                "observed_at": "2026-08-05T10:12:13Z",
+                "reason": "extra"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EndpointCapabilityInventoryResponse>(json!({
+                "endpoint_id": "not-a-uuid",
+                "entries": [observed]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EndpointCapabilityInventoryResponse>(json!({
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789e1",
+                "entries": [unobserved],
+                "next_page": null
             }))
             .is_err()
         );
