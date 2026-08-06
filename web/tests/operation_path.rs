@@ -1,0 +1,769 @@
+#![forbid(unsafe_code)]
+
+//! End-to-end Axum tests for the 0.3 operation submission and query paths:
+//! `POST /api/v1/operations`, `GET /api/v1/operations`, and
+//! `GET /api/v1/operations/{operation_id}`.
+//!
+//! Every application boundary is served by an in-memory fake, with a real
+//! in-memory operation store and endpoint list, so the Web Router is
+//! exercised without persistence or network access.
+
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+};
+
+use axum::{Router, body::Body, http::Request};
+use http_body_util::BodyExt as _;
+use rutilus_application::{
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
+    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, OperationStore,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, TlsIdentityObservation, TlsIdentityProbe,
+};
+use rutilus_domain::{
+    AuditActor, AuditEvent, Credential, CredentialId, CredentialUsername, CredentialVersionId,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
+    EndpointDisplayName, EndpointId, Operation, OperationId, OperationSource, OperationState,
+    OperationTarget, RedfishCommand, ResetType, ResourceSnapshot, SystemCommand, TargetId,
+    TlsCertificate, TlsTrust,
+};
+use rutilus_web::{AuditEventQuery, WebProductInfo, router};
+use secrecy::SecretString;
+use serde_json::{Value, json};
+use time::{Duration, OffsetDateTime};
+use tower::ServiceExt as _;
+
+#[derive(Default)]
+struct MockState {
+    endpoints: Vec<Endpoint>,
+    operations: HashMap<OperationId, Operation>,
+}
+
+/// Implements every application boundary behind the injected services bundle,
+/// with a functioning in-memory operation store and endpoint list.
+#[derive(Clone)]
+struct MockServices {
+    state: Arc<Mutex<MockState>>,
+}
+
+impl MockServices {
+    fn new(state: Arc<Mutex<MockState>>) -> Self {
+        Self { state }
+    }
+}
+
+/// Implements the Redfish boundaries without opening a socket; the operation
+/// paths never exercise them.
+#[derive(Clone, Copy)]
+struct MockGateway;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MockError {
+    Lock,
+    Persistence,
+}
+
+impl fmt::Display for MockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Lock => "mock state is unavailable",
+            Self::Persistence => "mock persistence failed",
+        })
+    }
+}
+
+impl Error for MockError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MockProtected;
+
+impl OperationStore for MockServices {
+    type Error = MockError;
+
+    fn create_operation<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .operations
+                .entry(operation.id())
+                .or_insert_with(|| operation.clone());
+            Ok(())
+        })
+    }
+
+    fn find_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .operations
+                .get(&operation_id)
+                .cloned())
+        })
+    }
+
+    fn apply_transition(
+        &self,
+        operation_id: OperationId,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().map_err(|_| MockError::Lock)?;
+            let row = state
+                .operations
+                .get(&operation_id)
+                .ok_or(MockError::Persistence)?
+                .clone();
+            if row.is_terminal() {
+                return Err(MockError::Persistence);
+            }
+            let updated = Operation::try_from_parts(
+                row.id(),
+                row.source(),
+                row.targets().to_vec(),
+                row.command(),
+                new_state,
+                row.created_at(),
+                occurred_at,
+            )
+            .map_err(|_| MockError::Persistence)?;
+            state.operations.insert(operation_id, updated);
+            Ok(())
+        })
+    }
+
+    fn list_operations(
+        &self,
+        state_filter: Option<OperationState>,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .operations
+                .values()
+                .filter(|operation| state_filter.is_none_or(|state| operation.state() == state))
+                .cloned()
+                .collect())
+        })
+    }
+}
+
+impl EndpointRefreshRepository for MockServices {
+    type Error = MockError;
+
+    fn find_endpoint(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Endpoint>, Self::Error>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id() == endpoint_id)
+                .cloned())
+        })
+    }
+
+    fn commit_resource_generation<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        _observations: &'a [ResourceObservation],
+        _observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl EndpointInventoryRepository for MockServices {
+    type Error = MockError;
+
+    fn list_endpoint_inventory(
+        &self,
+    ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl CredentialInventoryRepository for MockServices {
+    type Error = MockError;
+
+    fn list_credentials(&self) -> BoundaryFuture<'_, Result<Vec<Credential>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+impl CredentialSecretProtector for MockServices {
+    type Protected = MockProtected;
+    type Error = MockError;
+
+    fn protect(
+        &self,
+        _credential_id: CredentialId,
+        _version_id: CredentialVersionId,
+        _password: SecretString,
+    ) -> Result<Self::Protected, Self::Error> {
+        Err(MockError::Persistence)
+    }
+}
+
+impl CredentialCreationRepository<MockProtected> for MockServices {
+    type Error = MockError;
+
+    fn create_credential(
+        &self,
+        _creation: ProtectedCredentialCreation<MockProtected>,
+    ) -> BoundaryFuture<'_, Result<Credential, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl CredentialResolver for MockServices {
+    type Error = MockError;
+
+    fn resolve(
+        &self,
+        _credential_id: CredentialId,
+    ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+impl DiscoveredEndpointRepository for MockServices {
+    type Error = MockError;
+
+    fn create_discovered_endpoint<'a>(
+        &'a self,
+        _endpoint: Endpoint,
+        _observations: &'a [EndpointCapabilityObservation],
+    ) -> BoundaryFuture<'a, Result<Endpoint, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl AuditEventWriter for MockServices {
+    type Error = MockError;
+
+    fn append_audit_event<'a>(
+        &'a self,
+        _event: &'a AuditEvent,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl AuditEventQuery for MockServices {
+    type Error = MockError;
+
+    fn list_recent_events(
+        &self,
+        _limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+impl CapabilityQueryRepository for MockServices {
+    type Error = MockError;
+
+    fn find_endpoint_capabilities(
+        &self,
+        _endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl CapabilitySnapshotRepository for MockServices {
+    type Error = MockError;
+
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        _observations: &'a [EndpointCapabilityObservation],
+        _observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl TlsIdentityProbe for MockGateway {
+    type Error = MockError;
+
+    fn observe<'a>(
+        &'a self,
+        _address: &'a EndpointAddress,
+    ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl RedfishDiscovery for MockGateway {
+    type Error = MockError;
+
+    fn probe_core_capabilities<'a>(
+        &'a self,
+        _address: &'a EndpointAddress,
+        _trust: &'a TlsTrust,
+        _username: &'a CredentialUsername,
+        _password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<rutilus_application::EndpointDiscovery, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl CoreResourceReader for MockGateway {
+    type Error = MockError;
+
+    fn read_core_resources<'a>(
+        &'a self,
+        _address: &'a EndpointAddress,
+        _trust: &'a TlsTrust,
+        _username: &'a CredentialUsername,
+        _password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH
+    }
+}
+
+fn test_router(services: MockServices) -> Router {
+    router(
+        WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+        AuditActor::LocalOperator,
+        DeploymentPosture::Standalone,
+        Arc::new(services),
+        Arc::new(MockGateway),
+        FixedClock,
+    )
+}
+
+async fn post_json(
+    router: &Router,
+    path: &str,
+    body: Value,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    Ok(router
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body)?))?,
+        )
+        .await?)
+}
+
+async fn get(router: &Router, path: &str) -> Result<axum::response::Response, Box<dyn Error>> {
+    Ok(router
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty())?)
+        .await?)
+}
+
+async fn json_body(response: axum::response::Response) -> Result<Value, Box<dyn Error>> {
+    let bytes = response.into_body().collect().await?.to_bytes();
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Builds the one managed endpoint the operation tests target.
+fn managed_endpoint() -> Result<Endpoint, Box<dyn Error>> {
+    let now = OffsetDateTime::UNIX_EPOCH;
+    Ok(Endpoint::try_new(
+        EndpointId::generate(),
+        EndpointDisplayName::parse("Rack A BMC")?,
+        EndpointAddress::parse("https://192.0.2.10")?,
+        TlsTrust::PinnedCertificate {
+            certificate: TlsCertificate::from_der(b"operation test certificate".to_vec())?,
+            trusted_at: now,
+        },
+        CredentialId::generate(),
+        now,
+        now,
+    )?)
+}
+
+#[tokio::test]
+async fn submits_an_operation_and_echoes_the_queued_projection() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+
+    let response = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": [endpoint.id().to_string()],
+            "command": { "System": { "Reset": "PowerCycle" } }
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    assert_eq!(
+        response.headers().get("cache-control"),
+        Some(&axum::http::HeaderValue::from_static(
+            "no-store, must-revalidate"
+        ))
+    );
+    let body = json_body(response).await?;
+    let operation_id = body["operation_id"]
+        .as_str()
+        .ok_or("submission must return an operation_id")?;
+    assert_eq!(body["source"], "standalone");
+    let targets = body["targets"]
+        .as_array()
+        .ok_or("submission must return targets")?;
+    assert_eq!(targets.len(), 1);
+    assert!(targets[0]["target_id"].as_str().is_some());
+    assert_eq!(targets[0]["endpoint_id"], endpoint.id().to_string());
+    assert_eq!(
+        body["command"],
+        json!({ "System": { "Reset": "PowerCycle" } })
+    );
+    assert_eq!(body["state"], "queued");
+    assert_eq!(body["created_at"], "1970-01-01T00:00:00Z");
+    assert_eq!(body["updated_at"], "1970-01-01T00:00:00Z");
+
+    {
+        let state = state.lock().map_err(|_| MockError::Lock)?;
+        let stored = state
+            .operations
+            .get(&operation_id.parse::<OperationId>()?)
+            .ok_or("the submitted operation must be persisted")?;
+        assert_eq!(stored.state(), OperationState::Queued);
+        assert_eq!(stored.source(), OperationSource::Standalone);
+        assert_eq!(stored.targets().len(), 1);
+        assert_eq!(
+            stored.targets()[0].endpoint_id(),
+            endpoint.id(),
+            "the persisted target must bind the submitted endpoint"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_an_explicit_operation_source() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+
+    let response = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "source": "center",
+            "targets": [endpoint.id().to_string()],
+            "command": { "Manager": { "Reset": "GracefulRestart" } }
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body = json_body(response).await?;
+    assert_eq!(body["source"], "center");
+    assert_eq!(
+        body["command"],
+        json!({ "Manager": { "Reset": "GracefulRestart" } })
+    );
+    let stored = state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .operations
+        .values()
+        .next()
+        .ok_or("the operation must be persisted")?
+        .clone();
+    assert_eq!(stored.source(), OperationSource::Center);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_malformed_operation_requests_without_persisting() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+    let command = json!({ "System": { "Reset": "PowerCycle" } });
+
+    let invalid_source = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({ "source": "cluster", "targets": [endpoint.id().to_string()], "command": command }),
+    )
+    .await?;
+    assert_eq!(
+        invalid_source.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "an unknown source must be rejected"
+    );
+
+    let empty_targets = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({ "targets": [], "command": command }),
+    )
+    .await?;
+    assert_eq!(
+        empty_targets.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "an empty target list must be rejected"
+    );
+
+    let duplicate_targets = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": [endpoint.id().to_string(), endpoint.id().to_string()],
+            "command": command
+        }),
+    )
+    .await?;
+    assert_eq!(
+        duplicate_targets.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "a repeated endpoint must be rejected"
+    );
+
+    let unknown_endpoint = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({ "targets": [EndpointId::generate().to_string()], "command": command }),
+    )
+    .await?;
+    assert_eq!(
+        unknown_endpoint.status(),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "a body-referenced unmanaged endpoint must be unprocessable"
+    );
+    let body = json_body(unknown_endpoint).await?;
+    assert!(
+        body["message"]
+            .as_str()
+            .ok_or("error response must carry a message")?
+            .contains("is not a managed endpoint")
+    );
+
+    let invalid_target = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({ "targets": ["not-a-uuid"], "command": command }),
+    )
+    .await?;
+    assert_eq!(
+        invalid_target.status(),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "a malformed target uuid must fail at deserialization"
+    );
+
+    let unknown_field = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": [endpoint.id().to_string()],
+            "command": command,
+            "remember": true
+        }),
+    )
+    .await?;
+    assert_eq!(
+        unknown_field.status(),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown request fields must be rejected"
+    );
+
+    assert_eq!(
+        state.lock().map_err(|_| MockError::Lock)?.operations.len(),
+        0,
+        "every rejected submission must leave the store untouched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lists_operations_with_an_optional_state_filter() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let services = MockServices::new(Arc::clone(&state));
+    let router = test_router(services.clone());
+
+    let empty = get(&router, "/api/v1/operations").await?;
+    assert_eq!(empty.status(), axum::http::StatusCode::OK);
+    assert_eq!(json_body(empty).await?, json!({ "operations": [] }));
+
+    for source in ["standalone", "site"] {
+        let response = post_json(
+            &router,
+            "/api/v1/operations",
+            json!({
+                "source": source,
+                "targets": [endpoint.id().to_string()],
+                "command": { "System": { "Reset": "PowerCycle" } }
+            }),
+        )
+        .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    }
+
+    // One operation is parked in the asynchronous-acceptance phase directly in
+    // the store, so the listing exercises the full state vocabulary.
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let waiting = Operation::try_from_parts(
+        OperationId::generate(),
+        OperationSource::Standalone,
+        vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+        RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+        OperationState::WaitingRemote,
+        now,
+        now + Duration::SECOND,
+    )?;
+    services.create_operation(&waiting).await?;
+
+    let all = get(&router, "/api/v1/operations").await?;
+    assert_eq!(all.status(), axum::http::StatusCode::OK);
+    let body = json_body(all).await?;
+    let operations = body["operations"]
+        .as_array()
+        .ok_or("operations must be an array")?;
+    assert_eq!(operations.len(), 3);
+    for operation in operations {
+        assert_eq!(
+            operation["command"],
+            json!({ "System": { "Reset": "PowerCycle" } })
+        );
+    }
+
+    let queued = get(&router, "/api/v1/operations?state=queued").await?;
+    let body = json_body(queued).await?;
+    assert_eq!(
+        body["operations"]
+            .as_array()
+            .ok_or("operations must be an array")?
+            .len(),
+        2
+    );
+
+    let waiting_remote = get(&router, "/api/v1/operations?state=waiting_remote").await?;
+    let body = json_body(waiting_remote).await?;
+    let operations = body["operations"]
+        .as_array()
+        .ok_or("operations must be an array")?;
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["state"], "waiting_remote");
+    assert_eq!(operations[0]["operation_id"], waiting.id().to_string());
+
+    let succeeded = get(&router, "/api/v1/operations?state=succeeded").await?;
+    assert_eq!(succeeded.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        json_body(succeeded).await?,
+        json!({ "operations": [] }),
+        "a filter without matching operations must return an empty list"
+    );
+
+    for query in ["?state=bogus", "?state=", "?page=2", "?state=queued&page=1"] {
+        let response = get(&router, &format!("/api/v1/operations{query}")).await?;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "query {query} must be rejected"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_one_operation_detail() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+
+    let created = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": [endpoint.id().to_string()],
+            "command": { "System": { "Reset": "PowerCycle" } }
+        }),
+    )
+    .await?;
+    assert_eq!(created.status(), axum::http::StatusCode::CREATED);
+    let created_body = json_body(created).await?;
+    let operation_id = created_body["operation_id"]
+        .as_str()
+        .ok_or("submission must return an operation_id")?
+        .to_owned();
+
+    let detail = get(&router, &format!("/api/v1/operations/{operation_id}")).await?;
+    assert_eq!(detail.status(), axum::http::StatusCode::OK);
+    assert_eq!(json_body(detail).await?, created_body);
+
+    let missing = get(
+        &router,
+        &format!("/api/v1/operations/{}", OperationId::generate()),
+    )
+    .await?;
+    assert_eq!(
+        missing.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "an unknown operation id must be not-found"
+    );
+
+    let invalid = get(&router, "/api/v1/operations/not-a-uuid").await?;
+    assert_eq!(
+        invalid.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "a malformed operation id must be rejected"
+    );
+    Ok(())
+}

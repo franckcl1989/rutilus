@@ -20,14 +20,16 @@ use rutilus_api::{
     CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
     CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
     CoreResourceResponse, CoreResourceSourceResponse, CreateCredentialRequest,
-    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
-    EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
-    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
-    EndpointInventoryResponse, EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
-    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-    ErrorResponse, HealthResponse, ResourceStatusResponse, TlsTrustModeResponse,
-    TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
+    CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
+    EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
+    EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse,
+    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
+    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
+    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, HealthResponse,
+    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    OperationTargetResponse, ResourceStatusResponse, TlsTrustModeResponse, TrustRejectedResponse,
+    TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
     AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, CapabilityLedgerEntry,
@@ -42,14 +44,16 @@ use rutilus_application::{
     EndpointRefreshRepository, EndpointResourceInventory, EndpointResourceInventoryQuery,
     EndpointResourceInventoryQueryError, EndpointTrustChallenge, EndpointTrustEstablishment,
     EndpointTrustExpectation, EndpointTrustExpectationError, EnrolledEndpoint,
-    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, RedfishDiscovery,
-    ResourceStatusSummary, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, OperationStore,
+    OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError,
+    TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CapabilityClassification, CapabilityState,
     CertificateFingerprintParseError, Credential, CredentialId, CredentialName, CredentialUsername,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, ResourceFeature,
-    ResourceSnapshot, TlsTrust, UiLocation,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, Operation,
+    OperationId, OperationSource, OperationState, OperationTarget, ResourceFeature,
+    ResourceSnapshot, TargetId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -125,6 +129,14 @@ where
 /// concrete repository, security, and gateway implementations behind these
 /// boundaries and assembles the application use cases per request. The
 /// blanket implementation keeps the bundle open to any runtime composition.
+///
+/// The operation boundaries (§13) are `OperationStore` — the persistence
+/// boundary of the operation lifecycle, re-exported through the application
+/// facade — together with `EndpointRefreshRepository`, whose `find_endpoint`
+/// read is the endpoint-existence check of the operation submission use case.
+/// The embedding runtime supplies the `OperationStore` implementation (the
+/// Standalone posture delegates to its `SqliteStore`, which already
+/// implements the boundary) and the application composes it per request.
 pub trait ProductServices:
     EndpointInventoryRepository
     + CredentialInventoryRepository
@@ -137,6 +149,7 @@ pub trait ProductServices:
     + AuditEventWriter
     + AuditEventQuery
     + CapabilityQueryRepository
+    + OperationStore
 {
 }
 
@@ -152,6 +165,7 @@ impl<T> ProductServices for T where
         + AuditEventWriter
         + AuditEventQuery
         + CapabilityQueryRepository
+        + OperationStore
 {
 }
 
@@ -239,6 +253,18 @@ where
             post(import_endpoints_csv::<Services, Gateway, Time>),
         )
         .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/operations",
+            post(create_operation::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/operations",
+            get(list_operations::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/operations/{operation_id}",
+            get(operation_detail::<Services, Gateway, Time>),
+        )
         .fallback(static_asset)
         .with_state(WebState {
             product,
@@ -659,6 +685,213 @@ where
     no_store(&mut response);
     response
 }
+
+/// Converts one typed Redfish write into a persisted operation (§13.1) and
+/// returns its `Queued` projection.
+///
+/// The request names target endpoints only; the application submission use
+/// case binds a fresh target identity to each endpoint, verifies that every
+/// endpoint is managed, and persists the operation with the submitted source
+/// (defaulting to `standalone`).
+async fn create_operation<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CreateOperationRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Time: Clock,
+{
+    let source = match request.source() {
+        None => OperationSource::Standalone,
+        Some(raw) => match raw.parse() {
+            Ok(source) => source,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "operation source is invalid".to_owned(),
+                );
+            }
+        },
+    };
+    let targets = request
+        .targets()
+        .iter()
+        .map(|endpoint_id| {
+            OperationTarget::new(TargetId::generate(), EndpointId::from_uuid(*endpoint_id))
+        })
+        .collect();
+    let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
+    let now = state.clock.now();
+    match submission
+        .submit(source, targets, request.command().clone(), now)
+        .await
+    {
+        Ok(operation) => json_created(Json(project_operation(&operation))),
+        Err(SubmissionError::EmptyTargets) => json_error(
+            StatusCode::BAD_REQUEST,
+            "an operation must target at least one endpoint".to_owned(),
+        ),
+        Err(SubmissionError::DuplicateEndpoint { endpoint_id }) => json_error(
+            StatusCode::BAD_REQUEST,
+            format!("operation targets endpoint {endpoint_id} more than once"),
+        ),
+        // A body-referenced endpoint that does not exist is unprocessable,
+        // exactly like the enrollment path's missing-credential verdict.
+        Err(SubmissionError::UnknownEndpoint { endpoint_id }) => json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("target endpoint {endpoint_id} is not a managed endpoint"),
+        ),
+        Err(SubmissionError::Inventory(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the target endpoints could not be checked".to_owned(),
+        ),
+        Err(SubmissionError::Store(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operation persistence failed".to_owned(),
+        ),
+    }
+}
+
+/// Lists persisted operations, optionally filtered by exact §13.2 state.
+async fn list_operations<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    uri: Uri,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let Ok(state_filter) = parse_operation_state_filter(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "operation state filter is invalid".to_owned(),
+        );
+    };
+    let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
+    let operations = match submission.list(state_filter).await {
+        Ok(operations) => operations,
+        // The submission verdicts cannot occur from a listing; only the store
+        // boundary is reachable here.
+        Err(SubmissionError::Store(_) | SubmissionError::Inventory(_)) => {
+            return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(
+            SubmissionError::EmptyTargets
+            | SubmissionError::DuplicateEndpoint { .. }
+            | SubmissionError::UnknownEndpoint { .. },
+        ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut response = Json(OperationListResponse::new(
+        operations.iter().map(project_operation).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Returns one persisted operation projection by id.
+async fn operation_detail<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(operation_id): AxumPath<String>,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let Ok(operation_id) = operation_id.parse::<OperationId>() else {
+        return uncached_status(StatusCode::BAD_REQUEST);
+    };
+    let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
+    match submission.find(operation_id).await {
+        Ok(Some(operation)) => json_ok(Json(project_operation(&operation))),
+        Ok(None) => uncached_status(StatusCode::NOT_FOUND),
+        Err(SubmissionError::Store(_)) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+        // The submission verdicts cannot occur from a single-record read; only
+        // the store boundary is reachable here.
+        Err(
+            SubmissionError::EmptyTargets
+            | SubmissionError::DuplicateEndpoint { .. }
+            | SubmissionError::UnknownEndpoint { .. }
+            | SubmissionError::Inventory(_),
+        ) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+fn project_operation(operation: &Operation) -> OperationResponse {
+    OperationResponse::new(
+        operation.id().into_uuid(),
+        project_operation_source(operation.source()),
+        operation
+            .targets()
+            .iter()
+            .map(project_operation_target)
+            .collect(),
+        operation.command(),
+        project_operation_state(operation.state()),
+        operation.created_at(),
+        operation.updated_at(),
+    )
+}
+
+fn project_operation_target(target: &OperationTarget) -> OperationTargetResponse {
+    OperationTargetResponse::new(
+        target.target_id().into_uuid(),
+        target.endpoint_id().into_uuid(),
+    )
+}
+
+fn project_operation_source(source: OperationSource) -> OperationSourceResponse {
+    match source {
+        OperationSource::Standalone => OperationSourceResponse::Standalone,
+        OperationSource::Site => OperationSourceResponse::Site,
+        OperationSource::Center => OperationSourceResponse::Center,
+    }
+}
+
+fn project_operation_state(state: OperationState) -> OperationStateResponse {
+    match state {
+        OperationState::Queued => OperationStateResponse::Queued,
+        OperationState::Validating => OperationStateResponse::Validating,
+        OperationState::Running => OperationStateResponse::Running,
+        OperationState::WaitingRemote => OperationStateResponse::WaitingRemote,
+        OperationState::Verifying => OperationStateResponse::Verifying,
+        OperationState::Succeeded => OperationStateResponse::Succeeded,
+        OperationState::Failed => OperationStateResponse::Failed,
+        OperationState::Unknown => OperationStateResponse::Unknown,
+        OperationState::Cancelled => OperationStateResponse::Cancelled,
+    }
+}
+
+/// Parses the optional `state` query filter against the nine console wire
+/// values pinned by the api contract tests.
+///
+/// The filter deliberately accepts the same `snake_case` vocabulary the
+/// response emits (`waiting_remote`), not the domain's persistence code
+/// (`waiting-remote`), so the console needs exactly one state vocabulary.
+fn parse_operation_state_filter(
+    query: Option<&str>,
+) -> Result<Option<OperationState>, ParseOperationStateFilterError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let Some(value) = query.strip_prefix("state=") else {
+        return Err(ParseOperationStateFilterError);
+    };
+    match value {
+        "queued" => Ok(Some(OperationState::Queued)),
+        "validating" => Ok(Some(OperationState::Validating)),
+        "running" => Ok(Some(OperationState::Running)),
+        "waiting_remote" => Ok(Some(OperationState::WaitingRemote)),
+        "verifying" => Ok(Some(OperationState::Verifying)),
+        "succeeded" => Ok(Some(OperationState::Succeeded)),
+        "failed" => Ok(Some(OperationState::Failed)),
+        "unknown" => Ok(Some(OperationState::Unknown)),
+        "cancelled" => Ok(Some(OperationState::Cancelled)),
+        _ => Err(ParseOperationStateFilterError),
+    }
+}
+
+/// A `state` filter value that is not one of the nine console wire values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParseOperationStateFilterError;
 
 fn project_credential_summary(credential: &Credential) -> CredentialSummaryResponse {
     CredentialSummaryResponse::new(
@@ -3014,6 +3247,53 @@ mod tests {
         Ok(())
     }
 
+    /// Every operation route maps an unavailable services bundle to a
+    /// `503` that is never cached, exactly like the other write paths.
+    #[tokio::test]
+    async fn operation_routes_report_unavailable_services() -> Result<(), Box<dyn Error>> {
+        let router = test_router();
+        let body = serde_json::to_vec(&json!({
+            "targets": [EndpointId::generate().to_string()],
+            "command": { "System": { "Reset": "PowerCycle" } }
+        }))?;
+        let submitted = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/operations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(submitted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            submitted.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+
+        let listed = router
+            .clone()
+            .oneshot(Request::get("/api/v1/operations").body(Body::empty())?)
+            .await?;
+        assert_eq!(listed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            listed.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+
+        let detailed = router
+            .oneshot(
+                Request::get(format!("/api/v1/operations/{}", OperationId::generate()))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detailed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            detailed.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        Ok(())
+    }
+
     async fn json_body(response: Response) -> Result<Value, Box<dyn Error>> {
         let bytes = response.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&bytes)?)
@@ -3830,6 +4110,40 @@ mod tests {
             &self,
             _endpoint_id: EndpointId,
         ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl OperationStore for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn create_operation<'a>(
+            &'a self,
+            _operation: &'a Operation,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn find_operation(
+            &self,
+            _operation_id: OperationId,
+        ) -> BoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn apply_transition(
+            &self,
+            _operation_id: OperationId,
+            _new_state: OperationState,
+            _occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_operations(
+            &self,
+            _state: Option<OperationState>,
+        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
     }

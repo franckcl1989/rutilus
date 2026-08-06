@@ -18,16 +18,16 @@ use rutilus_application::{
     AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
     Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
     CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, OperationStore,
     ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
     StoredCapability, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CAPABILITY_LEDGER_ORDER, CapabilityState, Credential, CredentialId,
     CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-    RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot,
-    ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Operation,
+    OperationId, OperationState, RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId,
+    ResourceSnapshot, ResourceSnapshotPayload, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -376,6 +376,44 @@ impl TlsIdentityProbe for MockGateway {
                 self.evaluation,
             ))
         })
+    }
+}
+
+/// The operation lifecycle boundary, required by the product-services bundle.
+///
+/// The capability read-path tests never submit operations, so every operation
+/// call reports the controlled failure instead of mutating the mock state.
+impl OperationStore for MockServices {
+    type Error = MockError;
+
+    fn create_operation<'a>(
+        &'a self,
+        _operation: &'a Operation,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn find_operation(
+        &self,
+        _operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn apply_transition(
+        &self,
+        _operation_id: OperationId,
+        _new_state: OperationState,
+        _occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_operations(
+        &self,
+        _state: Option<OperationState>,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
     }
 }
 
