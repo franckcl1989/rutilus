@@ -9,6 +9,7 @@ pub mod endpoint_address;
 pub mod endpoint_capability;
 pub mod endpoint_credential;
 pub mod endpoint_trust;
+pub mod event;
 pub mod operation;
 pub mod operation_target;
 pub mod remote_task;
