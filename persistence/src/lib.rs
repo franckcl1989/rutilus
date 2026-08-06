@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 mod application_adapter;
+mod artifact_repository;
 mod audit_repository;
 mod credential_repository;
 mod endpoint_capability_repository;
@@ -24,6 +25,7 @@ mod remote_task_repository;
 mod resource_snapshot_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
+pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
