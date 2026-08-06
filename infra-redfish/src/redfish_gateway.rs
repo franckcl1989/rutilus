@@ -31,9 +31,14 @@ use nv_redfish::{
         control_collection::ControlCollection as ControlCollectionSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
+        host_interface::HostInterface as HostInterfaceSchema,
+        host_interface_collection::HostInterfaceCollection as HostInterfaceCollectionSchema,
+        log_service::LogService as LogServiceSchema,
+        log_service_collection::LogServiceCollection as LogServiceCollectionSchema,
         manager::Manager as ManagerSchema, manager_account::ManagerAccount as ManagerAccountSchema,
         manager_account_collection::ManagerAccountCollection as ManagerAccountCollectionSchema,
         manager_collection::ManagerCollection as ManagerCollectionSchema,
+        manager_network_protocol::ManagerNetworkProtocol as ManagerNetworkProtocolSchema,
         memory::Memory as MemorySchema,
         memory_collection::MemoryCollection as MemoryCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
@@ -227,7 +232,8 @@ impl RedfishGateway {
     /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors,
     /// Memory, Storage, `NetworkAdapters`, `EthernetInterfaces`, `Accounts`,
     /// `Bios`, `BootOptions`, `SecureBoot`, `Power`, `Thermal`, `Sensors`,
-    /// and `Controls` families) through public, typed `nv-redfish`
+    /// `Controls`, `LogServices`, `ManagerNetworkProtocol`, and
+    /// `HostInterfaces` families) through public, typed `nv-redfish`
     /// navigation and returns bounded domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
@@ -510,12 +516,14 @@ async fn read_chassis_resources(
 }
 
 /// Reads the Managers collection and, for every decoded Manager member, its
-/// `EthernetInterfaces` collection, so the 0.2 network family follows its
-/// parent through the same typed navigation.
+/// `EthernetInterfaces`, `LogServices`, and `HostInterfaces` collections plus
+/// the `NetworkProtocol` singleton, so the 0.2 Manager-facing families follow
+/// their parent through the same typed navigation.
 ///
 /// A missing Managers link leaves the whole family absent without an error; a
 /// failed Managers collection document aborts the read with the existing
-/// classified error semantics. Only individual members are skippable.
+/// classified error semantics. Only individual members and the
+/// `NetworkProtocol` singleton are skippable.
 async fn read_manager_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
@@ -545,6 +553,36 @@ async fn read_manager_resources(
                 identity,
                 trust,
                 ethernet_interface_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                manager.log_services.as_ref(),
+                bmc,
+                identity,
+                trust,
+                log_service_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_singleton_resources(
+                manager.network_protocol.as_ref(),
+                bmc,
+                identity,
+                trust,
+                manager_network_protocol_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                manager.host_interfaces.as_ref(),
+                bmc,
+                identity,
+                trust,
+                host_interface_projection,
             )
             .await?,
         );
@@ -651,6 +689,22 @@ impl MemberCollection for NetworkAdapterCollectionSchema {
 
 impl MemberCollection for EthernetInterfaceCollectionSchema {
     type Member = EthernetInterfaceSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for LogServiceCollectionSchema {
+    type Member = LogServiceSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for HostInterfaceCollectionSchema {
+    type Member = HostInterfaceSchema;
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
@@ -1371,6 +1425,71 @@ struct EthernetInterfacePayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `log-services` family projection.
+///
+/// The field set is exactly the `LogServicePayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. Only the direct
+/// `ServiceEnabled`, `MaxNumberOfRecords`, and `Status` properties are
+/// projectable: `OverWritePolicy`, `LogEntryType`, and the `Entries`
+/// log-entry collection stay out because the API surface projects metadata
+/// only and reading entries is deferred to a later iteration.
+#[derive(Serialize)]
+struct LogServicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ServiceEnabled", skip_serializing_if = "Option::is_none")]
+    service_enabled: Option<bool>,
+    #[serde(rename = "MaxNumberOfRecords", skip_serializing_if = "Option::is_none")]
+    max_number_of_records: Option<i64>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `manager-network-protocol` family projection.
+///
+/// The field set is exactly the `ManagerNetworkProtocolPayload` the
+/// application boundary decodes with `deny_unknown_fields`, so an extra field
+/// here would make every stored snapshot unreadable at projection time. Only
+/// the direct `HostName`, `FQDN`, and `Status` properties are projectable:
+/// the per-protocol settings (`HTTP`, `HTTPS`, `SSH`, ...) are nested
+/// `Protocol` objects whose set grows with every schema release, so they stay
+/// out exactly like `NetworkAdapter`'s `Controllers[]` array.
+#[derive(Serialize)]
+struct ManagerNetworkProtocolPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "HostName", skip_serializing_if = "Option::is_none")]
+    host_name: Option<String>,
+    #[serde(rename = "FQDN", skip_serializing_if = "Option::is_none")]
+    fqdn: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `host-interfaces` family projection.
+///
+/// The field set is exactly the `HostInterfacePayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `InterfaceEnabled` and `Status` properties are projectable and
+/// `HostInterfaceType` is retained in the persisted payload but stays
+/// internal (the API surface exposes only `InterfaceEnabled` and `Status`).
+/// The host-facing ethernet links (`HostEthernetInterfaces`,
+/// `ManagerEthernetInterface`) and the authentication-mode and
+/// credential-bootstrapping sections stay out.
+#[derive(Serialize)]
+struct HostInterfacePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "InterfaceEnabled", skip_serializing_if = "Option::is_none")]
+    interface_enabled: Option<bool>,
+    #[serde(rename = "HostInterfaceType", skip_serializing_if = "Option::is_none")]
+    host_interface_type: Option<nv_redfish::schema::host_interface::HostInterfaceType>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
 /// The §0.2.0 `accounts` family projection.
 ///
 /// The field set is exactly the `AccountPayload` the application boundary
@@ -1750,6 +1869,66 @@ fn ethernet_interface_projection(
     };
     build_core_projection(
         ResourceFeature::EthernetInterfaces,
+        interface.odata_id(),
+        interface.etag(),
+        &payload,
+    )
+}
+
+fn log_service_projection(
+    service: &LogServiceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = LogServicePayload {
+        resource: CommonResourcePayload::from_schema_base(&service.base),
+        service_enabled: service.service_enabled.as_ref().copied().flatten(),
+        max_number_of_records: service.max_number_of_records,
+        status: service
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::LogServices,
+        service.odata_id(),
+        service.etag(),
+        &payload,
+    )
+}
+
+fn manager_network_protocol_projection(
+    protocol: &ManagerNetworkProtocolSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = ManagerNetworkProtocolPayload {
+        resource: CommonResourcePayload::from_schema_base(&protocol.base),
+        host_name: optional_nullable_text(protocol.host_name.as_ref()),
+        fqdn: optional_nullable_text(protocol.fqdn.as_ref()),
+        status: protocol
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::ManagerNetworkProtocol,
+        protocol.odata_id(),
+        protocol.etag(),
+        &payload,
+    )
+}
+
+fn host_interface_projection(
+    interface: &HostInterfaceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = HostInterfacePayload {
+        resource: CommonResourcePayload::from_schema_base(&interface.base),
+        interface_enabled: interface.interface_enabled.as_ref().copied().flatten(),
+        host_interface_type: interface.host_interface_type.as_ref().copied().flatten(),
+        status: interface
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::HostInterfaces,
         interface.odata_id(),
         interface.etag(),
         &payload,
@@ -3577,6 +3756,116 @@ mod tests {
         "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"##;
 
+    /// A Manager member that advertises the 0.2 `LogServices`,
+    /// `NetworkProtocol`, and `HostInterfaces` surfaces.
+    const MANAGER_WITH_MANAGER_FAMILIES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+        "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+        "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"}
+    }"#;
+
+    const LOG_SERVICES_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#LogServiceCollection.LogServiceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices",
+        "Name":"Log Service Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Managers/1/LogServices/SEL"},
+            {"@odata.id":"/redfish/v1/Managers/1/LogServices/Audit"}
+        ]
+    }"##;
+
+    /// The full `LogService` member projection: the retention bound and the
+    /// overwrite policy are decoded but only the contract fields may leave
+    /// the gateway, and the linked `LogEntryCollection` is never fetched.
+    const LOG_SERVICE_ONE_BODY: &str = r##"{
+        "@odata.type":"#LogService.v1_9_0.LogService",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices/SEL",
+        "@odata.etag":"W/\"log-service-1\"",
+        "Id":"SEL",
+        "Name":"System Event Log",
+        "Description":"System event log service",
+        "ServiceEnabled":true,
+        "MaxNumberOfRecords":10000,
+        "OverWritePolicy":"WrapsWhenFull",
+        "LogEntryType":"SEL",
+        "DateTime":"2026-08-05T10:11:12Z",
+        "Entries":{"@odata.id":"/redfish/v1/Managers/1/LogServices/SEL/Entries"},
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A minimal `LogService` member: absent optional fields must be omitted
+    /// from the projection, never emitted as null.
+    const LOG_SERVICE_TWO_BODY: &str = r##"{
+        "@odata.type":"#LogService.v1_9_0.LogService",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices/Audit",
+        "@odata.etag":"W/\"log-service-2\"",
+        "Id":"Audit",
+        "Name":"Audit Log"
+    }"##;
+
+    /// The full `ManagerNetworkProtocol` singleton projection with the
+    /// top-level metadata populated and the per-protocol settings nested in
+    /// their own `Protocol` objects.
+    const NETWORK_PROTOCOL_FULL_BODY: &str = r##"{
+        "@odata.type":"#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol",
+        "@odata.id":"/redfish/v1/Managers/1/NetworkProtocol",
+        "@odata.etag":"W/\"network-protocol-1\"",
+        "Id":"NetworkProtocol",
+        "Name":"Manager Network Protocol",
+        "Description":"Network services for this manager",
+        "HostName":"bmc-rack-a",
+        "FQDN":"bmc-rack-a.example.test",
+        "HTTP":{"ProtocolEnabled":true,"Port":80},
+        "HTTPS":{"ProtocolEnabled":true,"Port":443},
+        "SSH":{"ProtocolEnabled":true,"Port":22},
+        "SNMP":{"ProtocolEnabled":false,"Port":161},
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    const HOST_INTERFACES_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#HostInterfaceCollection.HostInterfaceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/HostInterfaces",
+        "Name":"Host Interface Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Managers/1/HostInterfaces/1"},
+            {"@odata.id":"/redfish/v1/Managers/1/HostInterfaces/2"}
+        ]
+    }"##;
+
+    /// The full `HostInterface` member projection with every optional
+    /// contract field populated; the host-facing ethernet links are decoded
+    /// but stay outside the projection contract.
+    const HOST_INTERFACE_ONE_BODY: &str = r##"{
+        "@odata.type":"#HostInterface.v1_3_3.HostInterface",
+        "@odata.id":"/redfish/v1/Managers/1/HostInterfaces/1",
+        "@odata.etag":"W/\"host-interface-1\"",
+        "Id":"1",
+        "Name":"Host Interface One",
+        "Description":"Local host communication interface",
+        "HostInterfaceType":"NetworkHostInterface",
+        "InterfaceEnabled":true,
+        "ExternallyAccessible":false,
+        "AuthenticationModes":["BasicAuth","RedfishSessionAuth"],
+        "HostEthernetInterfaces":{"@odata.id":"/redfish/v1/Systems/1/EthernetInterfaces"},
+        "ManagerEthernetInterface":{"@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces/1"},
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A minimal `HostInterface` member: absent optional fields must be
+    /// omitted from the projection, never emitted as null.
+    const HOST_INTERFACE_TWO_BODY: &str = r##"{
+        "@odata.type":"#HostInterface.v1_3_3.HostInterface",
+        "@odata.id":"/redfish/v1/Managers/1/HostInterfaces/2",
+        "@odata.etag":"W/\"host-interface-2\"",
+        "Id":"2",
+        "Name":"Host Interface Two"
+    }"##;
+
     const ASSEMBLY_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/Chassis/1/Assembly",
         "Id":"Assembly",
@@ -4032,6 +4321,69 @@ mod tests {
         "/redfish/v1/Managers/1/EthernetInterfaces",
         "/redfish/v1/Managers/1/EthernetInterfaces/1",
         "/redfish/v1/Managers/1/EthernetInterfaces/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one Manager member that carries populated
+    /// `LogServices`, `NetworkProtocol`, and `HostInterfaces` surfaces: the
+    /// families are read right after their parent, before the Session
+    /// cleanup. The `LogServices` members are fetched individually, then the
+    /// `NetworkProtocol` singleton, then the `HostInterfaces` members.
+    const MANAGER_FAMILY_RESOURCE_REQUEST_PATHS: [&str; 18] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/LogServices",
+        "/redfish/v1/Managers/1/LogServices/SEL",
+        "/redfish/v1/Managers/1/LogServices/Audit",
+        "/redfish/v1/Managers/1/NetworkProtocol",
+        "/redfish/v1/Managers/1/HostInterfaces",
+        "/redfish/v1/Managers/1/HostInterfaces/1",
+        "/redfish/v1/Managers/1/HostInterfaces/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `LogServices` and `HostInterfaces`
+    /// collections are advertised but empty: the collection documents are
+    /// still read, no member is, and the `NetworkProtocol` singleton is read
+    /// because its link is present.
+    const EMPTY_MANAGER_FAMILY_REQUEST_PATHS: [&str; 14] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/LogServices",
+        "/redfish/v1/Managers/1/NetworkProtocol",
+        "/redfish/v1/Managers/1/HostInterfaces",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when a Manager member advertises none of the three
+    /// families: the collection and singleton URIs are never requested.
+    const ABSENT_MANAGER_FAMILY_REQUEST_PATHS: [&str; 11] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -5342,6 +5694,358 @@ mod tests {
         assert_eq!(minimal_payload.get("SpeedMbps"), None);
         assert_eq!(minimal_payload.get("InterfaceEnabled"), None);
         assert_session_requests(&server.finish_all().await?, &FAMILY_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_manager_families_through_typed_manager_navigation() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_MANAGER_FAMILIES_BODY),
+                ("200 OK", LOG_SERVICES_WITH_MEMBERS_BODY),
+                ("200 OK", LOG_SERVICE_ONE_BODY),
+                ("200 OK", LOG_SERVICE_TWO_BODY),
+                ("200 OK", NETWORK_PROTOCOL_FULL_BODY),
+                ("200 OK", HOST_INTERFACES_WITH_MEMBERS_BODY),
+                ("200 OK", HOST_INTERFACE_ONE_BODY),
+                ("200 OK", HOST_INTERFACE_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 9);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::LogServices,
+                ResourceFeature::LogServices,
+                ResourceFeature::ManagerNetworkProtocol,
+                ResourceFeature::HostInterfaces,
+                ResourceFeature::HostInterfaces,
+            ]
+        );
+        assert_log_service_projection(&resources[4])?;
+        assert_minimal_log_service_projection(&resources[5])?;
+        assert_manager_network_protocol_projection(&resources[6])?;
+        assert_host_interface_projection(&resources[7])?;
+        assert_minimal_host_interface_projection(&resources[8])?;
+        assert_session_requests(
+            &server.finish_all().await?,
+            &MANAGER_FAMILY_RESOURCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    /// Asserts the full `LogService` member projection with every optional
+    /// contract field populated. Only the contract fields may leave the
+    /// gateway: the decoded schema fields that are not part of the contract
+    /// must stay out of the snapshot or the strict application decoder
+    /// rejects it, and the linked `LogEntryCollection` is never fetched.
+    fn assert_log_service_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Managers/1/LogServices/SEL"
+        );
+        assert_eq!(
+            projection.etag().map(ResourceEtag::as_str),
+            Some("W/\"log-service-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["ServiceEnabled"], true);
+        assert_eq!(payload["MaxNumberOfRecords"], 10000);
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("OverWritePolicy"), None);
+        assert_eq!(payload.get("LogEntryType"), None);
+        assert_eq!(payload.get("DateTime"), None);
+        assert_eq!(payload.get("Entries"), None);
+        Ok(())
+    }
+
+    /// Asserts the minimal `LogService` member projection: every optional
+    /// contract field is absent and must be omitted, not emitted as null.
+    fn assert_minimal_log_service_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Managers/1/LogServices/Audit"
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Id"], "Audit");
+        assert_eq!(payload.get("ServiceEnabled"), None);
+        assert_eq!(payload.get("MaxNumberOfRecords"), None);
+        assert_eq!(payload.get("Status"), None);
+        Ok(())
+    }
+
+    /// Asserts the full `ManagerNetworkProtocol` singleton projection with
+    /// every optional contract field populated; the per-protocol settings are
+    /// nested `Protocol` objects that stay out of the strictly projectable
+    /// field set.
+    fn assert_manager_network_protocol_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Managers/1/NetworkProtocol",
+            "W/\"network-protocol-1\"",
+            "HostName",
+            "bmc-rack-a",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["FQDN"], "bmc-rack-a.example.test");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("HTTP"), None);
+        assert_eq!(payload.get("HTTPS"), None);
+        assert_eq!(payload.get("SSH"), None);
+        assert_eq!(payload.get("SNMP"), None);
+        Ok(())
+    }
+
+    /// Asserts the full `HostInterface` member projection with every optional
+    /// contract field populated; the host-facing ethernet links and the
+    /// authentication sections stay out.
+    fn assert_host_interface_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Managers/1/HostInterfaces/1"
+        );
+        assert_eq!(
+            projection.etag().map(ResourceEtag::as_str),
+            Some("W/\"host-interface-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["InterfaceEnabled"], true);
+        assert_eq!(payload["HostInterfaceType"], "NetworkHostInterface");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("ExternallyAccessible"), None);
+        assert_eq!(payload.get("AuthenticationModes"), None);
+        assert_eq!(payload.get("HostEthernetInterfaces"), None);
+        assert_eq!(payload.get("ManagerEthernetInterface"), None);
+        Ok(())
+    }
+
+    /// Asserts the minimal `HostInterface` member projection: every optional
+    /// contract field is absent and must be omitted, not emitted as null.
+    fn assert_minimal_host_interface_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Managers/1/HostInterfaces/2"
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Id"], "2");
+        assert_eq!(payload.get("InterfaceEnabled"), None);
+        assert_eq!(payload.get("HostInterfaceType"), None);
+        assert_eq!(payload.get("Status"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_manager_family_links_produce_no_family_snapshots() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The Manager member advertises no LogServices, NetworkProtocol, or
+        // HostInterfaces links, so none of the three families produce
+        // snapshots ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &ABSENT_MANAGER_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_manager_family_collections_produce_no_member_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_MANAGER_FAMILIES_BODY),
+                ("200 OK", LOG_SERVICES_BODY),
+                ("200 OK", NETWORK_PROTOCOL_FULL_BODY),
+                ("200 OK", HOST_INTERFACES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The advertised-but-empty LogServices and HostInterfaces
+        // collections produce no member snapshots, while the NetworkProtocol
+        // singleton is still read because its link is present
+        // ("资源存在才呈现").
+        assert_eq!(resources.len(), 5);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::ManagerNetworkProtocol,
+            ]
+        );
+        assert_eq!(
+            resources[4].odata_id().as_str(),
+            "/redfish/v1/Managers/1/NetworkProtocol"
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &EMPTY_MANAGER_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_undecodable_manager_family_members_and_singleton_without_aborting()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_MANAGER_FAMILIES_BODY),
+                ("200 OK", LOG_SERVICES_WITH_MEMBERS_BODY),
+                ("200 OK", LOG_SERVICE_ONE_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", "{}"),
+                ("200 OK", HOST_INTERFACES_WITH_MEMBERS_BODY),
+                ("200 OK", HOST_INTERFACE_ONE_BODY),
+                ("200 OK", HOST_INTERFACE_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The undecodable second LogService member and the undecodable
+        // NetworkProtocol singleton are skipped; the readable members of
+        // every family still produce snapshots (§0.2.0 acceptance, singleton
+        // failure treated as member-level skip).
+        assert_eq!(resources.len(), 7);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::LogServices,
+                ResourceFeature::HostInterfaces,
+                ResourceFeature::HostInterfaces,
+            ]
+        );
+        assert_eq!(
+            resources[4].odata_id().as_str(),
+            "/redfish/v1/Managers/1/LogServices/SEL"
+        );
+        assert_eq!(
+            resources[5].odata_id().as_str(),
+            "/redfish/v1/Managers/1/HostInterfaces/1"
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &MANAGER_FAMILY_RESOURCE_REQUEST_PATHS,
+        )?;
         Ok(())
     }
 
