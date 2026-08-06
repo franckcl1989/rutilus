@@ -23,7 +23,7 @@ use rutilus_application::{
     DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
     EndpointRefreshRepository, EventRepository, OperationStore, ProtectedCredentialCreation,
     RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
-    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
+    SystemCaEvaluation, TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityState, Credential,
@@ -31,7 +31,8 @@ use rutilus_domain::{
     Endpoint, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
     EndpointDisplayName, EndpointId, Event, Operation, OperationId, OperationState,
     RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot,
-    ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+    ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+    TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -392,6 +393,41 @@ impl ArtifactRepository for MockServices {
         // The artifact paths are never exercised by this suite; the path
         // contract is covered by the artifact_path e2e tests.
         PathBuf::from("unused-artifact-path")
+    }
+}
+
+impl TelemetryRepository for MockServices {
+    type Error = MockError;
+
+    fn upsert_series<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        _series_key: &'a SeriesKey,
+    ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn append_sample<'a>(
+        &'a self,
+        _sample: &'a TelemetrySample,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_samples(
+        &self,
+        _series_id: TelemetrySeriesId,
+        _limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn prune_before(&self, _cutoff: OffsetDateTime) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
     }
 }
 

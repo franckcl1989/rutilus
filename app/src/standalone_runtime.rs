@@ -16,13 +16,15 @@ use rutilus_application::{
     CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
     DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
     EndpointRefreshRepository, EventIngestion, EventRepository, EventStream, EventStreamPull,
-    OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
-    ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
+    MetricReportSnapshotReader, OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery,
+    ResolvedCredential, ResourceObservation, StoredCapability, TaskMonitor, TelemetryRepository,
+    TelemetrySampler, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
     CredentialVersionId, DeploymentPosture, Endpoint, EndpointCapabilityObservation, EndpointId,
-    Event, Operation, OperationId, OperationState, ResourceSnapshot,
+    Event, Operation, OperationId, OperationState, ResourceSnapshot, SeriesKey, TelemetrySample,
+    TelemetrySeries, TelemetrySeriesId,
 };
 use rutilus_infra_redfish::{
     EventStream as GatewayEventStream, EventStreamError, EventStreamOpenError,
@@ -36,7 +38,7 @@ use rutilus_persistence::{
     ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
     EventRepositoryError, NewCredential, OpenStoreError, OperationRepositoryError,
-    RemoteTaskRepositoryError, SqliteStore,
+    RemoteTaskRepositoryError, SqliteStore, TelemetryRepositoryError,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
@@ -55,6 +57,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ActiveCredentialResolverError, StandaloneUnlock, SystemClock, event_listener, scheduler,
+    telemetry_sampler,
 };
 
 /// Defensive upper bound for the in-memory recent-audit tail served by the
@@ -471,6 +474,100 @@ impl EventRepository for StandaloneState {
     }
 }
 
+impl TelemetryRepository for StandaloneState {
+    type Error = SharedTelemetryRepositoryError;
+
+    /// Delegates the §14.4 telemetry lifecycle to the same `SqliteStore`
+    /// that owns every other aggregate, so the sampling task (which appends
+    /// through the application use case) and the console's telemetry queries
+    /// (which compose the `TelemetryRepository` boundary of the
+    /// product-services bundle) always observe one authoritative record —
+    /// the same rows the retention prune rewrites.
+    fn upsert_series<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        series_key: &'a SeriesKey,
+    ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .upsert_series(endpoint_id, series_key.clone())
+                .await
+                .map_err(SharedTelemetryRepositoryError::Telemetry)
+        })
+    }
+
+    fn append_sample<'a>(
+        &'a self,
+        sample: &'a TelemetrySample,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .append_sample(sample)
+                .await
+                .map_err(SharedTelemetryRepositoryError::Telemetry)
+        })
+    }
+
+    fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
+        Box::pin(async move { list_all_telemetry_series(self).await })
+    }
+
+    fn list_samples(
+        &self,
+        series_id: TelemetrySeriesId,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
+        Box::pin(async move {
+            // The store's bounded listing takes a plain `usize` (its own
+            // contract: `0` lists nothing); the Web layer already caps every
+            // query limit at TELEMETRY_QUERY_MAX_LIMIT, so a limit this
+            // large cannot be unrepresentable on any supported pointer
+            // width — the audit projection's saturation fallback precedent.
+            let limit = usize::try_from(limit.get()).unwrap_or(usize::MAX);
+            self.store
+                .list_samples(series_id, limit)
+                .await
+                .map_err(SharedTelemetryRepositoryError::Telemetry)
+        })
+    }
+
+    fn prune_before(&self, cutoff: OffsetDateTime) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .prune_before(cutoff)
+                .await
+                .map(|_summary| ())
+                .map_err(SharedTelemetryRepositoryError::Telemetry)
+        })
+    }
+}
+
+/// Lists every telemetry series across every enrolled endpoint.
+///
+/// The store's listing is per-endpoint, and the product's current-value
+/// surface is one series inventory across endpoints: the wrapper merges the
+/// per-endpoint listings through the store's light endpoint-only listing.
+async fn list_all_telemetry_series(
+    state: &StandaloneState,
+) -> Result<Vec<TelemetrySeries>, SharedTelemetryRepositoryError> {
+    let endpoints = state
+        .store
+        .list_endpoints()
+        .await
+        .map_err(SharedTelemetryRepositoryError::Endpoints)?;
+    let mut series = Vec::new();
+    for endpoint in &endpoints {
+        series.extend(
+            state
+                .store
+                .list_series(endpoint.id())
+                .await
+                .map_err(SharedTelemetryRepositoryError::Telemetry)?,
+        );
+    }
+    Ok(series)
+}
+
 /// The `'static` event-repository role shared by the listener tasks.
 ///
 /// # Why the wrapper exists
@@ -498,6 +595,88 @@ impl EventRepository for SharedEventRepository {
         Box::pin(async move {
             let limit = usize::try_from(limit.get()).unwrap_or(usize::MAX);
             self.0.store.list_recent_events(limit).await
+        })
+    }
+}
+
+/// The `'static` telemetry-repository role shared by the sampling task.
+///
+/// # Why the wrapper exists
+///
+/// Exactly like [`SharedEventRepository`]: the sampling loop task is spawned
+/// with `'static` bounds (design §7.8), so the telemetry store role it holds
+/// cannot borrow the instance — it owns its repository through an `Arc`. An
+/// `Arc<StandaloneState>` cannot implement the application boundary directly
+/// (the orphan rule), so this crate-local wrapper is the owned role. The
+/// retention-prune summary the store returns is deliberately dropped at the
+/// boundary: the product has no log facility yet, and the loop's failures
+/// are already recorded through `eprintln!`.
+struct SharedTelemetryRepository(Arc<StandaloneState>);
+
+impl TelemetryRepository for SharedTelemetryRepository {
+    type Error = SharedTelemetryRepositoryError;
+
+    fn upsert_series<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        series_key: &'a SeriesKey,
+    ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
+        TelemetryRepository::upsert_series(self.0.as_ref(), endpoint_id, series_key)
+    }
+
+    fn append_sample<'a>(
+        &'a self,
+        sample: &'a TelemetrySample,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        TelemetryRepository::append_sample(self.0.as_ref(), sample)
+    }
+
+    fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
+        TelemetryRepository::list_series(self.0.as_ref())
+    }
+
+    fn list_samples(
+        &self,
+        series_id: TelemetrySeriesId,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
+        TelemetryRepository::list_samples(self.0.as_ref(), series_id, limit)
+    }
+
+    fn prune_before(&self, cutoff: OffsetDateTime) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        TelemetryRepository::prune_before(self.0.as_ref(), cutoff)
+    }
+}
+
+/// A controlled failure of the shared telemetry store role.
+///
+/// The wrapper composes the store's telemetry operations with the light
+/// endpoint-only listing, whose error vocabulary differs; the crate-local
+/// error keeps the boundary's failure type single while preserving the
+/// source chain for the loop's `Display` recording.
+#[derive(Debug, Error)]
+enum SharedTelemetryRepositoryError {
+    #[error("telemetry persistence failed: {0}")]
+    Telemetry(#[source] TelemetryRepositoryError),
+    #[error("enrolled endpoint listing failed: {0}")]
+    Endpoints(#[source] EndpointRepositoryError),
+}
+
+/// The §14.4 enrolled-endpoint listing of the sampling loop over the
+/// concrete Standalone composition.
+///
+/// Lists through the store's endpoint-only listing — one light query per
+/// tick — instead of the resource-bearing inventory listing the event
+/// listeners use at startup.
+struct StandaloneEndpointLister(Arc<StandaloneState>);
+
+impl telemetry_sampler::EndpointLister for StandaloneEndpointLister {
+    type Error = EndpointRepositoryError;
+
+    fn list_enrolled_endpoints(&self) -> BoundaryFuture<'_, Result<Vec<EndpointId>, Self::Error>> {
+        Box::pin(async move {
+            let endpoints = self.0.store.list_endpoints().await?;
+            Ok(endpoints.iter().map(Endpoint::id).collect())
         })
     }
 }
@@ -738,9 +917,9 @@ where
 /// endpoint's SSE stream and records every event through the ingestion use
 /// case. All of them stop through one stop signal, drained in the design
 /// §7.8 order — scheduling first (the in-flight tick finishes), then the
-/// event listeners (each in-flight event finishes), then the server —
-/// before `SQLite` closes, so no task ever touches the store after shutdown
-/// begins.
+/// event listeners (each in-flight event finishes), then the telemetry
+/// sampler (its in-flight sweep finishes), then the server — before
+/// `SQLite` closes, so no task ever touches the store after shutdown begins.
 ///
 /// # Errors
 ///
@@ -760,10 +939,10 @@ pub async fn run_initialized_standalone(
     let gateway = Arc::new(gateway);
     let run_result = async {
         let binding = StandaloneBinding::bind().await?;
-        // One stop signal stops the scheduler, the event listeners, and the
-        // server in order; each task owns its own Arc clones of the
-        // authenticated state and the gateway, so it is `'static` and
-        // spawnable.
+        // One stop signal stops the scheduler, the event listeners, the
+        // telemetry sampler, and the server in order; each task owns its own
+        // Arc clones of the authenticated state and the gateway, so it is
+        // `'static` and spawnable.
         let (stop_signal, stop_watch) = scheduler::StopSignal::new();
         let scheduler = tokio::spawn(run_operation_scheduler(
             stop_watch.clone(),
@@ -780,6 +959,13 @@ pub async fn run_initialized_standalone(
             Arc::clone(&instance.state),
             gateway.clone(),
         ));
+        // §14.4: the telemetry sampling loop ticks on its own cadence over
+        // the stored MetricReport snapshots, re-listing the enrolled
+        // endpoints every tick.
+        let sampler = tokio::spawn(run_telemetry_sampler(
+            stop_watch.clone(),
+            Arc::clone(&instance.state),
+        ));
         run_standalone_with_scheduler(
             binding,
             options,
@@ -789,6 +975,7 @@ pub async fn run_initialized_standalone(
             stop_signal,
             scheduler,
             listeners,
+            sampler,
         )
         .await
     }
@@ -958,6 +1145,39 @@ enum StandaloneEventStreamError {
     Stream(#[source] EventStreamError),
 }
 
+/// Assembles the §14.4 telemetry sampling loop over the authenticated
+/// Standalone state and runs it until the stop watch fires.
+///
+/// # Why the composition lives here
+///
+/// Like [`run_operation_scheduler`]: the loop's sampler composes the
+/// concrete `StandaloneState` — the stored-snapshot reader over the state's
+/// inventory role, the shared telemetry store role, and the endpoint lister
+/// — and the state type is private to this module, so the composition cannot
+/// live in `telemetry_sampler`. The task owns its Arc clones, so the
+/// composition is `'static` and spawnable; it exits on the stop signal after
+/// its in-flight sweep finishes, and the runtime joins it before closing
+/// `SQLite`.
+async fn run_telemetry_sampler(stop: scheduler::StopWatch, state: Arc<StandaloneState>) {
+    // The reader borrows the state for the task's lifetime, and the store
+    // role owns it through the Arc wrapper; the sampler's clock is the
+    // product's `SystemClock`, so the sweep instant and the retention cutoff
+    // both come from one clock.
+    let reader = MetricReportSnapshotReader::new(state.as_ref());
+    let store = SharedTelemetryRepository(Arc::clone(&state));
+    let sampler = TelemetrySampler::new(reader, store, SystemClock);
+    let lister = StandaloneEndpointLister(Arc::clone(&state));
+    telemetry_sampler::run(
+        stop,
+        &sampler,
+        &lister,
+        telemetry_sampler::TELEMETRY_SAMPLE_INTERVAL,
+        telemetry_sampler::TELEMETRY_RETENTION,
+        SystemClock,
+    )
+    .await;
+}
+
 /// Assembles the operation scheduling loop over the authenticated Standalone
 /// state and runs it until the stop watch fires.
 ///
@@ -1014,21 +1234,23 @@ async fn run_operation_scheduler(
     .await;
 }
 
-/// Serves the Standalone console with the operation scheduling loop and the
-/// §14.4 event listeners until Ctrl-C, then drains in the design §7.8 order:
-/// stop scheduling first (the loop finishes its in-flight tick), then the
-/// event listeners (each in-flight event finishes), then the HTTP server,
-/// and only then return so `SQLite` can close.
+/// Serves the Standalone console with the operation scheduling loop, the
+/// §14.4 event listeners, and the §14.4 telemetry sampling loop until
+/// Ctrl-C, then drains in the design §7.8 order: stop scheduling first (the
+/// loop finishes its in-flight tick), then the event listeners (each
+/// in-flight event finishes), then the telemetry sampler (its in-flight
+/// sweep finishes), then the HTTP server, and only then return so `SQLite`
+/// can close.
 ///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when loopback binding, signal registration,
-/// or HTTP serving fails; the scheduler's and the listeners' own shutdowns
-/// are always awaited before the store close.
+/// or HTTP serving fails; the background tasks' own shutdowns are always
+/// awaited before the store close.
 ///
 /// The function carries the whole shutdown orchestration (binding, options,
-/// both background tasks, and both stop handles), so the argument count is
-/// inherent to the §7.8 drain order it coordinates.
+/// all three background tasks, and both stop handles), so the argument count
+/// is inherent to the §7.8 drain order it coordinates.
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_with_scheduler(
     binding: StandaloneBinding,
@@ -1039,6 +1261,7 @@ async fn run_standalone_with_scheduler(
     stop_signal: scheduler::StopSignal,
     mut scheduler: tokio::task::JoinHandle<()>,
     mut listeners: tokio::task::JoinHandle<()>,
+    mut sampler: tokio::task::JoinHandle<()>,
 ) -> Result<(), StandaloneRunError> {
     // The server's graceful drain waits for the background tasks to have
     // fully stopped first (design §7.8: stop scheduling and listening, then
@@ -1058,6 +1281,7 @@ async fn run_standalone_with_scheduler(
             stop_signal.signal();
             drain_scheduler(&mut scheduler).await;
             drain_listeners(&mut listeners).await;
+            drain_sampler(&mut sampler).await;
             let _ = scheduler_done_sender.send(());
             result.map_err(StandaloneRunError::Serve)
         }
@@ -1068,6 +1292,9 @@ async fn run_standalone_with_scheduler(
             drain_scheduler(&mut scheduler).await;
             // The listeners drain next; each in-flight event finishes.
             drain_listeners(&mut listeners).await;
+            // The telemetry sampler drains last; its in-flight sweep
+            // finishes.
+            drain_sampler(&mut sampler).await;
             let _ = scheduler_done_sender.send(());
             // The server's shutdown future resolves now; await its drain.
             server.await.map_err(StandaloneRunError::Serve)
@@ -1096,6 +1323,18 @@ async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
 async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = listeners.await {
         eprintln!("The event listener task failed: {join_error}");
+    }
+}
+
+/// Waits for the telemetry-sampler task and reports an unexpected failure.
+///
+/// The sampler never returns an error — it exits only on the stop signal,
+/// after its in-flight sweep finishes — so a `JoinError` means the wrapper
+/// panicked or was cancelled, a programming defect worth surfacing but not a
+/// blocker for the `SQLite` close that follows.
+async fn drain_sampler(sampler: &mut tokio::task::JoinHandle<()>) {
+    if let Err(join_error) = sampler.await {
+        eprintln!("The telemetry sampling task failed: {join_error}");
     }
 }
 

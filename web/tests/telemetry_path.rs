@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! End-to-end Axum tests for the 0.4 §14.4 event history path:
-//! `GET /api/v1/events`.
+//! End-to-end Axum tests for the 0.4 §14.4 telemetry paths:
+//! `GET /api/v1/telemetry` and `GET /api/v1/telemetry/{series_id}/samples`.
 //!
 //! Every application boundary is served by an in-memory fake, with a real
-//! in-memory event store, so the Web Router is exercised without persistence
-//! or network access. The dedup contract of §14.4 去除明显重复 is the
-//! persistence implementation's — the application ingestion tests cover it —
-//! so this fake appends every event and only mirrors the newest-first
-//! bounded listing the console relies on.
+//! in-memory telemetry store, so the Web Router is exercised without
+//! persistence or network access. The current-value aggregate of the series
+//! listing is computed the same way the handler computes it — the newest
+//! retained sample through the bounded newest-first listing with limit one —
+//! so the fake's `list_samples` must honor that contract.
 
 use std::{
     error::Error,
@@ -32,9 +32,8 @@ use rutilus_application::{
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
     CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointCapabilityObservation, EndpointId, Event, EventId, EventSeverity, MessageId, Operation,
-    OperationId, OperationState, ResourceSnapshot, SeriesKey, TelemetrySample, TelemetrySeries,
-    TelemetrySeriesId, TlsTrust,
+    EndpointCapabilityObservation, EndpointId, Event, Operation, OperationId, OperationState,
+    ResourceSnapshot, SeriesKey, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -42,14 +41,16 @@ use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt as _;
 
+/// One stored series with its retained samples, in append order.
 #[derive(Default)]
 struct MockState {
-    events: Vec<Event>,
-    fail_event_listing: bool,
+    series: Vec<(TelemetrySeries, Vec<TelemetrySample>)>,
+    fail_series_listing: bool,
+    fail_sample_listing: bool,
 }
 
 /// Implements every application boundary behind the injected services bundle,
-/// with a functioning in-memory event store.
+/// with a functioning in-memory telemetry store.
 #[derive(Clone)]
 struct MockServices {
     state: Arc<Mutex<MockState>>,
@@ -61,7 +62,7 @@ impl MockServices {
     }
 }
 
-/// Implements the Redfish boundaries without opening a socket; the event
+/// Implements the Redfish boundaries without opening a socket; the telemetry
 /// paths never exercise them.
 #[derive(Clone, Copy)]
 struct MockGateway;
@@ -124,41 +125,6 @@ impl ArtifactRepository for MockServices {
         // The artifact paths are never exercised by this suite; the path
         // contract is covered by the artifact_path e2e tests.
         PathBuf::from("unused-artifact-path")
-    }
-}
-
-impl TelemetryRepository for MockServices {
-    type Error = MockError;
-
-    fn upsert_series<'a>(
-        &'a self,
-        _endpoint_id: EndpointId,
-        _series_key: &'a SeriesKey,
-    ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
-    }
-
-    fn append_sample<'a>(
-        &'a self,
-        _sample: &'a TelemetrySample,
-    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
-    }
-
-    fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
-    }
-
-    fn list_samples(
-        &self,
-        _series_id: TelemetrySeriesId,
-        _limit: NonZeroU64,
-    ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
-    }
-
-    fn prune_before(&self, _cutoff: OffsetDateTime) -> BoundaryFuture<'_, Result<(), Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
     }
 }
 
@@ -331,36 +297,81 @@ impl CapabilitySnapshotRepository for MockServices {
 impl EventRepository for MockServices {
     type Error = MockError;
 
-    /// Appends one event to the in-memory store.
-    ///
-    /// The §14.4 去除明显重复 dedup is the persistence implementation's
-    /// contract, exercised by the application ingestion tests; this fake
-    /// keeps every row so the listing assertions stay about the web path.
-    fn append_event<'a>(&'a self, event: &'a Event) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+    fn append_event<'a>(
+        &'a self,
+        _event: &'a Event,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_recent_events(
+        &self,
+        _limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl TelemetryRepository for MockServices {
+    type Error = MockError;
+
+    fn upsert_series<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        _series_key: &'a SeriesKey,
+    ) -> BoundaryFuture<'a, Result<TelemetrySeries, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn append_sample<'a>(
+        &'a self,
+        _sample: &'a TelemetrySample,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    /// Lists every series in seeding order; the handler's per-series
+    /// current-value query then asks for the newest sample.
+    fn list_series(&self) -> BoundaryFuture<'_, Result<Vec<TelemetrySeries>, Self::Error>> {
         Box::pin(async move {
-            self.state
-                .lock()
-                .map_err(|_| MockError::Lock)?
-                .events
-                .push(event.clone());
-            Ok(())
+            let state = self.state.lock().map_err(|_| MockError::Lock)?;
+            if state.fail_series_listing {
+                return Err(MockError::Persistence);
+            }
+            Ok(state
+                .series
+                .iter()
+                .map(|(series, _samples)| series.clone())
+                .collect())
         })
     }
 
-    /// Lists the newest events first: the fake stores in append order, so
-    /// the reversed tail is the console's newest-first view.
-    fn list_recent_events(
+    /// Lists the newest samples first: the fake stores in append order, so
+    /// the reversed tail is the console's newest-first view, exactly like
+    /// the real store's `observed_at`-descending order.
+    fn list_samples(
         &self,
+        series_id: TelemetrySeriesId,
         limit: NonZeroU64,
-    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+    ) -> BoundaryFuture<'_, Result<Vec<TelemetrySample>, Self::Error>> {
         Box::pin(async move {
             let state = self.state.lock().map_err(|_| MockError::Lock)?;
-            if state.fail_event_listing {
+            if state.fail_sample_listing {
                 return Err(MockError::Persistence);
             }
             let take = usize::try_from(limit.get()).map_err(|_| MockError::Persistence)?;
-            Ok(state.events.iter().rev().take(take).cloned().collect())
+            let samples = state
+                .series
+                .iter()
+                .find(|(series, _)| series.id() == series_id)
+                .map(|(_series, samples)| samples.iter().rev().take(take).copied().collect())
+                .unwrap_or_default();
+            Ok(samples)
         })
+    }
+
+    fn prune_before(&self, _cutoff: OffsetDateTime) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
     }
 }
 
@@ -435,147 +446,202 @@ async fn json_body(response: axum::response::Response) -> Result<Value, Box<dyn 
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// Builds one event recorded from the given endpoint at the given times.
+/// Seeds one series with the given readings and returns its stable identity.
 ///
-/// The receive time is always one second after the BMC's event timestamp, so
-/// the domain timeline constraint holds; the observed times are what the
-/// listing order and the assertions pin.
-fn recorded_event(
+/// The readings are stamped with the product clock at one-second intervals
+/// starting at the given base, so the newest-first order is deterministic.
+/// The series' `sample_count` mirrors the readings, exactly like the real
+/// store maintains it.
+fn seeded_series(
+    state: &Arc<Mutex<MockState>>,
     endpoint_id: EndpointId,
-    message_id: &str,
-    severity: EventSeverity,
-    event_timestamp: OffsetDateTime,
-) -> Result<Event, Box<dyn Error>> {
-    Ok(Event::new(
-        EventId::generate(),
+    series_key: &str,
+    base: OffsetDateTime,
+    readings: &[f64],
+) -> Result<TelemetrySeriesId, Box<dyn Error>> {
+    let series = TelemetrySeries::from_parts(
+        TelemetrySeriesId::generate(),
         endpoint_id,
-        MessageId::parse(message_id)?,
-        severity,
-        Some(format!("message text of {message_id}")),
-        event_timestamp,
-        event_timestamp + Duration::SECOND,
-    )?)
+        SeriesKey::parse(series_key)?,
+        u64::try_from(readings.len()).map_err(|_| std::io::Error::other("too many readings"))?,
+    );
+    let mut samples = Vec::new();
+    for (index, value) in readings.iter().enumerate() {
+        // The fixture runs at most a handful of readings, so the index fits
+        // the `u32` factor `Duration` multiplies by; the `try_from` makes
+        // the guarantee explicit instead of casting silently.
+        let step = u32::try_from(index).map_err(|_| std::io::Error::other("too many readings"))?;
+        let observed_at = base + Duration::SECOND * step;
+        samples.push(
+            TelemetrySample::new(series.id(), observed_at, *value)?.with_bmc_timestamp(observed_at),
+        );
+    }
+    let series_id = series.id();
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .series
+        .push((series, samples));
+    Ok(series_id)
 }
 
 #[tokio::test]
-async fn events_route_lists_newest_first_with_all_fields() -> Result<(), Box<dyn Error>> {
+async fn telemetry_route_lists_series_with_current_value_aggregates() -> Result<(), Box<dyn Error>>
+{
     let state = Arc::new(Mutex::new(MockState::default()));
     let endpoint = EndpointId::generate();
-    let oldest = recorded_event(
-        endpoint,
-        "Alert.1.0.PowerSupplyFailure",
-        EventSeverity::Critical,
-        OffsetDateTime::UNIX_EPOCH + Duration::SECOND * 10,
-    )?;
-    let middle = recorded_event(
-        endpoint,
-        "ResourceEvent.1.0.LanResetType",
-        EventSeverity::Warning,
-        OffsetDateTime::UNIX_EPOCH + Duration::SECOND * 20,
-    )?;
-    let newest = recorded_event(
-        EndpointId::generate(),
-        "Alert.1.0.FanRedundancyLost",
-        EventSeverity::Ok,
-        OffsetDateTime::UNIX_EPOCH + Duration::SECOND * 30,
-    )?;
-    {
-        let mut state = state.lock().map_err(|_| MockError::Lock)?;
-        state.events.push(oldest.clone());
-        state.events.push(middle.clone());
-        state.events.push(newest.clone());
-    }
-    let router = test_router(MockServices::new(Arc::clone(&state)));
+    let base = OffsetDateTime::UNIX_EPOCH;
+    let power_id = seeded_series(&state, endpoint, "PowerMetrics", base, &[100.0, 94.0])?;
+    // A series whose upsert preceded its first successful append reports no
+    // current value; the seeded id is regenerated so the assertion only pins
+    // the response's own id shape for the empty series.
+    let empty_id = seeded_series(&state, endpoint, "ThermalMetrics", base, &[])?;
+    let router = test_router(MockServices::new(state));
 
-    let response = get(&router, "/api/v1/events").await?;
+    let response = get(&router, "/api/v1/telemetry").await?;
 
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-    assert_eq!(
-        response.headers().get("cache-control"),
-        Some(&axum::http::HeaderValue::from_static(
-            "no-store, must-revalidate"
-        ))
-    );
-    let body = json_body(response).await?;
-    let events = body["events"]
-        .as_array()
-        .ok_or("the response must carry events")?;
-    assert_eq!(events.len(), 3);
-    // Newest first, with the BMC-reported MessageId, the stable severity
-    // code, the original message text, and both clocks.
-    assert_eq!(events[0]["id"], newest.id().to_string());
-    assert_eq!(events[0]["endpoint_id"], newest.endpoint_id().to_string());
-    assert_eq!(events[0]["message_id"], "Alert.1.0.FanRedundancyLost");
-    assert_eq!(events[0]["severity"], "ok");
-    assert_eq!(
-        events[0]["message"],
-        "message text of Alert.1.0.FanRedundancyLost"
-    );
-    assert_eq!(events[0]["event_timestamp"], "1970-01-01T00:00:30Z");
-    assert_eq!(events[0]["observed_at"], "1970-01-01T00:00:31Z");
-    assert_eq!(events[1]["id"], middle.id().to_string());
-    assert_eq!(events[1]["message_id"], "ResourceEvent.1.0.LanResetType");
-    assert_eq!(events[1]["severity"], "warning");
-    assert_eq!(events[2]["id"], oldest.id().to_string());
-    assert_eq!(events[2]["severity"], "critical");
-    Ok(())
-}
-
-#[tokio::test]
-async fn events_route_respects_the_limit_and_never_exceeds_it() -> Result<(), Box<dyn Error>> {
-    let state = Arc::new(Mutex::new(MockState::default()));
-    let endpoint = EndpointId::generate();
-    for seconds in 0..5 {
-        let event = recorded_event(
-            endpoint,
-            "Alert.1.0.PowerSupplyFailure",
-            EventSeverity::Critical,
-            OffsetDateTime::UNIX_EPOCH + Duration::SECOND * seconds,
-        )?;
-        state
-            .lock()
-            .map_err(|_| MockError::Lock)?
-            .events
-            .push(event);
-    }
-    let router = test_router(MockServices::new(Arc::clone(&state)));
-
-    let response = get(&router, "/api/v1/events?limit=2").await?;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-    let body = json_body(response).await?;
-    let events = body["events"]
-        .as_array()
-        .ok_or("the response must carry events")?;
-    assert_eq!(events.len(), 2);
-    // The bounded window is the newest tail.
-    assert_eq!(events[0]["event_timestamp"], "1970-01-01T00:00:04Z");
-    assert_eq!(events[1]["event_timestamp"], "1970-01-01T00:00:03Z");
-
-    // A limit beyond the recorded count returns what exists, not an error.
-    let response = get(&router, "/api/v1/events?limit=7").await?;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     let body = json_body(response).await?;
     assert_eq!(
-        body["events"]
-            .as_array()
-            .ok_or("the response must carry events")?
-            .len(),
-        5
+        body,
+        json!({
+            "series": [
+                {
+                    "series_id": power_id.to_string(),
+                    "endpoint_id": endpoint.to_string(),
+                    "series_key": "PowerMetrics",
+                    "sample_count": 2,
+                    "latest_value": 94.0,
+                    "latest_observed_at": "1970-01-01T00:00:01Z"
+                },
+                {
+                    "series_id": empty_id.to_string(),
+                    "endpoint_id": endpoint.to_string(),
+                    "series_key": "ThermalMetrics",
+                    "sample_count": 0,
+                    "latest_value": null,
+                    "latest_observed_at": null
+                }
+            ]
+        })
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn events_route_rejects_invalid_limits() -> Result<(), Box<dyn Error>> {
+async fn telemetry_route_returns_an_empty_series_list_before_any_sampling()
+-> Result<(), Box<dyn Error>> {
     let state = Arc::new(Mutex::new(MockState::default()));
     let router = test_router(MockServices::new(state));
 
+    let response = get(&router, "/api/v1/telemetry").await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    assert_eq!(body, json!({ "series": [] }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn samples_route_lists_the_bounded_history_newest_first() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = EndpointId::generate();
+    let base = OffsetDateTime::UNIX_EPOCH;
+    let series_id = seeded_series(
+        &state,
+        endpoint,
+        "PowerMetrics",
+        base,
+        &[1.0, 2.0, 3.0, 4.0, 5.0],
+    )?;
+    let router = test_router(MockServices::new(state));
+
+    let response = get(
+        &router,
+        &format!("/api/v1/telemetry/{series_id}/samples?limit=3"),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    assert_eq!(
+        body,
+        json!({
+            "samples": [
+                {
+                    "series_id": series_id.to_string(),
+                    "observed_at": "1970-01-01T00:00:04Z",
+                    "bmc_timestamp": "1970-01-01T00:00:04Z",
+                    "value": 5.0
+                },
+                {
+                    "series_id": series_id.to_string(),
+                    "observed_at": "1970-01-01T00:00:03Z",
+                    "bmc_timestamp": "1970-01-01T00:00:03Z",
+                    "value": 4.0
+                },
+                {
+                    "series_id": series_id.to_string(),
+                    "observed_at": "1970-01-01T00:00:02Z",
+                    "bmc_timestamp": "1970-01-01T00:00:02Z",
+                    "value": 3.0
+                }
+            ]
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn samples_route_defaults_the_limit_when_absent() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = EndpointId::generate();
+    let base = OffsetDateTime::UNIX_EPOCH;
+    let series_id = seeded_series(&state, endpoint, "PowerMetrics", base, &[1.0, 2.0])?;
+    let router = test_router(MockServices::new(state));
+
+    let response = get(&router, &format!("/api/v1/telemetry/{series_id}/samples")).await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    let samples = body["samples"]
+        .as_array()
+        .ok_or("samples must be an array")?;
+    assert_eq!(
+        samples.len(),
+        2,
+        "the default limit must serve the whole history"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn samples_route_lists_an_unknown_series_as_empty() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let router = test_router(MockServices::new(state));
+    let unknown = TelemetrySeriesId::generate();
+
+    let response = get(&router, &format!("/api/v1/telemetry/{unknown}/samples")).await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    assert_eq!(body, json!({ "samples": [] }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn samples_route_rejects_invalid_series_ids_and_limits() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let router = test_router(MockServices::new(state));
+    let known = TelemetrySeriesId::generate();
+
     for path in [
-        "/api/v1/events?limit=0",
-        "/api/v1/events?limit=1001",
-        "/api/v1/events?limit=abc",
-        "/api/v1/events?limit=",
-        "/api/v1/events?limit=-1",
+        "/api/v1/telemetry/not-a-uuid/samples",
+        &format!("/api/v1/telemetry/{known}/samples?limit=0"),
+        &format!("/api/v1/telemetry/{known}/samples?limit=1001"),
+        &format!("/api/v1/telemetry/{known}/samples?limit=abc"),
+        &format!("/api/v1/telemetry/{known}/samples?limit="),
+        &format!("/api/v1/telemetry/{known}/samples?limit=-1"),
     ] {
         let response = get(&router, path).await?;
         assert_eq!(
@@ -590,29 +656,41 @@ async fn events_route_rejects_invalid_limits() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn events_route_returns_an_empty_list_before_any_event_was_recorded()
--> Result<(), Box<dyn Error>> {
-    let state = Arc::new(Mutex::new(MockState::default()));
-    let router = test_router(MockServices::new(state));
-
-    let response = get(&router, "/api/v1/events").await?;
-
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-    let body = json_body(response).await?;
-    assert_eq!(body, json!({ "events": [] }));
-    Ok(())
-}
-
-#[tokio::test]
-async fn events_route_reports_a_failed_listing_as_unavailable() -> Result<(), Box<dyn Error>> {
+async fn telemetry_route_reports_failed_listings_as_unavailable() -> Result<(), Box<dyn Error>> {
     let state = Arc::new(Mutex::new(MockState::default()));
     state
         .lock()
         .map_err(|_| MockError::Lock)?
-        .fail_event_listing = true;
+        .fail_series_listing = true;
     let router = test_router(MockServices::new(state));
 
-    let response = get(&router, "/api/v1/events").await?;
+    let response = get(&router, "/api/v1/telemetry").await?;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn samples_route_reports_a_failed_listing_as_unavailable() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = EndpointId::generate();
+    let series_id = seeded_series(
+        &state,
+        endpoint,
+        "PowerMetrics",
+        OffsetDateTime::UNIX_EPOCH,
+        &[1.0],
+    )?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .fail_sample_listing = true;
+    let router = test_router(MockServices::new(state));
+
+    let response = get(&router, &format!("/api/v1/telemetry/{series_id}/samples")).await?;
 
     assert_eq!(
         response.status(),
