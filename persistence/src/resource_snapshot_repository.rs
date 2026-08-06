@@ -800,6 +800,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_storage_network_and_ethernet_features()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::Storages,
+                "/redfish/v1/Systems/1/Storage/SATA-1",
+                "Storage Subsystem One",
+            )?
+            .with_odata_type(ResourceODataType::parse("#Storage.v1_21_0.Storage")?),
+            observation(
+                ResourceFeature::NetworkAdapters,
+                "/redfish/v1/Chassis/1/NetworkAdapters/1",
+                "Network Adapter One",
+            )?,
+            observation(
+                ResourceFeature::EthernetInterfaces,
+                "/redfish/v1/Managers/1/EthernetInterfaces/1",
+                "Ethernet Interface One",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"eth-1\"")?),
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let storage = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::Storages)
+            .ok_or("storage snapshot is missing")?;
+        assert_eq!(
+            storage.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Storage/SATA-1"
+        );
+        assert_eq!(
+            storage.odata_type().map(ResourceODataType::as_str),
+            Some("#Storage.v1_21_0.Storage")
+        );
+        assert!(storage.payload().as_str().contains("Storage Subsystem One"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|snapshot| snapshot.feature() == ResourceFeature::Storages)
+                .count(),
+            1
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|snapshot| snapshot.feature() == ResourceFeature::NetworkAdapters)
+                .count(),
+            1
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|snapshot| snapshot.feature() == ResourceFeature::EthernetInterfaces)
+                .count(),
+            1
+        );
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::Storages
+                | ResourceFeature::NetworkAdapters
+                | ResourceFeature::EthernetInterfaces
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
