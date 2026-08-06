@@ -885,6 +885,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_accounts_bios_boot_options_and_secure_boot_features()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::Accounts,
+                "/redfish/v1/AccountService/Accounts/admin",
+                "Administrator Account",
+            )?
+            .with_odata_type(ResourceODataType::parse(
+                "#ManagerAccount.v1_14_1.ManagerAccount",
+            )?)
+            .with_etag(ResourceEtag::parse("W/\"account-1\"")?),
+            observation(
+                ResourceFeature::Bios,
+                "/redfish/v1/Systems/1/Bios",
+                "BIOS Configuration",
+            )?,
+            observation(
+                ResourceFeature::BootOptions,
+                "/redfish/v1/Systems/1/BootOptions/PXE-1",
+                "Network Boot Option",
+            )?,
+            observation(
+                ResourceFeature::SecureBoot,
+                "/redfish/v1/Systems/1/SecureBoot",
+                "Secure Boot",
+            )?
+            .with_odata_type(ResourceODataType::parse("#SecureBoot.v1_1_2.SecureBoot")?),
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let account = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::Accounts)
+            .ok_or("account snapshot is missing")?;
+        assert_eq!(
+            account.odata_id().as_str(),
+            "/redfish/v1/AccountService/Accounts/admin"
+        );
+        assert_eq!(
+            account.odata_type().map(ResourceODataType::as_str),
+            Some("#ManagerAccount.v1_14_1.ManagerAccount")
+        );
+        assert!(account.payload().as_str().contains("Administrator Account"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for (feature, expected) in [
+            (ResourceFeature::Accounts, 1),
+            (ResourceFeature::Bios, 1),
+            (ResourceFeature::BootOptions, 1),
+            (ResourceFeature::SecureBoot, 1),
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                expected,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::Accounts
+                | ResourceFeature::Bios
+                | ResourceFeature::BootOptions
+                | ResourceFeature::SecureBoot
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
