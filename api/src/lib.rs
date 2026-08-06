@@ -861,6 +861,61 @@ pub enum CoreResourceDetailsResponse {
         interface_enabled: Option<bool>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `accounts` family member projected from the typed Redfish
+    /// manager-account schema (`ManagerAccount_v1`, nv-redfish-schema 0.13;
+    /// the feature compiles no separate `Account_v1` resource type).
+    ///
+    /// Fields are the direct `Enabled`, `RoleId`, and `Locked` properties of
+    /// the account. `UserName` was considered but duplicates the common
+    /// identity surface of `CoreResourceCommonResponse`. Unlike the 0.1 triad
+    /// and the Processor/Memory/Storage/Network families, `ManagerAccount_v1`
+    /// declares no `Status` property, so there is no status field for the
+    /// console to render — a never-populated uniform status would break the
+    /// strict `deny_unknown_fields` alignment with the infra payload.
+    Account {
+        enabled: Option<bool>,
+        role_id: Option<String>,
+        locked: Option<bool>,
+    },
+    /// One §2.1 `bios` family member projected from the typed Redfish BIOS
+    /// schema (`Bios_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Only metadata is projected: `AttributeRegistry` names the registry that
+    /// defines the attribute set. The `Attributes` bag itself is deliberately
+    /// not projected — it is a vendor-specific dynamic property map of
+    /// unbounded size, so carrying it would swamp the console with raw
+    /// settings and defeat the strict `deny_unknown_fields` alignment with
+    /// the infra payload. `Bios_v1` declares no `Status` property, so this
+    /// family carries no status field either.
+    Bios { attribute_registry: Option<String> },
+    /// One §2.1 `boot-options` family member projected from the typed Redfish
+    /// boot-option schema (`BootOption_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `DisplayName`, `BootOptionEnabled`, and
+    /// `UefiDevicePath` properties. `BootOptionEnabled` is a plain Boolean in
+    /// the schema (not an enumeration), so it stays a bool; the `Alias` boot
+    /// source enumeration and the `BootOptionReference` handle stay out of
+    /// this first strictly projectable field set. `BootOption_v1` declares no
+    /// `Status` property, so this family carries no status field either.
+    BootOption {
+        display_name: Option<String>,
+        boot_option_enabled: Option<bool>,
+        uefi_device_path: Option<String>,
+    },
+    /// One §2.1 `secure-boot` family member projected from the typed Redfish
+    /// secure-boot schema (`SecureBoot_v1`, nv-redfish-schema 0.13).
+    ///
+    /// `secure_boot_enable` is the direct `SecureBootEnable` Boolean and
+    /// `secure_boot_mode` the `SecureBootMode` enumeration (`Disabled`,
+    /// `Enabled`, `AuditMode`, `DeployedMode`, `SetupMode`, `UserMode`)
+    /// retained as a string so the console renders it without re-parsing text.
+    /// `SecureBootCurrentBoot` was considered but mirrors `SecureBootMode`
+    /// for the current boot. `SecureBoot_v1` declares no `Status` property,
+    /// so this family carries no status field either.
+    SecureBoot {
+        secure_boot_enable: Option<bool>,
+        secure_boot_mode: Option<String>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -2434,6 +2489,269 @@ mod tests {
                 manufacturer: Some("Vendor A".to_owned()),
                 model: Some("NA-25G-2P".to_owned()),
                 status: None,
+            },
+        )
+    }
+
+    #[test]
+    fn core_resource_contract_carries_account_wire_values() -> Result<(), Box<dyn Error>> {
+        let account = account_resource();
+
+        assert_eq!(
+            serde_json::to_value(&account)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d7",
+                    "odata_id": "/redfish/v1/AccountService/Accounts/admin",
+                    "odata_type": "#ManagerAccount.v1_14_1.ManagerAccount",
+                    "etag": "W/\"account-1\""
+                },
+                "common": {
+                    "id": "admin",
+                    "name": "Administrator Account",
+                    "description": "Built-in administrator account"
+                },
+                "resource": {
+                    "resource_type": "account",
+                    "details": {
+                        "enabled": true,
+                        "role_id": "Administrator",
+                        "locked": false
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&account)?)?,
+            account
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "account",
+                "details": {
+                    "enabled": null,
+                    "role_id": null,
+                    "locked": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_bios_wire_values() -> Result<(), Box<dyn Error>> {
+        let bios = bios_resource();
+
+        assert_eq!(
+            serde_json::to_value(&bios)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d8",
+                    "odata_id": "/redfish/v1/Systems/1/Bios",
+                    "odata_type": "#Bios.v1_2_3.Bios",
+                    "etag": "W/\"bios-1\""
+                },
+                "common": {
+                    "id": "BIOS",
+                    "name": "BIOS Configuration",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "bios",
+                    "details": {
+                        "attribute_registry": "BiosAttributeRegistry.v1_0_0"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&bios)?)?,
+            bios
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "bios",
+                "details": {
+                    "attribute_registry": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_boot_option_wire_values() -> Result<(), Box<dyn Error>> {
+        let boot_option = boot_option_resource();
+
+        assert_eq!(
+            serde_json::to_value(&boot_option)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d9",
+                    "odata_id": "/redfish/v1/Systems/1/BootOptions/PXE-1",
+                    "odata_type": "#BootOption.v1_0_6.BootOption",
+                    "etag": null
+                },
+                "common": {
+                    "id": "PXE-1",
+                    "name": "Network Boot Option",
+                    "description": "PXE boot option"
+                },
+                "resource": {
+                    "resource_type": "boot_option",
+                    "details": {
+                        "display_name": "PXE Network Boot",
+                        "boot_option_enabled": true,
+                        "uefi_device_path": "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&boot_option)?)?,
+            boot_option
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "boot_option",
+                "details": {
+                    "display_name": null,
+                    "boot_option_enabled": null,
+                    "uefi_device_path": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_secure_boot_wire_values() -> Result<(), Box<dyn Error>> {
+        let secure_boot = secure_boot_resource();
+
+        assert_eq!(
+            serde_json::to_value(&secure_boot)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789da",
+                    "odata_id": "/redfish/v1/Systems/1/SecureBoot",
+                    "odata_type": "#SecureBoot.v1_1_2.SecureBoot",
+                    "etag": "W/\"secure-boot-1\""
+                },
+                "common": {
+                    "id": "SecureBoot",
+                    "name": "Secure Boot",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "secure_boot",
+                    "details": {
+                        "secure_boot_enable": true,
+                        "secure_boot_mode": "DeployedMode"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&secure_boot)?)?,
+            secure_boot
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "secure_boot",
+                "details": {
+                    "secure_boot_enable": null,
+                    "secure_boot_mode": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn account_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d7"),
+                "/redfish/v1/AccountService/Accounts/admin".to_owned(),
+                Some("#ManagerAccount.v1_14_1.ManagerAccount".to_owned()),
+                Some("W/\"account-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "admin".to_owned(),
+                "Administrator Account".to_owned(),
+                Some("Built-in administrator account".to_owned()),
+            ),
+            CoreResourceDetailsResponse::Account {
+                enabled: Some(true),
+                role_id: Some("Administrator".to_owned()),
+                locked: Some(false),
+            },
+        )
+    }
+
+    fn bios_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d8"),
+                "/redfish/v1/Systems/1/Bios".to_owned(),
+                Some("#Bios.v1_2_3.Bios".to_owned()),
+                Some("W/\"bios-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "BIOS".to_owned(),
+                "BIOS Configuration".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Bios {
+                attribute_registry: Some("BiosAttributeRegistry.v1_0_0".to_owned()),
+            },
+        )
+    }
+
+    fn boot_option_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d9"),
+                "/redfish/v1/Systems/1/BootOptions/PXE-1".to_owned(),
+                Some("#BootOption.v1_0_6.BootOption".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "PXE-1".to_owned(),
+                "Network Boot Option".to_owned(),
+                Some("PXE boot option".to_owned()),
+            ),
+            CoreResourceDetailsResponse::BootOption {
+                display_name: Some("PXE Network Boot".to_owned()),
+                boot_option_enabled: Some(true),
+                uefi_device_path: Some("PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)".to_owned()),
+            },
+        )
+    }
+
+    fn secure_boot_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789da"),
+                "/redfish/v1/Systems/1/SecureBoot".to_owned(),
+                Some("#SecureBoot.v1_1_2.SecureBoot".to_owned()),
+                Some("W/\"secure-boot-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "SecureBoot".to_owned(),
+                "Secure Boot".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::SecureBoot {
+                secure_boot_enable: Some(true),
+                secure_boot_mode: Some("DeployedMode".to_owned()),
             },
         )
     }
