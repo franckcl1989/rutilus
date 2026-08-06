@@ -26,7 +26,7 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -41,14 +41,16 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
     EndpointCapability::Thermal,
     EndpointCapability::Sensors,
     EndpointCapability::Controls,
+    EndpointCapability::HostInterfaces,
+    EndpointCapability::LogServices,
+    EndpointCapability::ManagerNetworkProtocol,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
 /// must report as `NotAdvertised` instead of guessing paths.
-const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 4] = [
+const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 3] = [
     EndpointCapability::EthernetInterfaces,
     EndpointCapability::Assembly,
-    EndpointCapability::HostInterfaces,
     EndpointCapability::UpdateService,
 ];
 
@@ -59,8 +61,10 @@ const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 4] = [
 /// Memory collection with DIMM1, Chassis collection with member, `Power`
 /// singleton, `Thermal` singleton, `Sensors` collection with member,
 /// `Controls` collection with member, Managers collection with member,
-/// `AccountService` with Accounts collection and member, Session delete.
-const RESOURCE_READ_REQUEST_COUNT: u64 = 29;
+/// `LogServices` collection with member, `NetworkProtocol` singleton,
+/// `HostInterfaces` collection with member, `AccountService` with Accounts
+/// collection and member, Session delete.
+const RESOURCE_READ_REQUEST_COUNT: u64 = 34;
 
 /// The gateway's request count for one complete `probe_core_capabilities`
 /// flow with this fixture: root, `SessionService`, Sessions collection,
@@ -71,9 +75,12 @@ const RESOURCE_READ_REQUEST_COUNT: u64 = 29;
 /// `Thermal` singletons plus the `Sensors` collection document (the wrapper
 /// keeps sensor members as lazy links), the `Controls` collection document
 /// and its member (the wrapper's `controls()` accessor eagerly fetches
-/// members), the `AccountService` document, and the Session delete.
-/// Unadvertised features add no requests.
-const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 25;
+/// members), the `LogServices` collection document and its member (the
+/// wrapper's `log_services()` accessor eagerly fetches members, unlike the
+/// lazy `host_interfaces()` collection wrapper), the `NetworkProtocol`
+/// document, the `HostInterfaces` collection document, the `AccountService`
+/// document, and the Session delete. Unadvertised features add no requests.
+const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 29;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -245,34 +252,7 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
     assert_resource_order(&resources);
-    assert_payload(
-        &resources[2],
-        "AttributeRegistry",
-        "BiosAttributeRegistryP11.v1_2_0",
-    )?;
-    assert_payload(&resources[3], "DisplayName", "PXE Network Boot")?;
-    assert_payload(&resources[4], "SecureBootMode", "UserMode")?;
-    assert_payload(&resources[5], "TotalCores", "64")?;
-    assert_payload(&resources[7], "CapacityMiB", "32768")?;
-    assert_payload(&resources[13], "FirmwareVersion", "1.2.3")?;
-    assert_payload(&resources[14], "RoleId", "Administrator")?;
-    // The telemetry projections carry the readings and status exactly as
-    // published: `Power_v1` has no projectable details, `Thermal_v1` only
-    // status, and the sensor and control members their direct readings.
-    let power_payload: serde_json::Value = serde_json::from_str(resources[9].payload().as_str())?;
-    assert_eq!(power_payload["Name"], "Power");
-    assert!(power_payload.get("PowerConsumedWatts").is_none());
-    let thermal_payload: serde_json::Value =
-        serde_json::from_str(resources[10].payload().as_str())?;
-    assert_eq!(thermal_payload["Status"]["Health"], "OK");
-    let sensor_payload: serde_json::Value = serde_json::from_str(resources[11].payload().as_str())?;
-    assert_eq!(sensor_payload["Reading"], 27.5);
-    assert_eq!(sensor_payload["ReadingUnits"], "Cel");
-    assert_eq!(sensor_payload["ReadingType"], "Temperature");
-    let control_payload: serde_json::Value =
-        serde_json::from_str(resources[12].payload().as_str())?;
-    assert_eq!(control_payload["SetPoint"], 30.0);
-    assert_eq!(control_payload["ControlType"], "DutyCycle");
+    assert_surface_payloads(&resources)?;
     for resource in &resources {
         assert!(
             resource.etag().is_some(),
@@ -326,6 +306,9 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
             ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
         ]
     );
@@ -350,9 +333,65 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             "/redfish/v1/Chassis/1/Sensors/InletTemp",
             "/redfish/v1/Chassis/1/Controls/FanDuty",
             "/redfish/v1/Managers/1",
+            "/redfish/v1/Managers/1/LogServices/1",
+            "/redfish/v1/Managers/1/NetworkProtocol",
+            "/redfish/v1/Managers/1/HostInterfaces/1",
             "/redfish/v1/AccountService/Accounts/admin",
         ]
     );
+}
+
+/// Asserts the typed field projections of every family, keeping the
+/// demo-flow test short by moving every payload assertion behind one call.
+fn assert_surface_payloads(resources: &[CoreResourceProjection]) -> Result<(), Box<dyn Error>> {
+    assert_payload(
+        &resources[2],
+        "AttributeRegistry",
+        "BiosAttributeRegistryP11.v1_2_0",
+    )?;
+    assert_payload(&resources[3], "DisplayName", "PXE Network Boot")?;
+    assert_payload(&resources[4], "SecureBootMode", "UserMode")?;
+    assert_payload(&resources[5], "TotalCores", "64")?;
+    assert_payload(&resources[7], "CapacityMiB", "32768")?;
+    assert_payload(&resources[13], "FirmwareVersion", "1.2.3")?;
+    assert_payload(&resources[17], "RoleId", "Administrator")?;
+    // The telemetry projections carry the readings and status exactly as
+    // published: `Power_v1` has no projectable details, `Thermal_v1` only
+    // status, and the sensor and control members their direct readings.
+    let power_payload: serde_json::Value = serde_json::from_str(resources[9].payload().as_str())?;
+    assert_eq!(power_payload["Name"], "Power");
+    assert!(power_payload.get("PowerConsumedWatts").is_none());
+    let thermal_payload: serde_json::Value =
+        serde_json::from_str(resources[10].payload().as_str())?;
+    assert_eq!(thermal_payload["Status"]["Health"], "OK");
+    let sensor_payload: serde_json::Value = serde_json::from_str(resources[11].payload().as_str())?;
+    assert_eq!(sensor_payload["Reading"], 27.5);
+    assert_eq!(sensor_payload["ReadingUnits"], "Cel");
+    assert_eq!(sensor_payload["ReadingType"], "Temperature");
+    let control_payload: serde_json::Value =
+        serde_json::from_str(resources[12].payload().as_str())?;
+    assert_eq!(control_payload["SetPoint"], 30.0);
+    assert_eq!(control_payload["ControlType"], "DutyCycle");
+    // The manager surface projections carry the direct properties exactly as
+    // published: the log service its enable flag and record capacity, the
+    // network protocol singleton its host metadata, and the host interface
+    // its interface state.
+    let log_service_payload: serde_json::Value =
+        serde_json::from_str(resources[14].payload().as_str())?;
+    assert_eq!(log_service_payload["ServiceEnabled"], true);
+    assert_eq!(log_service_payload["MaxNumberOfRecords"], 1000);
+    let protocol_payload: serde_json::Value =
+        serde_json::from_str(resources[15].payload().as_str())?;
+    assert_eq!(protocol_payload["HostName"], "bmc-1");
+    assert_eq!(protocol_payload["FQDN"], "bmc-1.example.com");
+    let host_interface_payload: serde_json::Value =
+        serde_json::from_str(resources[16].payload().as_str())?;
+    assert_eq!(host_interface_payload["InterfaceEnabled"], true);
+    assert_eq!(
+        host_interface_payload["HostInterfaceType"],
+        "NetworkHostInterface"
+    );
+    Ok(())
 }
 
 /// Asserts one typed field of a core resource projection.

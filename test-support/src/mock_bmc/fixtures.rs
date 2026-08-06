@@ -6,7 +6,8 @@
 //! product actually parses. The tree is deliberately small: one System with
 //! two Processors, one Memory module, one Bios singleton, one Boot Option,
 //! and one Secure Boot singleton, one Chassis with one Power and one Thermal
-//! singleton plus one Sensor and one Control member, one Manager, the
+//! singleton plus one Sensor and one Control member, one Manager with its
+//! `LogServices`, `NetworkProtocol`, and `HostInterfaces` surface, the
 //! `SessionService`, and one `AccountService` with a single account. Links
 //! the tree does not serve are omitted entirely, so the capability probe
 //! reports `NotAdvertised` for them instead of guessing paths.
@@ -403,9 +404,10 @@ pub(crate) const MANAGERS_COLLECTION: &str = r##"{
 
 /// `GET /redfish/v1/Managers/1` -- the BMC manager.
 ///
-/// Optional links (`EthernetInterfaces`, `HostInterfaces`,
-/// `NetworkProtocol`, `LogServices`) stay absent on purpose: the probe must
-/// observe them as `NotAdvertised` rather than following guessed paths.
+/// The 0.2 manager surface (`LogServices`, `NetworkProtocol`,
+/// `HostInterfaces`) is advertised through typed navigation links; the
+/// `EthernetInterfaces` link stays absent on purpose, so the probe observes
+/// that feature as `NotAdvertised` rather than following a guessed path.
 pub(crate) const MANAGER: &str = r#"{
     "@odata.id":"/redfish/v1/Managers/1",
     "@odata.etag":"W/\"manager-1\"",
@@ -419,8 +421,85 @@ pub(crate) const MANAGER: &str = r#"{
     "FirmwareVersion":"1.2.3",
     "Version":"4.5.6",
     "PowerState":"On",
-    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"}
 }"#;
+
+/// `GET /redfish/v1/Managers/1/LogServices` -- the log service collection
+/// with the single event-log member.
+pub(crate) const LOG_SERVICES_COLLECTION: &str = r##"{
+    "@odata.type":"#LogServiceCollection.LogServiceCollection",
+    "@odata.id":"/redfish/v1/Managers/1/LogServices",
+    "Name":"Log Service Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/LogServices/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/LogServices/1` -- the manager event log, with
+/// every optional contract field populated. The `Entries` navigation is
+/// omitted, exactly like every other link the tree does not serve, because
+/// the strictly projectable field set never fetches the entry collection.
+pub(crate) const LOG_SERVICE: &str = r##"{
+    "@odata.type":"#LogService.v1_9_0.LogService",
+    "@odata.id":"/redfish/v1/Managers/1/LogServices/1",
+    "@odata.etag":"W/\"log-service-1\"",
+    "Id":"1",
+    "Name":"BMC Event Log",
+    "Description":"Manager event log",
+    "ServiceEnabled":true,
+    "MaxNumberOfRecords":1000,
+    "OverWritePolicy":"WrapsWhenFull",
+    "LogEntryType":"Event",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"##;
+
+/// `GET /redfish/v1/Managers/1/NetworkProtocol` -- the manager network
+/// protocol singleton with its `HostName` and `FQDN` metadata plus realistic
+/// per-protocol sections, matching the shape `rutilus-infra-redfish` decodes
+/// in its own tests.
+pub(crate) const MANAGER_NETWORK_PROTOCOL: &str = r##"{
+    "@odata.type":"#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol",
+    "@odata.id":"/redfish/v1/Managers/1/NetworkProtocol",
+    "@odata.etag":"W/\"network-protocol-1\"",
+    "Id":"NetworkProtocol",
+    "Name":"Manager Network Protocol",
+    "Description":"Manager network protocol settings",
+    "HostName":"bmc-1",
+    "FQDN":"bmc-1.example.com",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HTTP":{"ProtocolEnabled":true,"Port":80},
+    "HTTPS":{"ProtocolEnabled":true,"Port":443},
+    "SSH":{"ProtocolEnabled":false,"Port":22},
+    "SSDP":{"ProtocolEnabled":false,"Port":1900}
+}"##;
+
+/// `GET /redfish/v1/Managers/1/HostInterfaces` -- the host interface
+/// collection with the single member.
+pub(crate) const HOST_INTERFACES_COLLECTION: &str = r##"{
+    "@odata.type":"#HostInterfaceCollection.HostInterfaceCollection",
+    "@odata.id":"/redfish/v1/Managers/1/HostInterfaces",
+    "Name":"Host Interface Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/HostInterfaces/1` -- the manager host
+/// interface with every optional contract field populated; the
+/// `HostInterface_v1` schema declares no `HostName` property, so the member
+/// carries its own direct interface properties only. The
+/// `ManagerEthernetInterface` link is omitted, exactly like every other link
+/// the tree does not serve.
+pub(crate) const HOST_INTERFACE: &str = r##"{
+    "@odata.type":"#HostInterface.v1_3_3.HostInterface",
+    "@odata.id":"/redfish/v1/Managers/1/HostInterfaces/1",
+    "@odata.etag":"W/\"host-interface-1\"",
+    "Id":"1",
+    "Name":"Host Interface One",
+    "Description":"Manager host interface",
+    "HostInterfaceType":"NetworkHostInterface",
+    "InterfaceEnabled":true,
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"##;
 
 /// The Redfish-shaped error body for unregistered paths.
 ///

@@ -61,11 +61,13 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 4. The resource page shows the typed core tree (ServiceRoot; System 1 with
    its Bios singleton, the PXE-1 boot option, Secure Boot, CPU1/CPU2, and
    DIMM1; Chassis 1 with its Power and Thermal singletons plus one Sensor
-   and one Control member; Manager 1; the built-in `admin` account); the
-   capability page shows the 30-capability probe result:
+   and one Control member; Manager 1 with its event LogService, Network
+   Protocol metadata, and Host Interface; the built-in `admin` account);
+   the capability page shows the 30-capability probe result:
    SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
-   BootOptions/SecureBoot/Power/Thermal/Sensors/Controls `Supported`,
-   everything the fixture does not serve honestly `NotAdvertised`.
+   BootOptions/SecureBoot/Power/Thermal/Sensors/Controls/HostInterfaces/
+   LogServices/ManagerNetworkProtocol `Supported`, everything the fixture
+   does not serve honestly `NotAdvertised`.
 5. Refresh the endpoint: the same tree is re-read through a fresh transient
    Session, which the product deletes before returning.
 
@@ -101,7 +103,12 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/Chassis/1/Controls` | Control collection (FanDuty) |
 | GET | `/redfish/v1/Chassis/1/Controls/FanDuty` | Fan duty-cycle control (set point 30 Percent) |
 | GET | `/redfish/v1/Managers` | Manager collection, one member |
-| GET | `/redfish/v1/Managers/1` | BMC manager with FirmwareVersion (no EthernetInterfaces/HostInterfaces/NetworkProtocol/LogServices links) |
+| GET | `/redfish/v1/Managers/1` | BMC manager with FirmwareVersion and HostInterfaces/NetworkProtocol/LogServices links (no EthernetInterfaces link) |
+| GET | `/redfish/v1/Managers/1/LogServices` | Log service collection (1) |
+| GET | `/redfish/v1/Managers/1/LogServices/1` | Event log (ServiceEnabled, MaxNumberOfRecords 1000) |
+| GET | `/redfish/v1/Managers/1/NetworkProtocol` | Manager network protocol singleton (HostName "bmc-1", FQDN) |
+| GET | `/redfish/v1/Managers/1/HostInterfaces` | Host interface collection (1) |
+| GET | `/redfish/v1/Managers/1/HostInterfaces/1` | Host interface (InterfaceEnabled, NetworkHostInterface) |
 | any other | | `404` with a Redfish-shaped `error` body (`Base.1.0.ResourceMissingAtURI`) |
 
 Fixture field sets and `@odata.type` spellings mirror the documents

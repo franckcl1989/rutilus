@@ -91,6 +91,19 @@ pub(crate) fn dispatch(
         }
         (HttpMethod::Get, "/redfish/v1/Managers") => json_ok(fixtures::MANAGERS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::MANAGER),
+        (HttpMethod::Get, "/redfish/v1/Managers/1/LogServices") => {
+            json_ok(fixtures::LOG_SERVICES_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/LogServices/1") => json_ok(fixtures::LOG_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/Managers/1/NetworkProtocol") => {
+            json_ok(fixtures::MANAGER_NETWORK_PROTOCOL)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/HostInterfaces") => {
+            json_ok(fixtures::HOST_INTERFACES_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/HostInterfaces/1") => {
+            json_ok(fixtures::HOST_INTERFACE)
+        }
         _ => not_found(),
     }
 }

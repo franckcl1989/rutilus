@@ -32,7 +32,7 @@ const MOCK_PASSWORD: &str = "password";
 /// only the inventory count and the core capability states are pinned here;
 /// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -47,6 +47,9 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
     EndpointCapability::Thermal,
     EndpointCapability::Sensors,
     EndpointCapability::Controls,
+    EndpointCapability::HostInterfaces,
+    EndpointCapability::LogServices,
+    EndpointCapability::ManagerNetworkProtocol,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -177,9 +180,10 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
     // The mock serves one System with its configuration surface (Bios,
     // BootOptions, SecureBoot), two Processors and one Memory module, one
     // Chassis with its Power and Thermal singletons plus one Sensor and one
-    // Control member, one Manager, and one Account; typed navigation must
-    // visit every family exactly in the documented read order.
-    assert_eq!(resources.len(), 15);
+    // Control member, one Manager with its LogServices, NetworkProtocol, and
+    // HostInterfaces surface, and one Account; typed navigation must visit
+    // every family exactly in the documented read order.
+    assert_eq!(resources.len(), 18);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -201,6 +205,9 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
             ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
         ]
     );
@@ -259,7 +266,26 @@ fn assert_family_payloads(resources: &[CoreResourceProjection]) -> Result<(), Bo
             .contains("\"SetPoint\":30.0")
     );
     assert_projection_payload(&resources[13], "ManagerType", "BMC")?;
-    assert_projection_payload(&resources[14], "RoleId", "Administrator")?;
+    // The manager surface projections carry the direct properties exactly as
+    // published: the log service its enable flag and record capacity, the
+    // network protocol singleton its host metadata, and the host interface
+    // its interface state and type.
+    let log_service_payload: serde_json::Value =
+        serde_json::from_str(resources[14].payload().as_str())?;
+    assert_eq!(log_service_payload["ServiceEnabled"], true);
+    assert_eq!(log_service_payload["MaxNumberOfRecords"], 1000);
+    let protocol_payload: serde_json::Value =
+        serde_json::from_str(resources[15].payload().as_str())?;
+    assert_eq!(protocol_payload["HostName"], "bmc-1");
+    assert_eq!(protocol_payload["FQDN"], "bmc-1.example.com");
+    let host_interface_payload: serde_json::Value =
+        serde_json::from_str(resources[16].payload().as_str())?;
+    assert_eq!(host_interface_payload["InterfaceEnabled"], true);
+    assert_eq!(
+        host_interface_payload["HostInterfaceType"],
+        "NetworkHostInterface"
+    );
+    assert_projection_payload(&resources[17], "RoleId", "Administrator")?;
     Ok(())
 }
 
@@ -282,6 +308,9 @@ fn assert_resource_identifiers(resources: &[CoreResourceProjection]) {
         "/redfish/v1/Chassis/1/Sensors/InletTemp",
         "/redfish/v1/Chassis/1/Controls/FanDuty",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/LogServices/1",
+        "/redfish/v1/Managers/1/NetworkProtocol",
+        "/redfish/v1/Managers/1/HostInterfaces/1",
         "/redfish/v1/AccountService/Accounts/admin",
     ];
     for (resource, expected) in resources.iter().zip(odata_ids) {
@@ -341,6 +370,11 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/Chassis/1/Controls/FanDuty"),
             ("GET", "/redfish/v1/Managers"),
             ("GET", "/redfish/v1/Managers/1"),
+            ("GET", "/redfish/v1/Managers/1/LogServices"),
+            ("GET", "/redfish/v1/Managers/1/LogServices/1"),
+            ("GET", "/redfish/v1/Managers/1/NetworkProtocol"),
+            ("GET", "/redfish/v1/Managers/1/HostInterfaces"),
+            ("GET", "/redfish/v1/Managers/1/HostInterfaces/1"),
             ("GET", "/redfish/v1/AccountService"),
             ("GET", "/redfish/v1/AccountService/Accounts"),
             ("GET", "/redfish/v1/AccountService/Accounts/admin"),
