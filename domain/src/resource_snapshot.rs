@@ -57,6 +57,22 @@ pub enum ResourceFeature {
     /// the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
     SecureBoot,
+    /// The §2.1 `power` feature, added as a typed resource family in the 0.2
+    /// snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Power,
+    /// The §2.1 `thermal` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code
+    /// so both inventories address the same wire surface.
+    Thermal,
+    /// The §2.1 `sensors` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code
+    /// so both inventories address the same wire surface.
+    Sensors,
+    /// The §2.1 `controls` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code
+    /// so both inventories address the same wire surface.
+    Controls,
 }
 
 impl ResourceFeature {
@@ -77,6 +93,10 @@ impl ResourceFeature {
             Self::Bios => "bios",
             Self::BootOptions => "boot-options",
             Self::SecureBoot => "secure-boot",
+            Self::Power => "power",
+            Self::Thermal => "thermal",
+            Self::Sensors => "sensors",
+            Self::Controls => "controls",
         }
     }
 }
@@ -105,6 +125,10 @@ impl FromStr for ResourceFeature {
             "bios" => Ok(Self::Bios),
             "boot-options" => Ok(Self::BootOptions),
             "secure-boot" => Ok(Self::SecureBoot),
+            "power" => Ok(Self::Power),
+            "thermal" => Ok(Self::Thermal),
+            "sensors" => Ok(Self::Sensors),
+            "controls" => Ok(Self::Controls),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -653,6 +677,10 @@ mod tests {
             ResourceFeature::Bios,
             ResourceFeature::BootOptions,
             ResourceFeature::SecureBoot,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
         ];
 
         for feature in features {
@@ -690,6 +718,13 @@ mod tests {
                 EndpointCapability::BootOptions,
             ),
             (ResourceFeature::SecureBoot, EndpointCapability::SecureBoot),
+            // The 0.2 Chassis telemetry families project the same four
+            // §2.1 codes that the ledger already persists, so the feature
+            // and capability inventories cannot drift on the wire.
+            (ResourceFeature::Power, EndpointCapability::Power),
+            (ResourceFeature::Thermal, EndpointCapability::Thermal),
+            (ResourceFeature::Sensors, EndpointCapability::Sensors),
+            (ResourceFeature::Controls, EndpointCapability::Controls),
         ];
         for (feature, capability) in families {
             assert_eq!(feature.as_str(), capability.as_str());
@@ -736,6 +771,23 @@ mod tests {
             "secure-boot/",
             "secureboot",
             "SecureBoot",
+            "powers",
+            "power/",
+            "Power",
+            "power-equipment",
+            "power-supplies",
+            "power-supply",
+            "thermals",
+            "thermal/",
+            "Thermal",
+            "temperature",
+            "sensor",
+            "sensors/",
+            "Sensors",
+            "control",
+            "controls/",
+            "Controls",
+            "environment-metrics",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
