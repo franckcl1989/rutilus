@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+secrecy.workspace = true
 serde.workspace = true
 time = { workspace = true, features = ["serde", "serde-well-known"] }
 uuid = { workspace = true, features = ["serde"] }
