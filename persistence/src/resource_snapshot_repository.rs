@@ -1133,6 +1133,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_pcie_devices_assembly_and_software_inventory_features()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::PcieDevices,
+                "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+                "PCIe Device One",
+            )?
+            .with_odata_type(ResourceODataType::parse("#PCIeDevice.v1_12_0.PCIeDevice")?),
+            observation(
+                ResourceFeature::Assembly,
+                "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+                "Fan Assembly",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"assembly-data-0\"")?),
+            observation(
+                ResourceFeature::SoftwareInventory,
+                "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+                "System BIOS",
+            )?,
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let pcie_device = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::PcieDevices)
+            .ok_or("pcie device snapshot is missing")?;
+        assert_eq!(
+            pcie_device.odata_id().as_str(),
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1"
+        );
+        assert_eq!(
+            pcie_device.odata_type().map(ResourceODataType::as_str),
+            Some("#PCIeDevice.v1_12_0.PCIeDevice")
+        );
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for (feature, expected) in [
+            (ResourceFeature::PcieDevices, 1),
+            (ResourceFeature::Assembly, 1),
+            (ResourceFeature::SoftwareInventory, 1),
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                expected,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::PcieDevices
+                | ResourceFeature::Assembly
+                | ResourceFeature::SoftwareInventory
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
