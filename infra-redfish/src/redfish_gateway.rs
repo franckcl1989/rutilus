@@ -27,6 +27,8 @@ use nv_redfish::{
         chassis_collection::ChassisCollection as ChassisCollectionSchema,
         computer_system::ComputerSystem as ComputerSystemSchema,
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
+        control::Control as ControlSchema,
+        control_collection::ControlCollection as ControlCollectionSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
         manager::Manager as ManagerSchema, manager_account::ManagerAccount as ManagerAccountSchema,
@@ -36,11 +38,14 @@ use nv_redfish::{
         memory_collection::MemoryCollection as MemoryCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
-        processor::Processor as ProcessorSchema,
+        power::Power as PowerSchema, processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
         resource::Resource as ResourceSchema, secure_boot::SecureBoot as SecureBootSchema,
+        sensor::Sensor as SensorSchema,
+        sensor_collection::SensorCollection as SensorCollectionSchema,
         storage::Storage as StorageSchema,
         storage_collection::StorageCollection as StorageCollectionSchema,
+        thermal::Thermal as ThermalSchema,
     },
     session_service::{Session, SessionCreate},
 };
@@ -221,8 +226,9 @@ impl RedfishGateway {
     /// Reads the complete advertised core resource surface (the 0.1
     /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors,
     /// Memory, Storage, `NetworkAdapters`, `EthernetInterfaces`, `Accounts`,
-    /// `Bios`, `BootOptions`, and `SecureBoot` families) through public,
-    /// typed `nv-redfish` navigation and returns bounded domain projections.
+    /// `Bios`, `BootOptions`, `SecureBoot`, `Power`, `Thermal`, `Sensors`,
+    /// and `Controls` families) through public, typed `nv-redfish`
+    /// navigation and returns bounded domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
@@ -419,12 +425,14 @@ async fn read_systems_resources(
 }
 
 /// Reads the Chassis collection and, for every decoded Chassis member, its
-/// `NetworkAdapters` collection, so the 0.2 network family follows its parent
-/// through the same typed navigation.
+/// `NetworkAdapters` collection plus the `Power` and `Thermal` telemetry
+/// singletons and the `Sensors` and `Controls` telemetry collections, so the
+/// 0.2 telemetry surface follows its parent through the same typed navigation.
 ///
 /// A missing Chassis link leaves the whole family absent without an error; a
 /// failed Chassis collection document aborts the read with the existing
-/// classified error semantics. Only individual members are skippable.
+/// classified error semantics. Only individual members and singletons are
+/// skippable.
 async fn read_chassis_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
@@ -454,6 +462,46 @@ async fn read_chassis_resources(
                 identity,
                 trust,
                 network_adapter_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_singleton_resources(
+                chassis.power.as_ref(),
+                bmc,
+                identity,
+                trust,
+                power_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_singleton_resources(
+                chassis.thermal.as_ref(),
+                bmc,
+                identity,
+                trust,
+                thermal_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                chassis.sensors.as_ref(),
+                bmc,
+                identity,
+                trust,
+                sensor_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                chassis.controls.as_ref(),
+                bmc,
+                identity,
+                trust,
+                control_projection,
             )
             .await?,
         );
@@ -619,6 +667,22 @@ impl MemberCollection for ManagerAccountCollectionSchema {
 
 impl MemberCollection for BootOptionCollectionSchema {
     type Member = BootOptionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for SensorCollectionSchema {
+    type Member = SensorSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for ControlCollectionSchema {
+    type Member = ControlSchema;
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
@@ -1415,6 +1479,81 @@ struct SecureBootPayload {
     secure_boot_mode: Option<nv_redfish::schema::secure_boot::SecureBootModeType>,
 }
 
+/// The §0.2.0 `power` singleton projection.
+///
+/// The field set is exactly the `PowerPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. `Power_v1` itself
+/// declares no `Status` property and no reading or metadata properties:
+/// consumption and capacity readings (`PowerConsumedWatts`,
+/// `PowerCapacityWatts`) exist only on the `PowerControl` and `PowerSupply`
+/// types, whose nested reading arrays deliberately stay out of the snapshot,
+/// so the projection carries no details at all.
+#[derive(Serialize)]
+struct PowerPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+}
+
+/// The §0.2.0 `thermal` singleton projection.
+///
+/// The field set is exactly the `ThermalPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. Only `Status` exists
+/// on the `Thermal` resource itself: `TemperatureCelsius` exists only on
+/// `Temperatures` members and fan readings only on `Fans` members, so those
+/// nested reading arrays stay out of the strictly projectable field set.
+#[derive(Serialize)]
+struct ThermalPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `sensors` family projection.
+///
+/// The field set is exactly the `SensorPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. `reading_type` keeps
+/// the typed `ReadingType` value, `reading` the current `Reading` value, and
+/// `reading_units` the `ReadingUnits` text, so the console renders the
+/// measurement without re-parsing text; the threshold, calibration, and
+/// range bags stay out.
+#[derive(Serialize)]
+struct SensorPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Reading", skip_serializing_if = "Option::is_none")]
+    reading: Option<f64>,
+    #[serde(rename = "ReadingUnits", skip_serializing_if = "Option::is_none")]
+    reading_units: Option<String>,
+    #[serde(rename = "ReadingType", skip_serializing_if = "Option::is_none")]
+    reading_type: Option<nv_redfish::schema::sensor::ReadingType>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `controls` family projection.
+///
+/// The field set is exactly the `ControlPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. `control_type` keeps
+/// the typed `ControlType` value and `set_point` the current `SetPoint`
+/// reading, so the console renders the control surface without re-parsing
+/// text; the setting ranges and update schedule stay out.
+#[derive(Serialize)]
+struct ControlPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ControlType", skip_serializing_if = "Option::is_none")]
+    control_type: Option<nv_redfish::schema::control::ControlType>,
+    #[serde(rename = "SetPoint", skip_serializing_if = "Option::is_none")]
+    set_point: Option<f64>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
 fn service_root_projection(
     root: &ServiceRoot<UpstreamBmc>,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -1690,6 +1829,81 @@ fn secure_boot_projection(
         ResourceFeature::SecureBoot,
         secure_boot.odata_id(),
         secure_boot.etag(),
+        &payload,
+    )
+}
+
+fn power_projection(power: &PowerSchema) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = PowerPayload {
+        resource: CommonResourcePayload::from_schema_base(&power.base),
+    };
+    build_core_projection(
+        ResourceFeature::Power,
+        power.odata_id(),
+        power.etag(),
+        &payload,
+    )
+}
+
+fn thermal_projection(
+    thermal: &ThermalSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = ThermalPayload {
+        resource: CommonResourcePayload::from_schema_base(&thermal.base),
+        status: thermal
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Thermal,
+        thermal.odata_id(),
+        thermal.etag(),
+        &payload,
+    )
+}
+
+fn sensor_projection(
+    sensor: &SensorSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = SensorPayload {
+        resource: CommonResourcePayload::from_schema_base(&sensor.base),
+        reading: sensor.reading.as_ref().copied().flatten(),
+        reading_units: sensor
+            .reading_units
+            .as_ref()
+            .and_then(Option::as_ref)
+            .cloned(),
+        reading_type: sensor.reading_type.as_ref().copied().flatten(),
+        status: sensor
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Sensors,
+        sensor.odata_id(),
+        sensor.etag(),
+        &payload,
+    )
+}
+
+fn control_projection(
+    control: &ControlSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = ControlPayload {
+        resource: CommonResourcePayload::from_schema_base(&control.base),
+        control_type: control.control_type.as_ref().copied().flatten(),
+        set_point: control.set_point.as_ref().copied().flatten(),
+        status: control
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Controls,
+        control.odata_id(),
+        control.etag(),
         &payload,
     )
 }
@@ -3395,6 +3609,174 @@ mod tests {
         "Members":[]
     }"##;
 
+    /// A Chassis member that advertises the 0.2 `Power`, `Thermal`,
+    /// `Sensors`, and `Controls` telemetry surface.
+    const CHASSIS_WITH_TELEMETRY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+        "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+        "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+        "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"}
+    }"#;
+
+    /// A Chassis member that advertises only the `Power` and `Thermal`
+    /// telemetry singletons, so a missing `Sensors` or `Controls` link stays
+    /// absent without an error.
+    const CHASSIS_WITH_POWER_AND_THERMAL_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+        "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"}
+    }"#;
+
+    /// The full `Power` singleton projection: the `PowerControl` member is
+    /// embedded with its capacity reading, while `Voltages`, `PowerSupplies`,
+    /// and `Redundancy` stay linked only, so the projection must keep every
+    /// non-contract field out of the snapshot.
+    const POWER_FULL_BODY: &str = r##"{
+        "@odata.type":"#Power.v1_7_0.Power",
+        "@odata.id":"/redfish/v1/Chassis/1/Power",
+        "@odata.etag":"W/\"power-1\"",
+        "Id":"Power",
+        "Name":"Chassis Power",
+        "Description":"Chassis power readings and limits",
+        "PowerControl":[
+            {
+                "@odata.id":"/redfish/v1/Chassis/1/Power/PowerControl/0",
+                "MemberId":"0",
+                "Name":"System Power Control",
+                "PowerCapacityWatts":2500,
+                "PowerConsumedWatts":850,
+                "PowerRequestedWatts":900,
+                "PowerAvailableWatts":1600,
+                "PowerAllocatedWatts":900
+            }
+        ],
+        "Voltages":[{"@odata.id":"/redfish/v1/Chassis/1/Power/Voltages/0"}],
+        "PowerSupplies":[{"@odata.id":"/redfish/v1/Chassis/1/Power/PowerSupplies/0"}],
+        "Redundancy":[{"@odata.id":"/redfish/v1/Chassis/1/Power/Redundancy/0"}]
+    }"##;
+
+    /// The full `Thermal` singleton projection: two `Temperatures` members
+    /// are embedded with readings, while `Fans` stays linked only, so the
+    /// projection must keep every non-contract field out of the snapshot.
+    const THERMAL_FULL_BODY: &str = r##"{
+        "@odata.type":"#Thermal.v1_7_0.Thermal",
+        "@odata.id":"/redfish/v1/Chassis/1/Thermal",
+        "@odata.etag":"W/\"thermal-1\"",
+        "Id":"Thermal",
+        "Name":"Chassis Thermal",
+        "Description":"Chassis thermal readings",
+        "Temperatures":[
+            {
+                "@odata.id":"/redfish/v1/Chassis/1/Thermal/Temperatures/0",
+                "MemberId":"0",
+                "Name":"CPU 1 Temp",
+                "ReadingCelsius":42.5,
+                "UpperThresholdCritical":70.0,
+                "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+            },
+            {
+                "@odata.id":"/redfish/v1/Chassis/1/Thermal/Temperatures/1",
+                "MemberId":"1",
+                "Name":"Inlet Temp",
+                "ReadingCelsius":25.0
+            }
+        ],
+        "Fans":[{"@odata.id":"/redfish/v1/Chassis/1/Thermal/Fans/0"}],
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    const SENSORS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#SensorCollection.SensorCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Sensors",
+        "Name":"Sensor Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Chassis/1/Sensors/1"},
+            {"@odata.id":"/redfish/v1/Chassis/1/Sensors/2"}
+        ]
+    }"##;
+
+    /// The full `Sensor` member projection with every optional contract field
+    /// populated; the threshold and range bags are decoded but stay outside
+    /// the projection contract.
+    const SENSOR_ONE_BODY: &str = r##"{
+        "@odata.type":"#Sensor.v1_7_0.Sensor",
+        "@odata.id":"/redfish/v1/Chassis/1/Sensors/1",
+        "@odata.etag":"W/\"sensor-1\"",
+        "Id":"1",
+        "Name":"CPU 1 Temperature Sensor",
+        "Description":"CPU package temperature",
+        "ReadingType":"Temperature",
+        "Reading":47.5,
+        "ReadingUnits":"Cel",
+        "ReadingRangeMin":0,
+        "ReadingRangeMax":100,
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A minimal `Sensor` member carrying only the required identity fields
+    /// plus a `Power` reading; every optional contract field is absent so the
+    /// projection omits it instead of emitting null.
+    const SENSOR_TWO_BODY: &str = r##"{
+        "@odata.type":"#Sensor.v1_7_0.Sensor",
+        "@odata.id":"/redfish/v1/Chassis/1/Sensors/2",
+        "@odata.etag":"W/\"sensor-2\"",
+        "Id":"2",
+        "Name":"Power Sensor",
+        "ReadingType":"Power",
+        "Reading":300.0,
+        "ReadingUnits":"W"
+    }"##;
+
+    const CONTROLS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#ControlCollection.ControlCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls",
+        "Name":"Control Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Chassis/1/Controls/1"},
+            {"@odata.id":"/redfish/v1/Chassis/1/Controls/2"}
+        ]
+    }"##;
+
+    /// The full `Control` member projection with every optional contract
+    /// field populated; the setting ranges are decoded but stay outside the
+    /// projection contract.
+    const CONTROL_ONE_BODY: &str = r##"{
+        "@odata.type":"#Control.v1_4_0.Control",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls/1",
+        "@odata.etag":"W/\"control-1\"",
+        "Id":"1",
+        "Name":"System Power Limit",
+        "Description":"Power capping control",
+        "ControlType":"Power",
+        "SetPoint":1800,
+        "SetPointUnits":"W",
+        "SettingMin":0,
+        "SettingMax":2500,
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// A minimal `Control` member carrying only the required identity fields
+    /// plus a `Temperature` set point; every optional contract field is
+    /// absent so the projection omits it instead of emitting null.
+    const CONTROL_TWO_BODY: &str = r##"{
+        "@odata.type":"#Control.v1_4_0.Control",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls/2",
+        "@odata.etag":"W/\"control-2\"",
+        "Id":"2",
+        "Name":"Chassis Fan Control",
+        "ControlType":"Temperature",
+        "SetPoint":35.0
+    }"##;
+
     const POWER_SUBSYSTEM_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem",
         "Id":"PowerSubsystem",
@@ -3797,6 +4179,71 @@ mod tests {
         "/redfish/v1/AccountService/Accounts",
         "/redfish/v1/AccountService/Accounts/1",
         "/redfish/v1/AccountService/Accounts/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one Chassis member that carries populated
+    /// `Power`, `Thermal`, `Sensors`, and `Controls` surfaces: the telemetry
+    /// families are read right after their parent, in fixture order.
+    const TELEMETRY_RESOURCE_REQUEST_PATHS: [&str; 19] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Power",
+        "/redfish/v1/Chassis/1/Thermal",
+        "/redfish/v1/Chassis/1/Sensors",
+        "/redfish/v1/Chassis/1/Sensors/1",
+        "/redfish/v1/Chassis/1/Sensors/2",
+        "/redfish/v1/Chassis/1/Controls",
+        "/redfish/v1/Chassis/1/Controls/1",
+        "/redfish/v1/Chassis/1/Controls/2",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `Sensors` and `Controls` collections are
+    /// advertised but empty: the collection documents are still read, no
+    /// member is; the singletons are still projected.
+    const EMPTY_TELEMETRY_REQUEST_PATHS: [&str; 15] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Power",
+        "/redfish/v1/Chassis/1/Thermal",
+        "/redfish/v1/Chassis/1/Sensors",
+        "/redfish/v1/Chassis/1/Controls",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the Chassis member advertises the `Power` and
+    /// `Thermal` singletons but no `Sensors` or `Controls` link: the missing
+    /// collections are never requested ("资源存在才呈现").
+    const PARTIAL_TELEMETRY_REQUEST_PATHS: [&str; 13] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Power",
+        "/redfish/v1/Chassis/1/Thermal",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -5365,6 +5812,369 @@ mod tests {
             "/redfish/v1/Systems/1/BootOptions/1"
         );
         assert_session_requests(&server.finish_all().await?, &SINGLETON_SKIP_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_chassis_telemetry_families_through_typed_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_TELEMETRY_BODY),
+                ("200 OK", POWER_FULL_BODY),
+                ("200 OK", THERMAL_FULL_BODY),
+                ("200 OK", SENSORS_WITH_MEMBERS_BODY),
+                ("200 OK", SENSOR_ONE_BODY),
+                ("200 OK", SENSOR_TWO_BODY),
+                ("200 OK", CONTROLS_WITH_MEMBERS_BODY),
+                ("200 OK", CONTROL_ONE_BODY),
+                ("200 OK", CONTROL_TWO_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 10);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Power,
+                ResourceFeature::Thermal,
+                ResourceFeature::Sensors,
+                ResourceFeature::Sensors,
+                ResourceFeature::Controls,
+                ResourceFeature::Controls,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_power_projection(&resources[3])?;
+        assert_thermal_projection(&resources[4])?;
+        assert_sensor_projection(&resources[5])?;
+        assert_minimal_sensor_projection(&resources[6])?;
+        assert_control_projection(&resources[7])?;
+        assert_minimal_control_projection(&resources[8])?;
+        assert_session_requests(
+            &server.finish_all().await?,
+            &TELEMETRY_RESOURCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    /// Asserts the `Power` singleton projection carries only the common
+    /// fields: the contract carries no details, so every decoded schema
+    /// field must stay out of the snapshot or the strict application decoder
+    /// rejects it — not the embedded `PowerControl` capacity reading, and
+    /// not the linked `Voltages`, `PowerSupplies`, or `Redundancy` arrays.
+    fn assert_power_projection(projection: &CoreResourceProjection) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/Power",
+            "W/\"power-1\"",
+            "Id",
+            "Power",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Name"], "Chassis Power");
+        assert_eq!(payload.get("PowerCapacityWatts"), None);
+        assert_eq!(payload.get("PowerControl"), None);
+        assert_eq!(payload.get("Voltages"), None);
+        assert_eq!(payload.get("PowerSupplies"), None);
+        assert_eq!(payload.get("Redundancy"), None);
+        Ok(())
+    }
+
+    /// Asserts the `Thermal` singleton projection carries the direct
+    /// `Status` only: the `Temperatures` and `Fans` reading arrays stay out
+    /// of the snapshot.
+    fn assert_thermal_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/Thermal",
+            "W/\"thermal-1\"",
+            "Id",
+            "Thermal",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("TemperatureCount"), None);
+        assert_eq!(payload.get("Temperatures"), None);
+        assert_eq!(payload.get("Fans"), None);
+        Ok(())
+    }
+
+    /// Asserts the full `Sensor` member projection with every optional
+    /// contract field populated; the range bags stay out.
+    fn assert_sensor_projection(projection: &CoreResourceProjection) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/Sensors/1",
+            "W/\"sensor-1\"",
+            "ReadingType",
+            "Temperature",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Reading"], 47.5);
+        assert_eq!(payload["ReadingUnits"], "Cel");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("ReadingRangeMin"), None);
+        assert_eq!(payload.get("ReadingRangeMax"), None);
+        Ok(())
+    }
+
+    /// Asserts the minimal `Sensor` member projection: every optional
+    /// contract field except the reading is absent and must be omitted, not
+    /// emitted as null.
+    fn assert_minimal_sensor_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Sensors/2"
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["ReadingType"], "Power");
+        assert_eq!(payload["Reading"], 300.0);
+        assert_eq!(payload["ReadingUnits"], "W");
+        assert_eq!(payload.get("Status"), None);
+        Ok(())
+    }
+
+    /// Asserts the full `Control` member projection with every optional
+    /// contract field populated; the setting ranges stay out.
+    fn assert_control_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/Controls/1",
+            "W/\"control-1\"",
+            "ControlType",
+            "Power",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["SetPoint"], 1800.0);
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("SetPointUnits"), None);
+        assert_eq!(payload.get("SettingMin"), None);
+        assert_eq!(payload.get("SettingMax"), None);
+        Ok(())
+    }
+
+    /// Asserts the minimal `Control` member projection: every optional
+    /// contract field except the set point is absent and must be omitted,
+    /// not emitted as null.
+    fn assert_minimal_control_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Controls/2"
+        );
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["ControlType"], "Temperature");
+        assert_eq!(payload["SetPoint"], 35.0);
+        assert_eq!(payload.get("Status"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_telemetry_collections_produce_no_member_snapshots() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_TELEMETRY_BODY),
+                ("200 OK", POWER_FULL_BODY),
+                ("200 OK", THERMAL_FULL_BODY),
+                ("200 OK", SENSORS_BODY),
+                ("200 OK", CONTROLS_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The advertised-but-empty Sensors and Controls collections produce
+        // no member snapshots; the Power and Thermal singletons still do
+        // ("资源存在才呈现").
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Power,
+                ResourceFeature::Thermal,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &EMPTY_TELEMETRY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_telemetry_links_produce_no_telemetry_collection_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_POWER_AND_THERMAL_BODY),
+                ("200 OK", POWER_FULL_BODY),
+                ("200 OK", THERMAL_FULL_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The Chassis member advertises the two telemetry singletons but no
+        // Sensors or Controls link, so only the singletons are projected and
+        // the missing collections are never requested ("资源存在才呈现").
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Power,
+                ResourceFeature::Thermal,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &PARTIAL_TELEMETRY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_undecodable_telemetry_singletons_and_members_without_aborting()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_TELEMETRY_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", THERMAL_FULL_BODY),
+                ("200 OK", SENSORS_WITH_MEMBERS_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", SENSOR_TWO_BODY),
+                ("200 OK", CONTROLS_WITH_MEMBERS_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", CONTROL_TWO_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The undecodable Power singleton is skipped with the member-level
+        // semantics, and the first Sensor and Control members are skipped
+        // too; the remaining telemetry families still produce snapshots
+        // (§0.2.0 acceptance).
+        assert_eq!(resources.len(), 7);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Thermal,
+                ResourceFeature::Sensors,
+                ResourceFeature::Controls,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_eq!(
+            resources[4].odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Sensors/2"
+        );
+        assert_eq!(
+            resources[5].odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Controls/2"
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &TELEMETRY_RESOURCE_REQUEST_PATHS,
+        )?;
         Ok(())
     }
 
