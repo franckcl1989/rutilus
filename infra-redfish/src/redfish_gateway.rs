@@ -11,14 +11,14 @@ use std::{
 };
 
 use nv_redfish::{
-    Resource as NvResource, ServiceRoot,
+    Bmc as _, Resource as NvResource, ServiceRoot,
     bmc_http::{
         BmcCredentials, CacheSettings, HttpBmc,
         reqwest::{BmcError, Client as NvHttpClient},
     },
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
-    core::{EntityTypeRef, NavProperty},
+    core::{EntityTypeRef, NavProperty, ReferenceLeaf},
     manager::{Manager, ManagerCollection},
     schema::{
         assembly::Assembly as AssemblySchema, assembly::AssemblyData as AssemblyDataSchema,
@@ -32,6 +32,7 @@ use nv_redfish::{
         control_collection::ControlCollection as ControlCollectionSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
+        event_service::EventService as EventServiceSchema,
         host_interface::HostInterface as HostInterfaceSchema,
         host_interface_collection::HostInterfaceCollection as HostInterfaceCollectionSchema,
         log_service::LogService as LogServiceSchema,
@@ -42,18 +43,26 @@ use nv_redfish::{
         manager_network_protocol::ManagerNetworkProtocol as ManagerNetworkProtocolSchema,
         memory::Memory as MemorySchema,
         memory_collection::MemoryCollection as MemoryCollectionSchema,
+        metric_definition::MetricDefinition as MetricDefinitionSchema,
+        metric_definition_collection::MetricDefinitionCollection as MetricDefinitionCollectionSchema,
+        metric_report::MetricReport as MetricReportSchema,
+        metric_report_collection::MetricReportCollection as MetricReportCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
         pcie_device::PcieDevice as PcieDeviceSchema, power::Power as PowerSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
-        resource::Resource as ResourceSchema, secure_boot::SecureBoot as SecureBootSchema,
-        sensor::Sensor as SensorSchema,
+        resource::Resource as ResourceSchema,
+        resource::ResourceCollection as ResourceCollectionSchema,
+        secure_boot::SecureBoot as SecureBootSchema, sensor::Sensor as SensorSchema,
         sensor_collection::SensorCollection as SensorCollectionSchema,
         software_inventory::SoftwareInventory as SoftwareInventorySchema,
         software_inventory_collection::SoftwareInventoryCollection as SoftwareInventoryCollectionSchema,
         storage::Storage as StorageSchema,
-        storage_collection::StorageCollection as StorageCollectionSchema,
+        storage_collection::StorageCollection as StorageCollectionSchema, task::Task as TaskSchema,
+        task_collection::TaskCollection as TaskCollectionSchema,
+        task_service::TaskService as TaskServiceSchema,
+        telemetry_service::TelemetryService as TelemetryServiceSchema,
         thermal::Thermal as ThermalSchema,
     },
     session_service::{Session, SessionCreate},
@@ -236,9 +245,11 @@ impl RedfishGateway {
     /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors,
     /// Memory, Storage, `NetworkAdapters`, `EthernetInterfaces`, `Accounts`,
     /// `Bios`, `BootOptions`, `SecureBoot`, `Power`, `Thermal`, `Sensors`,
-    /// `Controls`, `LogServices`, `ManagerNetworkProtocol`, and
-    /// `HostInterfaces` families) through public, typed `nv-redfish`
-    /// navigation and returns bounded domain projections.
+    /// `Controls`, `LogServices`, `ManagerNetworkProtocol`, `HostInterfaces`,
+    /// `SoftwareInventory`, `EventService`, `EventSubscription`,
+    /// `TelemetryService`, `MetricDefinition`, `MetricReport`, `TaskService`,
+    /// and `Task` families) through public, typed `nv-redfish` navigation and
+    /// returns bounded domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
@@ -339,6 +350,9 @@ async fn read_authenticated_core_resources(
     resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
     resources.extend(read_account_resources(bmc, root, identity, trust).await?);
     resources.extend(read_software_inventory_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_event_service_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_telemetry_service_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_task_service_resources(bmc, root, identity, trust).await?);
     Ok(resources)
 }
 
@@ -673,6 +687,169 @@ async fn read_software_inventory_resources(
     .await
 }
 
+/// Reads the root-level `EventService` singleton and, through its
+/// `Subscriptions` link, every `EventSubscription` member, so the §2.1
+/// `event-service` read surface follows its service through the decoded
+/// Service Root instead of a guessed path.
+///
+/// Unlike `AccountService` and `UpdateService`, the service document itself
+/// is part of the read surface (`event-service` is a projected feature, not
+/// only a navigation hub), so it is projected with the singleton decision
+/// exactly like `Bios`: a missing link leaves the family absent
+/// ("资源存在才呈现"), a failed document is skipped with the member-level
+/// semantics, and a representation failure skips only the singleton. The
+/// `Subscriptions` collection below it keeps the normal collection
+/// semantics: a failed collection document aborts, only individual members
+/// are skippable.
+async fn read_event_service_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(event_service) = root.root.event_service.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(service) = fetch_member(event_service, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) = member_projection(event_service_projection(&service))? {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_event_subscription_resources(service.subscriptions.as_ref(), bmc, identity, trust)
+            .await?,
+    );
+    Ok(resources)
+}
+
+/// Reads the `EventSubscription` members of the root-level `EventService`
+/// through the decoded `Subscriptions` collection link.
+///
+/// The `EventDestinationCollection` and `EventDestination` entity types are
+/// not compiled into nv-redfish 0.13 — the `Subscriptions` navigation is a
+/// bare [`ReferenceLeaf`] — so this is the one read surface that decodes its
+/// collection and member documents through the minimal local schemas
+/// declared below instead of the compiled tree. The fetch and failure
+/// semantics stay identical to every other collection: a missing link leaves
+/// the family absent, a failed collection document aborts the read with the
+/// existing classified error (the read iterates the collection, it does not
+/// observe it), and only individual members are skippable.
+async fn read_event_subscription_resources(
+    subscriptions: Option<&ReferenceLeaf>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(subscriptions) = subscriptions else {
+        return Ok(Vec::new());
+    };
+    let collection = bmc
+        .get::<EventSubscriptionCollectionSchema>(&subscriptions.odata_id)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in collection.members() {
+        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(event_subscription_projection(&member))? {
+            resources.push(projection);
+        }
+    }
+    Ok(resources)
+}
+
+/// Reads the root-level `TelemetryService` singleton and, through its
+/// `MetricDefinitions` and `MetricReports` links, every metric definition
+/// and metric report member, so the §2.1 `telemetry-service` read surface
+/// follows its service through the decoded Service Root.
+///
+/// The `TelemetryService` document itself is a singleton and follows the
+/// singleton decision exactly like `EventService`: a missing link leaves the
+/// family absent, a failed document is skipped with the member-level
+/// semantics, and a representation failure skips only the singleton. Both
+/// collections below it keep the normal collection semantics: a failed
+/// collection document aborts, only individual members are skippable.
+async fn read_telemetry_service_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(telemetry_service) = root.root.telemetry_service.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(service) = fetch_member(telemetry_service, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) = member_projection(telemetry_service_projection(&service))? {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_collection_resources(
+            service.metric_definitions.as_ref(),
+            bmc,
+            identity,
+            trust,
+            metric_definition_projection,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_collection_resources(
+            service.metric_reports.as_ref(),
+            bmc,
+            identity,
+            trust,
+            metric_report_projection,
+        )
+        .await?,
+    );
+    Ok(resources)
+}
+
+/// Reads the root-level `TaskService` singleton and, through its `Tasks`
+/// link, every `Task` member, so the §2.1 `task-service` read surface
+/// follows its service through the decoded Service Root.
+///
+/// The `TaskService` document itself is a singleton and follows the
+/// singleton decision exactly like `EventService`: a missing link leaves the
+/// family absent, a failed document is skipped with the member-level
+/// semantics, and a representation failure skips only the singleton. The
+/// `Tasks` collection below it keeps the normal collection semantics: a
+/// failed collection document aborts, only individual members are skippable.
+async fn read_task_service_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(task_service) = root.root.tasks.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(service) = fetch_member(task_service, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) = member_projection(task_service_projection(&service))? {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_collection_resources(
+            service.tasks.as_ref(),
+            bmc,
+            identity,
+            trust,
+            task_projection,
+        )
+        .await?,
+    );
+    Ok(resources)
+}
+
 /// Reads the `Assembly` document of every Chassis member and projects one
 /// snapshot per `AssemblyData` member embedded in it.
 ///
@@ -863,6 +1040,106 @@ impl MemberCollection for SoftwareInventoryCollectionSchema {
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
+    }
+}
+
+impl MemberCollection for MetricDefinitionCollectionSchema {
+    type Member = MetricDefinitionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for MetricReportCollectionSchema {
+    type Member = MetricReportSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for TaskCollectionSchema {
+    type Member = TaskSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for EventSubscriptionCollectionSchema {
+    type Member = EventSubscriptionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+/// The `EventDestination_v1` member schema of the `EventService`
+/// `Subscriptions` collection, declared locally because the
+/// `EventDestination` entity type is not compiled into nv-redfish 0.13 (the
+/// `Subscriptions` navigation is a bare [`ReferenceLeaf`]).
+///
+/// Only the contract fields are decoded. The subscription filtering and
+/// delivery fields (`HttpHeaders`, `MessageIds`, `RegistryPrefixes`,
+/// `ResourceTypes`, `DeliveryRetryPolicy`, and the origin-condition options)
+/// stay out of this minimal schema: they are not part of the projection
+/// contract, and an unknown key is ignored by the flattened base instead of
+/// failing the member decode. The string fields stay plain `Option`s with a
+/// missing-field default: serde maps both a missing property and an explicit
+/// null to `None`, so the projection sees exactly the same absent value the
+/// compiled double-optional shape would produce, without the clippy-forbidden
+/// `Option<Option<T>>` pair that only read-write schemas need.
+#[derive(Deserialize)]
+struct EventSubscriptionSchema {
+    #[serde(flatten)]
+    base: ResourceSchema,
+    #[serde(rename = "Destination", default)]
+    destination: Option<String>,
+    #[serde(rename = "Protocol", default)]
+    protocol: Option<String>,
+    #[serde(rename = "Context", default)]
+    context: Option<String>,
+    #[serde(rename = "EventTypes", default)]
+    event_types: Option<Vec<nv_redfish::schema::event::EventType>>,
+    #[serde(rename = "Status", default)]
+    status: Option<nv_redfish::schema::resource::Status>,
+}
+
+impl EntityTypeRef for EventSubscriptionSchema {
+    fn odata_id(&self) -> &nv_redfish::core::ODataId {
+        self.base.odata_id()
+    }
+
+    fn etag(&self) -> Option<&nv_redfish::core::ODataETag> {
+        self.base.etag()
+    }
+}
+
+/// The `EventDestinationCollection` document schema of the `EventService`
+/// `Subscriptions` link, declared locally for the same reason as
+/// [`EventSubscriptionSchema`]: the collection entity type is not compiled
+/// into nv-redfish 0.13.
+///
+/// The shape mirrors the compiled collection types exactly: the shared
+/// `ResourceCollection` base carries the identity metadata and `Members`
+/// carries the typed navigation links, so the collection document decodes
+/// from the same wire form as every compiled collection.
+#[derive(Deserialize)]
+struct EventSubscriptionCollectionSchema {
+    #[serde(flatten)]
+    base: ResourceCollectionSchema,
+    #[serde(rename = "Members", default)]
+    members: Vec<NavProperty<EventSubscriptionSchema>>,
+}
+
+impl EntityTypeRef for EventSubscriptionCollectionSchema {
+    fn odata_id(&self) -> &nv_redfish::core::ODataId {
+        self.base.odata_id()
+    }
+
+    fn etag(&self) -> Option<&nv_redfish::core::ODataETag> {
+        self.base.etag()
     }
 }
 
@@ -1708,6 +1985,164 @@ struct SoftwareInventoryPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `event-service` singleton projection.
+///
+/// The field set is exactly the `EventService` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `ServiceEnabled` and `Status` properties of the `EventService` schema are
+/// the whole projectable surface: the retry policy (`DeliveryRetryAttempts`,
+/// `DeliveryRetryIntervalSeconds`), the SMTP delivery settings, and the
+/// SSE endpoint describe event delivery plumbing rather than a
+/// console-rendered posture and stay out.
+#[derive(Serialize)]
+struct EventServicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ServiceEnabled", skip_serializing_if = "Option::is_none")]
+    service_enabled: Option<bool>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `event-subscription` family projection.
+///
+/// The field set is exactly the `EventSubscription` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `Destination`, `Protocol`, `Context`, and `EventTypes` properties and the
+/// `Status` property are the projectable surface; `protocol` keeps the
+/// `EventDestinationProtocol` enumeration value as the wire string and
+/// `event_types` the `EventTypes` array of `EventType` values, so the
+/// console renders both without re-parsing text. `HttpHeaders` and the
+/// `MessageIds`/`RegistryPrefixes`/`ResourceTypes` filters stay out.
+#[derive(Serialize)]
+struct EventSubscriptionPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Destination", skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+    #[serde(rename = "Protocol", skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    #[serde(rename = "Context", skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+    #[serde(rename = "EventTypes", skip_serializing_if = "Option::is_none")]
+    event_types: Option<Vec<nv_redfish::schema::event::EventType>>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `telemetry-service` singleton projection.
+///
+/// The field set is exactly the `TelemetryService` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The api
+/// contract exposes only the `Status` property of the `TelemetryService`
+/// schema, so `ServiceEnabled` — although the compiled schema carries it —
+/// must not be projected, and the service-capacity fields (`MaxReports`,
+/// `MinCollectionInterval`, `SupportedCollectionFunctions`) stay out for the
+/// telemetry-history iteration.
+#[derive(Serialize)]
+struct TelemetryServicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `metric-definition` family projection.
+///
+/// The field set is exactly the `MetricDefinition` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `Units` text and the `MetricType` enumeration (retained as the wire
+/// string) are the whole projectable surface; `MetricDataType`, `Precision`,
+/// the reading ranges, and the calculation properties describe measurement
+/// semantics that the telemetry-history iteration will render, and the
+/// schema declares no `Status` property.
+#[derive(Serialize)]
+struct MetricDefinitionPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Units", skip_serializing_if = "Option::is_none")]
+    units: Option<String>,
+    #[serde(rename = "MetricType", skip_serializing_if = "Option::is_none")]
+    metric_type: Option<nv_redfish::schema::metric_definition::MetricType>,
+}
+
+/// The §0.2.0 `metric-report` family projection.
+///
+/// The field set is exactly the `MetricReport` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. Only metadata
+/// is projected: `metric_values_count` is derived from the length of the
+/// `MetricValues` array, which is decoded by the schema but deliberately
+/// never projected — each `MetricValue` entry is a timestamped reading, the
+/// telemetry history of the 0.4.0 iteration, and carrying unbounded value
+/// arrays now would defeat the strict decoder alignment. The `Timestamp`,
+/// `Context`, and `ReportSequence` metadata and the (schema-absent) `Status`
+/// stay out too, so the projection carries only the derived count.
+#[derive(Serialize)]
+struct MetricReportPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "MetricValuesCount", skip_serializing_if = "Option::is_none")]
+    metric_values_count: Option<usize>,
+}
+
+/// The §0.2.0 `task-service` singleton projection.
+///
+/// The field set is exactly the `TaskService` variant the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `ServiceEnabled`, `CompletedTaskOverWritePolicy`, and `Status` properties
+/// are the projectable surface; the overwrite policy keeps the `OverWritePolicy`
+/// enumeration value so the console renders it without re-parsing text.
+/// `DateTime` and `LifeCycleEventOnTaskStateChange` describe service plumbing
+/// rather than a console-rendered surface and stay out.
+#[derive(Serialize)]
+struct TaskServicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ServiceEnabled", skip_serializing_if = "Option::is_none")]
+    service_enabled: Option<bool>,
+    #[serde(
+        rename = "CompletedTaskOverWritePolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    completed_task_over_write_policy: Option<nv_redfish::schema::task_service::OverWritePolicy>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `task` family projection.
+///
+/// The field set is exactly the `Task` variant the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct
+/// `TaskState`, `TaskStatus`, `PercentComplete`, `StartTime`, and `EndTime`
+/// properties are the projectable surface: `task_state` keeps the `TaskState`
+/// enumeration and `task_status` the `Resource.Health` enumeration as wire
+/// strings, `percent_complete` stays numeric, and `start_time`/`end_time`
+/// keep the RFC 3339 timestamps of the compiled `Edm.DateTimeOffset` type.
+/// `Messages` and the `Payload`/`TaskMonitor` links stay out, and the schema
+/// declares no `Status` property.
+#[derive(Serialize)]
+struct TaskPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "TaskState", skip_serializing_if = "Option::is_none")]
+    task_state: Option<nv_redfish::schema::task::TaskState>,
+    #[serde(rename = "TaskStatus", skip_serializing_if = "Option::is_none")]
+    task_status: Option<nv_redfish::schema::resource::Health>,
+    #[serde(rename = "PercentComplete", skip_serializing_if = "Option::is_none")]
+    percent_complete: Option<i64>,
+    #[serde(rename = "StartTime", skip_serializing_if = "Option::is_none")]
+    start_time: Option<nv_redfish::schema::edm::DateTimeOffset>,
+    #[serde(rename = "EndTime", skip_serializing_if = "Option::is_none")]
+    end_time: Option<nv_redfish::schema::edm::DateTimeOffset>,
+}
+
 /// The §0.2.0 `bios` family projection.
 ///
 /// The field set is exactly the `BiosPayload` the application boundary
@@ -2210,6 +2645,133 @@ fn software_inventory_projection(
         ResourceFeature::SoftwareInventory,
         item.odata_id(),
         item.etag(),
+        &payload,
+    )
+}
+
+fn event_service_projection(
+    service: &EventServiceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = EventServicePayload {
+        resource: CommonResourcePayload::from_schema_base(&service.base),
+        service_enabled: service.service_enabled.as_ref().copied().flatten(),
+        status: service
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::EventService,
+        service.odata_id(),
+        service.etag(),
+        &payload,
+    )
+}
+
+fn event_subscription_projection(
+    subscription: &EventSubscriptionSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = EventSubscriptionPayload {
+        resource: CommonResourcePayload::from_schema_base(&subscription.base),
+        destination: subscription.destination.clone(),
+        protocol: subscription.protocol.clone(),
+        context: subscription.context.clone(),
+        event_types: subscription.event_types.clone(),
+        status: subscription
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::EventSubscription,
+        subscription.odata_id(),
+        subscription.etag(),
+        &payload,
+    )
+}
+
+fn telemetry_service_projection(
+    service: &TelemetryServiceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = TelemetryServicePayload {
+        resource: CommonResourcePayload::from_schema_base(&service.base),
+        status: service
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::TelemetryService,
+        service.odata_id(),
+        service.etag(),
+        &payload,
+    )
+}
+
+fn metric_definition_projection(
+    definition: &MetricDefinitionSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = MetricDefinitionPayload {
+        resource: CommonResourcePayload::from_schema_base(&definition.base),
+        units: optional_nullable_text(definition.units.as_ref()),
+        metric_type: definition.metric_type.as_ref().copied().flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::MetricDefinition,
+        definition.odata_id(),
+        definition.etag(),
+        &payload,
+    )
+}
+
+fn metric_report_projection(
+    report: &MetricReportSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = MetricReportPayload {
+        resource: CommonResourcePayload::from_schema_base(&report.base),
+        metric_values_count: report.metric_values.as_ref().map(Vec::len),
+    };
+    build_core_projection(
+        ResourceFeature::MetricReport,
+        report.odata_id(),
+        report.etag(),
+        &payload,
+    )
+}
+
+fn task_service_projection(
+    service: &TaskServiceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = TaskServicePayload {
+        resource: CommonResourcePayload::from_schema_base(&service.base),
+        service_enabled: service.service_enabled.as_ref().copied().flatten(),
+        completed_task_over_write_policy: service.completed_task_over_write_policy,
+        status: service
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::TaskService,
+        service.odata_id(),
+        service.etag(),
+        &payload,
+    )
+}
+
+fn task_projection(task: &TaskSchema) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = TaskPayload {
+        resource: CommonResourcePayload::from_schema_base(&task.base),
+        task_state: task.task_state,
+        task_status: task.task_status,
+        percent_complete: task.percent_complete.as_ref().copied().flatten(),
+        start_time: task.start_time,
+        end_time: task.end_time,
+    };
+    build_core_projection(
+        ResourceFeature::Task,
+        task.odata_id(),
+        task.etag(),
         &payload,
     )
 }
@@ -3790,6 +4352,305 @@ mod tests {
         "Version":"1.4.2"
     }"##;
 
+    /// A Service Root that also advertises the 0.2 `EventService`,
+    /// `TelemetryService`, and `TaskService` surfaces through their root-level
+    /// links, so the service-family reads navigate from the decoded root.
+    const CORE_WITH_SERVICES_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "EventService":{"@odata.id":"/redfish/v1/EventService"},
+        "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+    }"#;
+
+    /// The `EventService` document that advertises the `Subscriptions`
+    /// collection; the event-delivery fields are decoded by the schema but
+    /// stay outside the projection contract.
+    const EVENT_SERVICE_WITH_SUBSCRIPTIONS_BODY: &str = r##"{
+        "@odata.type":"#EventService.v1_7_0.EventService",
+        "@odata.id":"/redfish/v1/EventService",
+        "@odata.etag":"W/\"event-service-1\"",
+        "Id":"EventService",
+        "Name":"Event Service",
+        "Description":"Event subscription and delivery",
+        "ServiceEnabled":true,
+        "DeliveryRetryAttempts":3,
+        "DeliveryRetryIntervalSeconds":30,
+        "ServerSentEventUri":"/redfish/v1/EventService/SSE",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "Subscriptions":{"@odata.id":"/redfish/v1/EventService/Subscriptions"}
+    }"##;
+
+    const EVENT_SUBSCRIPTIONS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#EventDestinationCollection.EventDestinationCollection",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions",
+        "Name":"Event Subscription Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/EventService/Subscriptions/1"},
+            {"@odata.id":"/redfish/v1/EventService/Subscriptions/2"}
+        ]
+    }"##;
+
+    /// An advertised but empty `Subscriptions` collection, so the read proves
+    /// that an empty subscription family produces no member snapshots.
+    const EVENT_SUBSCRIPTIONS_BODY: &str = r##"{
+        "@odata.type":"#EventDestinationCollection.EventDestinationCollection",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions",
+        "Name":"Event Subscription Collection",
+        "Members":[]
+    }"##;
+
+    /// The full `EventDestination` subscription member projection with every
+    /// optional contract field populated; the delivery and filtering fields
+    /// are decoded but stay outside the projection contract.
+    const EVENT_SUBSCRIPTION_ONE_BODY: &str = r##"{
+        "@odata.type":"#EventDestination.v1_14_0.EventDestination",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions/1",
+        "@odata.etag":"W/\"subscription-1\"",
+        "Id":"1",
+        "Name":"Webhook Subscription One",
+        "Description":"Primary webhook subscription",
+        "Destination":"https://events.example.com/hook-1",
+        "Protocol":"Redfish",
+        "Context":"hook-one",
+        "EventTypes":["StatusChange","Alert"],
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "HttpHeaders":[{"Key":"X-Example","Value":"1"}],
+        "MessageIds":["Base.1.0.Success"]
+    }"##;
+
+    /// A minimal `EventDestination` subscription member: every optional
+    /// contract field is absent so the projection omits it instead of
+    /// emitting null.
+    const EVENT_SUBSCRIPTION_TWO_BODY: &str = r##"{
+        "@odata.type":"#EventDestination.v1_14_0.EventDestination",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions/2",
+        "@odata.etag":"W/\"subscription-2\"",
+        "Id":"2",
+        "Name":"Webhook Subscription Two",
+        "Destination":"https://events.example.com/hook-2"
+    }"##;
+
+    /// The `TelemetryService` document that advertises the `MetricDefinitions`
+    /// and `MetricReports` collections. `ServiceEnabled` is present on the
+    /// wire and decoded by the schema, but the api contract exposes only
+    /// `Status`, so the projection must omit it (an extra key would make the
+    /// stored snapshot unreadable to the strict application decoder).
+    const TELEMETRY_SERVICE_WITH_LINKS_BODY: &str = r##"{
+        "@odata.type":"#TelemetryService.v1_4_0.TelemetryService",
+        "@odata.id":"/redfish/v1/TelemetryService",
+        "@odata.etag":"W/\"telemetry-service-1\"",
+        "Id":"TelemetryService",
+        "Name":"Telemetry Service",
+        "Description":"Telemetry collection and reporting",
+        "ServiceEnabled":true,
+        "MaxReports":256,
+        "MinCollectionInterval":"PT1S",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "MetricDefinitions":{"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions"},
+        "MetricReports":{"@odata.id":"/redfish/v1/TelemetryService/MetricReports"}
+    }"##;
+
+    const METRIC_DEFINITIONS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+        "Name":"Metric Definition Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/1"},
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/2"}
+        ]
+    }"##;
+
+    /// An advertised but empty `MetricDefinitions` collection, so the read
+    /// proves that an empty definition family produces no member snapshots.
+    const METRIC_DEFINITIONS_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+        "Name":"Metric Definition Collection",
+        "Members":[]
+    }"##;
+
+    /// The full `MetricDefinition` member projection with every optional
+    /// contract field populated; the measurement-semantics fields are decoded
+    /// but stay outside the projection contract.
+    const METRIC_DEFINITION_ONE_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinition.v1_2_0.MetricDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/1",
+        "@odata.etag":"W/\"metric-definition-1\"",
+        "Id":"1",
+        "Name":"Power Consumption",
+        "Description":"Instantaneous power consumption",
+        "MetricType":"Numeric",
+        "MetricDataType":"Integer",
+        "Units":"W",
+        "Precision":1,
+        "MetricProperties":["/redfish/v1/Chassis/1/Power#/0/PowerConsumedWatts"]
+    }"##;
+
+    /// A minimal `MetricDefinition` member carrying only the contract fields.
+    const METRIC_DEFINITION_TWO_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinition.v1_2_0.MetricDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/2",
+        "@odata.etag":"W/\"metric-definition-2\"",
+        "Id":"2",
+        "Name":"Chassis Temperature",
+        "MetricType":"Gauge",
+        "Units":"Cel"
+    }"##;
+
+    const METRIC_REPORTS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#MetricReportCollection.MetricReportCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReports",
+        "Name":"Metric Report Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricReports/1"},
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricReports/2"}
+        ]
+    }"##;
+
+    /// An advertised but empty `MetricReports` collection, so the read proves
+    /// that an empty report family produces no member snapshots.
+    const METRIC_REPORTS_BODY: &str = r##"{
+        "@odata.type":"#MetricReportCollection.MetricReportCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReports",
+        "Name":"Metric Report Collection",
+        "Members":[]
+    }"##;
+
+    /// A `MetricReports` collection with a single member, so the member-skip
+    /// test observes one undecodable report without a second member to
+    /// confuse the request-order assertion.
+    const METRIC_REPORTS_WITH_ONE_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#MetricReportCollection.MetricReportCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReports",
+        "Name":"Metric Report Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricReports/1"}
+        ]
+    }"##;
+
+    /// The full `MetricReport` member fixture: the `MetricValues` array and
+    /// the `Timestamp`/`Context` metadata are decoded by the schema, but the
+    /// projection carries only the derived `MetricValuesCount`, so every
+    /// value-array and metadata key must stay out of the snapshot. `Status`
+    /// is not a `MetricReport_v1` property and must stay out as well.
+    const METRIC_REPORT_ONE_BODY: &str = r##"{
+        "@odata.type":"#MetricReport.v1_4_0.MetricReport",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReports/1",
+        "@odata.etag":"W/\"metric-report-1\"",
+        "Id":"1",
+        "Name":"Power Report",
+        "Description":"Average platform power usage",
+        "ReportSequence":"1",
+        "Timestamp":"2026-08-01T09:30:00Z",
+        "Context":"power-context",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "MetricValues":[
+            {
+                "MetricId":"AverageConsumedWatts",
+                "MetricValue":"100",
+                "Timestamp":"2026-08-01T09:30:00Z"
+            },
+            {
+                "MetricId":"AverageConsumedWatts",
+                "MetricValue":"94",
+                "Timestamp":"2026-08-01T09:31:00Z"
+            }
+        ]
+    }"##;
+
+    /// A minimal `MetricReport` member with an empty `MetricValues` array, so
+    /// the derived count is asserted as zero instead of absent.
+    const METRIC_REPORT_TWO_BODY: &str = r##"{
+        "@odata.type":"#MetricReport.v1_4_0.MetricReport",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReports/2",
+        "@odata.etag":"W/\"metric-report-2\"",
+        "Id":"2",
+        "Name":"Temperature Report",
+        "MetricValues":[]
+    }"##;
+
+    /// The `TaskService` document that advertises the `Tasks` collection; the
+    /// service-plumbing fields are decoded by the schema but stay outside the
+    /// projection contract.
+    const TASK_SERVICE_WITH_TASKS_BODY: &str = r##"{
+        "@odata.type":"#TaskService.v1_2_0.TaskService",
+        "@odata.id":"/redfish/v1/TaskService",
+        "@odata.etag":"W/\"task-service-1\"",
+        "Id":"TaskService",
+        "Name":"Task Service",
+        "Description":"Asynchronous task tracking",
+        "ServiceEnabled":true,
+        "CompletedTaskOverWritePolicy":"Oldest",
+        "TaskAutoDeleteTimeoutMinutes":60,
+        "DateTime":"2026-08-01T09:30:00Z",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService/Tasks"}
+    }"##;
+
+    const TASKS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#TaskCollection.TaskCollection",
+        "@odata.id":"/redfish/v1/TaskService/Tasks",
+        "Name":"Task Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TaskService/Tasks/1"},
+            {"@odata.id":"/redfish/v1/TaskService/Tasks/2"}
+        ]
+    }"##;
+
+    /// An advertised but empty `Tasks` collection, so the read proves that an
+    /// empty task family produces no member snapshots.
+    const TASKS_BODY: &str = r##"{
+        "@odata.type":"#TaskCollection.TaskCollection",
+        "@odata.id":"/redfish/v1/TaskService/Tasks",
+        "Name":"Task Collection",
+        "Members":[]
+    }"##;
+
+    /// The full `Task` member projection with every optional contract field
+    /// populated (the running task carries no `EndTime` yet); the task
+    /// plumbing fields are decoded but stay outside the projection contract.
+    const TASK_ONE_BODY: &str = r##"{
+        "@odata.type":"#Task.v1_7_0.Task",
+        "@odata.id":"/redfish/v1/TaskService/Tasks/1",
+        "@odata.etag":"W/\"task-1\"",
+        "Id":"1",
+        "Name":"Firmware Update Task",
+        "Description":"Applying firmware update",
+        "TaskState":"Running",
+        "TaskStatus":"OK",
+        "PercentComplete":42,
+        "StartTime":"2026-08-01T09:30:00Z",
+        "TaskMonitor":"/redfish/v1/TaskService/Tasks/1/Monitor",
+        "HidePayload":false
+    }"##;
+
+    /// A minimal completed `Task` member: every optional contract field that
+    /// the endpoint omitted stays absent so the projection omits it instead
+    /// of emitting null.
+    const TASK_TWO_BODY: &str = r##"{
+        "@odata.type":"#Task.v1_7_0.Task",
+        "@odata.id":"/redfish/v1/TaskService/Tasks/2",
+        "@odata.etag":"W/\"task-2\"",
+        "Id":"2",
+        "Name":"Firmware Update Task Two",
+        "TaskState":"Completed",
+        "TaskStatus":"OK",
+        "PercentComplete":100,
+        "StartTime":"2026-08-01T09:00:00Z",
+        "EndTime":"2026-08-01T09:05:00Z"
+    }"##;
+
     /// A System member that advertises the 0.2 `PcieDevices` family as an
     /// in-document array of typed links, the presence-type shape the
     /// `ComputerSystem` schema uses instead of a collection resource.
@@ -5191,6 +6052,108 @@ mod tests {
         "/redfish/v1/Chassis/1/Thermal",
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for the complete 0.2 service-family read: the
+    /// `EventService` singleton and its `Subscriptions` members, the
+    /// `TelemetryService` singleton and its `MetricDefinitions` and
+    /// `MetricReports` members, and the `TaskService` singleton and its
+    /// `Tasks` members are read after the manager families, before the
+    /// Session cleanup.
+    const SERVICES_RESOURCE_REQUEST_PATHS: [&str; 26] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/EventService/Subscriptions/1",
+        "/redfish/v1/EventService/Subscriptions/2",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricDefinitions/1",
+        "/redfish/v1/TelemetryService/MetricDefinitions/2",
+        "/redfish/v1/TelemetryService/MetricReports",
+        "/redfish/v1/TelemetryService/MetricReports/1",
+        "/redfish/v1/TelemetryService/MetricReports/2",
+        "/redfish/v1/TaskService",
+        "/redfish/v1/TaskService/Tasks",
+        "/redfish/v1/TaskService/Tasks/1",
+        "/redfish/v1/TaskService/Tasks/2",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when none of the three service links is advertised:
+    /// the service URIs are never requested ("资源存在才呈现").
+    const ABSENT_SERVICES_REQUEST_PATHS: [&str; 11] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the three service singletons are advertised but
+    /// every collection below them is empty: the collection documents are
+    /// still read, no member is, and the three singletons are projected.
+    const EMPTY_SERVICES_REQUEST_PATHS: [&str; 18] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricReports",
+        "/redfish/v1/TaskService",
+        "/redfish/v1/TaskService/Tasks",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the `EventService` and `TaskService` singletons
+    /// are undecodable and the second `MetricDefinition` member is
+    /// undecodable: the failing URIs are still requested (that is how the
+    /// skip is observed), the skipped families complete around them, and the
+    /// `MetricReports` member failure is skipped the same way.
+    const SERVICES_SKIP_REQUEST_PATHS: [&str; 19] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/EventService",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricDefinitions/1",
+        "/redfish/v1/TelemetryService/MetricDefinitions/2",
+        "/redfish/v1/TelemetryService/MetricReports",
+        "/redfish/v1/TelemetryService/MetricReports/1",
+        "/redfish/v1/TaskService",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -7275,6 +8238,447 @@ mod tests {
             &server.finish_all().await?,
             &DEVICE_MEMBER_SKIP_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    // The fixture sequence and the per-family snapshot assertions of all
+    // seven families live in one test so the request order is asserted as a
+    // whole; splitting them would duplicate the session and core-triad
+    // fixtures. The domain crate allows the same on its long round-trip
+    // tests.
+    #[allow(clippy::too_many_lines)]
+    async fn reads_event_telemetry_and_task_families_through_typed_root_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_SERVICES_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", EVENT_SERVICE_WITH_SUBSCRIPTIONS_BODY),
+                ("200 OK", EVENT_SUBSCRIPTIONS_WITH_MEMBERS_BODY),
+                ("200 OK", EVENT_SUBSCRIPTION_ONE_BODY),
+                ("200 OK", EVENT_SUBSCRIPTION_TWO_BODY),
+                ("200 OK", TELEMETRY_SERVICE_WITH_LINKS_BODY),
+                ("200 OK", METRIC_DEFINITIONS_WITH_MEMBERS_BODY),
+                ("200 OK", METRIC_DEFINITION_ONE_BODY),
+                ("200 OK", METRIC_DEFINITION_TWO_BODY),
+                ("200 OK", METRIC_REPORTS_WITH_MEMBERS_BODY),
+                ("200 OK", METRIC_REPORT_ONE_BODY),
+                ("200 OK", METRIC_REPORT_TWO_BODY),
+                ("200 OK", TASK_SERVICE_WITH_TASKS_BODY),
+                ("200 OK", TASKS_WITH_MEMBERS_BODY),
+                ("200 OK", TASK_ONE_BODY),
+                ("200 OK", TASK_TWO_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 15);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::EventService,
+                ResourceFeature::EventSubscription,
+                ResourceFeature::EventSubscription,
+                ResourceFeature::TelemetryService,
+                ResourceFeature::MetricDefinition,
+                ResourceFeature::MetricDefinition,
+                ResourceFeature::MetricReport,
+                ResourceFeature::MetricReport,
+                ResourceFeature::TaskService,
+                ResourceFeature::Task,
+                ResourceFeature::Task,
+            ]
+        );
+        assert_projection(
+            &resources[4],
+            "/redfish/v1/EventService",
+            "W/\"event-service-1\"",
+            "Name",
+            "Event Service",
+        )?;
+        assert_projection(
+            &resources[5],
+            "/redfish/v1/EventService/Subscriptions/1",
+            "W/\"subscription-1\"",
+            "Protocol",
+            "Redfish",
+        )?;
+        assert_projection(
+            &resources[6],
+            "/redfish/v1/EventService/Subscriptions/2",
+            "W/\"subscription-2\"",
+            "Destination",
+            "https://events.example.com/hook-2",
+        )?;
+        assert_projection(
+            &resources[7],
+            "/redfish/v1/TelemetryService",
+            "W/\"telemetry-service-1\"",
+            "Name",
+            "Telemetry Service",
+        )?;
+        assert_projection(
+            &resources[8],
+            "/redfish/v1/TelemetryService/MetricDefinitions/1",
+            "W/\"metric-definition-1\"",
+            "Units",
+            "W",
+        )?;
+        assert_projection(
+            &resources[9],
+            "/redfish/v1/TelemetryService/MetricDefinitions/2",
+            "W/\"metric-definition-2\"",
+            "MetricType",
+            "Gauge",
+        )?;
+        assert_projection(
+            &resources[10],
+            "/redfish/v1/TelemetryService/MetricReports/1",
+            "W/\"metric-report-1\"",
+            "Id",
+            "1",
+        )?;
+        assert_projection(
+            &resources[11],
+            "/redfish/v1/TelemetryService/MetricReports/2",
+            "W/\"metric-report-2\"",
+            "Id",
+            "2",
+        )?;
+        assert_projection(
+            &resources[12],
+            "/redfish/v1/TaskService",
+            "W/\"task-service-1\"",
+            "Name",
+            "Task Service",
+        )?;
+        assert_projection(
+            &resources[13],
+            "/redfish/v1/TaskService/Tasks/1",
+            "W/\"task-1\"",
+            "TaskState",
+            "Running",
+        )?;
+        assert_projection(
+            &resources[14],
+            "/redfish/v1/TaskService/Tasks/2",
+            "W/\"task-2\"",
+            "TaskState",
+            "Completed",
+        )?;
+        assert_service_family_payloads(&resources)?;
+        assert_session_requests(
+            &server.finish_all().await?,
+            &SERVICES_RESOURCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    /// Asserts the exact contract field set of every service-family snapshot:
+    /// the populated fields of the full members, the omitted fields of the
+    /// minimal members, and the absence of every decoded schema field that is
+    /// not part of the contract — an extra key would make the stored snapshot
+    /// unreadable to the strict application decoder. The `MetricReport`
+    /// snapshots in particular carry only the derived `MetricValuesCount`;
+    /// the `MetricValues` value array and the `Status` key of the fixture
+    /// must never leave the gateway.
+    // All seven families are asserted in one place so the contract field set
+    // stays auditable side by side; splitting per family would duplicate the
+    // common absent-key checks. The domain crate's round-trip tests and the
+    // mock-BMC route dispatch allow the same on their long assertions.
+    #[allow(clippy::too_many_lines)]
+    fn assert_service_family_payloads(
+        resources: &[CoreResourceProjection],
+    ) -> Result<(), Box<dyn Error>> {
+        let event_service_payload: serde_json::Value =
+            serde_json::from_str(resources[4].payload().as_str())?;
+        assert_eq!(event_service_payload["ServiceEnabled"], true);
+        assert_eq!(event_service_payload["Status"]["Health"], "OK");
+        assert_eq!(event_service_payload["Id"], "EventService");
+        assert_eq!(event_service_payload["Name"], "Event Service");
+        assert_eq!(event_service_payload.get("DeliveryRetryAttempts"), None);
+        assert_eq!(
+            event_service_payload.get("DeliveryRetryIntervalSeconds"),
+            None
+        );
+        assert_eq!(event_service_payload.get("ServerSentEventUri"), None);
+        let subscription_payload: serde_json::Value =
+            serde_json::from_str(resources[5].payload().as_str())?;
+        assert_eq!(
+            subscription_payload["Destination"],
+            "https://events.example.com/hook-1"
+        );
+        assert_eq!(subscription_payload["Protocol"], "Redfish");
+        assert_eq!(subscription_payload["Context"], "hook-one");
+        assert_eq!(
+            subscription_payload["EventTypes"],
+            serde_json::json!(["StatusChange", "Alert"])
+        );
+        assert_eq!(subscription_payload["Status"]["Health"], "OK");
+        assert_eq!(subscription_payload.get("HttpHeaders"), None);
+        assert_eq!(subscription_payload.get("MessageIds"), None);
+        let subscription_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[6].payload().as_str())?;
+        assert_eq!(
+            subscription_minimal_payload["Destination"],
+            "https://events.example.com/hook-2"
+        );
+        assert_eq!(subscription_minimal_payload.get("Protocol"), None);
+        assert_eq!(subscription_minimal_payload.get("Context"), None);
+        assert_eq!(subscription_minimal_payload.get("EventTypes"), None);
+        assert_eq!(subscription_minimal_payload.get("Status"), None);
+        let telemetry_service_payload: serde_json::Value =
+            serde_json::from_str(resources[7].payload().as_str())?;
+        assert_eq!(telemetry_service_payload["Status"]["Health"], "OK");
+        assert_eq!(telemetry_service_payload["Id"], "TelemetryService");
+        assert_eq!(telemetry_service_payload["Name"], "Telemetry Service");
+        // `ServiceEnabled` is decoded by the schema but the api contract
+        // exposes only `Status`, so it must not be projected.
+        assert_eq!(telemetry_service_payload.get("ServiceEnabled"), None);
+        assert_eq!(telemetry_service_payload.get("MaxReports"), None);
+        assert_eq!(telemetry_service_payload.get("MinCollectionInterval"), None);
+        let definition_payload: serde_json::Value =
+            serde_json::from_str(resources[8].payload().as_str())?;
+        assert_eq!(definition_payload["Units"], "W");
+        assert_eq!(definition_payload["MetricType"], "Numeric");
+        assert_eq!(definition_payload["Id"], "1");
+        assert_eq!(definition_payload["Name"], "Power Consumption");
+        assert_eq!(definition_payload.get("MetricDataType"), None);
+        assert_eq!(definition_payload.get("Precision"), None);
+        assert_eq!(definition_payload.get("MetricProperties"), None);
+        assert_eq!(definition_payload.get("Status"), None);
+        let definition_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[9].payload().as_str())?;
+        assert_eq!(definition_minimal_payload["MetricType"], "Gauge");
+        assert_eq!(definition_minimal_payload["Units"], "Cel");
+        let report_payload: serde_json::Value =
+            serde_json::from_str(resources[10].payload().as_str())?;
+        assert_eq!(report_payload["MetricValuesCount"], 2);
+        assert_eq!(report_payload["Id"], "1");
+        assert_eq!(report_payload["Name"], "Power Report");
+        // The fixture carries a two-entry `MetricValues` array and a `Status`
+        // object; neither may leave the gateway, only the derived count may.
+        assert_eq!(report_payload.get("MetricValues"), None);
+        assert_eq!(report_payload.get("Status"), None);
+        assert_eq!(report_payload.get("Timestamp"), None);
+        assert_eq!(report_payload.get("Context"), None);
+        assert_eq!(report_payload.get("ReportSequence"), None);
+        let report_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[11].payload().as_str())?;
+        assert_eq!(report_minimal_payload["MetricValuesCount"], 0);
+        let task_service_payload: serde_json::Value =
+            serde_json::from_str(resources[12].payload().as_str())?;
+        assert_eq!(task_service_payload["ServiceEnabled"], true);
+        assert_eq!(
+            task_service_payload["CompletedTaskOverWritePolicy"],
+            "Oldest"
+        );
+        assert_eq!(task_service_payload["Status"]["Health"], "OK");
+        assert_eq!(task_service_payload.get("DateTime"), None);
+        assert_eq!(
+            task_service_payload.get("TaskAutoDeleteTimeoutMinutes"),
+            None
+        );
+        let task_payload: serde_json::Value =
+            serde_json::from_str(resources[13].payload().as_str())?;
+        assert_eq!(task_payload["TaskState"], "Running");
+        assert_eq!(task_payload["TaskStatus"], "OK");
+        assert_eq!(task_payload["PercentComplete"], 42);
+        assert_eq!(task_payload["StartTime"], "2026-08-01T09:30:00Z");
+        assert_eq!(task_payload.get("EndTime"), None);
+        assert_eq!(task_payload.get("TaskMonitor"), None);
+        assert_eq!(task_payload.get("HidePayload"), None);
+        assert_eq!(task_payload.get("Messages"), None);
+        let task_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[14].payload().as_str())?;
+        assert_eq!(task_minimal_payload["TaskState"], "Completed");
+        assert_eq!(task_minimal_payload["TaskStatus"], "OK");
+        assert_eq!(task_minimal_payload["PercentComplete"], 100);
+        assert_eq!(task_minimal_payload["StartTime"], "2026-08-01T09:00:00Z");
+        assert_eq!(task_minimal_payload["EndTime"], "2026-08-01T09:05:00Z");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_service_links_produce_no_family_snapshots() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The Service Root advertises none of the three service links, so
+        // none of the seven families produce snapshots ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &ABSENT_SERVICES_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_service_collections_produce_no_member_snapshots() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_SERVICES_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", EVENT_SERVICE_WITH_SUBSCRIPTIONS_BODY),
+                ("200 OK", EVENT_SUBSCRIPTIONS_BODY),
+                ("200 OK", TELEMETRY_SERVICE_WITH_LINKS_BODY),
+                ("200 OK", METRIC_DEFINITIONS_BODY),
+                ("200 OK", METRIC_REPORTS_BODY),
+                ("200 OK", TASK_SERVICE_WITH_TASKS_BODY),
+                ("200 OK", TASKS_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The three service singletons are projected; every collection below
+        // them is advertised but empty, so no member snapshot is produced.
+        assert_eq!(resources.len(), 7);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::EventService,
+                ResourceFeature::TelemetryService,
+                ResourceFeature::TaskService,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &EMPTY_SERVICES_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_undecodable_service_singletons_and_members_without_aborting()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_SERVICES_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", TELEMETRY_SERVICE_WITH_LINKS_BODY),
+                ("200 OK", METRIC_DEFINITIONS_WITH_MEMBERS_BODY),
+                ("200 OK", METRIC_DEFINITION_ONE_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", METRIC_REPORTS_WITH_ONE_MEMBER_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The `EventService` singleton is undecodable and takes its whole
+        // `Subscriptions` family with it; the `TaskService` singleton is
+        // undecodable the same way. The second `MetricDefinition` and the
+        // first `MetricReport` members are skipped with the member-level
+        // semantics. Every other resource still produces a snapshot.
+        assert_eq!(resources.len(), 6);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+                ResourceFeature::TelemetryService,
+                ResourceFeature::MetricDefinition,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &SERVICES_SKIP_REQUEST_PATHS)?;
         Ok(())
     }
 
