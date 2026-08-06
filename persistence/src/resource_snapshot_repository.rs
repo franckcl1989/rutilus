@@ -1055,6 +1055,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_log_services_manager_network_protocol_and_host_interfaces_features()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::LogServices,
+                "/redfish/v1/Managers/1/LogServices/1",
+                "BMC Event Log",
+            )?
+            .with_odata_type(ResourceODataType::parse("#LogService.v1_9_0.LogService")?),
+            observation(
+                ResourceFeature::ManagerNetworkProtocol,
+                "/redfish/v1/Managers/1/NetworkProtocol",
+                "Manager Network Protocol",
+            )?,
+            observation(
+                ResourceFeature::HostInterfaces,
+                "/redfish/v1/Managers/1/HostInterfaces/1",
+                "Host Interface One",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"host-interface-1\"")?),
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let log_service = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::LogServices)
+            .ok_or("log service snapshot is missing")?;
+        assert_eq!(
+            log_service.odata_id().as_str(),
+            "/redfish/v1/Managers/1/LogServices/1"
+        );
+        assert_eq!(
+            log_service.odata_type().map(ResourceODataType::as_str),
+            Some("#LogService.v1_9_0.LogService")
+        );
+        assert!(log_service.payload().as_str().contains("BMC Event Log"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for (feature, expected) in [
+            (ResourceFeature::LogServices, 1),
+            (ResourceFeature::ManagerNetworkProtocol, 1),
+            (ResourceFeature::HostInterfaces, 1),
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                expected,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::LogServices
+                | ResourceFeature::ManagerNetworkProtocol
+                | ResourceFeature::HostInterfaces
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
