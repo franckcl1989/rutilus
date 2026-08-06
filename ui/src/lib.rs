@@ -248,7 +248,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // three-line counts summary keeps its 0.1 wire shape.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::Processor { .. }
-            | CoreResourceDetailsResponse::Memory { .. } => {}
+            | CoreResourceDetailsResponse::Memory { .. }
+            | CoreResourceDetailsResponse::Storage { .. }
+            | CoreResourceDetailsResponse::NetworkAdapter { .. }
+            | CoreResourceDetailsResponse::EthernetInterface { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -307,6 +310,11 @@ fn card_facts(
         CoreResourceDetailsResponse::Manager { .. } => manager_card_facts(resource),
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
+        CoreResourceDetailsResponse::Storage { .. } => storage_card_facts(resource),
+        CoreResourceDetailsResponse::NetworkAdapter { .. } => network_adapter_card_facts(resource),
+        CoreResourceDetailsResponse::EthernetInterface { .. } => {
+            ethernet_interface_card_facts(resource)
+        }
     }
 }
 
@@ -526,6 +534,95 @@ fn memory_card_facts(
     );
     push_status_facts(&mut facts, status.as_ref());
     ("Memory", facts)
+}
+
+/// Facts for a §2.1 storage card; the numeric controller and drive counts
+/// come from the typed schema's collections and stay numeric so the card
+/// renders them without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `Storage` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn storage_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Storage {
+        controller_count,
+        drive_count,
+        status,
+    } = resource
+    else {
+        return ("Storage", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_u64_fact(&mut facts, "Controller count", *controller_count);
+    push_u64_fact(&mut facts, "Drive count", *drive_count);
+    push_status_facts(&mut facts, status.as_ref());
+    ("Storage", facts)
+}
+
+/// Facts for a §2.1 network-adapter card; part and serial numbers are not
+/// part of the network-adapter schema projection, so hardware facts render
+/// without them.
+///
+/// The dispatcher guarantees this receives the `NetworkAdapter` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn network_adapter_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::NetworkAdapter {
+        manufacturer,
+        model,
+        status,
+    } = resource
+    else {
+        return ("Network adapter", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        None,
+        None,
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Network adapter", facts)
+}
+
+/// Facts for a §2.1 ethernet-interface card; `speed_mbps` stays numeric so
+/// the card renders the link speed without re-parsing text, and the enabled
+/// flag renders only when the BMC published it.
+///
+/// The dispatcher guarantees this receives the `EthernetInterface` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn ethernet_interface_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::EthernetInterface {
+        mac_address,
+        speed_mbps,
+        interface_enabled,
+        status,
+    } = resource
+    else {
+        return ("Ethernet interface", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "MAC address", mac_address.as_deref());
+    push_u64_fact(&mut facts, "Speed (Mbps)", *speed_mbps);
+    push_fact(
+        &mut facts,
+        "Interface enabled",
+        interface_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Ethernet interface", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3598,7 +3695,10 @@ mod tests {
                             chassis_resource(),
                             manager_resource(),
                             processor_resource(),
-                            memory_resource()
+                            memory_resource(),
+                            storage_resource(),
+                            network_adapter_resource(),
+                            ethernet_interface_resource()
                         ]
                     }
                 }
@@ -3794,6 +3894,87 @@ mod tests {
         })
     }
 
+    fn storage_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d6",
+                "odata_id": "/redfish/v1/Systems/1/Storage/SATA-1",
+                "odata_type": "#Storage.v1_21_0.Storage",
+                "etag": "W/\"storage-1\""
+            },
+            "common": {
+                "id": "SATA-1",
+                "name": "Storage Subsystem One",
+                "description": "SATA storage subsystem"
+            },
+            "resource": {
+                "resource_type": "storage",
+                "details": {
+                    "controller_count": 2,
+                    "drive_count": 6,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn network_adapter_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d7",
+                "odata_id": "/redfish/v1/Chassis/1/NetworkAdapters/1",
+                "odata_type": "#NetworkAdapter.v1_14_0.NetworkAdapter",
+                "etag": null
+            },
+            "common": {
+                "id": "1",
+                "name": "Network Adapter One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "network_adapter",
+                "details": {
+                    "manufacturer": "Vendor A",
+                    "model": "NA-25G-2P",
+                    "status": null
+                }
+            }
+        })
+    }
+
+    fn ethernet_interface_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d8",
+                "odata_id": "/redfish/v1/Managers/1/EthernetInterfaces/1",
+                "odata_type": "#EthernetInterface.v1_12_4.EthernetInterface",
+                "etag": "W/\"eth-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Ethernet Interface One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "ethernet_interface",
+                "details": {
+                    "mac_address": "52:54:00:12:34:56",
+                    "speed_mbps": 10000,
+                    "interface_enabled": true,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
     /// The §2.1 capability ledger in design-document order: product code,
     /// upstream feature, and wire `ui_location` value of the shared contract.
     const LEDGER_FIXTURE: [(&str, &str, &str); 30] = [
@@ -3937,7 +4118,7 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 6);
+        assert_eq!(current.resources.len(), 9);
         let system = current
             .resources
             .iter()
@@ -4041,6 +4222,97 @@ mod tests {
                 .filter(|resource| resource.type_label == "Memory")
                 .count(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_network_and_ethernet_cards_render_family_facts() -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let storage = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Storage")
+            .ok_or("storage resource must exist")?;
+        assert_eq!(storage.name, "Storage Subsystem One");
+        assert_eq!(storage.source, "/redfish/v1/Systems/1/Storage/SATA-1");
+        assert!(storage.facts.contains(&ResourceFactProjection {
+            label: "Controller count",
+            value: "2".to_owned(),
+        }));
+        assert!(storage.facts.contains(&ResourceFactProjection {
+            label: "Drive count",
+            value: "6".to_owned(),
+        }));
+        assert!(storage.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let network_adapter = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Network adapter")
+            .ok_or("network adapter resource must exist")?;
+        assert_eq!(network_adapter.name, "Network Adapter One");
+        assert_eq!(
+            network_adapter.source,
+            "/redfish/v1/Chassis/1/NetworkAdapters/1"
+        );
+        assert!(network_adapter.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Vendor A".to_owned(),
+        }));
+        assert!(network_adapter.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "NA-25G-2P".to_owned(),
+        }));
+        assert!(
+            !network_adapter
+                .facts
+                .iter()
+                .any(|fact| fact.label == "Part number")
+        );
+        assert!(
+            !network_adapter
+                .facts
+                .iter()
+                .any(|fact| fact.label == "State")
+        );
+        let ethernet = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Ethernet interface")
+            .ok_or("ethernet interface resource must exist")?;
+        assert_eq!(ethernet.name, "Ethernet Interface One");
+        assert_eq!(
+            ethernet.source,
+            "/redfish/v1/Managers/1/EthernetInterfaces/1"
+        );
+        assert!(ethernet.facts.contains(&ResourceFactProjection {
+            label: "MAC address",
+            value: "52:54:00:12:34:56".to_owned(),
+        }));
+        assert!(ethernet.facts.contains(&ResourceFactProjection {
+            label: "Speed (Mbps)",
+            value: "10000".to_owned(),
+        }));
+        assert!(ethernet.facts.contains(&ResourceFactProjection {
+            label: "Interface enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
         );
         Ok(())
     }
