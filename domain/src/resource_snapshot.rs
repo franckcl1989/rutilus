@@ -11,12 +11,24 @@ const MAX_ETAG_BYTES: usize = 512;
 const MAX_TYPED_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 /// The typed Redfish feature that produced a resource snapshot.
+///
+/// Every variant's `as_str()` code is the §2.1 feature name and equals the
+/// matching [`EndpointCapability`] product code, so snapshot and ledger
+/// projections never translate the same wire string twice.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResourceFeature {
     ServiceRoot,
     Systems,
     Chassis,
     Managers,
+    /// The §2.1 `processors` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Processors,
+    /// The §2.1 `memory` feature, added as a typed resource family in the 0.2
+    /// snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Memory,
 }
 
 impl ResourceFeature {
@@ -28,6 +40,8 @@ impl ResourceFeature {
             Self::Systems => "systems",
             Self::Chassis => "chassis",
             Self::Managers => "managers",
+            Self::Processors => "processors",
+            Self::Memory => "memory",
         }
     }
 }
@@ -47,6 +61,8 @@ impl FromStr for ResourceFeature {
             "systems" => Ok(Self::Systems),
             "chassis" => Ok(Self::Chassis),
             "managers" => Ok(Self::Managers),
+            "processors" => Ok(Self::Processors),
+            "memory" => Ok(Self::Memory),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -575,6 +591,8 @@ fn write_exact_text_error(
 
 #[cfg(test)]
 mod tests {
+    use crate::EndpointCapability;
+
     use super::*;
 
     #[test]
@@ -584,6 +602,8 @@ mod tests {
             ResourceFeature::Systems,
             ResourceFeature::Chassis,
             ResourceFeature::Managers,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
         ];
 
         for feature in features {
@@ -593,6 +613,59 @@ mod tests {
             "unknown".parse::<ResourceFeature>(),
             Err(ResourceFeatureParseError)
         );
+    }
+
+    #[test]
+    fn processors_and_memory_codes_round_trip_and_match_the_capability_ledger() {
+        // The snapshot feature and the §2.1 capability ledger must speak the
+        // same wire string, so persistence and protocol layers never translate
+        // between two inventories for the same surface.
+        assert_eq!(
+            ResourceFeature::Processors.as_str(),
+            EndpointCapability::Processors.as_str()
+        );
+        assert_eq!(
+            ResourceFeature::Memory.as_str(),
+            EndpointCapability::Memory.as_str()
+        );
+        assert_eq!(
+            "processors".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::Processors)
+        );
+        assert_eq!(
+            "memory".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::Memory)
+        );
+        assert_eq!(
+            "processors".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::Processors)
+        );
+        assert_eq!(
+            "memory".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::Memory)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_and_near_miss_feature_codes() {
+        // Singular forms and trailing punctuation would silently address a
+        // different collection, so they must stay unparseable until a matching
+        // resource family actually exists.
+        for code in [
+            "processor",
+            "memories",
+            "mem",
+            "processors/",
+            "memory-",
+            "Processors",
+            "Memory",
+        ] {
+            assert_eq!(
+                code.parse::<ResourceFeature>(),
+                Err(ResourceFeatureParseError),
+                "{code} must not parse as a resource feature"
+            );
+        }
     }
 
     #[test]
