@@ -10,7 +10,7 @@ pub use rutilus_domain::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
     CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol, EventType,
     ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
-    SetBootSourceOverride, SystemCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, UpdateCommand,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

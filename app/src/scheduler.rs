@@ -31,9 +31,9 @@
 use std::{error::Error, time::Duration};
 
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CommandExecutor,
-    CommandVerifier, EndpointRefreshRepository, ExecutorError, OperationExecutor, TaskMonitor,
-    TaskMonitorError, TaskPoll, TaskReader,
+    ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock,
+    CommandExecutor, CommandVerifier, EndpointRefreshRepository, ExecutorError, OperationExecutor,
+    TaskMonitor, TaskMonitorError, TaskPoll, TaskReader, UpdateExecutor,
 };
 use rutilus_domain::{Operation, OperationId, OperationState};
 use rutilus_operation_engine::{EngineError, OperationEngine, OperationStore, RemoteTaskStore};
@@ -117,7 +117,7 @@ impl StopWatch {
 ///
 /// # Why a seam
 ///
-/// `OperationExecutor` is a concrete composition with a seven-boundary error
+/// `OperationExecutor` is a concrete composition with a nine-boundary error
 /// vocabulary; the loop only needs "drive one operation" and must never
 /// interpret the executor's verdicts itself. The seam keeps the loop
 /// testable with scripted fakes (the same pattern the application layer's
@@ -167,8 +167,12 @@ pub(crate) trait TaskPollDriver {
 
 impl<Store, Gateway, Audit, Time> OperationDriver for OperationExecutor<Store, Gateway, Audit, Time>
 where
-    Store: OperationStore + EndpointRefreshRepository + CapabilityQueryRepository + RemoteTaskStore,
-    Gateway: CommandExecutor + CommandVerifier,
+    Store: OperationStore
+        + EndpointRefreshRepository
+        + CapabilityQueryRepository
+        + RemoteTaskStore
+        + ArtifactRepository,
+    Gateway: CommandExecutor + CommandVerifier + UpdateExecutor,
     Audit: AuditEventWriter,
     Time: Clock,
 {
@@ -177,7 +181,9 @@ where
         <Store as EndpointRefreshRepository>::Error,
         <Store as CapabilityQueryRepository>::Error,
         <Store as RemoteTaskStore>::Error,
+        <Store as ArtifactRepository>::Error,
         <Gateway as CommandExecutor>::Error,
+        <Gateway as UpdateExecutor>::Error,
         <Gateway as CommandVerifier>::Error,
         <Audit as AuditEventWriter>::Error,
     >;

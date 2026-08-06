@@ -27,12 +27,14 @@ use rutilus_infra_redfish::{
     NV_REDFISH_DEVELOPMENT_BASELINE, RedfishCommandExecutor, RedfishGateway, TlsProbeInitError,
 };
 use rutilus_operation_engine::{
-    BoundaryFuture as OperationBoundaryFuture, OperationEngine, OperationStore,
+    BoundaryFuture as OperationBoundaryFuture, OperationEngine, OperationStore, RemoteTask,
+    RemoteTaskState, RemoteTaskStore,
 };
 use rutilus_persistence::{
     ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
-    NewCredential, OpenStoreError, OperationRepositoryError, SqliteStore,
+    NewCredential, OpenStoreError, OperationRepositoryError, RemoteTaskRepositoryError,
+    SqliteStore,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
@@ -330,6 +332,35 @@ impl OperationStore for StandaloneState {
         state: Option<OperationState>,
     ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         <SqliteStore as OperationStore>::list_operations(&self.store, state)
+    }
+}
+
+impl RemoteTaskStore for StandaloneState {
+    type Error = RemoteTaskRepositoryError;
+
+    /// Delegates the §13.6 remote-task observation rows to the same
+    /// `SqliteStore` that owns every other aggregate, so the local scheduling
+    /// loop's Task monitor and the executor's recovery path always observe
+    /// the same persisted row.
+    fn save_remote_task<'a>(
+        &'a self,
+        task: &'a RemoteTask,
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        <SqliteStore as RemoteTaskStore>::save_remote_task(&self.store, task)
+    }
+
+    fn find_remote_task(
+        &self,
+        operation_id: OperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<RemoteTask>, Self::Error>> {
+        <SqliteStore as RemoteTaskStore>::find_remote_task(&self.store, operation_id)
+    }
+
+    fn list_remote_tasks_by_state(
+        &self,
+        state: RemoteTaskState,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<RemoteTask>, Self::Error>> {
+        <SqliteStore as RemoteTaskStore>::list_remote_tasks_by_state(&self.store, state)
     }
 }
 
@@ -710,11 +741,16 @@ async fn run_operation_scheduler(
     // secrets or transport details (design section 7.2).
     // Every boundary composes over `&StandaloneState` (the Arc itself
     // implements no boundary): the state implements the credential resolver
-    // and audit writer roles next to the store's persistence roles.
+    // and audit writer roles next to the store's persistence roles. The
+    // executor's store role is the state itself — it carries the
+    // `ArtifactRepository` role the §13.3 step-4 artifact pre-flight of an
+    // Update command needs, beside the operation, capability, and remote-task
+    // roles it delegates to `SqliteStore` — while the command executor keeps
+    // the raw `SqliteStore` for its endpoint lookups.
     let command_executor =
         RedfishCommandExecutor::new(gateway.as_ref().clone(), &state.store, state.as_ref());
     let executor = OperationExecutor::new(
-        &state.store,
+        state.as_ref(),
         &command_executor,
         state.as_ref(),
         SystemClock,

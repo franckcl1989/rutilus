@@ -378,10 +378,11 @@ mod tests {
     use std::error::Error;
 
     use rutilus_domain::{
-        BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
-        CreateSubscription, EndpointId, EventCommand, EventDestinationProtocol,
+        ArtifactId, BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode,
+        ChassisCommand, CreateSubscription, EndpointId, EventCommand, EventDestinationProtocol,
         EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType,
-        ResetType, SecureBootCommand, SetBootSourceOverride, SystemCommand, TargetId,
+        ResetType, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TargetId,
+        UpdateCommand,
     };
     use rutilus_entity::{operation, operation_target};
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -928,7 +929,7 @@ mod tests {
         let (directory, store) = store_with_directory().await?;
         let now = OffsetDateTime::now_utc();
         // A deferred family (design section 7.5: `Account`, `Bios`, `Storage`,
-        // `Update`, `Telemetry`, `Oem`) and a truncated document are both
+        // `Telemetry`, `Oem`) and a truncated document are both
         // written directly, bypassing the repository's serializer — exactly
         // what a future build's row would look like to this build. Rehydration
         // must refuse the whole aggregate, never guess at the command.
@@ -1069,6 +1070,10 @@ mod tests {
                     vec![EventType::Alert],
                 )?,
             )),
+            RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                ArtifactId::generate(),
+                None,
+            ))),
         ])
     }
 
