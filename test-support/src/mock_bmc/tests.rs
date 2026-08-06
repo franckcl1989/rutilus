@@ -26,7 +26,7 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -37,34 +37,43 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
     EndpointCapability::Bios,
     EndpointCapability::BootOptions,
     EndpointCapability::SecureBoot,
+    EndpointCapability::Power,
+    EndpointCapability::Thermal,
+    EndpointCapability::Sensors,
+    EndpointCapability::Controls,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
 /// must report as `NotAdvertised` instead of guessing paths.
 const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 4] = [
     EndpointCapability::EthernetInterfaces,
-    EndpointCapability::Power,
-    EndpointCapability::Thermal,
+    EndpointCapability::Assembly,
+    EndpointCapability::HostInterfaces,
     EndpointCapability::UpdateService,
 ];
 
 /// The gateway's request count for one complete `read_core_resources` flow:
 /// root, `SessionService`, Sessions collection, Session create, Systems
-/// collection + member, `Bios` singleton, `BootOptions` collection + member,
-/// `SecureBoot` singleton, Processors collection + CPU1 + CPU2, Memory
-/// collection + DIMM1, Chassis collection + member, Managers collection +
-/// member, `AccountService` + Accounts collection + member, Session delete.
-const RESOURCE_READ_REQUEST_COUNT: u64 = 23;
+/// collection with member, `Bios` singleton, `BootOptions` collection with
+/// member, `SecureBoot` singleton, Processors collection with CPU1 and CPU2,
+/// Memory collection with DIMM1, Chassis collection with member, `Power`
+/// singleton, `Thermal` singleton, `Sensors` collection with member,
+/// `Controls` collection with member, Managers collection with member,
+/// `AccountService` with Accounts collection and member, Session delete.
+const RESOURCE_READ_REQUEST_COUNT: u64 = 29;
 
 /// The gateway's request count for one complete `probe_core_capabilities`
 /// flow with this fixture: root, `SessionService`, Sessions collection,
 /// Session create, the three core collections with their members, the
 /// Processors and Memory member fetches, the `Bios`, `BootOptions`, and
 /// `SecureBoot` navigation (the `BootOptions` probe fetches only the
-/// collection document, matching the `nv-redfish` wrapper), the
-/// `AccountService` document, and the Session delete. Unadvertised features
-/// add no requests.
-const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 20;
+/// collection document, matching the `nv-redfish` wrapper), the `Power` and
+/// `Thermal` singletons plus the `Sensors` collection document (the wrapper
+/// keeps sensor members as lazy links), the `Controls` collection document
+/// and its member (the wrapper's `controls()` accessor eagerly fetches
+/// members), the `AccountService` document, and the Session delete.
+/// Unadvertised features add no requests.
+const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 25;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -245,8 +254,25 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
     assert_payload(&resources[4], "SecureBootMode", "UserMode")?;
     assert_payload(&resources[5], "TotalCores", "64")?;
     assert_payload(&resources[7], "CapacityMiB", "32768")?;
-    assert_payload(&resources[9], "FirmwareVersion", "1.2.3")?;
-    assert_payload(&resources[10], "RoleId", "Administrator")?;
+    assert_payload(&resources[13], "FirmwareVersion", "1.2.3")?;
+    assert_payload(&resources[14], "RoleId", "Administrator")?;
+    // The telemetry projections carry the readings and status exactly as
+    // published: `Power_v1` has no projectable details, `Thermal_v1` only
+    // status, and the sensor and control members their direct readings.
+    let power_payload: serde_json::Value = serde_json::from_str(resources[9].payload().as_str())?;
+    assert_eq!(power_payload["Name"], "Power");
+    assert!(power_payload.get("PowerConsumedWatts").is_none());
+    let thermal_payload: serde_json::Value =
+        serde_json::from_str(resources[10].payload().as_str())?;
+    assert_eq!(thermal_payload["Status"]["Health"], "OK");
+    let sensor_payload: serde_json::Value = serde_json::from_str(resources[11].payload().as_str())?;
+    assert_eq!(sensor_payload["Reading"], 27.5);
+    assert_eq!(sensor_payload["ReadingUnits"], "Cel");
+    assert_eq!(sensor_payload["ReadingType"], "Temperature");
+    let control_payload: serde_json::Value =
+        serde_json::from_str(resources[12].payload().as_str())?;
+    assert_eq!(control_payload["SetPoint"], 30.0);
+    assert_eq!(control_payload["ControlType"], "DutyCycle");
     for resource in &resources {
         assert!(
             resource.etag().is_some(),
@@ -295,6 +321,10 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
             ResourceFeature::Managers,
             ResourceFeature::Accounts,
         ]
@@ -315,6 +345,10 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             "/redfish/v1/Systems/1/Processors/CPU2",
             "/redfish/v1/Systems/1/Memory/DIMM1",
             "/redfish/v1/Chassis/1",
+            "/redfish/v1/Chassis/1/Power",
+            "/redfish/v1/Chassis/1/Thermal",
+            "/redfish/v1/Chassis/1/Sensors/InletTemp",
+            "/redfish/v1/Chassis/1/Controls/FanDuty",
             "/redfish/v1/Managers/1",
             "/redfish/v1/AccountService/Accounts/admin",
         ]

@@ -32,7 +32,7 @@ const MOCK_PASSWORD: &str = "password";
 /// only the inventory count and the core capability states are pinned here;
 /// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 14] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -43,6 +43,10 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
     EndpointCapability::Bios,
     EndpointCapability::BootOptions,
     EndpointCapability::SecureBoot,
+    EndpointCapability::Power,
+    EndpointCapability::Thermal,
+    EndpointCapability::Sensors,
+    EndpointCapability::Controls,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -172,9 +176,10 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
 
     // The mock serves one System with its configuration surface (Bios,
     // BootOptions, SecureBoot), two Processors and one Memory module, one
-    // Chassis, one Manager, and one Account; typed navigation must visit
-    // every family exactly in the documented read order.
-    assert_eq!(resources.len(), 11);
+    // Chassis with its Power and Thermal singletons plus one Sensor and one
+    // Control member, one Manager, and one Account; typed navigation must
+    // visit every family exactly in the documented read order.
+    assert_eq!(resources.len(), 15);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -191,11 +196,23 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
             ResourceFeature::Managers,
             ResourceFeature::Accounts,
         ]
     );
 
+    assert_family_payloads(&resources)?;
+    assert_resource_identifiers(&resources);
+    Ok(())
+}
+
+/// Asserts the typed field projections of every family, naming the resource
+/// when a projected value does not match the mock fixture.
+fn assert_family_payloads(resources: &[CoreResourceProjection]) -> Result<(), Box<dyn Error>> {
     assert_projection_payload(&resources[0], "Id", "RootService")?;
     assert_projection_payload(&resources[0], "RedfishVersion", "1.20.0")?;
     assert_projection_payload(&resources[1], "SystemType", "Physical")?;
@@ -210,52 +227,71 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
     assert_projection_payload(&resources[6], "ProcessorType", "CPU")?;
     assert_projection_payload(&resources[7], "MemoryDeviceType", "DDR4")?;
     assert_projection_payload(&resources[8], "ChassisType", "RackMount")?;
-    assert_projection_payload(&resources[9], "ManagerType", "BMC")?;
-    assert_projection_payload(&resources[10], "RoleId", "Administrator")?;
+    // The telemetry projections carry exactly the published surface: the
+    // `Power` singleton has no projectable details, `Thermal` carries only
+    // status, and the sensor and control members their direct readings.
+    assert_projection_payload(&resources[9], "Name", "Power")?;
+    assert!(
+        !resources[9]
+            .payload()
+            .as_str()
+            .contains("PowerConsumedWatts")
+    );
+    assert!(
+        resources[10]
+            .payload()
+            .as_str()
+            .contains("\"Health\":\"OK\"")
+    );
+    assert_projection_payload(&resources[11], "ReadingType", "Temperature")?;
+    assert_projection_payload(&resources[11], "ReadingUnits", "Cel")?;
+    assert!(
+        resources[11]
+            .payload()
+            .as_str()
+            .contains("\"Reading\":27.5")
+    );
+    assert_projection_payload(&resources[12], "ControlType", "DutyCycle")?;
+    assert!(
+        resources[12]
+            .payload()
+            .as_str()
+            .contains("\"SetPoint\":30.0")
+    );
+    assert_projection_payload(&resources[13], "ManagerType", "BMC")?;
+    assert_projection_payload(&resources[14], "RoleId", "Administrator")?;
+    Ok(())
+}
 
-    // Identifiers and ETags survive the projection intact; the mock signs
-    // every resource with its own ETag, so presence plus exact URI is the
-    // shape assertion for the typed identifiers.
-    assert_eq!(resources[0].odata_id().as_str(), "/redfish/v1/");
-    assert_eq!(resources[1].odata_id().as_str(), "/redfish/v1/Systems/1");
-    assert_eq!(
-        resources[2].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Bios"
-    );
-    assert_eq!(
-        resources[3].odata_id().as_str(),
-        "/redfish/v1/Systems/1/BootOptions/PXE-1"
-    );
-    assert_eq!(
-        resources[4].odata_id().as_str(),
-        "/redfish/v1/Systems/1/SecureBoot"
-    );
-    assert_eq!(
-        resources[5].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Processors/CPU1"
-    );
-    assert_eq!(
-        resources[6].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Processors/CPU2"
-    );
-    assert_eq!(
-        resources[7].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Memory/DIMM1"
-    );
-    assert_eq!(resources[8].odata_id().as_str(), "/redfish/v1/Chassis/1");
-    assert_eq!(resources[9].odata_id().as_str(), "/redfish/v1/Managers/1");
-    assert_eq!(
-        resources[10].odata_id().as_str(),
-        "/redfish/v1/AccountService/Accounts/admin"
-    );
-    for resource in &resources {
+/// Asserts the exact `@odata.id` of every projection and that the mock's
+/// `ETag` survived the read; presence plus exact URI is the shape assertion
+/// for the typed identifiers.
+fn assert_resource_identifiers(resources: &[CoreResourceProjection]) {
+    let odata_ids = [
+        "/redfish/v1/",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Bios",
+        "/redfish/v1/Systems/1/BootOptions/PXE-1",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Systems/1/Processors/CPU1",
+        "/redfish/v1/Systems/1/Processors/CPU2",
+        "/redfish/v1/Systems/1/Memory/DIMM1",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Power",
+        "/redfish/v1/Chassis/1/Thermal",
+        "/redfish/v1/Chassis/1/Sensors/InletTemp",
+        "/redfish/v1/Chassis/1/Controls/FanDuty",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService/Accounts/admin",
+    ];
+    for (resource, expected) in resources.iter().zip(odata_ids) {
+        assert_eq!(resource.odata_id().as_str(), expected);
         assert!(
             resource.etag().is_some(),
             "{} must carry its upstream ETag",
             resource.odata_id()
         );
     }
-    Ok(())
 }
 
 #[tokio::test]
@@ -297,6 +333,12 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/Systems/1/Memory/DIMM1"),
             ("GET", "/redfish/v1/Chassis"),
             ("GET", "/redfish/v1/Chassis/1"),
+            ("GET", "/redfish/v1/Chassis/1/Power"),
+            ("GET", "/redfish/v1/Chassis/1/Thermal"),
+            ("GET", "/redfish/v1/Chassis/1/Sensors"),
+            ("GET", "/redfish/v1/Chassis/1/Sensors/InletTemp"),
+            ("GET", "/redfish/v1/Chassis/1/Controls"),
+            ("GET", "/redfish/v1/Chassis/1/Controls/FanDuty"),
             ("GET", "/redfish/v1/Managers"),
             ("GET", "/redfish/v1/Managers/1"),
             ("GET", "/redfish/v1/AccountService"),

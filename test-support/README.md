@@ -60,11 +60,12 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
    accepts any user name) and run the enrollment.
 4. The resource page shows the typed core tree (ServiceRoot; System 1 with
    its Bios singleton, the PXE-1 boot option, Secure Boot, CPU1/CPU2, and
-   DIMM1; Chassis 1; Manager 1; the built-in `admin` account); the capability
-   page shows the 30-capability probe result:
+   DIMM1; Chassis 1 with its Power and Thermal singletons plus one Sensor
+   and one Control member; Manager 1; the built-in `admin` account); the
+   capability page shows the 30-capability probe result:
    SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
-   BootOptions/SecureBoot `Supported`, everything the fixture does not serve
-   honestly `NotAdvertised`.
+   BootOptions/SecureBoot/Power/Thermal/Sensors/Controls `Supported`,
+   everything the fixture does not serve honestly `NotAdvertised`.
 5. Refresh the endpoint: the same tree is re-read through a fresh transient
    Session, which the product deletes before returning.
 
@@ -92,7 +93,13 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/Systems/1/Memory` | Memory collection (DIMM1) |
 | GET | `/redfish/v1/Systems/1/Memory/DIMM1` | Memory module (DDR4, 32768 MiB) |
 | GET | `/redfish/v1/Chassis` | Chassis collection, one member |
-| GET | `/redfish/v1/Chassis/1` | RackMount chassis (no Power/Thermal links) |
+| GET | `/redfish/v1/Chassis/1` | RackMount chassis with Power/Thermal/Sensors/Controls links |
+| GET | `/redfish/v1/Chassis/1/Power` | Power singleton (PowerControl: 320 W consumed, 800 W capacity) |
+| GET | `/redfish/v1/Chassis/1/Thermal` | Thermal singleton (inlet 27.5 C, Status) |
+| GET | `/redfish/v1/Chassis/1/Sensors` | Sensor collection (InletTemp) |
+| GET | `/redfish/v1/Chassis/1/Sensors/InletTemp` | Temperature sensor (27.5 Cel, ReadingType Temperature) |
+| GET | `/redfish/v1/Chassis/1/Controls` | Control collection (FanDuty) |
+| GET | `/redfish/v1/Chassis/1/Controls/FanDuty` | Fan duty-cycle control (set point 30 Percent) |
 | GET | `/redfish/v1/Managers` | Manager collection, one member |
 | GET | `/redfish/v1/Managers/1` | BMC manager with FirmwareVersion (no EthernetInterfaces/HostInterfaces/NetworkProtocol/LogServices links) |
 | any other | | `404` with a Redfish-shaped `error` body (`Base.1.0.ResourceMissingAtURI`) |

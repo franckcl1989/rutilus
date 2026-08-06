@@ -77,6 +77,18 @@ pub(crate) fn dispatch(
         (HttpMethod::Get, "/redfish/v1/Systems/1/Memory/DIMM1") => json_ok(fixtures::MEMORY_DIMM1),
         (HttpMethod::Get, "/redfish/v1/Chassis") => json_ok(fixtures::CHASSIS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Chassis/1") => json_ok(fixtures::CHASSIS),
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Power") => json_ok(fixtures::POWER),
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Thermal") => json_ok(fixtures::THERMAL),
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Sensors") => json_ok(fixtures::SENSORS_COLLECTION),
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Sensors/InletTemp") => {
+            json_ok(fixtures::SENSOR_INLET_TEMP)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Controls") => {
+            json_ok(fixtures::CONTROLS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Controls/FanDuty") => {
+            json_ok(fixtures::CONTROL_FAN_DUTY)
+        }
         (HttpMethod::Get, "/redfish/v1/Managers") => json_ok(fixtures::MANAGERS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::MANAGER),
         _ => not_found(),

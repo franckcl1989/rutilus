@@ -5,7 +5,8 @@
 //! field sets, same enum spellings), so the mock cannot drift from what the
 //! product actually parses. The tree is deliberately small: one System with
 //! two Processors, one Memory module, one Bios singleton, one Boot Option,
-//! and one Secure Boot singleton, one Chassis, one Manager, the
+//! and one Secure Boot singleton, one Chassis with one Power and one Thermal
+//! singleton plus one Sensor and one Control member, one Manager, the
 //! `SessionService`, and one `AccountService` with a single account. Links
 //! the tree does not serve are omitted entirely, so the capability probe
 //! reports `NotAdvertised` for them instead of guessing paths.
@@ -258,10 +259,13 @@ pub(crate) const CHASSIS_COLLECTION: &str = r##"{
     "Members":[{"@odata.id":"/redfish/v1/Chassis/1"}]
 }"##;
 
-/// `GET /redfish/v1/Chassis/1` -- the rack chassis.
-///
-/// No member-scoped links (Power, Thermal, and friends) are advertised, so
-/// the capability probe reports those features as `NotAdvertised`.
+/// `GET /redfish/v1/Chassis/1` -- the rack chassis, advertising the 0.2
+/// telemetry families through typed navigation links. The `Power` and
+/// `Thermal` singletons plus the `Sensors` and `Controls` collections are
+/// served so the capability probe reports them `Supported` and the typed
+/// resource read carries their readings; links the tree does not serve
+/// (`NetworkAdapters`, `Assembly`, `PowerSubsystem`, ...) stay absent so the
+/// probe reports those features as `NotAdvertised`.
 pub(crate) const CHASSIS: &str = r#"{
     "@odata.id":"/redfish/v1/Chassis/1",
     "@odata.etag":"W/\"chassis-1\"",
@@ -275,8 +279,119 @@ pub(crate) const CHASSIS: &str = r#"{
     "SKU":"CHA-SKU-1",
     "AssetTag":"RACK-01",
     "PowerState":"On",
-    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+    "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+    "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"}
 }"#;
+
+/// `GET /redfish/v1/Chassis/1/Power` -- the chassis power control singleton.
+///
+/// The single `PowerControl` entry carries realistic consumed and capacity
+/// readings so the document decodes like a real BMC; the typed `power`
+/// family deliberately projects no details (the nested reading arrays stay
+/// out of the strictly projectable field set), matching the member shape
+/// `rutilus-infra-redfish` decodes in its own tests.
+pub(crate) const POWER: &str = r##"{
+    "@odata.type":"#Power.v1_17_0.Power",
+    "@odata.id":"/redfish/v1/Chassis/1/Power",
+    "@odata.etag":"W/\"power-1\"",
+    "Id":"Power",
+    "Name":"Power",
+    "Description":"Chassis power control",
+    "PowerControl":[
+        {
+            "@odata.id":"/redfish/v1/Chassis/1/Power#/PowerControl/0",
+            "MemberId":"0",
+            "Name":"Chassis Power Control",
+            "PowerConsumedWatts":320.0,
+            "PowerRequestedWatts":360.0,
+            "PowerCapacityWatts":800.0,
+            "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+        }
+    ]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Thermal` -- the chassis thermal singleton.
+///
+/// The single `Temperatures` entry carries a realistic inlet temperature
+/// reading so the document decodes like a real BMC; the typed `thermal`
+/// family projects only the resource-level `Status` (the nested temperature
+/// array stays out of the strictly projectable field set), matching the
+/// member shape `rutilus-infra-redfish` decodes in its own tests.
+pub(crate) const THERMAL: &str = r##"{
+    "@odata.type":"#Thermal.v1_7_2.Thermal",
+    "@odata.id":"/redfish/v1/Chassis/1/Thermal",
+    "@odata.etag":"W/\"thermal-1\"",
+    "Id":"Thermal",
+    "Name":"Thermal",
+    "Description":"Chassis temperature and fan monitoring",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Temperatures":[
+        {
+            "@odata.id":"/redfish/v1/Chassis/1/Thermal#/Temperatures/0",
+            "MemberId":"0",
+            "Name":"Chassis Inlet Temperature",
+            "ReadingCelsius":27.5,
+            "UpperThresholdCritical":45.0,
+            "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+        }
+    ]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Sensors` -- the sensor collection with the
+/// single inlet-temperature sensor member.
+pub(crate) const SENSORS_COLLECTION: &str = r##"{
+    "@odata.type":"#SensorCollection.SensorCollection",
+    "@odata.id":"/redfish/v1/Chassis/1/Sensors",
+    "Name":"Sensor Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Chassis/1/Sensors/InletTemp"}]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Sensors/InletTemp` -- the inlet temperature
+/// sensor with every optional contract field populated, matching the full
+/// member shape `rutilus-infra-redfish` projects in its own tests.
+pub(crate) const SENSOR_INLET_TEMP: &str = r##"{
+    "@odata.type":"#Sensor.v1_9_0.Sensor",
+    "@odata.id":"/redfish/v1/Chassis/1/Sensors/InletTemp",
+    "@odata.etag":"W/\"sensor-inlet-1\"",
+    "Id":"InletTemp",
+    "Name":"Chassis Inlet Temperature",
+    "Description":"Temperature of air entering the chassis",
+    "ReadingType":"Temperature",
+    "Reading":27.5,
+    "ReadingUnits":"Cel",
+    "PhysicalContext":"Intake",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Controls` -- the control collection with the
+/// single fan-duty-cycle control member.
+pub(crate) const CONTROLS_COLLECTION: &str = r##"{
+    "@odata.type":"#ControlCollection.ControlCollection",
+    "@odata.id":"/redfish/v1/Chassis/1/Controls",
+    "Name":"Control Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Chassis/1/Controls/FanDuty"}]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Controls/FanDuty` -- the fan duty-cycle control
+/// with every optional contract field populated, matching the full member
+/// shape `rutilus-infra-redfish` projects in its own tests.
+pub(crate) const CONTROL_FAN_DUTY: &str = r##"{
+    "@odata.type":"#Control.v1_3_0.Control",
+    "@odata.id":"/redfish/v1/Chassis/1/Controls/FanDuty",
+    "@odata.etag":"W/\"control-fan-1\"",
+    "Id":"FanDuty",
+    "Name":"Chassis Fan Duty",
+    "Description":"Fan duty-cycle control for the chassis fans",
+    "ControlType":"DutyCycle",
+    "SetPointType":"Single",
+    "ControlMode":"Automatic",
+    "SetPoint":30.0,
+    "SetPointUnits":"Percent",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"##;
 
 /// `GET /redfish/v1/Managers` -- the manager collection.
 pub(crate) const MANAGERS_COLLECTION: &str = r##"{
