@@ -55,6 +55,9 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "managers",
                         "processors",
                         "memory",
+                        "storages",
+                        "network-adapters",
+                        "ethernet-interfaces",
                     ]),
                 ))
                 .to_owned(),
