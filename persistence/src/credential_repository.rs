@@ -8,7 +8,7 @@ use rutilus_security::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, Set, SqlErr, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -174,6 +174,40 @@ impl SqliteStore {
         credential_id: CredentialId,
     ) -> Result<Option<StoredCredential>, CredentialRepositoryError> {
         load_active_credential(&self.database, credential_id).await
+    }
+
+    /// Lists secret-free credential metadata in creation order, bounded to at
+    /// most `limit` credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialRepositoryError::InvalidLimit`] for a zero limit,
+    /// [`CredentialRepositoryError::Database`] when the query fails, or
+    /// [`CredentialRepositoryError::Corrupt`] when persisted metadata violates
+    /// a domain invariant.
+    pub async fn list_credentials(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<Credential>, CredentialRepositoryError> {
+        if limit == 0 {
+            return Err(CredentialRepositoryError::InvalidLimit { limit });
+        }
+        let models = credential::Entity::find()
+            .order_by_asc(credential::Column::CreatedAt)
+            .limit(limit)
+            .all(&self.database)
+            .await
+            .map_err(CredentialRepositoryError::Database)?;
+        let mut credentials = Vec::with_capacity(models.len());
+        for model in &models {
+            credentials.push(map_credential_model(model).map_err(|source| {
+                CredentialRepositoryError::Corrupt {
+                    credential_id: CredentialId::from_uuid(model.id),
+                    source,
+                }
+            })?);
+        }
+        Ok(credentials)
     }
 
     /// Appends an immutable encrypted version and atomically makes it active.
@@ -351,6 +385,8 @@ pub enum CredentialRepositoryError {
     AlreadyExists,
     #[error("credential version identity already exists")]
     VersionAlreadyExists,
+    #[error("credential inventory limit must be positive, not {limit}")]
+    InvalidLimit { limit: u64 },
     #[error("credential {credential_id} was not found")]
     NotFound { credential_id: CredentialId },
     #[error("credential timeline is invalid: {0}")]
@@ -560,6 +596,51 @@ mod tests {
             })
         ));
 
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_secret_free_credentials_in_creation_order_within_a_positive_limit()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let key = MasterKey::from_boxed_bytes(Box::new([0x45; 32]));
+        let secret: SecretString = String::from("list secret").into();
+        for (name, username) in [
+            ("Alpha", "administrator"),
+            ("Beta", "operator"),
+            ("Gamma", "auditor"),
+        ] {
+            store
+                .create_credential(NewCredential::new(
+                    CredentialName::parse(name)?,
+                    CredentialUsername::parse(username)?,
+                    encrypt_credential(
+                        &key,
+                        CredentialId::generate(),
+                        CredentialVersionId::generate(),
+                        &secret,
+                    )?,
+                ))
+                .await?;
+        }
+
+        let all = store.list_credentials(10).await?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].name().as_str(), "Alpha");
+        assert_eq!(all[1].name().as_str(), "Beta");
+        assert_eq!(all[2].name().as_str(), "Gamma");
+
+        let bounded = store.list_credentials(2).await?;
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].name().as_str(), "Alpha");
+        assert_eq!(bounded[1].name().as_str(), "Beta");
+
+        assert!(matches!(
+            store.list_credentials(0).await,
+            Err(CredentialRepositoryError::InvalidLimit { limit: 0 })
+        ));
         store.close().await?;
         Ok(())
     }

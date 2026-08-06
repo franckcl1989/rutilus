@@ -1,18 +1,21 @@
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryItemError, EndpointInventoryRepository, EndpointRefreshRepository,
-    ResourceObservation,
+    AuditEventWriter, BoundaryFuture, CredentialInventoryRepository, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
+    EndpointRefreshRepository, ResourceObservation,
 };
 use rutilus_domain::{
-    AuditEvent, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
+    AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    AuditRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
+    AuditRepositoryError, CredentialRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
     ResourceSnapshotRepositoryError, SqliteStore,
 };
+
+/// Defensive upper bound for one credential inventory projection.
+const CREDENTIAL_INVENTORY_LIMIT: u64 = 1000;
 
 impl AuditEventWriter for SqliteStore {
     type Error = AuditRepositoryError;
@@ -22,6 +25,16 @@ impl AuditEventWriter for SqliteStore {
         event: &'a AuditEvent,
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move { SqliteStore::append_audit_event(self, event).await })
+    }
+}
+
+impl CredentialInventoryRepository for SqliteStore {
+    type Error = CredentialRepositoryError;
+
+    fn list_credentials(&self) -> BoundaryFuture<'_, Result<Vec<Credential>, Self::Error>> {
+        Box::pin(
+            async move { SqliteStore::list_credentials(self, CREDENTIAL_INVENTORY_LIMIT).await },
+        )
     }
 }
 
@@ -142,8 +155,9 @@ mod tests {
     use std::error::Error;
 
     use rutilus_application::{
-        AuditEventWriter, DiscoveredEndpointRepository, EndpointInventoryQuery,
-        EndpointInventoryRepository, EndpointRefreshRepository, ResourceObservation,
+        AuditEventWriter, CredentialInventoryQuery, CredentialInventoryRepository,
+        DiscoveredEndpointRepository, EndpointInventoryQuery, EndpointInventoryRepository,
+        EndpointRefreshRepository, ResourceObservation,
     };
     use rutilus_domain::{
         AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
@@ -351,5 +365,62 @@ mod tests {
             created_at,
         )?;
         Ok((endpoint, observed_at))
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_credential_inventory_boundary() -> Result<(), Box<dyn Error>>
+    {
+        fn assert_repository<Repository: CredentialInventoryRepository>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        assert!(
+            CredentialInventoryQuery::new(&store)
+                .execute()
+                .await?
+                .is_empty()
+        );
+
+        let key = MasterKey::from_boxed_bytes(Box::new([0x66; 32]));
+        let secret: SecretString = String::from("inventory secret").into();
+        store
+            .create_credential(NewCredential::new(
+                CredentialName::parse("Zulu inventory")?,
+                CredentialUsername::parse("operator")?,
+                encrypt_credential(
+                    &key,
+                    CredentialId::generate(),
+                    CredentialVersionId::generate(),
+                    &secret,
+                )?,
+            ))
+            .await?;
+        store
+            .create_credential(NewCredential::new(
+                CredentialName::parse("Alpha inventory")?,
+                CredentialUsername::parse("administrator")?,
+                encrypt_credential(
+                    &key,
+                    CredentialId::generate(),
+                    CredentialVersionId::generate(),
+                    &secret,
+                )?,
+            ))
+            .await?;
+
+        let credentials = CredentialInventoryQuery::new(&store).execute().await?;
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials[0].name().as_str(), "Alpha inventory");
+        assert_eq!(credentials[1].name().as_str(), "Zulu inventory");
+        assert_eq!(
+            credentials[1].username().as_str(),
+            "operator",
+            "deterministic inventory order must pair name and username"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
     }
 }
