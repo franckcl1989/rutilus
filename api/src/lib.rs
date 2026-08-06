@@ -821,6 +821,46 @@ pub enum CoreResourceDetailsResponse {
         model: Option<String>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `storages` family member projected from the typed Redfish
+    /// storage schema (`Storage_v1`, nv-redfish-schema 0.13).
+    ///
+    /// `controller_count` and `drive_count` are derived from the
+    /// `StorageControllers` and `Drives` collection navigations, which the
+    /// typed schema always provides, and stay numeric so the console renders
+    /// counts without re-parsing text. A `storage_type` field was considered
+    /// but does not exist in `Storage_v1`, so it stays out of this strictly
+    /// projectable field set.
+    Storage {
+        controller_count: Option<u64>,
+        drive_count: Option<u64>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `network-adapters` family member projected from the typed
+    /// Redfish network-adapter schema (`NetworkAdapter_v1`, nv-redfish-schema
+    /// 0.13).
+    ///
+    /// Fields are the direct `Manufacturer`, `Model`, and `Status` properties
+    /// of the adapter resource. A `firmware_version` field was considered but
+    /// exists only as `Controllers[].FirmwarePackageVersion`, so it stays out
+    /// of this strictly projectable field set.
+    NetworkAdapter {
+        manufacturer: Option<String>,
+        model: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `ethernet-interfaces` family member projected from the typed
+    /// Redfish ethernet-interface schema (`EthernetInterface_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `MACAddress`, `SpeedMbps`, `InterfaceEnabled`,
+    /// and `Status` properties; `speed_mbps` stays numeric so the console
+    /// renders the link speed without re-parsing text.
+    EthernetInterface {
+        mac_address: Option<String>,
+        speed_mbps: Option<u64>,
+        interface_enabled: Option<bool>,
+        status: Option<ResourceStatusResponse>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -2196,6 +2236,230 @@ mod tests {
                 manufacturer: Some("Vendor B".to_owned()),
                 model: Some("MEM-32G".to_owned()),
                 status: None,
+            },
+        )
+    }
+
+    #[test]
+    fn core_resource_contract_carries_storage_wire_values() -> Result<(), Box<dyn Error>> {
+        let storage = storage_resource();
+
+        assert_eq!(
+            serde_json::to_value(&storage)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d0",
+                    "odata_id": "/redfish/v1/Systems/1/Storage/SATA-1",
+                    "odata_type": "#Storage.v1_21_0.Storage",
+                    "etag": "W/\"storage-1\""
+                },
+                "common": {
+                    "id": "SATA-1",
+                    "name": "Storage Subsystem One",
+                    "description": "SATA storage subsystem"
+                },
+                "resource": {
+                    "resource_type": "storage",
+                    "details": {
+                        "controller_count": 2,
+                        "drive_count": 6,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&storage)?)?,
+            storage
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "storage",
+                "details": {
+                    "controller_count": null,
+                    "drive_count": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_network_adapter_wire_values() -> Result<(), Box<dyn Error>> {
+        let network_adapter = network_adapter_resource();
+
+        assert_eq!(
+            serde_json::to_value(&network_adapter)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d1",
+                    "odata_id": "/redfish/v1/Chassis/1/NetworkAdapters/1",
+                    "odata_type": "#NetworkAdapter.v1_14_0.NetworkAdapter",
+                    "etag": null
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Network Adapter One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "network_adapter",
+                    "details": {
+                        "manufacturer": "Vendor A",
+                        "model": "NA-25G-2P",
+                        "status": null
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &network_adapter
+            )?)?,
+            network_adapter
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "network_adapter",
+                "details": {
+                    "manufacturer": null,
+                    "model": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_ethernet_interface_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let ethernet_interface = ethernet_interface_resource();
+
+        assert_eq!(
+            serde_json::to_value(&ethernet_interface)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789d2",
+                    "odata_id": "/redfish/v1/Managers/1/EthernetInterfaces/1",
+                    "odata_type": "#EthernetInterface.v1_12_4.EthernetInterface",
+                    "etag": "W/\"eth-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Ethernet Interface One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "ethernet_interface",
+                    "details": {
+                        "mac_address": "52:54:00:12:34:56",
+                        "speed_mbps": 10000,
+                        "interface_enabled": true,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &ethernet_interface
+            )?)?,
+            ethernet_interface
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "ethernet_interface",
+                "details": {
+                    "mac_address": null,
+                    "speed_mbps": null,
+                    "interface_enabled": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn storage_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d0"),
+                "/redfish/v1/Systems/1/Storage/SATA-1".to_owned(),
+                Some("#Storage.v1_21_0.Storage".to_owned()),
+                Some("W/\"storage-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "SATA-1".to_owned(),
+                "Storage Subsystem One".to_owned(),
+                Some("SATA storage subsystem".to_owned()),
+            ),
+            CoreResourceDetailsResponse::Storage {
+                controller_count: Some(2),
+                drive_count: Some(6),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn network_adapter_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d1"),
+                "/redfish/v1/Chassis/1/NetworkAdapters/1".to_owned(),
+                Some("#NetworkAdapter.v1_14_0.NetworkAdapter".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new("1".to_owned(), "Network Adapter One".to_owned(), None),
+            CoreResourceDetailsResponse::NetworkAdapter {
+                manufacturer: Some("Vendor A".to_owned()),
+                model: Some("NA-25G-2P".to_owned()),
+                status: None,
+            },
+        )
+    }
+
+    fn ethernet_interface_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789d2"),
+                "/redfish/v1/Managers/1/EthernetInterfaces/1".to_owned(),
+                Some("#EthernetInterface.v1_12_4.EthernetInterface".to_owned()),
+                Some("W/\"eth-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Ethernet Interface One".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::EthernetInterface {
+                mac_address: Some("52:54:00:12:34:56".to_owned()),
+                speed_mbps: Some(10000),
+                interface_enabled: Some(true),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
             },
         )
     }
