@@ -14,7 +14,11 @@ const MAX_TYPED_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// Every variant's `as_str()` code is the §2.1 feature name and equals the
 /// matching [`EndpointCapability`] product code, so snapshot and ledger
-/// projections never translate the same wire string twice.
+/// projections never translate the same wire string twice. The one deliberate
+/// exception is [`Self::SoftwareInventory`]: it is the read surface under the
+/// §2.1 `update-service` feature, so its `software-inventory` family code is
+/// narrower than the `update-service` capability code, which also covers the
+/// update operations of the same family (see the ledger-consistency test).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResourceFeature {
     ServiceRoot,
@@ -85,6 +89,21 @@ pub enum ResourceFeature {
     /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
     HostInterfaces,
+    /// The §2.1 `pcie-devices` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    PcieDevices,
+    /// The §2.1 `assembly` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code
+    /// so both inventories address the same wire surface.
+    Assembly,
+    /// The §2.1 `update-service` read surface, added as a typed resource
+    /// family in the 0.2 snapshot. The family code is `software-inventory`
+    /// (not `update-service`, which stays the capability code): one
+    /// `update-service` capability covers both the `SoftwareInventory` read
+    /// surface and the update operations, so this variant addresses only the
+    /// read surface and must not be mistaken for a capability code.
+    SoftwareInventory,
 }
 
 impl ResourceFeature {
@@ -112,6 +131,9 @@ impl ResourceFeature {
             Self::LogServices => "log-services",
             Self::ManagerNetworkProtocol => "manager-network-protocol",
             Self::HostInterfaces => "host-interfaces",
+            Self::PcieDevices => "pcie-devices",
+            Self::Assembly => "assembly",
+            Self::SoftwareInventory => "software-inventory",
         }
     }
 }
@@ -147,6 +169,9 @@ impl FromStr for ResourceFeature {
             "log-services" => Ok(Self::LogServices),
             "manager-network-protocol" => Ok(Self::ManagerNetworkProtocol),
             "host-interfaces" => Ok(Self::HostInterfaces),
+            "pcie-devices" => Ok(Self::PcieDevices),
+            "assembly" => Ok(Self::Assembly),
+            "software-inventory" => Ok(Self::SoftwareInventory),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -675,7 +700,7 @@ fn write_exact_text_error(
 
 #[cfg(test)]
 mod tests {
-    use crate::EndpointCapability;
+    use crate::{EndpointCapability, EndpointCapabilityParseError};
 
     use super::*;
 
@@ -702,6 +727,9 @@ mod tests {
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Assembly,
+            ResourceFeature::SoftwareInventory,
         ];
 
         for feature in features {
@@ -764,6 +792,14 @@ mod tests {
                 ResourceFeature::HostInterfaces,
                 EndpointCapability::HostInterfaces,
             ),
+            // The 0.2 read-surface families: `pcie-devices` and `assembly`
+            // reuse the §2.1 codes the ledger already persists, so the
+            // feature and capability inventories cannot drift on the wire.
+            (
+                ResourceFeature::PcieDevices,
+                EndpointCapability::PcieDevices,
+            ),
+            (ResourceFeature::Assembly, EndpointCapability::Assembly),
         ];
         for (feature, capability) in families {
             assert_eq!(feature.as_str(), capability.as_str());
@@ -773,6 +809,34 @@ mod tests {
                 Ok(capability)
             );
         }
+        // `software-inventory` is the resource family under the §2.1
+        // `update-service` feature and deliberately has no capability code of
+        // its own: the one `update-service` capability covers both the
+        // SoftwareInventory read surface and the update operations. The
+        // mapping is asserted explicitly (and the family code must not parse
+        // as a capability) so the two inventories cannot silently drift into
+        // aliasing each other.
+        assert_eq!(
+            ResourceFeature::SoftwareInventory.as_str(),
+            "software-inventory"
+        );
+        assert_eq!(EndpointCapability::UpdateService.as_str(), "update-service");
+        assert_eq!(
+            ResourceFeature::SoftwareInventory
+                .as_str()
+                .parse::<ResourceFeature>(),
+            Ok(ResourceFeature::SoftwareInventory)
+        );
+        assert_eq!(
+            "update-service".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::UpdateService)
+        );
+        assert_eq!(
+            ResourceFeature::SoftwareInventory
+                .as_str()
+                .parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
     }
 
     #[test]
@@ -844,6 +908,21 @@ mod tests {
             "hostinterface",
             "HostInterfaces",
             "host-interfaces-",
+            "pcie-device",
+            "pcie-devices/",
+            "pcie",
+            "PcieDevices",
+            "PCIeDevice",
+            "assemblies",
+            "assembly/",
+            "Assembly",
+            "assembly-data",
+            "software-inventories",
+            "software-inventory/",
+            "software-inventory-",
+            "SoftwareInventory",
+            "software",
+            "update-service",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
