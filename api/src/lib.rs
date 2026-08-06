@@ -896,6 +896,434 @@ impl EndpointResourceInventoryResponse {
     }
 }
 
+/// Binds a predeclared trust policy to the address that must satisfy it. The
+/// server re-observes TLS without credentials and verifies this exact
+/// expectation before any credential is selected or transmitted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmEndpointTrustRequest {
+    address: String,
+    trust: EndpointTrustExpectationRequest,
+}
+
+impl ConfirmEndpointTrustRequest {
+    #[must_use]
+    pub const fn new(address: String, trust: EndpointTrustExpectationRequest) -> Self {
+        Self { address, trust }
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn trust(&self) -> &EndpointTrustExpectationRequest {
+        &self.trust
+    }
+}
+
+/// A confirmed, address-bound TLS decision established without credentials.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedEndpointResponse {
+    address: String,
+    tls_trust_mode: TlsTrustModeResponse,
+    #[serde(with = "time::serde::rfc3339")]
+    trusted_at: OffsetDateTime,
+}
+
+impl TrustedEndpointResponse {
+    #[must_use]
+    pub const fn new(
+        address: String,
+        tls_trust_mode: TlsTrustModeResponse,
+        trusted_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            address,
+            tls_trust_mode,
+            trusted_at,
+        }
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn tls_trust_mode(&self) -> TlsTrustModeResponse {
+        self.tls_trust_mode
+    }
+
+    #[must_use]
+    pub const fn trusted_at(&self) -> OffsetDateTime {
+        self.trusted_at
+    }
+}
+
+/// A declared trust policy did not match the credential-free TLS observation.
+///
+/// Fingerprints are public certificate material, never secrets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustRejectedResponse {
+    expected_fingerprint_sha256: Option<String>,
+    observed_fingerprint_sha256: String,
+}
+
+impl TrustRejectedResponse {
+    #[must_use]
+    pub const fn new(
+        expected_fingerprint_sha256: Option<String>,
+        observed_fingerprint_sha256: String,
+    ) -> Self {
+        Self {
+            expected_fingerprint_sha256,
+            observed_fingerprint_sha256,
+        }
+    }
+
+    #[must_use]
+    pub fn expected_fingerprint_sha256(&self) -> Option<&str> {
+        self.expected_fingerprint_sha256.as_deref()
+    }
+
+    #[must_use]
+    pub fn observed_fingerprint_sha256(&self) -> &str {
+        &self.observed_fingerprint_sha256
+    }
+}
+
+/// A secret-free human-readable operation failure for the local console.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorResponse {
+    message: String,
+}
+
+impl ErrorResponse {
+    #[must_use]
+    pub const fn new(message: String) -> Self {
+        Self { message }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// One endpoint CSV import document submitted as a JSON-encoded string.
+///
+/// Credential material is deliberately not representable in the interchange
+/// format itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCsvImportRequest {
+    csv: String,
+}
+
+impl EndpointCsvImportRequest {
+    #[must_use]
+    pub const fn new(csv: String) -> Self {
+        Self { csv }
+    }
+
+    #[must_use]
+    pub fn csv(&self) -> &str {
+        &self.csv
+    }
+}
+
+/// The independent terminal status of one imported endpoint row.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointCsvImportRowStatusResponse {
+    Enrolled,
+    TlsProbeFailed,
+    TrustRejected,
+    EnrollmentFailed,
+}
+
+/// One independent, secret-free result inside an endpoint CSV import.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCsvImportRowResponse {
+    record_number: u64,
+    address: String,
+    status: EndpointCsvImportRowStatusResponse,
+    endpoint_id: Option<Uuid>,
+    message: Option<String>,
+}
+
+impl EndpointCsvImportRowResponse {
+    #[must_use]
+    pub const fn new(
+        record_number: u64,
+        address: String,
+        status: EndpointCsvImportRowStatusResponse,
+        endpoint_id: Option<Uuid>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            record_number,
+            address,
+            status,
+            endpoint_id,
+            message,
+        }
+    }
+
+    #[must_use]
+    pub const fn record_number(&self) -> u64 {
+        self.record_number
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> EndpointCsvImportRowStatusResponse {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Option<Uuid> {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+/// Per-row results for one endpoint CSV import, complete or partial.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCsvImportResponse {
+    total_rows: u64,
+    succeeded_count: u64,
+    failed_count: u64,
+    rows: Vec<EndpointCsvImportRowResponse>,
+}
+
+impl EndpointCsvImportResponse {
+    #[must_use]
+    pub const fn new(
+        total_rows: u64,
+        succeeded_count: u64,
+        failed_count: u64,
+        rows: Vec<EndpointCsvImportRowResponse>,
+    ) -> Self {
+        Self {
+            total_rows,
+            succeeded_count,
+            failed_count,
+            rows,
+        }
+    }
+
+    #[must_use]
+    pub const fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    #[must_use]
+    pub const fn succeeded_count(&self) -> u64 {
+        self.succeeded_count
+    }
+
+    #[must_use]
+    pub const fn failed_count(&self) -> u64 {
+        self.failed_count
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &[EndpointCsvImportRowResponse] {
+        &self.rows
+    }
+}
+
+/// The stable, secret-free target of one audit event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditTargetResponse {
+    kind: String,
+    identifier: Option<String>,
+}
+
+impl AuditTargetResponse {
+    #[must_use]
+    pub const fn new(kind: String, identifier: Option<String>) -> Self {
+        Self { kind, identifier }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[must_use]
+    pub fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
+}
+
+/// The stable, secret-free lifecycle outcome of one audit event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditOutcomeResponse {
+    kind: String,
+    progress: Option<String>,
+    failure: Option<String>,
+    verification: Option<String>,
+}
+
+impl AuditOutcomeResponse {
+    #[must_use]
+    pub const fn new(
+        kind: String,
+        progress: Option<String>,
+        failure: Option<String>,
+        verification: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            progress,
+            failure,
+            verification,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> Option<&str> {
+        self.progress.as_deref()
+    }
+
+    #[must_use]
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    #[must_use]
+    pub fn verification(&self) -> Option<&str> {
+        self.verification.as_deref()
+    }
+}
+
+/// One immutable, secret-free audit event for the local console.
+///
+/// All values are stable product codes or validated identity data; no
+/// credential, token, or certificate material can be represented.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditEventResponse {
+    #[serde(with = "time::serde::rfc3339")]
+    occurred_at: OffsetDateTime,
+    actor: String,
+    action: String,
+    target: AuditTargetResponse,
+    outcome: AuditOutcomeResponse,
+    sequence: u32,
+    operation_id: Uuid,
+    message: String,
+}
+
+impl AuditEventResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        occurred_at: OffsetDateTime,
+        actor: String,
+        action: String,
+        target: AuditTargetResponse,
+        outcome: AuditOutcomeResponse,
+        sequence: u32,
+        operation_id: Uuid,
+        message: String,
+    ) -> Self {
+        Self {
+            occurred_at,
+            actor,
+            action,
+            target,
+            outcome,
+            sequence,
+            operation_id,
+            message,
+        }
+    }
+
+    #[must_use]
+    pub const fn occurred_at(&self) -> OffsetDateTime {
+        self.occurred_at
+    }
+
+    #[must_use]
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    #[must_use]
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &AuditTargetResponse {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &AuditOutcomeResponse {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u32 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Stable envelope for a bounded, newest-first audit query.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditQueryResponse {
+    events: Vec<AuditEventResponse>,
+}
+
+impl AuditQueryResponse {
+    #[must_use]
+    pub const fn new(events: Vec<AuditEventResponse>) -> Self {
+        Self { events }
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[AuditEventResponse] {
+        &self.events
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
@@ -1473,5 +1901,221 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn trust_confirmation_contract_binds_policy_to_address() -> Result<(), Box<dyn Error>> {
+        let request = ConfirmEndpointTrustRequest::new(
+            "https://bmc.example.test/".to_owned(),
+            EndpointTrustExpectationRequest::pinned_certificate(
+                "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                    .to_owned(),
+            ),
+        );
+        let trusted_at = OffsetDateTime::parse("2026-08-05T10:15:00Z", &Rfc3339)?;
+        let confirmed = TrustedEndpointResponse::new(
+            "https://bmc.example.test/".to_owned(),
+            TlsTrustModeResponse::PinnedCertificate,
+            trusted_at,
+        );
+        let rejected = TrustRejectedResponse::new(
+            Some(
+                "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                    .to_owned(),
+            ),
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "address": "https://bmc.example.test/",
+                "trust": {
+                    "mode": "pinned_certificate",
+                    "fingerprint_sha256": "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&confirmed)?,
+            json!({
+                "address": "https://bmc.example.test/",
+                "tls_trust_mode": "pinned_certificate",
+                "trusted_at": "2026-08-05T10:15:00Z"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&rejected)?,
+            json!({
+                "expected_fingerprint_sha256": "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00",
+                "observed_fingerprint_sha256": "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+            })
+        );
+        assert_eq!(request.address(), "https://bmc.example.test/");
+        assert_eq!(
+            confirmed.tls_trust_mode(),
+            TlsTrustModeResponse::PinnedCertificate
+        );
+        assert_eq!(confirmed.trusted_at(), trusted_at);
+        assert_eq!(
+            rejected.expected_fingerprint_sha256(),
+            Some(
+                "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+            )
+        );
+        assert!(
+            serde_json::from_value::<ConfirmEndpointTrustRequest>(json!({
+                "address": "https://bmc.example.test/",
+                "trust": { "mode": "system_ca" },
+                "extra": true
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn csv_import_contract_returns_independent_row_results() -> Result<(), Box<dyn Error>> {
+        let request = EndpointCsvImportRequest::new(
+            "display_name,address,credential_id,tls_sha256\nRack A,https://bmc.example.test,01989abc-def0-7abc-8def-0123456789cf,\n"
+                .to_owned(),
+        );
+        let endpoint_id = uuid!("01989abc-def0-7abc-8def-0123456789d5");
+        let enrolled = EndpointCsvImportRowResponse::new(
+            2,
+            "https://bmc.example.test/".to_owned(),
+            EndpointCsvImportRowStatusResponse::Enrolled,
+            Some(endpoint_id),
+            None,
+        );
+        let rejected = EndpointCsvImportRowResponse::new(
+            3,
+            "https://other.example.test/".to_owned(),
+            EndpointCsvImportRowStatusResponse::TrustRejected,
+            None,
+            Some("observed TLS certificate AA:BB does not match expected Pin 11:22".to_owned()),
+        );
+        let response = EndpointCsvImportResponse::new(2, 1, 1, vec![enrolled, rejected]);
+
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({ "csv": request.csv() })
+        );
+        assert_eq!(response.total_rows(), 2);
+        assert_eq!(response.succeeded_count(), 1);
+        assert_eq!(response.failed_count(), 1);
+        assert_eq!(response.rows()[0].record_number(), 2);
+        assert_eq!(response.rows()[0].endpoint_id(), Some(endpoint_id));
+        assert_eq!(
+            response.rows()[0].status(),
+            EndpointCsvImportRowStatusResponse::Enrolled
+        );
+        assert_eq!(
+            response.rows()[1].status(),
+            EndpointCsvImportRowStatusResponse::TrustRejected
+        );
+        assert_eq!(response.rows()[1].endpoint_id(), None);
+        assert!(response.rows()[1].message().is_some());
+        assert_eq!(
+            serde_json::from_value::<EndpointCsvImportResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert!(
+            serde_json::from_value::<EndpointCsvImportRequest>(json!({ "csv": "", "file": "" }))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_contract_is_secret_free_and_strict() -> Result<(), Box<dyn Error>> {
+        let occurred_at = OffsetDateTime::parse("2026-08-05T10:16:00Z", &Rfc3339)?;
+        let operation_id = uuid!("01989abc-def0-7abc-8def-0123456789d6");
+        let event = AuditEventResponse::new(
+            occurred_at,
+            "local-operator".to_owned(),
+            "enroll-endpoint".to_owned(),
+            AuditTargetResponse::new(
+                "endpoint-address".to_owned(),
+                Some("https://bmc.example.test/".to_owned()),
+            ),
+            AuditOutcomeResponse::new(
+                "started".to_owned(),
+                None,
+                None,
+                None,
+            ),
+            1,
+            operation_id,
+            "local-operator enroll-endpoint started for endpoint-address https://bmc.example.test/ (sequence 1)"
+                .to_owned(),
+        );
+        let response = AuditQueryResponse::new(vec![event]);
+
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "events": [{
+                    "occurred_at": "2026-08-05T10:16:00Z",
+                    "actor": "local-operator",
+                    "action": "enroll-endpoint",
+                    "target": {
+                        "kind": "endpoint-address",
+                        "identifier": "https://bmc.example.test/"
+                    },
+                    "outcome": {
+                        "kind": "started",
+                        "progress": null,
+                        "failure": null,
+                        "verification": null
+                    },
+                    "sequence": 1,
+                    "operation_id": operation_id,
+                    "message": "local-operator enroll-endpoint started for endpoint-address https://bmc.example.test/ (sequence 1)"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<AuditQueryResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        let encoded = serde_json::to_string(&response)?;
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("secret"));
+        assert!(
+            serde_json::from_value::<AuditEventResponse>(json!({
+                "occurred_at": "2026-08-05T10:16:00Z",
+                "actor": "local-operator",
+                "action": "enroll-endpoint",
+                "target": { "kind": "product", "identifier": null },
+                "outcome": { "kind": "started" },
+                "sequence": 1,
+                "operation_id": operation_id,
+                "message": "started",
+                "extra": true
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_error_contract_carries_only_a_message() -> Result<(), Box<dyn Error>> {
+        let error = ErrorResponse::new("selected credential was not found".to_owned());
+
+        assert_eq!(
+            serde_json::to_value(&error)?,
+            json!({ "message": "selected credential was not found" })
+        );
+        assert_eq!(error.message(), "selected credential was not found");
+        assert!(
+            serde_json::from_value::<ErrorResponse>(json!({
+                "message": "failed",
+                "secret": "must not leak"
+            }))
+            .is_err()
+        );
+        Ok(())
     }
 }
