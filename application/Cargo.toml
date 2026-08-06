@@ -6,16 +6,20 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 csv.workspace = true
 rutilus-domain.workspace = true
 rutilus-operation-engine.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["serde-well-known"] }
+tokio.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod artifact_store;
 mod audit_log;
 mod capability_query;
 mod command_executor;
@@ -16,6 +17,10 @@ mod operation_executor;
 mod operation_submission;
 mod task_monitor;
 
+pub use artifact_store::{
+    ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
+    ArtifactStoreError,
+};
 pub use audit_log::{AuditEventWriter, AuditRecordError};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
