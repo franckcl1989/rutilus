@@ -1,0 +1,147 @@
+# CI quality gates for the Rutilus multi-vendor Redfish management product.
+#
+# Mirrors §19.4 of redfish-management-product-final-design.md:
+#
+#   cargo fmt --check
+#   cargo clippy --workspace --all-targets --all-features
+#   cargo test
+#   cargo nextest            <- not enabled yet (see inline comments)
+#   cargo llvm-cov           <- not enabled yet (see inline comments)
+#   cargo deny
+#   cargo audit              <- advisory scan already covered by cargo deny
+#   cargo machete            <- not enabled yet (see inline comments)
+#   跨平台 Build             <- 3-OS matrix + wasm32 UI artifact
+#   Migration Test
+#   Capability Ledger Check
+#
+# The toolchain comes exclusively from rust-toolchain.toml (channel 1.97.1,
+# components clippy + rustfmt); no version is hard-coded here.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The default job runs the full gates; the other two platforms
+          # verify the 跨平台 Build gate with a full compile instead of tests.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            is_default: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            is_default: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            is_default: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # dtolnay/rust-toolchain reads rust-toolchain.toml (channel 1.97.1,
+      # components clippy + rustfmt) and adds the per-OS host target plus
+      # wasm32-unknown-unknown for the UI crate.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }},wasm32-unknown-unknown
+
+      # Build cache for cargo. Covers target/ (including the wasm target and
+      # target/rutilus-tools, where the pinned wasm-bindgen-cli is installed)
+      # and ~/.cargo; keyed by toolchain + Cargo.lock.
+      - uses: swatinem/rust-cache@v2
+
+      # §19.4: cargo fmt --check
+      - name: Format
+        run: cargo fmt --check
+
+      # §19.4: cargo clippy --workspace --all-targets --all-features
+      # [workspace.lints] in Cargo.toml already denies the whole lint set;
+      # -D warnings is the backstop so no warning can enter main.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # §19.4: cargo test. --workspace is required because
+      # default-members = ["app"] would skip every other crate; --locked pins
+      # the committed Cargo.lock.
+      - name: Test (full workspace)
+        if: matrix.is_default
+        run: cargo test --locked --workspace
+
+      # Non-default platforms: full compile of every target instead of
+      # running tests (same coverage for the 跨平台 Build gate, much cheaper).
+      - name: Check (cross-platform build)
+        if: ${{ !matrix.is_default }}
+        run: cargo check --locked --workspace --all-targets
+
+      # §19.4: cargo nextest — NOT enabled yet. The repo has no nextest
+      # configuration and this gate has not been verified on the workspace.
+      # Enable once adopted:
+      #   run: cargo nextest run --workspace --locked
+
+      # §19.4: cargo llvm-cov — NOT enabled yet. No coverage config or
+      # baseline exists in the repo. Enable once a coverage threshold is set:
+      #   run: cargo llvm-cov --workspace --locked
+
+      # §19.4: cargo deny. Official cargo-deny action (pinned to the version
+      # verified locally against deny.toml: `cargo deny check` -> all of
+      # advisories/bans/licenses/sources ok); the action caches the advisory
+      # database on top of swatinem/rust-cache above.
+      - name: Deny checks
+        uses: embarkstudios/cargo-deny-action@v2
+        with:
+          command: check
+          version: 0.20.2
+
+      # §19.4: cargo audit — NOT enabled yet. The advisory scan is already a
+      # part of `cargo deny check` (deny.toml [advisories] holds the ignore
+      # list), so audit is a later standalone gate. Enable with:
+      #   run: cargo audit
+
+      # §19.4: cargo machete — NOT enabled yet. No machete.toml exists in the
+      # repo. Enable once the crate is adopted:
+      #   run: cargo machete
+
+      # §19.4: 跨平台 Build — wasm32 UI artifact. Commands mirror ui/README.md;
+      # wasm-bindgen-cli must stay at 0.2.126, the exact workspace
+      # wasm-bindgen version. Regeneration is deterministic, so the fresh
+      # artifacts are diffed against the checked-in web/assets to prove the
+      # generated files are up to date (verified byte-identical locally).
+      - name: Build wasm32 UI artifact
+        if: matrix.is_default
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked --root target/rutilus-tools
+          target/rutilus-tools/bin/wasm-bindgen --target web --no-typescript \
+            --out-dir target/wasm-assets --out-name rutilus_ui \
+            target/wasm32-unknown-unknown/release/rutilus_ui.wasm
+          diff -q target/wasm-assets/rutilus_ui.js web/assets/rutilus_ui.js
+          diff -q target/wasm-assets/rutilus_ui_bg.wasm web/assets/rutilus_ui_bg.wasm
+
+      # §19.4: Migration Test. Also covered by the full workspace test above;
+      # kept as an explicit gate for visibility (migration/tests/initial_storage.rs).
+      - name: Migration test
+        if: matrix.is_default
+        run: cargo test --locked -p rutilus-migration
+
+      # §19.4: Capability Ledger Check. Asserts the compiled nv-redfish
+      # baseline (version 0.13.0, std-redfish, 14 OEM feature groups) in
+      # infra-redfish/src/lib.rs::links_the_complete_development_capability_surface.
+      - name: Capability ledger check
+        if: matrix.is_default
+        run: cargo test --locked -p rutilus-infra-redfish
