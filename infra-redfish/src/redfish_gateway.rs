@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::io::Cursor;
 use nv_redfish::{
     Bmc as _, Resource as NvResource, ServiceRoot,
     bmc_http::{
@@ -18,7 +19,10 @@ use nv_redfish::{
     },
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
-    core::{EntityTypeRef, ModificationResponse, NavProperty, ODataId, ReferenceLeaf, ToSnakeCase},
+    core::{
+        DataStream, EntityTypeRef, HttpPushUriUpdateRequest, ModificationResponse,
+        MultipartUpdateRequest, NavProperty, ODataId, ReferenceLeaf, ToSnakeCase, UploadStream,
+    },
     manager::{Manager, ManagerCollection},
     schema::{
         assembly::Assembly as AssemblySchema,
@@ -74,6 +78,8 @@ use nv_redfish::{
         task_service::TaskService as TaskServiceSchema,
         telemetry_service::TelemetryService as TelemetryServiceSchema,
         thermal::Thermal as ThermalSchema,
+        update_service::UpdateParametersUpdate as MultipartUpdateParameters,
+        update_service::UpdateService as UpdateServiceSchema,
     },
     session_service::{Session, SessionCreate},
 };
@@ -399,6 +405,109 @@ impl RedfishGateway {
         finish_command_execution(result, authenticated.session, &identity, trust).await
     }
 
+    /// Uploads one firmware artifact to the endpoint's `UpdateService` (§14.3)
+    /// exclusively through the public `nv-redfish` typed upload API — the
+    /// `Bmc::multipart_update` and `Bmc::http_push_uri_update` methods —
+    /// never a raw `reqwest` request (§7.4).
+    ///
+    /// The upload method follows the caller's decision, which the §14.3 flow
+    /// derives from the endpoint's published update surface:
+    ///
+    /// - `push_uri: None` — the standard multipart upload: a
+    ///   `multipart/form-data` `POST` to the `MultipartHttpPushUri` the
+    ///   decoded `UpdateService` document advertises, carrying the typed
+    ///   `UpdateParameters` JSON part and the artifact as the named
+    ///   `UpdateFile` binary part. §13.3 step 2: a missing `UpdateService`
+    ///   link or a missing `MultipartHttpPushUri` property rejects the
+    ///   upload before any write is sent.
+    /// - `push_uri: Some(uri)` — the upstream-retained legacy direct push
+    ///   (§0.4.0 "上游保留的 Legacy Update 兼容"): a raw `application/octet-stream`
+    ///   `POST` to the caller-selected `HttpPushUri`. The endpoint must still
+    ///   advertise `HttpPushUri` on its `UpdateService` document (§13.3 step
+    ///   2); the gateway never constructs the URI and the transport resolves
+    ///   it same-origin, so a caller-supplied value cannot escape the
+    ///   endpoint (§15.6).
+    ///
+    /// The artifact arrives as an in-memory byte range because the gateway
+    /// performs no file-system I/O: the application resolves the artifact's
+    /// stored file and hands the bytes across the boundary (§7.2, §7.8), and
+    /// the in-memory range is the artifact-size boundary of this iteration —
+    /// streaming from storage and resumable transfers are the later §0.4.0
+    /// large-file iteration.
+    ///
+    /// The transient Session lifecycle is identical to the write surfaces: a
+    /// Session is established when usable, the upload authenticates with its
+    /// token, and the Session is deleted before returning. A `202` response
+    /// is reported as [`CommandExecutionError::AsyncTaskAccepted`], never as
+    /// acceptance: the gateway itself never polls Tasks, so the application
+    /// adapter maps that error onto the `AsyncTaskAccepted` outcome the Task
+    /// monitor polls (§13.6) — the §14.3 flow tracks the Task, waits out a
+    /// possible BMC restart, reconnects, and re-reads `SoftwareInventory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandExecutionError`] with the same classification
+    /// contract as [`Self::execute_command`]: a provable rejection
+    /// (capability unavailable, authentication/permission denial, refused by
+    /// the BMC, unsafe payload), a client-side failure that provably
+    /// prevented dispatch, a dispatched upload whose outcome cannot be
+    /// proven (§13.5), or a `202` Task acceptance.
+    pub async fn execute_update(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+        artifact: UpdateArtifactUpload,
+        push_uri: Option<&ResourceODataId>,
+    ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+        // The artifact name becomes the `filename` attribute of the multipart
+        // `UpdateFile` part, so it is validated before any network work: a
+        // control character could smuggle request structure into the body,
+        // and the rejection proves the write was never dispatched (§13.5).
+        if !validate_update_file_name(artifact.name()) {
+            return Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload,
+            ));
+        }
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(CommandExecutionError::from)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(classify_command_preparation_error(source, &identity, trust));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(source.into()),
+        };
+        let result = execute_authenticated_update(
+            authenticated.bmc.as_ref(),
+            &authenticated.root,
+            &identity,
+            trust,
+            artifact,
+            push_uri,
+        )
+        .await;
+        finish_command_execution(result, authenticated.session, &identity, trust).await
+    }
+
     /// Re-reads the target of one previously accepted write command and
     /// checks the expected result (§13.3 steps 9–10).
     ///
@@ -474,6 +583,85 @@ impl RedfishGateway {
             &identity,
             trust,
             command,
+        )
+        .await;
+        finish_command_verification(result, authenticated.session, &identity, trust).await
+    }
+
+    /// Re-reads the endpoint's `SoftwareInventory` family after an accepted
+    /// firmware update (§14.3: "重新读取 `SoftwareInventory` → 验证版本").
+    ///
+    /// The verification is "accepted" verification in the same honest sense
+    /// as the reset families: the re-read of the complete inventory family —
+    /// the `UpdateService` document, the `SoftwareInventory` collection, and
+    /// every member document — must succeed without error, and the verifier
+    /// returns `Confirmed` without asserting a specific firmware version. The
+    /// version expectation is not part of the update contract of this
+    /// iteration (the artifact carries no declared target version), so
+    /// claiming a version match from a successful read would fabricate a
+    /// result (design section 13.7). The re-read itself is exactly the
+    /// recovery re-read §13.6 performs after a BMC restart, and the strict
+    /// member fetch (no member is skippable) keeps the verdict honest: after
+    /// an accepted update, an inventory document that cannot be read leaves
+    /// the outcome unprovable.
+    ///
+    /// Only `Accepted` or Task-completed updates reach the verifier, so every
+    /// failure here proves nothing about the write: the scheduler records
+    /// `Unknown` (§13.5) instead of a failure.
+    ///
+    /// The re-reads go through the same typed navigation and Session
+    /// lifecycle as the write itself, and the endpoint's own URI structure is
+    /// never guessed (§11.1): the collection and members are discovered
+    /// through the decoded root `UpdateService` link. A `404` from the
+    /// `UpdateService` document or the `SoftwareInventory` collection, or a
+    /// vanished navigation link, is [`CommandVerificationOutcome::Mismatched`]:
+    /// the application contract records a provably absent inventory surface
+    /// as the update's result being absent, not as an unprovable re-read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandVerificationError`] when the inventory cannot be
+    /// re-read at all.
+    pub async fn verify_update(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+    ) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(CommandVerificationError::from)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(CommandVerificationError::from(classify_service_root_error(
+                    source, &identity, trust,
+                )));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(source.into()),
+        };
+        let result = verify_authenticated_update(
+            authenticated.bmc.as_ref(),
+            &authenticated.root,
+            &identity,
+            trust,
         )
         .await;
         finish_command_verification(result, authenticated.session, &identity, trust).await
@@ -1896,7 +2084,177 @@ async fn execute_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             execute_delete_subscription(bmc, root, identity, trust, payload).await
         }
+        // The Update family is deliberately dispatched through the dedicated
+        // `UpdateExecutor` boundary, never this one: the typed command
+        // carries only the database-serializable artifact id, while the
+        // upload needs the resolved artifact bytes, which the application
+        // resolves from the artifact store at execution time (§13.3 step 4,
+        // §14.3). Reaching this arm means the caller misrouted the command
+        // through the wrong boundary; the refusal is provable (no write is
+        // ever sent) and the payload is rejected because it cannot be
+        // executed through this boundary.
+        RedfishCommand::Update(_) => Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        )),
     }
+}
+
+/// Dispatches one §14.3 firmware upload through the authenticated transport.
+///
+/// The upload is endpoint-scoped like every other write of this iteration:
+/// the artifact is handed to the endpoint's `UpdateService`, which decides
+/// the targets from the image. The method branches on the caller's upload
+/// decision: `push_uri: None` selects the standard multipart upload, and a
+/// caller-supplied `push_uri` selects the upstream-retained legacy direct
+/// push. Both branches run the §13.3 step 2 capability check against the
+/// decoded `UpdateService` document before any write is sent.
+async fn execute_authenticated_update(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    artifact: UpdateArtifactUpload,
+    push_uri: Option<&ResourceODataId>,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(update_service) = update_service_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    match push_uri {
+        None => execute_multipart_update(bmc, &update_service, identity, trust, artifact).await,
+        Some(push_uri) => {
+            execute_http_push_update(bmc, &update_service, identity, trust, artifact, push_uri)
+                .await
+        }
+    }
+}
+
+/// Executes the standard §14.3 multipart upload through the typed
+/// `Bmc::multipart_update` API.
+///
+/// The upload targets the `MultipartHttpPushUri` the decoded `UpdateService`
+/// document advertises — never a guessed path (§11.1) — and the body is
+/// produced by the upstream multipart machinery from the typed
+/// [`MultipartUpdateParameters`] JSON part and the artifact as the named
+/// `UpdateFile` binary part (§7.4). The parameters are empty: an image-based
+/// upload leaves target selection to the endpoint, and the typed parameter
+/// set (`Targets`, `ForceUpdate`, `Stage`, ...) stays empty until a product
+/// flow needs it. The upload timeout is the shared request timeout; larger
+/// firmware with streaming progress is the later §0.4.0 large-file
+/// iteration.
+async fn execute_multipart_update(
+    bmc: &UpstreamBmc,
+    update_service: &UpdateServiceSchema,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    artifact: UpdateArtifactUpload,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(multipart_uri) = update_service.multipart_http_push_uri.as_deref() else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let parameters = MultipartUpdateParameters::default();
+    let length = artifact.bytes.len();
+    let request = MultipartUpdateRequest {
+        update_parameters: &parameters,
+        update_stream: DataStream::new(artifact.name, Cursor::new(artifact.bytes))
+            .with_content_length(length as u64),
+        oem_parts: Vec::new(),
+        upload_timeout: HTTP_REQUEST_TIMEOUT,
+    };
+    let response = match bmc
+        .multipart_update::<_, MultipartUpdateParameters, ()>(multipart_uri, request)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes the upstream-retained legacy direct push (§0.4.0) through the
+/// typed `Bmc::http_push_uri_update` API.
+///
+/// The upload targets the caller-selected `HttpPushUri` as a raw
+/// `application/octet-stream` body; the endpoint must still advertise
+/// `HttpPushUri` on its `UpdateService` document (§13.3 step 2), and the
+/// transport resolves the URI same-origin, so a caller-supplied value cannot
+/// escape the endpoint (§15.6).
+async fn execute_http_push_update(
+    bmc: &UpstreamBmc,
+    update_service: &UpdateServiceSchema,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    artifact: UpdateArtifactUpload,
+    push_uri: &ResourceODataId,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    if update_service.http_push_uri.is_none() {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    }
+    let length = artifact.bytes.len();
+    let request = HttpPushUriUpdateRequest {
+        update_stream: UploadStream::new(Cursor::new(artifact.bytes))
+            .with_content_length(length as u64),
+        upload_timeout: HTTP_REQUEST_TIMEOUT,
+    };
+    let response = match bmc
+        .http_push_uri_update::<_, ()>(push_uri.as_str(), request)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the typed `UpdateService` document through its root navigation
+/// property, classifying fetch failures as command preparation failures; a
+/// missing link is `None`.
+async fn update_service_document(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<UpdateServiceSchema>>, CommandExecutionError> {
+    let Some(update_service) = root.root.update_service.as_ref() else {
+        return Ok(None);
+    };
+    let service = update_service
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    Ok(Some(service))
+}
+
+/// Validates the artifact name as a safe multipart file name.
+///
+/// The name becomes the `filename` attribute of the multipart `UpdateFile`
+/// part, so a control character could smuggle request structure into the
+/// body; the domain's `ArtifactName` already rejects control characters, and
+/// this check keeps the transport boundary safe even when a caller bypasses
+/// the domain validation.
+fn validate_update_file_name(name: &str) -> bool {
+    // Control bytes (0x00-0x1F and 0x7F) are the header-injection surface:
+    // CRLF terminates the part headers. Multi-byte UTF-8 sequences are all
+    // >= 0x80, so the check keeps Unicode file names (the domain `ArtifactName`
+    // allows them) while excluding every control byte.
+    !name.is_empty() && name.bytes().all(|byte| byte >= 0x20 && byte != 0x7F)
 }
 
 /// Fetches the first advertised member of one core collection.
@@ -2461,6 +2819,103 @@ async fn verify_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             verify_subscription_deleted(bmc, root, identity, trust, payload).await
         }
+        // §14.3 update verification: the complete `SoftwareInventory` family
+        // must re-read without error. The application contract for this
+        // family records a provably absent inventory surface as `Mismatched`
+        // (the update did not leave the expected result) instead of the
+        // reset families' `CapabilityUnavailable` error — see the
+        // `CommandVerifier` contract doc.
+        RedfishCommand::Update(_) => verify_authenticated_update(bmc, root, identity, trust).await,
+    }
+}
+
+/// Re-reads the complete `SoftwareInventory` family for §14.3 verification.
+///
+/// Every inventory document — the `UpdateService` singleton, the
+/// `SoftwareInventory` collection, and each member — must re-read without
+/// error, and a failed re-read converges on
+/// [`CommandVerificationError::ReReadFailed`] exactly like the other
+/// verification re-reads: after an accepted update, an unreadable inventory
+/// leaves the outcome unprovable (§13.5). The application contract for this
+/// family is stricter than the reset families about one case: a `404` from
+/// the `UpdateService` document or the `SoftwareInventory` collection, or a
+/// vanished navigation link, proves the inventory surface is absent after
+/// the accepted update, and that provable absence is
+/// [`CommandVerificationOutcome::Mismatched`] — the update did not leave the
+/// expected readable inventory. Members are fetched strictly — none is
+/// skippable — because the member documents are the inventory itself;
+/// skipping a member could hide the proof of the write, and a member that
+/// cannot be fetched fails outright (the surface exists, so the outcome is
+/// unprovable, never `Mismatched`).
+async fn verify_authenticated_update(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(update_service) = root.root.update_service.as_ref() else {
+        return Ok(CommandVerificationOutcome::Mismatched);
+    };
+    let service = match update_service.get(bmc).await {
+        Ok(service) => service,
+        Err(source) => return classify_update_surface_fetch(source, identity, trust),
+    };
+    let Some(software_inventory) = service.software_inventory.as_ref() else {
+        return Ok(CommandVerificationOutcome::Mismatched);
+    };
+    let collection = match bmc
+        .get::<SoftwareInventoryCollectionSchema>(software_inventory.odata_id())
+        .await
+    {
+        Ok(collection) => collection,
+        Err(source) => return classify_update_surface_fetch(source, identity, trust),
+    };
+    for member in collection.members() {
+        member
+            .get(bmc)
+            .await
+            .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Classifies one §14.3 inventory-surface fetch failure.
+///
+/// A `404` proves the inventory surface no longer exists after the accepted
+/// update and becomes [`CommandVerificationOutcome::Mismatched`]; every
+/// other failure converges on [`CommandVerificationError::ReReadFailed`]
+/// because the outcome is unprovable (§13.5). TLS-safety failures keep
+/// precedence over the status: a changed or rejected identity is never read
+/// as a vanished surface.
+fn classify_update_surface_fetch(
+    source: BmcError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match identity.take_change(trust) {
+        Err(state) => {
+            return Err(CommandVerificationError::ReReadFailed(Box::new(
+                RedfishServiceRootError::TlsIdentityState(state),
+            )));
+        }
+        Ok(Some(changed)) => {
+            return Err(CommandVerificationError::ReReadFailed(Box::new(
+                RedfishServiceRootError::TlsIdentityChanged(changed),
+            )));
+        }
+        Ok(None) => {}
+    }
+    if identity.validation_rejected() {
+        return Err(CommandVerificationError::ReReadFailed(Box::new(
+            RedfishServiceRootError::TlsRejected { source },
+        )));
+    }
+    match source {
+        BmcError::InvalidResponse {
+            status: StatusCode::NOT_FOUND,
+            ..
+        } => Ok(CommandVerificationOutcome::Mismatched),
+        source => Err(command_verification_read_error(source, identity, trust)),
     }
 }
 
@@ -2686,6 +3141,45 @@ async fn finish_command_verification(
                 },
             ),
         },
+    }
+}
+
+/// One firmware artifact, fully resolved in memory, ready for the §14.3
+/// upload.
+///
+/// The gateway deliberately performs no file-system I/O: the application
+/// resolves the artifact's stored file (persistence derives the on-disk
+/// location) and hands the complete byte range across the boundary, so
+/// storage policy stays inside the application crate (§7.2, §7.8). The
+/// in-memory byte range is the artifact-size boundary of this iteration —
+/// streaming from storage and resumable transfers are the later §0.4.0
+/// large-file iteration. `Clone` is deliberately not derived: firmware
+/// images can be large, and duplicating the bytes should be an explicit
+/// caller decision.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UpdateArtifactUpload {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl UpdateArtifactUpload {
+    /// Bundles the artifact name and its complete byte range for one upload.
+    #[must_use]
+    pub const fn new(name: String, bytes: Vec<u8>) -> Self {
+        Self { name, bytes }
+    }
+
+    /// Returns the file name, which becomes the `filename` attribute of the
+    /// multipart `UpdateFile` part.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// Returns the complete artifact byte range.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
     }
 }
 
@@ -5323,6 +5817,17 @@ fn classify_command_write_error(
                 source,
             }))
         }
+        // A URI reference the transport refused before the request was sent
+        // (cross-origin or malformed — the §15.6 same-origin policy): the
+        // write was provably never dispatched, so this is a rejection —
+        // `InvalidCommandPayload` because a payload value could not be
+        // represented safely on the wire — never an outcome-unknown failure
+        // (§13.5). The upload paths are the only writers that resolve
+        // service-provided URI references, so only they can produce this
+        // error.
+        nv_redfish::Error::Bmc(BmcError::InvalidRequest(_)) => {
+            CommandExecutionError::Rejected(CommandRejection::InvalidCommandPayload)
+        }
         nv_redfish::Error::ActionNotAvailable => {
             CommandExecutionError::Rejected(CommandRejection::CapabilityUnavailable)
         }
@@ -5659,7 +6164,7 @@ mod tests {
         RootCertStore, ServerConfig,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
-    use rutilus_domain::{TlsCertificate, TlsTrust};
+    use rutilus_domain::{StartUpdate, TlsCertificate, TlsTrust, UpdateCommand};
     use time::OffsetDateTime;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -13696,6 +14201,816 @@ mod tests {
                 Err(CommandVerificationError::CapabilityUnavailable)
             ),
             "a vanished subscription link cannot confirm anything: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    /// The `UpdateService` document for §14.3 update write tests: advertises
+    /// the standard `MultipartHttpPushUri` upload endpoint, the
+    /// upstream-retained legacy `HttpPushUri`, and the `SoftwareInventory`
+    /// collection.
+    const UPDATE_SERVICE_WITH_UPLOAD_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/UpdateService",
+        "@odata.etag":"W/\"update-service-1\"",
+        "Id":"UpdateService",
+        "Name":"Update Service",
+        "Description":"Firmware update service",
+        "ServiceEnabled":true,
+        "MaxImageSizeBytes":2147483648,
+        "MultipartHttpPushUri":"/redfish/v1/UpdateService/MultipartUpdate",
+        "HttpPushUri":"/redfish/v1/UpdateService/HTTPPushUri",
+        "SoftwareInventory":{"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory"}
+    }"#;
+
+    /// An `UpdateService` document that advertises the upload endpoints but
+    /// no `SoftwareInventory` link, for the vanished-inventory verification
+    /// case.
+    const UPDATE_SERVICE_WITHOUT_INVENTORY_LINK_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/UpdateService",
+        "Id":"UpdateService",
+        "Name":"Update Service",
+        "Description":"Firmware update service",
+        "ServiceEnabled":true,
+        "MultipartHttpPushUri":"/redfish/v1/UpdateService/MultipartUpdate",
+        "HttpPushUri":"/redfish/v1/UpdateService/HTTPPushUri"
+    }"#;
+
+    /// The request order of one multipart firmware upload: the Session
+    /// lifecycle around the `UpdateService` document fetch and the multipart
+    /// `POST` onto the advertised `MultipartHttpPushUri`.
+    const MULTIPART_UPDATE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/MultipartUpdate",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one legacy `HttpPushUri` direct push: identical
+    /// to [`MULTIPART_UPDATE_REQUEST_PATHS`] except that the write targets
+    /// the caller-selected push URI.
+    const HTTP_PUSH_UPDATE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/HTTPPushUri",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one §14.3 update verification: the Session
+    /// lifecycle around the `UpdateService` document, the
+    /// `SoftwareInventory` collection, and both member documents.
+    const VERIFY_UPDATE_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/SoftwareInventory",
+        "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+        "/redfish/v1/UpdateService/SoftwareInventory/BMC",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// One small in-memory firmware artifact fixture.
+    ///
+    /// The bytes are ASCII so the captured multipart body stays valid UTF-8
+    /// for the structural assertions; the fixture body asserts the exact
+    /// `UpdateFile` part content, which only works when the bytes survive a
+    /// UTF-8 decode.
+    fn firmware_artifact() -> UpdateArtifactUpload {
+        UpdateArtifactUpload::new(
+            "firmware-2026.bin".to_owned(),
+            b"rutilus fixture firmware image".to_vec(),
+        )
+    }
+
+    /// Asserts the request sequence of one update upload: the Session
+    /// lifecycle around one token-authenticated upload `POST`.
+    ///
+    /// This mirrors [`assert_command_requests`] without the exact-body
+    /// assertion, because the multipart upload body carries a random boundary
+    /// and is asserted structurally by the dedicated helpers instead.
+    fn assert_update_write_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        let last = requests.len().saturating_sub(1);
+        let write_index = last.saturating_sub(1);
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = match index {
+                3 => "POST",
+                value if value == write_index => "POST",
+                value if value == last => "DELETE",
+                _ => "GET",
+            };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n")),
+                "request {index} must be {expected_method} {expected_path}, was: {request}"
+            );
+            let authorization = request_header(request, "authorization");
+            let token = request_header(request, "x-auth-token");
+            match index {
+                3 => {
+                    assert!(authorization.is_none());
+                    assert!(token.is_none());
+                }
+                4.. if index < last => {
+                    assert!(authorization.is_none());
+                    assert_eq!(token, Some("test-session-token"));
+                }
+                _ => {
+                    assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                    assert!(token.is_none());
+                }
+            }
+            if index != 3 {
+                assert!(!request.contains("password"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Asserts the wire form of one multipart upload request: the
+    /// `multipart/form-data` content type with a boundary, the Session token,
+    /// and the structural body — the typed `UpdateParameters` JSON part
+    /// before the named `UpdateFile` binary part carrying the artifact bytes.
+    ///
+    /// The boundary is random per request, so the body is asserted
+    /// structurally instead of byte-exactly: part names, part content types,
+    /// the parameter projection, and the exact artifact bytes.
+    fn assert_multipart_write_request(
+        request: &[u8],
+        expected_path: &str,
+        artifact_name: &str,
+        artifact_bytes: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        let request = std::str::from_utf8(request)?;
+        assert!(request.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")));
+        let content_type = request_header(request, "content-type").unwrap_or_default();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "the upload must be a multipart request, content-type was {content_type:?}"
+        );
+        assert_eq!(
+            request_header(request, "x-auth-token"),
+            Some("test-session-token")
+        );
+        assert!(
+            request_header(request, "authorization").is_none(),
+            "the token-authenticated upload must not carry Basic credentials"
+        );
+        let body = request_body(request.as_bytes())
+            .ok_or_else(|| io::Error::other("the multipart upload body was not captured"))?;
+        let parameters_start = body
+            .find("name=\"UpdateParameters\"")
+            .ok_or_else(|| io::Error::other("the UpdateParameters part is missing"))?;
+        let file_start = body
+            .find("name=\"UpdateFile\"")
+            .ok_or_else(|| io::Error::other("the UpdateFile part is missing"))?;
+        assert!(
+            parameters_start < file_start,
+            "the UpdateParameters part must precede the UpdateFile part"
+        );
+        let parameters_part = &body[parameters_start..file_start];
+        assert!(
+            parameters_part.contains("application/json"),
+            "the UpdateParameters part must be JSON: {parameters_part}"
+        );
+        assert!(
+            parameters_part.contains("{}"),
+            "the image-based update parameters must be empty: {parameters_part}"
+        );
+        let file_part = &body[file_start..];
+        assert!(
+            file_part.contains("application/octet-stream"),
+            "the UpdateFile part must be a raw binary stream"
+        );
+        assert!(
+            file_part.contains(&format!("filename=\"{artifact_name}\"")),
+            "the UpdateFile part must carry the artifact file name"
+        );
+        let artifact_text = std::str::from_utf8(artifact_bytes)?;
+        assert!(
+            file_part.contains(artifact_text),
+            "the UpdateFile part must carry the exact artifact bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploads_artifact_through_the_typed_multipart_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            http_response("200 OK", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                None,
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        let requests = server.finish_all().await?;
+        assert_update_write_requests(&requests, &MULTIPART_UPDATE_REQUEST_PATHS)?;
+        assert_multipart_write_request(
+            &requests[5],
+            "/redfish/v1/UpdateService/MultipartUpdate",
+            "firmware-2026.bin",
+            b"rutilus fixture firmware image",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surfaces_a_multipart_upload_acceptance_as_an_async_task() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            http_response_with_headers(
+                "202 Accepted",
+                "",
+                &[("Location", "/redfish/v1/TaskService/Tasks/42")],
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                None,
+            )
+            .await;
+
+        let task_location = match outcome {
+            Err(CommandExecutionError::AsyncTaskAccepted { task_location }) => task_location,
+            other => {
+                return Err(format!(
+                    "a 202 upload must surface as AsyncTaskAccepted, got {other:?}"
+                )
+                .into());
+            }
+        };
+        assert_eq!(
+            task_location.to_string(),
+            "/redfish/v1/TaskService/Tasks/42"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pushes_artifact_through_the_legacy_http_push_uri() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            http_response_with_headers(
+                "202 Accepted",
+                "",
+                &[("Location", "/redfish/v1/TaskService/Tasks/7")],
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let push_uri = ResourceODataId::parse("/redfish/v1/UpdateService/HTTPPushUri")?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                Some(&push_uri),
+            )
+            .await;
+
+        let task_location = match outcome {
+            Err(CommandExecutionError::AsyncTaskAccepted { task_location }) => task_location,
+            other => {
+                return Err(
+                    format!("a 202 push must surface as AsyncTaskAccepted, got {other:?}").into(),
+                );
+            }
+        };
+        assert_eq!(task_location.to_string(), "/redfish/v1/TaskService/Tasks/7");
+        let requests = server.finish_all().await?;
+        assert_update_write_requests(&requests, &HTTP_PUSH_UPDATE_REQUEST_PATHS)?;
+        let write = std::str::from_utf8(&requests[5])?;
+        assert_eq!(
+            request_header(write, "content-type"),
+            Some("application/octet-stream"),
+            "the legacy push sends the raw binary body without multipart"
+        );
+        assert_eq!(
+            request_body(&requests[5]),
+            Some("rutilus fixture firmware image"),
+            "the legacy push body must be exactly the artifact bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_when_the_update_service_link_is_absent() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            CORE_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        // The capability check stops the sequence before any upload request.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/UpdateService/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_when_multipart_http_push_uri_is_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/UpdateService/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_when_http_push_uri_is_not_advertised() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let push_uri = ResourceODataId::parse("/redfish/v1/UpdateService/HTTPPushUri")?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                Some(&push_uri),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/UpdateService/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_uploads_the_bmc_refuses() -> Result<(), Box<dyn Error>> {
+        for (status, expected) in [
+            ("401 Unauthorized", CommandRejection::AuthenticationFailed),
+            ("403 Forbidden", CommandRejection::PermissionDenied),
+            ("400 Bad Request", CommandRejection::RefusedByBmc),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+                CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+                &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+                http_response(status, ""),
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_update(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    firmware_artifact(),
+                    None,
+                )
+                .await;
+
+            assert!(
+                matches!(outcome, Err(CommandExecutionError::Rejected(reason)) if reason == expected),
+                "a {status} upload response must be rejected as {expected}, got {outcome:?}"
+            );
+            assert_update_write_requests(
+                &server.finish_all().await?,
+                &MULTIPART_UPDATE_REQUEST_PATHS,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_an_upload_when_the_push_uri_is_cross_origin() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let push_uri = ResourceODataId::parse("https://192.0.2.10/upload")?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                Some(&push_uri),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload
+            ))
+        ));
+        // The §15.6 same-origin policy rejects the URI before transport: the
+        // UpdateService document is read, then no upload request is ever sent.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /upload"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_with_a_control_character_artifact_name() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(Vec::new()).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                UpdateArtifactUpload::new("firmware\n2026.bin".to_owned(), Vec::new()),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload
+            ))
+        ));
+        assert!(
+            server.finish_all().await?.is_empty(),
+            "a control character in the file name must be rejected before any network request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_file_name_validation_accepts_only_control_free_names() {
+        for safe in ["firmware.bin", "firmware 2026.bin", "固件-2026.bin", "a"] {
+            assert!(
+                validate_update_file_name(safe),
+                "name {safe:?} must be accepted"
+            );
+        }
+        for unsafe_name in ["", "a\nb", "a\rb", "a\tb", "a\x7Fb", "\u{0}"] {
+            assert!(
+                !validate_update_file_name(unsafe_name),
+                "name {unsafe_name:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verifies_update_by_re_reading_the_software_inventory_family()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(vec![
+            http_response("200 OK", CORE_WITH_UPDATE_SERVICE_ROOT_BODY),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response_with_headers(
+                "201 Created",
+                SESSION_BODY,
+                &[
+                    ("X-Auth-Token", "test-session-token"),
+                    ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                ],
+            ),
+            http_response("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+            http_response("200 OK", SOFTWARE_INVENTORY_WITH_MEMBERS_BODY),
+            http_response("200 OK", SOFTWARE_INVENTORY_BIOS_BODY),
+            http_response("200 OK", SOFTWARE_INVENTORY_BMC_BODY),
+            http_response("204 No Content", ""),
+        ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(&server.finish_all().await?, &VERIFY_UPDATE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_as_an_error_when_the_inventory_cannot_be_re_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(CommandVerificationError::ReReadFailed(_))),
+            "an unreadable inventory proves nothing about the update: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_as_mismatched_when_the_update_service_link_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            CORE_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Ok(CommandVerificationOutcome::Mismatched)),
+            "a vanished UpdateService link proves the inventory surface is absent: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_as_mismatched_when_the_inventory_surface_vanished()
+    -> Result<(), Box<dyn Error>> {
+        for (doc_status, doc_body) in [
+            // The `UpdateService` document itself is gone.
+            ("404 Not Found", "{}"),
+            // The `UpdateService` document no longer advertises the
+            // `SoftwareInventory` collection link.
+            ("200 OK", UPDATE_SERVICE_WITHOUT_INVENTORY_LINK_BODY),
+        ] {
+            let responses = vec![
+                http_response("200 OK", CORE_WITH_UPDATE_SERVICE_ROOT_BODY),
+                http_response("200 OK", SESSION_SERVICE_BODY),
+                http_response("200 OK", SESSIONS_BODY),
+                http_response_with_headers(
+                    "201 Created",
+                    SESSION_BODY,
+                    &[
+                        ("X-Auth-Token", "test-session-token"),
+                        ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                    ],
+                ),
+                http_response(doc_status, doc_body),
+                http_response("204 No Content", ""),
+            ];
+            let server = TestRedfishServer::start_raw_sequence(responses).await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_update(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await;
+
+            assert!(
+                matches!(verdict, Ok(CommandVerificationOutcome::Mismatched)),
+                "an absent inventory surface is the provably absent expected result: {verdict:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_as_mismatched_when_the_inventory_collection_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("404 Not Found", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Ok(CommandVerificationOutcome::Mismatched)),
+            "a 404 from the collection proves the inventory surface is absent: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_as_an_error_when_an_inventory_member_cannot_be_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_WITH_MEMBERS_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_BIOS_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(CommandVerificationError::ReReadFailed(_))),
+            "an unreadable member leaves the outcome unprovable, never Mismatched: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_commands_dispatched_through_the_typed_command_boundary()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            FULL_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                    rutilus_domain::ArtifactId::generate(),
+                    None,
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload
+            ))
+        ));
+        // The misrouted family is refused before any update request: only the
+        // Session lifecycle requests were made.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/UpdateService/"))
         );
         Ok(())
     }

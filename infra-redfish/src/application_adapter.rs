@@ -6,7 +6,7 @@ use rutilus_application::{
     CredentialResolver, DispatchVerdict, DispatchVerdictClassifier, EndpointDiscovery,
     EndpointRefreshRepository, RedfishDiscovery, ResourceObservation, SystemCaEvaluation,
     TaskObservation as ApplicationTaskObservation, TaskReader, TlsIdentityObservation,
-    TlsIdentityProbe, VerificationVerdict,
+    TlsIdentityProbe, UpdateArtifactPayload, UpdateExecutor, VerificationVerdict,
 };
 use rutilus_domain::{
     CredentialUsername, EndpointAddress, EndpointId, RedfishCommand, ResourceODataId,
@@ -20,6 +20,7 @@ use crate::{
     CommandExecutionError, CommandExecutionOutcome, CommandVerificationError,
     CommandVerificationOutcome, CoreResourceReadError, RedfishGateway, RedfishServiceRootError,
     SystemCaStatus, TaskMessageObservation, TaskObservation, TaskReadError, TlsProbeError,
+    UpdateArtifactUpload,
 };
 
 impl TlsIdentityProbe for RedfishGateway {
@@ -129,6 +130,42 @@ pub trait CommandGateway: Send + Sync {
         password: &'a SecretString,
         task_uri: &'a ResourceODataId,
     ) -> BoundaryFuture<'a, Result<TaskObservation, TaskReadError>>;
+
+    /// Uploads one firmware artifact to the endpoint's `UpdateService`
+    /// (§14.3): the standard multipart upload when `push_uri` is `None`, or
+    /// the upstream-retained legacy direct push to the caller-selected
+    /// `HttpPushUri` (§0.4.0). The artifact bytes are resolved by the caller
+    /// — the gateway performs no file-system I/O (§7.2, §7.8) — and the
+    /// outcome contract is identical to [`Self::execute_command`]: a `202`
+    /// surfaces as [`CommandExecutionError::AsyncTaskAccepted`] for the §13.6
+    /// Task monitor, never as acceptance.
+    ///
+    /// The application Update boundary ([`UpdateExecutor`]) wires this
+    /// method onto its `execute_update(endpoint_id, artifact, push_uri)`
+    /// contract; the gateway-level signature carries the resolved bytes so
+    /// the application keeps the storage policy (§7.8) while the gateway
+    /// keeps the transport policy.
+    fn execute_update<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+        artifact: UpdateArtifactUpload,
+        push_uri: Option<&'a ResourceODataId>,
+    ) -> BoundaryFuture<'a, Result<CommandExecutionOutcome, CommandExecutionError>>;
+
+    /// Re-reads the endpoint's `SoftwareInventory` family after an accepted
+    /// update (§14.3: "重新读取 `SoftwareInventory` → 验证版本"). The verdict
+    /// contract is identical to [`Self::verify_command`]: a failed re-read
+    /// proves nothing about the write (§13.5).
+    fn verify_update<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<CommandVerificationOutcome, CommandVerificationError>>;
 }
 
 impl CommandGateway for RedfishGateway {
@@ -168,6 +205,35 @@ impl CommandGateway for RedfishGateway {
     ) -> BoundaryFuture<'a, Result<TaskObservation, TaskReadError>> {
         Box::pin(async move {
             RedfishGateway::read_task(self, address, trust, username, password, task_uri).await
+        })
+    }
+
+    fn execute_update<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+        artifact: UpdateArtifactUpload,
+        push_uri: Option<&'a ResourceODataId>,
+    ) -> BoundaryFuture<'a, Result<CommandExecutionOutcome, CommandExecutionError>> {
+        Box::pin(async move {
+            RedfishGateway::execute_update(
+                self, address, trust, username, password, artifact, push_uri,
+            )
+            .await
+        })
+    }
+
+    fn verify_update<'a>(
+        &'a self,
+        address: &'a EndpointAddress,
+        trust: &'a TlsTrust,
+        username: &'a CredentialUsername,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<CommandVerificationOutcome, CommandVerificationError>> {
+        Box::pin(async move {
+            RedfishGateway::verify_update(self, address, trust, username, password).await
         })
     }
 }
@@ -372,6 +438,82 @@ where
     }
 }
 
+impl<Gateway, Repository, Credentials> UpdateExecutor
+    for RedfishCommandExecutor<Gateway, Repository, Credentials>
+where
+    Gateway: CommandGateway,
+    Repository: EndpointRefreshRepository,
+    Credentials: CredentialResolver,
+{
+    type Error = CommandDispatchError;
+
+    fn execute_update<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        artifact: &'a UpdateArtifactPayload,
+        push_uri: Option<&'a str>,
+    ) -> BoundaryFuture<'a, Result<CommandOutcome, Self::Error>> {
+        Box::pin(async move {
+            let endpoint = match self.endpoints.find_endpoint(endpoint_id).await {
+                Ok(Some(endpoint)) => endpoint,
+                Ok(None) => return Err(CommandDispatchError::EndpointUnknown),
+                Err(source) => {
+                    return Err(CommandDispatchError::EndpointResolution(Box::new(source)));
+                }
+            };
+            let credential = match self.credentials.resolve(endpoint.credential_id()).await {
+                Ok(Some(credential)) => credential,
+                Ok(None) => return Err(CommandDispatchError::CredentialUnknown),
+                Err(source) => {
+                    return Err(CommandDispatchError::CredentialResolution(Box::new(source)));
+                }
+            };
+            // The push URI is an exact identifier validated before it
+            // reaches the transport: an unrepresentable value is a provable
+            // refusal — the upload was never dispatched (§13.5) — and the
+            // gateway's transport resolves the URI same-origin so the value
+            // cannot escape the endpoint (§15.6).
+            let Ok(push_uri) = push_uri.map(ResourceODataId::parse).transpose() else {
+                return Ok(CommandOutcome::Rejected);
+            };
+            // The application payload is borrowed while the gateway's upload
+            // owns its transport stream, so the bytes are copied once at
+            // this boundary; the gateway performs no file-system I/O (§7.2,
+            // §7.8), and this copy is the single transition between the
+            // application-owned file read and the transport-owned stream.
+            let upload = UpdateArtifactUpload::new(
+                artifact.name().as_str().to_owned(),
+                artifact.bytes().to_vec(),
+            );
+            match self
+                .gateway
+                .execute_update(
+                    endpoint.address(),
+                    endpoint.trust(),
+                    credential.username(),
+                    credential.password(),
+                    upload,
+                    push_uri.as_ref(),
+                )
+                .await
+            {
+                Ok(CommandExecutionOutcome::Accepted) => Ok(CommandOutcome::Accepted),
+                // Every provable rejection maps onto the application's
+                // `Rejected` outcome, exactly like the typed command path.
+                Err(CommandExecutionError::Rejected(_)) => Ok(CommandOutcome::Rejected),
+                // A `202` acceptance surfaces as the application's
+                // `AsyncTaskAccepted` outcome so the scheduler persists the
+                // Task and moves the operation to `WaitingRemote` (§13.6) —
+                // the §14.3 flow tracks the Task through the BMC restart.
+                Err(CommandExecutionError::AsyncTaskAccepted { task_location }) => {
+                    map_async_task_outcome(&task_location)
+                }
+                Err(source) => Err(CommandDispatchError::Dispatch(source)),
+            }
+        })
+    }
+}
+
 /// A controlled failure while verifying one accepted command at the
 /// application boundary.
 ///
@@ -543,11 +685,11 @@ mod tests {
     use rutilus_application::{
         CommandExecutor, CommandOutcome, CommandVerifier, CoreResourceReader, DispatchVerdict,
         DispatchVerdictClassifier, EndpointRefreshRepository, RedfishDiscovery,
-        ResourceObservation, TaskReader, TlsIdentityProbe,
+        ResourceObservation, TaskReader, TlsIdentityProbe, UpdateArtifactPayload, UpdateExecutor,
     };
     use rutilus_domain::{
-        CredentialId, CredentialUsername, Endpoint, EndpointAddress, EndpointDisplayName,
-        EndpointId, RedfishCommand, ResourceODataId, TlsCertificate, TlsTrust,
+        ArtifactName, CredentialId, CredentialUsername, Endpoint, EndpointAddress,
+        EndpointDisplayName, EndpointId, RedfishCommand, ResourceODataId, TlsCertificate, TlsTrust,
     };
     use rutilus_operation_engine::{RemoteTaskState, TaskUri, TaskUriError};
     use secrecy::SecretString;
@@ -561,7 +703,7 @@ mod tests {
         CommandDispatchError, CommandExecutionError, CommandExecutionOutcome, CommandTaskReadError,
         CommandVerificationError, CommandVerificationOutcome, CommandVerifyError,
         RedfishCommandExecutor, RedfishGateway, RedfishServiceRootError, TaskObservation,
-        TaskReadError,
+        TaskReadError, UpdateArtifactUpload,
     };
 
     #[test]
@@ -754,6 +896,46 @@ mod tests {
                 })
             })
         }
+
+        fn execute_update<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+            _artifact: UpdateArtifactUpload,
+            _push_uri: Option<&'a ResourceODataId>,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<CommandExecutionOutcome, CommandExecutionError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Err(CommandExecutionError::Rejected(
+                    crate::CommandRejection::CapabilityUnavailable,
+                ))
+            })
+        }
+
+        fn verify_update<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<CommandVerificationOutcome, CommandVerificationError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(CommandVerificationOutcome::Confirmed) })
+        }
     }
 
     /// One managed endpoint fixture the repository double can serve.
@@ -817,6 +999,98 @@ mod tests {
         assert_task_reader::<
             RedfishCommandExecutor<RedfishGateway, TestEndpointRepository, TestCredentialResolver>,
         >();
+    }
+
+    #[test]
+    fn executor_implements_the_application_update_executor_boundary() {
+        fn assert_update_executor<Executor: UpdateExecutor<Error = CommandDispatchError>>() {}
+
+        assert_update_executor::<
+            RedfishCommandExecutor<RedfishGateway, TestEndpointRepository, TestCredentialResolver>,
+        >();
+    }
+
+    /// One resolved §14.3 artifact payload fixture.
+    fn update_artifact() -> Result<UpdateArtifactPayload, Box<dyn Error>> {
+        Ok(UpdateArtifactPayload::new(
+            rutilus_domain::ArtifactId::generate(),
+            ArtifactName::parse("firmware-2026.bin")?,
+            b"rutilus fixture firmware image".to_vec(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_maps_a_provably_refused_upload_onto_rejected()
+    -> Result<(), Box<dyn Error>> {
+        let executor = RedfishCommandExecutor::new(
+            FakeGateway::task_gone()?,
+            TestEndpointRepository {
+                endpoint: Some(managed_endpoint()?),
+            },
+            TestCredentialResolver {
+                credential: Some(resolved_credential()?),
+            },
+        );
+
+        let outcome = executor
+            .execute_update(
+                EndpointId::generate(),
+                &update_artifact()?,
+                Some("https://192.0.2.10/upload"),
+            )
+            .await?;
+
+        assert_eq!(
+            outcome,
+            CommandOutcome::Rejected,
+            "a gateway rejection must surface as the application Rejected outcome"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_reports_unknown_endpoints_without_touching_the_gateway()
+    -> Result<(), Box<dyn Error>> {
+        let executor = RedfishCommandExecutor::new(
+            FakeGateway::task_gone()?,
+            TestEndpointRepository::empty(),
+            TestCredentialResolver::empty(),
+        );
+
+        let result = executor
+            .execute_update(EndpointId::generate(), &update_artifact()?, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(CommandDispatchError::EndpointUnknown)),
+            "an unmanaged endpoint must be rejected before any upload request: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_rejects_a_push_uri_that_cannot_be_represented()
+    -> Result<(), Box<dyn Error>> {
+        let executor = RedfishCommandExecutor::new(
+            FakeGateway::task_gone()?,
+            TestEndpointRepository {
+                endpoint: Some(managed_endpoint()?),
+            },
+            TestCredentialResolver {
+                credential: Some(resolved_credential()?),
+            },
+        );
+
+        let outcome = executor
+            .execute_update(EndpointId::generate(), &update_artifact()?, Some(" \t"))
+            .await?;
+
+        assert_eq!(
+            outcome,
+            CommandOutcome::Rejected,
+            "an unrepresentable push URI is a provable refusal, never a dispatch"
+        );
+        Ok(())
     }
 
     #[tokio::test]

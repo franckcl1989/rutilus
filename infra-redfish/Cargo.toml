@@ -6,7 +6,13 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-nv-redfish.workspace = true
+# The `update-service-deprecated` feature gates the upstream `HttpPushUri`
+# raw-binary upload surface (`HttpPushUriUpdateRequest`/`Bmc::http_push_uri_update`).
+# §0.4.0 requires "上游保留的 Legacy Update 兼容" and §14.3 chooses between
+# multipart and the endpoint's public push interface, so the deprecated
+# upload surface is compiled in with the rest of the 0.13.0 baseline.
+nv-redfish = { workspace = true, features = ["update-service-deprecated"] }
+futures-util = { version = "0.3.32", features = ["io"] }
 reqwest.workspace = true
 rutilus-application.workspace = true
 rutilus-domain.workspace = true

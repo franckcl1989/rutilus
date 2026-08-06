@@ -15,6 +15,7 @@ pub use redfish_gateway::{
     CommandVerificationOutcome, CoreEndpointDiscovery, CoreResourceProjection,
     CoreResourceReadError, RedfishGateway, RedfishServiceRootError, ServiceRootSummary,
     TaskMessageObservation, TaskObservation, TaskReadError, TlsIdentityStateError,
+    UpdateArtifactUpload,
 };
 pub use tls_probe::{
     SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,
