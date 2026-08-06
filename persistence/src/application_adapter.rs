@@ -8,14 +8,17 @@ use rutilus_domain::{
     AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, Operation,
     OperationId, OperationState, ResourceSnapshot,
 };
-use rutilus_operation_engine::{BoundaryFuture as OperationBoundaryFuture, OperationStore};
+use rutilus_operation_engine::{
+    BoundaryFuture as OperationBoundaryFuture, OperationStore, RemoteTask, RemoteTaskState,
+    RemoteTaskStore,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
     AuditRepositoryError, CredentialRepositoryError, EndpointCapabilityRepositoryError,
     EndpointRepositoryError, NewResourceSnapshot, OperationRepositoryError,
-    ResourceSnapshotRepositoryError, SqliteStore,
+    RemoteTaskRepositoryError, ResourceSnapshotRepositoryError, SqliteStore,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -165,6 +168,31 @@ impl OperationStore for SqliteStore {
     }
 }
 
+impl RemoteTaskStore for SqliteStore {
+    type Error = RemoteTaskRepositoryError;
+
+    fn save_remote_task<'a>(
+        &'a self,
+        task: &'a RemoteTask,
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::save_remote_task(self, task).await })
+    }
+
+    fn find_remote_task(
+        &self,
+        operation_id: OperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<RemoteTask>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_remote_task(self, operation_id).await })
+    }
+
+    fn list_remote_tasks_by_state(
+        &self,
+        state: RemoteTaskState,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<RemoteTask>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_remote_tasks_by_state(self, state).await })
+    }
+}
+
 impl EndpointInventoryRepository for SqliteStore {
     type Error = EndpointInventoryPersistenceError;
 
@@ -251,7 +279,9 @@ mod tests {
         ResourceFeature, ResourceODataId, ResourceSnapshotPayload, SystemCommand, TargetId,
         TlsCertificate, TlsTrust,
     };
-    use rutilus_operation_engine::{OperationEngine, OperationStore};
+    use rutilus_operation_engine::{
+        OperationEngine, OperationStore, RemoteTask, RemoteTaskState, RemoteTaskStore, TaskUri,
+    };
     use rutilus_security::{MasterKey, encrypt_credential};
     use secrecy::SecretString;
     use time::{Duration, OffsetDateTime};
@@ -747,6 +777,67 @@ mod tests {
                 .await?
                 .len(),
             1
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_remote_task_store_boundary() -> Result<(), Box<dyn Error>> {
+        fn assert_repository<Repository: RemoteTaskStore>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let created_at = OffsetDateTime::now_utc();
+        let operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Site,
+            vec![OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            created_at,
+        );
+        OperationStore::create_operation(&store, &operation).await?;
+        let operation_id = operation.id();
+
+        // The boundary saves the acceptance record (§13.6), and the poll
+        // update replaces it through the same boundary call.
+        let acceptance = RemoteTask::new(
+            operation_id,
+            EndpointId::generate(),
+            TaskUri::parse("/redfish/v1/TaskService/Tasks/7")?,
+            None,
+            created_at,
+        );
+        RemoteTaskStore::save_remote_task(&store, &acceptance).await?;
+        assert_eq!(
+            RemoteTaskStore::find_remote_task(&store, operation_id).await?,
+            Some(acceptance.clone())
+        );
+        let observed = RemoteTask::try_from_parts(
+            operation_id,
+            acceptance.endpoint_id(),
+            acceptance.task_uri().clone(),
+            None,
+            RemoteTaskState::Running,
+            Some("power cycle in progress".to_owned()),
+            Some(40),
+            created_at + Duration::SECOND,
+        )?;
+        RemoteTaskStore::save_remote_task(&store, &observed).await?;
+        assert_eq!(
+            RemoteTaskStore::list_remote_tasks_by_state(&store, RemoteTaskState::Running).await?,
+            [observed]
+        );
+        assert!(
+            RemoteTaskStore::list_remote_tasks_by_state(&store, RemoteTaskState::Completed)
+                .await?
+                .is_empty()
         );
 
         store.close().await?;
