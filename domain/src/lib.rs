@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt, str::FromStr};
 
+mod artifact;
 mod audit;
 mod capability;
 mod credential;
@@ -12,6 +13,10 @@ mod operation;
 mod redfish_command;
 mod resource_snapshot;
 
+pub use artifact::{
+    Artifact, ArtifactError, ArtifactName, ArtifactNameError, ArtifactRestoreError, ArtifactState,
+    ArtifactStateParseError, Sha256Hex, Sha256HexParseError,
+};
 pub use audit::{
     AuditAction, AuditActor, AuditCodeParseError, AuditEvent, AuditEventError, AuditFailure,
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOutcome,
@@ -35,8 +40,8 @@ pub use endpoint::{
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{
-    AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, OperationId,
-    ResourceId, TargetId,
+    ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
+    OperationId, ResourceId, TargetId,
 };
 pub use operation::{
     InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,

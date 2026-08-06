@@ -85,12 +85,20 @@ define_id!(
      endpoint instance) that an operation acts on; an `OperationTarget`\n\
      binds it to the endpoint that actually receives the Redfish request."
 );
+define_id!(
+    ArtifactId,
+    "The stable identity of one persisted firmware artifact (§9.3, §14.3).\n\n\
+     The identity of the `artifacts` row that drives the §14.3 firmware\n\
+     upload flow. The artifact file on disk is named after this identity by\n\
+     the persistence `artifact_file_path` contract, so the row and the bytes\n\
+     always link deterministically."
+);
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, OperationId,
-        ResourceId, TargetId,
+        ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
+        OperationId, ResourceId, TargetId,
     };
 
     #[test]
@@ -152,6 +160,15 @@ mod tests {
         assert_eq!(target.into_uuid().get_version_num(), 7);
         assert_eq!(operation.to_string().parse::<OperationId>()?, operation);
         assert_eq!(target.to_string().parse::<TargetId>()?, target);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_identifier_is_uuid_v7_and_round_trips() -> Result<(), uuid::Error> {
+        let artifact = ArtifactId::generate();
+
+        assert_eq!(artifact.into_uuid().get_version_num(), 7);
+        assert_eq!(artifact.to_string().parse::<ArtifactId>()?, artifact);
         Ok(())
     }
 }
