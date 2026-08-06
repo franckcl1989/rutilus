@@ -246,8 +246,9 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // The 0.2 resource families mirror the server-side counts
             // contract: they render as cards in the resource list, while the
             // three-line counts summary keeps its 0.1 wire shape. The
-            // Power/Thermal/Sensors/Controls telemetry families follow the
-            // same rule.
+            // Power/Thermal/Sensors/Controls telemetry families and the
+            // LogServices/ManagerNetworkProtocol/HostInterfaces manager
+            // surface follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
@@ -261,7 +262,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Power { .. }
             | CoreResourceDetailsResponse::Thermal { .. }
             | CoreResourceDetailsResponse::Sensor { .. }
-            | CoreResourceDetailsResponse::Control { .. } => {}
+            | CoreResourceDetailsResponse::Control { .. }
+            | CoreResourceDetailsResponse::LogService { .. }
+            | CoreResourceDetailsResponse::ManagerNetworkProtocol { .. }
+            | CoreResourceDetailsResponse::HostInterface { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -333,6 +337,11 @@ fn card_facts(
         CoreResourceDetailsResponse::Thermal { .. } => thermal_card_facts(resource),
         CoreResourceDetailsResponse::Sensor { .. } => sensor_card_facts(resource),
         CoreResourceDetailsResponse::Control { .. } => control_card_facts(resource),
+        CoreResourceDetailsResponse::LogService { .. } => log_service_card_facts(resource),
+        CoreResourceDetailsResponse::ManagerNetworkProtocol { .. } => {
+            manager_network_protocol_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::HostInterface { .. } => host_interface_card_facts(resource),
     }
 }
 
@@ -842,6 +851,92 @@ fn control_card_facts(
     push_f64_fact(&mut facts, "Set point", *set_point);
     push_status_facts(&mut facts, status.as_ref());
     ("Control", facts)
+}
+
+/// Facts for a §2.1 log-service card; the service-enabled flag renders as
+/// Yes/No and the record capacity stays numeric as published so the card
+/// renders the log service without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `LogService` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn log_service_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::LogService {
+        service_enabled,
+        max_log_entries,
+        status,
+    } = resource
+    else {
+        return ("Log Service", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Service enabled",
+        service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_u64_fact(&mut facts, "Max records", *max_log_entries);
+    push_status_facts(&mut facts, status.as_ref());
+    ("Log Service", facts)
+}
+
+/// Facts for a §2.1 manager-network-protocol card; the direct `HostName` and
+/// `FQDN` metadata properties render as published (the per-protocol sections
+/// stay out of the strictly projectable field set).
+///
+/// The dispatcher guarantees this receives the `ManagerNetworkProtocol`
+/// variant; the fallback keeps a stable empty facts list instead of panicking
+/// if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn manager_network_protocol_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::ManagerNetworkProtocol {
+        host_name,
+        fqdn,
+        status,
+    } = resource
+    else {
+        return ("Manager Network Protocol", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Host name", host_name.as_deref());
+    push_fact(&mut facts, "FQDN", fqdn.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Manager Network Protocol", facts)
+}
+
+/// Facts for a §2.1 host-interface card; the interface-enabled flag renders
+/// as Yes/No and the resource-level status values follow. The
+/// `HostInterface_v1` schema declares no `HostName` property (host identity
+/// lives in the linked host/manager ethernet interfaces), so the card
+/// identifies the interface through the common name and the interface state.
+///
+/// The dispatcher guarantees this receives the `HostInterface` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn host_interface_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::HostInterface {
+        interface_enabled,
+        status,
+    } = resource
+    else {
+        return ("Host Interface", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Interface enabled",
+        interface_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Host Interface", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3938,7 +4033,10 @@ mod tests {
                             power_resource(),
                             thermal_resource(),
                             sensor_resource(),
-                            control_resource()
+                            control_resource(),
+                            log_service_resource(),
+                            manager_network_protocol_resource(),
+                            host_interface_resource()
                         ]
                     }
                 }
@@ -4481,6 +4579,89 @@ mod tests {
         })
     }
 
+    fn log_service_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e2",
+                "odata_id": "/redfish/v1/Managers/1/LogServices/1",
+                "odata_type": "#LogService.v1_9_0.LogService",
+                "etag": "W/\"log-service-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "BMC Event Log",
+                "description": "Manager event log"
+            },
+            "resource": {
+                "resource_type": "log_service",
+                "details": {
+                    "service_enabled": true,
+                    "max_log_entries": 1000,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn manager_network_protocol_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e3",
+                "odata_id": "/redfish/v1/Managers/1/NetworkProtocol",
+                "odata_type": "#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol",
+                "etag": "W/\"network-protocol-1\""
+            },
+            "common": {
+                "id": "NetworkProtocol",
+                "name": "Manager Network Protocol",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "manager_network_protocol",
+                "details": {
+                    "host_name": "bmc-1",
+                    "fqdn": "bmc-1.example.com",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn host_interface_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e4",
+                "odata_id": "/redfish/v1/Managers/1/HostInterfaces/1",
+                "odata_type": "#HostInterface.v1_3_3.HostInterface",
+                "etag": "W/\"host-interface-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Host Interface One",
+                "description": "Manager host interface"
+            },
+            "resource": {
+                "resource_type": "host_interface",
+                "details": {
+                    "interface_enabled": true,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
     fn capability_inventory(
         states: &[Option<&str>],
     ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
@@ -4554,7 +4735,7 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 17);
+        assert_eq!(current.resources.len(), 20);
         let system = current
             .resources
             .iter()
@@ -5584,6 +5765,92 @@ mod tests {
                 .any(|fact| fact.label == "Set point units")
         );
         assert!(control.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_services_manager_network_protocol_and_host_interfaces_cards_render_family_facts()
+    -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let log_service = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Log Service")
+            .ok_or("log service resource must exist")?;
+        assert_eq!(log_service.name, "BMC Event Log");
+        assert_eq!(log_service.source, "/redfish/v1/Managers/1/LogServices/1");
+        assert!(log_service.facts.contains(&ResourceFactProjection {
+            label: "Service enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(log_service.facts.contains(&ResourceFactProjection {
+            label: "Max records",
+            value: "1000".to_owned(),
+        }));
+        assert!(log_service.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let network_protocol = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Manager Network Protocol")
+            .ok_or("manager network protocol resource must exist")?;
+        assert_eq!(network_protocol.name, "Manager Network Protocol");
+        assert_eq!(
+            network_protocol.source,
+            "/redfish/v1/Managers/1/NetworkProtocol"
+        );
+        assert!(network_protocol.facts.contains(&ResourceFactProjection {
+            label: "Host name",
+            value: "bmc-1".to_owned(),
+        }));
+        assert!(network_protocol.facts.contains(&ResourceFactProjection {
+            label: "FQDN",
+            value: "bmc-1.example.com".to_owned(),
+        }));
+        assert!(network_protocol.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        let host_interface = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Host Interface")
+            .ok_or("host interface resource must exist")?;
+        assert_eq!(host_interface.name, "Host Interface One");
+        assert_eq!(
+            host_interface.source,
+            "/redfish/v1/Managers/1/HostInterfaces/1"
+        );
+        assert!(host_interface.facts.contains(&ResourceFactProjection {
+            label: "Interface enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(
+            !host_interface
+                .facts
+                .iter()
+                .any(|fact| fact.label == "Host interface type")
+        );
+        assert!(host_interface.facts.contains(&ResourceFactProjection {
             label: "State",
             value: "Enabled".to_owned(),
         }));
