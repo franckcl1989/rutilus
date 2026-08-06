@@ -5,6 +5,7 @@ mod initialization_runtime;
 mod onboarding_runtime;
 mod scheduler;
 mod standalone_runtime;
+mod telemetry_sampler;
 
 pub use initialization_runtime::{
     InitializationError, InitializationOutcome, StandaloneUnlock, StandaloneUnlockError,
