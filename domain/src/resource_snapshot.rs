@@ -41,6 +41,22 @@ pub enum ResourceFeature {
     /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
     /// product code so both inventories address the same wire surface.
     EthernetInterfaces,
+    /// The §2.1 `accounts` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Accounts,
+    /// The §2.1 `bios` feature, added as a typed resource family in the 0.2
+    /// snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Bios,
+    /// The §2.1 `boot-options` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    BootOptions,
+    /// The §2.1 `secure-boot` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    SecureBoot,
 }
 
 impl ResourceFeature {
@@ -57,6 +73,10 @@ impl ResourceFeature {
             Self::Storages => "storages",
             Self::NetworkAdapters => "network-adapters",
             Self::EthernetInterfaces => "ethernet-interfaces",
+            Self::Accounts => "accounts",
+            Self::Bios => "bios",
+            Self::BootOptions => "boot-options",
+            Self::SecureBoot => "secure-boot",
         }
     }
 }
@@ -81,6 +101,10 @@ impl FromStr for ResourceFeature {
             "storages" => Ok(Self::Storages),
             "network-adapters" => Ok(Self::NetworkAdapters),
             "ethernet-interfaces" => Ok(Self::EthernetInterfaces),
+            "accounts" => Ok(Self::Accounts),
+            "bios" => Ok(Self::Bios),
+            "boot-options" => Ok(Self::BootOptions),
+            "secure-boot" => Ok(Self::SecureBoot),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -625,6 +649,10 @@ mod tests {
             ResourceFeature::Storages,
             ResourceFeature::NetworkAdapters,
             ResourceFeature::EthernetInterfaces,
+            ResourceFeature::Accounts,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
         ];
 
         for feature in features {
@@ -655,6 +683,13 @@ mod tests {
                 ResourceFeature::EthernetInterfaces,
                 EndpointCapability::EthernetInterfaces,
             ),
+            (ResourceFeature::Accounts, EndpointCapability::Accounts),
+            (ResourceFeature::Bios, EndpointCapability::Bios),
+            (
+                ResourceFeature::BootOptions,
+                EndpointCapability::BootOptions,
+            ),
+            (ResourceFeature::SecureBoot, EndpointCapability::SecureBoot),
         ];
         for (feature, capability) in families {
             assert_eq!(feature.as_str(), capability.as_str());
@@ -688,6 +723,19 @@ mod tests {
             "Storages",
             "NetworkAdapters",
             "EthernetInterfaces",
+            "account",
+            "accounts/",
+            "Accounts",
+            "bios/",
+            "BIOS",
+            "bios-config",
+            "boot-option",
+            "boot-options/",
+            "bootoptions",
+            "BootOptions",
+            "secure-boot/",
+            "secureboot",
+            "SecureBoot",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
