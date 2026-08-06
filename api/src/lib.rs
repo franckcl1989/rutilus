@@ -508,6 +508,13 @@ impl EndpointIdentityResponse {
 }
 
 /// Counts from one latest complete core-resource Generation.
+///
+/// The three fields deliberately cover only the 0.1 management triad
+/// (Systems, Chassis, Managers). The 0.2 resource families (Processors,
+/// Memory, and later Storage, Network, Accounts) are presented through the
+/// typed resource-inventory API instead of this summary, so the endpoint
+/// card remains a stable three-line overview while new families ship
+/// without changing the counts wire shape.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreResourceCountsResponse {
@@ -791,6 +798,27 @@ pub enum CoreResourceDetailsResponse {
         firmware_version: Option<String>,
         version: Option<String>,
         power_state: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `processors` family member projected from the typed Redfish
+    /// processor schema. `total_cores` stays numeric so the console can
+    /// render a core count without re-parsing text.
+    Processor {
+        processor_type: Option<String>,
+        socket: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        total_cores: Option<u64>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `memory` family member projected from the typed Redfish
+    /// memory schema. `capacity_mib` stays numeric so the console can render
+    /// a capacity without re-parsing text.
+    Memory {
+        memory_device_type: Option<String>,
+        capacity_mib: Option<u64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
         status: Option<ResourceStatusResponse>,
     },
 }
@@ -2011,6 +2039,165 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn core_resource_contract_carries_processor_wire_values() -> Result<(), Box<dyn Error>> {
+        let processor = processor_resource();
+
+        assert_eq!(
+            serde_json::to_value(&processor)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789ce",
+                    "odata_id": "/redfish/v1/Systems/1/Processors/CPU1",
+                    "odata_type": "#Processor.v1_15_0.Processor",
+                    "etag": "W/\"cpu-1\""
+                },
+                "common": {
+                    "id": "CPU1",
+                    "name": "Processor One",
+                    "description": "Primary compute processor"
+                },
+                "resource": {
+                    "resource_type": "processor",
+                    "details": {
+                        "processor_type": "CPU",
+                        "socket": "LGA4189",
+                        "manufacturer": "Vendor A",
+                        "model": "EPYC Model X",
+                        "total_cores": 64,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&processor)?)?,
+            processor
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "processor",
+                "details": {
+                    "processor_type": null,
+                    "socket": null,
+                    "manufacturer": null,
+                    "model": null,
+                    "total_cores": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_memory_wire_values() -> Result<(), Box<dyn Error>> {
+        let memory = memory_resource();
+
+        assert_eq!(
+            serde_json::to_value(&memory)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789cf",
+                    "odata_id": "/redfish/v1/Systems/1/Memory/DIMM1",
+                    "odata_type": "#Memory.v1_15_0.Memory",
+                    "etag": null
+                },
+                "common": {
+                    "id": "DIMM1",
+                    "name": "Memory Module One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "memory",
+                    "details": {
+                        "memory_device_type": "DDR4",
+                        "capacity_mib": 32768,
+                        "manufacturer": "Vendor B",
+                        "model": "MEM-32G",
+                        "status": null
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&memory)?)?,
+            memory
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "memory",
+                "details": {
+                    "memory_device_type": null,
+                    "capacity_mib": null,
+                    "manufacturer": null,
+                    "model": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn processor_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789ce"),
+                "/redfish/v1/Systems/1/Processors/CPU1".to_owned(),
+                Some("#Processor.v1_15_0.Processor".to_owned()),
+                Some("W/\"cpu-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "CPU1".to_owned(),
+                "Processor One".to_owned(),
+                Some("Primary compute processor".to_owned()),
+            ),
+            CoreResourceDetailsResponse::Processor {
+                processor_type: Some("CPU".to_owned()),
+                socket: Some("LGA4189".to_owned()),
+                manufacturer: Some("Vendor A".to_owned()),
+                model: Some("EPYC Model X".to_owned()),
+                total_cores: Some(64),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn memory_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789cf"),
+                "/redfish/v1/Systems/1/Memory/DIMM1".to_owned(),
+                Some("#Memory.v1_15_0.Memory".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "DIMM1".to_owned(),
+                "Memory Module One".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Memory {
+                memory_device_type: Some("DDR4".to_owned()),
+                capacity_mib: Some(32768),
+                manufacturer: Some("Vendor B".to_owned()),
+                model: Some("MEM-32G".to_owned()),
+                status: None,
+            },
+        )
     }
 
     #[test]
