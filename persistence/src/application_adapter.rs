@@ -1,7 +1,7 @@
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CredentialInventoryRepository, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
-    EndpointRefreshRepository, ResourceObservation,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CredentialInventoryRepository,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryItemError,
+    EndpointInventoryRepository, EndpointRefreshRepository, ResourceObservation, StoredCapability,
 };
 use rutilus_domain::{
     AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
@@ -10,8 +10,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    AuditRepositoryError, CredentialRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
-    ResourceSnapshotRepositoryError, SqliteStore,
+    AuditRepositoryError, CredentialRepositoryError, EndpointCapabilityRepositoryError,
+    EndpointRepositoryError, NewResourceSnapshot, ResourceSnapshotRepositoryError, SqliteStore,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -25,6 +25,27 @@ impl AuditEventWriter for SqliteStore {
         event: &'a AuditEvent,
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move { SqliteStore::append_audit_event(self, event).await })
+    }
+}
+
+impl CapabilityQueryRepository for SqliteStore {
+    type Error = EndpointCapabilityRepositoryError;
+
+    fn find_endpoint_capabilities(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+        Box::pin(async move {
+            let stored = SqliteStore::find_endpoint_capabilities(self, endpoint_id).await?;
+            Ok(stored.map(|capabilities| {
+                capabilities
+                    .iter()
+                    .map(|capability| {
+                        StoredCapability::new(capability.observation(), capability.observed_at())
+                    })
+                    .collect()
+            }))
+        })
     }
 }
 
@@ -155,20 +176,22 @@ mod tests {
     use std::error::Error;
 
     use rutilus_application::{
-        AuditEventWriter, CredentialInventoryQuery, CredentialInventoryRepository,
-        DiscoveredEndpointRepository, EndpointInventoryQuery, EndpointInventoryRepository,
-        EndpointRefreshRepository, ResourceObservation,
+        AuditEventWriter, CapabilityQueryRepository, CredentialInventoryQuery,
+        CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointCapabilityQuery,
+        EndpointInventoryQuery, EndpointInventoryRepository, EndpointRefreshRepository,
+        ResourceObservation,
     };
     use rutilus_domain::{
         AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
-        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CredentialId, CredentialName,
-        CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
+        AuditParameterSummary, AuditRedfishOperation, AuditTarget, CAPABILITY_LEDGER_ORDER,
+        CapabilityState, CredentialId, CredentialName, CredentialUsername, CredentialVersionId,
+        DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
         EndpointDisplayName, EndpointId, ProductPermission, ResourceFeature, ResourceODataId,
         ResourceSnapshotPayload, TlsCertificate, TlsTrust,
     };
     use rutilus_security::{MasterKey, encrypt_credential};
     use secrecy::SecretString;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
 
     use crate::{
         EndpointRefreshPersistenceError, EndpointRepositoryError, NewCredential,
@@ -365,6 +388,133 @@ mod tests {
             created_at,
         )?;
         Ok((endpoint, observed_at))
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_merges_the_complete_capability_ledger_at_the_boundary()
+    -> Result<(), Box<dyn Error>> {
+        fn assert_repository<Repository: CapabilityQueryRepository>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let (endpoint, created_at) = capability_endpoint(&store).await?;
+        store.create_endpoint(endpoint.clone()).await?;
+        let endpoint_id = endpoint.id();
+
+        // An existing endpoint with no completed probe still yields the
+        // complete unobserved ledger, never a missing result.
+        let unobserved = EndpointCapabilityQuery::new(&store, endpoint_id)
+            .execute()
+            .await?
+            .ok_or("endpoint capabilities are missing")?;
+        assert_eq!(unobserved.len(), CAPABILITY_LEDGER_ORDER.len());
+        assert!(
+            unobserved
+                .iter()
+                .zip(CAPABILITY_LEDGER_ORDER)
+                .all(|(entry, capability)| {
+                    entry.capability() == capability
+                        && entry.state().is_none()
+                        && entry.observed_at().is_none()
+                }),
+            "an unobserved endpoint must still expose the complete §2.1 ledger"
+        );
+
+        let observed_at = created_at + Duration::SECOND;
+        store
+            .replace_endpoint_capabilities(endpoint_id, &all_capability_observations(), observed_at)
+            .await?;
+        let observed = EndpointCapabilityQuery::new(&store, endpoint_id)
+            .execute()
+            .await?
+            .ok_or("endpoint capabilities are missing")?;
+        assert_eq!(observed.len(), CAPABILITY_LEDGER_ORDER.len());
+        assert!(
+            observed
+                .iter()
+                .zip(CAPABILITY_LEDGER_ORDER)
+                .all(|(entry, capability)| {
+                    entry.capability() == capability
+                        && entry.observed_at() == Some(observed_at)
+                        && entry.state().is_some()
+                }),
+            "every compiled capability must read back in §2.1 ledger order with its observed state"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .find(|entry| entry.capability()
+                    == rutilus_domain::EndpointCapability::SessionService)
+                .ok_or("session-service entry is missing")?
+                .classification(),
+            rutilus_domain::CapabilityClassification::Infrastructure
+        );
+
+        // An unknown endpoint stays distinguishable from an unobserved one.
+        assert!(
+            EndpointCapabilityQuery::new(&store, EndpointId::generate())
+                .execute()
+                .await?
+                .is_none()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    async fn capability_endpoint(
+        store: &SqliteStore,
+    ) -> Result<(Endpoint, OffsetDateTime), Box<dyn Error>> {
+        let credential_id = CredentialId::generate();
+        let version_id = CredentialVersionId::generate();
+        let key = MasterKey::from_boxed_bytes(Box::new([0x63; 32]));
+        let secret = SecretString::from(String::from("capability test secret"));
+        let protected = encrypt_credential(&key, credential_id, version_id, &secret)?;
+        store
+            .create_credential(NewCredential::new(
+                CredentialName::parse("Capability credential")?,
+                CredentialUsername::parse("administrator")?,
+                protected,
+            ))
+            .await?;
+        let created_at = OffsetDateTime::now_utc();
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Capability BMC")?,
+            EndpointAddress::parse("https://192.0.2.82")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(b"capability certificate".to_vec())?,
+                trusted_at: created_at,
+            },
+            credential_id,
+            created_at,
+            created_at,
+        )?;
+        Ok((endpoint, created_at))
+    }
+
+    /// Every `EndpointCapability` variant with a deterministic state, so the
+    /// boundary round-trip proves the complete compiled surface survives
+    /// persistence and the §2.1 ledger order is restored by the query.
+    fn all_capability_observations() -> Vec<EndpointCapabilityObservation> {
+        const STATES: [CapabilityState; 7] = [
+            CapabilityState::Supported,
+            CapabilityState::ReadOnly,
+            CapabilityState::Unauthorized,
+            CapabilityState::TemporarilyUnavailable,
+            CapabilityState::SchemaIncompatible,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotCompiled,
+        ];
+        CAPABILITY_LEDGER_ORDER
+            .into_iter()
+            .enumerate()
+            .map(|(index, capability)| {
+                EndpointCapabilityObservation::new(capability, STATES[index % STATES.len()])
+            })
+            .collect()
     }
 
     #[tokio::test]
