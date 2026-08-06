@@ -33,7 +33,7 @@ enum ConsoleLoadFailure {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ConsoleData {
     about: AboutResponse,
     inventory: EndpointInventoryResponse,
@@ -41,7 +41,7 @@ struct ConsoleData {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum ConsoleLoadState {
     Loading,
     Ready(ConsoleData),
@@ -245,7 +245,9 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
         match resource.resource() {
             // The 0.2 resource families mirror the server-side counts
             // contract: they render as cards in the resource list, while the
-            // three-line counts summary keeps its 0.1 wire shape.
+            // three-line counts summary keeps its 0.1 wire shape. The
+            // Power/Thermal/Sensors/Controls telemetry families follow the
+            // same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
@@ -255,7 +257,11 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Account { .. }
             | CoreResourceDetailsResponse::Bios { .. }
             | CoreResourceDetailsResponse::BootOption { .. }
-            | CoreResourceDetailsResponse::SecureBoot { .. } => {}
+            | CoreResourceDetailsResponse::SecureBoot { .. }
+            | CoreResourceDetailsResponse::Power { .. }
+            | CoreResourceDetailsResponse::Thermal { .. }
+            | CoreResourceDetailsResponse::Sensor { .. }
+            | CoreResourceDetailsResponse::Control { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -323,6 +329,10 @@ fn card_facts(
         CoreResourceDetailsResponse::Bios { .. } => bios_card_facts(resource),
         CoreResourceDetailsResponse::BootOption { .. } => boot_option_card_facts(resource),
         CoreResourceDetailsResponse::SecureBoot { .. } => secure_boot_card_facts(resource),
+        CoreResourceDetailsResponse::Power { .. } => power_card_facts(resource),
+        CoreResourceDetailsResponse::Thermal { .. } => thermal_card_facts(resource),
+        CoreResourceDetailsResponse::Sensor { .. } => sensor_card_facts(resource),
+        CoreResourceDetailsResponse::Control { .. } => control_card_facts(resource),
     }
 }
 
@@ -746,6 +756,94 @@ fn secure_boot_card_facts(
     ("Secure Boot", facts)
 }
 
+/// Facts for a §2.1 power card. The `Power_v1` projection carries no
+/// details (the schema declares no `Status` and no reading or metadata
+/// properties of its own), so the card renders the common identity only.
+///
+/// The dispatcher guarantees this receives the `Power` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn power_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Power {} = resource else {
+        return ("Power", Vec::new());
+    };
+    ("Power", Vec::new())
+}
+
+/// Facts for a §2.1 thermal card; only the resource-level status values are
+/// projectable, because temperature readings exist only on nested
+/// `Temperatures` members.
+///
+/// The dispatcher guarantees this receives the `Thermal` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn thermal_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Thermal { status } = resource else {
+        return ("Thermal", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_status_facts(&mut facts, status.as_ref());
+    ("Thermal", facts)
+}
+
+/// Facts for a §2.1 sensors card; the reading and its UCUM units stay as
+/// published so the card renders the sensor without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `Sensor` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sensor_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Sensor {
+        reading_type,
+        reading,
+        reading_units,
+        status,
+    } = resource
+    else {
+        return ("Sensor", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Reading type", reading_type.as_deref());
+    push_f64_fact(&mut facts, "Reading", *reading);
+    push_fact(&mut facts, "Reading units", reading_units.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Sensor", facts)
+}
+
+/// Facts for a §2.1 controls card; the set point stays numeric as published
+/// so the card renders the control without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `Control` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn control_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Control {
+        control_type,
+        set_point,
+        status,
+    } = resource
+    else {
+        return ("Control", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Control type", control_type.as_deref());
+    push_f64_fact(&mut facts, "Set point", *set_point);
+    push_status_facts(&mut facts, status.as_ref());
+    ("Control", facts)
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn push_hardware_facts(
     facts: &mut Vec<ResourceFactProjection>,
@@ -776,6 +874,19 @@ fn push_status_facts(
 /// Renders one numeric resource fact only when a value exists, keeping the
 /// facts list free of placeholder text for absent observations.
 fn push_u64_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value: Option<u64>) {
+    if let Some(value) = value {
+        facts.push(ResourceFactProjection {
+            label,
+            value: value.to_string(),
+        });
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders one decimal resource fact (a telemetry reading or set point) only
+/// when a value exists, keeping the facts list free of placeholder text for
+/// absent observations.
+fn push_f64_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value: Option<f64>) {
     if let Some(value) = value {
         facts.push(ResourceFactProjection {
             label,
@@ -3823,7 +3934,11 @@ mod tests {
                             account_resource(),
                             bios_resource(),
                             boot_option_resource(),
-                            secure_boot_resource()
+                            secure_boot_resource(),
+                            power_resource(),
+                            thermal_resource(),
+                            sensor_resource(),
+                            control_resource()
                         ]
                     }
                 }
@@ -4263,6 +4378,109 @@ mod tests {
             .collect()
     }
 
+    fn power_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789dd",
+                "odata_id": "/redfish/v1/Chassis/1/Power",
+                "odata_type": "#Power.v1_17_0.Power",
+                "etag": "W/\"power-1\""
+            },
+            "common": {
+                "id": "Power",
+                "name": "Power",
+                "description": "Chassis power control"
+            },
+            "resource": {
+                "resource_type": "power",
+                "details": {}
+            }
+        })
+    }
+
+    fn thermal_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789de",
+                "odata_id": "/redfish/v1/Chassis/1/Thermal",
+                "odata_type": "#Thermal.v1_7_2.Thermal",
+                "etag": "W/\"thermal-1\""
+            },
+            "common": {
+                "id": "Thermal",
+                "name": "Thermal",
+                "description": "Chassis temperature and fan monitoring"
+            },
+            "resource": {
+                "resource_type": "thermal",
+                "details": {
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn sensor_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789df",
+                "odata_id": "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                "odata_type": "#Sensor.v1_9_0.Sensor",
+                "etag": "W/\"sensor-inlet-1\""
+            },
+            "common": {
+                "id": "InletTemp",
+                "name": "Chassis Inlet Temperature",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "sensor",
+                "details": {
+                    "reading_type": "Temperature",
+                    "reading": 27.5,
+                    "reading_units": "Cel",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn control_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e0",
+                "odata_id": "/redfish/v1/Chassis/1/Controls/FanDuty",
+                "odata_type": "#Control.v1_3_0.Control",
+                "etag": "W/\"control-fan-1\""
+            },
+            "common": {
+                "id": "FanDuty",
+                "name": "Chassis Fan Duty",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "control",
+                "details": {
+                    "control_type": "DutyCycle",
+                    "set_point": 30.0,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
     fn capability_inventory(
         states: &[Option<&str>],
     ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
@@ -4336,7 +4554,7 @@ mod tests {
             })
         );
         assert!(waiting.resources.is_empty());
-        assert_eq!(current.resources.len(), 13);
+        assert_eq!(current.resources.len(), 17);
         let system = current
             .resources
             .iter()
@@ -5286,6 +5504,97 @@ mod tests {
             ImportState::Failed(ImportFailure::Unavailable),
             ImportState::Failed(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn power_thermal_sensors_and_controls_cards_render_family_facts() -> Result<(), Box<dyn Error>>
+    {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let power = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Power")
+            .ok_or("power resource must exist")?;
+        assert_eq!(power.name, "Power");
+        assert_eq!(power.source, "/redfish/v1/Chassis/1/Power");
+        assert!(
+            power.facts.iter().all(|fact| fact.label == "Redfish ID"),
+            "the Power projection carries no family facts"
+        );
+        let thermal = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Thermal")
+            .ok_or("thermal resource must exist")?;
+        assert_eq!(thermal.name, "Thermal");
+        assert_eq!(thermal.source, "/redfish/v1/Chassis/1/Thermal");
+        assert!(thermal.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let sensor = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Sensor")
+            .ok_or("sensor resource must exist")?;
+        assert_eq!(sensor.name, "Chassis Inlet Temperature");
+        assert_eq!(sensor.source, "/redfish/v1/Chassis/1/Sensors/InletTemp");
+        assert!(sensor.facts.contains(&ResourceFactProjection {
+            label: "Reading type",
+            value: "Temperature".to_owned(),
+        }));
+        assert!(sensor.facts.contains(&ResourceFactProjection {
+            label: "Reading",
+            value: "27.5".to_owned(),
+        }));
+        assert!(sensor.facts.contains(&ResourceFactProjection {
+            label: "Reading units",
+            value: "Cel".to_owned(),
+        }));
+        assert!(sensor.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let control = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Control")
+            .ok_or("control resource must exist")?;
+        assert_eq!(control.name, "Chassis Fan Duty");
+        assert_eq!(control.source, "/redfish/v1/Chassis/1/Controls/FanDuty");
+        assert!(control.facts.contains(&ResourceFactProjection {
+            label: "Control type",
+            value: "DutyCycle".to_owned(),
+        }));
+        assert!(control.facts.contains(&ResourceFactProjection {
+            label: "Set point",
+            value: "30".to_owned(),
+        }));
+        assert!(
+            !control
+                .facts
+                .iter()
+                .any(|fact| fact.label == "Set point units")
+        );
+        assert!(control.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
         Ok(())
     }
 
