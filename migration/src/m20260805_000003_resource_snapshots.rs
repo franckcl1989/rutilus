@@ -72,6 +72,13 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "pcie-devices",
                         "assembly",
                         "software-inventory",
+                        "event-service",
+                        "event-subscription",
+                        "telemetry-service",
+                        "metric-definition",
+                        "metric-report",
+                        "task-service",
+                        "task",
                     ]),
                 ))
                 .to_owned(),
