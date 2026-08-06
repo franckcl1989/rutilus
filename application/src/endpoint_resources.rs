@@ -204,6 +204,41 @@ pub enum CoreResourceDetails {
         set_point: Option<f64>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `log-services` family member (a `LogService_v1` collection
+    /// member under the manager). `service_enabled` is the direct
+    /// `ServiceEnabled` Boolean and `max_log_entries` the direct
+    /// `MaxNumberOfRecords` capacity, kept numeric so the console renders the
+    /// log service without re-parsing text; the `Entries` log-entry
+    /// collection is deliberately not counted, because that would require a
+    /// nested fetch the strictly projectable field set does not perform.
+    LogService {
+        service_enabled: Option<bool>,
+        max_log_entries: Option<u64>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `manager-network-protocol` family member (the
+    /// `ManagerNetworkProtocol_v1` manager singleton). Only the direct
+    /// `HostName` and `FQDN` metadata properties are projectable: the
+    /// per-protocol sections (`HTTP`, `HTTPS`, `SSH`, ...) are nested
+    /// `Protocol` objects, which stay out of the strictly projectable field
+    /// set exactly like `NetworkAdapter`'s `Controllers[]` array.
+    ManagerNetworkProtocol {
+        host_name: Option<String>,
+        fqdn: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `host-interfaces` family member (a `HostInterface_v1`
+    /// collection member under the manager). `interface_enabled` is the
+    /// direct `InterfaceEnabled` Boolean. The `HostInterface_v1` schema
+    /// declares no `HostName` property (host identity lives in the linked
+    /// host/manager ethernet interfaces), and the `HostInterfaceType`
+    /// enumeration is retained only in the persisted payload, so the details
+    /// carry the interface state exactly like the `Account` family carries
+    /// only its direct properties.
+    HostInterface {
+        interface_enabled: Option<bool>,
+        status: Option<ResourceStatusSummary>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -391,6 +426,11 @@ where
         ResourceFeature::Thermal => project_thermal(snapshot, payload)?,
         ResourceFeature::Sensors => project_sensor(snapshot, payload)?,
         ResourceFeature::Controls => project_control(snapshot, payload)?,
+        ResourceFeature::LogServices => project_log_service(snapshot, payload)?,
+        ResourceFeature::ManagerNetworkProtocol => {
+            project_manager_network_protocol(snapshot, payload)?
+        }
+        ResourceFeature::HostInterfaces => project_host_interface(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -738,6 +778,64 @@ where
         CoreResourceDetails::Control {
             control_type: parsed.control_type,
             set_point: parsed.set_point,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_log_service<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<LogServicePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::LogService {
+            service_enabled: parsed.service_enabled,
+            max_log_entries: parsed.max_number_of_records,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_manager_network_protocol<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ManagerNetworkProtocolPayload, _, RepositoryError>(
+        snapshot,
+        payload,
+        |parsed| CoreResourceDetails::ManagerNetworkProtocol {
+            host_name: parsed.host_name,
+            fqdn: parsed.fqdn,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        },
+    )
+}
+
+fn project_host_interface<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<HostInterfacePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::HostInterface {
+            interface_enabled: parsed.interface_enabled,
             status: parsed.status.map(ResourceStatusPayload::into_summary),
         }
     })
@@ -1303,6 +1401,87 @@ struct ControlPayload {
 }
 
 impl CommonPayload for ControlPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogServicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ServiceEnabled")]
+    service_enabled: Option<bool>,
+    #[serde(rename = "MaxNumberOfRecords")]
+    max_number_of_records: Option<u64>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for LogServicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagerNetworkProtocolPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "HostName")]
+    host_name: Option<String>,
+    #[serde(rename = "FQDN")]
+    fqdn: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for ManagerNetworkProtocolPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostInterfacePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "InterfaceEnabled")]
+    interface_enabled: Option<bool>,
+    #[serde(rename = "HostInterfaceType")]
+    _host_interface_type: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for HostInterfacePayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -1938,6 +2117,112 @@ mod tests {
             } if reading_type == "Temperature"
                 && (*reading - 27.5).abs() < f64::EPSILON
                 && units == "Cel"
+                && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_log_services_manager_network_protocol_and_host_interfaces_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(18)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::LogServices,
+                    "/redfish/v1/Managers/1/LogServices/1",
+                    r#"{"Id":"1","Name":"BMC Event Log","Description":"Manager event log","ServiceEnabled":true,"MaxNumberOfRecords":1000,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ManagerNetworkProtocol,
+                    "/redfish/v1/Managers/1/NetworkProtocol",
+                    r#"{"Id":"NetworkProtocol","Name":"Manager Network Protocol","HostName":"bmc-1","FQDN":"bmc-1.example.com","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::HostInterfaces,
+                    "/redfish/v1/Managers/1/HostInterfaces/1",
+                    r#"{"Id":"1","Name":"Host Interface One","InterfaceEnabled":true,"HostInterfaceType":"NetworkHostInterface","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.observed_at(), Some(observed_at));
+        assert_eq!(result.resources().len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the host
+        // interface sorts before the log service, which sorts before the
+        // manager network protocol singleton.
+        let host_interface = &result.resources()[1];
+        assert_eq!(host_interface.feature(), ResourceFeature::HostInterfaces);
+        assert_eq!(
+            host_interface.odata_id().as_str(),
+            "/redfish/v1/Managers/1/HostInterfaces/1"
+        );
+        assert_eq!(host_interface.common().name(), "Host Interface One");
+        assert!(matches!(
+            host_interface.details(),
+            CoreResourceDetails::HostInterface {
+                interface_enabled: Some(true),
+                status: Some(status),
+            } if status.health() == Some("OK")
+        ));
+        let log_service = &result.resources()[2];
+        assert_eq!(log_service.feature(), ResourceFeature::LogServices);
+        assert_eq!(
+            log_service.odata_id().as_str(),
+            "/redfish/v1/Managers/1/LogServices/1"
+        );
+        assert_eq!(log_service.common().name(), "BMC Event Log");
+        assert!(matches!(
+            log_service.details(),
+            CoreResourceDetails::LogService {
+                service_enabled: Some(true),
+                max_log_entries: Some(1000),
+                status: Some(status),
+            } if status.state() == Some("Enabled")
+        ));
+        let network_protocol = &result.resources()[3];
+        assert_eq!(
+            network_protocol.feature(),
+            ResourceFeature::ManagerNetworkProtocol
+        );
+        assert_eq!(
+            network_protocol.odata_id().as_str(),
+            "/redfish/v1/Managers/1/NetworkProtocol"
+        );
+        assert_eq!(network_protocol.common().name(), "Manager Network Protocol");
+        assert!(matches!(
+            network_protocol.details(),
+            CoreResourceDetails::ManagerNetworkProtocol {
+                host_name: Some(host_name),
+                fqdn: Some(fqdn),
+                status: Some(status),
+            } if host_name == "bmc-1"
+                && fqdn == "bmc-1.example.com"
                 && status.health() == Some("OK")
         ));
         Ok(())
