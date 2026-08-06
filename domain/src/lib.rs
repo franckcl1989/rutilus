@@ -13,6 +13,7 @@ mod ids;
 mod operation;
 mod redfish_command;
 mod resource_snapshot;
+mod telemetry;
 
 pub use artifact::{
     Artifact, ArtifactError, ArtifactName, ArtifactNameError, ArtifactRestoreError, ArtifactState,
@@ -63,6 +64,10 @@ pub use resource_snapshot::{
     ResourceFeatureParseError, ResourceODataId, ResourceODataIdError, ResourceODataType,
     ResourceODataTypeError, ResourceSnapshot, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError,
+};
+pub use telemetry::{
+    NonFiniteSampleValue, SeriesKey, SeriesKeyError, TelemetrySample, TelemetrySeries,
+    TelemetrySeriesId,
 };
 
 /// The execution boundary inside the single Rutilus binary.
