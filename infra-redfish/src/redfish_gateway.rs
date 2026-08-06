@@ -18,8 +18,21 @@ use nv_redfish::{
     },
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
-    core::EntityTypeRef as _,
+    core::{EntityTypeRef, NavProperty},
     manager::{Manager, ManagerCollection},
+    schema::{
+        chassis::Chassis as ChassisSchema,
+        chassis_collection::ChassisCollection as ChassisCollectionSchema,
+        computer_system::ComputerSystem as ComputerSystemSchema,
+        computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
+        manager::Manager as ManagerSchema,
+        manager_collection::ManagerCollection as ManagerCollectionSchema,
+        memory::Memory as MemorySchema,
+        memory_collection::MemoryCollection as MemoryCollectionSchema,
+        processor::Processor as ProcessorSchema,
+        processor_collection::ProcessorCollection as ProcessorCollectionSchema,
+        resource::Resource as ResourceSchema,
+    },
     session_service::{Session, SessionCreate},
 };
 use reqwest::{Client as ReqwestClient, StatusCode, redirect::Policy as RedirectPolicy};
@@ -39,7 +52,7 @@ use rutilus_domain::{
     ResourceSnapshotPayloadError, TlsIdentityChanged, TlsTrust,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::error::Category as JsonErrorCategory;
 use thiserror::Error;
 
@@ -153,11 +166,20 @@ impl RedfishGateway {
         password: &SecretString,
     ) -> Result<CoreEndpointDiscovery, RedfishServiceRootError> {
         let (bmc, http, identity) = self.authenticated_bmc(address, trust, username, password)?;
-        let root = ServiceRoot::new(bmc)
+        let root = ServiceRoot::new(Arc::clone(&bmc))
             .await
             .map_err(|source| classify_service_root_error(source, &identity, trust))?;
         let authenticated = establish_preferred_authentication(
-            root, http, address, username, password, &identity, trust,
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
         )
         .await?;
         let service_root = ServiceRootSummary::from_root(&authenticated.root);
@@ -187,19 +209,25 @@ impl RedfishGateway {
         finish_redfish_operation(result, authenticated.session, &identity, trust).await
     }
 
-    /// Reads the complete advertised 0.1 core resource surface through public,
-    /// typed `nv-redfish` navigation and returns bounded domain projections.
+    /// Reads the complete advertised core resource surface (the 0.1
+    /// ServiceRoot/Systems/Chassis/Managers triad plus the 0.2 Processors and
+    /// Memory families) through public, typed `nv-redfish` navigation and
+    /// returns bounded domain projections.
     ///
     /// Collection links and member identifiers always come from the decoded
     /// Service Root and collection types; the gateway never constructs a BMC
-    /// resource URI. An error aborts the complete read so the application
-    /// cannot commit a partial refresh Generation. Session tokens are scoped
-    /// to this call, kept only in memory, and actively cleaned up.
+    /// resource URI. Member-granular failures are skippable (§0.2.0
+    /// acceptance): one member that cannot be fetched or represented is left
+    /// behind without disabling its collection or the rest of the read.
+    /// Service Root and collection-document failures still abort the complete
+    /// read so the application cannot commit a partial refresh Generation.
+    /// Session tokens are scoped to this call, kept only in memory, and
+    /// actively cleaned up.
     ///
     /// # Errors
     ///
     /// Returns [`CoreResourceReadError`] when trusted Redfish access fails or
-    /// a decoded resource cannot be represented by the domain snapshot model.
+    /// the Service Root cannot be represented by the domain snapshot model.
     pub async fn read_core_resources(
         &self,
         address: &EndpointAddress,
@@ -208,14 +236,29 @@ impl RedfishGateway {
         password: &SecretString,
     ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
         let (bmc, http, identity) = self.authenticated_bmc(address, trust, username, password)?;
-        let root = ServiceRoot::new(bmc)
+        let root = ServiceRoot::new(Arc::clone(&bmc))
             .await
             .map_err(|source| classify_service_root_error(source, &identity, trust))?;
         let authenticated = establish_preferred_authentication(
-            root, http, address, username, password, &identity, trust,
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
         )
         .await?;
-        let result = read_authenticated_core_resources(&authenticated.root, &identity, trust).await;
+        let result = read_authenticated_core_resources(
+            authenticated.bmc.as_ref(),
+            &authenticated.root,
+            &identity,
+            trust,
+        )
+        .await;
         finish_core_resource_read(result, authenticated.session, &identity, trust).await
     }
 
@@ -251,59 +294,256 @@ impl RedfishGateway {
     }
 }
 
+/// Reads the authenticated resource surface through the transport the
+/// Session logic selected, so the token never leaks into the Basic path.
+///
+/// Members are fetched one at a time from the decoded collection documents
+/// instead of through the `nv-redfish` wholesale accessors, because the
+/// wholesale accessors abort on the first undecodable member. Fetching
+/// individually is what makes the §0.2.0 member-skip acceptance implementable.
 async fn read_authenticated_core_resources(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let mut resources = vec![service_root_projection(root)?];
-
-    if let Some(collection) = root
-        .systems()
-        .await
-        .map_err(|source| classify_service_root_error(source, identity, trust))?
-    {
-        let members = collection
-            .members()
-            .await
-            .map_err(|source| classify_service_root_error(source, identity, trust))?;
-        resources.reserve(members.len());
-        for system in members {
-            resources.push(computer_system_projection(&system)?);
-        }
-    }
-
-    if let Some(collection) = root
-        .chassis()
-        .await
-        .map_err(|source| classify_service_root_error(source, identity, trust))?
-    {
-        let members = collection
-            .members()
-            .await
-            .map_err(|source| classify_service_root_error(source, identity, trust))?;
-        resources.reserve(members.len());
-        for chassis in members {
-            resources.push(chassis_projection(&chassis)?);
-        }
-    }
-
-    if let Some(collection) = root
-        .managers()
-        .await
-        .map_err(|source| classify_service_root_error(source, identity, trust))?
-    {
-        let members = collection
-            .members()
-            .await
-            .map_err(|source| classify_service_root_error(source, identity, trust))?;
-        resources.reserve(members.len());
-        for manager in members {
-            resources.push(manager_projection(&manager)?);
-        }
-    }
-
+    resources.extend(read_systems_resources(bmc, root, identity, trust).await?);
+    resources.extend(
+        read_collection_resources(
+            root.root.chassis.as_ref(),
+            bmc,
+            identity,
+            trust,
+            chassis_projection,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_collection_resources(
+            root.root.managers.as_ref(),
+            bmc,
+            identity,
+            trust,
+            manager_projection,
+        )
+        .await?,
+    );
     Ok(resources)
+}
+
+/// Reads the Systems collection and, for every decoded System member, its
+/// Processors and Memory collections, so the 0.2 families follow their
+/// parent through the same typed navigation.
+///
+/// A missing Systems link leaves the whole family absent without an error
+/// ("资源存在才呈现"); a failed Systems collection document aborts the read
+/// with the existing classified error semantics. Only individual members are
+/// skippable.
+async fn read_systems_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(systems) = root.root.systems.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let collection = systems
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in &collection.members {
+        let Some(system) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        let Some(system_projection) = member_projection(computer_system_projection(&system))?
+        else {
+            continue;
+        };
+        resources.push(system_projection);
+        resources.extend(
+            read_collection_resources(
+                system.processors.as_ref(),
+                bmc,
+                identity,
+                trust,
+                processor_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_collection_resources(
+                system.memory.as_ref(),
+                bmc,
+                identity,
+                trust,
+                memory_projection,
+            )
+            .await?,
+        );
+    }
+    Ok(resources)
+}
+
+/// A decoded Redfish collection schema that exposes its member navigation
+/// properties, so members can be fetched individually and one failing member
+/// cannot erase its peers.
+trait MemberCollection: EntityTypeRef + for<'de> Deserialize<'de> + 'static {
+    type Member: EntityTypeRef + for<'de> Deserialize<'de> + 'static;
+
+    fn members(&self) -> &[NavProperty<Self::Member>];
+}
+
+impl MemberCollection for ComputerSystemCollectionSchema {
+    type Member = ComputerSystemSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for ChassisCollectionSchema {
+    type Member = ChassisSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for ManagerCollectionSchema {
+    type Member = ManagerSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for ProcessorCollectionSchema {
+    type Member = ProcessorSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for MemoryCollectionSchema {
+    type Member = MemorySchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+/// Projects one typed collection with per-member skip semantics.
+///
+/// A missing link or an empty collection produces no snapshots, because a
+/// family the endpoint does not advertise must not be presented as existing.
+/// A failed collection document keeps the existing classified read-error
+/// semantics, so the refresh Generation stays all-or-nothing.
+async fn read_collection_resources<C, M>(
+    nav: Option<&NavProperty<C>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    project: impl Fn(&M) -> Result<CoreResourceProjection, CoreResourceReadError>,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
+where
+    C: MemberCollection<Member = M>,
+    M: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let collection = nav
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in collection.members() {
+        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(project(&member))? {
+            resources.push(projection);
+        }
+    }
+    Ok(resources)
+}
+
+/// Fetches one member through its typed navigation property.
+///
+/// A member-level failure is endpoint-local and must not erase the readable
+/// remainder of its collection (§0.2.0 acceptance), so endpoint-local errors
+/// skip the member. TLS-safety errors always abort: a changed or rejected
+/// identity is never swallowed by a member-scoped skip.
+async fn fetch_member<T>(
+    nav: &NavProperty<T>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<T>>, CoreResourceReadError>
+where
+    T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    match nav.get(bmc).await {
+        Ok(member) => Ok(Some(member)),
+        Err(source) => {
+            skip_member_failure(source, identity, trust)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Decides whether one member-level fetch failure is skippable.
+///
+/// Reuses the capability classifier's Ok/Err split: endpoint-local states
+/// (unauthorized, permission, schema, availability) leave the member behind,
+/// while TLS-safety failures abort the complete read.
+fn skip_member_failure(
+    source: BmcError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<(), CoreResourceReadError> {
+    match classify_capability_error(nv_redfish::Error::Bmc(source), identity, trust) {
+        Ok(_) => Ok(()),
+        Err(source) => Err(source.into()),
+    }
+}
+
+/// Resolves one member projection, skipping representation failures.
+///
+/// A decoded member that cannot be represented (invalid @odata.id or
+/// `ETag`, oversized payload) is skipped like an undecodable member: it is
+/// one odd member, not an endpoint-wide condition. Transport failures cannot
+/// occur inside the synchronous projection and abort defensively.
+fn member_projection(
+    result: Result<CoreResourceProjection, CoreResourceReadError>,
+) -> Result<Option<CoreResourceProjection>, CoreResourceReadError> {
+    match result {
+        Ok(projection) => Ok(Some(projection)),
+        Err(
+            CoreResourceReadError::InvalidODataId { .. }
+            | CoreResourceReadError::InvalidEtag { .. }
+            | CoreResourceReadError::SerializePayload { .. }
+            | CoreResourceReadError::InvalidPayload { .. },
+        ) => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+/// Classifies one collection-document fetch failure as a complete-read error.
+///
+/// Collection-document failures keep the existing read error semantics (the
+/// whole read aborts) instead of the member-skip semantics, because a
+/// collection is the unit the read iterates, not a single observation.
+fn collection_failure(
+    source: BmcError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CoreResourceReadError {
+    classify_service_root_error(nv_redfish::Error::Bmc(source), identity, trust).into()
 }
 
 fn build_bmc(
@@ -321,24 +561,45 @@ fn build_bmc(
 
 struct AuthenticatedRoot {
     root: ServiceRoot<UpstreamBmc>,
+    /// The transport `root` actually reads through: the token Session
+    /// transport when one was established, the Basic transport otherwise.
+    /// Resource reads navigate through this transport directly, so it must
+    /// stay paired with the root that published the decoded links.
+    bmc: Arc<UpstreamBmc>,
     session: Option<Session<UpstreamBmc>>,
     session_state: CapabilityState,
 }
 
+/// The endpoint-bound Basic transport and credentials used to establish the
+/// preferred Session transport, and kept as the fallback when a Session
+/// cannot be established.
+struct SessionSetup<'a> {
+    bmc: Arc<UpstreamBmc>,
+    http: NvHttpClient,
+    address: &'a EndpointAddress,
+    username: &'a CredentialUsername,
+    password: &'a SecretString,
+}
+
 async fn establish_preferred_authentication(
     root: ServiceRoot<UpstreamBmc>,
-    http: NvHttpClient,
-    address: &EndpointAddress,
-    username: &CredentialUsername,
-    password: &SecretString,
+    setup: SessionSetup<'_>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
 ) -> Result<AuthenticatedRoot, RedfishServiceRootError> {
+    let SessionSetup {
+        bmc,
+        http,
+        address,
+        username,
+        password,
+    } = setup;
     let service = match root.session_service().await {
         Ok(Some(service)) => service,
         Ok(None) => {
             return Ok(AuthenticatedRoot {
                 root,
+                bmc,
                 session: None,
                 session_state: CapabilityState::NotAdvertised,
             });
@@ -347,6 +608,7 @@ async fn establish_preferred_authentication(
             let session_state = session_fallback_state(source, identity, trust)?;
             return Ok(AuthenticatedRoot {
                 root,
+                bmc,
                 session: None,
                 session_state,
             });
@@ -355,6 +617,7 @@ async fn establish_preferred_authentication(
     if matches!(service.raw().service_enabled, Some(Some(false))) {
         return Ok(AuthenticatedRoot {
             root,
+            bmc,
             session: None,
             session_state: CapabilityState::TemporarilyUnavailable,
         });
@@ -364,6 +627,7 @@ async fn establish_preferred_authentication(
         Ok(None) => {
             return Ok(AuthenticatedRoot {
                 root,
+                bmc,
                 session: None,
                 session_state: CapabilityState::TemporarilyUnavailable,
             });
@@ -372,6 +636,7 @@ async fn establish_preferred_authentication(
             let session_state = session_fallback_state(source, identity, trust)?;
             return Ok(AuthenticatedRoot {
                 root,
+                bmc,
                 session: None,
                 session_state,
             });
@@ -388,6 +653,7 @@ async fn establish_preferred_authentication(
             let session_state = session_fallback_state(source, identity, trust)?;
             return Ok(AuthenticatedRoot {
                 root,
+                bmc,
                 session: None,
                 session_state,
             });
@@ -401,13 +667,16 @@ async fn establish_preferred_authentication(
         cleanup_session(Some(session), identity, trust).await?;
         return Ok(AuthenticatedRoot {
             root,
+            bmc,
             session: None,
             session_state: CapabilityState::SchemaIncompatible,
         });
     };
     let token_bmc = build_bmc(address, http, BmcCredentials::token(token));
+    let bmc = Arc::clone(&token_bmc);
     Ok(AuthenticatedRoot {
         root: root.replace_bmc(token_bmc),
+        bmc,
         session: Some(session),
         session_state: CapabilityState::Supported,
     })
@@ -598,6 +867,17 @@ impl CommonResourcePayload {
             description: resource.description().map(|value| value.to_string()),
         }
     }
+
+    /// Builds the common projection from a decoded schema base instead of an
+    /// `nv-redfish` wrapper type, because members fetched individually for
+    /// per-member skip semantics are raw schemas, not wrappers.
+    fn from_schema_base(base: &ResourceSchema) -> Self {
+        Self {
+            id: base.id.clone(),
+            name: base.name.clone(),
+            description: base.description.as_ref().and_then(Option::as_ref).cloned(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -706,6 +986,50 @@ struct ManagerPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `processors` family projection.
+///
+/// The field set is exactly the `ProcessorPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time.
+#[derive(Serialize)]
+struct ProcessorPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ProcessorType", skip_serializing_if = "Option::is_none")]
+    processor_type: Option<nv_redfish::schema::processor::ProcessorType>,
+    #[serde(rename = "Socket", skip_serializing_if = "Option::is_none")]
+    socket: Option<String>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "TotalCores", skip_serializing_if = "Option::is_none")]
+    total_cores: Option<i64>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `memory` family projection.
+///
+/// The field set is exactly the `MemoryPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time.
+#[derive(Serialize)]
+struct MemoryPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "MemoryDeviceType", skip_serializing_if = "Option::is_none")]
+    memory_device_type: Option<nv_redfish::schema::memory::MemoryDeviceType>,
+    #[serde(rename = "CapacityMiB", skip_serializing_if = "Option::is_none")]
+    capacity_mib: Option<i64>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
 fn service_root_projection(
     root: &ServiceRoot<UpstreamBmc>,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -717,70 +1041,134 @@ fn service_root_projection(
     };
     build_core_projection(
         ResourceFeature::ServiceRoot,
-        root,
+        root.odata_id(),
         root.root.etag(),
         &payload,
     )
 }
 
 fn computer_system_projection(
-    system: &nv_redfish::computer_system::ComputerSystem<UpstreamBmc>,
+    system: &ComputerSystemSchema,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
-    let raw = system.raw();
-    let hardware = system.hardware_id();
     let payload = ComputerSystemPayload {
-        resource: CommonResourcePayload::from_resource(system),
-        system_type: raw.system_type,
-        manufacturer: hardware.manufacturer.map(|value| value.to_string()),
-        model: hardware.model.map(|value| value.to_string()),
-        part_number: hardware.part_number.map(|value| value.to_string()),
-        serial_number: hardware.serial_number.map(|value| value.to_string()),
-        sku: system.sku().map(|value| value.to_string()),
-        host_name: optional_nullable_text(raw.host_name.as_ref()),
-        bios_version: optional_nullable_text(raw.bios_version.as_ref()),
-        power_state: system.power_state(),
-        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+        resource: CommonResourcePayload::from_schema_base(&system.base),
+        system_type: system.system_type,
+        manufacturer: optional_nullable_text(system.manufacturer.as_ref()),
+        model: optional_nullable_text(system.model.as_ref()),
+        part_number: optional_nullable_text(system.part_number.as_ref()),
+        serial_number: optional_nullable_text(system.serial_number.as_ref()),
+        sku: optional_nullable_text(system.sku.as_ref()),
+        host_name: optional_nullable_text(system.host_name.as_ref()),
+        bios_version: optional_nullable_text(system.bios_version.as_ref()),
+        power_state: system.power_state.as_ref().copied().flatten(),
+        status: system
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
     };
-    build_core_projection(ResourceFeature::Systems, system, raw.etag(), &payload)
+    build_core_projection(
+        ResourceFeature::Systems,
+        system.odata_id(),
+        system.etag(),
+        &payload,
+    )
 }
 
 fn chassis_projection(
-    chassis: &nv_redfish::chassis::Chassis<UpstreamBmc>,
+    chassis: &ChassisSchema,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
-    let raw = chassis.raw();
-    let hardware = chassis.hardware_id();
     let payload = ChassisPayload {
-        resource: CommonResourcePayload::from_resource(chassis),
-        chassis_type: raw.chassis_type,
-        manufacturer: hardware.manufacturer.map(|value| value.to_string()),
-        model: hardware.model.map(|value| value.to_string()),
-        part_number: hardware.part_number.map(|value| value.to_string()),
-        serial_number: hardware.serial_number.map(|value| value.to_string()),
-        sku: optional_nullable_text(raw.sku.as_ref()),
-        asset_tag: optional_nullable_text(raw.asset_tag.as_ref()),
-        power_state: raw.power_state.as_ref().copied().flatten(),
-        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+        resource: CommonResourcePayload::from_schema_base(&chassis.base),
+        chassis_type: chassis.chassis_type,
+        manufacturer: optional_nullable_text(chassis.manufacturer.as_ref()),
+        model: optional_nullable_text(chassis.model.as_ref()),
+        part_number: optional_nullable_text(chassis.part_number.as_ref()),
+        serial_number: optional_nullable_text(chassis.serial_number.as_ref()),
+        sku: optional_nullable_text(chassis.sku.as_ref()),
+        asset_tag: optional_nullable_text(chassis.asset_tag.as_ref()),
+        power_state: chassis.power_state.as_ref().copied().flatten(),
+        status: chassis
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
     };
-    build_core_projection(ResourceFeature::Chassis, chassis, raw.etag(), &payload)
+    build_core_projection(
+        ResourceFeature::Chassis,
+        chassis.odata_id(),
+        chassis.etag(),
+        &payload,
+    )
 }
 
 fn manager_projection(
-    manager: &nv_redfish::manager::Manager<UpstreamBmc>,
+    manager: &ManagerSchema,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
-    let raw = manager.raw();
     let payload = ManagerPayload {
-        resource: CommonResourcePayload::from_resource(manager),
-        manager_type: raw.manager_type,
-        manufacturer: optional_nullable_text(raw.manufacturer.as_ref()),
-        model: optional_nullable_text(raw.model.as_ref()),
-        part_number: optional_nullable_text(raw.part_number.as_ref()),
-        serial_number: optional_nullable_text(raw.serial_number.as_ref()),
-        firmware_version: optional_nullable_text(raw.firmware_version.as_ref()),
-        version: optional_nullable_text(raw.version.as_ref()),
-        power_state: raw.power_state.as_ref().copied().flatten(),
-        status: raw.status.as_ref().map(ResourceStatusPayload::from_status),
+        resource: CommonResourcePayload::from_schema_base(&manager.base),
+        manager_type: manager.manager_type,
+        manufacturer: optional_nullable_text(manager.manufacturer.as_ref()),
+        model: optional_nullable_text(manager.model.as_ref()),
+        part_number: optional_nullable_text(manager.part_number.as_ref()),
+        serial_number: optional_nullable_text(manager.serial_number.as_ref()),
+        firmware_version: optional_nullable_text(manager.firmware_version.as_ref()),
+        version: optional_nullable_text(manager.version.as_ref()),
+        power_state: manager.power_state.as_ref().copied().flatten(),
+        status: manager
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
     };
-    build_core_projection(ResourceFeature::Managers, manager, raw.etag(), &payload)
+    build_core_projection(
+        ResourceFeature::Managers,
+        manager.odata_id(),
+        manager.etag(),
+        &payload,
+    )
+}
+
+fn processor_projection(
+    processor: &ProcessorSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = ProcessorPayload {
+        resource: CommonResourcePayload::from_schema_base(&processor.base),
+        processor_type: processor.processor_type.as_ref().copied().flatten(),
+        socket: optional_nullable_text(processor.socket.as_ref()),
+        manufacturer: optional_nullable_text(processor.manufacturer.as_ref()),
+        model: optional_nullable_text(processor.model.as_ref()),
+        total_cores: processor.total_cores.as_ref().copied().flatten(),
+        status: processor
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Processors,
+        processor.odata_id(),
+        processor.etag(),
+        &payload,
+    )
+}
+
+fn memory_projection(
+    memory: &MemorySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = MemoryPayload {
+        resource: CommonResourcePayload::from_schema_base(&memory.base),
+        memory_device_type: memory.memory_device_type.as_ref().copied().flatten(),
+        capacity_mib: memory.capacity_mi_b.as_ref().copied().flatten(),
+        manufacturer: optional_nullable_text(memory.manufacturer.as_ref()),
+        model: optional_nullable_text(memory.model.as_ref()),
+        status: memory
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Memory,
+        memory.odata_id(),
+        memory.etag(),
+        &payload,
+    )
 }
 
 fn optional_nullable_text(value: Option<&Option<String>>) -> Option<String> {
@@ -789,11 +1177,11 @@ fn optional_nullable_text(value: Option<&Option<String>>) -> Option<String> {
 
 fn build_core_projection(
     feature: ResourceFeature,
-    resource: &impl NvResource,
+    odata_id: &nv_redfish::core::ODataId,
     etag: Option<&nv_redfish::core::ODataETag>,
     payload: &impl Serialize,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
-    let odata_id = ResourceODataId::parse(&resource.odata_id().to_string())
+    let odata_id = ResourceODataId::parse(&odata_id.to_string())
         .map_err(|source| CoreResourceReadError::InvalidODataId { feature, source })?;
     let etag = etag
         .map(|value| ResourceEtag::parse(&value.to_string()))
@@ -1871,6 +2259,31 @@ mod tests {
         "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"#;
 
+    /// A System member that advertises the 0.2 Processors and Memory
+    /// collections, so the resource read can navigate into both families.
+    const SYSTEM_WITH_COMPONENTS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "Description":"Primary compute system",
+        "SystemType":"Physical",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model S",
+        "Processors":{"@odata.id":"/redfish/v1/Systems/1/Processors"},
+        "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"}
+    }"#;
+
+    const SYSTEMS_WITH_TWO_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",
+        "@odata.id":"/redfish/v1/Systems",
+        "Name":"Computer System Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Systems/1"},
+            {"@odata.id":"/redfish/v1/Systems/2"}
+        ]
+    }"##;
+
     const CHASSIS_WITH_MEMBER_BODY: &str = r##"{
         "@odata.type":"#ChassisCollection.ChassisCollection",
         "@odata.id":"/redfish/v1/Chassis",
@@ -2047,11 +2460,83 @@ mod tests {
         "Members":[]
     }"##;
 
+    const PROCESSORS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#ProcessorCollection.ProcessorCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Processors",
+        "Name":"Processor Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Systems/1/Processors/CPU1"},
+            {"@odata.id":"/redfish/v1/Systems/1/Processors/CPU2"}
+        ]
+    }"##;
+
+    const PROCESSOR_ONE_BODY: &str = r##"{
+        "@odata.type":"#Processor.v1_15_0.Processor",
+        "@odata.id":"/redfish/v1/Systems/1/Processors/CPU1",
+        "@odata.etag":"W/\"cpu-1\"",
+        "Id":"CPU1",
+        "Name":"Processor One",
+        "Description":"Primary compute processor",
+        "ProcessorType":"CPU",
+        "Socket":"LGA4189",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model P",
+        "TotalCores":64,
+        "TotalThreads":128,
+        "MaxSpeedMHz":3200,
+        "PartNumber":"CPU-PART-1",
+        "SerialNumber":"CPU-1",
+        "Version":"3.0.0",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    const PROCESSOR_TWO_BODY: &str = r##"{
+        "@odata.type":"#Processor.v1_15_0.Processor",
+        "@odata.id":"/redfish/v1/Systems/1/Processors/CPU2",
+        "@odata.etag":"W/\"cpu-2\"",
+        "Id":"CPU2",
+        "Name":"Processor Two",
+        "ProcessorType":"CPU",
+        "Socket":"LGA4189",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model P2",
+        "TotalCores":32,
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
     const MEMORY_BODY: &str = r##"{
         "@odata.type":"#MemoryCollection.MemoryCollection",
         "@odata.id":"/redfish/v1/Systems/1/Memory",
         "Name":"Memory Collection",
         "Members":[]
+    }"##;
+
+    const MEMORY_WITH_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#MemoryCollection.MemoryCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Memory",
+        "Name":"Memory Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1/Memory/DIMM1"}]
+    }"##;
+
+    const MEMORY_DIMM_ONE_BODY: &str = r##"{
+        "@odata.type":"#Memory.v1_17_0.Memory",
+        "@odata.id":"/redfish/v1/Systems/1/Memory/DIMM1",
+        "@odata.etag":"W/\"dimm-1\"",
+        "Id":"DIMM1",
+        "Name":"Memory Module One",
+        "Description":"Main memory module",
+        "MemoryType":"DRAM",
+        "MemoryDeviceType":"DDR4",
+        "CapacityMiB":32768,
+        "DataWidthBits":64,
+        "BusWidthBits":72,
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model MEM",
+        "PartNumber":"MEM-PART-1",
+        "SerialNumber":"MEM-1",
+        "DeviceLocator":"A1",
+        "RankCount":2,
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"##;
 
     const STORAGE_BODY: &str = r##"{
@@ -2195,13 +2680,14 @@ mod tests {
         "/redfish/v1/Managers",
     ];
 
-    const FAILED_RESOURCE_AND_CLEANUP_REQUEST_PATHS: [&str; 7] = [
+    const FAILED_RESOURCE_AND_CLEANUP_REQUEST_PATHS: [&str; 8] = [
         "/redfish/v1",
         "/redfish/v1/SessionService",
         "/redfish/v1/SessionService/Sessions",
         "/redfish/v1/SessionService/Sessions",
         "/redfish/v1/Systems",
         "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -2212,6 +2698,69 @@ mod tests {
         "/redfish/v1/SessionService/Sessions",
         "/redfish/v1/Systems",
         "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one System member that carries populated
+    /// Processors and Memory collections: the families are read right after
+    /// their parent, before the sibling collections.
+    const CORE_RESOURCE_WITH_COMPONENTS_REQUEST_PATHS: [&str; 16] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Processors",
+        "/redfish/v1/Systems/1/Processors/CPU1",
+        "/redfish/v1/Systems/1/Processors/CPU2",
+        "/redfish/v1/Systems/1/Memory",
+        "/redfish/v1/Systems/1/Memory/DIMM1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when both component collections are advertised but
+    /// empty: the collection documents are still read, no member is.
+    const EMPTY_COMPONENT_REQUEST_PATHS: [&str; 13] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Processors",
+        "/redfish/v1/Systems/1/Memory",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when members fail at every level: the failing
+    /// member URIs are still requested (that is how the skip is observed),
+    /// then the next member or collection is attempted.
+    const MEMBER_SKIP_REQUEST_PATHS: [&str; 17] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Processors",
+        "/redfish/v1/Systems/1/Processors/CPU1",
+        "/redfish/v1/Systems/1/Processors/CPU2",
+        "/redfish/v1/Systems/1/Memory",
+        "/redfish/v1/Systems/1/Memory/DIMM1",
+        "/redfish/v1/Systems/2",
         "/redfish/v1/Chassis",
         "/redfish/v1/Chassis/1",
         "/redfish/v1/Managers",
@@ -3026,6 +3575,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_processors_and_memory_through_typed_system_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_COMPONENTS_BODY),
+                ("200 OK", PROCESSORS_WITH_MEMBERS_BODY),
+                ("200 OK", PROCESSOR_ONE_BODY),
+                ("200 OK", PROCESSOR_TWO_BODY),
+                ("200 OK", MEMORY_WITH_MEMBER_BODY),
+                ("200 OK", MEMORY_DIMM_ONE_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 7);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Processors,
+                ResourceFeature::Processors,
+                ResourceFeature::Memory,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_projection(
+            &resources[2],
+            "/redfish/v1/Systems/1/Processors/CPU1",
+            "W/\"cpu-1\"",
+            "ProcessorType",
+            "CPU",
+        )?;
+        assert_projection(
+            &resources[3],
+            "/redfish/v1/Systems/1/Processors/CPU2",
+            "W/\"cpu-2\"",
+            "Model",
+            "Model P2",
+        )?;
+        assert_projection(
+            &resources[4],
+            "/redfish/v1/Systems/1/Memory/DIMM1",
+            "W/\"dimm-1\"",
+            "MemoryDeviceType",
+            "DDR4",
+        )?;
+        let processor_payload: serde_json::Value =
+            serde_json::from_str(resources[2].payload().as_str())?;
+        assert_eq!(processor_payload["TotalCores"], 64);
+        assert_eq!(processor_payload["Socket"], "LGA4189");
+        assert_eq!(processor_payload["Status"]["Health"], "OK");
+        let memory_payload: serde_json::Value =
+            serde_json::from_str(resources[4].payload().as_str())?;
+        assert_eq!(memory_payload["CapacityMiB"], 32768);
+        assert_eq!(memory_payload["Manufacturer"], "Rutilus Test");
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_COMPONENTS_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_component_collections_produce_no_component_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_COMPONENTS_BODY),
+                ("200 OK", PROCESSORS_BODY),
+                ("200 OK", MEMORY_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &EMPTY_COMPONENT_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_failing_members_without_aborting_the_read() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_TWO_MEMBERS_BODY),
+                ("200 OK", SYSTEM_WITH_COMPONENTS_BODY),
+                ("200 OK", PROCESSORS_WITH_MEMBERS_BODY),
+                ("200 OK", PROCESSOR_ONE_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", MEMORY_WITH_MEMBER_BODY),
+                ("200 OK", MEMORY_DIMM_ONE_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // Systems/2, CPU2, and Chassis/1 all return undecodable bodies and
+        // are skipped; every other member still produces a snapshot.
+        assert_eq!(resources.len(), 5);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Processors,
+                ResourceFeature::Memory,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(&server.finish_all().await?, &MEMBER_SKIP_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reads_only_service_root_when_core_collections_are_not_advertised()
     -> Result<(), Box<dyn Error>> {
         let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
@@ -3075,13 +3807,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborts_complete_resource_read_on_incompatible_member_schema()
+    async fn skips_incompatible_member_schema_without_aborting_the_read()
     -> Result<(), Box<dyn Error>> {
         let server = TestRedfishServer::start_sequence(&[
             ("200 OK", SYSTEMS_SERVICE_ROOT_BODY),
             ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
             ("200 OK", "{}"),
         ])
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The undecodable member is left behind; the Service Root snapshot
+        // still completes, so the endpoint stays usable (§0.2.0 acceptance).
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].feature(), ResourceFeature::ServiceRoot);
+        assert_authenticated_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborts_complete_resource_read_on_incompatible_collection_document()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", "{}"),
+            ],
+        ))
         .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
@@ -3095,17 +3866,25 @@ mod tests {
             )
             .await;
 
+        // A failed Chassis collection document is a collection-level failure,
+        // not a member-level one: it keeps the existing read error semantics
+        // so a refresh Generation is never partial.
         assert!(matches!(
             result,
             Err(CoreResourceReadError::Redfish(source))
                 if matches!(*source, RedfishServiceRootError::SchemaIncompatible { .. })
         ));
-        assert_authenticated_requests(
+        assert_session_requests(
             &server.finish_all().await?,
             &[
                 "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
                 "/redfish/v1/Systems",
                 "/redfish/v1/Systems/1",
+                "/redfish/v1/Chassis",
+                "/redfish/v1/SessionService/Sessions/1",
             ],
         )?;
         Ok(())
@@ -3116,7 +3895,11 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let mut responses = session_response_sequence(
             CORE_SERVICE_ROOT_BODY,
-            &[("200 OK", SYSTEMS_WITH_MEMBER_BODY), ("200 OK", "{}")],
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", "{}"),
+            ],
         );
         if let Some(cleanup) = responses.last_mut() {
             *cleanup = http_response("500 Internal Server Error", "{}");
