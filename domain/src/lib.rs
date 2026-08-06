@@ -19,7 +19,7 @@ pub use audit::{
 };
 pub use capability::{
     CapabilityClassification, CapabilityState, CapabilityStateParseError, EndpointCapability,
-    EndpointCapabilityObservation, EndpointCapabilityParseError,
+    EndpointCapabilityObservation, EndpointCapabilityParseError, UiLocation, UiLocationParseError,
 };
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,
