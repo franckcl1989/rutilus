@@ -9,18 +9,19 @@ use std::{collections::BTreeSet, fmt};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
-    AboutResponse, AuditEventResponse, AuditQueryResponse, BootCommand, BootSource,
-    BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
-    CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
-    CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
-    EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
-    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
-    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
-    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EventCommand, EventDestinationProtocol, EventType,
-    ManagerCommand, OperationResponse, OperationSourceResponse, OperationStateResponse,
-    RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand,
-    SetBootSourceOverride, SystemCommand, TlsTrustModeResponse, UiLocationResponse,
+    AboutResponse, ArtifactResponse, ArtifactStateResponse, AuditEventResponse, AuditQueryResponse,
+    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode,
+    CapabilityEntryResponse, CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse,
+    CoreResourceResponse, CreateSubscription, CredentialInventoryResponse,
+    CredentialSummaryResponse, DeleteSubscription, EndpointCapabilityInventoryResponse,
+    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
+    EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+    EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
+    EventDestinationProtocol, EventType, ManagerCommand, OperationResponse,
+    OperationSourceResponse, OperationStateResponse, RedfishCommand, ResetKeysType, ResetType,
+    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, SystemCommand,
+    TlsTrustModeResponse, UiLocationResponse,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1344,11 +1345,12 @@ enum ConsoleView {
     Audit,
     Capabilities,
     Operations,
+    Artifacts,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 7] = [
+    const ALL: [ConsoleView; 8] = [
         Self::Overview,
         Self::Credentials,
         Self::AddEndpoint,
@@ -1356,6 +1358,7 @@ impl ConsoleView {
         Self::Audit,
         Self::Capabilities,
         Self::Operations,
+        Self::Artifacts,
     ];
 
     const fn label(self) -> &'static str {
@@ -1367,6 +1370,7 @@ impl ConsoleView {
             Self::Audit => "Audit",
             Self::Capabilities => "Capabilities",
             Self::Operations => "Operations",
+            Self::Artifacts => "Artifacts",
         }
     }
 }
@@ -3359,6 +3363,622 @@ fn operation_endpoint_choices(
         .collect()
 }
 
+/// One uploaded or in-flight firmware artifact, projected for a list card.
+///
+/// `size_bytes` and `uploaded_bytes` stay numeric so the card renders the
+/// §0.4.0 resume progress without re-parsing text. The sha-256 field is the
+/// declared digest the server verified at finalize; the wire always carries
+/// it, even while uploading, because the digest is declared up front.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactCardProjection {
+    artifact_id: String,
+    short_id: String,
+    name: String,
+    size_text: String,
+    sha256_short: String,
+    status: ArtifactStatusView,
+    uploaded_bytes: u64,
+    size_bytes: u64,
+    progress_percent: u8,
+    created_at_text: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ArtifactCardProjection {
+    #[must_use]
+    pub const fn is_uploading(&self) -> bool {
+        matches!(self.status, ArtifactStatusView::Uploading)
+    }
+
+    /// Whether this artifact has every byte and only awaits `finalize`, so a
+    /// matching file selection resumes directly into the finalize step.
+    #[must_use]
+    pub const fn is_completely_uploaded(&self) -> bool {
+        self.uploaded_bytes >= self.size_bytes
+    }
+
+    #[must_use]
+    pub const fn status_label(&self) -> &'static str {
+        self.status.label()
+    }
+
+    #[must_use]
+    pub const fn status_class(&self) -> &'static str {
+        self.status.class()
+    }
+}
+
+/// The §14.3 lifecycle of one artifact as display vocabulary.
+///
+/// `Uploading` is the only resumable state: the server's `uploaded_bytes`
+/// defines the next chunk boundary. `Ready` is terminal and awaits the
+/// §14.3 `UpdateService` step; `Failed` is terminal and static.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactStatusView {
+    Uploading,
+    Ready,
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ArtifactStatusView {
+    /// Static English badge label for one artifact lifecycle state.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Uploading => "Uploading",
+            Self::Ready => "Ready",
+            Self::Failed => "Failed",
+        }
+    }
+
+    /// Semantic badge styling, following the capability and operation badge
+    /// vocabulary: `Ready` is ok (green), `Failed` is error (red), and
+    /// `Uploading` is active (blue) because it is in flight and resumable.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Uploading => "artifact-state artifact-active",
+            Self::Ready => "artifact-state artifact-ok",
+            Self::Failed => "artifact-state artifact-error",
+        }
+    }
+}
+
+/// Maps the wire artifact lifecycle state onto the display vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<ArtifactStateResponse> for ArtifactStatusView {
+    fn from(state: ArtifactStateResponse) -> Self {
+        match state {
+            ArtifactStateResponse::Uploading => Self::Uploading,
+            ArtifactStateResponse::Ready => Self::Ready,
+            ArtifactStateResponse::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Projects one §9.3 artifact row into its list card.
+///
+/// The sha-256 short code renders the declared digest — the same digest the
+/// server verified at finalize — so a `ready` card and a `failed` card are
+/// distinguishable by the same visible hash.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&ArtifactResponse> for ArtifactCardProjection {
+    fn from(artifact: &ArtifactResponse) -> Self {
+        Self {
+            artifact_id: artifact.artifact_id().to_string(),
+            short_id: short_sha256(&artifact.artifact_id().to_string()),
+            name: artifact.name().to_owned(),
+            size_text: format_artifact_size(artifact.size_bytes()),
+            sha256_short: short_sha256(artifact.sha256()),
+            status: ArtifactStatusView::from(artifact.state()),
+            uploaded_bytes: artifact.uploaded_bytes(),
+            size_bytes: artifact.size_bytes(),
+            progress_percent: upload_progress_percent(
+                artifact.uploaded_bytes(),
+                artifact.size_bytes(),
+            ),
+            created_at_text: format_observed_at(&artifact.created_at()),
+        }
+    }
+}
+
+/// The loading state of the §14.3 artifact list.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ArtifactsListState {
+    Loading,
+    Ready(Vec<ArtifactCardProjection>),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ArtifactsListState {
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    fn has_empty_list(&self) -> bool {
+        matches!(self, Self::Ready(cards) if cards.is_empty())
+    }
+
+    /// One-line count heading, e.g. "3 artifacts".
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(cards) => cards.len(),
+            Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 artifact".to_owned(),
+            _ => format!("{count} artifacts"),
+        }
+    }
+
+    fn cards(&self) -> Vec<ArtifactCardProjection> {
+        match self {
+            Self::Ready(cards) => cards.clone(),
+            Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+
+    /// The uploading artifact whose name and declared size match a selected
+    /// file, if any — the §0.4.0 interrupt-recovery anchor.
+    fn resume_candidate(&self, name: &str, size_bytes: u64) -> Option<ArtifactCardProjection> {
+        self.cards()
+            .into_iter()
+            .find(|card| card.is_uploading() && card.name == name && card.size_bytes == size_bytes)
+    }
+}
+
+/// Why an artifact upload could not be created, appended to, or finalized.
+///
+/// Every message is either static copy or carries the HTTP status so the
+/// console never invents a server-side reason.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactUploadFailure {
+    FileUnreadable,
+    FileEmpty,
+    CreateRejected { status: u16 },
+    ChunkRejected { status: u16 },
+    FinalizeRejected { status: u16 },
+    Unavailable,
+    MalformedResponse,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ArtifactUploadFailure {
+    fn message(self) -> String {
+        match self {
+            Self::FileUnreadable => "The selected file could not be read.".to_owned(),
+            Self::FileEmpty => "The selected file is empty.".to_owned(),
+            Self::CreateRejected { status } => {
+                format!("The server rejected the artifact creation (HTTP {status}).")
+            }
+            Self::ChunkRejected { status } => {
+                format!("The server rejected an upload chunk (HTTP {status}).")
+            }
+            Self::FinalizeRejected { status } => {
+                format!("The server rejected the upload finalize (HTTP {status}).")
+            }
+            Self::Unavailable => "The artifact store is temporarily unavailable.".to_owned(),
+            Self::MalformedResponse => "The server response could not be read.".to_owned(),
+        }
+    }
+}
+
+/// The §0.4.0 progression of one artifact upload submission.
+///
+/// The file bytes live in the `draft` while the upload runs; the state
+/// machine only records which step is in flight so the form disables itself
+/// and renders one progress bar. After a page reload the browser no longer
+/// holds the file, so `Succeeded`/`Failed` are per-session outcomes and the
+/// §0.4.0 resume path re-enters through the list's `uploading` cards.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ArtifactUploadState {
+    Idle,
+    Creating,
+    /// The server's acknowledged byte count drives the progress bar; the
+    /// chunk index and percentage are derived at render time.
+    Uploading {
+        artifact_id: String,
+        uploaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Finalizing {
+        artifact_id: String,
+    },
+    Succeeded,
+    Failed(ArtifactUploadFailure),
+}
+
+/// One-line upload status text for the form, e.g. "Uploading chunk 2 of 3 ·
+/// 45%". Empty for states the form renders through other elements.
+#[cfg(any(target_arch = "wasm32", test))]
+fn artifact_upload_status_text(state: &ArtifactUploadState) -> String {
+    match state {
+        ArtifactUploadState::Idle
+        | ArtifactUploadState::Succeeded
+        | ArtifactUploadState::Failed(_) => String::new(),
+        ArtifactUploadState::Creating => "Creating artifact...".to_owned(),
+        ArtifactUploadState::Uploading {
+            uploaded_bytes,
+            total_bytes,
+            ..
+        } => {
+            let chunk_index = uploaded_bytes / ARTIFACT_CHUNK_BYTES + 1;
+            let total_chunks = artifact_chunk_ranges(*total_bytes).len().max(1);
+            format!(
+                "Uploading chunk {chunk_index} of {total_chunks} · {}%",
+                upload_progress_percent(*uploaded_bytes, *total_bytes)
+            )
+        }
+        ArtifactUploadState::Finalizing { .. } => "Verifying the uploaded digest...".to_owned(),
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ArtifactUploadState {
+    const fn is_in_flight(&self) -> bool {
+        matches!(
+            self,
+            Self::Creating | Self::Uploading { .. } | Self::Finalizing { .. }
+        )
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
+    const fn is_succeeded(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    fn failure_message(&self) -> String {
+        match self {
+            Self::Failed(failure) => failure.message(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// One artifact upload chunk: the byte range the client slices out of the
+/// file for a single `chunks` request.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtifactChunkRange {
+    offset: u64,
+    length: usize,
+}
+
+/// The §0.4.0 per-chunk payload size: 3 MiB, the largest byte range whose
+/// base64 encoding fits the server's chunk-text cap.
+///
+/// The chunk contract caps the base64 *text* of a chunk at 4 MiB characters,
+/// and 3 payload bytes expand to exactly 4 base64 characters, so 3 MiB of
+/// payload encodes to exactly 4 MiB of text — the largest accepted chunk.
+#[cfg(any(target_arch = "wasm32", test))]
+const ARTIFACT_CHUNK_BYTES: u64 = 3 * 1024 * 1024;
+
+/// The chunk the client must send next, derived from the server's
+/// `uploaded_bytes` count.
+///
+/// The chunk contract requires `offset` to equal the bytes already received
+/// and never to merge a hole, so the resume offset is the server count
+/// itself — never rounded to a chunk boundary, because the server may have
+/// acknowledged a shorter final append. A file whose `uploaded_bytes` equals
+/// its size yields `None`: callers check `is_completely_uploaded` first and
+/// jump straight to `finalize`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn artifact_chunk_range_at(offset: u64, total_bytes: u64) -> Option<ArtifactChunkRange> {
+    if offset >= total_bytes {
+        return None;
+    }
+    let length = u64::min(ARTIFACT_CHUNK_BYTES, total_bytes - offset);
+    Some(ArtifactChunkRange {
+        offset,
+        length: usize::try_from(length).ok().unwrap_or(0),
+    })
+}
+
+/// Splits a file into the strictly ordered chunk ranges of a fresh upload:
+/// every chunk except the last is exactly 3 MiB of payload — the largest
+/// range whose base64 text fits the server's 4 MiB character cap — and the
+/// last chunk is the remainder.
+#[cfg(any(target_arch = "wasm32", test))]
+fn artifact_chunk_ranges(total_bytes: u64) -> Vec<ArtifactChunkRange> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(range) = artifact_chunk_range_at(offset, total_bytes) {
+        ranges.push(range);
+        offset += range.length as u64;
+    }
+    ranges
+}
+
+/// Upload progress in whole percent, clamped to 0..=100 so a server that
+/// reports slightly more than the declared size cannot render an overfull
+/// bar.
+#[cfg(any(target_arch = "wasm32", test))]
+fn upload_progress_percent(uploaded_bytes: u64, total_bytes: u64) -> u8 {
+    if total_bytes == 0 {
+        return 100;
+    }
+    let percent = uploaded_bytes.saturating_mul(100) / total_bytes;
+    u8::try_from(percent).ok().unwrap_or(100).min(100)
+}
+
+/// Human-readable binary size, e.g. "512 B", "1.5 KiB", "4 MiB", "1.2 GiB".
+///
+/// The decimal is derived from integer remainder arithmetic so a `u64` byte
+/// count never loses precision through an `f64` cast.
+#[cfg(any(target_arch = "wasm32", test))]
+fn format_artifact_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut unit_index = 0;
+    let mut scaled = bytes;
+    while scaled >= 1024 && unit_index + 1 < UNITS.len() {
+        scaled /= 1024;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        return format!("{bytes} B");
+    }
+    let unit_bytes = 1024_u64.pow(u32::try_from(unit_index).ok().unwrap_or(0));
+    let tenths = (bytes % unit_bytes) * 10 / unit_bytes;
+    format!("{scaled}.{tenths} {}", UNITS[unit_index])
+}
+
+/// Compact card identity for one sha-256 digest: its first 8 characters.
+///
+/// The full digest stays available in the card body while the short form
+/// keeps the card grid scannable, mirroring the operation id convention.
+#[cfg(any(target_arch = "wasm32", test))]
+fn short_sha256(sha256: &str) -> String {
+    sha256.chars().take(8).collect()
+}
+
+/// RFC 4648 base64 with padding, standard alphabet.
+///
+/// Hand-rolled because the workspace does not depend on a base64 crate and
+/// this iteration's file budget is limited to `ui/src/lib.rs`; the encoding
+/// is host-tested against RFC 4648 vectors. The browser API never sees the
+/// encoder — chunks cross the FFI boundary as base64 strings.
+#[cfg(any(target_arch = "wasm32", test))]
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        encoded.push(ALPHABET[(b0 >> 2) as usize] as char);
+        encoded.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
+        if chunk.len() >= 2 {
+            encoded.push(ALPHABET[((b1 & 0x0F) << 2 | b2 >> 6) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() >= 3 {
+            encoded.push(ALPHABET[(b2 & 0x3F) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+/// The 64 round constants of FIPS 180-4 §4.2.2: the fractional parts of the
+/// cube roots of the first 64 primes, written as big-endian words.
+#[cfg(any(target_arch = "wasm32", test))]
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
+];
+
+/// SHA-256 of a byte slice, lowercase hex.
+///
+/// Hand-rolled from FIPS 180-4 because the `CreateArtifactRequest.sha256`
+/// field is required at creation time and the UI crate cannot add the
+/// workspace `sha2` dependency within this iteration's file budget. The
+/// server independently recomputes and verifies the digest at finalize, so a
+/// defective client hash surfaces as a clean `failed` verdict instead of a
+/// corrupted BMC flash. Correctness is pinned by the RFC 6234 vectors in the
+/// test module.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sha256_hex(bytes: &[u8]) -> String {
+    // The eight initial hash values of FIPS 180-4 §5.3.3: the fractional
+    // parts of the square roots of the first eight primes.
+    let mut state = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let total_bytes = u64::try_from(bytes.len()).ok().unwrap_or(0);
+
+    // Every full 64-byte block is compressed as it arrives; the remainder
+    // and the padded final block are handled below. Padding appends 0x80,
+    // then zeros up to 56 bytes, then the big-endian 64-bit bit length, so
+    // the padding never spills past one extra block.
+    let mut blocks = bytes.chunks_exact(64);
+    for block in blocks.by_ref() {
+        let schedule = sha256_schedule(block);
+        state = sha256_compress(&state, &schedule);
+    }
+    let remainder = blocks.remainder();
+
+    let mut tail = [0_u8; 128];
+    let remaining = remainder.len();
+    tail[..remaining].copy_from_slice(remainder);
+    tail[remaining] = 0x80;
+    if remaining >= 56 {
+        let bit_length = total_bytes.wrapping_mul(8);
+        tail[120..128].copy_from_slice(&bit_length.to_be_bytes());
+        let schedule = sha256_schedule(&tail[..64]);
+        state = sha256_compress(&state, &schedule);
+        let schedule = sha256_schedule(&tail[64..128]);
+        state = sha256_compress(&state, &schedule);
+    } else {
+        let bit_length = total_bytes.wrapping_mul(8);
+        tail[56..64].copy_from_slice(&bit_length.to_be_bytes());
+        let schedule = sha256_schedule(&tail[..64]);
+        state = sha256_compress(&state, &schedule);
+    }
+
+    let mut digest = String::with_capacity(64);
+    for word in state {
+        // `write!` into a String cannot fail; the `_ =` discards the
+        // infallible `fmt::Result`.
+        let _ = std::fmt::Write::write_fmt(&mut digest, format_args!("{word:08x}"));
+    }
+    digest
+}
+
+/// Builds the 64-word message schedule from one 64-byte block (FIPS 180-4
+/// §6.2.2 step 1): the first 16 words are big-endian bytes, the rest are
+/// mixed with the `sigma0` and `sigma1` rotations.
+#[cfg(any(target_arch = "wasm32", test))]
+fn sha256_schedule(block: &[u8]) -> [u32; 64] {
+    let mut schedule = [0_u32; 64];
+    for (word_index, word) in schedule.iter_mut().enumerate().take(16) {
+        let start = word_index * 4;
+        *word = (u32::from(block[start]) << 24)
+            | (u32::from(block[start + 1]) << 16)
+            | (u32::from(block[start + 2]) << 8)
+            | u32::from(block[start + 3]);
+    }
+    for word_index in 16..64 {
+        let w15 = schedule[word_index - 15];
+        let w2 = schedule[word_index - 2];
+        let sigma0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+        let sigma1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+        schedule[word_index] = schedule[word_index - 16]
+            .wrapping_add(sigma0)
+            .wrapping_add(schedule[word_index - 7])
+            .wrapping_add(sigma1);
+    }
+    schedule
+}
+
+/// One 64-round compression of the working state (FIPS 180-4 §6.2.2 steps
+/// 2–4).
+///
+/// The working variables follow the FIPS 180-4 notation (`a` through `h`),
+/// so the single-character names are deliberate and not ambiguous.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::similar_names, clippy::many_single_char_names)]
+fn sha256_compress(state: &[u32; 8], schedule: &[u32; 64]) -> [u32; 8] {
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for (round, constant) in SHA256_K.iter().enumerate() {
+        let sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let choice = (e & f) ^ (!e & g);
+        let temp1 = h
+            .wrapping_add(sigma1)
+            .wrapping_add(choice)
+            .wrapping_add(*constant)
+            .wrapping_add(schedule[round]);
+        let sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = sigma0.wrapping_add(majority);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    [
+        state[0].wrapping_add(a),
+        state[1].wrapping_add(b),
+        state[2].wrapping_add(c),
+        state[3].wrapping_add(d),
+        state[4].wrapping_add(e),
+        state[5].wrapping_add(f),
+        state[6].wrapping_add(g),
+        state[7].wrapping_add(h),
+    ]
+}
+
 /// Maps the wire operation source onto the display vocabulary.
 #[cfg(any(target_arch = "wasm32", test))]
 impl From<OperationSourceResponse> for OperationSourceView {
@@ -3667,31 +4287,35 @@ mod browser {
         web_sys::{Blob, Event, HtmlInputElement},
     };
     use rutilus_api::{
-        AboutResponse, AuditQueryResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
-        CreateCredentialRequest, CreateOperationRequest, CredentialInventoryResponse,
-        CredentialSummaryResponse, EndpointCapabilityInventoryResponse, EndpointCsvImportRequest,
-        EndpointCsvImportResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
-        EndpointResourceInventoryResponse, EndpointTrustChallengeResponse,
-        EndpointTrustExpectationRequest, EnrollEndpointRequest, OperationListResponse,
-        OperationResponse, TrustedEndpointResponse,
+        AboutResponse, AppendArtifactChunkRequest, ArtifactListResponse, ArtifactProgressResponse,
+        ArtifactResponse, AuditQueryResponse, BeginEndpointTrustRequest,
+        ConfirmEndpointTrustRequest, CreateArtifactRequest, CreateCredentialRequest,
+        CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
+        EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
+        EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+        EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
+        OperationListResponse, OperationResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     use super::{
-        AuditEventCardProjection, AuditListState, BootEnabledView, BootModeView, BootSourceView,
-        CapabilityEntryProjection, CapabilityGroupProjection, CapabilityLoadFailure,
-        CapabilityMatrixProjection, CapabilityMatrixState, CapabilityTargetProjection,
-        CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState, ConsoleView,
-        CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
+        ArtifactCardProjection, ArtifactStatusView, ArtifactUploadFailure, ArtifactUploadState,
+        ArtifactsListState, AuditEventCardProjection, AuditListState, BootEnabledView,
+        BootModeView, BootSourceView, CapabilityEntryProjection, CapabilityGroupProjection,
+        CapabilityLoadFailure, CapabilityMatrixProjection, CapabilityMatrixState,
+        CapabilityTargetProjection, CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState,
+        ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
         EventActionView, EventProtocolView, EventTypeView, ImportFailure, ImportState,
         OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
         OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
         OperationSubmitState, OperationsListState, ResetKeysTypeView, ResetTypeView,
-        SecureBootActionView, TrustChallengeProjection, build_command, command_summary,
-        endpoint_address_draft_error, operation_endpoint_choices, trust_mode_label,
+        SecureBootActionView, TrustChallengeProjection, artifact_chunk_range_at,
+        artifact_upload_status_text, base64_encode, build_command, command_summary,
+        endpoint_address_draft_error, format_artifact_size, operation_endpoint_choices, sha256_hex,
+        trust_mode_label,
     };
 
     #[wasm_bindgen(start)]
@@ -3854,6 +4478,7 @@ mod browser {
                     on_back=on_back_to_overview
                 />
                 <OperationsView view=view load_state=state />
+                <ArtifactsView view=view />
             </main>
         }
     }
@@ -5609,6 +6234,187 @@ mod browser {
         Ok(())
     }
 
+    /// Loads the §9.3 artifact inventory.
+    ///
+    /// Any transport failure or non-200 status maps to the single static
+    /// unavailable message, exactly like the audit and credential lists; a
+    /// 200 body that violates the strict shared contract maps to the same
+    /// failure because a list that cannot be projected is as useless as one
+    /// that never arrived.
+    async fn fetch_artifacts() -> ArtifactsListState {
+        let Ok(response) = Request::get("/api/v1/artifacts")
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return ArtifactsListState::Failed;
+        };
+        if !response.ok() {
+            return ArtifactsListState::Failed;
+        }
+        match response.json::<ArtifactListResponse>().await {
+            Ok(list) => ArtifactsListState::Ready(
+                list.artifacts()
+                    .iter()
+                    .map(ArtifactCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => ArtifactsListState::Failed,
+        }
+    }
+
+    /// Reads one artifact's current projection, used to recover the
+    /// acknowledged byte count after a chunk response that did not advance.
+    async fn fetch_artifact(artifact_id: &str) -> Option<ArtifactResponse> {
+        let path = format!("/api/v1/artifacts/{artifact_id}");
+        let response = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        response.json::<ArtifactResponse>().await.ok()
+    }
+
+    /// Declares an artifact (§14.3) with the client-computed SHA-256 digest,
+    /// because the create contract requires the digest up front; the server
+    /// independently recomputes and verifies it at finalize.
+    async fn create_artifact(name: &str, bytes: &[u8]) -> Result<String, ArtifactUploadFailure> {
+        let size_bytes = u64::try_from(bytes.len()).ok().unwrap_or(0);
+        let request = CreateArtifactRequest::new(name.to_owned(), size_bytes, sha256_hex(bytes));
+        let response = Request::post("/api/v1/artifacts")
+            .json(&request)
+            .map_err(|_| ArtifactUploadFailure::Unavailable)?
+            .send()
+            .await
+            .map_err(|_| ArtifactUploadFailure::Unavailable)?;
+        if !response.ok() {
+            return Err(ArtifactUploadFailure::CreateRejected {
+                status: response.status(),
+            });
+        }
+        response
+            .json::<ArtifactResponse>()
+            .await
+            .map(|artifact| artifact.artifact_id().to_string())
+            .map_err(|_| ArtifactUploadFailure::MalformedResponse)
+    }
+
+    /// Appends one base64-encoded chunk at the exact next offset the server
+    /// acknowledged; the response's `uploaded_bytes` is the source of truth
+    /// for the following chunk.
+    async fn append_artifact_chunk(
+        artifact_id: &str,
+        offset: u64,
+        data: String,
+    ) -> Result<ArtifactProgressResponse, ArtifactUploadFailure> {
+        let path = format!("/api/v1/artifacts/{artifact_id}/chunks");
+        let request = AppendArtifactChunkRequest::new(offset, data);
+        let response = Request::post(&path)
+            .json(&request)
+            .map_err(|_| ArtifactUploadFailure::Unavailable)?
+            .send()
+            .await
+            .map_err(|_| ArtifactUploadFailure::Unavailable)?;
+        if !response.ok() {
+            return Err(ArtifactUploadFailure::ChunkRejected {
+                status: response.status(),
+            });
+        }
+        response
+            .json::<ArtifactProgressResponse>()
+            .await
+            .map_err(|_| ArtifactUploadFailure::MalformedResponse)
+    }
+
+    /// Commits an artifact: the server reads the stored bytes back and
+    /// verifies them against the declared SHA-256 (§14.3).
+    async fn finalize_artifact(artifact_id: &str) -> Result<(), ArtifactUploadFailure> {
+        let path = format!("/api/v1/artifacts/{artifact_id}/finalize");
+        let response = Request::post(&path)
+            .send()
+            .await
+            .map_err(|_| ArtifactUploadFailure::Unavailable)?;
+        if !response.ok() {
+            return Err(ArtifactUploadFailure::FinalizeRejected {
+                status: response.status(),
+            });
+        }
+        response
+            .json::<ArtifactResponse>()
+            .await
+            .map_err(|_| ArtifactUploadFailure::MalformedResponse)?;
+        Ok(())
+    }
+
+    /// Drives one create → chunked upload → finalize sequence (§14.3) and
+    /// reports every step through `report` so the form can render the
+    /// progress bar.
+    ///
+    /// The loop is driven by the server's acknowledged `uploaded_bytes`,
+    /// never by local arithmetic: each successful chunk response advances the
+    /// offset, and a chunk response that did not advance (an idempotent
+    /// retransmit of a chunk the server already committed) re-reads the
+    /// artifact once before failing.
+    async fn run_artifact_upload(
+        name: &str,
+        bytes: &[u8],
+        resume: Option<ArtifactCardProjection>,
+        report: impl Fn(ArtifactUploadState) + Send + 'static,
+    ) -> Result<(), ArtifactUploadFailure> {
+        let size_bytes = u64::try_from(bytes.len()).ok().unwrap_or(0);
+        let (artifact_id, mut offset) = match resume {
+            // Every byte is already stored; only the finalize step remains.
+            Some(card) if card.is_completely_uploaded() => {
+                report(ArtifactUploadState::Finalizing {
+                    artifact_id: card.artifact_id.clone(),
+                });
+                return finalize_artifact(&card.artifact_id).await;
+            }
+            Some(card) => (card.artifact_id.clone(), card.uploaded_bytes),
+            None => {
+                report(ArtifactUploadState::Creating);
+                (create_artifact(name, bytes).await?, 0)
+            }
+        };
+        while let Some(range) = artifact_chunk_range_at(offset, size_bytes) {
+            let start = usize::try_from(range.offset).ok().unwrap_or(0);
+            let end = start + range.length;
+            let data = base64_encode(&bytes[start..end]);
+            report(ArtifactUploadState::Uploading {
+                artifact_id: artifact_id.clone(),
+                uploaded_bytes: offset,
+                total_bytes: size_bytes,
+            });
+            match append_artifact_chunk(&artifact_id, range.offset, data).await {
+                Ok(progress) if progress.uploaded_bytes() >= size_bytes => break,
+                Ok(progress) if progress.uploaded_bytes() > offset => {
+                    offset = progress.uploaded_bytes();
+                }
+                Ok(_) => {
+                    // The server already held the chunk (idempotent
+                    // retransmit) but reported no advance; re-read its truth
+                    // once. A second no-advance is a contract violation.
+                    let Some(artifact) = fetch_artifact(&artifact_id).await else {
+                        return Err(ArtifactUploadFailure::Unavailable);
+                    };
+                    if artifact.uploaded_bytes() > offset {
+                        offset = artifact.uploaded_bytes();
+                    } else {
+                        return Err(ArtifactUploadFailure::MalformedResponse);
+                    }
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+        report(ArtifactUploadState::Finalizing {
+            artifact_id: artifact_id.clone(),
+        });
+        finalize_artifact(&artifact_id).await
+    }
+
     #[component]
     fn OperationsView(
         view: ReadSignal<ConsoleView>,
@@ -6399,6 +7205,286 @@ mod browser {
         }
     }
 
+    #[component]
+    fn ArtifactsView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Artifacts;
+        let (list_state, set_list_state) = signal(ArtifactsListState::Loading);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (file_info, set_file_info) = signal(None::<(String, u64)>);
+        // The file bytes stay outside the reactive view surface: the form
+        // renders name and size, while the submit path reads the bytes once
+        // and drops the signal copy so only the upload future holds the
+        // file during the chunk loop.
+        //
+        // Holding the whole file in browser memory is deliberate for this
+        // iteration: the §0.4.0 chunk contract needs the base64 encoding of
+        // arbitrary byte ranges, and re-reading a `File` slice per chunk is a
+        // later iteration together with the `File.slice()`-driven streaming
+        // upload path, which must land with its own progress semantics and
+        // chunk-alignment tests. The memory ceiling is the selected file
+        // size, and the one-shot copy at submit time is bounded and dropped
+        // as soon as the upload future owns the bytes.
+        let (file_bytes, set_file_bytes) = signal(None::<Vec<u8>>);
+        let (resume_target, set_resume_target) = signal(None::<ArtifactCardProjection>);
+        let (upload_state, set_upload_state) = signal(ArtifactUploadState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(ArtifactsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(fetch_artifacts().await);
+                });
+            }
+        });
+
+        let on_refresh = move |_| {
+            set_list_state.set(ArtifactsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(fetch_artifacts().await);
+            });
+        };
+
+        let on_file_change = move |event: Event| {
+            let Some(input) = event
+                .target()
+                .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
+            else {
+                return;
+            };
+            let Some(file) = input_files(&input) else {
+                return;
+            };
+            set_upload_state.set(ArtifactUploadState::Idle);
+            let file_name = selected_file_name(&file);
+            spawn_local(async move {
+                match read_blob_bytes(&file).await {
+                    Some(bytes) if bytes.is_empty() => {
+                        set_upload_state.set(ArtifactUploadState::Failed(
+                            ArtifactUploadFailure::FileEmpty,
+                        ));
+                    }
+                    Some(bytes) => {
+                        let size_bytes = u64::try_from(bytes.len()).ok().unwrap_or(0);
+                        // A selected file that matches an interrupted
+                        // artifact by name and size arms the §0.4.0 resume
+                        // path instead of a fresh create.
+                        let candidate = list_state.get().resume_candidate(&file_name, size_bytes);
+                        set_file_info.set(Some((file_name, size_bytes)));
+                        set_file_bytes.set(Some(bytes));
+                        set_resume_target.set(candidate);
+                    }
+                    None => {
+                        set_upload_state.set(ArtifactUploadState::Failed(
+                            ArtifactUploadFailure::FileUnreadable,
+                        ));
+                    }
+                }
+            });
+        };
+
+        let on_submit = move |_| {
+            let Some((name, _)) = file_info.get() else {
+                return;
+            };
+            let Some(bytes) = file_bytes.get() else {
+                return;
+            };
+            let resume = resume_target.get();
+            // The upload future now owns the only copy of the file bytes.
+            set_file_bytes.set(None);
+            set_upload_state.set(ArtifactUploadState::Creating);
+            let report = {
+                let set_upload_state = set_upload_state;
+                move |state| set_upload_state.set(state)
+            };
+            spawn_local(async move {
+                match run_artifact_upload(&name, &bytes, resume, report).await {
+                    Ok(()) => {
+                        set_upload_state.set(ArtifactUploadState::Succeeded);
+                        set_file_info.set(None);
+                        set_resume_target.set(None);
+                        set_list_state.set(fetch_artifacts().await);
+                    }
+                    Err(failure) => {
+                        set_upload_state.set(ArtifactUploadState::Failed(failure));
+                        // Refresh the list so the interrupted artifact's card
+                        // shows the server's acknowledged progress (the
+                        // resume anchor) or its terminal failed state.
+                        set_list_state.set(fetch_artifacts().await);
+                    }
+                }
+            });
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Firmware artifacts"</p>
+                        <h2>{move || list_state.get().count_text()}</h2>
+                    </div>
+                    <p>"Uploaded firmware artifacts for the §14.3 update flow."</p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || list_state.get().is_loading()
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !list_state.get().is_loading()>
+                    "Loading artifacts..."
+                </p>
+                <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                    "The artifact store is temporarily unavailable."
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !list_state.get().is_ready() || !list_state.get().has_empty_list()
+                    }
+                >
+                    "No firmware artifacts have been uploaded yet."
+                </p>
+                <div class="resource-list">
+                    {move || {
+                        list_state
+                            .get()
+                            .cards()
+                            .into_iter()
+                            .map(|card| view! { <ArtifactCard card=card /> })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="form-panel">
+                    <div class="form-field">
+                        <label for="artifact-file">"Firmware file"</label>
+                        <input
+                            id="artifact-file"
+                            class="form-input"
+                            type="file"
+                            on:change=on_file_change
+                        />
+                    </div>
+                    <p class="form-hint" hidden=move || file_info.get().is_none()>
+                        {move || {
+                            file_info.get().map_or_else(String::new, |(name, size)| {
+                                format!("Selected: {name} · {}", format_artifact_size(size))
+                            })
+                        }}
+                    </p>
+                    <p class="form-hint" hidden=move || resume_target.get().is_none()>
+                        {move || {
+                            resume_target.get().map_or_else(String::new, |card| {
+                                format!(
+                                    "Resumes the interrupted upload of this file from {}%.",
+                                    card.progress_percent
+                                )
+                            })
+                        }}
+                    </p>
+                    <p class="form-error" hidden=move || !upload_state.get().is_failed()>
+                        {move || upload_state.get().failure_message()}
+                    </p>
+                    <p class="inline-status" hidden=move || !upload_state.get().is_in_flight()>
+                        {move || artifact_upload_status_text(&upload_state.get())}
+                    </p>
+                    <p
+                        class="inline-status success"
+                        hidden=move || !upload_state.get().is_succeeded()
+                    >
+                        "Artifact uploaded and verified."
+                    </p>
+                    <div class="form-actions">
+                        <button
+                            type="button"
+                            class="btn btn-primary"
+                            disabled=move || {
+                                file_info.get().is_none() || upload_state.get().is_in_flight()
+                            }
+                            on:click=on_submit
+                        >
+                            {move || {
+                                if resume_target.get().is_some() {
+                                    "Resume upload"
+                                } else {
+                                    "Upload artifact"
+                                }
+                            }}
+                        </button>
+                    </div>
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn ArtifactCard(card: ArtifactCardProjection) -> impl IntoView {
+        let is_uploading = card.is_uploading();
+        let is_failed = card.status == ArtifactStatusView::Failed;
+        let status_label = card.status_label().to_owned();
+        let status_class = card.status_class().to_owned();
+        let ArtifactCardProjection {
+            artifact_id,
+            short_id,
+            name,
+            size_text,
+            sha256_short,
+            uploaded_bytes,
+            progress_percent,
+            created_at_text,
+            ..
+        } = card;
+        let progress_width = format!("{progress_percent}%");
+        let uploaded_text = format_artifact_size(uploaded_bytes);
+        let sha256_title = sha256_short.clone();
+        let sha256_text = format!("{sha256_short}…");
+
+        view! {
+            <article class="artifact-card">
+                <div class="artifact-title">
+                    <div>
+                        <h3>{name}</h3>
+                        <p class="artifact-id" title=artifact_id>{short_id}</p>
+                    </div>
+                    <span class=status_class>{status_label}</span>
+                </div>
+                <dl class="resource-facts">
+                    <div>
+                        <dt>"Size"</dt>
+                        <dd>{size_text.clone()}</dd>
+                    </div>
+                    <div>
+                        <dt>"SHA-256"</dt>
+                        <dd title=sha256_title>{sha256_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Created"</dt>
+                        <dd>{created_at_text}</dd>
+                    </div>
+                </dl>
+                <div class="artifact-progress" hidden=!is_uploading>
+                    <div class="progress-track" aria-hidden="true">
+                        <div class="progress-fill" style=("width", progress_width)></div>
+                    </div>
+                    <p class="form-hint">
+                        {format!("{uploaded_text} of {size_text} uploaded · {progress_percent}%")}
+                    </p>
+                    <p class="form-hint">
+                        "Select the same file in the upload form to resume from this point."
+                    </p>
+                </div>
+                <p class="form-error" hidden=!is_failed>
+                    "The uploaded bytes did not pass SHA-256 verification."
+                </p>
+            </article>
+        }
+    }
+
     /// Reads the first selected file of a file input as a `Blob`.
     ///
     /// The workspace `web-sys` feature set does not enable the `FileList` and
@@ -6439,6 +7525,50 @@ mod browser {
 
         #[wasm_bindgen(method, structural, getter, js_class = "File", js_name = "name")]
         fn name(this: &FileHandle) -> String;
+
+        // The artifact upload reads firmware bytes, so the binary Blob
+        // surface is bound here: `arrayBuffer` (the CSV path's `text` cannot
+        // represent arbitrary bytes) and `Uint8Array`, whose type is not in
+        // the enabled `web-sys` feature set. `Vec<u8>` is wasm-bindgen's
+        // `Uint8Array` wire type, so the `slice` binding copies the whole
+        // typed array into Rust in one boundary crossing instead of one JS
+        // call per byte.
+        #[wasm_bindgen(typescript_type = "Blob")]
+        type BlobBinaryHandle;
+
+        #[wasm_bindgen(method, structural, js_class = "Blob", js_name = "arrayBuffer")]
+        fn array_buffer(this: &BlobBinaryHandle) -> JsValue;
+
+        #[wasm_bindgen(js_name = "Uint8Array")]
+        type Uint8ArrayHandle;
+
+        #[wasm_bindgen(constructor)]
+        fn new_uint8_array(buffer: &JsValue) -> Uint8ArrayHandle;
+
+        #[wasm_bindgen(method, structural, js_name = "slice")]
+        fn copy_to_vec(this: &Uint8ArrayHandle) -> Vec<u8>;
+    }
+
+    /// Starts the `arrayBuffer()` promise of one `Blob`.
+    fn blob_array_buffer(file: &Blob) -> JsValue {
+        file.unchecked_ref::<BlobBinaryHandle>().array_buffer()
+    }
+
+    /// Reads the full binary content of a `Blob` as `Vec<u8>`.
+    ///
+    /// The CSV import path reads `Blob::text()` because CSV is text;
+    /// firmware files are binary, so this path awaits `arrayBuffer()` and
+    /// copies the resulting `Uint8Array` into Rust. An empty result is
+    /// returned as an empty vector; the caller maps it to the "empty file"
+    /// validation.
+    async fn read_blob_bytes(file: &Blob) -> Option<Vec<u8>> {
+        // `leptos::web_sys` re-exports `js_sys` unconditionally, so the
+        // promise wrapper is reachable without a direct `js-sys` dependency;
+        // the value is a real JS Promise, so the unchecked cast is sound.
+        let promise = blob_array_buffer(file).unchecked_into::<leptos::web_sys::js_sys::Promise>();
+        let buffer = JsFuture::from(promise).await.ok()?;
+        let bytes = Uint8ArrayHandle::new_uint8_array(&buffer);
+        Some(bytes.copy_to_vec())
     }
 
     fn input_files_list(input: &HtmlInputElement) -> Option<FileListHandle> {
@@ -8924,6 +10054,7 @@ mod tests {
                 ConsoleView::Audit,
                 ConsoleView::Capabilities,
                 ConsoleView::Operations,
+                ConsoleView::Artifacts,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -8933,6 +10064,7 @@ mod tests {
         assert_eq!(ConsoleView::Audit.label(), "Audit");
         assert_eq!(ConsoleView::Capabilities.label(), "Capabilities");
         assert_eq!(ConsoleView::Operations.label(), "Operations");
+        assert_eq!(ConsoleView::Artifacts.label(), "Artifacts");
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(
@@ -8943,6 +10075,372 @@ mod tests {
             )
             .is_loading()
         );
+    }
+
+    #[test]
+    fn artifact_chunk_ranges_split_every_size_class_on_the_base64_capped_boundary() {
+        let empty = artifact_chunk_ranges(0);
+        assert!(empty.is_empty());
+
+        // A single byte is one 1-byte chunk.
+        let tiny = artifact_chunk_ranges(1);
+        assert_eq!(
+            tiny,
+            [ArtifactChunkRange {
+                offset: 0,
+                length: 1,
+            }]
+        );
+
+        // Exactly one full chunk: 3 MiB of payload, whose base64 text is
+        // exactly the server's 4 MiB character cap.
+        let exact = artifact_chunk_ranges(ARTIFACT_CHUNK_BYTES);
+        assert_eq!(
+            exact,
+            [ArtifactChunkRange {
+                offset: 0,
+                length: 3 * 1024 * 1024,
+            }]
+        );
+        assert_eq!(
+            base64_encode(&vec![0_u8; 3 * 1024 * 1024]).len(),
+            4 * 1024 * 1024,
+            "a full chunk must fit the server's base64 text cap exactly"
+        );
+
+        // Two full chunks plus a remainder: the last chunk is never padded.
+        let total = 2 * ARTIFACT_CHUNK_BYTES + 17;
+        let ranges = artifact_chunk_ranges(total);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].length as u64, ARTIFACT_CHUNK_BYTES);
+        assert_eq!(ranges[1].offset, ARTIFACT_CHUNK_BYTES);
+        assert_eq!(ranges[1].length as u64, ARTIFACT_CHUNK_BYTES);
+        assert_eq!(ranges[2].offset, 2 * ARTIFACT_CHUNK_BYTES);
+        assert_eq!(ranges[2].length, 17);
+
+        // The ranges tile the file exactly.
+        let total: u64 = ranges.iter().map(|range| range.length as u64).sum();
+        assert_eq!(total, 2 * ARTIFACT_CHUNK_BYTES + 17);
+    }
+
+    #[test]
+    fn artifact_resume_offset_is_the_acknowledged_byte_count_not_a_boundary() {
+        // Aligned acknowledgement resumes at the next chunk start.
+        let resumed = artifact_chunk_range_at(3 * 1024 * 1024, 10 * 1024 * 1024);
+        assert_eq!(
+            resumed,
+            Some(ArtifactChunkRange {
+                offset: 3 * 1024 * 1024,
+                length: 3 * 1024 * 1024,
+            })
+        );
+
+        // A server that acknowledged a partial chunk resumes at that exact
+        // byte, never rounded down, because the chunk contract requires the
+        // offset to equal the bytes already received.
+        let partial = artifact_chunk_range_at(5 * 1024 * 1024, 10 * 1024 * 1024);
+        assert_eq!(
+            partial,
+            Some(ArtifactChunkRange {
+                offset: 5 * 1024 * 1024,
+                length: 3 * 1024 * 1024,
+            })
+        );
+
+        // A fully received file has no chunk left; callers jump to finalize.
+        assert_eq!(
+            artifact_chunk_range_at(10 * 1024 * 1024, 10 * 1024 * 1024),
+            None
+        );
+        assert_eq!(
+            artifact_chunk_range_at(11 * 1024 * 1024, 10 * 1024 * 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn upload_progress_percent_scales_and_clamps() {
+        assert_eq!(upload_progress_percent(0, 0), 100);
+        assert_eq!(upload_progress_percent(0, 8), 0);
+        assert_eq!(upload_progress_percent(2, 8), 25);
+        assert_eq!(upload_progress_percent(6, 8), 75);
+        assert_eq!(upload_progress_percent(8, 8), 100);
+        // A server that reports slightly more than the declared size cannot
+        // render an overfull bar.
+        assert_eq!(upload_progress_percent(9, 8), 100);
+        assert_eq!(upload_progress_percent(u64::MAX, 1), 100);
+    }
+
+    #[test]
+    fn format_artifact_size_uses_binary_units() {
+        assert_eq!(format_artifact_size(0), "0 B");
+        assert_eq!(format_artifact_size(512), "512 B");
+        assert_eq!(format_artifact_size(1536), "1.5 KiB");
+        assert_eq!(format_artifact_size(4 * 1024 * 1024), "4.0 MiB");
+        assert_eq!(format_artifact_size(10 * 1024 * 1024), "10.0 MiB");
+        assert_eq!(format_artifact_size(12 * 1024 * 1024 * 1024), "12.0 GiB");
+    }
+
+    #[test]
+    fn base64_encoding_follows_rfc_4648_vectors() {
+        for (bytes, expected) in [
+            (&[][..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+            (&[0x00, 0x01, 0x02][..], "AAEC"),
+            (&[0xFF, 0xFF, 0xFF][..], "////"),
+            (&[0xFE, 0xED][..], "/u0="),
+            (&[0x00_u8; 3][..], "AAAA"),
+        ] {
+            assert_eq!(base64_encode(bytes), expected);
+        }
+    }
+
+    #[test]
+    fn sha256_hex_matches_rfc_6234_vectors() {
+        for (bytes, expected) in [
+            (
+                &[][..],
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+            (
+                b"The quick brown fox jumps over the lazy dog",
+                "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
+            ),
+            // The million-"a" vector exercises the two-block padding path:
+            // 1 000 000 bytes fill 15 625 blocks and leave a 64-byte tail.
+            // A heap `Vec` keeps the million bytes off the test stack.
+            (
+                vec![b'a'; 1_000_000].as_slice(),
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            ),
+        ] {
+            assert_eq!(sha256_hex(bytes), expected);
+        }
+        // A digest of 3 MiB spans the padding boundary exactly once at the
+        // tail: 49 152 full blocks, then a 64-byte tail block whose padding
+        // spills into a second block.
+        let three_mib = vec![b'x'; 3 * 1024 * 1024];
+        assert_eq!(sha256_hex(&three_mib).len(), 64);
+        assert_eq!(sha256_hex(&three_mib), sha256_hex(&three_mib));
+    }
+
+    #[test]
+    fn artifact_fixture_projects_cards_across_three_states() -> Result<(), Box<dyn Error>> {
+        let list: rutilus_api::ArtifactListResponse = serde_json::from_value(json!({
+            "artifacts": [
+                {
+                    "artifact_id": "01989abc-def0-7abc-8def-0123456789e1",
+                    "name": "firmware-a.bin",
+                    "size_bytes": 8 * 1024 * 1024,
+                    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                    "state": "uploading",
+                    "uploaded_bytes": 4 * 1024 * 1024,
+                    "created_at": "2026-08-06T10:11:12Z",
+                    "updated_at": "2026-08-06T10:12:13Z"
+                },
+                {
+                    "artifact_id": "01989abc-def0-7abc-8def-0123456789e2",
+                    "name": "firmware-b.bin",
+                    "size_bytes": 6,
+                    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                    "state": "ready",
+                    "uploaded_bytes": 6,
+                    "created_at": "2026-08-06T10:11:12Z",
+                    "updated_at": "2026-08-06T10:12:13Z"
+                },
+                {
+                    "artifact_id": "01989abc-def0-7abc-8def-0123456789e3",
+                    "name": "firmware-c.bin",
+                    "size_bytes": 6,
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "state": "failed",
+                    "uploaded_bytes": 6,
+                    "created_at": "2026-08-06T10:11:12Z",
+                    "updated_at": "2026-08-06T10:12:13Z"
+                }
+            ]
+        }))?;
+        let cards = list
+            .artifacts()
+            .iter()
+            .map(ArtifactCardProjection::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(cards.len(), 3);
+
+        let uploading = &cards[0];
+        assert_eq!(uploading.status, ArtifactStatusView::Uploading);
+        assert_eq!(uploading.status_label(), "Uploading");
+        assert_eq!(uploading.status_class(), "artifact-state artifact-active");
+        assert_eq!(uploading.progress_percent, 50);
+        assert_eq!(uploading.size_text, "8.0 MiB");
+        assert_eq!(uploading.uploaded_bytes, 4 * 1024 * 1024);
+        assert_eq!(uploading.sha256_short, "9f86d081");
+        assert_eq!(uploading.created_at_text, "2026-08-06T10:11:12Z");
+        assert!(uploading.is_uploading());
+        assert!(!uploading.is_completely_uploaded());
+
+        let ready = &cards[1];
+        assert_eq!(ready.status, ArtifactStatusView::Ready);
+        assert_eq!(ready.status_label(), "Ready");
+        assert_eq!(ready.status_class(), "artifact-state artifact-ok");
+        assert_eq!(ready.progress_percent, 100);
+        assert!(ready.is_completely_uploaded());
+
+        let failed = &cards[2];
+        assert_eq!(failed.status, ArtifactStatusView::Failed);
+        assert_eq!(failed.status_label(), "Failed");
+        assert_eq!(failed.status_class(), "artifact-state artifact-error");
+        assert_eq!(failed.sha256_short, "00000000");
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_resume_candidate_matches_only_uploading_cards_by_name_and_size()
+    -> Result<(), Box<dyn Error>> {
+        let cards = vec![
+            artifact_fixture_card("firmware.bin", ArtifactStatusView::Uploading, 4, 8),
+            artifact_fixture_card("firmware.bin", ArtifactStatusView::Ready, 8, 8),
+            artifact_fixture_card("other.bin", ArtifactStatusView::Uploading, 0, 8),
+        ];
+        let list = ArtifactsListState::Ready(cards);
+
+        // The interrupted artifact matches by name and declared size.
+        let candidate = list
+            .resume_candidate("firmware.bin", 8 * 1024 * 1024)
+            .ok_or("uploading card must be the resume candidate")?;
+        assert_eq!(candidate.artifact_id, "resume-target");
+
+        // A ready artifact with the same name is not a resume target: its
+        // upload is complete, and re-selecting it would create a duplicate.
+        assert!(
+            list.resume_candidate("other.bin", 8 * 1024 * 1024)
+                .is_some()
+        );
+        assert!(
+            list.resume_candidate("firmware.bin", 7 * 1024 * 1024)
+                .is_none(),
+            "a size mismatch must never resume a different file"
+        );
+        assert!(
+            list.resume_candidate("missing.bin", 8 * 1024 * 1024)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_upload_status_text_and_failure_messages_are_static_or_status_aware() {
+        // The list and upload states are exercised here so the host build
+        // keeps every variant reachable, mirroring the operations list test.
+        assert!(ArtifactsListState::Loading.is_loading());
+        assert!(!ArtifactsListState::Loading.is_ready());
+        assert!(ArtifactsListState::Failed.is_failed());
+        assert!(!ArtifactsListState::Failed.is_loading());
+        assert_eq!(ArtifactsListState::Failed.count_text(), "0 artifacts");
+        assert!(!ArtifactsListState::Loading.has_empty_list());
+        assert!(!ArtifactUploadState::Idle.is_in_flight());
+        assert!(ArtifactUploadState::Creating.is_in_flight());
+        assert!(
+            ArtifactUploadState::Failed(ArtifactUploadFailure::FileEmpty).is_failed(),
+            "a failed upload must be visible as failed"
+        );
+        assert!(ArtifactUploadState::Succeeded.is_succeeded());
+        assert_eq!(
+            ArtifactUploadState::Failed(ArtifactUploadFailure::FileEmpty).failure_message(),
+            "The selected file is empty."
+        );
+
+        assert_eq!(artifact_upload_status_text(&ArtifactUploadState::Idle), "");
+        assert_eq!(
+            artifact_upload_status_text(&ArtifactUploadState::Creating),
+            "Creating artifact..."
+        );
+        assert_eq!(
+            artifact_upload_status_text(&ArtifactUploadState::Uploading {
+                artifact_id: "id".to_owned(),
+                uploaded_bytes: 4 * 1024 * 1024,
+                total_bytes: 10 * 1024 * 1024,
+            }),
+            "Uploading chunk 2 of 4 · 40%"
+        );
+        assert_eq!(
+            artifact_upload_status_text(&ArtifactUploadState::Finalizing {
+                artifact_id: "id".to_owned(),
+            }),
+            "Verifying the uploaded digest..."
+        );
+        assert_eq!(
+            artifact_upload_status_text(&ArtifactUploadState::Succeeded),
+            ""
+        );
+        assert_eq!(
+            ArtifactUploadFailure::FileUnreadable.message(),
+            "The selected file could not be read."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::FileEmpty.message(),
+            "The selected file is empty."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::CreateRejected { status: 422 }.message(),
+            "The server rejected the artifact creation (HTTP 422)."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::ChunkRejected { status: 409 }.message(),
+            "The server rejected an upload chunk (HTTP 409)."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::FinalizeRejected { status: 422 }.message(),
+            "The server rejected the upload finalize (HTTP 422)."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::Unavailable.message(),
+            "The artifact store is temporarily unavailable."
+        );
+        assert_eq!(
+            ArtifactUploadFailure::MalformedResponse.message(),
+            "The server response could not be read."
+        );
+    }
+
+    /// One artifact card fixture, sized in MiB so tests read in storage
+    /// units instead of raw bytes.
+    fn artifact_fixture_card(
+        name: &str,
+        status: ArtifactStatusView,
+        uploaded_mib: u64,
+        size_mib: u64,
+    ) -> ArtifactCardProjection {
+        ArtifactCardProjection {
+            artifact_id: "resume-target".to_owned(),
+            short_id: "resume".to_owned(),
+            name: name.to_owned(),
+            size_text: format_artifact_size(size_mib * 1024 * 1024),
+            sha256_short: "9f86d081".to_owned(),
+            status,
+            uploaded_bytes: uploaded_mib * 1024 * 1024,
+            size_bytes: size_mib * 1024 * 1024,
+            progress_percent: upload_progress_percent(
+                uploaded_mib * 1024 * 1024,
+                size_mib * 1024 * 1024,
+            ),
+            created_at_text: "2026-08-06T10:11:12Z".to_owned(),
+        }
     }
 
     #[test]

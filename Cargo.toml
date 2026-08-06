@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22.1"
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.5", features = ["derive"] }
 console = { version = "0.16.4", default-features = false, features = ["std"] }

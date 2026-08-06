@@ -3445,12 +3445,15 @@ dependencies = [
 name = "rutilus-application"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "csv",
  "rutilus-domain",
  "rutilus-operation-engine",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.19",
  "time",
  "tokio",
@@ -3605,6 +3608,7 @@ dependencies = [
  "rutilus-domain",
  "secrecy",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tower",

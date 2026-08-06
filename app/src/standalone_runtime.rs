@@ -11,17 +11,17 @@ use std::{
 };
 
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
-    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
-    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
-    OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
-    ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
+    ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
+    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
+    EndpointRefreshRepository, OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery,
+    ResolvedCredential, ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    AuditActor, AuditEvent, Credential, CredentialId, CredentialVersionId, DeploymentPosture,
-    Endpoint, EndpointCapabilityObservation, EndpointId, Operation, OperationId, OperationState,
-    ResourceSnapshot,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
+    CredentialVersionId, DeploymentPosture, Endpoint, EndpointCapabilityObservation, EndpointId,
+    Operation, OperationId, OperationState, ResourceSnapshot,
 };
 use rutilus_infra_redfish::{
     NV_REDFISH_DEVELOPMENT_BASELINE, RedfishCommandExecutor, RedfishGateway, TlsProbeInitError,
@@ -30,7 +30,7 @@ use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, OperationEngine, OperationStore,
 };
 use rutilus_persistence::{
-    AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
+    ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
     NewCredential, OpenStoreError, OperationRepositoryError, SqliteStore,
 };
@@ -330,6 +330,57 @@ impl OperationStore for StandaloneState {
         state: Option<OperationState>,
     ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         <SqliteStore as OperationStore>::list_operations(&self.store, state)
+    }
+}
+
+impl ArtifactRepository for StandaloneState {
+    type Error = ArtifactRepositoryError;
+
+    /// Delegates the artifact lifecycle to the same `SqliteStore` that owns
+    /// every other aggregate, so the Web layer's §14.3 artifact upload paths
+    /// (which compose the `ArtifactRepository` boundary of the
+    /// product-services bundle) always observe one authoritative manifest and
+    /// progress row — the same row any future recovery scan reads. The store
+    /// persists the manifest and progress only; the application upload use
+    /// case performs the file bytes under `spawn_blocking` (§7.8) at the
+    /// deterministic `artifact_file_path`.
+    fn create_artifact<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.store.create_artifact(artifact).await })
+    }
+
+    fn find_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> BoundaryFuture<'_, Result<Option<Artifact>, Self::Error>> {
+        Box::pin(async move { self.store.find_artifact(artifact_id).await })
+    }
+
+    fn list_artifacts_by_state(
+        &self,
+        state: ArtifactState,
+    ) -> BoundaryFuture<'_, Result<Vec<Artifact>, Self::Error>> {
+        Box::pin(async move { self.store.list_artifacts_by_state(state).await })
+    }
+
+    fn update_artifact(
+        &self,
+        artifact_id: ArtifactId,
+        uploaded_bytes: u64,
+        state: ArtifactState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .update_artifact(artifact_id, uploaded_bytes, state, occurred_at)
+                .await
+        })
+    }
+
+    fn artifact_file_path(&self, artifact_id: ArtifactId) -> PathBuf {
+        self.store.artifact_file_path(artifact_id)
     }
 }
 
