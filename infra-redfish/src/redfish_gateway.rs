@@ -21,6 +21,7 @@ use nv_redfish::{
     core::{EntityTypeRef, NavProperty},
     manager::{Manager, ManagerCollection},
     schema::{
+        assembly::Assembly as AssemblySchema, assembly::AssemblyData as AssemblyDataSchema,
         bios::Bios as BiosSchema, boot_option::BootOption as BootOptionSchema,
         boot_option_collection::BootOptionCollection as BootOptionCollectionSchema,
         chassis::Chassis as ChassisSchema,
@@ -43,11 +44,14 @@ use nv_redfish::{
         memory_collection::MemoryCollection as MemoryCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
-        power::Power as PowerSchema, processor::Processor as ProcessorSchema,
+        pcie_device::PcieDevice as PcieDeviceSchema, power::Power as PowerSchema,
+        processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
         resource::Resource as ResourceSchema, secure_boot::SecureBoot as SecureBootSchema,
         sensor::Sensor as SensorSchema,
         sensor_collection::SensorCollection as SensorCollectionSchema,
+        software_inventory::SoftwareInventory as SoftwareInventorySchema,
+        software_inventory_collection::SoftwareInventoryCollection as SoftwareInventoryCollectionSchema,
         storage::Storage as StorageSchema,
         storage_collection::StorageCollection as StorageCollectionSchema,
         thermal::Thermal as ThermalSchema,
@@ -334,13 +338,14 @@ async fn read_authenticated_core_resources(
     resources.extend(read_chassis_resources(bmc, root, identity, trust).await?);
     resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
     resources.extend(read_account_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_software_inventory_resources(bmc, root, identity, trust).await?);
     Ok(resources)
 }
 
 /// Reads the Systems collection and, for every decoded System member, its
 /// `Bios`, `BootOptions`, and `SecureBoot` configuration surfaces plus the
-/// `Processors`, `Memory`, and `Storage` collections, so the 0.2 families
-/// follow their parent through the same typed navigation.
+/// `Processors`, `Memory`, `Storage`, and `PcieDevices` families, so the 0.2
+/// families follow their parent through the same typed navigation.
 ///
 /// A missing Systems link leaves the whole family absent without an error
 /// ("资源存在才呈现"); a failed Systems collection document aborts the read
@@ -426,14 +431,25 @@ async fn read_systems_resources(
             )
             .await?,
         );
+        resources.extend(
+            read_nav_link_members(
+                system.pcie_devices.as_deref(),
+                bmc,
+                identity,
+                trust,
+                pcie_device_projection,
+            )
+            .await?,
+        );
     }
     Ok(resources)
 }
 
 /// Reads the Chassis collection and, for every decoded Chassis member, its
 /// `NetworkAdapters` collection plus the `Power` and `Thermal` telemetry
-/// singletons and the `Sensors` and `Controls` telemetry collections, so the
-/// 0.2 telemetry surface follows its parent through the same typed navigation.
+/// singletons, the `Sensors` and `Controls` telemetry collections, and the
+/// `Assembly` document, so the 0.2 telemetry and assembly surfaces follow
+/// their parent through the same typed navigation.
 ///
 /// A missing Chassis link leaves the whole family absent without an error; a
 /// failed Chassis collection document aborts the read with the existing
@@ -510,6 +526,9 @@ async fn read_chassis_resources(
                 control_projection,
             )
             .await?,
+        );
+        resources.extend(
+            read_assembly_resources(chassis.assembly.as_ref(), bmc, identity, trust).await?,
         );
     }
     Ok(resources)
@@ -620,6 +639,102 @@ async fn read_account_resources(
         manager_account_projection,
     )
     .await
+}
+
+/// Reads the `SoftwareInventory` family through the root-level
+/// `UpdateService` link, so members are discovered from the decoded Service
+/// Root instead of a guessed path.
+///
+/// The `UpdateService` document itself is a singleton and follows the
+/// singleton decision exactly like `AccountService`: a missing link leaves
+/// the family absent and a failed document is skipped with the member-level
+/// semantics instead of aborting the read. The `SoftwareInventory` collection
+/// below it keeps the normal collection semantics: a failed collection
+/// document aborts, only individual members are skippable.
+async fn read_software_inventory_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(update_service) = root.root.update_service.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(service) = fetch_member(update_service, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_collection_resources(
+        service.software_inventory.as_ref(),
+        bmc,
+        identity,
+        trust,
+        software_inventory_projection,
+    )
+    .await
+}
+
+/// Reads the `Assembly` document of every Chassis member and projects one
+/// snapshot per `AssemblyData` member embedded in it.
+///
+/// The `Assembly` document is a singleton: a missing link leaves the family
+/// absent and a failed document is skipped with the member-level semantics,
+/// because there is no collection document to abort the read over. Each
+/// `AssemblyData` member is then fetched individually, so one undecodable
+/// member cannot erase its peers.
+async fn read_assembly_resources(
+    assembly: Option<&NavProperty<AssemblySchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(assembly) = assembly else {
+        return Ok(Vec::new());
+    };
+    let Some(assembly) = fetch_member(assembly, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_nav_link_members(
+        assembly.assemblies.as_deref(),
+        bmc,
+        identity,
+        trust,
+        assembly_data_projection,
+    )
+    .await
+}
+
+/// Projects the members of an in-document array of typed navigation links
+/// with the same per-member skip semantics as a collection, because the array
+/// is the whole family surface and there is no collection document to abort
+/// the read over.
+///
+/// `PCIeDevices` on a System and `Assemblies` inside the Assembly document
+/// are both arrays of links instead of collection resources: a missing or
+/// empty array produces no snapshots ("资源存在才呈现"), and every member is
+/// fetched individually so one undecodable member cannot erase its peers.
+async fn read_nav_link_members<T>(
+    links: Option<&[NavProperty<T>]>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    project: impl Fn(&T) -> Result<CoreResourceProjection, CoreResourceReadError>,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
+where
+    T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    let Some(links) = links else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    for link in links {
+        let Some(member) = fetch_member(link, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(project(&member))? {
+            resources.push(projection);
+        }
+    }
+    Ok(resources)
 }
 
 /// A decoded Redfish collection schema that exposes its member navigation
@@ -737,6 +852,14 @@ impl MemberCollection for SensorCollectionSchema {
 
 impl MemberCollection for ControlCollectionSchema {
     type Member = ControlSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for SoftwareInventoryCollectionSchema {
+    type Member = SoftwareInventorySchema;
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
@@ -1518,6 +1641,73 @@ struct AccountsPayload {
     account_types: Option<Vec<nv_redfish::schema::manager_account::AccountTypes>>,
 }
 
+/// The §0.2.0 `pcie-devices` family projection.
+///
+/// The field set is exactly the `PcieDevicePayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct
+/// `DeviceType`, `Manufacturer`, `Model`, and `Status` properties of the
+/// `PCIeDevice` schema are all projectable; `DeviceType` keeps the typed
+/// enumeration value so the console renders the device class without
+/// re-parsing text. `SlotType` entered `PCIeDevice_v1` only in `v1_9_0` and
+/// the schema compiles no `SlotType` property, so it stays out of this
+/// strictly projectable field set.
+#[derive(Serialize)]
+struct PcieDevicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DeviceType", skip_serializing_if = "Option::is_none")]
+    device_type: Option<nv_redfish::schema::pcie_device::DeviceType>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `assembly` family projection.
+///
+/// The field set is exactly the `AssemblyPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. The direct `Producer`
+/// and `Status` properties of the `AssemblyData` member schema are the whole
+/// projectable surface: the type of an assembly is expressed through the
+/// `PhysicalContext` property, which stays out of this first strictly
+/// projectable field set.
+#[derive(Serialize)]
+struct AssemblyDataPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Producer", skip_serializing_if = "Option::is_none")]
+    producer: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `software-inventory` family projection.
+///
+/// The field set is exactly the `SoftwareInventoryPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The direct
+/// `SoftwareId`, `Version`, `ReleaseDate`, and `Status` properties of the
+/// `SoftwareInventory` schema are all projectable; `ReleaseDate` keeps the
+/// RFC 3339 timestamp of the compiled `Edm.DateTimeOffset` type so the
+/// console renders the release date without re-parsing text.
+#[derive(Serialize)]
+struct SoftwareInventoryPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "SoftwareId", skip_serializing_if = "Option::is_none")]
+    software_id: Option<String>,
+    #[serde(rename = "Version", skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(rename = "ReleaseDate", skip_serializing_if = "Option::is_none")]
+    release_date: Option<nv_redfish::schema::edm::DateTimeOffset>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
 /// The §0.2.0 `bios` family projection.
 ///
 /// The field set is exactly the `BiosPayload` the application boundary
@@ -1950,6 +2140,76 @@ fn manager_account_projection(
         ResourceFeature::Accounts,
         account.odata_id(),
         account.etag(),
+        &payload,
+    )
+}
+
+fn pcie_device_projection(
+    device: &PcieDeviceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = PcieDevicePayload {
+        resource: CommonResourcePayload::from_schema_base(&device.base),
+        device_type: device.device_type,
+        manufacturer: optional_nullable_text(device.manufacturer.as_ref()),
+        model: optional_nullable_text(device.model.as_ref()),
+        status: device
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::PcieDevices,
+        device.odata_id(),
+        device.etag(),
+        &payload,
+    )
+}
+
+fn assembly_data_projection(
+    data: &AssemblyDataSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = AssemblyDataPayload {
+        resource: CommonResourcePayload {
+            // `AssemblyData` is a referenceable member: the schema declares
+            // no `Id` property, so the required `MemberId` array index is
+            // the member's stable identifier, and `Name` is optional while
+            // the common projection requires a string, so an unnamed member
+            // falls back to the empty string instead of producing an
+            // undecodable snapshot.
+            id: data.base.member_id.clone(),
+            name: data
+                .name
+                .as_ref()
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or_default(),
+            description: data.description.as_ref().and_then(Option::as_ref).cloned(),
+        },
+        producer: optional_nullable_text(data.producer.as_ref()),
+        status: data.status.as_ref().map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::Assembly,
+        data.odata_id(),
+        data.etag(),
+        &payload,
+    )
+}
+
+fn software_inventory_projection(
+    item: &SoftwareInventorySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = SoftwareInventoryPayload {
+        resource: CommonResourcePayload::from_schema_base(&item.base),
+        software_id: item.software_id.clone(),
+        version: optional_nullable_text(item.version.as_ref()),
+        release_date: item.release_date.as_ref().and_then(Option::as_ref).copied(),
+        status: item.status.as_ref().map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::SoftwareInventory,
+        item.odata_id(),
+        item.etag(),
         &payload,
     )
 }
@@ -3450,6 +3710,223 @@ mod tests {
         "AccountTypes":["Redfish"]
     }"##;
 
+    /// A Service Root that also advertises the 0.2 `SoftwareInventory` family
+    /// through the root-level `UpdateService` link.
+    const CORE_WITH_UPDATE_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"}
+    }"#;
+
+    /// The `UpdateService` document that advertises the `SoftwareInventory`
+    /// collection; the update-operation fields are decoded but stay outside
+    /// the projection contract.
+    const UPDATE_SERVICE_WITH_INVENTORY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/UpdateService",
+        "@odata.etag":"W/\"update-service-1\"",
+        "Id":"UpdateService",
+        "Name":"Update Service",
+        "Description":"Firmware update service",
+        "ServiceEnabled":true,
+        "MaxImageSizeBytes":2147483648,
+        "SoftwareInventory":{"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory"}
+    }"#;
+
+    const SOFTWARE_INVENTORY_BODY: &str = r##"{
+        "@odata.type":"#SoftwareInventoryCollection.SoftwareInventoryCollection",
+        "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory",
+        "Name":"Software Inventory Collection",
+        "Members":[]
+    }"##;
+
+    const SOFTWARE_INVENTORY_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#SoftwareInventoryCollection.SoftwareInventoryCollection",
+        "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory",
+        "Name":"Software Inventory Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BIOS"},
+            {"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BMC"}
+        ]
+    }"##;
+
+    /// The full `SoftwareInventory` member projection with every optional
+    /// contract field populated; the update-lifecycle fields are decoded but
+    /// stay outside the projection contract.
+    const SOFTWARE_INVENTORY_BIOS_BODY: &str = r##"{
+        "@odata.type":"#SoftwareInventory.v1_7_0.SoftwareInventory",
+        "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+        "@odata.etag":"W/\"sw-1\"",
+        "Id":"BIOS",
+        "Name":"System BIOS",
+        "Description":"Host firmware",
+        "SoftwareId":"BIOS-2026-1",
+        "Version":"2.7.0",
+        "ReleaseDate":"2026-05-01T00:00:00Z",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "Updateable":true,
+        "Manufacturer":"Vendor E",
+        "LowestSupportedVersion":"2.0.0"
+    }"##;
+
+    /// A minimal `SoftwareInventory` member: every optional contract field
+    /// is absent so the projection omits it instead of emitting null.
+    const SOFTWARE_INVENTORY_BMC_BODY: &str = r##"{
+        "@odata.type":"#SoftwareInventory.v1_7_0.SoftwareInventory",
+        "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BMC",
+        "@odata.etag":"W/\"sw-2\"",
+        "Id":"BMC",
+        "Name":"BMC Firmware",
+        "SoftwareId":"BMC-2026-1",
+        "Version":"1.4.2"
+    }"##;
+
+    /// A System member that advertises the 0.2 `PcieDevices` family as an
+    /// in-document array of typed links, the presence-type shape the
+    /// `ComputerSystem` schema uses instead of a collection resource.
+    const SYSTEM_WITH_PCIE_DEVICES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "Description":"Primary compute system",
+        "SystemType":"Physical",
+        "Manufacturer":"Rutilus Test",
+        "Model":"Model S",
+        "PCIeDevices":[
+            {"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1"},
+            {"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/NIC1"}
+        ]
+    }"#;
+
+    /// A System member that advertises an empty `PCIeDevices` link array, so
+    /// the read proves the presence-type family produces nothing when the
+    /// advertised surface has no members.
+    const SYSTEM_WITH_EMPTY_PCIE_DEVICES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "PCIeDevices":[]
+    }"#;
+
+    /// The full `PCIeDevice` member projection with every optional contract
+    /// field populated; the firmware and identity fields are decoded but stay
+    /// outside the projection contract.
+    const PCIE_DEVICE_GPU_BODY: &str = r##"{
+        "@odata.type":"#PCIeDevice.v1_12_0.PCIeDevice",
+        "@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1",
+        "@odata.etag":"W/\"pcie-device-1\"",
+        "Id":"GPU1",
+        "Name":"PCIe Device One",
+        "Description":"GPU accelerator",
+        "DeviceType":"SingleFunction",
+        "Manufacturer":"Vendor C",
+        "Model":"PCIE-GEN4-X16",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "FirmwareVersion":"1.2.3",
+        "SerialNumber":"PCI-SN-1",
+        "SKU":"PCI-SKU-1"
+    }"##;
+
+    /// A minimal `PCIeDevice` member: every optional contract field is
+    /// absent so the projection omits it instead of emitting null.
+    const PCIE_DEVICE_NIC_BODY: &str = r##"{
+        "@odata.type":"#PCIeDevice.v1_12_0.PCIeDevice",
+        "@odata.id":"/redfish/v1/Systems/1/PCIeDevices/NIC1",
+        "@odata.etag":"W/\"pcie-device-2\"",
+        "Id":"NIC1",
+        "Name":"PCIe Device Two",
+        "DeviceType":"MultiFunction"
+    }"##;
+
+    /// A Chassis member that advertises the 0.2 `Assembly` document.
+    const CHASSIS_WITH_ASSEMBLY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"}
+    }"#;
+
+    /// The `Assembly` document that embeds the `Assemblies` link array; the
+    /// document itself is not projected, only its members are.
+    const ASSEMBLY_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#Assembly.v1_5_0.Assembly",
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly",
+        "@odata.etag":"W/\"assembly-1\"",
+        "Id":"Assembly",
+        "Name":"Chassis Assembly",
+        "Assemblies":[
+            {"@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0"},
+            {"@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/1"}
+        ]
+    }"##;
+
+    /// The full `AssemblyData` member projection with every optional contract
+    /// field populated; the FRU identity fields are decoded but stay outside
+    /// the projection contract.
+    const ASSEMBLY_FAN_BODY: &str = r##"{
+        "@odata.type":"#Assembly.v1_5_0.AssemblyData",
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+        "@odata.etag":"W/\"assembly-data-0\"",
+        "MemberId":"0",
+        "Name":"Fan Assembly",
+        "Description":"Cooling fan",
+        "Producer":"Vendor D",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "Model":"FRU-MODEL-X",
+        "SerialNumber":"FRU-1",
+        "Version":"1.0"
+    }"##;
+
+    /// A minimal `AssemblyData` member: every optional contract field is
+    /// absent so the projection omits it instead of emitting null.
+    const ASSEMBLY_PSU_BODY: &str = r##"{
+        "@odata.type":"#Assembly.v1_5_0.AssemblyData",
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/1",
+        "@odata.etag":"W/\"assembly-data-1\"",
+        "MemberId":"1",
+        "Name":"Power Supply Assembly",
+        "Producer":"Vendor E"
+    }"##;
+
+    /// An `Assembly` document embedding a single `AssemblyData` member that
+    /// carries no `Name` property, so the projection exercises the empty-name
+    /// fallback of the common payload.
+    const ASSEMBLY_WITH_UNNAMED_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#Assembly.v1_5_0.Assembly",
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly",
+        "Id":"Assembly",
+        "Name":"Chassis Assembly",
+        "Assemblies":[
+            {"@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0"}
+        ]
+    }"##;
+
+    /// A minimal `AssemblyData` member without the optional `Name` property:
+    /// the schema decodes it, and the projection falls back to the empty
+    /// string so the strict application decoder still reads the snapshot.
+    const ASSEMBLY_UNNAMED_BODY: &str = r##"{
+        "@odata.type":"#Assembly.v1_5_0.AssemblyData",
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+        "@odata.etag":"W/\"assembly-data-0\"",
+        "MemberId":"0",
+        "Producer":"Vendor D",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
     /// A System member that advertises the 0.2 `Bios`, `BootOptions` (inside
     /// the `Boot` property), and `SecureBoot` configuration surfaces.
     const SYSTEM_WITH_CONFIG_FEATURES_BODY: &str = r#"{
@@ -4510,6 +4987,124 @@ mod tests {
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
         "/redfish/v1/AccountService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for the complete 0.2 device-family read: every
+    /// `PCIeDevices` link of the System member, the `Assembly` document and
+    /// its `AssemblyData` members, and the `UpdateService` document plus the
+    /// `SoftwareInventory` collection members are fetched individually.
+    const DEVICE_FAMILY_RESOURCE_REQUEST_PATHS: [&str; 20] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+        "/redfish/v1/Systems/1/PCIeDevices/NIC1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Assembly",
+        // The `AssemblyData` member URIs embed a JSON-pointer fragment; the
+        // transport percent-encodes the `#` as `%23` on the wire.
+        "/redfish/v1/Chassis/1/Assembly%23/Assemblies/0",
+        "/redfish/v1/Chassis/1/Assembly%23/Assemblies/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/SoftwareInventory",
+        "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+        "/redfish/v1/UpdateService/SoftwareInventory/BMC",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when none of the three device families are
+    /// advertised: the `UpdateService` document is still read, no
+    /// `SoftwareInventory` member is, and the System/Chassis members
+    /// advertise neither `PCIeDevices` nor `Assembly`.
+    const ABSENT_DEVICE_FAMILY_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the advertised device surfaces are empty: the
+    /// empty `PCIeDevices` array and the `Assembly` document and the empty
+    /// `SoftwareInventory` collection are still read, no member is.
+    const EMPTY_DEVICE_FAMILY_REQUEST_PATHS: [&str; 14] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Assembly",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/SoftwareInventory",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when the second `PCIeDevice`, the second
+    /// `AssemblyData`, and the second `SoftwareInventory` members are
+    /// undecodable: their URIs are still requested (that is how the skip is
+    /// observed), then the remaining device families complete.
+    const DEVICE_MEMBER_SKIP_REQUEST_PATHS: [&str; 20] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+        "/redfish/v1/Systems/1/PCIeDevices/NIC1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Assembly",
+        // The `AssemblyData` member URIs embed a JSON-pointer fragment; the
+        // transport percent-encodes the `#` as `%23` on the wire.
+        "/redfish/v1/Chassis/1/Assembly%23/Assemblies/0",
+        "/redfish/v1/Chassis/1/Assembly%23/Assemblies/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService/SoftwareInventory",
+        "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+        "/redfish/v1/UpdateService/SoftwareInventory/BMC",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for the single unnamed `AssemblyData` member: the
+    /// `Assembly` document and its one member are fetched through the Chassis
+    /// navigation, and no other family makes a request.
+    const UNNAMED_ASSEMBLY_REQUEST_PATHS: [&str; 13] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Assembly",
+        // The `AssemblyData` member URI embeds a JSON-pointer fragment; the
+        // transport percent-encodes the `#` as `%23` on the wire.
+        "/redfish/v1/Chassis/1/Assembly%23/Assemblies/0",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -6352,6 +6947,391 @@ mod tests {
             &server.finish_all().await?,
             &ACCOUNTS_RESOURCE_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_pcie_assembly_and_software_inventory_families_through_typed_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_PCIE_DEVICES_BODY),
+                ("200 OK", PCIE_DEVICE_GPU_BODY),
+                ("200 OK", PCIE_DEVICE_NIC_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_ASSEMBLY_BODY),
+                ("200 OK", ASSEMBLY_WITH_MEMBERS_BODY),
+                ("200 OK", ASSEMBLY_FAN_BODY),
+                ("200 OK", ASSEMBLY_PSU_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_WITH_MEMBERS_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_BIOS_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_BMC_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 10);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::PcieDevices,
+                ResourceFeature::PcieDevices,
+                ResourceFeature::Chassis,
+                ResourceFeature::Assembly,
+                ResourceFeature::Assembly,
+                ResourceFeature::Managers,
+                ResourceFeature::SoftwareInventory,
+                ResourceFeature::SoftwareInventory,
+            ]
+        );
+        assert_projection(
+            &resources[2],
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+            "W/\"pcie-device-1\"",
+            "DeviceType",
+            "SingleFunction",
+        )?;
+        assert_projection(
+            &resources[3],
+            "/redfish/v1/Systems/1/PCIeDevices/NIC1",
+            "W/\"pcie-device-2\"",
+            "DeviceType",
+            "MultiFunction",
+        )?;
+        assert_projection(
+            &resources[5],
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+            "W/\"assembly-data-0\"",
+            "Producer",
+            "Vendor D",
+        )?;
+        assert_projection(
+            &resources[6],
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/1",
+            "W/\"assembly-data-1\"",
+            "Producer",
+            "Vendor E",
+        )?;
+        assert_projection(
+            &resources[8],
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+            "W/\"sw-1\"",
+            "SoftwareId",
+            "BIOS-2026-1",
+        )?;
+        assert_projection(
+            &resources[9],
+            "/redfish/v1/UpdateService/SoftwareInventory/BMC",
+            "W/\"sw-2\"",
+            "SoftwareId",
+            "BMC-2026-1",
+        )?;
+        assert_device_family_payloads(&resources)?;
+        assert_session_requests(
+            &server.finish_all().await?,
+            &DEVICE_FAMILY_RESOURCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    /// Asserts the exact contract field set of every device-family snapshot:
+    /// the populated fields of the full members, the omitted fields of the
+    /// minimal members, and the absence of every decoded schema field that is
+    /// not part of the contract (an extra key would make the stored snapshot
+    /// unreadable to the strict application decoder).
+    fn assert_device_family_payloads(
+        resources: &[CoreResourceProjection],
+    ) -> Result<(), Box<dyn Error>> {
+        let pcie_payload: serde_json::Value =
+            serde_json::from_str(resources[2].payload().as_str())?;
+        assert_eq!(pcie_payload["Manufacturer"], "Vendor C");
+        assert_eq!(pcie_payload["Model"], "PCIE-GEN4-X16");
+        assert_eq!(pcie_payload["Status"]["Health"], "OK");
+        assert_eq!(pcie_payload["Id"], "GPU1");
+        assert_eq!(pcie_payload["Name"], "PCIe Device One");
+        assert_eq!(pcie_payload.get("FirmwareVersion"), None);
+        assert_eq!(pcie_payload.get("SerialNumber"), None);
+        assert_eq!(pcie_payload.get("SKU"), None);
+        let pcie_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[3].payload().as_str())?;
+        assert_eq!(pcie_minimal_payload.get("Manufacturer"), None);
+        assert_eq!(pcie_minimal_payload.get("Model"), None);
+        assert_eq!(pcie_minimal_payload.get("Status"), None);
+        let assembly_payload: serde_json::Value =
+            serde_json::from_str(resources[5].payload().as_str())?;
+        assert_eq!(assembly_payload["Producer"], "Vendor D");
+        assert_eq!(assembly_payload["Status"]["Health"], "OK");
+        assert_eq!(assembly_payload["Id"], "0");
+        assert_eq!(assembly_payload["Name"], "Fan Assembly");
+        assert_eq!(assembly_payload.get("Model"), None);
+        assert_eq!(assembly_payload.get("SerialNumber"), None);
+        assert_eq!(assembly_payload.get("Version"), None);
+        let assembly_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[6].payload().as_str())?;
+        assert_eq!(assembly_minimal_payload["Producer"], "Vendor E");
+        assert_eq!(assembly_minimal_payload.get("Status"), None);
+        let software_payload: serde_json::Value =
+            serde_json::from_str(resources[8].payload().as_str())?;
+        assert_eq!(software_payload["SoftwareId"], "BIOS-2026-1");
+        assert_eq!(software_payload["Version"], "2.7.0");
+        assert_eq!(software_payload["ReleaseDate"], "2026-05-01T00:00:00Z");
+        assert_eq!(software_payload["Status"]["Health"], "OK");
+        assert_eq!(software_payload["Id"], "BIOS");
+        assert_eq!(software_payload["Name"], "System BIOS");
+        assert_eq!(software_payload.get("Updateable"), None);
+        assert_eq!(software_payload.get("Manufacturer"), None);
+        assert_eq!(software_payload.get("LowestSupportedVersion"), None);
+        let software_minimal_payload: serde_json::Value =
+            serde_json::from_str(resources[9].payload().as_str())?;
+        assert_eq!(software_minimal_payload["SoftwareId"], "BMC-2026-1");
+        assert_eq!(software_minimal_payload["Version"], "1.4.2");
+        assert_eq!(software_minimal_payload.get("ReleaseDate"), None);
+        assert_eq!(software_minimal_payload.get("Status"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_device_links_produce_no_family_snapshots() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", UPDATE_SERVICE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The System member advertises no PCIeDevices array, the Chassis
+        // member no Assembly document, and the UpdateService no
+        // SoftwareInventory collection, so none of the three families produce
+        // snapshots ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &ABSENT_DEVICE_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_device_arrays_and_collections_produce_no_family_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_EMPTY_PCIE_DEVICES_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_ASSEMBLY_BODY),
+                ("200 OK", ASSEMBLY_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The advertised-but-empty PCIeDevices array, Assembly document
+        // without Assemblies members, and SoftwareInventory collection
+        // produce no member snapshots ("资源存在才呈现").
+        assert_eq!(resources.len(), 4);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Managers,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &EMPTY_DEVICE_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_undecodable_device_members_without_aborting_the_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_PCIE_DEVICES_BODY),
+                ("200 OK", PCIE_DEVICE_GPU_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_ASSEMBLY_BODY),
+                ("200 OK", ASSEMBLY_WITH_MEMBERS_BODY),
+                ("200 OK", ASSEMBLY_FAN_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", UPDATE_SERVICE_WITH_INVENTORY_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_WITH_MEMBERS_BODY),
+                ("200 OK", SOFTWARE_INVENTORY_BIOS_BODY),
+                ("200 OK", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The second PCIe device, the second AssemblyData member, and the
+        // second SoftwareInventory member all return undecodable bodies and
+        // are skipped; every other member still produces a snapshot (§0.2.0
+        // acceptance, per-member skip without erasing peers).
+        assert_eq!(resources.len(), 7);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::PcieDevices,
+                ResourceFeature::Chassis,
+                ResourceFeature::Assembly,
+                ResourceFeature::Managers,
+                ResourceFeature::SoftwareInventory,
+            ]
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &DEVICE_MEMBER_SKIP_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assembly_member_without_name_falls_back_to_empty_common_name()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_ASSEMBLY_BODY),
+                ("200 OK", ASSEMBLY_WITH_UNNAMED_MEMBER_BODY),
+                ("200 OK", ASSEMBLY_UNNAMED_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Assembly,
+                ResourceFeature::Managers,
+            ]
+        );
+        // The `AssemblyData` schema makes `Name` optional while the common
+        // projection requires a string, so the missing name falls back to
+        // the empty string instead of producing an undecodable snapshot.
+        let assembly_payload: serde_json::Value =
+            serde_json::from_str(resources[3].payload().as_str())?;
+        assert_eq!(assembly_payload["Id"], "0");
+        assert_eq!(assembly_payload["Name"], "");
+        assert_eq!(assembly_payload.get("Description"), None);
+        assert_eq!(assembly_payload["Producer"], "Vendor D");
+        assert_eq!(assembly_payload["Status"]["Health"], "OK");
+        assert_session_requests(&server.finish_all().await?, &UNNAMED_ASSEMBLY_REQUEST_PATHS)?;
         Ok(())
     }
 
