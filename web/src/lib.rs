@@ -5,7 +5,7 @@ use std::{num::NonZeroU64, path::Path, sync::Arc};
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{
         HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
@@ -15,13 +15,18 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use rutilus_api::{
-    AboutResponse, CoreResourceCountsResponse, EndpointIdentityResponse, EndpointInventoryResponse,
-    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, HealthResponse, TlsTrustModeResponse,
+    AboutResponse, CoreResourceCommonResponse, CoreResourceCountsResponse,
+    CoreResourceDetailsResponse, CoreResourceResponse, CoreResourceSourceResponse,
+    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
+    HealthResponse, ResourceStatusResponse, TlsTrustModeResponse,
 };
 use rutilus_application::{
-    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryRepository,
+    CoreResourceDetails, CoreResourceSummary, EndpointInventoryItem, EndpointInventoryQuery,
+    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointResourceInventory,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, ResourceStatusSummary,
 };
-use rutilus_domain::{ResourceFeature, TlsTrust};
+use rutilus_domain::{Endpoint, EndpointId, ResourceFeature, TlsTrust};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
@@ -89,6 +94,10 @@ where
         .route("/api/v1/health", get(health))
         .route("/api/v1/about", get(about::<Repository>))
         .route("/api/v1/endpoints", get(endpoint_inventory::<Repository>))
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/resources",
+            get(endpoint_resources::<Repository>),
+        )
         .fallback(static_asset)
         .with_state(WebState { product, inventory })
         .layer(SetResponseHeaderLayer::overriding(
@@ -150,22 +159,48 @@ where
     response
 }
 
+async fn endpoint_resources<Repository>(
+    State(state): State<WebState<Repository>>,
+    AxumPath(endpoint_id): AxumPath<String>,
+) -> Response
+where
+    Repository: EndpointInventoryRepository,
+{
+    let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
+        return uncached_status(StatusCode::BAD_REQUEST);
+    };
+    let inventory = match EndpointResourceInventoryQuery::new(state.inventory.as_ref(), endpoint_id)
+        .execute()
+        .await
+    {
+        Ok(Some(inventory)) => inventory,
+        Ok(None) => return uncached_status(StatusCode::NOT_FOUND),
+        Err(EndpointResourceInventoryQueryError::Inventory(
+            EndpointInventoryQueryError::Repository(_),
+        )) => return uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+        Err(
+            EndpointResourceInventoryQueryError::Inventory(
+                EndpointInventoryQueryError::DuplicateEndpoint { .. },
+            )
+            | EndpointResourceInventoryQueryError::Projection { .. },
+        ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let Ok(response) = project_endpoint_resources(&inventory) else {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let mut response = Json(response).into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
+    response
+}
+
 fn project_endpoint_summary(
     item: &EndpointInventoryItem,
 ) -> Result<EndpointSummaryResponse, EndpointInventoryProjectionError> {
     let endpoint = item.endpoint();
-    let trust = match endpoint.trust() {
-        TlsTrust::SystemCa { .. } => TlsTrustModeResponse::SystemCa,
-        TlsTrust::PinnedCertificate { .. } => TlsTrustModeResponse::PinnedCertificate,
-    };
-    let identity = EndpointIdentityResponse::new(
-        endpoint.id().into_uuid(),
-        endpoint.display_name().to_string(),
-        endpoint.address().to_string(),
-        trust,
-        endpoint.created_at(),
-        endpoint.updated_at(),
-    );
+    let identity = project_endpoint_identity(endpoint);
     let snapshot = match item.generation() {
         None => EndpointSnapshotSummaryResponse::AwaitingFirstRefresh,
         Some(generation) => EndpointSnapshotSummaryResponse::current(
@@ -183,6 +218,155 @@ fn project_endpoint_summary(
     Ok(EndpointSummaryResponse::new(identity, snapshot))
 }
 
+fn project_endpoint_resources(
+    inventory: &EndpointResourceInventory,
+) -> Result<EndpointResourceInventoryResponse, EndpointInventoryProjectionError> {
+    let resources = inventory
+        .resources()
+        .iter()
+        .map(project_core_resource)
+        .collect::<Vec<_>>();
+    let snapshot = match (inventory.generation(), inventory.observed_at()) {
+        (None, None) if resources.is_empty() => {
+            EndpointResourceSnapshotResponse::AwaitingFirstRefresh
+        }
+        (Some(generation), Some(observed_at)) if !resources.is_empty() => {
+            EndpointResourceSnapshotResponse::current(
+                NonZeroU64::new(generation.get())
+                    .ok_or(EndpointInventoryProjectionError::ZeroGeneration)?,
+                observed_at,
+                resources,
+            )
+        }
+        _ => {
+            return Err(EndpointInventoryProjectionError::IncoherentResourceSnapshot);
+        }
+    };
+    Ok(EndpointResourceInventoryResponse::new(
+        project_endpoint_identity(inventory.endpoint()),
+        snapshot,
+    ))
+}
+
+fn project_endpoint_identity(endpoint: &Endpoint) -> EndpointIdentityResponse {
+    let trust = match endpoint.trust() {
+        TlsTrust::SystemCa { .. } => TlsTrustModeResponse::SystemCa,
+        TlsTrust::PinnedCertificate { .. } => TlsTrustModeResponse::PinnedCertificate,
+    };
+    EndpointIdentityResponse::new(
+        endpoint.id().into_uuid(),
+        endpoint.display_name().to_string(),
+        endpoint.address().to_string(),
+        trust,
+        endpoint.created_at(),
+        endpoint.updated_at(),
+    )
+}
+
+fn project_core_resource(resource: &CoreResourceSummary) -> CoreResourceResponse {
+    CoreResourceResponse::new(
+        CoreResourceSourceResponse::new(
+            resource.resource_id().into_uuid(),
+            resource.odata_id().to_string(),
+            resource.odata_type().map(ToString::to_string),
+            resource.etag().map(ToString::to_string),
+        ),
+        CoreResourceCommonResponse::new(
+            resource.common().id().to_owned(),
+            resource.common().name().to_owned(),
+            resource.common().description().map(str::to_owned),
+        ),
+        project_core_resource_details(resource.details()),
+    )
+}
+
+fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    match details {
+        CoreResourceDetails::ServiceRoot {
+            vendor,
+            product,
+            redfish_version,
+        } => CoreResourceDetailsResponse::ServiceRoot {
+            vendor: vendor.clone(),
+            product: product.clone(),
+            redfish_version: redfish_version.clone(),
+        },
+        CoreResourceDetails::System {
+            system_type,
+            manufacturer,
+            model,
+            part_number,
+            serial_number,
+            sku,
+            host_name,
+            bios_version,
+            power_state,
+            status,
+        } => CoreResourceDetailsResponse::System {
+            system_type: system_type.clone(),
+            manufacturer: manufacturer.clone(),
+            model: model.clone(),
+            part_number: part_number.clone(),
+            serial_number: serial_number.clone(),
+            sku: sku.clone(),
+            host_name: host_name.clone(),
+            bios_version: bios_version.clone(),
+            power_state: power_state.clone(),
+            status: status.as_ref().map(project_resource_status),
+        },
+        CoreResourceDetails::Chassis {
+            chassis_type,
+            manufacturer,
+            model,
+            part_number,
+            serial_number,
+            sku,
+            asset_tag,
+            power_state,
+            status,
+        } => CoreResourceDetailsResponse::Chassis {
+            chassis_type: chassis_type.clone(),
+            manufacturer: manufacturer.clone(),
+            model: model.clone(),
+            part_number: part_number.clone(),
+            serial_number: serial_number.clone(),
+            sku: sku.clone(),
+            asset_tag: asset_tag.clone(),
+            power_state: power_state.clone(),
+            status: status.as_ref().map(project_resource_status),
+        },
+        CoreResourceDetails::Manager {
+            manager_type,
+            manufacturer,
+            model,
+            part_number,
+            serial_number,
+            firmware_version,
+            version,
+            power_state,
+            status,
+        } => CoreResourceDetailsResponse::Manager {
+            manager_type: manager_type.clone(),
+            manufacturer: manufacturer.clone(),
+            model: model.clone(),
+            part_number: part_number.clone(),
+            serial_number: serial_number.clone(),
+            firmware_version: firmware_version.clone(),
+            version: version.clone(),
+            power_state: power_state.clone(),
+            status: status.as_ref().map(project_resource_status),
+        },
+    }
+}
+
+fn project_resource_status(status: &ResourceStatusSummary) -> ResourceStatusResponse {
+    ResourceStatusResponse::new(
+        status.state().map(str::to_owned),
+        status.health().map(str::to_owned),
+        status.health_rollup().map(str::to_owned),
+    )
+}
+
 fn count_resources(
     item: &EndpointInventoryItem,
     feature: ResourceFeature,
@@ -196,6 +380,7 @@ enum EndpointInventoryProjectionError {
     ZeroGeneration,
     MissingRefreshTime,
     ResourceCountOverflow,
+    IncoherentResourceSnapshot,
 }
 
 fn uncached_status(status: StatusCode) -> Response {
@@ -257,8 +442,8 @@ mod tests {
     use rutilus_application::BoundaryFuture;
     use rutilus_domain::{
         CredentialId, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId,
-        RefreshGeneration, ResourceId, ResourceODataId, ResourceSnapshot, ResourceSnapshotPayload,
-        TlsCertificate,
+        RefreshGeneration, ResourceEtag, ResourceId, ResourceODataId, ResourceODataType,
+        ResourceSnapshot, ResourceSnapshotPayload, TlsCertificate,
     };
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime};
@@ -459,6 +644,128 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn exposes_typed_core_resources_with_source_values() -> Result<(), Box<dyn Error>> {
+        let item = core_resource_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(MockInventory::ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        let body = json_body(response).await?;
+        assert_eq!(body["endpoint"]["display_name"], "Resource detail BMC");
+        assert_eq!(body["endpoint"]["tls_trust_mode"], "pinned_certificate");
+        assert_eq!(body["snapshot"]["state"], "current");
+        assert_eq!(body["snapshot"]["details"]["generation"], 3);
+        assert_eq!(
+            body["snapshot"]["details"]["observed_at"],
+            "1970-01-01T00:00:01Z"
+        );
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        assert_eq!(resources[0]["common"]["name"], "Root Service");
+        assert_eq!(
+            resources[0]["resource"]["details"]["redfish_version"],
+            "1.20.0"
+        );
+        assert_eq!(resources[1]["resource"]["resource_type"], "system");
+        assert_eq!(resources[1]["source"]["odata_id"], "/redfish/v1/Systems/1");
+        assert_eq!(
+            resources[1]["source"]["odata_type"],
+            "#ComputerSystem.v1_20_0.ComputerSystem"
+        );
+        assert_eq!(resources[1]["source"]["etag"], "W/\"system-1\"");
+        assert_eq!(
+            resources[1]["resource"]["details"]["manufacturer"],
+            "Vendor A"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        let encoded = serde_json::to_string(&body)?;
+        assert!(!encoded.contains("credential"));
+        assert!(!encoded.contains("\"certificate\":"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinguishes_core_resource_route_states() -> Result<(), Box<dyn Error>> {
+        let waiting = inventory_item("Waiting BMC", "https://192.0.2.20", 20, false)?;
+        let endpoint_id = waiting.endpoint().id();
+        let waiting_router = test_router_with(MockInventory::ok(vec![waiting]));
+
+        let bad_id = waiting_router
+            .clone()
+            .oneshot(Request::get("/api/v1/endpoints/not-a-uuid/resources").body(Body::empty())?)
+            .await?;
+        assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
+        let missing = waiting_router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/endpoints/{}/resources",
+                    EndpointId::generate()
+                ))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let waiting = waiting_router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(waiting.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(waiting).await?["snapshot"],
+            json!({ "state": "awaiting_first_refresh" })
+        );
+        let wrong_method = waiting_router
+            .oneshot(
+                Request::post(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let unavailable = test_router_with(MockInventory::failed())
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+
+        let corrupt = inventory_item("Corrupt BMC", "https://192.0.2.21", 21, true)?;
+        let corrupt_id = corrupt.endpoint().id();
+        let corrupt = test_router_with(MockInventory::ok(vec![corrupt]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{corrupt_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(corrupt.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        Ok(())
+    }
+
     async fn json_body(response: Response) -> Result<Value, Box<dyn Error>> {
         let bytes = response.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&bytes)?)
@@ -528,10 +835,70 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(endpoint, resources)?)
     }
 
+    fn core_resource_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Resource detail BMC")?,
+            EndpointAddress::parse("https://192.0.2.30")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![30])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(3)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let system = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Systems,
+            "/redfish/v1/Systems/1",
+            r#"{"Id":"1","Name":"System One","Description":"Compute","SystemType":"Physical","Manufacturer":"Vendor A","Model":"Model S","PartNumber":"P1","SerialNumber":"S1","SKU":"SKU1","HostName":"compute-1","BiosVersion":"2.3.4","PowerState":"On","Status":{"State":"Enabled","Health":"OK","HealthRollup":"Warning"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#ComputerSystem.v1_20_0.ComputerSystem",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"system-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![system, root],
+        )?)
+    }
+
     fn resource_snapshot(
         endpoint_id: EndpointId,
         feature: ResourceFeature,
         odata_id: &str,
+        observed_at: OffsetDateTime,
+        generation: RefreshGeneration,
+    ) -> Result<ResourceSnapshot, Box<dyn Error>> {
+        resource_snapshot_with_payload(
+            endpoint_id,
+            feature,
+            odata_id,
+            r#"{"Name":"Web test"}"#,
+            observed_at,
+            generation,
+        )
+    }
+
+    fn resource_snapshot_with_payload(
+        endpoint_id: EndpointId,
+        feature: ResourceFeature,
+        odata_id: &str,
+        payload: &str,
         observed_at: OffsetDateTime,
         generation: RefreshGeneration,
     ) -> Result<ResourceSnapshot, Box<dyn Error>> {
@@ -540,7 +907,7 @@ mod tests {
             endpoint_id,
             feature,
             ResourceODataId::parse(odata_id)?,
-            ResourceSnapshotPayload::parse(r#"{"Name":"Web test"}"#)?,
+            ResourceSnapshotPayload::parse(payload)?,
             observed_at,
             generation,
         ))
