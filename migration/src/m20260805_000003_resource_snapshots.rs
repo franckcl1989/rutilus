@@ -58,6 +58,10 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "storages",
                         "network-adapters",
                         "ethernet-interfaces",
+                        "accounts",
+                        "bios",
+                        "boot-options",
+                        "secure-boot",
                     ]),
                 ))
                 .to_owned(),
