@@ -61,7 +61,11 @@ impl ResourceStatusSummary {
 }
 
 /// Feature-specific fields from one public `nv-redfish` typed projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
+/// carry numeric readings (`f64`, matching the compiled `Edm.Decimal` type
+/// of nv-redfish 0.13), and `f64` cannot implement `Eq`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum CoreResourceDetails {
     ServiceRoot {
         vendor: Option<String>,
@@ -170,10 +174,42 @@ pub enum CoreResourceDetails {
         secure_boot_enable: Option<bool>,
         secure_boot_mode: Option<String>,
     },
+    /// One §2.1 `power` family member (a `Power_v1` chassis singleton).
+    /// `Power_v1` declares no `Status` property and no reading or metadata
+    /// properties of its own (consumption and capacity exist only on the
+    /// nested `PowerControl`/`PowerSupply` reading arrays, which stay out of
+    /// the strictly projectable field set), so the details carry no fields.
+    Power {},
+    /// One §2.1 `thermal` family member (a `Thermal_v1` chassis singleton).
+    /// Only the resource-level `Status` is projectable: temperature readings
+    /// exist only on nested `Temperatures` members, so they stay out of the
+    /// strictly projectable field set.
+    Thermal {
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `sensors` family member (a `Sensor_v1` collection member);
+    /// the reading and its UCUM units stay numeric/text as published so the
+    /// console renders the sensor without re-parsing text.
+    Sensor {
+        reading: Option<f64>,
+        reading_units: Option<String>,
+        reading_type: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `controls` family member (a `Control_v1` collection member);
+    /// the set point stays numeric as published so the console renders the
+    /// control without re-parsing text.
+    Control {
+        control_type: Option<String>,
+        set_point: Option<f64>,
+        status: Option<ResourceStatusSummary>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PartialEq` (not `Eq`) because the details enum carries `f64` readings.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CoreResourceSummary {
     resource_id: ResourceId,
     feature: ResourceFeature,
@@ -223,7 +259,10 @@ impl CoreResourceSummary {
 
 /// One endpoint and either no successful refresh or its latest complete,
 /// strongly typed core-resource Generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PartialEq` (not `Eq`) because the resource summaries carry `f64`
+/// readings.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EndpointResourceInventory {
     endpoint: Endpoint,
     generation: Option<RefreshGeneration>,
@@ -348,6 +387,10 @@ where
         ResourceFeature::Bios => project_bios(snapshot, payload)?,
         ResourceFeature::BootOptions => project_boot_option(snapshot, payload)?,
         ResourceFeature::SecureBoot => project_secure_boot(snapshot, payload)?,
+        ResourceFeature::Power => project_power(snapshot, payload)?,
+        ResourceFeature::Thermal => project_thermal(snapshot, payload)?,
+        ResourceFeature::Sensors => project_sensor(snapshot, payload)?,
+        ResourceFeature::Controls => project_control(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -625,6 +668,77 @@ where
         CoreResourceDetails::SecureBoot {
             secure_boot_enable: parsed.secure_boot_enable,
             secure_boot_mode: parsed.secure_boot_mode,
+        }
+    })
+}
+
+fn project_power<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<PowerPayload, _, RepositoryError>(snapshot, payload, |_parsed| {
+        CoreResourceDetails::Power {}
+    })
+}
+
+fn project_thermal<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ThermalPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Thermal {
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_sensor<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<SensorPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Sensor {
+            reading: parsed.reading,
+            reading_units: parsed.reading_units,
+            reading_type: parsed.reading_type,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_control<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ControlPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Control {
+            control_type: parsed.control_type,
+            set_point: parsed.set_point,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
         }
     })
 }
@@ -1089,6 +1203,106 @@ struct SecureBootPayload {
 }
 
 impl CommonPayload for SecureBootPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PowerPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+}
+
+impl CommonPayload for PowerPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThermalPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for ThermalPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SensorPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Reading")]
+    reading: Option<f64>,
+    #[serde(rename = "ReadingUnits")]
+    reading_units: Option<String>,
+    #[serde(rename = "ReadingType")]
+    reading_type: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for SensorPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ControlType")]
+    control_type: Option<String>,
+    #[serde(rename = "SetPoint")]
+    set_point: Option<f64>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for ControlPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -1583,6 +1797,148 @@ mod tests {
                 secure_boot_enable: Some(true),
                 secure_boot_mode: Some(mode),
             } if mode == "DeployedMode"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_power_and_thermal_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(16)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Power,
+                    "/redfish/v1/Chassis/1/Power",
+                    r#"{"Id":"Power","Name":"Power","Description":"Chassis power control"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Thermal,
+                    "/redfish/v1/Chassis/1/Thermal",
+                    r#"{"Id":"Thermal","Name":"Thermal","Description":"Chassis temperature and fan monitoring","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 3);
+        let power = &result.resources()[1];
+        assert_eq!(power.feature(), ResourceFeature::Power);
+        assert_eq!(power.odata_id().as_str(), "/redfish/v1/Chassis/1/Power");
+        assert_eq!(power.common().name(), "Power");
+        assert!(matches!(power.details(), CoreResourceDetails::Power {}));
+        let thermal = &result.resources()[2];
+        assert_eq!(thermal.feature(), ResourceFeature::Thermal);
+        assert_eq!(thermal.odata_id().as_str(), "/redfish/v1/Chassis/1/Thermal");
+        assert_eq!(thermal.common().name(), "Thermal");
+        assert!(matches!(
+            thermal.details(),
+            CoreResourceDetails::Thermal {
+                status: Some(status),
+            } if status.state() == Some("Enabled")
+                && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_sensors_and_controls_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(17)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Sensors,
+                    "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                    r#"{"Id":"InletTemp","Name":"Chassis Inlet Temperature","ReadingType":"Temperature","Reading":27.5,"ReadingUnits":"Cel","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Controls,
+                    "/redfish/v1/Chassis/1/Controls/FanDuty",
+                    r#"{"Id":"FanDuty","Name":"Chassis Fan Duty","ControlType":"DutyCycle","SetPoint":30.0,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 3);
+        // The inventory orders snapshots by `@odata.id`, so the controls
+        // collection member sorts before the sensors collection member.
+        let control = &result.resources()[1];
+        assert_eq!(control.feature(), ResourceFeature::Controls);
+        assert_eq!(
+            control.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Controls/FanDuty"
+        );
+        assert_eq!(control.common().name(), "Chassis Fan Duty");
+        assert!(matches!(
+            control.details(),
+            CoreResourceDetails::Control {
+                control_type: Some(control_type),
+                set_point: Some(set_point),
+                status: Some(status),
+            } if control_type == "DutyCycle"
+                && (*set_point - 30.0).abs() < f64::EPSILON
+                && status.state() == Some("Enabled")
+        ));
+        let sensor = &result.resources()[2];
+        assert_eq!(sensor.feature(), ResourceFeature::Sensors);
+        assert_eq!(
+            sensor.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Sensors/InletTemp"
+        );
+        assert_eq!(sensor.common().name(), "Chassis Inlet Temperature");
+        assert!(matches!(
+            sensor.details(),
+            CoreResourceDetails::Sensor {
+                reading_type: Some(reading_type),
+                reading: Some(reading),
+                reading_units: Some(units),
+                status: Some(status),
+            } if reading_type == "Temperature"
+                && (*reading - 27.5).abs() < f64::EPSILON
+                && units == "Cel"
+                && status.health() == Some("OK")
         ));
         Ok(())
     }
