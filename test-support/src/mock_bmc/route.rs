@@ -75,6 +75,9 @@ pub(crate) fn dispatch(
         }
         (HttpMethod::Get, "/redfish/v1/Systems/1/Memory") => json_ok(fixtures::MEMORY_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Systems/1/Memory/DIMM1") => json_ok(fixtures::MEMORY_DIMM1),
+        (HttpMethod::Get, "/redfish/v1/Systems/1/PCIeDevices/GPU1") => {
+            json_ok(fixtures::PCIE_DEVICE_GPU1)
+        }
         (HttpMethod::Get, "/redfish/v1/Chassis") => json_ok(fixtures::CHASSIS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Chassis/1") => json_ok(fixtures::CHASSIS),
         (HttpMethod::Get, "/redfish/v1/Chassis/1/Power") => json_ok(fixtures::POWER),
@@ -88,6 +91,15 @@ pub(crate) fn dispatch(
         }
         (HttpMethod::Get, "/redfish/v1/Chassis/1/Controls/FanDuty") => {
             json_ok(fixtures::CONTROL_FAN_DUTY)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Assembly") => json_ok(fixtures::ASSEMBLY),
+        // The `AssemblyData` member keeps its fragment-style `@odata.id` in
+        // the payload, but the HTTP client percent-encodes the JSON-pointer
+        // `#` when it builds the request URL, so the fixture is served under
+        // the encoded path instead of letting the request fall through to
+        // the 404 arm.
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Assembly%23/Assemblies/0") => {
+            json_ok(fixtures::ASSEMBLY_FAN)
         }
         (HttpMethod::Get, "/redfish/v1/Managers") => json_ok(fixtures::MANAGERS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::MANAGER),
@@ -103,6 +115,13 @@ pub(crate) fn dispatch(
         }
         (HttpMethod::Get, "/redfish/v1/Managers/1/HostInterfaces/1") => {
             json_ok(fixtures::HOST_INTERFACE)
+        }
+        (HttpMethod::Get, "/redfish/v1/UpdateService") => json_ok(fixtures::UPDATE_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/UpdateService/SoftwareInventory") => {
+            json_ok(fixtures::SOFTWARE_INVENTORIES_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/UpdateService/SoftwareInventory/BIOS") => {
+            json_ok(fixtures::SOFTWARE_INVENTORY_BIOS)
         }
         _ => not_found(),
     }

@@ -26,7 +26,7 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -44,27 +44,32 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
     EndpointCapability::HostInterfaces,
     EndpointCapability::LogServices,
     EndpointCapability::ManagerNetworkProtocol,
+    // The 0.2 device-family read surface: `pcie-devices` is presence-only in
+    // the probe (the System advertises its link array), while `assembly` and
+    // `update-service` are probed through their documents.
+    EndpointCapability::PcieDevices,
+    EndpointCapability::Assembly,
+    EndpointCapability::UpdateService,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
 /// must report as `NotAdvertised` instead of guessing paths.
-const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 3] = [
-    EndpointCapability::EthernetInterfaces,
-    EndpointCapability::Assembly,
-    EndpointCapability::UpdateService,
-];
+const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 1] =
+    [EndpointCapability::EthernetInterfaces];
 
 /// The gateway's request count for one complete `read_core_resources` flow:
 /// root, `SessionService`, Sessions collection, Session create, Systems
 /// collection with member, `Bios` singleton, `BootOptions` collection with
 /// member, `SecureBoot` singleton, Processors collection with CPU1 and CPU2,
-/// Memory collection with DIMM1, Chassis collection with member, `Power`
-/// singleton, `Thermal` singleton, `Sensors` collection with member,
-/// `Controls` collection with member, Managers collection with member,
-/// `LogServices` collection with member, `NetworkProtocol` singleton,
-/// `HostInterfaces` collection with member, `AccountService` with Accounts
-/// collection and member, Session delete.
-const RESOURCE_READ_REQUEST_COUNT: u64 = 34;
+/// Memory collection with DIMM1, the `PCIeDevices` member link fetch, Chassis
+/// collection with member, `Power` singleton, `Thermal` singleton, `Sensors`
+/// collection with member, `Controls` collection with member, `Assembly`
+/// document plus its `AssemblyData` member fetch, Managers collection with
+/// member, `LogServices` collection with member, `NetworkProtocol`
+/// singleton, `HostInterfaces` collection with member, `AccountService` with
+/// Accounts collection and member, `UpdateService` document with
+/// `SoftwareInventory` collection and member, Session delete.
+const RESOURCE_READ_REQUEST_COUNT: u64 = 40;
 
 /// The gateway's request count for one complete `probe_core_capabilities`
 /// flow with this fixture: root, `SessionService`, Sessions collection,
@@ -79,8 +84,11 @@ const RESOURCE_READ_REQUEST_COUNT: u64 = 34;
 /// wrapper's `log_services()` accessor eagerly fetches members, unlike the
 /// lazy `host_interfaces()` collection wrapper), the `NetworkProtocol`
 /// document, the `HostInterfaces` collection document, the `AccountService`
-/// document, and the Session delete. Unadvertised features add no requests.
-const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 29;
+/// document, the `Assembly` document and the `UpdateService` document (the
+/// probe fetches each advertised document; `pcie-devices` is presence-only
+/// and adds no request), and the Session delete. Unadvertised features add
+/// no requests.
+const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 31;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -300,16 +308,19 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             ResourceFeature::Processors,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
             ResourceFeature::Chassis,
             ResourceFeature::Power,
             ResourceFeature::Thermal,
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
+            ResourceFeature::Assembly,
             ResourceFeature::Managers,
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
         ]
     );
     let odata_ids: Vec<&str> = resources
@@ -327,16 +338,21 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
             "/redfish/v1/Systems/1/Processors/CPU1",
             "/redfish/v1/Systems/1/Processors/CPU2",
             "/redfish/v1/Systems/1/Memory/DIMM1",
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1",
             "/redfish/v1/Chassis/1",
             "/redfish/v1/Chassis/1/Power",
             "/redfish/v1/Chassis/1/Thermal",
             "/redfish/v1/Chassis/1/Sensors/InletTemp",
             "/redfish/v1/Chassis/1/Controls/FanDuty",
+            // The `AssemblyData` member keeps its fragment-style `@odata.id`,
+            // exactly as the fixture publishes it.
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
             "/redfish/v1/Managers/1",
             "/redfish/v1/Managers/1/LogServices/1",
             "/redfish/v1/Managers/1/NetworkProtocol",
             "/redfish/v1/Managers/1/HostInterfaces/1",
             "/redfish/v1/AccountService/Accounts/admin",
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
         ]
     );
 }
@@ -353,23 +369,23 @@ fn assert_surface_payloads(resources: &[CoreResourceProjection]) -> Result<(), B
     assert_payload(&resources[4], "SecureBootMode", "UserMode")?;
     assert_payload(&resources[5], "TotalCores", "64")?;
     assert_payload(&resources[7], "CapacityMiB", "32768")?;
-    assert_payload(&resources[13], "FirmwareVersion", "1.2.3")?;
-    assert_payload(&resources[17], "RoleId", "Administrator")?;
+    assert_payload(&resources[15], "FirmwareVersion", "1.2.3")?;
+    assert_payload(&resources[19], "RoleId", "Administrator")?;
     // The telemetry projections carry the readings and status exactly as
     // published: `Power_v1` has no projectable details, `Thermal_v1` only
     // status, and the sensor and control members their direct readings.
-    let power_payload: serde_json::Value = serde_json::from_str(resources[9].payload().as_str())?;
+    let power_payload: serde_json::Value = serde_json::from_str(resources[10].payload().as_str())?;
     assert_eq!(power_payload["Name"], "Power");
     assert!(power_payload.get("PowerConsumedWatts").is_none());
     let thermal_payload: serde_json::Value =
-        serde_json::from_str(resources[10].payload().as_str())?;
+        serde_json::from_str(resources[11].payload().as_str())?;
     assert_eq!(thermal_payload["Status"]["Health"], "OK");
-    let sensor_payload: serde_json::Value = serde_json::from_str(resources[11].payload().as_str())?;
+    let sensor_payload: serde_json::Value = serde_json::from_str(resources[12].payload().as_str())?;
     assert_eq!(sensor_payload["Reading"], 27.5);
     assert_eq!(sensor_payload["ReadingUnits"], "Cel");
     assert_eq!(sensor_payload["ReadingType"], "Temperature");
     let control_payload: serde_json::Value =
-        serde_json::from_str(resources[12].payload().as_str())?;
+        serde_json::from_str(resources[13].payload().as_str())?;
     assert_eq!(control_payload["SetPoint"], 30.0);
     assert_eq!(control_payload["ControlType"], "DutyCycle");
     // The manager surface projections carry the direct properties exactly as
@@ -377,20 +393,37 @@ fn assert_surface_payloads(resources: &[CoreResourceProjection]) -> Result<(), B
     // network protocol singleton its host metadata, and the host interface
     // its interface state.
     let log_service_payload: serde_json::Value =
-        serde_json::from_str(resources[14].payload().as_str())?;
+        serde_json::from_str(resources[16].payload().as_str())?;
     assert_eq!(log_service_payload["ServiceEnabled"], true);
     assert_eq!(log_service_payload["MaxNumberOfRecords"], 1000);
     let protocol_payload: serde_json::Value =
-        serde_json::from_str(resources[15].payload().as_str())?;
+        serde_json::from_str(resources[17].payload().as_str())?;
     assert_eq!(protocol_payload["HostName"], "bmc-1");
     assert_eq!(protocol_payload["FQDN"], "bmc-1.example.com");
     let host_interface_payload: serde_json::Value =
-        serde_json::from_str(resources[16].payload().as_str())?;
+        serde_json::from_str(resources[18].payload().as_str())?;
     assert_eq!(host_interface_payload["InterfaceEnabled"], true);
     assert_eq!(
         host_interface_payload["HostInterfaceType"],
         "NetworkHostInterface"
     );
+    // The device-family projections carry the direct properties exactly as
+    // published: the PCIe device its type and hardware identifiers, the
+    // assembly member its producer, and the software inventory its identity,
+    // version, and typed release date.
+    let pcie_payload: serde_json::Value = serde_json::from_str(resources[8].payload().as_str())?;
+    assert_eq!(pcie_payload["DeviceType"], "SingleFunction");
+    assert_eq!(pcie_payload["Manufacturer"], "Rutilus Test");
+    assert_eq!(pcie_payload["Model"], "PCIE-GEN4-X16");
+    let assembly_payload: serde_json::Value =
+        serde_json::from_str(resources[14].payload().as_str())?;
+    assert_eq!(assembly_payload["Id"], "0");
+    assert_eq!(assembly_payload["Producer"], "Rutilus Test");
+    let software_payload: serde_json::Value =
+        serde_json::from_str(resources[20].payload().as_str())?;
+    assert_eq!(software_payload["SoftwareId"], "BIOS-2026-1");
+    assert_eq!(software_payload["Version"], "2.7.0");
+    assert_eq!(software_payload["ReleaseDate"], "2026-05-01T00:00:00Z");
     Ok(())
 }
 

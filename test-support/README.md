@@ -59,15 +59,18 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 3. Select or create a credential (`admin` / `password` works; the mock
    accepts any user name) and run the enrollment.
 4. The resource page shows the typed core tree (ServiceRoot; System 1 with
-   its Bios singleton, the PXE-1 boot option, Secure Boot, CPU1/CPU2, and
-   DIMM1; Chassis 1 with its Power and Thermal singletons plus one Sensor
-   and one Control member; Manager 1 with its event LogService, Network
-   Protocol metadata, and Host Interface; the built-in `admin` account);
-   the capability page shows the 30-capability probe result:
+   its Bios singleton, the PXE-1 boot option, Secure Boot, CPU1/CPU2, DIMM1,
+   and the GPU1 PCIe device; Chassis 1 with its Power and Thermal singletons
+   plus one Sensor, one Control member, and the Fan Assembly member; Manager
+   1 with its event LogService, Network Protocol metadata, and Host
+   Interface; the built-in `admin` account; and the System BIOS software
+   inventory under the UpdateService); the capability page shows the
+   30-capability probe result:
    SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
    BootOptions/SecureBoot/Power/Thermal/Sensors/Controls/HostInterfaces/
-   LogServices/ManagerNetworkProtocol `Supported`, everything the fixture
-   does not serve honestly `NotAdvertised`.
+   LogServices/ManagerNetworkProtocol/PcieDevices/Assembly/UpdateService
+   `Supported`, everything the fixture does not serve honestly
+   `NotAdvertised`.
 5. Refresh the endpoint: the same tree is re-read through a fresh transient
    Session, which the product deletes before returning.
 
@@ -75,7 +78,7 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers/AccountService) |
+| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers/AccountService/UpdateService) |
 | GET | `/redfish/v1/SessionService` | Session Service, `ServiceEnabled: true` |
 | GET | `/redfish/v1/SessionService/Sessions` | Session collection listing the active ledger |
 | POST | `/redfish/v1/SessionService/Sessions` | `201` + `X-Auth-Token: test-session-token` + `Location` + Session document (echoes `UserName`) |
@@ -84,7 +87,7 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/AccountService/Accounts` | ManagerAccount collection (admin) |
 | GET | `/redfish/v1/AccountService/Accounts/admin` | Built-in administrator account (RoleId "Administrator", AccountTypes Redfish/IPMI) |
 | GET | `/redfish/v1/Systems` | System collection, one member |
-| GET | `/redfish/v1/Systems/1` | ComputerSystem with Bios/BootOptions/SecureBoot/Processors/Memory links |
+| GET | `/redfish/v1/Systems/1` | ComputerSystem with Bios/BootOptions/SecureBoot/Processors/Memory/PCIeDevices links |
 | GET | `/redfish/v1/Systems/1/Bios` | BIOS configuration singleton (AttributeRegistry, no raw Attributes bag in the snapshot) |
 | GET | `/redfish/v1/Systems/1/BootOptions` | Boot option collection (PXE-1) |
 | GET | `/redfish/v1/Systems/1/BootOptions/PXE-1` | Boot option (UEFI PXE, alias "Pxe") |
@@ -94,14 +97,17 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/Systems/1/Processors/CPU2` | Processor (32 cores) |
 | GET | `/redfish/v1/Systems/1/Memory` | Memory collection (DIMM1) |
 | GET | `/redfish/v1/Systems/1/Memory/DIMM1` | Memory module (DDR4, 32768 MiB) |
+| GET | `/redfish/v1/Systems/1/PCIeDevices/GPU1` | PCIe device (SingleFunction, GPU accelerator) |
 | GET | `/redfish/v1/Chassis` | Chassis collection, one member |
-| GET | `/redfish/v1/Chassis/1` | RackMount chassis with Power/Thermal/Sensors/Controls links |
+| GET | `/redfish/v1/Chassis/1` | RackMount chassis with Power/Thermal/Sensors/Controls/Assembly links |
 | GET | `/redfish/v1/Chassis/1/Power` | Power singleton (PowerControl: 320 W consumed, 800 W capacity) |
 | GET | `/redfish/v1/Chassis/1/Thermal` | Thermal singleton (inlet 27.5 C, Status) |
 | GET | `/redfish/v1/Chassis/1/Sensors` | Sensor collection (InletTemp) |
 | GET | `/redfish/v1/Chassis/1/Sensors/InletTemp` | Temperature sensor (27.5 Cel, ReadingType Temperature) |
 | GET | `/redfish/v1/Chassis/1/Controls` | Control collection (FanDuty) |
 | GET | `/redfish/v1/Chassis/1/Controls/FanDuty` | Fan duty-cycle control (set point 30 Percent) |
+| GET | `/redfish/v1/Chassis/1/Assembly` | Assembly document embedding the Assemblies link array |
+| GET | `/redfish/v1/Chassis/1/Assembly%23/Assemblies/0` | Fan Assembly member (the JSON-pointer `#` arrives percent-encoded on the wire) |
 | GET | `/redfish/v1/Managers` | Manager collection, one member |
 | GET | `/redfish/v1/Managers/1` | BMC manager with FirmwareVersion and HostInterfaces/NetworkProtocol/LogServices links (no EthernetInterfaces link) |
 | GET | `/redfish/v1/Managers/1/LogServices` | Log service collection (1) |
@@ -109,6 +115,9 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 | GET | `/redfish/v1/Managers/1/NetworkProtocol` | Manager network protocol singleton (HostName "bmc-1", FQDN) |
 | GET | `/redfish/v1/Managers/1/HostInterfaces` | Host interface collection (1) |
 | GET | `/redfish/v1/Managers/1/HostInterfaces/1` | Host interface (InterfaceEnabled, NetworkHostInterface) |
+| GET | `/redfish/v1/UpdateService` | Firmware update service advertising its SoftwareInventory collection |
+| GET | `/redfish/v1/UpdateService/SoftwareInventory` | Software inventory collection (BIOS) |
+| GET | `/redfish/v1/UpdateService/SoftwareInventory/BIOS` | System BIOS (SoftwareId "BIOS-2026-1", Version "2.7.0", ReleaseDate) |
 | any other | | `404` with a Redfish-shaped `error` body (`Base.1.0.ResourceMissingAtURI`) |
 
 Fixture field sets and `@odata.type` spellings mirror the documents

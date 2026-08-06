@@ -32,7 +32,7 @@ const MOCK_PASSWORD: &str = "password";
 /// only the inventory count and the core capability states are pinned here;
 /// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 20] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -50,6 +50,12 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 17] = [
     EndpointCapability::HostInterfaces,
     EndpointCapability::LogServices,
     EndpointCapability::ManagerNetworkProtocol,
+    // The 0.2 device-family read surface: the System advertises
+    // `pcie-devices` as a link array, the Chassis advertises its `Assembly`
+    // document, and the Service Root advertises `update-service`.
+    EndpointCapability::PcieDevices,
+    EndpointCapability::Assembly,
+    EndpointCapability::UpdateService,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -178,12 +184,14 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
         .await?;
 
     // The mock serves one System with its configuration surface (Bios,
-    // BootOptions, SecureBoot), two Processors and one Memory module, one
-    // Chassis with its Power and Thermal singletons plus one Sensor and one
-    // Control member, one Manager with its LogServices, NetworkProtocol, and
-    // HostInterfaces surface, and one Account; typed navigation must visit
-    // every family exactly in the documented read order.
-    assert_eq!(resources.len(), 18);
+    // BootOptions, SecureBoot), two Processors, one Memory module, and one
+    // PCIe device; one Chassis with its Power and Thermal singletons plus one
+    // Sensor, one Control member, and one Assembly member; one Manager with
+    // its LogServices, NetworkProtocol, and HostInterfaces surface; one
+    // Account; and one SoftwareInventory member under the UpdateService;
+    // typed navigation must visit every family exactly in the documented
+    // read order.
+    assert_eq!(resources.len(), 21);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -199,16 +207,19 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
             ResourceFeature::Processors,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
             ResourceFeature::Chassis,
             ResourceFeature::Power,
             ResourceFeature::Thermal,
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
+            ResourceFeature::Assembly,
             ResourceFeature::Managers,
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
             ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
         ]
     );
 
@@ -233,59 +244,73 @@ fn assert_family_payloads(resources: &[CoreResourceProjection]) -> Result<(), Bo
     assert_projection_payload(&resources[5], "ProcessorType", "CPU")?;
     assert_projection_payload(&resources[6], "ProcessorType", "CPU")?;
     assert_projection_payload(&resources[7], "MemoryDeviceType", "DDR4")?;
-    assert_projection_payload(&resources[8], "ChassisType", "RackMount")?;
+    // The device-family projections carry the direct properties exactly as
+    // published: the PCIe device its type and hardware identifiers.
+    assert_projection_payload(&resources[8], "DeviceType", "SingleFunction")?;
+    assert_projection_payload(&resources[8], "Manufacturer", "Rutilus Test")?;
+    assert_projection_payload(&resources[8], "Model", "PCIE-GEN4-X16")?;
+    assert_projection_payload(&resources[9], "ChassisType", "RackMount")?;
     // The telemetry projections carry exactly the published surface: the
     // `Power` singleton has no projectable details, `Thermal` carries only
     // status, and the sensor and control members their direct readings.
-    assert_projection_payload(&resources[9], "Name", "Power")?;
+    assert_projection_payload(&resources[10], "Name", "Power")?;
     assert!(
-        !resources[9]
+        !resources[10]
             .payload()
             .as_str()
             .contains("PowerConsumedWatts")
     );
     assert!(
-        resources[10]
+        resources[11]
             .payload()
             .as_str()
             .contains("\"Health\":\"OK\"")
     );
-    assert_projection_payload(&resources[11], "ReadingType", "Temperature")?;
-    assert_projection_payload(&resources[11], "ReadingUnits", "Cel")?;
-    assert!(
-        resources[11]
-            .payload()
-            .as_str()
-            .contains("\"Reading\":27.5")
-    );
-    assert_projection_payload(&resources[12], "ControlType", "DutyCycle")?;
+    assert_projection_payload(&resources[12], "ReadingType", "Temperature")?;
+    assert_projection_payload(&resources[12], "ReadingUnits", "Cel")?;
     assert!(
         resources[12]
             .payload()
             .as_str()
+            .contains("\"Reading\":27.5")
+    );
+    assert_projection_payload(&resources[13], "ControlType", "DutyCycle")?;
+    assert!(
+        resources[13]
+            .payload()
+            .as_str()
             .contains("\"SetPoint\":30.0")
     );
-    assert_projection_payload(&resources[13], "ManagerType", "BMC")?;
+    // The `AssemblyData` member carries its `MemberId` as the common Id and
+    // its producer exactly as published.
+    assert_projection_payload(&resources[14], "Id", "0")?;
+    assert_projection_payload(&resources[14], "Producer", "Rutilus Test")?;
+    assert_projection_payload(&resources[15], "ManagerType", "BMC")?;
     // The manager surface projections carry the direct properties exactly as
     // published: the log service its enable flag and record capacity, the
     // network protocol singleton its host metadata, and the host interface
     // its interface state and type.
     let log_service_payload: serde_json::Value =
-        serde_json::from_str(resources[14].payload().as_str())?;
+        serde_json::from_str(resources[16].payload().as_str())?;
     assert_eq!(log_service_payload["ServiceEnabled"], true);
     assert_eq!(log_service_payload["MaxNumberOfRecords"], 1000);
     let protocol_payload: serde_json::Value =
-        serde_json::from_str(resources[15].payload().as_str())?;
+        serde_json::from_str(resources[17].payload().as_str())?;
     assert_eq!(protocol_payload["HostName"], "bmc-1");
     assert_eq!(protocol_payload["FQDN"], "bmc-1.example.com");
     let host_interface_payload: serde_json::Value =
-        serde_json::from_str(resources[16].payload().as_str())?;
+        serde_json::from_str(resources[18].payload().as_str())?;
     assert_eq!(host_interface_payload["InterfaceEnabled"], true);
     assert_eq!(
         host_interface_payload["HostInterfaceType"],
         "NetworkHostInterface"
     );
-    assert_projection_payload(&resources[17], "RoleId", "Administrator")?;
+    assert_projection_payload(&resources[19], "RoleId", "Administrator")?;
+    // The software inventory member carries its identity, version, and typed
+    // release date exactly as published.
+    assert_projection_payload(&resources[20], "SoftwareId", "BIOS-2026-1")?;
+    assert_projection_payload(&resources[20], "Version", "2.7.0")?;
+    assert_projection_payload(&resources[20], "ReleaseDate", "2026-05-01T00:00:00Z")?;
     Ok(())
 }
 
@@ -302,16 +327,21 @@ fn assert_resource_identifiers(resources: &[CoreResourceProjection]) {
         "/redfish/v1/Systems/1/Processors/CPU1",
         "/redfish/v1/Systems/1/Processors/CPU2",
         "/redfish/v1/Systems/1/Memory/DIMM1",
+        "/redfish/v1/Systems/1/PCIeDevices/GPU1",
         "/redfish/v1/Chassis/1",
         "/redfish/v1/Chassis/1/Power",
         "/redfish/v1/Chassis/1/Thermal",
         "/redfish/v1/Chassis/1/Sensors/InletTemp",
         "/redfish/v1/Chassis/1/Controls/FanDuty",
+        // The `AssemblyData` member keeps its fragment-style `@odata.id`,
+        // exactly as the fixture publishes it.
+        "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
         "/redfish/v1/Managers/1",
         "/redfish/v1/Managers/1/LogServices/1",
         "/redfish/v1/Managers/1/NetworkProtocol",
         "/redfish/v1/Managers/1/HostInterfaces/1",
         "/redfish/v1/AccountService/Accounts/admin",
+        "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
     ];
     for (resource, expected) in resources.iter().zip(odata_ids) {
         assert_eq!(resource.odata_id().as_str(), expected);
@@ -360,6 +390,7 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/Systems/1/Processors/CPU2"),
             ("GET", "/redfish/v1/Systems/1/Memory"),
             ("GET", "/redfish/v1/Systems/1/Memory/DIMM1"),
+            ("GET", "/redfish/v1/Systems/1/PCIeDevices/GPU1"),
             ("GET", "/redfish/v1/Chassis"),
             ("GET", "/redfish/v1/Chassis/1"),
             ("GET", "/redfish/v1/Chassis/1/Power"),
@@ -368,6 +399,11 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/Chassis/1/Sensors/InletTemp"),
             ("GET", "/redfish/v1/Chassis/1/Controls"),
             ("GET", "/redfish/v1/Chassis/1/Controls/FanDuty"),
+            ("GET", "/redfish/v1/Chassis/1/Assembly"),
+            // The `AssemblyData` member is fetched through its fragment-style
+            // `@odata.id`, which the HTTP client percent-encodes on the wire
+            // (`%23`), exactly as the fixture publishes it.
+            ("GET", "/redfish/v1/Chassis/1/Assembly%23/Assemblies/0"),
             ("GET", "/redfish/v1/Managers"),
             ("GET", "/redfish/v1/Managers/1"),
             ("GET", "/redfish/v1/Managers/1/LogServices"),
@@ -378,6 +414,9 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/AccountService"),
             ("GET", "/redfish/v1/AccountService/Accounts"),
             ("GET", "/redfish/v1/AccountService/Accounts/admin"),
+            ("GET", "/redfish/v1/UpdateService"),
+            ("GET", "/redfish/v1/UpdateService/SoftwareInventory"),
+            ("GET", "/redfish/v1/UpdateService/SoftwareInventory/BIOS"),
             ("DELETE", "/redfish/v1/SessionService/Sessions/1"),
         ],
     );

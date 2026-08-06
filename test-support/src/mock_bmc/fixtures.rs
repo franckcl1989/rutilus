@@ -5,16 +5,19 @@
 //! field sets, same enum spellings), so the mock cannot drift from what the
 //! product actually parses. The tree is deliberately small: one System with
 //! two Processors, one Memory module, one Bios singleton, one Boot Option,
-//! and one Secure Boot singleton, one Chassis with one Power and one Thermal
-//! singleton plus one Sensor and one Control member, one Manager with its
-//! `LogServices`, `NetworkProtocol`, and `HostInterfaces` surface, the
-//! `SessionService`, and one `AccountService` with a single account. Links
-//! the tree does not serve are omitted entirely, so the capability probe
-//! reports `NotAdvertised` for them instead of guessing paths.
+//! one Secure Boot singleton, and one `PCIeDevice`; one Chassis with one
+//! Power and one Thermal singleton plus one Sensor and one Control member
+//! and one `Assembly` document with a single assembly member; one Manager
+//! with its `LogServices`, `NetworkProtocol`, and `HostInterfaces` surface;
+//! the `SessionService`; one `AccountService` with a single account; and
+//! one `UpdateService` with a single software-inventory member. Links the
+//! tree does not serve are omitted entirely, so the capability probe reports
+//! `NotAdvertised` for them instead of guessing paths.
 
 /// `GET /redfish/v1` -- the Service Root.
 ///
-/// The core navigation links plus the 0.2 `AccountService` root service are
+/// The core navigation links, the 0.2 `AccountService` root service, and the
+/// `UpdateService` root service behind the `software-inventory` family are
 /// advertised; the remaining root services (`EventService`, `TaskService`,
 /// and friends) stay absent so the probe reports them as `NotAdvertised`.
 pub(crate) const SERVICE_ROOT: &str = r##"{
@@ -31,7 +34,8 @@ pub(crate) const SERVICE_ROOT: &str = r##"{
     "Systems":{"@odata.id":"/redfish/v1/Systems"},
     "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
     "Managers":{"@odata.id":"/redfish/v1/Managers"},
-    "AccountService":{"@odata.id":"/redfish/v1/AccountService"}
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"}
 }"##;
 
 /// `GET /redfish/v1/SessionService` -- the session service, enabled so the
@@ -150,8 +154,11 @@ pub(crate) const SECURE_BOOT: &str = r##"{
 }"##;
 
 /// `GET /redfish/v1/Systems/1` -- the compute system, advertising the 0.2
-/// Bios, `BootOptions`, `SecureBoot`, `Processors`, and `Memory` families
-/// through typed navigation links.
+/// Bios, `BootOptions`, `SecureBoot`, `Processors`, `Memory`, and
+/// `PcieDevices` families through typed navigation links. `PCIeDevices` is
+/// an in-document array of typed links (the presence-type shape the
+/// `ComputerSystem` schema uses instead of a collection resource), exactly
+/// like the `rutilus-infra-redfish` fixture the product's decoder accepts.
 pub(crate) const SYSTEM: &str = r#"{
     "@odata.id":"/redfish/v1/Systems/1",
     "@odata.etag":"W/\"system-1\"",
@@ -172,7 +179,10 @@ pub(crate) const SYSTEM: &str = r#"{
     "Boot":{"BootOptions":{"@odata.id":"/redfish/v1/Systems/1/BootOptions"}},
     "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
     "Processors":{"@odata.id":"/redfish/v1/Systems/1/Processors"},
-    "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"}
+    "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"},
+    "PCIeDevices":[
+        {"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1"}
+    ]
 }"#;
 
 /// `GET /redfish/v1/Systems/1/Processors` -- the processor collection.
@@ -261,12 +271,13 @@ pub(crate) const CHASSIS_COLLECTION: &str = r##"{
 }"##;
 
 /// `GET /redfish/v1/Chassis/1` -- the rack chassis, advertising the 0.2
-/// telemetry families through typed navigation links. The `Power` and
-/// `Thermal` singletons plus the `Sensors` and `Controls` collections are
-/// served so the capability probe reports them `Supported` and the typed
-/// resource read carries their readings; links the tree does not serve
-/// (`NetworkAdapters`, `Assembly`, `PowerSubsystem`, ...) stay absent so the
-/// probe reports those features as `NotAdvertised`.
+/// telemetry and assembly families through typed navigation links. The
+/// `Power` and `Thermal` singletons plus the `Sensors` and `Controls`
+/// collections and the `Assembly` document are served so the capability
+/// probe reports them `Supported` and the typed resource read carries their
+/// readings; links the tree does not serve (`NetworkAdapters`,
+/// `PowerSubsystem`, ...) stay absent so the probe reports those features as
+/// `NotAdvertised`.
 pub(crate) const CHASSIS: &str = r#"{
     "@odata.id":"/redfish/v1/Chassis/1",
     "@odata.etag":"W/\"chassis-1\"",
@@ -284,7 +295,8 @@ pub(crate) const CHASSIS: &str = r#"{
     "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
     "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
     "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
-    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"}
+    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+    "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"}
 }"#;
 
 /// `GET /redfish/v1/Chassis/1/Power` -- the chassis power control singleton.
@@ -499,6 +511,111 @@ pub(crate) const HOST_INTERFACE: &str = r##"{
     "HostInterfaceType":"NetworkHostInterface",
     "InterfaceEnabled":true,
     "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"##;
+
+/// `GET /redfish/v1/Systems/1/PCIeDevices/GPU1` -- the single `PCIeDevice`
+/// linked from the computer system, with every optional contract field
+/// populated; the firmware and identity fields are decoded by the schema but
+/// stay outside the strictly projectable field set, exactly like the
+/// `rutilus-infra-redfish` fixture the product's decoder accepts.
+pub(crate) const PCIE_DEVICE_GPU1: &str = r##"{
+    "@odata.type":"#PCIeDevice.v1_12_0.PCIeDevice",
+    "@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1",
+    "@odata.etag":"W/\"pcie-device-1\"",
+    "Id":"GPU1",
+    "Name":"PCIe Device One",
+    "Description":"GPU accelerator",
+    "DeviceType":"SingleFunction",
+    "Manufacturer":"Rutilus Test",
+    "Model":"PCIE-GEN4-X16",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "FirmwareVersion":"1.2.3",
+    "SerialNumber":"PCI-SN-1",
+    "SKU":"PCI-SKU-1"
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Assembly` -- the chassis assembly document,
+/// embedding the `Assemblies` link array. The document itself is never
+/// projected, only its members are, so its own shape stays minimal; the
+/// member link keeps the fragment-style `@odata.id` the `AssemblyData`
+/// referenceable-member schema uses.
+pub(crate) const ASSEMBLY: &str = r##"{
+    "@odata.type":"#Assembly.v1_5_0.Assembly",
+    "@odata.id":"/redfish/v1/Chassis/1/Assembly",
+    "@odata.etag":"W/\"assembly-1\"",
+    "Id":"Assembly",
+    "Name":"Chassis Assembly",
+    "Assemblies":[
+        {"@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0"}
+    ]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Assembly#/Assemblies/0` -- the single
+/// `AssemblyData` member, with every optional contract field populated; the
+/// FRU identity fields (`Model`, `SerialNumber`, `Version`) are decoded by
+/// the schema but stay outside the strictly projectable field set, exactly
+/// like the `rutilus-infra-redfish` fixture the product's decoder accepts.
+///
+/// The gateway requests this member through its fragment-style `@odata.id`
+/// literally, so the mock routes the exact path including the fragment.
+pub(crate) const ASSEMBLY_FAN: &str = r##"{
+    "@odata.type":"#Assembly.v1_5_0.AssemblyData",
+    "@odata.id":"/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+    "@odata.etag":"W/\"assembly-data-0\"",
+    "MemberId":"0",
+    "Name":"Fan Assembly",
+    "Description":"Cooling fan",
+    "Producer":"Rutilus Test",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Model":"FRU-MODEL-X",
+    "SerialNumber":"FRU-1",
+    "Version":"1.0"
+}"##;
+
+/// `GET /redfish/v1/UpdateService` -- the firmware update service,
+/// advertising the `SoftwareInventory` collection behind the 0.2
+/// `software-inventory` family; the update-operation fields are decoded by
+/// the schema but stay outside the strictly projectable field set.
+pub(crate) const UPDATE_SERVICE: &str = r#"{
+    "@odata.id":"/redfish/v1/UpdateService",
+    "@odata.etag":"W/\"update-service-1\"",
+    "Id":"UpdateService",
+    "Name":"Update Service",
+    "Description":"Firmware update service",
+    "ServiceEnabled":true,
+    "MaxImageSizeBytes":2147483648,
+    "SoftwareInventory":{"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory"}
+}"#;
+
+/// `GET /redfish/v1/UpdateService/SoftwareInventory` -- the software
+/// inventory collection with the single BIOS member.
+pub(crate) const SOFTWARE_INVENTORIES_COLLECTION: &str = r##"{
+    "@odata.type":"#SoftwareInventoryCollection.SoftwareInventoryCollection",
+    "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory",
+    "Name":"Software Inventory Collection",
+    "Members":[{"@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BIOS"}]
+}"##;
+
+/// `GET /redfish/v1/UpdateService/SoftwareInventory/BIOS` -- the BIOS
+/// software inventory member with every optional contract field populated;
+/// the update-lifecycle fields (`Updateable`, `Manufacturer`,
+/// `LowestSupportedVersion`) are decoded by the schema but stay outside the
+/// strictly projectable field set, exactly like the `rutilus-infra-redfish`
+/// fixture the product's decoder accepts.
+pub(crate) const SOFTWARE_INVENTORY_BIOS: &str = r##"{
+    "@odata.type":"#SoftwareInventory.v1_7_0.SoftwareInventory",
+    "@odata.id":"/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+    "@odata.etag":"W/\"sw-1\"",
+    "Id":"BIOS",
+    "Name":"System BIOS",
+    "Description":"Host firmware",
+    "SoftwareId":"BIOS-2026-1",
+    "Version":"2.7.0",
+    "ReleaseDate":"2026-05-01T00:00:00Z",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Updateable":true,
+    "Manufacturer":"Rutilus Test",
+    "LowestSupportedVersion":"2.0.0"
 }"##;
 
 /// The Redfish-shaped error body for unregistered paths.
