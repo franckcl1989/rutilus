@@ -20,8 +20,8 @@ use rutilus_api::{
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
     EventDestinationProtocol, EventType, ManagerCommand, OperationResponse,
     OperationSourceResponse, OperationStateResponse, RedfishCommand, ResetKeysType, ResetType,
-    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, SystemCommand,
-    TlsTrustModeResponse, UiLocationResponse,
+    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+    TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -2423,18 +2423,20 @@ enum CommandFamilyView {
     BootOverride,
     SecureBoot,
     EventSubscription,
+    FirmwareUpdate,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl CommandFamilyView {
     /// Every family in §7.5 order, so the form cannot miss a variant.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::SystemReset,
         Self::ManagerReset,
         Self::ChassisReset,
         Self::BootOverride,
         Self::SecureBoot,
         Self::EventSubscription,
+        Self::FirmwareUpdate,
     ];
 
     /// The stable §7.5 family code, matching the domain's wire vocabulary.
@@ -2447,6 +2449,7 @@ impl CommandFamilyView {
             Self::BootOverride => "boot",
             Self::SecureBoot => "secure-boot",
             Self::EventSubscription => "event",
+            Self::FirmwareUpdate => "update",
         }
     }
 
@@ -2460,6 +2463,7 @@ impl CommandFamilyView {
             Self::BootOverride => "Boot source override",
             Self::SecureBoot => "Secure Boot",
             Self::EventSubscription => "Event subscription",
+            Self::FirmwareUpdate => "Firmware update",
         }
     }
 }
@@ -2874,6 +2878,21 @@ enum OperationCommandDraft {
     },
     SecureBoot(SecureBootActionView),
     Event(EventActionDraft),
+    Update(UpdateDraft),
+}
+
+/// The §14.3 firmware-update payload assembled from the operation form.
+///
+/// The two fields mirror the domain `UpdateCommand::StartUpdate` payload
+/// exactly: the selected artifact id and the optional push URI. `None` means
+/// the operation engine reads the artifact from the local store and
+/// dispatches it through the default multipart path; `Some` means the engine
+/// pushes the artifact bytes to that public URI instead.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateDraft {
+    artifact_id: String,
+    push_uri: Option<String>,
 }
 
 /// The event-command payload assembled from the operation form.
@@ -2963,6 +2982,20 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
                 payload,
             }
         }
+        OperationCommandDraft::Update(update) => {
+            // The artifact id renders in the same short form as the artifact
+            // card, so the preview and the operation card of a submitted
+            // update agree on how the artifact is identified.
+            let artifact_short_id = short_sha256(&update.artifact_id);
+            let payload = match update.push_uri.as_deref() {
+                Some(uri) => format!("Start · {artifact_short_id} · push {uri}"),
+                None => format!("Start · {artifact_short_id} · multipart"),
+            };
+            CommandSummaryProjection {
+                family: CommandFamilyView::FirmwareUpdate.label(),
+                payload,
+            }
+        }
     }
 }
 
@@ -2988,6 +3021,13 @@ struct OperationFormDraft {
     protocol: Option<EventProtocolView>,
     event_types: Vec<EventTypeView>,
     subscription_id: String,
+    /// The selected §14.3 artifact id. Only ready artifacts are offered by
+    /// the form (see [`update_artifact_choices`]), so a filled draft always
+    /// names a complete, verified artifact.
+    artifact_id: Option<String>,
+    /// The optional push URI; empty means the default multipart dispatch of
+    /// the locally stored artifact.
+    push_uri: String,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3009,6 +3049,8 @@ impl OperationFormDraft {
             protocol: None,
             event_types: Vec::new(),
             subscription_id: String::new(),
+            artifact_id: None,
+            push_uri: String::new(),
         }
     }
 
@@ -3064,7 +3106,8 @@ impl OperationFormDraft {
                     CommandFamilyView::ChassisReset => ResetResourceView::Chassis,
                     CommandFamilyView::BootOverride
                     | CommandFamilyView::SecureBoot
-                    | CommandFamilyView::EventSubscription => {
+                    | CommandFamilyView::EventSubscription
+                    | CommandFamilyView::FirmwareUpdate => {
                         // Refused rather than fabricated: the reset arm only
                         // ever receives a reset family from the outer match.
                         return Err(OperationFormError::FamilyRequired);
@@ -3137,7 +3180,33 @@ impl OperationFormDraft {
                     }
                 }
             }
+            CommandFamilyView::FirmwareUpdate => {
+                Ok(OperationCommandDraft::Update(self.update_draft()?))
+            }
         }
+    }
+
+    /// Assembles the §14.3 update payload of a validated draft.
+    ///
+    /// The artifact selection is required: the operation engine can only
+    /// start an update from one complete, verified artifact, and the form
+    /// offers only ready artifacts, so an unset id is a missing choice rather
+    /// than a bad one. The push URI is optional and checked separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationFormError::ArtifactRequired`] when no artifact was
+    /// chosen and [`OperationFormError::PushUriInvalid`] when the push URI
+    /// cannot be an http(s) URL.
+    fn update_draft(&self) -> Result<UpdateDraft, OperationFormError> {
+        let Some(artifact_id) = self.artifact_id.clone() else {
+            return Err(OperationFormError::ArtifactRequired);
+        };
+        let push_uri = update_push_uri_draft_error(&self.push_uri)?;
+        Ok(UpdateDraft {
+            artifact_id,
+            push_uri,
+        })
     }
 }
 
@@ -3159,6 +3228,8 @@ enum OperationFormError {
     ProtocolRequired,
     EventTypesRequired,
     SubscriptionIdRequired,
+    ArtifactRequired,
+    PushUriInvalid,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3181,8 +3252,41 @@ impl OperationFormError {
             Self::ProtocolRequired => "Choose a delivery protocol.",
             Self::EventTypesRequired => "Select at least one event type.",
             Self::SubscriptionIdRequired => "A subscription ID is required.",
+            Self::ArtifactRequired => "Choose a ready firmware artifact.",
+            Self::PushUriInvalid => "The push URI must be an http(s) URL.",
         }
     }
+}
+
+/// Checks one optional firmware push URI (§14.3).
+///
+/// An empty value means the default dispatch path: the operation engine
+/// reads the verified artifact from the local store and pushes it to the BMC
+/// as multipart. A filled value must be an http(s) URL that the engine can
+/// push the artifact bytes to; any other scheme, a missing host, or embedded
+/// whitespace is rejected up front, mirroring the subscription destination
+/// draft rules. The server remains authoritative during submission; this
+/// check only rejects drafts that could never be a usable push URI.
+#[cfg(any(target_arch = "wasm32", test))]
+fn update_push_uri_draft_error(value: &str) -> Result<Option<String>, OperationFormError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(OperationFormError::PushUriInvalid);
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(OperationFormError::PushUriInvalid);
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(OperationFormError::PushUriInvalid);
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(OperationFormError::PushUriInvalid);
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 /// Checks one event subscription destination URL.
@@ -3359,6 +3463,36 @@ fn operation_endpoint_choices(
                 display_name: identity.display_name().to_owned(),
                 address: identity.address().to_owned(),
             }
+        })
+        .collect()
+}
+
+/// One ready firmware artifact offered by the update form.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateArtifactChoice {
+    artifact_id: String,
+    name: String,
+    size_text: String,
+}
+
+/// Projects the §14.3 artifact list into the update form's choices.
+///
+/// Only `ready` artifacts are offered: an uploading artifact has an
+/// incomplete byte range, and a failed one was rejected by the finalize
+/// verification, so neither can be dispatched to a BMC — the operation
+/// engine can only start a firmware update from a complete, verified
+/// artifact. The other two states stay visible in the Artifacts view (where
+/// uploads resume) but are never selectable here.
+#[cfg(any(target_arch = "wasm32", test))]
+fn update_artifact_choices(artifacts: &[ArtifactCardProjection]) -> Vec<UpdateArtifactChoice> {
+    artifacts
+        .iter()
+        .filter(|card| card.status == ArtifactStatusView::Ready)
+        .map(|card| UpdateArtifactChoice {
+            artifact_id: card.artifact_id.clone(),
+            name: card.name.clone(),
+            size_text: card.size_text.clone(),
         })
         .collect()
 }
@@ -4186,6 +4320,21 @@ fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, Oper
                 EventCommand::DeleteSubscription(DeleteSubscription::new(subscription_id.clone())),
             )),
         },
+        OperationCommandDraft::Update(update) => {
+            // The id string parses into the domain's `ArtifactId` wrapper.
+            // The API crate re-exports only the command surface, not
+            // `ArtifactId`, so the wrapper type is inferred from
+            // `StartUpdate::new`'s signature; a non-uuid string is refused
+            // as a missing artifact choice because the form can only ever
+            // offer server-provided uuids through the ready-only select.
+            let artifact_id = update
+                .artifact_id
+                .parse()
+                .map_err(|_| OperationFormError::ArtifactRequired)?;
+            Ok(RedfishCommand::Update(UpdateCommand::StartUpdate(
+                StartUpdate::new(artifact_id, update.push_uri.clone()),
+            )))
+        }
     }
 }
 
@@ -4256,6 +4405,20 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                 payload: format!("Delete · {}", deletion.subscription_id()),
             }
         }
+        RedfishCommand::Update(UpdateCommand::StartUpdate(payload)) => {
+            // The artifact id renders in the same short form as the form
+            // preview and the artifact card, so the card of a submitted
+            // update agrees with both on how the artifact is identified.
+            let artifact_short_id = short_sha256(&payload.artifact_id().to_string());
+            let payload_text = match payload.push_uri() {
+                Some(uri) => format!("Start · {artifact_short_id} · push {uri}"),
+                None => format!("Start · {artifact_short_id} · multipart"),
+            };
+            CommandSummaryProjection {
+                family: CommandFamilyView::FirmwareUpdate.label(),
+                payload: payload_text,
+            }
+        }
     }
 }
 
@@ -4312,10 +4475,10 @@ mod browser {
         OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
         OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
         OperationSubmitState, OperationsListState, ResetKeysTypeView, ResetTypeView,
-        SecureBootActionView, TrustChallengeProjection, artifact_chunk_range_at,
-        artifact_upload_status_text, base64_encode, build_command, command_summary,
-        endpoint_address_draft_error, format_artifact_size, operation_endpoint_choices, sha256_hex,
-        trust_mode_label,
+        SecureBootActionView, TrustChallengeProjection, UpdateArtifactChoice,
+        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
+        command_summary, endpoint_address_draft_error, format_artifact_size,
+        operation_endpoint_choices, sha256_hex, trust_mode_label, update_artifact_choices,
     };
 
     #[wasm_bindgen(start)]
@@ -6426,6 +6589,13 @@ mod browser {
         let (draft, set_draft) = signal(OperationFormDraft::new());
         let (draft_error, set_draft_error) = signal(None::<OperationFormError>);
         let (submit_state, set_submit_state) = signal(OperationSubmitState::Idle);
+        // The update form needs the §14.3 artifact inventory to offer ready
+        // choices. It is fetched lazily when the update family is selected
+        // (not on every visit of the view), because only that family renders
+        // the artifact select and the list is otherwise the Artifacts view's
+        // own state.
+        let (artifact_list_state, set_artifact_list_state) = signal(ArtifactsListState::Loading);
+        let (artifact_list_triggered, set_artifact_list_triggered) = signal(false);
 
         Effect::new(move |_| {
             if active() && !list_triggered.get() {
@@ -6433,6 +6603,19 @@ mod browser {
                 set_list_state.set(OperationsListState::Loading);
                 spawn_local(async move {
                     set_list_state.set(fetch_operations().await);
+                });
+            }
+        });
+
+        Effect::new(move |_| {
+            if active()
+                && draft.get().family == Some(CommandFamilyView::FirmwareUpdate)
+                && !artifact_list_triggered.get()
+            {
+                set_artifact_list_triggered.set(true);
+                set_artifact_list_state.set(ArtifactsListState::Loading);
+                spawn_local(async move {
+                    set_artifact_list_state.set(fetch_artifacts().await);
                 });
             }
         });
@@ -6463,7 +6646,16 @@ mod browser {
                 draft.reset_keys_type = None;
                 draft.event_action = None;
                 draft.protocol = None;
+                draft.artifact_id = None;
+                draft.push_uri = String::new();
             });
+            // Re-entering the update family refreshes the artifact choices,
+            // so a firmware file finalized after the last fetch is offered
+            // immediately.
+            if family == CommandFamilyView::FirmwareUpdate {
+                set_artifact_list_triggered.set(false);
+                set_artifact_list_state.set(ArtifactsListState::Loading);
+            }
             set_draft_error.set(None);
             set_submit_state.set(OperationSubmitState::Idle);
         });
@@ -6496,6 +6688,11 @@ mod browser {
         let endpoint_choices = move || match &load_state.get() {
             ConsoleLoadState::Ready(data) => operation_endpoint_choices(&data.inventory),
             ConsoleLoadState::Loading | ConsoleLoadState::Failed(_) => Vec::new(),
+        };
+
+        let artifact_choices = move || match &artifact_list_state.get() {
+            ArtifactsListState::Ready(cards) => update_artifact_choices(cards),
+            ArtifactsListState::Loading | ArtifactsListState::Failed => Vec::new(),
         };
 
         view! {
@@ -6543,6 +6740,8 @@ mod browser {
                 </div>
                 <OperationSubmitForm
                     endpoint_choices=endpoint_choices
+                    artifact_choices=artifact_choices
+                    artifact_list_state=artifact_list_state
                     draft=draft
                     set_draft=set_draft
                     error=draft_error
@@ -6560,6 +6759,8 @@ mod browser {
     #[component]
     fn OperationSubmitForm(
         endpoint_choices: impl Fn() -> Vec<OperationEndpointChoice> + Send + 'static,
+        artifact_choices: impl Fn() -> Vec<UpdateArtifactChoice> + Send + 'static,
+        artifact_list_state: ReadSignal<ArtifactsListState>,
         draft: ReadSignal<OperationFormDraft>,
         set_draft: WriteSignal<OperationFormDraft>,
         error: ReadSignal<Option<OperationFormError>>,
@@ -6670,6 +6871,18 @@ mod browser {
             set_error.set(None);
             set_submit_state.set(OperationSubmitState::Idle);
         });
+        let on_update_artifact_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = if value.is_empty() { None } else { Some(value) };
+            set_draft.update(|draft| draft.artifact_id = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_update_push_uri_input = move |event| {
+            set_draft.update(|draft| draft.push_uri = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
 
         // The reset families share one parameter block; any of the three
         // selections shows it.
@@ -7114,6 +7327,85 @@ mod browser {
                                 {OperationFormError::SubscriptionIdRequired.message()}
                             </p>
                         </div>
+                    </div>
+                </div>
+
+                <div
+                    class="form-field"
+                    hidden=move || !family_selected(CommandFamilyView::FirmwareUpdate)
+                >
+                    <label for="operation-update-artifact">"Firmware artifact"</label>
+                    <select
+                        id="operation-update-artifact"
+                        class="form-select"
+                        prop:value=move || draft.get().artifact_id.clone().unwrap_or_default()
+                        on:change=on_update_artifact_change
+                    >
+                        <option value="">"Choose an artifact"</option>
+                        {artifact_choices()
+                            .into_iter()
+                            .map(|choice| {
+                                // The id is cloned before the template moves
+                                // the display fields, mirroring the endpoint
+                                // choice buttons.
+                                let artifact_id = choice.artifact_id.clone();
+                                view! {
+                                    <option value=artifact_id>
+                                        {format!("{} · {}", choice.name, choice.size_text)}
+                                    </option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                    <p class="form-hint">
+                        "Only artifacts with a verified complete upload (Ready) can be dispatched."
+                    </p>
+                    <p
+                        class="form-error"
+                        hidden=move || field_error(OperationFormError::ArtifactRequired).is_empty()
+                    >
+                        {OperationFormError::ArtifactRequired.message()}
+                    </p>
+                    <p
+                        class="inline-status"
+                        hidden=move || !artifact_list_state.get().is_loading()
+                    >
+                        "Loading firmware artifacts..."
+                    </p>
+                    <p
+                        class="form-error"
+                        hidden=move || !artifact_list_state.get().is_failed()
+                    >
+                        "The firmware artifact list is temporarily unavailable."
+                    </p>
+                    <p
+                        class="form-hint"
+                        hidden=move || {
+                            !artifact_list_state.get().is_ready() || !artifact_choices().is_empty()
+                        }
+                    >
+                        "No ready firmware artifacts. Upload and finalize one in the Artifacts view."
+                    </p>
+                    <div class="form-field">
+                        <label for="operation-update-push-uri">"Push URI (optional)"</label>
+                        <input
+                            id="operation-update-push-uri"
+                            class="form-input"
+                            type="text"
+                            autocomplete="off"
+                            placeholder="https://mirror.example.test/firmware.bin"
+                            prop:value=move || draft.get().push_uri
+                            on:input=on_update_push_uri_input
+                        />
+                        <p class="form-hint">
+                            "Leave empty to dispatch the locally stored artifact as multipart upload."
+                        </p>
+                        <p
+                            class="form-error"
+                            hidden=move || field_error(OperationFormError::PushUriInvalid).is_empty()
+                        >
+                            {OperationFormError::PushUriInvalid.message()}
+                        </p>
                     </div>
                 </div>
 
@@ -10728,6 +11020,7 @@ mod tests {
                 CommandFamilyView::BootOverride,
                 CommandFamilyView::SecureBoot,
                 CommandFamilyView::EventSubscription,
+                CommandFamilyView::FirmwareUpdate,
             ]
         );
         for (family, code, label) in [
@@ -10745,13 +11038,18 @@ mod tests {
                 "event",
                 "Event subscription",
             ),
+            (
+                CommandFamilyView::FirmwareUpdate,
+                "update",
+                "Firmware update",
+            ),
         ] {
             assert_eq!(family.as_str(), code);
             assert_eq!(family.label(), label);
         }
-        // The family codes are the §7.5 wire contract; the deferred families
-        // must not be claimed by a form family.
-        assert_eq!(CommandFamilyView::ALL.len(), 6);
+        // The family codes are the §7.5 wire contract; the families that
+        // still have no form surface must not be claimed by one.
+        assert_eq!(CommandFamilyView::ALL.len(), 7);
     }
 
     #[test]
@@ -11099,6 +11397,188 @@ mod tests {
                 }
             ))
         );
+    }
+
+    /// One artifact card fixture for the update choice filtering tests; the
+    /// status is the only field that varies between fixtures.
+    fn artifact_card_fixture(
+        artifact_id: &str,
+        name: &str,
+        status: ArtifactStatusView,
+    ) -> ArtifactCardProjection {
+        ArtifactCardProjection {
+            artifact_id: artifact_id.to_owned(),
+            short_id: short_sha256(artifact_id),
+            name: name.to_owned(),
+            size_text: "8.0 MiB".to_owned(),
+            sha256_short: "a1b2c3d4".to_owned(),
+            status,
+            uploaded_bytes: 0,
+            size_bytes: 8_388_608,
+            progress_percent: 0,
+            created_at_text: "2026-08-06T09:10:11Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn update_artifact_choices_offer_only_ready_artifacts() {
+        let cards = [
+            artifact_card_fixture(
+                "01989abc-def0-7abc-8def-0123456789aa",
+                "bmc-fw-1.2.3.bin",
+                ArtifactStatusView::Uploading,
+            ),
+            artifact_card_fixture(
+                "01989abc-def0-7abc-8def-0123456789ab",
+                "bmc-fw-1.2.3.bin",
+                ArtifactStatusView::Ready,
+            ),
+            artifact_card_fixture(
+                "01989abc-def0-7abc-8def-0123456789ac",
+                "bmc-fw-1.2.3-corrupt.bin",
+                ArtifactStatusView::Failed,
+            ),
+        ];
+        let choices = update_artifact_choices(&cards);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(
+            choices[0].artifact_id,
+            "01989abc-def0-7abc-8def-0123456789ab"
+        );
+        assert_eq!(choices[0].name, "bmc-fw-1.2.3.bin");
+        assert_eq!(choices[0].size_text, "8.0 MiB");
+        assert!(update_artifact_choices(&[]).is_empty());
+    }
+
+    #[test]
+    fn update_form_validation_rejects_missing_artifact_and_invalid_push_uri() {
+        let mut draft = OperationFormDraft::new();
+        draft.toggle_endpoint("01989abc-def0-7abc-8def-0123456789ad".to_owned());
+        draft.family = Some(CommandFamilyView::FirmwareUpdate);
+        assert_eq!(draft.try_build(), Err(OperationFormError::ArtifactRequired));
+
+        draft.artifact_id = Some("01989abc-def0-7abc-8def-0123456789ab".to_owned());
+        draft.push_uri = "ftp://mirror.example.test/fw.bin".to_owned();
+        assert_eq!(draft.try_build(), Err(OperationFormError::PushUriInvalid));
+        draft.push_uri = "https://mirror.example.test/fw.bin extra".to_owned();
+        assert_eq!(draft.try_build(), Err(OperationFormError::PushUriInvalid));
+        draft.push_uri = "mirror.example.test/fw.bin".to_owned();
+        assert_eq!(draft.try_build(), Err(OperationFormError::PushUriInvalid));
+        draft.push_uri = "https:///fw.bin".to_owned();
+        assert_eq!(draft.try_build(), Err(OperationFormError::PushUriInvalid));
+
+        draft.push_uri = "https://mirror.example.test/fw.bin".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Ok(OperationCommandDraft::Update(UpdateDraft {
+                artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+                push_uri: Some("https://mirror.example.test/fw.bin".to_owned()),
+            }))
+        );
+        // Whitespace-only means the default multipart dispatch path.
+        draft.push_uri = "   ".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Ok(OperationCommandDraft::Update(UpdateDraft {
+                artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+                push_uri: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn update_command_draft_summaries_project_multipart_and_push_modes() {
+        let multipart = OperationCommandDraft::Update(UpdateDraft {
+            artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+            push_uri: None,
+        });
+        let summary = command_summary(&multipart);
+        assert_eq!(summary.family, "Firmware update");
+        assert_eq!(summary.payload, "Start · 01989abc · multipart");
+
+        let push = OperationCommandDraft::Update(UpdateDraft {
+            artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+            push_uri: Some("https://mirror.example.test/fw.bin".to_owned()),
+        });
+        let summary = command_summary(&push);
+        assert_eq!(summary.family, "Firmware update");
+        assert_eq!(
+            summary.payload,
+            "Start · 01989abc · push https://mirror.example.test/fw.bin"
+        );
+    }
+
+    #[test]
+    fn built_update_commands_serialize_to_the_canonical_wire_contract() -> Result<(), Box<dyn Error>>
+    {
+        // The multipart default leaves `push_uri` absent from the wire form,
+        // exactly like the domain golden contract.
+        let multipart = OperationCommandDraft::Update(UpdateDraft {
+            artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+            push_uri: None,
+        });
+        let command = build_command(&multipart).map_err(|error| error.message().to_owned())?;
+        assert_eq!(
+            serde_json::to_value(&command)?,
+            json!({
+                "Update": {
+                    "StartUpdate": {
+                        "artifact_id": "01989abc-def0-7abc-8def-0123456789ab"
+                    }
+                }
+            })
+        );
+
+        let push = OperationCommandDraft::Update(UpdateDraft {
+            artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+            push_uri: Some("https://mirror.example.test/fw.bin".to_owned()),
+        });
+        let command = build_command(&push).map_err(|error| error.message().to_owned())?;
+        assert_eq!(
+            serde_json::to_value(&command)?,
+            json!({
+                "Update": {
+                    "StartUpdate": {
+                        "artifact_id": "01989abc-def0-7abc-8def-0123456789ab",
+                        "push_uri": "https://mirror.example.test/fw.bin"
+                    }
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_command_summaries_render_the_update_family() -> Result<(), Box<dyn Error>> {
+        for (wire, payload) in [
+            (
+                json!({
+                    "Update": {
+                        "StartUpdate": {
+                            "artifact_id": "01989abc-def0-7abc-8def-0123456789ab"
+                        }
+                    }
+                }),
+                "Start · 01989abc · multipart",
+            ),
+            (
+                json!({
+                    "Update": {
+                        "StartUpdate": {
+                            "artifact_id": "01989abc-def0-7abc-8def-0123456789ab",
+                            "push_uri": "https://mirror.example.test/fw.bin"
+                        }
+                    }
+                }),
+                "Start · 01989abc · push https://mirror.example.test/fw.bin",
+            ),
+        ] {
+            let command = serde_json::from_value::<RedfishCommand>(wire)?;
+            let summary = wire_command_summary(&command);
+            assert_eq!(summary.family, "Firmware update");
+            assert_eq!(summary.payload, payload);
+        }
+        Ok(())
     }
 
     #[test]
