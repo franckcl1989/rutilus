@@ -58,27 +58,74 @@ stable_audit_codes! {
 
 stable_audit_codes! {
     /// A product permission checked before the audited action.
+    ///
+    /// `ExecuteOperations` is the permission checked before a persisted
+    /// [`Operation`](crate::Operation) is executed (§13.1). It is distinct
+    /// from `ManageEndpoints` and `RefreshEndpoints` because §16.1 grants
+    /// device-operation execution to roles that cannot manage endpoints or
+    /// credentials; an audit record must show which product activity was
+    /// authorized, not a closest-sounding neighbor.
     pub enum ProductPermission for "product permission" {
         ManageEndpoints => "manage-endpoints",
         RefreshEndpoints => "refresh-endpoints",
+        ExecuteOperations => "execute-operations",
     }
 }
 
 stable_audit_codes! {
     /// A stable product action represented by an audit operation.
+    ///
+    /// `ExecuteOperation` covers every execution of a persisted
+    /// [`Operation`](crate::Operation) (§13.1): the audited action is the
+    /// execution itself, and the typed [`AuditRedfishOperation`] recorded
+    /// beside it names the §7.5 write family the execution dispatched.
+    /// Keeping the write executions a separate action from the discovery
+    /// actions — `EnrollEndpoint`, `RefreshEndpoint`, `ImportEndpoints` — is
+    /// the §16.3 accountability point: a viewer must be able to distinguish
+    /// an action that only reads from one that changes the managed endpoint.
     pub enum AuditAction for "action" {
         EnrollEndpoint => "enroll-endpoint",
         RefreshEndpoint => "refresh-endpoint",
         ImportEndpoints => "import-endpoints",
+        ExecuteOperation => "execute-operation",
     }
 }
 
 stable_audit_codes! {
     /// The public typed Redfish operation used by a product action.
+    ///
+    /// The write operations mirror the §7.5 command families compiled in
+    /// [`crate::RedfishCommand`], with the same granularity decisions. The
+    /// three reset families are independent variants because they target
+    /// different CSDL resources whose action sets diverge — the decision
+    /// that also keeps [`crate::SystemCommand::Reset`],
+    /// [`crate::ManagerCommand::Reset`], and [`crate::ChassisCommand::Reset`]
+    /// separate. The three Secure Boot writes are separate because their
+    /// accountability differs: enabling Secure Boot, disabling it, and
+    /// resetting its key sets are materially different security-relevant
+    /// actions an audit reader must not conflate. Creating and deleting an
+    /// event subscription are separate for the same reason: one adds a
+    /// delivery target, the other removes one.
+    ///
+    /// `PollRemoteTask` names the Task-resource polling that a write
+    /// returning `202 Accepted` starts (§13.6). Polling is a Redfish
+    /// operation of its own even though it never changes a resource, so the
+    /// vocabulary must be able to name it when a monitor-recorded audit fact
+    /// describes the poll.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
         ReadCoreResources => "read-core-resources",
+        ResetSystem => "reset-system",
+        ResetManager => "reset-manager",
+        ResetChassis => "reset-chassis",
+        SetBootSourceOverride => "set-boot-source-override",
+        SecureBootEnable => "secure-boot-enable",
+        SecureBootDisable => "secure-boot-disable",
+        SecureBootResetKeys => "secure-boot-reset-keys",
+        CreateEventSubscription => "create-event-subscription",
+        DeleteEventSubscription => "delete-event-subscription",
+        PollRemoteTask => "poll-remote-task",
     }
 }
 
@@ -320,6 +367,23 @@ pub struct AuditOperationContext {
 impl AuditOperationContext {
     /// Creates one semantically consistent 0.1 audit operation context.
     ///
+    /// The accepted combinations are exactly the pairs of a product action
+    /// and its typed Redfish operation. The check is an exhaustive match on
+    /// the operation type, so adding an operation type fails to compile
+    /// until its action is decided here — the §7.5 exhaustiveness rule
+    /// applied to the audit vocabulary.
+    ///
+    /// An execution context — [`AuditAction::ExecuteOperation`] with a §7.5
+    /// write operation type or [`AuditRedfishOperation::PollRemoteTask`] —
+    /// targets the endpoint that receives the write and checks
+    /// [`ProductPermission::ExecuteOperations`]. Its parameter summary stays
+    /// [`AuditParameterSummary::EndpointRefresh`] for this iteration: the
+    /// summary vocabulary is projected per-variant by the persistence crate,
+    /// which is not extended here, so `EndpointRefresh` is the closest legal
+    /// summary until an operation-scoped summary lands together with its
+    /// persistence projection. The permission, action, and operation-type
+    /// fields are truthful.
+    ///
     /// # Errors
     ///
     /// Returns [`AuditOperationContextError`] when the target, parameter
@@ -336,28 +400,59 @@ impl AuditOperationContext {
         action: AuditAction,
         redfish_operation: AuditRedfishOperation,
     ) -> Result<Self, AuditOperationContextError> {
-        let consistent = matches!(
-            (&target, parameters, permission, action, redfish_operation),
-            (
-                AuditTarget::EndpointAddress(_),
-                AuditParameterSummary::EndpointEnrollment { .. },
-                ProductPermission::ManageEndpoints,
-                AuditAction::EnrollEndpoint,
-                AuditRedfishOperation::ProbeCoreCapabilities,
-            ) | (
-                AuditTarget::Endpoint(_),
-                AuditParameterSummary::EndpointRefresh,
-                ProductPermission::RefreshEndpoints,
-                AuditAction::RefreshEndpoint,
-                AuditRedfishOperation::ReadCoreResources,
-            ) | (
-                AuditTarget::Product,
-                AuditParameterSummary::CsvEndpointImport { .. },
-                ProductPermission::ManageEndpoints,
-                AuditAction::ImportEndpoints,
-                AuditRedfishOperation::None,
-            )
-        );
+        let consistent = match redfish_operation {
+            // Enrollment probes the capabilities of the endpoint address.
+            AuditRedfishOperation::ProbeCoreCapabilities => matches!(
+                (&target, parameters, permission, action),
+                (
+                    AuditTarget::EndpointAddress(_),
+                    AuditParameterSummary::EndpointEnrollment { .. },
+                    ProductPermission::ManageEndpoints,
+                    AuditAction::EnrollEndpoint,
+                )
+            ),
+            // Refresh reads the core resources of the managed endpoint.
+            AuditRedfishOperation::ReadCoreResources => matches!(
+                (&target, parameters, permission, action),
+                (
+                    AuditTarget::Endpoint(_),
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::RefreshEndpoints,
+                    AuditAction::RefreshEndpoint,
+                )
+            ),
+            // A CSV import changes no Redfish resource at all.
+            AuditRedfishOperation::None => matches!(
+                (&target, parameters, permission, action),
+                (
+                    AuditTarget::Product,
+                    AuditParameterSummary::CsvEndpointImport { .. },
+                    ProductPermission::ManageEndpoints,
+                    AuditAction::ImportEndpoints,
+                )
+            ),
+            // Every §7.5 write family and the §13.6 remote-task polling is
+            // the execution of one persisted operation against the managed
+            // endpoint that receives the request.
+            AuditRedfishOperation::ResetSystem
+            | AuditRedfishOperation::ResetManager
+            | AuditRedfishOperation::ResetChassis
+            | AuditRedfishOperation::SetBootSourceOverride
+            | AuditRedfishOperation::SecureBootEnable
+            | AuditRedfishOperation::SecureBootDisable
+            | AuditRedfishOperation::SecureBootResetKeys
+            | AuditRedfishOperation::CreateEventSubscription
+            | AuditRedfishOperation::DeleteEventSubscription
+            | AuditRedfishOperation::PollRemoteTask => matches!(
+                (&target, parameters, permission, action),
+                (
+                    AuditTarget::Endpoint(_),
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ExecuteOperations,
+                    AuditAction::ExecuteOperation,
+                )
+            ),
+        };
         if !consistent {
             return Err(AuditOperationContextError);
         }
@@ -738,16 +833,28 @@ mod tests {
         assert_codes(&[
             ProductPermission::ManageEndpoints,
             ProductPermission::RefreshEndpoints,
+            ProductPermission::ExecuteOperations,
         ]);
         assert_codes(&[
             AuditAction::EnrollEndpoint,
             AuditAction::RefreshEndpoint,
             AuditAction::ImportEndpoints,
+            AuditAction::ExecuteOperation,
         ]);
         assert_codes(&[
             AuditRedfishOperation::None,
             AuditRedfishOperation::ProbeCoreCapabilities,
             AuditRedfishOperation::ReadCoreResources,
+            AuditRedfishOperation::ResetSystem,
+            AuditRedfishOperation::ResetManager,
+            AuditRedfishOperation::ResetChassis,
+            AuditRedfishOperation::SetBootSourceOverride,
+            AuditRedfishOperation::SecureBootEnable,
+            AuditRedfishOperation::SecureBootDisable,
+            AuditRedfishOperation::SecureBootResetKeys,
+            AuditRedfishOperation::CreateEventSubscription,
+            AuditRedfishOperation::DeleteEventSubscription,
+            AuditRedfishOperation::PollRemoteTask,
         ]);
         assert_codes(&[AuditProgress::EndpointCreated, AuditProgress::RowValidated]);
         assert_codes(&[
@@ -778,6 +885,69 @@ mod tests {
         assert_eq!(
             "unknown".parse::<AuditAction>(),
             Err(AuditCodeParseError::new("action"))
+        );
+        assert_eq!(
+            "unknown".parse::<AuditRedfishOperation>(),
+            Err(AuditCodeParseError::new("Redfish operation"))
+        );
+        assert_eq!(
+            "unknown".parse::<ProductPermission>(),
+            Err(AuditCodeParseError::new("product permission"))
+        );
+    }
+
+    #[test]
+    fn new_execute_codes_are_pinned_as_the_stable_wire_contract() {
+        // The round-trip test alone would not catch a renamed code: a code
+        // that parses back to itself is consistent by definition. Persisted
+        // audit rows keep the code they were written under, so the codes
+        // added for operation execution are pinned as exact literals — the
+        // same contract the §7.5 command vocabulary pins.
+        for (operation, expected) in [
+            (AuditRedfishOperation::ResetSystem, "reset-system"),
+            (AuditRedfishOperation::ResetManager, "reset-manager"),
+            (AuditRedfishOperation::ResetChassis, "reset-chassis"),
+            (
+                AuditRedfishOperation::SetBootSourceOverride,
+                "set-boot-source-override",
+            ),
+            (
+                AuditRedfishOperation::SecureBootEnable,
+                "secure-boot-enable",
+            ),
+            (
+                AuditRedfishOperation::SecureBootDisable,
+                "secure-boot-disable",
+            ),
+            (
+                AuditRedfishOperation::SecureBootResetKeys,
+                "secure-boot-reset-keys",
+            ),
+            (
+                AuditRedfishOperation::CreateEventSubscription,
+                "create-event-subscription",
+            ),
+            (
+                AuditRedfishOperation::DeleteEventSubscription,
+                "delete-event-subscription",
+            ),
+            (AuditRedfishOperation::PollRemoteTask, "poll-remote-task"),
+        ] {
+            assert_eq!(operation.as_str(), expected);
+            assert_eq!(expected.parse(), Ok(operation));
+        }
+        assert_eq!(AuditAction::ExecuteOperation.as_str(), "execute-operation");
+        assert_eq!(
+            "execute-operation".parse(),
+            Ok(AuditAction::ExecuteOperation)
+        );
+        assert_eq!(
+            ProductPermission::ExecuteOperations.as_str(),
+            "execute-operations"
+        );
+        assert_eq!(
+            "execute-operations".parse(),
+            Ok(ProductPermission::ExecuteOperations)
         );
     }
 
@@ -917,6 +1087,187 @@ mod tests {
         );
     }
 
+    /// The §7.5 write operation types plus remote-task polling.
+    ///
+    /// Kept next to [`AuditOperationContext::try_new`]'s exhaustive check so
+    /// the two lists stay reviewable together.
+    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 10] = [
+        AuditRedfishOperation::ResetSystem,
+        AuditRedfishOperation::ResetManager,
+        AuditRedfishOperation::ResetChassis,
+        AuditRedfishOperation::SetBootSourceOverride,
+        AuditRedfishOperation::SecureBootEnable,
+        AuditRedfishOperation::SecureBootDisable,
+        AuditRedfishOperation::SecureBootResetKeys,
+        AuditRedfishOperation::CreateEventSubscription,
+        AuditRedfishOperation::DeleteEventSubscription,
+        AuditRedfishOperation::PollRemoteTask,
+    ];
+
+    #[test]
+    fn execute_contexts_accept_every_write_operation_type() -> Result<(), Box<dyn Error>> {
+        for operation in EXECUTE_OPERATIONS {
+            let context = execute_context(operation)?;
+            assert_eq!(context.action(), AuditAction::ExecuteOperation);
+            assert_eq!(context.permission(), ProductPermission::ExecuteOperations);
+            assert_eq!(context.redfish_operation(), operation);
+            assert!(matches!(context.target(), AuditTarget::Endpoint(_)));
+            assert!(matches!(
+                context.parameters(),
+                AuditParameterSummary::EndpointRefresh
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn execute_contexts_reject_metadata_describing_other_actions() -> Result<(), Box<dyn Error>> {
+        // A write operation type is rejected when any other field still
+        // describes the action it used to borrow from.
+        for (permission, action, operation) in [
+            (
+                ProductPermission::RefreshEndpoints,
+                AuditAction::RefreshEndpoint,
+                AuditRedfishOperation::ResetSystem,
+            ),
+            (
+                ProductPermission::RefreshEndpoints,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ResetSystem,
+            ),
+            (
+                ProductPermission::ExecuteOperations,
+                AuditAction::RefreshEndpoint,
+                AuditRedfishOperation::ResetSystem,
+            ),
+            (
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ProbeCoreCapabilities,
+            ),
+            (
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ReadCoreResources,
+            ),
+            (
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::None,
+            ),
+        ] {
+            assert_eq!(
+                AuditOperationContext::try_new(
+                    AuditOperationId::generate(),
+                    AuditActor::System,
+                    DeploymentPosture::Site,
+                    AuditTarget::Endpoint(EndpointId::generate()),
+                    AuditParameterSummary::EndpointRefresh,
+                    permission,
+                    action,
+                    operation,
+                ),
+                Err(AuditOperationContextError)
+            );
+        }
+        // An execution targets the endpoint that receives the write, so a
+        // product-level target is rejected for it.
+        for operation in [
+            AuditRedfishOperation::ResetSystem,
+            AuditRedfishOperation::PollRemoteTask,
+        ] {
+            assert_eq!(
+                AuditOperationContext::try_new(
+                    AuditOperationId::generate(),
+                    AuditActor::System,
+                    DeploymentPosture::Site,
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ExecuteOperations,
+                    AuditAction::ExecuteOperation,
+                    operation,
+                ),
+                Err(AuditOperationContextError)
+            );
+        }
+        // A CSV summary cannot describe an endpoint write execution.
+        let csv_summary = AuditParameterSummary::csv_endpoint_import(1)?;
+        assert_eq!(
+            AuditOperationContext::try_new(
+                AuditOperationId::generate(),
+                AuditActor::System,
+                DeploymentPosture::Site,
+                AuditTarget::Endpoint(EndpointId::generate()),
+                csv_summary,
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ResetSystem,
+            ),
+            Err(AuditOperationContextError)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_events_flow_through_the_existing_construction_paths() -> Result<(), Box<dyn Error>>
+    {
+        let context = execute_context(AuditRedfishOperation::ResetSystem)?;
+        let now = OffsetDateTime::now_utc();
+
+        let started = AuditEvent::started(context.clone(), now);
+        assert_eq!(started.sequence(), AuditSequence::FIRST);
+        assert_eq!(started.outcome().kind(), AuditOutcomeKind::Started);
+
+        let terminal_sequence = AuditSequence::FIRST.next()?;
+        let succeeded = AuditEvent::succeeded(context.clone(), terminal_sequence, now)?;
+        assert_eq!(
+            succeeded.outcome().verification(),
+            Some(AuditVerification::Confirmed)
+        );
+        assert!(succeeded.outcome().is_terminal());
+
+        let failed = AuditEvent::failed(
+            context.clone(),
+            terminal_sequence,
+            AuditFailure::RedfishDiscoveryFailed,
+            AuditFailureVerification::Inconclusive,
+            now,
+        )?;
+        assert_eq!(
+            failed.outcome().failure(),
+            Some(AuditFailure::RedfishDiscoveryFailed)
+        );
+
+        // A stored event rehydrates through try_from_parts with its
+        // operation type intact.
+        let rehydrated = AuditEvent::try_from_parts(
+            succeeded.id(),
+            context.clone(),
+            succeeded.sequence(),
+            succeeded.outcome(),
+            succeeded.occurred_at(),
+        )?;
+        assert_eq!(rehydrated, succeeded);
+        assert_eq!(
+            rehydrated.context().redfish_operation(),
+            AuditRedfishOperation::ResetSystem
+        );
+
+        // Executions have no progress milestone yet, so a progress event is
+        // rejected rather than recorded with a milestone that belongs to
+        // another action; the milestone lands with the monitoring audit.
+        assert_eq!(
+            AuditEvent::progress(
+                context,
+                terminal_sequence,
+                AuditProgress::EndpointCreated,
+                now,
+            ),
+            Err(AuditEventError::InvalidProgress)
+        );
+        Ok(())
+    }
+
     fn enrollment_context(
         address: EndpointAddress,
         credential_id: CredentialId,
@@ -933,6 +1284,21 @@ mod tests {
             ProductPermission::ManageEndpoints,
             AuditAction::EnrollEndpoint,
             AuditRedfishOperation::ProbeCoreCapabilities,
+        )
+    }
+
+    fn execute_context(
+        operation: AuditRedfishOperation,
+    ) -> Result<AuditOperationContext, AuditOperationContextError> {
+        AuditOperationContext::try_new(
+            AuditOperationId::generate(),
+            AuditActor::System,
+            DeploymentPosture::Site,
+            AuditTarget::Endpoint(EndpointId::generate()),
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::ExecuteOperations,
+            AuditAction::ExecuteOperation,
+            operation,
         )
     }
 
