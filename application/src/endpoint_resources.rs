@@ -102,6 +102,21 @@ pub enum CoreResourceDetails {
         power_state: Option<String>,
         status: Option<ResourceStatusSummary>,
     },
+    Processor {
+        processor_type: Option<String>,
+        socket: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        total_cores: Option<u64>,
+        status: Option<ResourceStatusSummary>,
+    },
+    Memory {
+        memory_device_type: Option<String>,
+        capacity_mib: Option<u64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -268,21 +283,16 @@ where
     let payload = snapshot.payload().as_str();
     let (common, details) = match snapshot.feature() {
         ResourceFeature::ServiceRoot => {
-            let parsed =
-                deserialize_payload::<ServiceRootPayload, RepositoryError>(snapshot, payload)?;
-            (
-                parsed.common(),
+            project_typed::<ServiceRootPayload, _, RepositoryError>(snapshot, payload, |parsed| {
                 CoreResourceDetails::ServiceRoot {
                     vendor: parsed.vendor,
                     product: parsed.product,
                     redfish_version: parsed.redfish_version,
-                },
-            )
+                }
+            })?
         }
         ResourceFeature::Systems => {
-            let parsed = deserialize_payload::<SystemPayload, RepositoryError>(snapshot, payload)?;
-            (
-                parsed.common(),
+            project_typed::<SystemPayload, _, RepositoryError>(snapshot, payload, |parsed| {
                 CoreResourceDetails::System {
                     system_type: parsed.system_type,
                     manufacturer: parsed.manufacturer,
@@ -294,13 +304,11 @@ where
                     bios_version: parsed.bios_version,
                     power_state: parsed.power_state,
                     status: parsed.status.map(ResourceStatusPayload::into_summary),
-                },
-            )
+                }
+            })?
         }
         ResourceFeature::Chassis => {
-            let parsed = deserialize_payload::<ChassisPayload, RepositoryError>(snapshot, payload)?;
-            (
-                parsed.common(),
+            project_typed::<ChassisPayload, _, RepositoryError>(snapshot, payload, |parsed| {
                 CoreResourceDetails::Chassis {
                     chassis_type: parsed.chassis_type,
                     manufacturer: parsed.manufacturer,
@@ -311,13 +319,11 @@ where
                     asset_tag: parsed.asset_tag,
                     power_state: parsed.power_state,
                     status: parsed.status.map(ResourceStatusPayload::into_summary),
-                },
-            )
+                }
+            })?
         }
         ResourceFeature::Managers => {
-            let parsed = deserialize_payload::<ManagerPayload, RepositoryError>(snapshot, payload)?;
-            (
-                parsed.common(),
+            project_typed::<ManagerPayload, _, RepositoryError>(snapshot, payload, |parsed| {
                 CoreResourceDetails::Manager {
                     manager_type: parsed.manager_type,
                     manufacturer: parsed.manufacturer,
@@ -328,8 +334,31 @@ where
                     version: parsed.version,
                     power_state: parsed.power_state,
                     status: parsed.status.map(ResourceStatusPayload::into_summary),
-                },
-            )
+                }
+            })?
+        }
+        ResourceFeature::Processors => {
+            project_typed::<ProcessorPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+                CoreResourceDetails::Processor {
+                    processor_type: parsed.processor_type,
+                    socket: parsed.socket,
+                    manufacturer: parsed.manufacturer,
+                    model: parsed.model,
+                    total_cores: parsed.total_cores,
+                    status: parsed.status.map(ResourceStatusPayload::into_summary),
+                }
+            })?
+        }
+        ResourceFeature::Memory => {
+            project_typed::<MemoryPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+                CoreResourceDetails::Memory {
+                    memory_device_type: parsed.memory_device_type,
+                    capacity_mib: parsed.capacity_mib,
+                    manufacturer: parsed.manufacturer,
+                    model: parsed.model,
+                    status: parsed.status.map(ResourceStatusPayload::into_summary),
+                }
+            })?
         }
     };
     Ok(CoreResourceSummary {
@@ -341,6 +370,23 @@ where
         common,
         details,
     })
+}
+
+/// Decodes one feature payload and closes it over the feature-specific
+/// details projection, keeping the per-family arms free of repeated
+/// error-mapping and common-field plumbing.
+fn project_typed<Payload, Details, RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+    project: impl FnOnce(Payload) -> Details,
+) -> Result<(CoreResourceCommon, Details), EndpointResourceInventoryQueryError<RepositoryError>>
+where
+    Payload: for<'de> Deserialize<'de> + CommonPayload,
+    Details: Sized,
+    RepositoryError: Error + 'static,
+{
+    let parsed = deserialize_payload::<Payload, RepositoryError>(snapshot, payload)?;
+    Ok((parsed.common(), project(parsed)))
 }
 
 fn deserialize_payload<Payload, RepositoryError>(
@@ -360,6 +406,13 @@ where
     })
 }
 
+/// Every typed feature payload carries the three product-level fields shared
+/// by all core resources, projected through one trait so the generic
+/// projection path never re-maps common fields per family.
+trait CommonPayload {
+    fn common(&self) -> CoreResourceCommon;
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServiceRootPayload {
@@ -377,7 +430,7 @@ struct ServiceRootPayload {
     redfish_version: Option<String>,
 }
 
-impl ServiceRootPayload {
+impl CommonPayload for ServiceRootPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -439,7 +492,7 @@ struct SystemPayload {
     status: Option<ResourceStatusPayload>,
 }
 
-impl SystemPayload {
+impl CommonPayload for SystemPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -478,7 +531,7 @@ struct ChassisPayload {
     status: Option<ResourceStatusPayload>,
 }
 
-impl ChassisPayload {
+impl CommonPayload for ChassisPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -517,7 +570,71 @@ struct ManagerPayload {
     status: Option<ResourceStatusPayload>,
 }
 
-impl ManagerPayload {
+impl CommonPayload for ManagerPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessorPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ProcessorType")]
+    processor_type: Option<String>,
+    #[serde(rename = "Socket")]
+    socket: Option<String>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "TotalCores")]
+    total_cores: Option<u64>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for ProcessorPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "MemoryDeviceType")]
+    memory_device_type: Option<String>,
+    #[serde(rename = "CapacityMiB")]
+    capacity_mib: Option<u64>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for MemoryPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -616,6 +733,93 @@ mod tests {
                 && status.health() == Some("OK")
                 && status.health_rollup() == Some("Warning")
                 && status.state() == Some("Enabled")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_processor_and_memory_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(10)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Processors,
+                    "/redfish/v1/Systems/1/Processors/CPU1",
+                    r#"{"Id":"CPU1","Name":"Processor One","Description":"Primary CPU","ProcessorType":"CPU","Socket":"LGA4189","Manufacturer":"Vendor A","Model":"Model P","TotalCores":64,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Memory,
+                    "/redfish/v1/Systems/1/Memory/DIMM1",
+                    r#"{"Id":"DIMM1","Name":"Memory Module One","MemoryDeviceType":"DDR4","CapacityMiB":32768,"Manufacturer":"Vendor B","Model":"Model MEM","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.observed_at(), Some(observed_at));
+        assert_eq!(result.resources().len(), 3);
+        let memory = &result.resources()[1];
+        assert_eq!(memory.feature(), ResourceFeature::Memory);
+        assert_eq!(
+            memory.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Memory/DIMM1"
+        );
+        assert_eq!(memory.common().name(), "Memory Module One");
+        assert!(matches!(
+            memory.details(),
+            CoreResourceDetails::Memory {
+                memory_device_type: Some(memory_device_type),
+                capacity_mib: Some(32768),
+                manufacturer: Some(manufacturer),
+                status: Some(status),
+                ..
+            } if memory_device_type == "DDR4"
+                && manufacturer == "Vendor B"
+                && status.health() == Some("OK")
+        ));
+        let processor = &result.resources()[2];
+        assert_eq!(processor.feature(), ResourceFeature::Processors);
+        assert_eq!(
+            processor.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Processors/CPU1"
+        );
+        assert_eq!(processor.common().name(), "Processor One");
+        assert!(matches!(
+            processor.details(),
+            CoreResourceDetails::Processor {
+                processor_type: Some(processor_type),
+                socket: Some(socket),
+                model: Some(model),
+                total_cores: Some(64),
+                status: Some(status),
+                ..
+            } if processor_type == "CPU"
+                && socket == "LGA4189"
+                && model == "Model P"
+                && status.state() == Some("Enabled")
+                && status.health() == Some("OK")
         ));
         Ok(())
     }
