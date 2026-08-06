@@ -734,13 +734,16 @@ fn project_enrollment(
             ResourceFeature::Systems => systems += 1,
             ResourceFeature::Chassis => chassis += 1,
             ResourceFeature::Managers => managers += 1,
-            // The 0.2 resource families (Processors, Memory, and later
-            // Storage, Network, Accounts) intentionally stay out of the
+            // The 0.2 resource families (Processors, Memory, Storage,
+            // Network, and later Accounts) intentionally stay out of the
             // three-field enrollment counts; the typed resource-inventory
             // route carries their full snapshots instead.
             ResourceFeature::ServiceRoot
             | ResourceFeature::Processors
-            | ResourceFeature::Memory => {}
+            | ResourceFeature::Memory
+            | ResourceFeature::Storages
+            | ResourceFeature::NetworkAdapters
+            | ResourceFeature::EthernetInterfaces => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1127,6 +1130,11 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::Manager { .. } => project_manager_details(details),
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
+        CoreResourceDetails::Storage { .. } => project_storage_details(details),
+        CoreResourceDetails::NetworkAdapter { .. } => project_network_adapter_details(details),
+        CoreResourceDetails::EthernetInterface { .. } => {
+            project_ethernet_interface_details(details)
+        }
     }
 }
 
@@ -1350,6 +1358,89 @@ fn project_memory_details(details: &CoreResourceDetails) -> CoreResourceDetailsR
         capacity_mib: *capacity_mib,
         manufacturer: manufacturer.clone(),
         model: model.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 storage family into the shared wire contract,
+/// preserving the numeric controller and drive counts so clients never
+/// re-parse text.
+///
+/// The dispatcher guarantees this receives the `Storage` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_storage_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Storage {
+        controller_count,
+        drive_count,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Storage {
+            controller_count: None,
+            drive_count: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Storage {
+        controller_count: *controller_count,
+        drive_count: *drive_count,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 network-adapter family into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `NetworkAdapter` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_network_adapter_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::NetworkAdapter {
+        manufacturer,
+        model,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::NetworkAdapter {
+            manufacturer: None,
+            model: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::NetworkAdapter {
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 ethernet-interface family into the shared wire contract,
+/// preserving the numeric link speed so clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `EthernetInterface` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_ethernet_interface_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::EthernetInterface {
+        mac_address,
+        speed_mbps,
+        interface_enabled,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::EthernetInterface {
+            mac_address: None,
+            speed_mbps: None,
+            interface_enabled: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::EthernetInterface {
+        mac_address: mac_address.clone(),
+        speed_mbps: *speed_mbps,
+        interface_enabled: *interface_enabled,
         status: status.as_ref().map(project_resource_status),
     }
 }
@@ -1797,6 +1888,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_storage_network_and_ethernet_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = storage_network_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the chassis
+        // network adapter sorts before the manager ethernet interface, which
+        // sorts before the system storage subsystem.
+        assert_eq!(resources[1]["resource"]["resource_type"], "network_adapter");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/NetworkAdapters/1"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["manufacturer"],
+            "Vendor A"
+        );
+        assert_eq!(resources[1]["resource"]["details"]["model"], "NA-25G-2P");
+        assert_eq!(
+            resources[2]["resource"]["resource_type"],
+            "ethernet_interface"
+        );
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/EthernetInterfaces/1"
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["mac_address"],
+            "52:54:00:12:34:56"
+        );
+        assert_eq!(resources[2]["resource"]["details"]["speed_mbps"], 10000);
+        assert_eq!(
+            resources[2]["resource"]["details"]["interface_enabled"],
+            true
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "storage");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Storage/SATA-1"
+        );
+        assert_eq!(resources[3]["common"]["name"], "Storage Subsystem One");
+        assert_eq!(resources[3]["resource"]["details"]["controller_count"], 2);
+        assert_eq!(resources[3]["resource"]["details"]["drive_count"], 6);
+        assert_eq!(
+            resources[3]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn distinguishes_core_resource_route_states() -> Result<(), Box<dyn Error>> {
         let waiting = inventory_item("Waiting BMC", "https://192.0.2.20", 20, false)?;
         let endpoint_id = waiting.endpoint().id();
@@ -1992,6 +2149,60 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![processor, memory, system, root],
+        )?)
+    }
+
+    fn storage_network_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Storage and network BMC")?,
+            EndpointAddress::parse("https://192.0.2.31")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![31])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(4)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let storage = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Storages,
+            "/redfish/v1/Systems/1/Storage/SATA-1",
+            r#"{"Id":"SATA-1","Name":"Storage Subsystem One","Description":"SATA storage subsystem","ControllerCount":2,"DriveCount":6,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?;
+        let network_adapter = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::NetworkAdapters,
+            "/redfish/v1/Chassis/1/NetworkAdapters/1",
+            r#"{"Id":"1","Name":"Network Adapter One","Manufacturer":"Vendor A","Model":"NA-25G-2P","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?;
+        let ethernet_interface = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::EthernetInterfaces,
+            "/redfish/v1/Managers/1/EthernetInterfaces/1",
+            r#"{"Id":"1","Name":"Ethernet Interface One","MACAddress":"52:54:00:12:34:56","SpeedMbps":10000,"InterfaceEnabled":true,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?;
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, storage, network_adapter, ethernet_interface],
         )?)
     }
 
