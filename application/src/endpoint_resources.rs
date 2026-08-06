@@ -273,6 +273,82 @@ pub enum CoreResourceDetails {
         release_date: Option<OffsetDateTime>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `event-service` family member (an `EventService_v1` root
+    /// singleton). Only the service posture is projectable: `ServiceEnabled`
+    /// and `Status` are direct properties, while the retry-policy fields
+    /// (`DeliveryRetryAttempts`, `DeliveryRetryIntervalSeconds`) govern event
+    /// delivery rather than a console-rendered surface and the `Subscriptions`
+    /// collection members are separate `EventSubscription` resources.
+    EventService {
+        service_enabled: Option<bool>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One subscription under the §2.1 `event-service` feature (an
+    /// `EventDestination_v1` member of the `Subscriptions` collection).
+    /// Redfish models subscriptions as `EventDestination`; nv-redfish 0.13
+    /// does not compile that type, so infra decodes the `Subscriptions` leaf
+    /// with a local minimal schema. `protocol` stays the
+    /// `EventDestinationProtocol` enumeration string and `event_types` the
+    /// `EventTypes` array of `EventType` values, so the console renders both
+    /// without re-parsing text.
+    EventSubscription {
+        destination: Option<String>,
+        protocol: Option<String>,
+        context: Option<String>,
+        event_types: Option<Vec<String>>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `telemetry-service` family member (a `TelemetryService_v1`
+    /// root singleton). Only `Status` is projected this round: the compiled
+    /// `TelemetryService` type exposes `ServiceEnabled` and the
+    /// service-capacity fields (`MaxReports`, `MinCollectionInterval`,
+    /// `SupportedCollectionFunctions`), but the product defers them to the
+    /// 0.4.0 telemetry iteration, and projecting them now would widen this
+    /// strictly projectable field set ahead of the infra payload that must
+    /// feed it.
+    TelemetryService {
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One metric definition under the §2.1 `telemetry-service` feature (a
+    /// `MetricDefinition_v1` collection member). `metric_type` stays the
+    /// `MetricType` enumeration string so the console renders it without
+    /// re-parsing text; the schema declares no `Status` property, and
+    /// `MetricDataType`, `Precision`, and the calculation properties describe
+    /// measurement semantics left for the telemetry-history iteration.
+    MetricDefinition {
+        units: Option<String>,
+        metric_type: Option<String>,
+    },
+    /// One metric report under the §2.1 `telemetry-service` feature (a
+    /// `MetricReport_v1` collection member). Only metadata is projected:
+    /// `metric_values_count` is derived from the length of the `MetricValues`
+    /// array, because each entry carries a timestamped reading that belongs to
+    /// the telemetry-history iteration, and the schema declares no `Status`
+    /// property (the report instead carries `Timestamp` and `Context`
+    /// metadata).
+    MetricReport { metric_values_count: Option<u64> },
+    /// One §2.1 `task-service` family member (a `TaskService_v1` root
+    /// singleton). `completed_task_overwrite_policy` stays the
+    /// `OverWritePolicy` enumeration string so the console renders it without
+    /// re-parsing text; `DateTime` and `LifeCycleEventOnTaskStateChange`
+    /// describe service plumbing rather than a console-rendered surface.
+    TaskService {
+        service_enabled: Option<bool>,
+        completed_task_overwrite_policy: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One task under the §2.1 `task-service` feature (a `Task_v1` collection
+    /// member). `task_state` and `task_status` stay their enumeration strings,
+    /// `percent_complete` stays numeric, and `start_time`/`end_time` keep the
+    /// RFC 3339 instants of the compiled `Edm.DateTimeOffset` type so the
+    /// console renders the task timeline without re-parsing text.
+    Task {
+        task_state: Option<String>,
+        task_status: Option<String>,
+        percent_complete: Option<u64>,
+        start_time: Option<OffsetDateTime>,
+        end_time: Option<OffsetDateTime>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -468,6 +544,13 @@ where
         ResourceFeature::PcieDevices => project_pcie_device(snapshot, payload)?,
         ResourceFeature::Assembly => project_assembly(snapshot, payload)?,
         ResourceFeature::SoftwareInventory => project_software_inventory(snapshot, payload)?,
+        ResourceFeature::EventService => project_event_service(snapshot, payload)?,
+        ResourceFeature::EventSubscription => project_event_subscription(snapshot, payload)?,
+        ResourceFeature::TelemetryService => project_telemetry_service(snapshot, payload)?,
+        ResourceFeature::MetricDefinition => project_metric_definition(snapshot, payload)?,
+        ResourceFeature::MetricReport => project_metric_report(snapshot, payload)?,
+        ResourceFeature::TaskService => project_task_service(snapshot, payload)?,
+        ResourceFeature::Task => project_task(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -932,6 +1015,137 @@ where
             version: parsed.version,
             release_date: parsed.release_date,
             status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_event_service<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<EventServicePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::EventService {
+            service_enabled: parsed.service_enabled,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_event_subscription<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<EventSubscriptionPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::EventSubscription {
+            destination: parsed.destination,
+            protocol: parsed.protocol,
+            context: parsed.context,
+            event_types: parsed.event_types,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_telemetry_service<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<TelemetryServicePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::TelemetryService {
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_metric_definition<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<MetricDefinitionPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::MetricDefinition {
+            units: parsed.units,
+            metric_type: parsed.metric_type,
+        }
+    })
+}
+
+fn project_metric_report<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<MetricReportPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::MetricReport {
+            metric_values_count: parsed.metric_values_count,
+        }
+    })
+}
+
+fn project_task_service<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<TaskServicePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::TaskService {
+            service_enabled: parsed.service_enabled,
+            completed_task_overwrite_policy: parsed.completed_task_overwrite_policy,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_task<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<TaskPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Task {
+            task_state: parsed.task_state,
+            task_status: parsed.task_status,
+            percent_complete: parsed.percent_complete,
+            start_time: parsed.start_time,
+            end_time: parsed.end_time,
         }
     })
 }
@@ -1663,6 +1877,194 @@ struct SoftwareInventoryPayload {
 }
 
 impl CommonPayload for SoftwareInventoryPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventServicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ServiceEnabled")]
+    service_enabled: Option<bool>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for EventServicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventSubscriptionPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Destination")]
+    destination: Option<String>,
+    #[serde(rename = "Protocol")]
+    protocol: Option<String>,
+    #[serde(rename = "Context")]
+    context: Option<String>,
+    #[serde(rename = "EventTypes")]
+    event_types: Option<Vec<String>>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for EventSubscriptionPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelemetryServicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for TelemetryServicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricDefinitionPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "MetricType")]
+    metric_type: Option<String>,
+    #[serde(rename = "Units")]
+    units: Option<String>,
+}
+
+impl CommonPayload for MetricDefinitionPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricReportPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "MetricValuesCount")]
+    metric_values_count: Option<u64>,
+}
+
+impl CommonPayload for MetricReportPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskServicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ServiceEnabled")]
+    service_enabled: Option<bool>,
+    #[serde(rename = "CompletedTaskOverWritePolicy")]
+    completed_task_overwrite_policy: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for TaskServicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "TaskState")]
+    task_state: Option<String>,
+    #[serde(rename = "TaskStatus")]
+    task_status: Option<String>,
+    #[serde(rename = "PercentComplete")]
+    percent_complete: Option<u64>,
+    /// `StartTime` keeps the RFC 3339 timestamp of the compiled
+    /// `Edm.DateTimeOffset` type, so the projection carries the typed instants
+    /// instead of strings the console would have to re-parse.
+    #[serde(rename = "StartTime", with = "time::serde::rfc3339::option")]
+    start_time: Option<OffsetDateTime>,
+    #[serde(rename = "EndTime", with = "time::serde::rfc3339::option")]
+    end_time: Option<OffsetDateTime>,
+}
+
+impl CommonPayload for TaskPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -2577,6 +2979,263 @@ mod tests {
                     == OffsetDateTime::from_unix_timestamp(1_777_593_600)
                         .map_err(|_| "fixture release date must convert")?
                 && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_event_service_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(22)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::EventService,
+                    "/redfish/v1/EventService",
+                    r#"{"Id":"EventService","Name":"Event Service","Description":"Event subscription service","ServiceEnabled":true,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::EventSubscription,
+                    "/redfish/v1/EventService/Subscriptions/1",
+                    r#"{"Id":"1","Name":"Subscription One","Description":"Alert subscription","Destination":"https://subscriber.example.test/events","Protocol":"Redfish","Context":"Rack A","EventTypes":["Alert","StatusChange"],"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.resources().len(), 3);
+        // The inventory orders snapshots by `@odata.id`, so the event service
+        // root singleton sorts before its subscriptions collection member.
+        let event_service = &result.resources()[1];
+        assert_eq!(event_service.feature(), ResourceFeature::EventService);
+        assert_eq!(
+            event_service.odata_id().as_str(),
+            "/redfish/v1/EventService"
+        );
+        assert_eq!(event_service.common().name(), "Event Service");
+        assert!(matches!(
+            event_service.details(),
+            CoreResourceDetails::EventService {
+                service_enabled: Some(true),
+                status: Some(status),
+            } if status.health() == Some("OK")
+        ));
+        let subscription = &result.resources()[2];
+        assert_eq!(subscription.feature(), ResourceFeature::EventSubscription);
+        assert_eq!(
+            subscription.odata_id().as_str(),
+            "/redfish/v1/EventService/Subscriptions/1"
+        );
+        assert_eq!(subscription.common().id(), "1");
+        assert!(matches!(
+            subscription.details(),
+            CoreResourceDetails::EventSubscription {
+                destination: Some(destination),
+                protocol: Some(protocol),
+                context: Some(context),
+                event_types: Some(event_types),
+                status: Some(status),
+            } if destination == "https://subscriber.example.test/events"
+                && protocol == "Redfish"
+                && context == "Rack A"
+                && *event_types == ["Alert", "StatusChange"]
+                && status.state() == Some("Enabled")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_telemetry_service_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(23)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::TelemetryService,
+                    "/redfish/v1/TelemetryService",
+                    r#"{"Id":"TelemetryService","Name":"Telemetry Service","Description":"Telemetry collection service","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::MetricDefinition,
+                    "/redfish/v1/TelemetryService/MetricDefinitions/1",
+                    r#"{"Id":"1","Name":"Inlet Temperature Definition","Description":"Inlet temperature metric","MetricType":"Numeric","Units":"Cel"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::MetricReport,
+                    "/redfish/v1/TelemetryService/MetricReports/1",
+                    r#"{"Id":"1","Name":"Inlet Temperature Report","Description":"Latest inlet temperature report","MetricValuesCount":12}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the telemetry
+        // service root singleton sorts before its definitions collection
+        // member, which sorts before the reports collection member.
+        let telemetry = &result.resources()[1];
+        assert_eq!(telemetry.feature(), ResourceFeature::TelemetryService);
+        assert_eq!(
+            telemetry.odata_id().as_str(),
+            "/redfish/v1/TelemetryService"
+        );
+        assert_eq!(telemetry.common().name(), "Telemetry Service");
+        assert!(matches!(
+            telemetry.details(),
+            CoreResourceDetails::TelemetryService {
+                status: Some(status),
+            } if status.state() == Some("Enabled")
+        ));
+        let definition = &result.resources()[2];
+        assert_eq!(definition.feature(), ResourceFeature::MetricDefinition);
+        assert_eq!(
+            definition.odata_id().as_str(),
+            "/redfish/v1/TelemetryService/MetricDefinitions/1"
+        );
+        assert_eq!(definition.common().name(), "Inlet Temperature Definition");
+        assert!(matches!(
+            definition.details(),
+            CoreResourceDetails::MetricDefinition {
+                units: Some(units),
+                metric_type: Some(metric_type),
+            } if units == "Cel" && metric_type == "Numeric"
+        ));
+        let report = &result.resources()[3];
+        assert_eq!(report.feature(), ResourceFeature::MetricReport);
+        assert_eq!(
+            report.odata_id().as_str(),
+            "/redfish/v1/TelemetryService/MetricReports/1"
+        );
+        assert_eq!(report.common().name(), "Inlet Temperature Report");
+        assert!(matches!(
+            report.details(),
+            CoreResourceDetails::MetricReport {
+                metric_values_count: Some(12),
+            }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_task_service_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(24)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::TaskService,
+                    "/redfish/v1/TaskService",
+                    r#"{"Id":"TaskService","Name":"Task Service","Description":"Asynchronous task service","ServiceEnabled":true,"CompletedTaskOverWritePolicy":"Oldest","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Task,
+                    "/redfish/v1/TaskService/Tasks/1",
+                    r#"{"Id":"1","Name":"Firmware Update Task","Description":"BIOS firmware update","TaskState":"Running","TaskStatus":"OK","PercentComplete":42,"StartTime":"2026-08-05T10:20:00Z","EndTime":null}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.resources().len(), 3);
+        // The inventory orders snapshots by `@odata.id`, so the task service
+        // root singleton sorts before its tasks collection member.
+        let task_service = &result.resources()[1];
+        assert_eq!(task_service.feature(), ResourceFeature::TaskService);
+        assert_eq!(task_service.odata_id().as_str(), "/redfish/v1/TaskService");
+        assert_eq!(task_service.common().name(), "Task Service");
+        assert!(matches!(
+            task_service.details(),
+            CoreResourceDetails::TaskService {
+                service_enabled: Some(true),
+                completed_task_overwrite_policy: Some(policy),
+                status: Some(status),
+            } if policy == "Oldest" && status.health() == Some("OK")
+        ));
+        let task = &result.resources()[2];
+        assert_eq!(task.feature(), ResourceFeature::Task);
+        assert_eq!(task.odata_id().as_str(), "/redfish/v1/TaskService/Tasks/1");
+        assert_eq!(task.common().name(), "Firmware Update Task");
+        assert!(matches!(
+            task.details(),
+            CoreResourceDetails::Task {
+                task_state: Some(task_state),
+                task_status: Some(task_status),
+                percent_complete: Some(42),
+                start_time: Some(start_time),
+                end_time: None,
+            } if task_state == "Running"
+                && task_status == "OK"
+                // The typed `StartTime` instant of the fixture timestamp
+                // `2026-08-05T10:20:00Z` (epoch seconds 1785925200) survives
+                // the projection unchanged.
+                && *start_time
+                    == OffsetDateTime::from_unix_timestamp(1_785_925_200)
+                        .map_err(|_| "fixture start time must convert")?
         ));
         Ok(())
     }
