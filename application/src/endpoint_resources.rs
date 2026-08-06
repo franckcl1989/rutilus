@@ -139,6 +139,37 @@ pub enum CoreResourceDetails {
         interface_enabled: Option<bool>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `accounts` family member (a `ManagerAccount` inside the
+    /// `AccountService`'s `Accounts` collection). The manager-account schema
+    /// declares no `Status` property, so the details carry no status field;
+    /// the persisted payload's `UserName` and `AccountTypes` stay internal.
+    Account {
+        enabled: Option<bool>,
+        role_id: Option<String>,
+        locked: Option<bool>,
+    },
+    /// One §2.1 `bios` family member. Only the `AttributeRegistry` metadata
+    /// is retained: the `Attributes` bag is a vendor-specific dynamic map of
+    /// unbounded size, and `Bios_v1` declares no `Status` property; the
+    /// persisted payload's `ResetBiosToDefaultsPending` flag stays internal.
+    Bios { attribute_registry: Option<String> },
+    /// One §2.1 `boot-options` family member; `boot_option_enabled` stays a
+    /// Boolean so the console renders it without re-parsing text, and
+    /// `BootOption_v1` declares no `Status` property; the persisted payload's
+    /// `BootOptionReference` and `Alias` stay internal.
+    BootOption {
+        display_name: Option<String>,
+        boot_option_enabled: Option<bool>,
+        uefi_device_path: Option<String>,
+    },
+    /// One §2.1 `secure-boot` family member; `secure_boot_mode` stays the
+    /// original schema enumeration string so the console renders it without
+    /// re-parsing text, and `SecureBoot_v1` declares no `Status` property;
+    /// the persisted payload's `SecureBootCurrentBoot` stays internal.
+    SecureBoot {
+        secure_boot_enable: Option<bool>,
+        secure_boot_mode: Option<String>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -313,6 +344,10 @@ where
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
         ResourceFeature::NetworkAdapters => project_network_adapter(snapshot, payload)?,
         ResourceFeature::EthernetInterfaces => project_ethernet_interface(snapshot, payload)?,
+        ResourceFeature::Accounts => project_account(snapshot, payload)?,
+        ResourceFeature::Bios => project_bios(snapshot, payload)?,
+        ResourceFeature::BootOptions => project_boot_option(snapshot, payload)?,
+        ResourceFeature::SecureBoot => project_secure_boot(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -517,6 +552,79 @@ where
             speed_mbps: parsed.speed_mbps,
             interface_enabled: parsed.interface_enabled,
             status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_account<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<AccountPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Account {
+            enabled: parsed.enabled,
+            role_id: parsed.role_id,
+            locked: parsed.locked,
+        }
+    })
+}
+
+fn project_bios<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<BiosPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Bios {
+            attribute_registry: parsed.attribute_registry,
+        }
+    })
+}
+
+fn project_boot_option<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<BootOptionPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::BootOption {
+            display_name: parsed.display_name,
+            boot_option_enabled: parsed.boot_option_enabled,
+            uefi_device_path: parsed.uefi_device_path,
+        }
+    })
+}
+
+fn project_secure_boot<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<SecureBootPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::SecureBoot {
+            secure_boot_enable: parsed.secure_boot_enable,
+            secure_boot_mode: parsed.secure_boot_mode,
         }
     })
 }
@@ -876,6 +984,120 @@ impl CommonPayload for EthernetInterfacePayload {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "UserName")]
+    _user_name: Option<String>,
+    #[serde(rename = "RoleId")]
+    role_id: Option<String>,
+    #[serde(rename = "Enabled")]
+    enabled: Option<bool>,
+    #[serde(rename = "Locked")]
+    locked: Option<bool>,
+    #[serde(rename = "AccountTypes")]
+    _account_types: Option<Vec<String>>,
+}
+
+impl CommonPayload for AccountPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BiosPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "AttributeRegistry")]
+    attribute_registry: Option<String>,
+    #[serde(rename = "ResetBiosToDefaultsPending")]
+    _reset_bios_to_defaults_pending: Option<bool>,
+}
+
+impl CommonPayload for BiosPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootOptionPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "BootOptionReference")]
+    _boot_option_reference: Option<String>,
+    #[serde(rename = "DisplayName")]
+    display_name: Option<String>,
+    #[serde(rename = "BootOptionEnabled")]
+    boot_option_enabled: Option<bool>,
+    #[serde(rename = "UefiDevicePath")]
+    uefi_device_path: Option<String>,
+    #[serde(rename = "Alias")]
+    _alias: Option<String>,
+}
+
+impl CommonPayload for BootOptionPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecureBootPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "SecureBootEnable")]
+    secure_boot_enable: Option<bool>,
+    #[serde(rename = "SecureBootCurrentBoot")]
+    _secure_boot_current_boot: Option<String>,
+    #[serde(rename = "SecureBootMode")]
+    secure_boot_mode: Option<String>,
+}
+
+impl CommonPayload for SecureBootPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -1160,6 +1382,207 @@ mod tests {
                 status: Some(status),
                 ..
             } if status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_accounts_family_without_losing_source_values() -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(12)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Accounts,
+                    "/redfish/v1/AccountService/Accounts/admin",
+                    r#"{"Id":"admin","Name":"Administrator Account","Description":"Built-in administrator account","UserName":"admin","RoleId":"Administrator","Enabled":true,"Locked":false,"AccountTypes":["Redfish","IPMI"]}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let account = &result.resources()[1];
+        assert_eq!(account.feature(), ResourceFeature::Accounts);
+        assert_eq!(
+            account.odata_id().as_str(),
+            "/redfish/v1/AccountService/Accounts/admin"
+        );
+        assert_eq!(account.common().name(), "Administrator Account");
+        assert_eq!(
+            account.common().description(),
+            Some("Built-in administrator account")
+        );
+        assert!(matches!(
+            account.details(),
+            CoreResourceDetails::Account {
+                enabled: Some(true),
+                role_id: Some(role_id),
+                locked: Some(false),
+            } if role_id == "Administrator"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_bios_family_without_losing_source_values() -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(13)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Bios,
+                    "/redfish/v1/Systems/1/Bios",
+                    r#"{"Id":"BIOS","Name":"BIOS Configuration","AttributeRegistry":"BiosAttributeRegistry.v1_0_0","ResetBiosToDefaultsPending":false}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let bios = &result.resources()[1];
+        assert_eq!(bios.feature(), ResourceFeature::Bios);
+        assert_eq!(bios.odata_id().as_str(), "/redfish/v1/Systems/1/Bios");
+        assert_eq!(bios.common().name(), "BIOS Configuration");
+        assert!(matches!(
+            bios.details(),
+            CoreResourceDetails::Bios {
+                attribute_registry: Some(registry),
+            } if registry == "BiosAttributeRegistry.v1_0_0"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_boot_options_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(14)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::BootOptions,
+                    "/redfish/v1/Systems/1/BootOptions/PXE-1",
+                    r#"{"Id":"PXE-1","Name":"Network Boot Option","Description":"PXE boot option","BootOptionReference":"Boot0001","DisplayName":"PXE Network Boot","BootOptionEnabled":true,"UefiDevicePath":"PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)","Alias":"Pxe"}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let boot_option = &result.resources()[1];
+        assert_eq!(boot_option.feature(), ResourceFeature::BootOptions);
+        assert_eq!(
+            boot_option.odata_id().as_str(),
+            "/redfish/v1/Systems/1/BootOptions/PXE-1"
+        );
+        assert_eq!(boot_option.common().id(), "PXE-1");
+        assert!(matches!(
+            boot_option.details(),
+            CoreResourceDetails::BootOption {
+                display_name: Some(display_name),
+                boot_option_enabled: Some(true),
+                uefi_device_path: Some(device_path),
+            } if display_name == "PXE Network Boot"
+                && device_path == "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_secure_boot_family_without_losing_source_values() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(15)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::SecureBoot,
+                    "/redfish/v1/Systems/1/SecureBoot",
+                    r#"{"Id":"SecureBoot","Name":"Secure Boot","SecureBootEnable":true,"SecureBootCurrentBoot":"Enabled","SecureBootMode":"DeployedMode"}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let secure_boot = &result.resources()[1];
+        assert_eq!(secure_boot.feature(), ResourceFeature::SecureBoot);
+        assert_eq!(
+            secure_boot.odata_id().as_str(),
+            "/redfish/v1/Systems/1/SecureBoot"
+        );
+        assert_eq!(secure_boot.common().name(), "Secure Boot");
+        assert!(matches!(
+            secure_boot.details(),
+            CoreResourceDetails::SecureBoot {
+                secure_boot_enable: Some(true),
+                secure_boot_mode: Some(mode),
+            } if mode == "DeployedMode"
         ));
         Ok(())
     }
