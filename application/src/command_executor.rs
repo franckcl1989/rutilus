@@ -181,6 +181,18 @@ pub enum VerificationVerdict {
 ///   would fabricate a result (design section 13.7 forbids pretending partial
 ///   success is whole success). The honest semantics are documented here and
 ///   the same re-read pattern is what design section 13.6 recovery uses.
+/// - [`UpdateCommand::StartUpdate`](rutilus_domain::UpdateCommand::StartUpdate) —
+///   "accepted" verification: the re-read `SoftwareInventory` must succeed
+///   without error and the implementation returns `Confirmed`. Design section
+///   14.3 asks to verify the final firmware version, but the product has no
+///   version inventory in this iteration, so the honest expected result is
+///   re-readability: the software-inventory surface is present and readable
+///   after the update (the BMC may have rebooted, so this re-read also
+///   proves the reconnection of the §14.3 flow). A re-read that proves the
+///   inventory surface is absent (the collection no longer exists) is
+///   `Mismatched`; a re-read that fails outright is `Err` → `Unknown`.
+///   Comparing the final firmware version against the artifact's target
+///   lands with the version-inventory iteration.
 ///
 /// A failed re-read (an `Err`) proves nothing about the write: the write has
 /// already landed (only `Accepted` operations reach the verifier), so the

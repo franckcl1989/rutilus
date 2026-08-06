@@ -12,9 +12,11 @@
 //! pattern (design section 13.6 restart recovery).
 //!
 //! The executor performs the first cut of the §13.3 pre-flight checks (steps
-//! 1-2: endpoint existence and capability availability), dispatches the typed
-//! command through the [`CommandExecutor`] boundary (step 7), and handles
-//! the §13.3 step 8 branch that the response selects:
+//! 1-2: endpoint existence and capability availability; step 4 for Update
+//! commands: the referenced artifact must exist and be `Ready`, §14.3),
+//! dispatches the typed command through the [`CommandExecutor`] boundary
+//! (step 7) — and the §14.3 firmware update through the [`UpdateExecutor`]
+//! boundary — and handles the §13.3 step 8 branch that the response selects:
 //!
 //! - synchronous acceptance (`Accepted`) is re-read and verified through the
 //!   [`CommandVerifier`] boundary (steps 9-10) to a terminal state;
@@ -30,54 +32,60 @@
 //! terminal fact of an asynchronous execution is recorded by the Task
 //! monitor once the Task completes (§13.6 recovery verification).
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, fs, io, path::PathBuf};
 
 use rutilus_domain::{
-    AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
-    AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
-    AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand, CapabilityState,
-    ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId, EventCommand,
-    ManagerCommand, Operation, OperationEvent, OperationId, OperationState, ProductPermission,
-    RedfishCommand, SecureBootCommand, SystemCommand,
+    ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
+    AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOperationId,
+    AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
+    CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
+    EventCommand, ManagerCommand, Operation, OperationEvent, OperationId, OperationState,
+    ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand, UpdateCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::task::spawn_blocking;
 
 use crate::{
-    AuditEventWriter, AuditRecordError, CapabilityLedgerEntry, CapabilityQueryRepository, Clock,
-    CommandExecutor, CommandOutcome, CommandVerifier, DispatchVerdict, DispatchVerdictClassifier,
-    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointRefreshRepository,
+    ArtifactRepository, AuditEventWriter, AuditRecordError, CapabilityLedgerEntry,
+    CapabilityQueryRepository, Clock, CommandExecutor, CommandOutcome, CommandVerifier,
+    DispatchVerdict, DispatchVerdictClassifier, EndpointCapabilityQuery,
+    EndpointCapabilityQueryError, EndpointRefreshRepository, UpdateArtifactPayload, UpdateExecutor,
     VerificationVerdict,
 };
 
 /// The concrete failure type of one execution attempt.
 ///
-/// The generic parameters are the seven boundary error types, in
+/// The generic parameters are the nine boundary error types, in
 /// [`ExecutorError`] order: operation store, endpoint lookup, capability
-/// query, remote-task store, command dispatch, verification, and audit.
-/// Keeping them separate preserves every source chain, exactly like the
-/// refresh use case's error.
+/// query, remote-task store, artifact lookup, command dispatch, update
+/// dispatch, verification, and audit. Keeping them separate preserves every
+/// source chain, exactly like the refresh use case's error.
 type ExecutorErrorOf<Store, Gateway, Audit> = ExecutorError<
     <Store as OperationStore>::Error,
     <Store as EndpointRefreshRepository>::Error,
     <Store as CapabilityQueryRepository>::Error,
     <Store as RemoteTaskStore>::Error,
+    <Store as ArtifactRepository>::Error,
     <Gateway as CommandExecutor>::Error,
+    <Gateway as UpdateExecutor>::Error,
     <Gateway as CommandVerifier>::Error,
     <Audit as AuditEventWriter>::Error,
 >;
 
 /// Drives one persisted operation through the execution flow.
 ///
-/// `Store` stays one constructor parameter although it plays four roles —
-/// operation lifecycle, endpoint lookup, capability ledger, and remote-task
-/// observation rows — because every runtime composes one `SqliteStore`
-/// implementing all four, exactly like the refresh use case's repository.
-/// `Gateway` implements both dispatch and verification on the same Redfish
-/// gateway object, and `Audit` appends the §16.3 lifecycle facts.
+/// `Store` stays one constructor parameter although it plays five roles —
+/// operation lifecycle, endpoint lookup, capability ledger, remote-task
+/// observation rows, and artifact lookup (the §13.3 step-4 pre-flight of an
+/// Update command) — because every runtime composes one `SqliteStore`
+/// implementing all five, exactly like the refresh use case's repository.
+/// `Gateway` implements dispatch, update dispatch, and verification on the
+/// same Redfish gateway object, and `Audit` appends the §16.3 lifecycle
+/// facts.
 pub struct OperationExecutor<Store, Gateway, Audit, Time> {
     store: Store,
     gateway: Gateway,
@@ -89,8 +97,12 @@ pub struct OperationExecutor<Store, Gateway, Audit, Time> {
 
 impl<Store, Gateway, Audit, Time> OperationExecutor<Store, Gateway, Audit, Time>
 where
-    Store: OperationStore + EndpointRefreshRepository + CapabilityQueryRepository + RemoteTaskStore,
-    Gateway: CommandExecutor + CommandVerifier,
+    Store: OperationStore
+        + EndpointRefreshRepository
+        + CapabilityQueryRepository
+        + RemoteTaskStore
+        + ArtifactRepository,
+    Gateway: CommandExecutor + CommandVerifier + UpdateExecutor,
     Audit: AuditEventWriter,
     Time: Clock,
 {
@@ -238,6 +250,48 @@ where
                 .await;
         }
 
+        // §13.3 step 4 (first cut, Update only): the referenced artifact must
+        // exist and be `Ready` before any validation step is persisted — an
+        // unusable artifact is a provable refusal, exactly like the endpoint
+        // and capability pre-flight checks. The artifact bytes are resolved
+        // here too (the file read runs under `spawn_blocking`, design §7.8),
+        // so the update dispatch never starts without the payload it must
+        // upload; the command itself carries only the database-serializable
+        // `artifact_id` (§14.3).
+        let update_artifact = match &command {
+            RedfishCommand::Update(UpdateCommand::StartUpdate(payload)) => {
+                match self.resolve_update_artifact(payload.artifact_id()).await {
+                    Ok(artifact) => Some(artifact),
+                    Err(error) => match error {
+                        // The artifact store could not be read: the check
+                        // cannot be decided, so the failure escalates like
+                        // the endpoint pre-flight lookup failure (nothing is
+                        // persisted).
+                        UpdateArtifactResolutionError::Lookup(source) => {
+                            return Err(ExecutorError::ArtifactPreflight(source));
+                        }
+                        // The artifact is provably unusable — missing, not
+                        // `Ready`, or its file unreadable — so the write can
+                        // never be dispatched and the refusal is provable
+                        // (§13.5: recorded `Failed`, never `Unknown`).
+                        UpdateArtifactResolutionError::Missing
+                        | UpdateArtifactResolutionError::NotReady
+                        | UpdateArtifactResolutionError::Unreadable => {
+                            return self
+                                .refuse(
+                                    &engine,
+                                    operation_id,
+                                    &started,
+                                    AuditFailure::EndpointPersistenceFailed,
+                                )
+                                .await;
+                        }
+                    },
+                }
+            }
+            _ => None,
+        };
+
         if state == OperationState::Queued {
             // §13.3 step 6 begins the validation phase. A resumed `Validating`
             // operation already persisted this step in the crashed attempt
@@ -249,8 +303,15 @@ where
         self.apply_step(&engine, operation_id, OperationEvent::ValidationPassed)
             .await?;
 
-        self.dispatch_and_verify(&engine, operation_id, endpoint_id, &command, &started)
-            .await
+        self.dispatch_and_verify(
+            &engine,
+            operation_id,
+            endpoint_id,
+            &command,
+            &started,
+            update_artifact.as_ref(),
+        )
+        .await
     }
 
     /// Resolves the outcome of an operation stranded in `Running` or
@@ -637,20 +698,28 @@ where
             .map_err(guard_recovery_race)
     }
 
-    /// Dispatches the write (§13.3 step 7) and drives the outcome of the
-    /// §13.3 step 8 branch the response selects, including the §13.5
-    /// classification of failed dispatches.
+    /// Dispatches the write (§13.3 step 7) — through the typed command
+    /// boundary for every family except Update, through the update boundary
+    /// for a §14.3 firmware update — and drives the outcome of the §13.3
+    /// step 8 branch the response selects.
+    ///
+    /// `artifact` is the pre-flight-resolved update payload; it is `Some`
+    /// exactly when `command` is an Update command (the §13.3 step-4 check
+    /// resolved it before any validation step was persisted), and a missing
+    /// payload in the Update arm would be a scheduling bug, refused
+    /// defensively without any dispatch.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Gateway`] with the classified dispatch error
-    /// as its source after the operation has been persisted into its honest
-    /// terminal state (`Failed` or `Unknown`) and the terminal audit fact has
-    /// been recorded, and [`ExecutorError::RemoteTask`] when the §13.6
-    /// observation row of an accepted Task cannot be persisted — the
-    /// operation is recorded `Unknown` (§13.5, because the BMC already
-    /// accepted the write and it must never be re-dispatched) and the
-    /// terminal audit fact is recorded before the error escapes.
+    /// Returns [`ExecutorError::Gateway`] or [`ExecutorError::UpdateGateway`]
+    /// with the classified dispatch error as its source after the operation
+    /// has been persisted into its honest terminal state (`Failed` or
+    /// `Unknown`) and the terminal audit fact has been recorded, and
+    /// [`ExecutorError::RemoteTask`] when the §13.6 observation row of an
+    /// accepted Task cannot be persisted — the operation is recorded
+    /// `Unknown` (§13.5, because the BMC already accepted the write and it
+    /// must never be re-dispatched) and the terminal audit fact is recorded
+    /// before the error escapes.
     async fn dispatch_and_verify(
         &self,
         engine: &OperationEngine<&Store>,
@@ -658,8 +727,91 @@ where
         endpoint_id: EndpointId,
         command: &RedfishCommand,
         started: &StartedAudit,
+        artifact: Option<&UpdateArtifactPayload>,
     ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
-        match self.gateway.execute(endpoint_id, command).await {
+        if let RedfishCommand::Update(UpdateCommand::StartUpdate(payload)) = command {
+            // The §13.3 step-4 pre-flight resolved the payload for every
+            // Update command; a missing payload here would be a scheduling
+            // bug, refused defensively without any dispatch (a provable
+            // refusal — nothing reaches the BMC).
+            let Some(artifact) = artifact else {
+                return self
+                    .refuse(
+                        engine,
+                        operation_id,
+                        started,
+                        AuditFailure::EndpointPersistenceFailed,
+                    )
+                    .await;
+            };
+            let outcome = self
+                .gateway
+                .execute_update(endpoint_id, artifact, payload.push_uri())
+                .await;
+            self.drive_outcome(
+                engine,
+                operation_id,
+                endpoint_id,
+                command,
+                started,
+                outcome,
+                ExecutorError::UpdateGateway,
+            )
+            .await
+        } else {
+            let outcome = self.gateway.execute(endpoint_id, command).await;
+            self.drive_outcome(
+                engine,
+                operation_id,
+                endpoint_id,
+                command,
+                started,
+                outcome,
+                ExecutorError::Gateway,
+            )
+            .await
+        }
+    }
+
+    /// Drives the outcome of a dispatched write (§13.3 step 8) through the
+    /// branch the response selects, including the §13.5 classification of
+    /// failed dispatches.
+    ///
+    /// `wrap_error` maps the boundary's own error type onto the executor's
+    /// vocabulary — [`ExecutorError::Gateway`] for the typed command
+    /// boundary, [`ExecutorError::UpdateGateway`] for the update boundary —
+    /// so the outcome semantics stay in one place for both dispatch paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped dispatch error after the operation has been
+    /// persisted into its honest terminal state (`Failed` or `Unknown`) and
+    /// the terminal audit fact has been recorded, and
+    /// [`ExecutorError::RemoteTask`] when the §13.6 observation row of an
+    /// accepted Task cannot be persisted — the operation is recorded
+    /// `Unknown` (§13.5, because the BMC already accepted the write and it
+    /// must never be re-dispatched) and the terminal audit fact is recorded
+    /// before the error escapes.
+    // The engine, the operation's target facts, the audit bundle, the
+    // outcome, and its error wrapper are all individually named facts of the
+    // shared outcome handling; grouping them would hide the exact contract
+    // that mirrors the two dispatch call sites (the same accepted trade-off
+    // as `AuditOperationContext::try_new`).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_outcome<DispatchError>(
+        &self,
+        engine: &OperationEngine<&Store>,
+        operation_id: OperationId,
+        endpoint_id: EndpointId,
+        command: &RedfishCommand,
+        started: &StartedAudit,
+        outcome: Result<CommandOutcome, DispatchError>,
+        wrap_error: fn(DispatchError) -> ExecutorErrorOf<Store, Gateway, Audit>,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>>
+    where
+        DispatchError: DispatchVerdictClassifier,
+    {
+        match outcome {
             Ok(CommandOutcome::AsyncTaskAccepted { task_location }) => {
                 // §13.3 step 8, asynchronous acceptance: the BMC accepted the
                 // write as a Task whose result is only observable by polling.
@@ -741,9 +893,54 @@ where
                 };
                 self.apply_step(engine, operation_id, event).await?;
                 self.record_failure(started, failure, verification).await?;
-                Err(ExecutorError::Gateway(source))
+                Err(wrap_error(source))
             }
         }
+    }
+
+    /// §13.3 step 4 (first cut for Update): resolves the referenced artifact
+    /// into the payload the update boundary uploads.
+    ///
+    /// The artifact row must exist and be `Ready`: an `Uploading` artifact
+    /// has not passed its finalize SHA-256 check and a `Failed` artifact was
+    /// already rejected, so neither may reach a BMC. The file bytes are read
+    /// from the artifact store's deterministic path under `spawn_blocking`
+    /// (design §7.8: large file reads must never block a Tokio worker). The
+    /// command only carries the artifact id — a database-serializable
+    /// identity; the bytes are resolved here, at execution time, never
+    /// persisted inside the command (§14.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateArtifactResolutionError::Lookup`] when the artifact
+    /// store read fails (the pre-flight cannot be evaluated), and the refusal
+    /// variants when the artifact is provably unusable — the caller records a
+    /// `Failed` operation with `Rejected` verification (§13.3 step 4, §13.5).
+    async fn resolve_update_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<
+        UpdateArtifactPayload,
+        UpdateArtifactResolutionError<<Store as ArtifactRepository>::Error>,
+    > {
+        let artifact = self
+            .store
+            .find_artifact(artifact_id)
+            .await
+            .map_err(UpdateArtifactResolutionError::Lookup)?
+            .ok_or(UpdateArtifactResolutionError::Missing)?;
+        if artifact.state() != ArtifactState::Ready {
+            return Err(UpdateArtifactResolutionError::NotReady);
+        }
+        let path = self.store.artifact_file_path(artifact.id());
+        let bytes = read_artifact_bytes(path)
+            .await
+            .map_err(|_| UpdateArtifactResolutionError::Unreadable)?;
+        Ok(UpdateArtifactPayload::new(
+            artifact.id(),
+            artifact.name().clone(),
+            bytes,
+        ))
     }
 
     /// Re-reads the target and checks the expected result (§13.3 steps 9-10),
@@ -961,6 +1158,9 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
         RedfishCommand::Event(EventCommand::DeleteSubscription(_)) => {
             AuditRedfishOperation::DeleteEventSubscription
         }
+        RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
+            AuditRedfishOperation::UpdateFirmware
+        }
     }
 }
 
@@ -981,6 +1181,9 @@ fn required_capability(command: &RedfishCommand) -> EndpointCapability {
         RedfishCommand::Chassis(_) => EndpointCapability::Chassis,
         RedfishCommand::SecureBoot(_) => EndpointCapability::SecureBoot,
         RedfishCommand::Event(_) => EndpointCapability::EventService,
+        // A firmware update targets the BMC's UpdateService (§14.3), so the
+        // update command requires the update-service capability.
+        RedfishCommand::Update(_) => EndpointCapability::UpdateService,
     }
 }
 
@@ -1004,6 +1207,40 @@ fn at_or_after(previous: OffsetDateTime, observed: OffsetDateTime) -> OffsetDate
     previous.max(observed)
 }
 
+/// Why the §13.3 step-4 artifact pre-flight cannot produce an update payload.
+///
+/// The first three variants are provable parameter violations — the caller
+/// records a `Failed` operation with `Rejected` verification (§13.5: nothing
+/// was dispatched). The refusal path treats them alike (the audit vocabulary
+/// carries no reason string in this iteration; the specific reason is a
+/// later diagnostic surface's work). [`Self::Lookup`] is an evaluation
+/// failure: the artifact store could not be read, so the check cannot be
+/// decided and the caller escalates it exactly like the endpoint pre-flight
+/// lookup failure.
+enum UpdateArtifactResolutionError<ArtifactRepositoryError> {
+    /// The referenced artifact row does not exist.
+    Missing,
+    /// The referenced artifact exists but has not finished its upload
+    /// lifecycle; only a `Ready` artifact may reach a BMC.
+    NotReady,
+    /// The artifact file cannot be read from the artifact store; the row is
+    /// `Ready` but the bytes are gone.
+    Unreadable,
+    /// The artifact store rejected the lookup.
+    Lookup(ArtifactRepositoryError),
+}
+
+/// Reads one artifact file under `spawn_blocking` (design §7.8).
+///
+/// The artifact store's deterministic path is a pure function of the artifact
+/// id (§9.3), so the bytes are resolved here at execution time without the
+/// command ever carrying file content.
+async fn read_artifact_bytes(path: PathBuf) -> Result<Vec<u8>, io::Error> {
+    spawn_blocking(move || fs::read(path))
+        .await
+        .map_err(io::Error::other)?
+}
+
 /// Renames the execution-flow race guard to the recovery contract's guard for
 /// errors observed on the recovery path.
 ///
@@ -1018,7 +1255,9 @@ fn guard_recovery_race<
     RepositoryError,
     CapabilityError,
     RemoteTaskStoreError,
+    ArtifactRepositoryError,
     GatewayError,
+    UpdateGatewayError,
     VerifierError,
     AuditError,
 >(
@@ -1027,7 +1266,9 @@ fn guard_recovery_race<
         RepositoryError,
         CapabilityError,
         RemoteTaskStoreError,
+        ArtifactRepositoryError,
         GatewayError,
+        UpdateGatewayError,
         VerifierError,
         AuditError,
     >,
@@ -1036,7 +1277,9 @@ fn guard_recovery_race<
     RepositoryError,
     CapabilityError,
     RemoteTaskStoreError,
+    ArtifactRepositoryError,
     GatewayError,
+    UpdateGatewayError,
     VerifierError,
     AuditError,
 >
@@ -1045,7 +1288,9 @@ where
     RepositoryError: Error + 'static,
     CapabilityError: Error + 'static,
     RemoteTaskStoreError: Error + 'static,
+    ArtifactRepositoryError: Error + 'static,
     GatewayError: Error + 'static,
+    UpdateGatewayError: Error + 'static,
     VerifierError: Error + 'static,
     AuditError: Error + 'static,
 {
@@ -1083,18 +1328,20 @@ impl fmt::Display for OperationAuditStage {
 /// A controlled failure while driving one operation toward its terminal
 /// state.
 ///
-/// The seven generic parameters are the boundary error types in dependency
+/// The nine generic parameters are the boundary error types in dependency
 /// order: the operation store, the endpoint lookup, the capability query, the
-/// remote-task store, the command dispatch, the post-execution verification,
-/// and the audit append. Every variant keeps its boundary source on the error
-/// chain.
+/// remote-task store, the artifact lookup, the command dispatch, the update
+/// dispatch, the post-execution verification, and the audit append. Every
+/// variant keeps its boundary source on the error chain.
 #[derive(Debug, Error)]
 pub enum ExecutorError<
     StoreError,
     RepositoryError,
     CapabilityError,
     RemoteTaskStoreError,
+    ArtifactRepositoryError,
     GatewayError,
+    UpdateGatewayError,
     VerifierError,
     AuditError,
 > where
@@ -1102,7 +1349,9 @@ pub enum ExecutorError<
     RepositoryError: Error + 'static,
     CapabilityError: Error + 'static,
     RemoteTaskStoreError: Error + 'static,
+    ArtifactRepositoryError: Error + 'static,
     GatewayError: Error + 'static,
+    UpdateGatewayError: Error + 'static,
     VerifierError: Error + 'static,
     AuditError: Error + 'static,
 {
@@ -1172,6 +1421,14 @@ pub enum ExecutorError<
     /// tell an accepted Task from a lost dispatch.
     #[error("remote task observation could not be persisted or read: {0}")]
     RemoteTask(#[source] RemoteTaskStoreError),
+    /// The §13.3 step-4 artifact pre-flight could not be evaluated.
+    ///
+    /// The artifact store rejected the lookup of the artifact an Update
+    /// command references; nothing has been dispatched and no operation step
+    /// is persisted (the same contract as the endpoint pre-flight lookup
+    /// failure).
+    #[error("artifact pre-flight lookup failed: {0}")]
+    ArtifactPreflight(#[source] ArtifactRepositoryError),
     /// The command dispatch (§13.3 step 7) failed.
     ///
     /// The operation has already been persisted into its honest terminal
@@ -1180,6 +1437,15 @@ pub enum ExecutorError<
     /// returned.
     #[error("command dispatch failed: {0}")]
     Gateway(#[source] GatewayError),
+    /// The §14.3 update dispatch failed.
+    ///
+    /// The operation has already been persisted into its honest terminal
+    /// state (`Failed` or `Unknown`, per the error's own [`DispatchVerdict`])
+    /// and its terminal audit fact has been recorded before this error is
+    /// returned — the same contract as [`Self::Gateway`], for the update
+    /// boundary.
+    #[error("update dispatch failed: {0}")]
+    UpdateGateway(#[source] UpdateGatewayError),
     /// The post-execution verification re-read (§13.3 steps 9-10) failed.
     ///
     /// The operation has already been persisted into `Unknown` (a failed
@@ -1207,13 +1473,14 @@ mod tests {
     };
 
     use rutilus_domain::{
-        AuditOutcomeKind, AuditVerification, BootCommand, BootSource, BootSourceOverrideEnabled,
-        BootSourceOverrideMode, CapabilityState, ChassisCommand, CreateSubscription, CredentialId,
-        DeleteSubscription, Endpoint, EndpointAddress, EndpointCapabilityObservation,
-        EndpointDisplayName, EndpointId, EventCommand, EventDestinationProtocol, EventType,
-        ManagerCommand, OperationSource, OperationTarget, ResetKeysType, ResetType,
-        ResourceSnapshot, SecureBootCommand, SetBootSourceOverride, SystemCommand, TargetId,
-        TlsCertificate, TlsTrust,
+        Artifact, ArtifactName, ArtifactState, AuditOutcomeKind, AuditVerification, BootCommand,
+        BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
+        ChassisCommand, CreateSubscription, CredentialId, DeleteSubscription, Endpoint,
+        EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
+        EventCommand, EventDestinationProtocol, EventType, ManagerCommand, OperationSource,
+        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, SecureBootCommand,
+        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
+        TlsTrust, UpdateCommand,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, RemoteTaskState, TaskUri,
@@ -1242,6 +1509,24 @@ mod tests {
             OperationSource::Standalone,
             vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
             RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            created_at(),
+        )
+    }
+
+    /// Builds one schedulable queued firmware-update operation (§14.3).
+    fn queued_update_operation(
+        endpoint_id: EndpointId,
+        artifact_id: ArtifactId,
+        push_uri: Option<String>,
+    ) -> Operation {
+        Operation::new(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                artifact_id,
+                push_uri,
+            ))),
             created_at(),
         )
     }
@@ -1308,6 +1593,19 @@ mod tests {
         )]
     }
 
+    /// One persisted `UpdateService` capability observation at the supported
+    /// state, which is what an Update command needs to pass pre-flight
+    /// (§14.3).
+    fn supported_update_service_capability() -> Vec<StoredCapability> {
+        vec![StoredCapability::new(
+            EndpointCapabilityObservation::new(
+                EndpointCapability::UpdateService,
+                CapabilityState::Supported,
+            ),
+            created_at(),
+        )]
+    }
+
     /// Composes the executor under test over the given fakes.
     ///
     /// The executor borrows the fakes (every boundary has a forwarding impl
@@ -1348,6 +1646,7 @@ mod tests {
         ApplyTransition(OperationId, OperationState),
         FindEndpoint(EndpointId),
         FindCapabilities(EndpointId),
+        FindArtifact(ArtifactId),
         SaveRemoteTask(OperationId),
     }
 
@@ -1358,19 +1657,27 @@ mod tests {
         Write,
         EndpointLookup,
         CapabilityLookup,
+        ArtifactLookup,
         RemoteTaskWrite,
     }
 
     /// In-memory store implementing every repository role the executor uses.
     ///
     /// One struct implements `OperationStore`, `EndpointRefreshRepository`,
-    /// `CapabilityQueryRepository`, and `RemoteTaskStore` exactly like the
-    /// production `SqliteStore`, so the executor composes over a single test
-    /// object. `apply_transition` upholds the store contract: unknown ids and
-    /// writes onto terminal states are rejected.
+    /// `CapabilityQueryRepository`, `RemoteTaskStore`, and
+    /// `ArtifactRepository` exactly like the production `SqliteStore`, so the
+    /// executor composes over a single test object. `apply_transition`
+    /// upholds the store contract: unknown ids and writes onto terminal
+    /// states are rejected. The artifact role uses a real temporary
+    /// directory — the executor reads the artifact file from the
+    /// deterministic path, so the update dispatch tests exercise the same
+    /// file I/O the production flow performs.
     struct FakeStore {
         rows: Mutex<HashMap<OperationId, Operation>>,
         remote_tasks: Mutex<HashMap<OperationId, RemoteTask>>,
+        artifacts: Mutex<HashMap<ArtifactId, Artifact>>,
+        artifact_directory: Option<PathBuf>,
+        artifact_tempdir: Option<tempfile::TempDir>,
         endpoint: Option<Endpoint>,
         capabilities: Vec<StoredCapability>,
         calls: Mutex<Vec<Call>>,
@@ -1384,6 +1691,9 @@ mod tests {
             Self {
                 rows: Mutex::new(HashMap::new()),
                 remote_tasks: Mutex::new(HashMap::new()),
+                artifacts: Mutex::new(HashMap::new()),
+                artifact_directory: None,
+                artifact_tempdir: None,
                 endpoint,
                 capabilities,
                 calls: Mutex::new(Vec::new()),
@@ -1391,6 +1701,58 @@ mod tests {
                 find_calls: Mutex::new(0),
                 find_race: Mutex::new(None),
             }
+        }
+
+        /// Creates the artifact directory for tests that exercise the §14.3
+        /// update dispatch; the temporary directory lives for the store's
+        /// lifetime.
+        fn with_artifact_directory(mut self) -> Result<Self, MockError> {
+            let directory = tempfile::tempdir().map_err(|_| MockError::Artifact)?;
+            let artifact_directory = directory.path().join("artifacts");
+            std::fs::create_dir_all(&artifact_directory).map_err(|_| MockError::Artifact)?;
+            self.artifact_directory = Some(artifact_directory);
+            self.artifact_tempdir = Some(directory);
+            Ok(self)
+        }
+
+        /// Stores one artifact row and, for the `Ready` state, its file
+        /// bytes — exactly the invariant the domain guarantees (a ready
+        /// artifact holds its complete verified content).
+        fn store_artifact(
+            &self,
+            artifact_id: ArtifactId,
+            state: ArtifactState,
+            bytes: &[u8],
+        ) -> Result<Artifact, MockError> {
+            let uploaded = if state == ArtifactState::Ready {
+                bytes.len() as u64
+            } else {
+                0
+            };
+            let artifact = Artifact::try_from_parts(
+                artifact_id,
+                ArtifactName::parse("firmware.bin").map_err(|_| MockError::Artifact)?,
+                bytes.len() as u64,
+                Sha256Hex::from_bytes([0xAB; 32]),
+                state,
+                uploaded,
+                created_at(),
+                clock_time(),
+            )
+            .map_err(|_| MockError::Artifact)?;
+            self.artifacts
+                .lock()
+                .map_err(|_| MockError::Events)?
+                .insert(artifact_id, artifact.clone());
+            if state == ArtifactState::Ready {
+                let directory = self
+                    .artifact_directory
+                    .as_ref()
+                    .ok_or(MockError::Artifact)?;
+                std::fs::write(directory.join(format!("{artifact_id}.bin")), bytes)
+                    .map_err(|_| MockError::Artifact)?;
+            }
+            Ok(artifact)
         }
 
         /// Arms exactly one failure for the next call of `kind`.
@@ -1620,6 +1982,66 @@ mod tests {
         }
     }
 
+    impl ArtifactRepository for FakeStore {
+        type Error = MockError;
+
+        fn create_artifact<'a>(
+            &'a self,
+            _artifact: &'a Artifact,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            // The executor never creates artifacts; the upload use case owns
+            // that boundary, so this stub is unreachable here.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn find_artifact(
+            &self,
+            artifact_id: ArtifactId,
+        ) -> BoundaryFuture<'_, Result<Option<Artifact>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(Call::FindArtifact(artifact_id));
+                if self.consume_failure(FailureKind::ArtifactLookup)? {
+                    return Err(MockError::Artifact);
+                }
+                self.artifacts
+                    .lock()
+                    .map_err(|_| MockError::Events)
+                    .map(|rows| rows.get(&artifact_id).cloned())
+            })
+        }
+
+        fn list_artifacts_by_state(
+            &self,
+            _state: ArtifactState,
+        ) -> BoundaryFuture<'_, Result<Vec<Artifact>, Self::Error>> {
+            // The executor never lists artifacts; the inventory use case owns
+            // that projection, so this stub is unreachable here.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn update_artifact(
+            &self,
+            _artifact_id: ArtifactId,
+            _uploaded_bytes: u64,
+            _state: ArtifactState,
+            _occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            // The executor never advances artifact progress; the upload use
+            // case owns that boundary, so this stub is unreachable here.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn artifact_file_path(&self, artifact_id: ArtifactId) -> PathBuf {
+            match &self.artifact_directory {
+                Some(directory) => directory.join(format!("{artifact_id}.bin")),
+                None => PathBuf::from(format!("{artifact_id}.bin")),
+            }
+        }
+    }
+
     impl RemoteTaskStore for FakeStore {
         type Error = MockError;
 
@@ -1675,11 +2097,23 @@ mod tests {
         Verify,
     }
 
-    /// Scripted gateway: `outcome` is the dispatch result and `verdict` the
-    /// verification result, both recorded per call.
+    /// One recorded update-boundary call with the exact endpoint, artifact,
+    /// and push URI (§14.3).
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct UpdateCall {
+        endpoint_id: EndpointId,
+        artifact_id: ArtifactId,
+        push_uri: Option<String>,
+    }
+
+    /// Scripted gateway: `outcome` is the dispatch result, `update_outcome`
+    /// the update-boundary result, and `verdict` the verification result,
+    /// each recorded per call.
     struct FakeGateway {
         calls: Mutex<Vec<GatewayCall>>,
+        update_calls: Mutex<Vec<UpdateCall>>,
         outcome: Result<CommandOutcome, MockError>,
+        update_outcome: Result<CommandOutcome, MockError>,
         verdict: Result<VerificationVerdict, MockError>,
     }
 
@@ -1690,13 +2124,32 @@ mod tests {
         ) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                update_calls: Mutex::new(Vec::new()),
                 outcome,
+                update_outcome: Ok(CommandOutcome::Accepted),
                 verdict,
             }
         }
 
+        /// Scripts the update-boundary result; the typed dispatch outcome
+        /// stays `Accepted` unless a test changes it.
+        fn with_update_outcome(
+            mut self,
+            update_outcome: Result<CommandOutcome, MockError>,
+        ) -> Self {
+            self.update_outcome = update_outcome;
+            self
+        }
+
         fn recorded_calls(&self) -> Result<Vec<GatewayCall>, MockError> {
             self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .map_err(|_| MockError::Events)
+        }
+
+        fn recorded_update_calls(&self) -> Result<Vec<UpdateCall>, MockError> {
+            self.update_calls
                 .lock()
                 .map(|calls| calls.clone())
                 .map_err(|_| MockError::Events)
@@ -1747,6 +2200,29 @@ mod tests {
         }
     }
 
+    impl UpdateExecutor for FakeGateway {
+        type Error = MockError;
+
+        fn execute_update<'a>(
+            &'a self,
+            endpoint_id: EndpointId,
+            artifact: &'a UpdateArtifactPayload,
+            push_uri: Option<&'a str>,
+        ) -> BoundaryFuture<'a, Result<CommandOutcome, Self::Error>> {
+            Box::pin(async move {
+                self.update_calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(UpdateCall {
+                        endpoint_id,
+                        artifact_id: artifact.artifact_id(),
+                        push_uri: push_uri.map(str::to_owned),
+                    });
+                self.update_outcome.clone()
+            })
+        }
+    }
+
     /// The single mock failure vocabulary of every boundary under test.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockError {
@@ -1754,6 +2230,7 @@ mod tests {
         Store,
         Repository,
         Capability,
+        Artifact,
         RemoteTaskStore,
         GatewayNotExecuted,
         GatewayUnknown,
@@ -1924,6 +2401,478 @@ mod tests {
         );
         assert_eq!(events[0].context().actor(), AuditActor::System);
         assert_eq!(events[0].context().origin(), DeploymentPosture::Site);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_resolves_the_ready_artifact_and_drives_the_full_event_order()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        let operation = queued_update_operation(
+            endpoint_id,
+            artifact_id,
+            Some("https://192.0.2.10/upload".to_owned()),
+        );
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.execute_operation(operation_id).await?;
+
+        assert_eq!(finished.id(), operation_id);
+        assert_eq!(finished.state(), OperationState::Succeeded);
+        // The §13.2 event order matches every other family: the artifact
+        // pre-flight (§13.3 step 4) resolves the payload before any persisted
+        // step, then ValidationStarted → Validating, ValidationPassed →
+        // Running, ExecutionAccepted → Verifying, VerificationPassed →
+        // Succeeded.
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::Verifying,
+                OperationState::Succeeded,
+            ]
+        );
+        let calls = store.recorded_calls()?;
+        assert_eq!(calls[0], Call::Find(operation_id));
+        let first_apply = calls
+            .iter()
+            .position(|call| matches!(call, Call::ApplyTransition(..)))
+            .ok_or("no persisted step was recorded")?;
+        let artifact_lookup = calls
+            .iter()
+            .position(|call| *call == Call::FindArtifact(artifact_id))
+            .ok_or("the artifact pre-flight never ran")?;
+        assert!(
+            artifact_lookup < first_apply,
+            "the artifact pre-flight must run before any persisted step"
+        );
+        // The update boundary received the exact artifact and the operator's
+        // push URI, and the accepted update was then verified through the
+        // shared re-read — the post-update SoftwareInventory check (§14.3).
+        assert_eq!(
+            gateway.recorded_update_calls()?,
+            [UpdateCall {
+                endpoint_id,
+                artifact_id,
+                push_uri: Some("https://192.0.2.10/upload".to_owned()),
+            }]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "an accepted update must be verified through the shared re-read"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Confirmed)
+        );
+        assert_eq!(events[0].context(), events[1].context());
+        assert_eq!(
+            events[0].context().redfish_operation(),
+            AuditRedfishOperation::UpdateFirmware,
+            "the §16.3 vocabulary names the firmware update family"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_with_missing_artifact_is_refused_before_any_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        );
+        // No artifact row: the referenced firmware does not exist (§13.3
+        // step 4 parameter check).
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed],
+            "an unusable artifact is one Failed step from Queued"
+        );
+        assert_eq!(
+            gateway.recorded_update_calls()?.len(),
+            0,
+            "no update may be dispatched after an artifact pre-flight refusal"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().failure(),
+            Some(AuditFailure::EndpointPersistenceFailed)
+        );
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_with_uploading_artifact_is_refused_before_any_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        // An Uploading artifact has not passed its finalize SHA-256 check
+        // and must never reach a BMC.
+        store.store_artifact(artifact_id, ArtifactState::Uploading, b"firmware image")?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        assert_eq!(gateway.recorded_update_calls()?.len(), 0);
+        assert_eq!(
+            audit.recorded_events()?[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_with_unreadable_artifact_file_is_refused_before_any_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        // The row is Ready but the bytes are gone — an environmental loss
+        // that still proves the write was never dispatched.
+        std::fs::remove_file(store.artifact_file_path(artifact_id))?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        assert_eq!(gateway.recorded_update_calls()?.len(), 0);
+        assert_eq!(
+            audit.recorded_events()?[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_artifact_lookup_failure_propagates_as_artifact_preflight()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        );
+        store.arm_failure(FailureKind::ArtifactLookup)?;
+        let operation = queued_update_operation(endpoint_id, ArtifactId::generate(), None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        let error = result
+            .err()
+            .ok_or("the artifact lookup failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::ArtifactPreflight(MockError::Artifact)
+        ));
+        assert_error_source(&error, MockError::Artifact)?;
+        assert_eq!(
+            applied_states(&store.recorded_calls()?).len(),
+            0,
+            "no step may be persisted when the artifact pre-flight lookup itself fails"
+        );
+        assert_eq!(gateway.recorded_update_calls()?.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_async_acceptance_persists_the_task_row_and_waits()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let task_location = TaskUri::parse("/redfish/v1/TaskService/Tasks/42")?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        )
+        .with_update_outcome(Ok(CommandOutcome::AsyncTaskAccepted {
+            task_location: task_location.clone(),
+        }));
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let waiting = executor.execute_operation(operation_id).await?;
+
+        assert_eq!(waiting.id(), operation_id);
+        assert_eq!(waiting.state(), OperationState::WaitingRemote);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::WaitingRemote,
+            ]
+        );
+        // The observation row exists with the exact task location from the
+        // `202` `Location` header, exactly like the typed dispatch path.
+        let task = store
+            .find_remote_task_owned(operation_id)?
+            .ok_or("the accepted update task row must be persisted")?;
+        assert_eq!(task.task_uri(), &task_location);
+        assert_eq!(
+            gateway.recorded_update_calls()?.len(),
+            1,
+            "the update was dispatched exactly once"
+        );
+        assert_eq!(
+            gateway.recorded_calls()?.len(),
+            0,
+            "an accepted update Task must never be verified synchronously"
+        );
+        assert_eq!(
+            audit.recorded_events()?.len(),
+            1,
+            "only the start fact is audited; the terminal fact belongs to the Task monitor"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_provable_failure_records_failed_and_propagates_the_source()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        )
+        .with_update_outcome(Err(MockError::GatewayNotExecuted));
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        let error = result
+            .err()
+            .ok_or("the update dispatch failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::UpdateGateway(MockError::GatewayNotExecuted)
+        ));
+        assert_error_source(&error, MockError::GatewayNotExecuted)?;
+        // The update boundary's own verdict classifies the failure: a
+        // provable non-execution is Failed, never Unknown (§13.5).
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::Failed,
+            ]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_dispatch_unprovable_failure_records_unknown_and_propagates_the_source()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        )
+        .with_update_outcome(Err(MockError::GatewayUnknown));
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        let error = result
+            .err()
+            .ok_or("the update dispatch failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::UpdateGateway(MockError::GatewayUnknown)
+        ));
+        assert_error_source(&error, MockError::GatewayUnknown)?;
+        // The firmware submission may already have been accepted by the BMC:
+        // the operation is Unknown, never re-dispatched blindly (§13.5).
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::Unknown,
+            ]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_verification_mismatch_records_failed() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let artifact_id = ArtifactId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            supported_update_service_capability(),
+        )
+        .with_artifact_directory()?;
+        store.store_artifact(artifact_id, ArtifactState::Ready, b"firmware image")?;
+        let operation = queued_update_operation(endpoint_id, artifact_id, None);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Mismatched),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        // The post-update re-read proves the expected result absent (the
+        // software-inventory surface is gone): a provable failure.
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::Verifying,
+                OperationState::Failed,
+            ]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "the mismatch re-read ran against the update command"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().failure(),
+            Some(AuditFailure::CoreResourceReadFailed)
+        );
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Rejected),
+            "a proven-absent result is a provable failure"
+        );
         Ok(())
     }
 
@@ -2933,13 +3882,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_audit_operations_pin_the_nine_write_families() -> Result<(), Box<dyn Error>> {
+    async fn command_audit_operations_pin_the_ten_write_families() -> Result<(), Box<dyn Error>> {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
         // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another) fails
         // here instead of reaching the audit log.
-        let pairs: [(&RedfishCommand, AuditRedfishOperation); 9] = [
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 10] = [
             (
                 &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
                 AuditRedfishOperation::ResetSystem,
@@ -2992,6 +3941,13 @@ mod tests {
                 ))),
                 AuditRedfishOperation::DeleteEventSubscription,
             ),
+            (
+                &RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                    ArtifactId::generate(),
+                    None,
+                ))),
+                AuditRedfishOperation::UpdateFirmware,
+            ),
         ];
         for (command, expected) in pairs {
             assert_eq!(
@@ -3001,6 +3957,18 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn update_commands_require_the_update_service_capability() {
+        let command = RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+            ArtifactId::generate(),
+            None,
+        )));
+        assert_eq!(
+            required_capability(&command),
+            EndpointCapability::UpdateService
+        );
     }
 
     #[tokio::test]
