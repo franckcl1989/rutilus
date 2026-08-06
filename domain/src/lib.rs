@@ -9,10 +9,12 @@ mod credential;
 mod endpoint;
 mod endpoint_address;
 mod event;
+mod group;
 mod ids;
 mod operation;
 mod redfish_command;
 mod resource_snapshot;
+mod tag;
 mod telemetry;
 
 pub use artifact::{
@@ -45,6 +47,7 @@ pub use event::{
     Event, EventId, EventSeverity, EventSeverityParseError, EventTimelineError, MessageId,
     MessageIdError,
 };
+pub use group::{Group, GroupId, GroupName, GroupNameError, GroupRestoreError};
 pub use ids::{
     ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
     OperationId, ResourceId, TargetId,
@@ -65,6 +68,7 @@ pub use resource_snapshot::{
     ResourceODataTypeError, ResourceSnapshot, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError,
 };
+pub use tag::{Tag, TagId, TagName, TagNameError};
 pub use telemetry::{
     NonFiniteSampleValue, SeriesKey, SeriesKeyError, TelemetrySample, TelemetrySeries,
     TelemetrySeriesId,
