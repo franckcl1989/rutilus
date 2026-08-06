@@ -16,15 +16,15 @@ use rutilus_application::{
     CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
     DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
     EndpointRefreshRepository, EventIngestion, EventRepository, EventStream, EventStreamPull,
-    MetricReportSnapshotReader, OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery,
-    ResolvedCredential, ResourceObservation, StoredCapability, TaskMonitor, TelemetryRepository,
-    TelemetrySampler, TlsIdentityProbe,
+    GroupRepository, MetricReportSnapshotReader, OperationExecutor, ProtectedCredentialCreation,
+    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability, TagRepository,
+    TaskMonitor, TelemetryRepository, TelemetrySampler, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
     CredentialVersionId, DeploymentPosture, Endpoint, EndpointCapabilityObservation, EndpointId,
-    Event, Operation, OperationId, OperationState, ResourceSnapshot, SeriesKey, TelemetrySample,
-    TelemetrySeries, TelemetrySeriesId,
+    Event, Group, GroupId, Operation, OperationId, OperationState, ResourceSnapshot, SeriesKey,
+    Tag, TagName, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
 };
 use rutilus_infra_redfish::{
     EventStream as GatewayEventStream, EventStreamError, EventStreamOpenError,
@@ -37,8 +37,9 @@ use rutilus_operation_engine::{
 use rutilus_persistence::{
     ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
-    EventRepositoryError, NewCredential, OpenStoreError, OperationRepositoryError,
-    RemoteTaskRepositoryError, SqliteStore, TelemetryRepositoryError,
+    EventRepositoryError, GroupRepositoryError, NewCredential, OpenStoreError,
+    OperationRepositoryError, RemoteTaskRepositoryError, SqliteStore, TagRepositoryError,
+    TelemetryRepositoryError,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
@@ -538,6 +539,146 @@ impl TelemetryRepository for StandaloneState {
                 .await
                 .map(|_summary| ())
                 .map_err(SharedTelemetryRepositoryError::Telemetry)
+        })
+    }
+}
+
+impl GroupRepository for StandaloneState {
+    type Error = SharedGroupRepositoryError;
+
+    /// Delegates the §12.1 static-group lifecycle to the same `SqliteStore`
+    /// that owns every other aggregate, so the console's grouping paths
+    /// (which compose the `GroupRepository` boundary of the product-services
+    /// bundle) and the `groups`/`group_members` tables always observe one
+    /// authoritative membership.
+    fn create<'a>(&'a self, group: &'a Group) -> BoundaryFuture<'a, Result<Group, Self::Error>> {
+        Box::pin(async move {
+            // The store's create acknowledges the write without returning the
+            // row (§15.4 at-least-once: a stored identity is a no-op and the
+            // stored row is authoritative); the boundary contract hands the
+            // stored row back, so the read-back is the rehydration.
+            self.store.create_group(group).await?;
+            self.store.find_group(group.id()).await?.ok_or(
+                SharedGroupRepositoryError::MissingAfterCreate {
+                    group_id: group.id(),
+                },
+            )
+        })
+    }
+
+    fn find(&self, group_id: GroupId) -> BoundaryFuture<'_, Result<Option<Group>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_group(group_id)
+                .await
+                .map_err(SharedGroupRepositoryError::from)
+        })
+    }
+
+    fn list(&self) -> BoundaryFuture<'_, Result<Vec<Group>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .list_groups()
+                .await
+                .map_err(SharedGroupRepositoryError::from)
+        })
+    }
+
+    fn add_member(
+        &self,
+        group_id: GroupId,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .add_member(group_id, endpoint_id)
+                .await
+                .map_err(SharedGroupRepositoryError::Group)
+        })
+    }
+
+    fn remove_member(
+        &self,
+        group_id: GroupId,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .remove_member(group_id, endpoint_id)
+                .await
+                .map_err(SharedGroupRepositoryError::Group)
+        })
+    }
+
+    fn delete(&self, group_id: GroupId) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .delete_group(group_id)
+                .await
+                .map_err(SharedGroupRepositoryError::Group)
+        })
+    }
+}
+
+/// A controlled failure of the shared group store role.
+///
+/// The wrapper composes the store's create (which acknowledges the write
+/// without returning the row) with the read-back the boundary contract
+/// requires; the crate-local error keeps the boundary's failure type single
+/// while preserving the source chain, like `SharedTelemetryRepositoryError`.
+#[derive(Debug, Error)]
+enum SharedGroupRepositoryError {
+    #[error("group persistence failed: {0}")]
+    Group(#[from] GroupRepositoryError),
+    #[error("created group {group_id} cannot be read back")]
+    MissingAfterCreate { group_id: GroupId },
+}
+
+impl TagRepository for StandaloneState {
+    type Error = TagRepositoryError;
+
+    /// Delegates the §14.2 tag lifecycle to the same `SqliteStore` that owns
+    /// every other aggregate, so the console's tag paths (which compose the
+    /// `TagRepository` boundary of the product-services bundle) and the
+    /// `tags`/`endpoint_tags` tables always observe one authoritative
+    /// binding — the same rows the §14.2 homepage tag filter reads.
+    fn assign<'a>(&'a self, tag: &'a Tag) -> BoundaryFuture<'a, Result<Tag, Self::Error>> {
+        Box::pin(async move { self.store.assign_tag(tag.endpoint_id(), tag.name()).await })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        tag_name: &'a TagName,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { self.store.remove_tag(endpoint_id, tag_name).await })
+    }
+
+    fn list_for_endpoint(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Vec<Tag>, Self::Error>> {
+        Box::pin(async move { self.store.list_tags_for_endpoint(endpoint_id).await })
+    }
+
+    fn list_by_tag<'a>(
+        &'a self,
+        tag_name: &'a TagName,
+    ) -> BoundaryFuture<'a, Result<Vec<Tag>, Self::Error>> {
+        Box::pin(async move {
+            // The store's per-name listing returns endpoint identities only
+            // (its own contract); the boundary hands full bindings back, so
+            // each endpoint's tags are re-read and the exact name selects the
+            // binding — one per endpoint by the natural key.
+            let mut tags = Vec::new();
+            for endpoint_id in self.store.list_endpoints_by_tag(tag_name).await? {
+                for tag in self.store.list_tags_for_endpoint(endpoint_id).await? {
+                    if tag.name() == tag_name {
+                        tags.push(tag);
+                    }
+                }
+            }
+            Ok(tags)
         })
     }
 }
