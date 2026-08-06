@@ -20,10 +20,12 @@ mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
 mod event_repository;
+mod group_repository;
 mod migration_backup;
 mod operation_repository;
 mod remote_task_repository;
 mod resource_snapshot_repository;
+mod tag_repository;
 mod telemetry_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
@@ -37,12 +39,14 @@ pub use endpoint_capability_repository::{
 };
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
 pub use event_repository::{EventRepositoryError, StoredEventError};
+pub use group_repository::{GroupRepositoryError, StoredGroupError};
 pub use migration_backup::{MigrationBackup, MigrationBackupError};
 pub use operation_repository::{OperationRepositoryError, StoredOperationError};
 pub use remote_task_repository::{RemoteTaskRepositoryError, StoredRemoteTaskError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
 };
+pub use tag_repository::{StoredTagError, TagRepositoryError};
 pub use telemetry_repository::{
     StoredTelemetryError, TelemetryPruneSummary, TelemetryRepositoryError,
 };
