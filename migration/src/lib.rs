@@ -7,6 +7,7 @@ mod m20260805_000002_endpoint_capabilities;
 mod m20260805_000003_resource_snapshots;
 mod m20260805_000004_audit_events;
 mod m20260805_000005_operations;
+mod m20260805_000006_remote_tasks;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000003_resource_snapshots::Migration),
             Box::new(m20260805_000004_audit_events::Migration),
             Box::new(m20260805_000005_operations::Migration),
+            Box::new(m20260805_000006_remote_tasks::Migration),
         ]
     }
 }
