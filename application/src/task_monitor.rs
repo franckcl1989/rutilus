@@ -56,8 +56,9 @@
 //! The §16.3 start fact is recorded by the executor before dispatch; the
 //! monitor records the terminal fact when the operation reaches its final
 //! state, with the same failure classes and verification semantics as the
-//! executor's synchronous terminal facts. Per-poll progress is not audited:
-//! the 0.1 `AuditProgress` vocabulary (domain crate read-only this iteration)
+//! executor's synchronous terminal facts, under the execute-operation
+//! vocabulary with the [`AuditRedfishOperation::PollRemoteTask`] operation
+//! type. Per-poll progress is not audited: the 0.1 `AuditProgress` vocabulary
 //! has no truthful milestone for "task polled", and design section 13.6
 //! progress is persisted on the `RemoteTask` row itself. The monitor
 //! reconstructs the terminal fact's context from the operation's endpoint and
@@ -78,8 +79,8 @@ use std::{error::Error, fmt};
 
 use rutilus_domain::{
     AuditActor, AuditEvent, AuditFailure, AuditFailureVerification, AuditOperationContext,
-    AuditSequence, DeploymentPosture, EndpointId, Operation, OperationEvent, OperationId,
-    OperationState, RedfishCommand,
+    AuditRedfishOperation, AuditSequence, DeploymentPosture, EndpointId, Operation, OperationEvent,
+    OperationId, OperationState, RedfishCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskError, RemoteTaskState,
@@ -722,9 +723,13 @@ where
 
     /// Builds the monitor's §16.3 context for one endpoint.
     ///
-    /// The context reuses the executor's vocabulary (see
-    /// [`operation_audit_context`]). It carries a fresh `AuditOperationId`:
-    /// the append-only audit boundary has no read path to recover the
+    /// The context reuses the executor's execute-operation vocabulary (see
+    /// [`operation_audit_context`]) with
+    /// [`AuditRedfishOperation::PollRemoteTask`]: the terminal fact of an
+    /// asynchronous lifecycle describes the Task polling that observed the
+    /// outcome, not the write itself (which the executor's start fact
+    /// already names). It carries a fresh `AuditOperationId`: the
+    /// append-only audit boundary has no read path to recover the
     /// executor's start context, so the start (executor) and terminal
     /// (monitor) facts of one asynchronous operation are correlated only by
     /// the endpoint, actor, and origin until an audit-read boundary lands
@@ -738,11 +743,15 @@ where
         &self,
         endpoint_id: EndpointId,
     ) -> Result<AuditOperationContext, TaskMonitorErrorOf<Store, Reader, Audit>> {
-        operation_audit_context(endpoint_id, self.actor, self.origin).map_err(|source| {
-            TaskMonitorError::Audit {
-                stage: MonitorAuditStage::Terminal,
-                source: AuditRecordError::Context(source),
-            }
+        operation_audit_context(
+            endpoint_id,
+            AuditRedfishOperation::PollRemoteTask,
+            self.actor,
+            self.origin,
+        )
+        .map_err(|source| TaskMonitorError::Audit {
+            stage: MonitorAuditStage::Terminal,
+            source: AuditRecordError::Context(source),
         })
     }
 
@@ -868,8 +877,9 @@ mod tests {
     };
 
     use rutilus_domain::{
-        AuditOutcomeKind, AuditTarget, AuditVerification, EndpointId, OperationId, OperationSource,
-        OperationState, OperationTarget, RedfishCommand, ResetType, SystemCommand, TargetId,
+        AuditAction, AuditOutcomeKind, AuditRedfishOperation, AuditTarget, AuditVerification,
+        EndpointId, OperationId, OperationSource, OperationState, OperationTarget, RedfishCommand,
+        ResetType, SystemCommand, TargetId,
     };
     use rutilus_operation_engine::BoundaryFuture as OperationBoundaryFuture;
     use time::{Duration, OffsetDateTime};
@@ -1481,6 +1491,12 @@ mod tests {
         assert_eq!(
             events[0].context().target(),
             &AuditTarget::Endpoint(endpoint_id)
+        );
+        assert_eq!(events[0].context().action(), AuditAction::ExecuteOperation);
+        assert_eq!(
+            events[0].context().redfish_operation(),
+            AuditRedfishOperation::PollRemoteTask,
+            "the monitor's terminal fact names the Task polling that observed the outcome"
         );
         Ok(())
     }

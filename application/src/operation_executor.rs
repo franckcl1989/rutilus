@@ -1,11 +1,20 @@
 //! The command execution scheduler (design sections 13.3, 13.5, and 13.6).
 //!
-//! [`OperationExecutor`] drives one persisted operation from `Queued` toward
-//! a terminal state through the §13.2 state machine. It performs the first
-//! cut of the §13.3 pre-flight checks (steps 1-2: endpoint existence and
-//! capability availability), dispatches the typed command through the
-//! [`CommandExecutor`] boundary (step 7), and handles the §13.3 step 8
-//! branch that the response selects:
+//! [`OperationExecutor`] drives one persisted operation through the §13.2
+//! state machine.
+//! [`OperationExecutor::execute_operation`] runs the execution flow: it
+//! starts fresh `Queued` work and, after a crash, resumes work stranded in
+//! `Validating` — the state is persisted before dispatch, so the write was
+//! provably never issued and resuming the execution flow is always safe.
+//! [`OperationExecutor::recover_operation`] resolves the outcome of work
+//! stranded in `Running` or `Verifying` — states where the write may already
+//! have landed and the response is lost — through the §13.5 re-read-and-decide
+//! pattern (design section 13.6 restart recovery).
+//!
+//! The executor performs the first cut of the §13.3 pre-flight checks (steps
+//! 1-2: endpoint existence and capability availability), dispatches the typed
+//! command through the [`CommandExecutor`] boundary (step 7), and handles
+//! the §13.3 step 8 branch that the response selects:
 //!
 //! - synchronous acceptance (`Accepted`) is re-read and verified through the
 //!   [`CommandVerifier`] boundary (steps 9-10) to a terminal state;
@@ -26,9 +35,10 @@ use std::{error::Error, fmt};
 use rutilus_domain::{
     AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
     AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
-    AuditRedfishOperation, AuditSequence, AuditTarget, CapabilityState, DeploymentPosture,
-    EndpointCapability, EndpointId, Operation, OperationEvent, OperationId, OperationState,
-    ProductPermission, RedfishCommand,
+    AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand, CapabilityState,
+    ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId, EventCommand,
+    ManagerCommand, Operation, OperationEvent, OperationId, OperationState, ProductPermission,
+    RedfishCommand, SecureBootCommand, SystemCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
@@ -108,13 +118,19 @@ where
         }
     }
 
-    /// Executes one queued operation to a terminal state.
+    /// Executes one operation to a terminal state, starting fresh `Queued`
+    /// work or resuming an operation stranded in `Validating` by a crash.
     ///
     /// # Flow
     ///
-    /// 1. Read the operation. Only `Queued` work is schedulable; a
-    ///    not-found id and a non-queued state are defensive rejects that
-    ///    change nothing and record no audit (nothing was driven).
+    /// 1. Read the operation. Only `Queued` and `Validating` work is
+    ///    schedulable here: `Queued` work has never started, and a `Validating`
+    ///    operation persisted its validation step before dispatch, so the
+    ///    write was provably never issued and resuming is always safe (design
+    ///    section 13.6). Every other state is a defensive reject that changes
+    ///    nothing and records no audit (nothing was driven); the scheduler
+    ///    dispatches `Running`/`Verifying` to [`Self::recover_operation`] and
+    ///    `WaitingRemote` to the Task monitor.
     /// 2. Record the §16.3 start fact (before any pre-flight work, the same
     ///    order as the other audited use cases).
     /// 3. Pre-flight, first cut of §13.3 steps 1-2: the first target's
@@ -122,8 +138,10 @@ where
     ///    capability as `Supported`. A failed pre-flight is a provable
     ///    refusal — nothing has been dispatched — so the operation is
     ///    recorded `Failed`, never `Unknown`.
-    /// 4. Persist `ValidationStarted` → `ValidationPassed` → `Running`
-    ///    (§13.3 step 6, then the dispatch of step 7).
+    /// 4. Persist `ValidationStarted` (`Queued` work only — a resumed
+    ///    `Validating` operation already persisted this step in the crashed
+    ///    attempt) and `ValidationPassed` → `Running` (§13.3 step 6, then the
+    ///    dispatch of step 7).
     /// 5. Dispatch through [`CommandExecutor`]. `Accepted` (synchronous
     ///    `200`/`201`/`204` handled) persists `ExecutionAccepted`;
     ///    `AsyncTaskAccepted` (`202`) persists the [`RemoteTask`] observation
@@ -156,9 +174,9 @@ where
     ///
     /// Returns [`ExecutorError::OperationNotFound`] for an unknown id,
     /// [`ExecutorError::NotQueued`] when the operation is no longer `Queued`
-    /// (including a second driver racing this id — the engine reports the
-    /// state the domain observed), [`ExecutorError::EmptyTargets`] for a
-    /// corrupt zero-target row, and the store, pre-flight, dispatch,
+    /// or `Validating` (including a second driver racing this id — the engine
+    /// reports the state the domain observed), [`ExecutorError::EmptyTargets`]
+    /// for a corrupt zero-target row, and the store, pre-flight, dispatch,
     /// verification, and audit boundary errors with their sources chained.
     /// Note that a failed dispatch or verification still persists the
     /// operation's honest terminal state before the error is returned, so a
@@ -167,8 +185,8 @@ where
         &self,
         operation_id: OperationId,
     ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
-        // The scheduler drives only queued work. The engine exposes no read
-        // in this iteration, so the pre-read goes through the same
+        // The scheduler drives fresh and resumable work. The engine exposes
+        // no read in this iteration, so the pre-read goes through the same
         // `OperationStore` boundary the engine itself uses: the scheduler
         // must inspect the aggregate (state, first target, command) before
         // the first persisted step.
@@ -180,10 +198,11 @@ where
         else {
             return Err(ExecutorError::OperationNotFound(operation_id));
         };
-        if operation.state() != OperationState::Queued {
+        let state = operation.state();
+        if !matches!(state, OperationState::Queued | OperationState::Validating) {
             return Err(ExecutorError::NotQueued {
                 operation_id,
-                state: operation.state(),
+                state,
             });
         }
         let Some(target) = operation.targets().first() else {
@@ -196,7 +215,7 @@ where
         let command = operation.command();
         let engine = OperationEngine::new(&self.store);
 
-        let started = self.start_audit(endpoint_id).await?;
+        let started = self.start_audit(endpoint_id, &command).await?;
 
         if !self.endpoint_exists(endpoint_id).await? {
             return self
@@ -219,8 +238,14 @@ where
                 .await;
         }
 
-        self.apply_step(&engine, operation_id, OperationEvent::ValidationStarted)
-            .await?;
+        if state == OperationState::Queued {
+            // §13.3 step 6 begins the validation phase. A resumed `Validating`
+            // operation already persisted this step in the crashed attempt
+            // (which is exactly why the crash left it in `Validating`), so it
+            // resumes after the step.
+            self.apply_step(&engine, operation_id, OperationEvent::ValidationStarted)
+                .await?;
+        }
         self.apply_step(&engine, operation_id, OperationEvent::ValidationPassed)
             .await?;
 
@@ -228,7 +253,207 @@ where
             .await
     }
 
+    /// Resolves the outcome of an operation stranded in `Running` or
+    /// `Verifying` by a crash (design sections 13.5 and 13.6 restart
+    /// recovery).
+    ///
+    /// These two states share one property: the write may already have landed
+    /// and its response was lost, so the operation must never be re-dispatched
+    /// blindly — §13.5 lists Create/Delete/Action/Reset among the writes whose
+    /// lost response forbids a direct retry. Recovery therefore applies the
+    /// §13.5 pattern instead: re-read the target (or the persisted Task
+    /// record) and decide from what the re-read proves.
+    ///
+    /// # Per-state decisions
+    ///
+    /// - `Running` — the dispatch was in flight when the process died, so the
+    ///   write may or may not have been issued:
+    ///   - a persisted [`RemoteTask`] observation row proves the write was
+    ///     accepted as an asynchronous Task (the row is saved before
+    ///     `RemoteTaskStarted`, so a crash in that window leaves `Running`
+    ///     with a row; the Task's effect is not yet observable and a target
+    ///     re-read would misjudge it). Recovery back-fills `RemoteTaskStarted`
+    ///     → `WaitingRemote` and the Task monitor resumes the polling. This
+    ///     path records no audit: it performs no outcome work — the original
+    ///     attempt's start fact and the monitor's terminal fact already
+    ///     bracket the lifecycle.
+    ///   - without a Task row, the target is re-read through
+    ///     [`CommandVerifier`]:
+    ///     - `Confirmed` — the re-read proves the write happened (§13.5
+    ///       "判断是否已经发生"); `ExecutionAccepted` is back-filled (the
+    ///       re-read takes the place of the lost response) and the
+    ///       verification chain continues to `Succeeded`;
+    ///     - `Mismatched` — the expected result is absent. The operation
+    ///       provably did not achieve its result, so it is recorded `Failed`;
+    ///       it is never re-dispatched: an absent expected result does not
+    ///       confirm the write was never delivered (it may have been
+    ///       delivered and failed, or its effect may be transient — a reset's
+    ///       post-write state can equal its pre-write state), and §13.5
+    ///       allows a retry only for requests confirmable as not delivered.
+    ///       The verification is `Inconclusive` because — unlike the
+    ///       synchronous path, where the `Accepted` response proves delivery
+    ///       — the product cannot prove whether the write was ever delivered;
+    ///     - a failed re-read proves nothing and the operation is recorded
+    ///       `Unknown` (§13.5), escaping as [`ExecutorError::Verifier`].
+    /// - `Verifying` — `ExecutionAccepted` was persisted, which happens only
+    ///   after the synchronous response was received and fully handled, so
+    ///   the write provably landed and only the re-read was in flight. The
+    ///   target is re-read again (§13.5 re-read-and-decide):
+    ///   `Confirmed` → `VerificationPassed` → `Succeeded`; `Mismatched` → a
+    ///   provable failure (`Failed`, verification `Rejected` — delivery is
+    ///   proven by the persisted step); a failed re-read → `Unknown`.
+    ///
+    /// Every judgement path (the `Running` re-read and the `Verifying`
+    /// re-verify) records a fresh §16.3 start fact first: the append-only
+    /// audit boundary has no read path to recover the crashed attempt's
+    /// context, so each recovery attempt opens its own lifecycle (the same
+    /// documented limitation as the Task monitor's terminal fact). The
+    /// Task-row handoff above records no start — it performs no outcome
+    /// work, so the original attempt's start fact and the monitor's terminal
+    /// fact already bracket the lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::OperationNotFound`] for an unknown id,
+    /// [`ExecutorError::NotRecoverable`] when the operation is not in
+    /// `Running` or `Verifying`, [`ExecutorError::EmptyTargets`] for a
+    /// corrupt zero-target row, and the store, remote-task, verification, and
+    /// audit boundary errors with their sources chained. A failed judgement
+    /// re-read still persists the operation's honest terminal state
+    /// (`Unknown`) before the error is returned.
+    pub async fn recover_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
+        let Some(operation) = self
+            .store
+            .find_operation(operation_id)
+            .await
+            .map_err(ExecutorError::Store)?
+        else {
+            return Err(ExecutorError::OperationNotFound(operation_id));
+        };
+        let state = operation.state();
+        if !matches!(state, OperationState::Running | OperationState::Verifying) {
+            return Err(ExecutorError::NotRecoverable {
+                operation_id,
+                state,
+            });
+        }
+        let Some(target) = operation.targets().first() else {
+            // Rehydration does not re-check targets, so a corrupt persisted
+            // row can still reach the recovery path; a target is needed for
+            // the §13.5 judgement re-read.
+            return Err(ExecutorError::EmptyTargets(operation_id));
+        };
+        let endpoint_id = target.endpoint_id();
+        let command = operation.command();
+        let engine = OperationEngine::new(&self.store);
+
+        if state == OperationState::Running {
+            // The §13.6 observation row is persisted BEFORE the
+            // `RemoteTaskStarted` step (the row is what a crash between
+            // acceptance and the first poll must not lose), so a `Running`
+            // operation that has a row provably waits on an accepted Task:
+            // recovery resumes Task tracking instead of judging by re-read,
+            // whose expected-result check cannot see a Task that is still
+            // running and would misjudge it as not occurred.
+            let accepted = self
+                .store
+                .find_remote_task(operation_id)
+                .await
+                .map_err(ExecutorError::RemoteTask)?
+                .is_some();
+            if accepted {
+                return self
+                    .recover_step(&engine, operation_id, OperationEvent::RemoteTaskStarted)
+                    .await;
+            }
+            let started = self.start_audit(endpoint_id, &command).await?;
+            return self
+                .judge_running(&engine, operation_id, endpoint_id, &command, &started)
+                .await;
+        }
+        let started = self.start_audit(endpoint_id, &command).await?;
+        self.verify_target(&engine, operation_id, endpoint_id, &command, &started)
+            .await
+            .map_err(guard_recovery_race)
+    }
+
+    /// The §13.5 judgement of a `Running` orphan whose dispatch outcome is
+    /// unknown: re-read the target and decide what the re-read proves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Verifier`] with the re-read error as its
+    /// source after the operation has been persisted into `Unknown` (a failed
+    /// re-read proves nothing about the possibly-landed write, design section
+    /// 13.5) and the terminal audit fact has been recorded.
+    async fn judge_running(
+        &self,
+        engine: &OperationEngine<&Store>,
+        operation_id: OperationId,
+        endpoint_id: EndpointId,
+        command: &RedfishCommand,
+        started: &StartedAudit,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
+        match self.gateway.verify(endpoint_id, command).await {
+            Ok(VerificationVerdict::Confirmed) => {
+                // The re-read proves the write already happened (§13.5
+                // "判断是否已经发生"), so `ExecutionAccepted` is back-filled —
+                // the re-read takes the place of the lost response — and the
+                // verification chain continues exactly as after a synchronous
+                // acceptance.
+                self.recover_step(engine, operation_id, OperationEvent::ExecutionAccepted)
+                    .await?;
+                let final_operation = self
+                    .recover_step(engine, operation_id, OperationEvent::VerificationPassed)
+                    .await?;
+                self.record_success(started).await?;
+                Ok(final_operation)
+            }
+            Ok(VerificationVerdict::Mismatched) => {
+                // §13.5 decision: the expected result is absent, so the
+                // operation provably did not achieve its result — but an
+                // absent expected result does not confirm the write was never
+                // delivered (it may have been delivered and failed, or its
+                // effect may be transient), and §13.5 allows a retry only for
+                // requests confirmable as not delivered. The operation is
+                // therefore recorded `Failed`, never re-dispatched; the
+                // verification is `Inconclusive` because the product cannot
+                // prove whether the write was ever delivered.
+                let final_operation = self
+                    .recover_step(engine, operation_id, OperationEvent::Failed)
+                    .await?;
+                self.record_failure(
+                    started,
+                    AuditFailure::CoreResourceReadFailed,
+                    AuditFailureVerification::Inconclusive,
+                )
+                .await?;
+                Ok(final_operation)
+            }
+            Err(source) => {
+                // §13.5: a failed re-read proves nothing about the
+                // possibly-landed write, so the outcome cannot be confirmed
+                // and the operation is recorded Unknown.
+                self.recover_step(engine, operation_id, OperationEvent::OutcomeUnknown)
+                    .await?;
+                self.record_failure(
+                    started,
+                    AuditFailure::CoreResourceReadFailed,
+                    AuditFailureVerification::Inconclusive,
+                )
+                .await?;
+                Err(ExecutorError::Verifier(source))
+            }
+        }
+    }
+
     /// Builds and appends the §16.3 start fact before any pre-flight work.
+    ///
+    /// The context names the command's §7.5 write family, so the audit record
+    /// shows which typed write the attempt dispatched or judged.
     ///
     /// # Errors
     ///
@@ -238,14 +463,18 @@ where
     async fn start_audit(
         &self,
         endpoint_id: EndpointId,
+        command: &RedfishCommand,
     ) -> Result<StartedAudit, ExecutorErrorOf<Store, Gateway, Audit>> {
-        let context =
-            operation_audit_context(endpoint_id, self.actor, self.origin).map_err(|source| {
-                ExecutorError::Audit {
-                    stage: OperationAuditStage::Start,
-                    source: AuditRecordError::Context(source),
-                }
-            })?;
+        let context = operation_audit_context(
+            endpoint_id,
+            command_audit_operation(command),
+            self.actor,
+            self.origin,
+        )
+        .map_err(|source| ExecutorError::Audit {
+            stage: OperationAuditStage::Start,
+            source: AuditRecordError::Context(source),
+        })?;
         let terminal_sequence =
             AuditSequence::FIRST
                 .next()
@@ -381,6 +610,31 @@ where
                 // `EngineError` is a closed enum.
                 EngineError::EmptyTargets => ExecutorError::EmptyTargets(operation_id),
             })
+    }
+
+    /// Persists one §13.2 step on the recovery path, mapping a transition
+    /// race onto the recovery contract's own guard name.
+    ///
+    /// The shared step helper maps an `InvalidTransition` race onto
+    /// [`ExecutorError::NotQueued`] — the execution flow's guard — but a
+    /// recovery step races with another driver that moved the operation out
+    /// of `Running`/`Verifying`, so the guard is
+    /// [`ExecutorError::NotRecoverable`], with the state the domain reported
+    /// preserved. Every other verdict passes through unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same vocabulary as [`Self::apply_step`], with the race verdict
+    /// renamed for the recovery contract.
+    async fn recover_step(
+        &self,
+        engine: &OperationEngine<&Store>,
+        operation_id: OperationId,
+        event: OperationEvent,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
+        self.apply_step(engine, operation_id, event)
+            .await
+            .map_err(guard_recovery_race)
     }
 
     /// Dispatches the write (§13.3 step 7) and drives the outcome of the
@@ -554,11 +808,12 @@ where
     ///
     /// The failure classes are the closest 0.1 vocabulary values for each
     /// phase (endpoint pre-flight, capability pre-flight, dispatch,
-    /// verification); the write-specific failure vocabulary is the next
-    /// domain iteration's work (see [`operation_audit_context`]). The
-    /// verification class is the truthful part: `Rejected` for every provable
-    /// outcome and `Inconclusive` for every outcome the product cannot prove
-    /// (design section 13.5).
+    /// verification); write-specific failure classes are a later iteration's
+    /// work, while the action and Redfish-operation fields are now the
+    /// truthful execute-operation vocabulary (see [`operation_audit_context`]).
+    /// The verification class is the truthful part: `Rejected` for every
+    /// provable outcome and `Inconclusive` for every outcome the product
+    /// cannot prove (design section 13.5).
     ///
     /// # Errors
     ///
@@ -631,27 +886,27 @@ struct StartedAudit {
     started_at: OffsetDateTime,
 }
 
-/// Builds the audit context of one operation execution attempt.
+/// Builds the audit context of one operation execution or Task-poll attempt.
 ///
-/// Shared by the executor (start + synchronous terminal facts) and the Task
-/// monitor (the asynchronous terminal fact, design section 13.6).
+/// Shared by the executor (start + synchronous terminal facts, naming the
+/// command's §7.5 write family) and the Task monitor (the asynchronous
+/// terminal fact, design section 13.6, naming
+/// [`AuditRedfishOperation::PollRemoteTask`]).
 ///
-/// # Why the refresh vocabulary
+/// # Why the execute-operation vocabulary
 ///
-/// The 0.1 domain audit vocabulary (§16.3) accepts exactly three
-/// (target, parameter summary, permission, action, Redfish operation)
-/// combinations — enrollment, refresh, and CSV import — and none of them
-/// describes executing a write. The domain crate is read-only for this
-/// iteration, so the only legal context whose target is truthful (the managed
-/// endpoint that receives the write) is the refresh combination. The
-/// operation-specific vocabulary — an execute-operation action, the
-/// Reset/Boot/SecureBoot/Event Redfish operation types, and the
-/// write-failure classes — is the next domain iteration's work; until then
-/// the permission, action, and Redfish-operation fields of the recorded
-/// context are the closest legal values and must not be read as naming the
-/// product action they display. The truthful parts of every recorded event
-/// are the actor, the origin, the endpoint target, the occurrence time, and
-/// the outcome (started / succeeded / failed with its verification class).
+/// The §16.3 domain vocabulary names the execution of a persisted write
+/// (§13.1): the action is [`AuditAction::ExecuteOperation`], the permission
+/// checked before it is [`ProductPermission::ExecuteOperations`], and the
+/// typed [`AuditRedfishOperation`] is the §7.5 write family the command
+/// dispatches — so a viewer can distinguish an action that only reads from
+/// one that changes the managed endpoint. The parameter summary stays
+/// [`AuditParameterSummary::EndpointRefresh`]: the domain documents it as
+/// the closest legal summary until an operation-scoped summary lands
+/// together with its persistence projection. The truthful parts of every
+/// recorded event are the actor, the origin, the endpoint target, the
+/// occurrence time, the write family, and the outcome (started / succeeded /
+/// failed with its verification class).
 ///
 /// # Errors
 ///
@@ -659,6 +914,7 @@ struct StartedAudit {
 /// 0.1 vocabulary accepts.
 pub(crate) fn operation_audit_context(
     endpoint_id: EndpointId,
+    redfish_operation: AuditRedfishOperation,
     actor: AuditActor,
     origin: DeploymentPosture,
 ) -> Result<AuditOperationContext, AuditOperationContextError> {
@@ -668,10 +924,44 @@ pub(crate) fn operation_audit_context(
         origin,
         AuditTarget::Endpoint(endpoint_id),
         AuditParameterSummary::EndpointRefresh,
-        ProductPermission::RefreshEndpoints,
-        AuditAction::RefreshEndpoint,
-        AuditRedfishOperation::ReadCoreResources,
+        ProductPermission::ExecuteOperations,
+        AuditAction::ExecuteOperation,
+        redfish_operation,
     )
+}
+
+/// Maps one typed command to the §16.3 audit name of its §7.5 write family.
+///
+/// The mapping is exhaustive per the §7.5 family list, so a new command
+/// variant fails to compile until its audit name is decided here — the same
+/// rule as [`required_capability`]. The granularity mirrors the domain
+/// vocabulary: the three resets, the two Secure Boot writes beyond enable,
+/// and subscription create/delete are named separately because their
+/// accountability differs.
+fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
+    match command {
+        RedfishCommand::System(SystemCommand::Reset(_)) => AuditRedfishOperation::ResetSystem,
+        RedfishCommand::Manager(ManagerCommand::Reset(_)) => AuditRedfishOperation::ResetManager,
+        RedfishCommand::Chassis(ChassisCommand::Reset(_)) => AuditRedfishOperation::ResetChassis,
+        RedfishCommand::Boot(BootCommand::SetBootSourceOverride(_)) => {
+            AuditRedfishOperation::SetBootSourceOverride
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::Enable) => {
+            AuditRedfishOperation::SecureBootEnable
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::Disable) => {
+            AuditRedfishOperation::SecureBootDisable
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(_)) => {
+            AuditRedfishOperation::SecureBootResetKeys
+        }
+        RedfishCommand::Event(EventCommand::CreateSubscription(_)) => {
+            AuditRedfishOperation::CreateEventSubscription
+        }
+        RedfishCommand::Event(EventCommand::DeleteSubscription(_)) => {
+            AuditRedfishOperation::DeleteEventSubscription
+        }
+    }
 }
 
 /// Maps one typed command to the capability the endpoint must advertise.
@@ -712,6 +1002,63 @@ fn required_capability_state(
 /// or after the start fact even when the clock reports an identical instant.
 fn at_or_after(previous: OffsetDateTime, observed: OffsetDateTime) -> OffsetDateTime {
     previous.max(observed)
+}
+
+/// Renames the execution-flow race guard to the recovery contract's guard for
+/// errors observed on the recovery path.
+///
+/// The recovery path shares the step helper of the execution flow, which
+/// reports a transition race as [`ExecutorError::NotQueued`] ("only queued or
+/// validating work"); on the recovery path the same race means "another
+/// driver moved the operation out of `Running`/`Verifying`", which is
+/// [`ExecutorError::NotRecoverable`]. Every other error passes through
+/// unchanged.
+fn guard_recovery_race<
+    StoreError,
+    RepositoryError,
+    CapabilityError,
+    RemoteTaskStoreError,
+    GatewayError,
+    VerifierError,
+    AuditError,
+>(
+    error: ExecutorError<
+        StoreError,
+        RepositoryError,
+        CapabilityError,
+        RemoteTaskStoreError,
+        GatewayError,
+        VerifierError,
+        AuditError,
+    >,
+) -> ExecutorError<
+    StoreError,
+    RepositoryError,
+    CapabilityError,
+    RemoteTaskStoreError,
+    GatewayError,
+    VerifierError,
+    AuditError,
+>
+where
+    StoreError: Error + 'static,
+    RepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
+    RemoteTaskStoreError: Error + 'static,
+    GatewayError: Error + 'static,
+    VerifierError: Error + 'static,
+    AuditError: Error + 'static,
+{
+    match error {
+        ExecutorError::NotQueued {
+            operation_id,
+            state,
+        } => ExecutorError::NotRecoverable {
+            operation_id,
+            state,
+        },
+        other => other,
+    }
 }
 
 /// The audit lifecycle point that could not be recorded (§16.3).
@@ -762,15 +1109,36 @@ pub enum ExecutorError<
     /// The operation id is not known to the store.
     #[error("operation {0} was not found")]
     OperationNotFound(OperationId),
-    /// The scheduler tried to drive an operation that is no longer queued.
+    /// The scheduler tried to drive an operation that is no longer queued or
+    /// validating.
     ///
-    /// This is the defensive guard for the queued-only scheduling contract:
-    /// either the caller passed a state the scheduler must not touch, or a
-    /// second driver advanced the operation between the scheduler's read and
-    /// its first persisted step (the domain state machine reported the
-    /// current state).
-    #[error("operation {operation_id} is {state} and only queued operations are schedulable")]
+    /// This is the defensive guard for the execution-flow scheduling contract
+    /// (fresh `Queued` work and crash-resumed `Validating` work): either the
+    /// caller passed a state the execution flow must not touch — the
+    /// scheduler dispatches `Running`/`Verifying` to
+    /// [`OperationExecutor::recover_operation`] and `WaitingRemote` to the
+    /// Task monitor — or a second driver advanced the operation between the
+    /// scheduler's read and its first persisted step (the domain state
+    /// machine reported the current state).
+    #[error(
+        "operation {operation_id} is {state} and only queued or validating operations are schedulable"
+    )]
     NotQueued {
+        operation_id: OperationId,
+        state: OperationState,
+    },
+    /// The scheduler tried to recover an operation that is not stranded in
+    /// flight.
+    ///
+    /// This is the defensive guard for the recovery contract: only `Running`
+    /// (dispatch outcome unknown, §13.5) and `Verifying` (re-read in flight)
+    /// carry unfinished outcome work. `Validating` work resumes through
+    /// [`OperationExecutor::execute_operation`], `WaitingRemote` work through
+    /// the Task monitor, and terminal states are final.
+    #[error(
+        "operation {operation_id} is {state} and only running or verifying operations are recoverable"
+    )]
+    NotRecoverable {
         operation_id: OperationId,
         state: OperationState,
     },
@@ -791,14 +1159,18 @@ pub enum ExecutorError<
     /// The capability pre-flight (§13.3 step 2) could not be evaluated.
     #[error("capability pre-flight query failed: {0}")]
     CapabilityPreflight(#[source] EndpointCapabilityQueryError<CapabilityError>),
-    /// The §13.6 observation row of an accepted Task could not be persisted.
+    /// The §13.6 observation row of an accepted Task could not be persisted
+    /// or read.
     ///
-    /// The BMC already accepted the write (the `202` was dispatched), so the
-    /// operation is recorded `Unknown` — the product cannot prove the outcome
-    /// of a Task it cannot track (§13.5), and re-dispatching would execute
-    /// the write twice — and the terminal audit fact is recorded before this
-    /// error is returned.
-    #[error("remote task observation could not be persisted: {0}")]
+    /// After a failed save, the BMC already accepted the write (the `202` was
+    /// dispatched), so the operation is recorded `Unknown` — the product
+    /// cannot prove the outcome of a Task it cannot track (§13.5), and
+    /// re-dispatching would execute the write twice — and the terminal audit
+    /// fact is recorded before this error is returned. A failed read on the
+    /// recovery path (design section 13.6) carries the same error with no
+    /// step persisted: the row could not be inspected, so the recovery cannot
+    /// tell an accepted Task from a lost dispatch.
+    #[error("remote task observation could not be persisted or read: {0}")]
     RemoteTask(#[source] RemoteTaskStoreError),
     /// The command dispatch (§13.3 step 7) failed.
     ///
@@ -835,9 +1207,12 @@ mod tests {
     };
 
     use rutilus_domain::{
-        AuditOutcomeKind, AuditVerification, CapabilityState, CredentialId, Endpoint,
-        EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        OperationSource, OperationTarget, ResetType, ResourceSnapshot, SystemCommand, TargetId,
+        AuditOutcomeKind, AuditVerification, BootCommand, BootSource, BootSourceOverrideEnabled,
+        BootSourceOverrideMode, CapabilityState, ChassisCommand, CreateSubscription, CredentialId,
+        DeleteSubscription, Endpoint, EndpointAddress, EndpointCapabilityObservation,
+        EndpointDisplayName, EndpointId, EventCommand, EventDestinationProtocol, EventType,
+        ManagerCommand, OperationSource, OperationTarget, ResetKeysType, ResetType,
+        ResourceSnapshot, SecureBootCommand, SetBootSourceOverride, SystemCommand, TargetId,
         TlsCertificate, TlsTrust,
     };
     use rutilus_operation_engine::{
@@ -869,6 +1244,40 @@ mod tests {
             RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
             created_at(),
         )
+    }
+
+    /// Builds one operation parked in the given in-flight state, exactly as
+    /// rehydration would surface it after a crash (every step at the fixed
+    /// clock time).
+    ///
+    /// Only the recovery states are parkable; any other state is a test bug,
+    /// and the helper says so instead of constructing a meaningless row.
+    fn parked_operation(
+        endpoint_id: EndpointId,
+        state: OperationState,
+    ) -> Result<Operation, Box<dyn Error>> {
+        let steps: &[OperationEvent] = match state {
+            OperationState::Validating => &[OperationEvent::ValidationStarted],
+            OperationState::Running => &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+            ],
+            OperationState::Verifying => &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+                OperationEvent::ExecutionAccepted,
+            ],
+            _ => {
+                return Err(
+                    std::io::Error::other("test helper parks only in-flight states").into(),
+                );
+            }
+        };
+        let mut operation = queued_operation(endpoint_id);
+        for step in steps {
+            operation.apply(*step, clock_time())?;
+        }
+        Ok(operation)
     }
 
     /// Builds one trusted endpoint row for the pre-flight existence check.
@@ -966,6 +1375,8 @@ mod tests {
         capabilities: Vec<StoredCapability>,
         calls: Mutex<Vec<Call>>,
         fail_once: Mutex<Option<FailureKind>>,
+        find_calls: Mutex<usize>,
+        find_race: Mutex<Option<(usize, OperationState)>>,
     }
 
     impl FakeStore {
@@ -977,12 +1388,29 @@ mod tests {
                 capabilities,
                 calls: Mutex::new(Vec::new()),
                 fail_once: Mutex::new(None),
+                find_calls: Mutex::new(0),
+                find_race: Mutex::new(None),
             }
         }
 
         /// Arms exactly one failure for the next call of `kind`.
         fn arm_failure(&self, kind: FailureKind) -> Result<(), MockError> {
             *self.fail_once.lock().map_err(|_| MockError::Events)? = Some(kind);
+            Ok(())
+        }
+
+        /// Arms a transition race: the `n`-th `find_operation` read
+        /// (1-based) reports the operation in `state` instead of its stored
+        /// state.
+        ///
+        /// This is the injection seam for the `InvalidTransition` race the
+        /// domain state machine reports when a second driver advances the
+        /// operation between the executor's own read and the engine's step
+        /// read — the engine's `find` inside `apply` is always exactly one
+        /// `find_operation` call later, so tests arm `on_call = 2`. Every
+        /// other read returns the stored row.
+        fn arm_find_race(&self, on_call: usize, state: OperationState) -> Result<(), MockError> {
+            *self.find_race.lock().map_err(|_| MockError::Events)? = Some((on_call, state));
             Ok(())
         }
 
@@ -1060,12 +1488,38 @@ mod tests {
                 if self.consume_failure(FailureKind::Read)? {
                     return Err(MockError::Store);
                 }
-                Ok(self
+                let mut find_count = self.find_calls.lock().map_err(|_| MockError::Events)?;
+                *find_count += 1;
+                let race = self.find_race.lock().map_err(|_| MockError::Events)?;
+                let row = self
                     .rows
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .get(&operation_id)
-                    .cloned())
+                    .cloned();
+                if let Some((target, state)) = *race
+                    && *find_count == target
+                {
+                    // Report the operation in `state` instead of its
+                    // stored state: a second driver advanced the operation,
+                    // so the domain state machine will reject the next step
+                    // as an invalid transition — the race the executor's
+                    // step helpers guard against.
+                    let row = row.ok_or(MockError::Store)?;
+                    return Ok(Some(
+                        Operation::try_from_parts(
+                            row.id(),
+                            row.source(),
+                            row.targets().to_vec(),
+                            row.command(),
+                            state,
+                            row.created_at(),
+                            row.updated_at(),
+                        )
+                        .map_err(|_| MockError::Store)?,
+                    ));
+                }
+                Ok(row)
             })
         }
 
@@ -1902,8 +2356,11 @@ mod tests {
     async fn non_queued_operation_is_rejected_without_side_effects() -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        // A Running operation belongs to the recovery path, not the execution
+        // flow; the executor must refuse it without touching anything.
         let mut operation = queued_operation(endpoint_id);
         operation.apply(OperationEvent::ValidationStarted, clock_time())?;
+        operation.apply(OperationEvent::ValidationPassed, clock_time())?;
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(
             Ok(CommandOutcome::Accepted),
@@ -1918,7 +2375,7 @@ mod tests {
             result,
             Err(ExecutorError::NotQueued {
                 operation_id,
-                state: OperationState::Validating,
+                state: OperationState::Running,
             }) if operation_id == operation.id()
         ));
         assert_eq!(
@@ -1928,6 +2385,644 @@ mod tests {
         );
         assert_eq!(audit.recorded_events()?.len(), 0);
         assert_eq!(gateway.recorded_calls()?.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validating_orphan_resumes_the_execution_flow() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Validating)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.execute_operation(operation_id).await?;
+
+        assert_eq!(finished.id(), operation_id);
+        assert_eq!(finished.state(), OperationState::Succeeded);
+        // The resumed attempt skips ValidationStarted (the crashed attempt
+        // already persisted it — that is exactly why the crash left the
+        // operation in Validating) and re-runs the remaining execution flow:
+        // pre-flight, ValidationPassed, dispatch, verification.
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Running,
+                OperationState::Verifying,
+                OperationState::Succeeded,
+            ]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [
+                GatewayCall {
+                    kind: GatewayCallKind::Execute,
+                    endpoint_id,
+                    command: operation.command(),
+                },
+                GatewayCall {
+                    kind: GatewayCallKind::Verify,
+                    endpoint_id,
+                    command: operation.command(),
+                },
+            ]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(events[0].context(), events[1].context());
+        assert_eq!(
+            events[0].context().target(),
+            &AuditTarget::Endpoint(endpoint_id)
+        );
+        assert_eq!(
+            events[0].context().action(),
+            AuditAction::ExecuteOperation,
+            "the §16.3 vocabulary names the execution of the persisted write"
+        );
+        assert_eq!(
+            events[0].context().permission(),
+            ProductPermission::ExecuteOperations
+        );
+        assert_eq!(
+            events[0].context().redfish_operation(),
+            AuditRedfishOperation::ResetSystem,
+            "the §16.3 vocabulary names the exact §7.5 write family"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validating_orphan_preflight_refusal_records_failed() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        // The endpoint vanished while the operation was in flight: the resumed
+        // pre-flight refuses the operation before anything is dispatched.
+        let store = FakeStore::new(None, Vec::new());
+        let operation = parked_operation(endpoint_id, OperationState::Validating)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?.len(),
+            0,
+            "no dispatch may happen after a resumed pre-flight refusal"
+        );
+        assert_eq!(
+            audit.recorded_events()?[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_orphan_with_confirmed_judgement_backfills_acceptance_and_succeeds()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        // No RemoteTask row: the dispatch outcome is judged by re-reading the
+        // target (§13.5).
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.recover_operation(operation_id).await?;
+
+        assert_eq!(finished.id(), operation_id);
+        assert_eq!(finished.state(), OperationState::Succeeded);
+        // The judgement re-read proves the write already happened, so
+        // ExecutionAccepted is back-filled (the re-read takes the place of
+        // the lost response) and the verification chain continues (§13.5).
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Verifying, OperationState::Succeeded,]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "recovery must never re-dispatch; only the judgement re-read runs"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Confirmed)
+        );
+        assert_eq!(events[0].context(), events[1].context());
+        assert_eq!(
+            events[0].context().target(),
+            &AuditTarget::Endpoint(endpoint_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_orphan_with_mismatched_judgement_records_failed_without_redispatch()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Mismatched),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.recover_operation(operation_id).await?;
+
+        // The expected result is absent: the operation provably did not
+        // achieve its result, but an absent result does not confirm the write
+        // was never delivered (§13.5 retry gate), so the operation is Failed,
+        // never re-dispatched.
+        assert_eq!(finished.id(), operation_id);
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "an unconfirmed write must never be re-dispatched (§13.5)"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().failure(),
+            Some(AuditFailure::CoreResourceReadFailed)
+        );
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive),
+            "the product cannot prove whether the write was ever delivered"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_orphan_with_failed_judgement_records_unknown_and_propagates_the_source()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(Ok(CommandOutcome::Accepted), Err(MockError::Verifier));
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.recover_operation(operation.id()).await;
+
+        let error = result.err().ok_or("the re-read failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::Verifier(MockError::Verifier)
+        ));
+        assert_error_source(&error, MockError::Verifier)?;
+        // The failed re-read proves nothing about the possibly-landed write,
+        // so the operation is recorded Unknown (§13.5).
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Unknown]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_orphan_with_persisted_task_row_resumes_task_tracking()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        // The crash window between the 202 acceptance and the
+        // RemoteTaskStarted step: the observation row is already durable
+        // (§13.6), which proves the write was accepted as a Task.
+        store
+            .save_remote_task(&RemoteTask::new(
+                operation.id(),
+                endpoint_id,
+                TaskUri::parse("/redfish/v1/TaskService/Tasks/42")?,
+                None,
+                clock_time(),
+            ))
+            .await?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let waiting = executor.recover_operation(operation_id).await?;
+
+        assert_eq!(waiting.id(), operation_id);
+        assert_eq!(waiting.state(), OperationState::WaitingRemote);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::WaitingRemote]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?.len(),
+            0,
+            "an accepted Task is resumed by polling, never judged or re-dispatched"
+        );
+        assert_eq!(
+            audit.recorded_events()?.len(),
+            0,
+            "the handoff performs no outcome work, so it records no audit fact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifying_orphan_reverifies_to_success() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Verifying)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.recover_operation(operation_id).await?;
+
+        assert_eq!(finished.state(), OperationState::Succeeded);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Succeeded]
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "a Verifying orphan re-runs only the verification re-read"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Confirmed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifying_orphan_with_mismatch_records_failed() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Verifying)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Mismatched),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.recover_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().failure(),
+            Some(AuditFailure::CoreResourceReadFailed)
+        );
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Rejected),
+            "delivery is proven by the persisted ExecutionAccepted step"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifying_orphan_with_failed_verification_records_unknown_and_propagates_the_source()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Verifying)?;
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(Ok(CommandOutcome::Accepted), Err(MockError::Verifier));
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.recover_operation(operation.id()).await;
+
+        let error = result.err().ok_or("the re-read failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::Verifier(MockError::Verifier)
+        ));
+        assert_error_source(&error, MockError::Verifier)?;
+        // The write already landed (ExecutionAccepted was persisted); the
+        // failed re-read proves nothing, so the operation is Unknown (§13.5).
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Unknown]
+        );
+        assert_eq!(
+            audit.recorded_events()?[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_recoverable_states_are_rejected_without_side_effects() -> Result<(), Box<dyn Error>>
+    {
+        // Every state outside the recovery span (Running/Verifying) belongs
+        // to another driver: Queued and Validating run the execution flow,
+        // WaitingRemote runs the Task-monitor pass, and the terminal states
+        // are final. The recovery path must refuse each of them without
+        // touching anything.
+        for state in [
+            OperationState::Queued,
+            OperationState::Validating,
+            OperationState::WaitingRemote,
+            OperationState::Succeeded,
+            OperationState::Failed,
+            OperationState::Unknown,
+            OperationState::Cancelled,
+        ] {
+            let endpoint_id = EndpointId::generate();
+            let store =
+                FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+            let operation = Operation::try_from_parts(
+                OperationId::generate(),
+                OperationSource::Standalone,
+                vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+                RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                state,
+                created_at(),
+                clock_time(),
+            )?;
+            store.insert(operation.clone())?;
+            let gateway = FakeGateway::new(
+                Ok(CommandOutcome::Accepted),
+                Ok(VerificationVerdict::Confirmed),
+            );
+            let audit = MockAudit::succeed();
+            let executor = executor(&store, &gateway, &audit);
+
+            let result = executor.recover_operation(operation.id()).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(ExecutorError::NotRecoverable {
+                        operation_id,
+                        state: observed,
+                    }) if operation_id == operation.id() && observed == state
+                ),
+                "recovering a {state} operation must be refused"
+            );
+            assert_eq!(
+                store.recorded_calls()?,
+                [Call::Find(operation.id())],
+                "the defense must not persist anything"
+            );
+            assert_eq!(audit.recorded_events()?.len(), 0);
+            assert_eq!(gateway.recorded_calls()?.len(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transition_race_during_execution_reports_not_queued() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = queued_operation(endpoint_id);
+        store.insert(operation.clone())?;
+        // A second driver advanced the operation to Running between the
+        // executor's own read (find 1) and the engine's first step read
+        // (find 2): ValidationStarted is invalid from Running, so the domain
+        // state machine rejects the step.
+        store.arm_find_race(2, OperationState::Running)?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NotQueued {
+                operation_id,
+                state: OperationState::Running,
+            }) if operation_id == operation.id()
+        ));
+        // The start audit fact of the attempt was recorded before the raced
+        // step; the raced step itself was never persisted and nothing was
+        // dispatched.
+        assert_eq!(
+            applied_states(&store.recorded_calls()?).len(),
+            0,
+            "the raced step must not be persisted"
+        );
+        assert_eq!(audit.recorded_events()?.len(), 1);
+        assert_eq!(gateway.recorded_calls()?.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transition_race_during_recovery_reports_not_recoverable() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        // A second driver moved the operation to WaitingRemote between the
+        // executor's own read (find 1) and the engine's judgement-step read
+        // (find 2): ExecutionAccepted is invalid from WaitingRemote, so the
+        // recovery step is rejected with the recovery contract's own guard.
+        store.arm_find_race(2, OperationState::WaitingRemote)?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.recover_operation(operation.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NotRecoverable {
+                operation_id,
+                state: OperationState::WaitingRemote,
+            }) if operation_id == operation.id()
+        ));
+        // The judgement re-read ran and the attempt's start fact landed
+        // before the raced step; the raced step itself was never persisted.
+        assert_eq!(
+            applied_states(&store.recorded_calls()?).len(),
+            0,
+            "the raced step must not be persisted"
+        );
+        assert_eq!(audit.recorded_events()?.len(), 1);
+        assert_eq!(
+            gateway.recorded_calls()?.len(),
+            1,
+            "the judgement re-read ran before the raced step"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_audit_operations_pin_the_nine_write_families() -> Result<(), Box<dyn Error>> {
+        // One representative command per §7.5 write family, pinned against
+        // the audit operation type it must map to — the same exhaustive-pair
+        // style as the domain's execute-context tests, so a swapped mapping
+        // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another) fails
+        // here instead of reaching the audit log.
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 9] = [
+            (
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                AuditRedfishOperation::ResetSystem,
+            ),
+            (
+                &RedfishCommand::Manager(ManagerCommand::Reset(ResetType::ForceRestart)),
+                AuditRedfishOperation::ResetManager,
+            ),
+            (
+                &RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::PowerCycle)),
+                AuditRedfishOperation::ResetChassis,
+            ),
+            (
+                &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                    SetBootSourceOverride::new(
+                        BootSource::Pxe,
+                        BootSourceOverrideEnabled::Once,
+                        BootSourceOverrideMode::Uefi,
+                    ),
+                )),
+                AuditRedfishOperation::SetBootSourceOverride,
+            ),
+            (
+                &RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+                AuditRedfishOperation::SecureBootEnable,
+            ),
+            (
+                &RedfishCommand::SecureBoot(SecureBootCommand::Disable),
+                AuditRedfishOperation::SecureBootDisable,
+            ),
+            (
+                &RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(
+                    ResetKeysType::ResetAllKeysToDefault,
+                )),
+                AuditRedfishOperation::SecureBootResetKeys,
+            ),
+            (
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://events.example.test".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+                AuditRedfishOperation::CreateEventSubscription,
+            ),
+            (
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "42".to_owned(),
+                ))),
+                AuditRedfishOperation::DeleteEventSubscription,
+            ),
+        ];
+        for (command, expected) in pairs {
+            assert_eq!(
+                command_audit_operation(command),
+                expected,
+                "the command family must map to exactly its own audit operation"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_of_unknown_operation_reports_not_found() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let unknown = OperationId::generate();
+
+        let result = executor.recover_operation(unknown).await;
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::OperationNotFound(id)) if id == unknown
+        ));
+        assert_eq!(store.recorded_calls()?, [Call::Find(unknown)]);
+        assert_eq!(audit.recorded_events()?.len(), 0);
         Ok(())
     }
 
