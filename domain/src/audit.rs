@@ -112,6 +112,13 @@ stable_audit_codes! {
     /// operation of its own even though it never changes a resource, so the
     /// vocabulary must be able to name it when a monitor-recorded audit fact
     /// describes the poll.
+    ///
+    /// `UpdateFirmware` names the §14.3 firmware update submission: the
+    /// operation that uploads a previously validated artifact to the target
+    /// `UpdateService`. It is the audit name of the
+    /// [`UpdateCommand::StartUpdate`](crate::UpdateCommand::StartUpdate)
+    /// write family, so an audit reader can distinguish a firmware submission
+    /// from every other §7.5 write.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
@@ -125,6 +132,7 @@ stable_audit_codes! {
         SecureBootResetKeys => "secure-boot-reset-keys",
         CreateEventSubscription => "create-event-subscription",
         DeleteEventSubscription => "delete-event-subscription",
+        UpdateFirmware => "update-firmware",
         PollRemoteTask => "poll-remote-task",
     }
 }
@@ -443,6 +451,7 @@ impl AuditOperationContext {
             | AuditRedfishOperation::SecureBootResetKeys
             | AuditRedfishOperation::CreateEventSubscription
             | AuditRedfishOperation::DeleteEventSubscription
+            | AuditRedfishOperation::UpdateFirmware
             | AuditRedfishOperation::PollRemoteTask => matches!(
                 (&target, parameters, permission, action),
                 (
@@ -854,6 +863,7 @@ mod tests {
             AuditRedfishOperation::SecureBootResetKeys,
             AuditRedfishOperation::CreateEventSubscription,
             AuditRedfishOperation::DeleteEventSubscription,
+            AuditRedfishOperation::UpdateFirmware,
             AuditRedfishOperation::PollRemoteTask,
         ]);
         assert_codes(&[AuditProgress::EndpointCreated, AuditProgress::RowValidated]);

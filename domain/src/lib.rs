@@ -51,7 +51,7 @@ pub use redfish_command::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
     CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol,
     EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType, ResetType,
-    SecureBootCommand, SetBootSourceOverride, SystemCommand,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, UpdateCommand,
 };
 pub use resource_snapshot::{
     RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,

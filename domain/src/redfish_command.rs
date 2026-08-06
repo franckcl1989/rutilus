@@ -24,6 +24,8 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ArtifactId;
+
 /// The reset action argument used by system, manager, and chassis resets.
 ///
 /// The member set follows `nv-redfish-schema` 0.13.0's `Resource_v1.xml`
@@ -536,6 +538,81 @@ impl DeleteSubscription {
     }
 }
 
+/// Serializes [`ArtifactId`] as its uuid string, the §9.4 typed-payload rule
+/// applied to the command wire contract.
+///
+/// The id type itself stays serialization-free (it is a `Uuid` wrapper with
+/// `Display`/`FromStr`), so the payload declares the wire form explicitly
+/// instead of the domain exporting a serde surface for one field.
+mod artifact_id_serde {
+    use std::str::FromStr;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::ArtifactId;
+
+    pub fn serialize<S>(artifact_id: &ArtifactId, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&artifact_id.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ArtifactId, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        ArtifactId::from_str(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The payload of [`UpdateCommand::StartUpdate`].
+///
+/// `artifact_id` names a persisted, `Ready` firmware artifact (§14.3) whose
+/// bytes the execution flow resolves from the artifact store at dispatch
+/// time — the command carries only the database-serializable identity, never
+/// file content. `push_uri` selects the submission method of §14.3: when the
+/// BMC's `UpdateService` advertises a public HTTP push URI, the gateway
+/// submits the artifact bytes to that URI directly; `None` selects the
+/// multipart upload through the `UpdateService`'s `MultipartHttpPushUri`
+/// action. The product never invents a push URI — the value comes from the
+/// operator or from the BMC's own advertisement (§14.3 选择可用更新方法).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartUpdate {
+    #[serde(with = "artifact_id_serde")]
+    artifact_id: ArtifactId,
+    /// The BMC's advertised HTTP push URI; `None` selects the multipart
+    /// submission method and stays absent from the wire form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_uri: Option<String>,
+}
+
+impl StartUpdate {
+    /// Constructs one firmware-update start with the artifact to upload and
+    /// the optional public push URI of the target `UpdateService`.
+    #[must_use]
+    pub const fn new(artifact_id: ArtifactId, push_uri: Option<String>) -> Self {
+        Self {
+            artifact_id,
+            push_uri,
+        }
+    }
+
+    /// Returns the identity of the artifact whose bytes must be uploaded.
+    #[must_use]
+    pub const fn artifact_id(&self) -> ArtifactId {
+        self.artifact_id
+    }
+
+    /// Returns the BMC's advertised HTTP push URI, when one was supplied.
+    #[must_use]
+    pub fn push_uri(&self) -> Option<&str> {
+        self.push_uri.as_deref()
+    }
+}
+
 /// Commands against a system (`ComputerSystem`) resource (§7.5).
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum SystemCommand {
@@ -588,6 +665,17 @@ pub enum EventCommand {
     DeleteSubscription(DeleteSubscription),
 }
 
+/// Commands against the update service (§7.5, §14.3).
+///
+/// Redfish models firmware updates through the `UpdateService`; see
+/// [`crate::ResourceFeature::SoftwareInventory`] for the matching read
+/// surface.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum UpdateCommand {
+    /// Starts a firmware update with one previously uploaded, ready artifact.
+    StartUpdate(StartUpdate),
+}
+
 /// One typed write command — the exhaustive §7.5 command surface.
 ///
 /// Every write the product performs is one value of this enum, and every
@@ -613,8 +701,6 @@ pub enum EventCommand {
 ///   exists.
 /// - `Storage` — storage writes (volume and `RAID` operations) have no
 ///   first-cut product flow.
-/// - `Update` — firmware upload is a multipart flow (§14.3) scheduled for a
-///   later iteration.
 /// - `Telemetry` — telemetry writes (metric report subscription lifecycle)
 ///   build on the event-service surface and land with it.
 /// - `Oem` — OEM writes have no standardized shape (§11.5) and stay deferred
@@ -633,6 +719,8 @@ pub enum RedfishCommand {
     SecureBoot(SecureBootCommand),
     /// A command against the event service.
     Event(EventCommand),
+    /// A command against the update service.
+    Update(UpdateCommand),
 }
 
 impl RedfishCommand {
@@ -657,6 +745,7 @@ impl RedfishCommand {
             Self::Boot(_) => "boot",
             Self::SecureBoot(_) => "secure-boot",
             Self::Event(_) => "event",
+            Self::Update(_) => "update",
         }
     }
 }
@@ -670,6 +759,8 @@ impl fmt::Display for RedfishCommand {
 #[cfg(test)]
 mod tests {
     use std::{error::Error, fmt};
+
+    use uuid::Uuid;
 
     use super::*;
 
@@ -829,7 +920,7 @@ mod tests {
 
     /// One representative command per family with its expected family code.
     ///
-    /// The six entries are the exhaustive §7.5 family list for this
+    /// The seven entries are the exhaustive §7.5 family list for this
     /// iteration; adding a family must add an entry here or the
     /// exhaustiveness tests fail.
     fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, EventSubscriptionError> {
@@ -872,6 +963,13 @@ mod tests {
                 )),
                 "event",
             ),
+            (
+                RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                    ArtifactId::generate(),
+                    None,
+                ))),
+                "update",
+            ),
         ])
     }
 
@@ -892,11 +990,11 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            6,
+            7,
             "add the new family to `all_families` when a variant is added"
         );
         // The deferred §7.5 families must not be claimed by an existing code.
-        for deferred in ["account", "bios", "storage", "update", "telemetry", "oem"] {
+        for deferred in ["account", "bios", "storage", "telemetry", "oem"] {
             assert!(
                 !seen.contains(&deferred),
                 "the deferred family code {deferred} must not be claimed"
@@ -917,6 +1015,7 @@ mod tests {
                 RedfishCommand::Boot(_) => "boot",
                 RedfishCommand::SecureBoot(_) => "secure-boot",
                 RedfishCommand::Event(_) => "event",
+                RedfishCommand::Update(_) => "update",
             };
             assert_eq!(matched, expected);
             assert_eq!(command.as_str(), matched);
@@ -938,7 +1037,6 @@ mod tests {
             r#"{"Account":{"Create":{}}}"#,
             r#"{"Bios":{"SetAttributes":{}}}"#,
             r#"{"Storage":{"Format":{}}}"#,
-            r#"{"Update":{"StartUpdate":{}}}"#,
             r#"{"Telemetry":{"SubmitTestMetricReport":{}}}"#,
             r#"{"Oem":{"Custom":{}}}"#,
         ] {
@@ -998,6 +1096,13 @@ mod tests {
                     )?,
                 )),
                 r#"{"Event":{"CreateSubscription":{"destination":"https://example.com/hook","protocol":"Redfish","event_types":["Alert"]}}}"#,
+            ),
+            (
+                RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                    ArtifactId::from_uuid(Uuid::parse_str("0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f")?),
+                    Some("https://192.0.2.10/upload".to_owned()),
+                ))),
+                r#"{"Update":{"StartUpdate":{"artifact_id":"0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f","push_uri":"https://192.0.2.10/upload"}}}"#,
             ),
         ];
         for (command, golden) in commands {
@@ -1087,6 +1192,47 @@ mod tests {
             serde_json::from_str::<DeleteSubscription>(r#"{"subscription_id":"Sub-1","id":2}"#)
                 .is_err(),
             "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn start_update_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let artifact_id =
+            ArtifactId::from_uuid(Uuid::parse_str("0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f")?);
+        let update = StartUpdate::new(artifact_id, Some("https://192.0.2.10/upload".to_owned()));
+        assert_eq!(update.artifact_id(), artifact_id);
+        assert_eq!(update.push_uri(), Some("https://192.0.2.10/upload"));
+
+        let json = serde_json::to_string(&update)?;
+        assert_eq!(
+            json,
+            r#"{"artifact_id":"0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f","push_uri":"https://192.0.2.10/upload"}"#
+        );
+        assert_eq!(serde_json::from_str::<StartUpdate>(&json)?, update);
+        assert!(
+            serde_json::from_str::<StartUpdate>(r#"{"artifact_id":"not-a-uuid","push_uri":null}"#)
+                .is_err(),
+            "the artifact id must deserialize as a uuid string"
+        );
+        assert!(
+            serde_json::from_str::<StartUpdate>(r#"{"artifact_id":"0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f","push_uri":"https://192.0.2.10/upload","name":"extra"}"#)
+                .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        // The multipart fallback (no public push URI) stays absent from the
+        // wire form and deserializes back as `None`.
+        let multipart = StartUpdate::new(artifact_id, None);
+        assert_eq!(multipart.push_uri(), None);
+        let multipart_json = serde_json::to_string(&multipart)?;
+        assert_eq!(
+            multipart_json,
+            r#"{"artifact_id":"0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<StartUpdate>(&multipart_json)?,
+            multipart
         );
         Ok(())
     }
