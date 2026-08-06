@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{num::NonZeroU64, path::Path, sync::Arc};
+use std::{error::Error, num::NonZeroU64, path::Path, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -11,22 +11,42 @@ use axum::{
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use rust_embed::RustEmbed;
 use rutilus_api::{
-    AboutResponse, CoreResourceCommonResponse, CoreResourceCountsResponse,
-    CoreResourceDetailsResponse, CoreResourceResponse, CoreResourceSourceResponse,
-    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
-    HealthResponse, ResourceStatusResponse, TlsTrustModeResponse,
+    AboutResponse, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
+    AuditTargetResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
+    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
+    CoreResourceResponse, CoreResourceSourceResponse, CreateCredentialRequest,
+    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCsvImportRequest,
+    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
+    EndpointEnrollmentResponse, EndpointIdentityResponse, EndpointInventoryResponse,
+    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
+    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
+    ErrorResponse, HealthResponse, ResourceStatusResponse, TlsTrustModeResponse,
+    TrustRejectedResponse, TrustedEndpointResponse,
 };
 use rutilus_application::{
-    CoreResourceDetails, CoreResourceSummary, EndpointInventoryItem, EndpointInventoryQuery,
-    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointResourceInventory,
-    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, ResourceStatusSummary,
+    AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, Clock, CoreResourceDetails,
+    CoreResourceReader, CoreResourceSummary, CredentialCreation, CredentialCreationError,
+    CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointCsvImportExecutor, EndpointCsvImportReport,
+    EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError,
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
+    EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
+    EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
+    EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
+    RedfishDiscovery, ResourceStatusSummary, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
-use rutilus_domain::{Endpoint, EndpointId, ResourceFeature, TlsTrust};
+use rutilus_domain::{
+    AuditActor, AuditEvent, CertificateFingerprintParseError, Credential, CredentialId,
+    CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointDisplayName, EndpointId, ResourceFeature, ResourceSnapshot, TlsTrust,
+};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
@@ -68,16 +88,86 @@ impl WebProductInfo {
     }
 }
 
-struct WebState<Repository> {
-    product: WebProductInfo,
-    inventory: Arc<Repository>,
+/// Appends immutable audit facts through an application-owned boundary.
+///
+/// The boundary intentionally exposes no update or delete operation. The
+/// returned events are newest-first and never contain secret material.
+pub trait AuditEventQuery: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn list_recent_events(
+        &self,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>>;
 }
 
-impl<Repository> Clone for WebState<Repository> {
+impl<Query> AuditEventQuery for &Query
+where
+    Query: AuditEventQuery + ?Sized,
+{
+    type Error = Query::Error;
+
+    fn list_recent_events(
+        &self,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        Query::list_recent_events(*self, limit)
+    }
+}
+
+/// One injected bundle of application boundaries for every product path.
+///
+/// The Web crate never touches persistence; the embedding runtime composes
+/// concrete repository, security, and gateway implementations behind these
+/// boundaries and assembles the application use cases per request. The
+/// blanket implementation keeps the bundle open to any runtime composition.
+pub trait ProductServices:
+    EndpointInventoryRepository
+    + CredentialInventoryRepository
+    + CredentialSecretProtector
+    + CredentialCreationRepository<Self::Protected>
+    + CredentialResolver
+    + DiscoveredEndpointRepository
+    + EndpointRefreshRepository
+    + AuditEventWriter
+    + AuditEventQuery
+{
+}
+
+impl<T> ProductServices for T where
+    T: EndpointInventoryRepository
+        + CredentialInventoryRepository
+        + CredentialSecretProtector
+        + CredentialCreationRepository<T::Protected>
+        + CredentialResolver
+        + DiscoveredEndpointRepository
+        + EndpointRefreshRepository
+        + AuditEventWriter
+        + AuditEventQuery
+{
+}
+
+struct WebState<Services, Gateway, Time> {
+    product: WebProductInfo,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
+}
+
+impl<Services, Gateway, Time> Clone for WebState<Services, Gateway, Time>
+where
+    Time: Clone,
+{
     fn clone(&self) -> Self {
         Self {
             product: self.product,
-            inventory: Arc::clone(&self.inventory),
+            actor: self.actor,
+            origin: self.origin,
+            services: Arc::clone(&self.services),
+            gateway: Arc::clone(&self.gateway),
+            clock: self.clock.clone(),
         }
     }
 }
@@ -85,21 +175,67 @@ impl<Repository> Clone for WebState<Repository> {
 /// Builds the local Web application without binding a socket.
 ///
 /// Socket policy remains an app/platform responsibility, so the same Router
-/// can serve Standalone loopback and a future HTTPS Site listener.
-pub fn router<Repository>(product: WebProductInfo, inventory: Arc<Repository>) -> Router
+/// can serve Standalone loopback and a future HTTPS Site listener. All write
+/// paths are composed from the injected application boundaries at request
+/// time, keeping the Web crate free of persistence and security internals.
+pub fn router<Services, Gateway, Time>(
+    product: WebProductInfo,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
+) -> Router
 where
-    Repository: EndpointInventoryRepository + 'static,
+    Services: ProductServices + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
 {
     Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/about", get(about::<Repository>))
-        .route("/api/v1/endpoints", get(endpoint_inventory::<Repository>))
+        .route("/api/v1/about", get(about::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/endpoints",
+            get(endpoint_inventory::<Services, Gateway, Time>),
+        )
         .route(
             "/api/v1/endpoints/{endpoint_id}/resources",
-            get(endpoint_resources::<Repository>),
+            get(endpoint_resources::<Services, Gateway, Time>),
         )
+        .route(
+            "/api/v1/credentials",
+            get(credential_inventory::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/credentials",
+            post(create_credential::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints/trust",
+            post(begin_endpoint_trust::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints/trust/expect",
+            post(confirm_endpoint_trust::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints",
+            post(enroll_endpoint::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints/import",
+            post(import_endpoints_csv::<Services, Gateway, Time>),
+        )
+        .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
         .fallback(static_asset)
-        .with_state(WebState { product, inventory })
+        .with_state(WebState {
+            product,
+            actor,
+            origin,
+            services,
+            gateway,
+            clock,
+        })
         .layer(SetResponseHeaderLayer::overriding(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(CSP),
@@ -126,7 +262,9 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse::healthy())
 }
 
-async fn about<Repository>(State(state): State<WebState<Repository>>) -> Json<AboutResponse> {
+async fn about<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Json<AboutResponse> {
     Json(AboutResponse::new(
         "rutilus".to_owned(),
         state.product.product_version().to_owned(),
@@ -134,11 +272,13 @@ async fn about<Repository>(State(state): State<WebState<Repository>>) -> Json<Ab
     ))
 }
 
-async fn endpoint_inventory<Repository>(State(state): State<WebState<Repository>>) -> Response
+async fn endpoint_inventory<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
 where
-    Repository: EndpointInventoryRepository,
+    Services: EndpointInventoryRepository,
 {
-    let Ok(items) = EndpointInventoryQuery::new(state.inventory.as_ref())
+    let Ok(items) = EndpointInventoryQuery::new(state.services.as_ref())
         .execute()
         .await
     else {
@@ -152,24 +292,21 @@ where
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = Json(EndpointInventoryResponse::new(endpoints)).into_response();
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("no-store, must-revalidate"),
-    );
+    no_store(&mut response);
     response
 }
 
-async fn endpoint_resources<Repository>(
-    State(state): State<WebState<Repository>>,
+async fn endpoint_resources<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
     AxumPath(endpoint_id): AxumPath<String>,
 ) -> Response
 where
-    Repository: EndpointInventoryRepository,
+    Services: EndpointInventoryRepository,
 {
     let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
         return uncached_status(StatusCode::BAD_REQUEST);
     };
-    let inventory = match EndpointResourceInventoryQuery::new(state.inventory.as_ref(), endpoint_id)
+    let inventory = match EndpointResourceInventoryQuery::new(state.services.as_ref(), endpoint_id)
         .execute()
         .await
     {
@@ -189,11 +326,654 @@ where
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = Json(response).into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Maximum accepted `limit` for one bounded audit query.
+const AUDIT_QUERY_MAX_LIMIT: u64 = 1000;
+/// Default `limit` for one bounded audit query without an explicit value.
+const AUDIT_QUERY_DEFAULT_LIMIT: u64 = 100;
+
+/// Lists secret-free reusable credential metadata in deterministic product
+/// order.
+async fn credential_inventory<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: CredentialInventoryRepository,
+{
+    let credentials = match CredentialInventoryQuery::new(state.services.as_ref())
+        .execute()
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(CredentialInventoryQueryError::Repository(_)) => {
+            return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(
+            CredentialInventoryQueryError::DuplicateCredential { .. }
+            | CredentialInventoryQueryError::DuplicateActiveVersion { .. },
+        ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut response = Json(CredentialInventoryResponse::new(
+        credentials.iter().map(project_credential_summary).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Protects, persists, and returns one new credential without echoing its
+/// plaintext.
+async fn create_credential<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CreateCredentialRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Time: Clock,
+{
+    let (name, username, password) = request.into_parts();
+    let Ok(name) = CredentialName::parse(&name) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "credential name is invalid".to_owned(),
+        );
+    };
+    let Ok(username) = CredentialUsername::parse(&username) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "credential username is invalid".to_owned(),
+        );
+    };
+    let Ok(request) = NewCredentialRequest::try_new(name, username, password) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "credential password is invalid".to_owned(),
+        );
+    };
+    let creation = CredentialCreation::new(
+        state.services.as_ref(),
+        state.services.as_ref(),
+        &state.clock,
+    );
+    match creation.execute(request).await {
+        Ok(credential) => json_created(Json(project_credential_summary(&credential))),
+        Err(CredentialCreationError::Protection(_)) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credential protection failed".to_owned(),
+        ),
+        Err(CredentialCreationError::Repository(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "credential persistence failed".to_owned(),
+        ),
+        Err(CredentialCreationError::IncoherentPersistence { .. }) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credential persistence returned incoherent state".to_owned(),
+        ),
+    }
+}
+
+/// Observes one endpoint's TLS identity without credentials and returns the
+/// safe next trust state.
+async fn begin_endpoint_trust<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<BeginEndpointTrustRequest>,
+) -> Response
+where
+    Gateway: TlsIdentityProbe,
+    Time: Clock,
+{
+    let Ok(address) = EndpointAddress::parse(request.address()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "endpoint address is invalid".to_owned(),
+        );
+    };
+    let establishment = EndpointTrustEstablishment::new(state.gateway.as_ref(), &state.clock);
+    match establishment.begin(address).await {
+        Ok(challenge) => json_ok(Json(project_trust_challenge(challenge))),
+        Err(source) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("TLS identity observation failed: {source}"),
+        ),
+    }
+}
+
+/// Verifies a predeclared trust expectation against the credential-free
+/// re-observation of the same address.
+async fn confirm_endpoint_trust<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<ConfirmEndpointTrustRequest>,
+) -> Response
+where
+    Gateway: TlsIdentityProbe,
+    Time: Clock,
+{
+    let Ok(address) = EndpointAddress::parse(request.address()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "endpoint address is invalid".to_owned(),
+        );
+    };
+    let Ok(expectation) = project_trust_expectation(request.trust()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "trust expectation is invalid".to_owned(),
+        );
+    };
+    let establishment = EndpointTrustEstablishment::new(state.gateway.as_ref(), &state.clock);
+    let Ok(challenge) = establishment.begin(address).await else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "TLS identity re-observation failed".to_owned(),
+        );
+    };
+    match establishment.complete_with_expectation(challenge, expectation) {
+        Ok(target) => json_ok(Json(project_trusted_endpoint(&target))),
+        Err(source) => trust_rejected_response(source),
+    }
+}
+
+/// Re-observes the declared trust policy, then enrolls and initially
+/// refreshes one endpoint under mandatory audit.
+async fn enroll_endpoint<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<EnrollEndpointRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader,
+    Time: Clock,
+{
+    let Ok(display_name) = EndpointDisplayName::parse(request.display_name()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "endpoint display name is invalid".to_owned(),
+        );
+    };
+    let Ok(address) = EndpointAddress::parse(request.address()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "endpoint address is invalid".to_owned(),
+        );
+    };
+    let Ok(expectation) = project_trust_expectation(request.trust()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "trust expectation is invalid".to_owned(),
+        );
+    };
+    let establishment = EndpointTrustEstablishment::new(state.gateway.as_ref(), &state.clock);
+    let Ok(challenge) = establishment.begin(address).await else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "TLS identity observation failed".to_owned(),
+        );
+    };
+    let target = match establishment.complete_with_expectation(challenge, expectation) {
+        Ok(target) => target,
+        Err(source) => return trust_rejected_response(source),
+    };
+    let enrollment = EndpointEnrollment::new(
+        state.services.as_ref(),
+        state.services.as_ref(),
+        state.gateway.as_ref(),
+        &state.clock,
+        state.actor,
+        state.origin,
+    );
+    let request = OnboardEndpointRequest::new(
+        display_name,
+        target,
+        CredentialId::from_uuid(request.credential_id()),
+    );
+    match enrollment.execute(request).await {
+        Ok(enrolled) => match project_enrollment(&enrolled) {
+            Ok(response) => json_ok(Json(response)),
+            Err(_) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enrollment result could not be projected".to_owned(),
+            ),
+        },
+        Err(source) => enrollment_error_response(source),
+    }
+}
+
+/// Imports validated CSV rows sequentially, retaining every independent row
+/// result under one mandatory batch audit.
+async fn import_endpoints_csv<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<EndpointCsvImportRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader,
+    Time: Clock,
+{
+    let Ok(import) = parse_endpoint_csv(request.csv().as_bytes()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "endpoint CSV is invalid".to_owned(),
+        );
+    };
+    let enrollment = EndpointEnrollment::new(
+        state.services.as_ref(),
+        state.services.as_ref(),
+        state.gateway.as_ref(),
+        &state.clock,
+        state.actor,
+        state.origin,
+    );
+    let importer = EndpointCsvImportExecutor::new(
+        state.gateway.as_ref(),
+        &enrollment,
+        state.services.as_ref(),
+        &state.clock,
+        state.actor,
+        state.origin,
+    );
+    match importer.execute(import).await {
+        Ok(report) => json_ok(Json(project_import_report(&report))),
+        Err(source) => {
+            let mut response = Json(project_import_report(source.report())).into_response();
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            no_store(&mut response);
+            response
+        }
+    }
+}
+
+/// Returns recent immutable audit events, newest first, bounded by `limit`.
+async fn audit_query<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    uri: Uri,
+) -> Response
+where
+    Services: AuditEventQuery,
+{
+    let Ok(limit) = parse_audit_limit(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!("audit limit must be between 1 and {AUDIT_QUERY_MAX_LIMIT}"),
+        );
+    };
+    let Ok(events) = state.services.list_recent_events(limit).await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut response = Json(AuditQueryResponse::new(
+        events.iter().map(project_audit_event).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+fn project_credential_summary(credential: &Credential) -> CredentialSummaryResponse {
+    CredentialSummaryResponse::new(
+        credential.id().into_uuid(),
+        credential.name().to_string(),
+        credential.username().to_string(),
+        credential.created_at(),
+        credential.updated_at(),
+    )
+}
+
+fn project_trust_challenge(challenge: EndpointTrustChallenge) -> EndpointTrustChallengeResponse {
+    match challenge {
+        EndpointTrustChallenge::SystemCaTrusted(target) => {
+            let trust = target.trust();
+            EndpointTrustChallengeResponse::new(
+                target.address().to_string(),
+                trust.certificate().fingerprint().to_string(),
+                trust.established_at(),
+                EndpointTrustChallengeStateResponse::SystemCaTrusted,
+            )
+        }
+        EndpointTrustChallenge::ExplicitPinRequired(pending) => {
+            EndpointTrustChallengeResponse::new(
+                pending.address().to_string(),
+                pending.fingerprint().to_string(),
+                pending.observed_at(),
+                EndpointTrustChallengeStateResponse::ExplicitPinRequired,
+            )
+        }
+    }
+}
+
+fn project_trusted_endpoint(target: &TrustedEndpoint) -> TrustedEndpointResponse {
+    TrustedEndpointResponse::new(
+        target.address().to_string(),
+        project_trust_mode(target.trust()),
+        target.trust().established_at(),
+    )
+}
+
+fn project_trust_mode(trust: &TlsTrust) -> TlsTrustModeResponse {
+    match trust {
+        TlsTrust::SystemCa { .. } => TlsTrustModeResponse::SystemCa,
+        TlsTrust::PinnedCertificate { .. } => TlsTrustModeResponse::PinnedCertificate,
+    }
+}
+
+fn project_trust_expectation(
+    expectation: &EndpointTrustExpectationRequest,
+) -> Result<EndpointTrustExpectation, CertificateFingerprintParseError> {
+    match expectation {
+        EndpointTrustExpectationRequest::SystemCa => Ok(EndpointTrustExpectation::SystemCaOnly),
+        EndpointTrustExpectationRequest::PinnedCertificate { fingerprint_sha256 } => Ok(
+            EndpointTrustExpectation::ExplicitPin(fingerprint_sha256.parse()?),
+        ),
+    }
+}
+
+fn project_enrollment(
+    enrolled: &EnrolledEndpoint,
+) -> Result<EndpointEnrollmentResponse, EnrollmentProjectionError> {
+    let snapshots = enrolled.snapshots();
+    let generation = snapshots
+        .first()
+        .map(ResourceSnapshot::generation)
+        .ok_or(EnrollmentProjectionError::EmptyGeneration)?;
+    let mut systems = 0_u64;
+    let mut chassis = 0_u64;
+    let mut managers = 0_u64;
+    for snapshot in snapshots {
+        match snapshot.feature() {
+            ResourceFeature::Systems => systems += 1,
+            ResourceFeature::Chassis => chassis += 1,
+            ResourceFeature::Managers => managers += 1,
+            ResourceFeature::ServiceRoot => {}
+        }
+    }
+    Ok(EndpointEnrollmentResponse::new(
+        enrolled.onboarded().endpoint().id().into_uuid(),
+        NonZeroU64::new(generation.get()).ok_or(EnrollmentProjectionError::ZeroGeneration)?,
+        CoreResourceCountsResponse::new(systems, chassis, managers),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnrollmentProjectionError {
+    EmptyGeneration,
+    ZeroGeneration,
+}
+
+fn project_import_report<ProbeError, EnrollmentError>(
+    report: &EndpointCsvImportReport<ProbeError, EnrollmentError>,
+) -> EndpointCsvImportResponse
+where
+    ProbeError: Error,
+    EnrollmentError: Error,
+{
+    let rows = report
+        .rows()
+        .iter()
+        .map(project_import_row)
+        .collect::<Vec<_>>();
+    EndpointCsvImportResponse::new(
+        u64::try_from(report.total_rows()).unwrap_or(u64::MAX),
+        u64::try_from(report.succeeded_count()).unwrap_or(u64::MAX),
+        u64::try_from(report.failed_count()).unwrap_or(u64::MAX),
+        rows,
+    )
+}
+
+fn project_import_row<ProbeError, EnrollmentError>(
+    result: &EndpointCsvRowResult<ProbeError, EnrollmentError>,
+) -> EndpointCsvImportRowResponse
+where
+    ProbeError: Error,
+    EnrollmentError: Error,
+{
+    let record_number = u64::try_from(result.record_number()).unwrap_or(u64::MAX);
+    let address = result.address().to_string();
+    match result.outcome() {
+        EndpointCsvRowOutcome::Enrolled(endpoint_id) => EndpointCsvImportRowResponse::new(
+            record_number,
+            address,
+            EndpointCsvImportRowStatusResponse::Enrolled,
+            Some(endpoint_id.into_uuid()),
+            None,
+        ),
+        EndpointCsvRowOutcome::TlsProbeFailed(source) => EndpointCsvImportRowResponse::new(
+            record_number,
+            address,
+            EndpointCsvImportRowStatusResponse::TlsProbeFailed,
+            None,
+            Some(source.to_string()),
+        ),
+        EndpointCsvRowOutcome::TrustRejected(source) => EndpointCsvImportRowResponse::new(
+            record_number,
+            address,
+            EndpointCsvImportRowStatusResponse::TrustRejected,
+            None,
+            Some(source.to_string()),
+        ),
+        EndpointCsvRowOutcome::EnrollmentFailed(source) => EndpointCsvImportRowResponse::new(
+            record_number,
+            address,
+            EndpointCsvImportRowStatusResponse::EnrollmentFailed,
+            None,
+            Some(source.to_string()),
+        ),
+    }
+}
+
+fn project_audit_event(event: &AuditEvent) -> AuditEventResponse {
+    let context = event.context();
+    let outcome = event.outcome();
+    let target = context.target();
+    AuditEventResponse::new(
+        event.occurred_at(),
+        context.actor().as_str().to_owned(),
+        context.action().as_str().to_owned(),
+        AuditTargetResponse::new(target.kind().to_owned(), target.identifier()),
+        AuditOutcomeResponse::new(
+            outcome.kind().as_str().to_owned(),
+            outcome
+                .progress()
+                .map(|progress| progress.as_str().to_owned()),
+            outcome.failure().map(|failure| failure.as_str().to_owned()),
+            outcome
+                .verification()
+                .map(|verification| verification.as_str().to_owned()),
+        ),
+        event.sequence().get(),
+        context.operation_id().into_uuid(),
+        audit_message(event),
+    )
+}
+
+fn audit_message(event: &AuditEvent) -> String {
+    let context = event.context();
+    let base = format!(
+        "{} {} {} for {}",
+        context.actor().as_str(),
+        context.action().as_str(),
+        event.outcome().kind().as_str(),
+        context.target().kind()
+    );
+    match context.target().identifier() {
+        Some(identifier) => format!("{base} {identifier} (sequence {})", event.sequence().get()),
+        None => format!("{base} (sequence {})", event.sequence().get()),
+    }
+}
+
+fn parse_audit_limit(query: Option<&str>) -> Result<NonZeroU64, ParseAuditLimitError> {
+    let Some(query) = query else {
+        return default_audit_limit();
+    };
+    let Some(value) = query.strip_prefix("limit=") else {
+        return Err(ParseAuditLimitError);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseAuditLimitError);
+    }
+    let Ok(limit) = value.parse::<u64>() else {
+        return Err(ParseAuditLimitError);
+    };
+    if limit == 0 || limit > AUDIT_QUERY_MAX_LIMIT {
+        return Err(ParseAuditLimitError);
+    }
+    NonZeroU64::new(limit).ok_or(ParseAuditLimitError)
+}
+
+fn default_audit_limit() -> Result<NonZeroU64, ParseAuditLimitError> {
+    NonZeroU64::new(AUDIT_QUERY_DEFAULT_LIMIT).ok_or(ParseAuditLimitError)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParseAuditLimitError;
+
+fn trust_rejected_response(source: EndpointTrustExpectationError) -> Response {
+    json_error_with_status(
+        StatusCode::CONFLICT,
+        Json(TrustRejectedResponse::new(
+            source.expected().map(|fingerprint| fingerprint.to_string()),
+            source.observed().to_string(),
+        )),
+    )
+}
+
+fn enrollment_error_response<
+    CredentialError,
+    DiscoveryError,
+    OnboardingRepositoryError,
+    RefreshRepositoryError,
+    ReaderError,
+    AuditError,
+>(
+    error: EndpointEnrollmentError<
+        CredentialError,
+        DiscoveryError,
+        OnboardingRepositoryError,
+        RefreshRepositoryError,
+        ReaderError,
+        AuditError,
+    >,
+) -> Response
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    OnboardingRepositoryError: Error + 'static,
+    RefreshRepositoryError: Error + 'static,
+    ReaderError: Error + 'static,
+    AuditError: Error + 'static,
+{
+    match error {
+        EndpointEnrollmentError::Onboarding(onboarding) => onboarding_error_response(*onboarding),
+        EndpointEnrollmentError::OnboardingAuditAfterCreation { endpoint_id, .. } => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("endpoint {endpoint_id} was created but its onboarding audit failed"),
+        ),
+        EndpointEnrollmentError::InitialRefresh {
+            endpoint_id,
+            source,
+        } => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("endpoint {endpoint_id} was created but its initial refresh failed: {source}"),
+        ),
+        EndpointEnrollmentError::InitialRefreshAuditAfterCommit {
+            endpoint_id,
+            source,
+        } => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "endpoint {endpoint_id} committed its initial resources but its refresh audit failed: {source}"
+            ),
+        ),
+    }
+}
+
+fn onboarding_error_response<CredentialError, DiscoveryError, RepositoryError, AuditError>(
+    error: AuditedOnboardEndpointError<
+        CredentialError,
+        DiscoveryError,
+        RepositoryError,
+        AuditError,
+    >,
+) -> Response
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    RepositoryError: Error + 'static,
+    AuditError: Error + 'static,
+{
+    match error {
+        AuditedOnboardEndpointError::Audit { .. } => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audited endpoint onboarding could not be finalized".to_owned(),
+        ),
+        AuditedOnboardEndpointError::Onboarding(onboarding)
+        | AuditedOnboardEndpointError::OnboardingAndAudit { onboarding, .. } => {
+            onboard_error_response(*onboarding)
+        }
+    }
+}
+
+fn onboard_error_response<CredentialError, DiscoveryError, RepositoryError>(
+    error: OnboardEndpointError<CredentialError, DiscoveryError, RepositoryError>,
+) -> Response
+where
+    CredentialError: Error + 'static,
+    DiscoveryError: Error + 'static,
+    RepositoryError: Error + 'static,
+{
+    match error {
+        OnboardEndpointError::CredentialNotFound { credential_id } => json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("selected credential {credential_id} was not found"),
+        ),
+        OnboardEndpointError::Credential(source) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the selected credential could not be resolved: {source}"),
+        ),
+        OnboardEndpointError::Discovery(source) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("trusted Redfish discovery failed: {source}"),
+        ),
+        OnboardEndpointError::InvalidTimeline(source) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("endpoint timeline is invalid after discovery: {source}"),
+        ),
+        OnboardEndpointError::Repository(source) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("endpoint persistence failed: {source}"),
+        ),
+    }
+}
+
+fn json_ok<Body: IntoResponse>(body: Body) -> Response {
+    let mut response = body.into_response();
+    no_store(&mut response);
+    response
+}
+
+fn json_created<Body: IntoResponse>(body: Body) -> Response {
+    let mut response = body.into_response();
+    *response.status_mut() = StatusCode::CREATED;
+    no_store(&mut response);
+    response
+}
+
+fn json_error(status: StatusCode, message: String) -> Response {
+    json_error_with_status(status, Json(ErrorResponse::new(message)))
+}
+
+fn json_error_with_status<Body: IntoResponse>(status: StatusCode, body: Body) -> Response {
+    let mut response = body.into_response();
+    *response.status_mut() = status;
+    no_store(&mut response);
+    response
+}
+
+fn no_store(response: &mut Response) {
     response.headers_mut().insert(
         CACHE_CONTROL,
         HeaderValue::from_static("no-store, must-revalidate"),
     );
-    response
 }
 
 fn project_endpoint_summary(
@@ -439,12 +1219,17 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
-    use rutilus_application::BoundaryFuture;
-    use rutilus_domain::{
-        CredentialId, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId,
-        RefreshGeneration, ResourceEtag, ResourceId, ResourceODataId, ResourceODataType,
-        ResourceSnapshot, ResourceSnapshotPayload, TlsCertificate,
+    use rutilus_application::{
+        BoundaryFuture, EndpointDiscovery, ProtectedCredentialCreation, ResolvedCredential,
+        ResourceObservation, TlsIdentityObservation,
     };
+    use rutilus_domain::{
+        CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
+        EndpointCapabilityObservation, EndpointDisplayName, EndpointId, RefreshGeneration,
+        ResourceEtag, ResourceId, ResourceODataId, ResourceODataType, ResourceSnapshot,
+        ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+    };
+    use secrecy::SecretString;
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime};
     use tower::ServiceExt as _;
@@ -452,13 +1237,17 @@ mod tests {
     use super::*;
 
     fn test_router() -> Router {
-        test_router_with(MockInventory::ok(Vec::new()))
+        test_router_with(Ok(Vec::new()))
     }
 
-    fn test_router_with(inventory: MockInventory) -> Router {
+    fn test_router_with(inventory: Result<Vec<EndpointInventoryItem>, MockWriteError>) -> Router {
         router(
             WebProductInfo::new("0.1.0-test", "0.13.0-test"),
-            Arc::new(inventory),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            Arc::new(UnavailableWriteServices { inventory }),
+            Arc::new(UnavailableGateway),
+            FixedClock,
         )
     }
 
@@ -579,7 +1368,7 @@ mod tests {
         let current = inventory_item("Rack B BMC", "https://192.0.2.11", 11, true)?;
         let waiting_id = waiting.endpoint().id().to_string();
         let current_id = current.endpoint().id().to_string();
-        let response = test_router_with(MockInventory::ok(vec![current, waiting]))
+        let response = test_router_with(Ok(vec![current, waiting]))
             .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
             .await?;
 
@@ -629,7 +1418,7 @@ mod tests {
             })
         );
 
-        let failed = test_router_with(MockInventory::failed())
+        let failed = test_router_with(Err(MockWriteError))
             .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
             .await?;
         assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -638,7 +1427,7 @@ mod tests {
             Some(&HeaderValue::from_static("no-store, must-revalidate"))
         );
         let wrong_method = test_router()
-            .oneshot(Request::post("/api/v1/endpoints").body(Body::empty())?)
+            .oneshot(Request::delete("/api/v1/endpoints").body(Body::empty())?)
             .await?;
         assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
         Ok(())
@@ -648,7 +1437,7 @@ mod tests {
     async fn exposes_typed_core_resources_with_source_values() -> Result<(), Box<dyn Error>> {
         let item = core_resource_inventory_item()?;
         let endpoint_id = item.endpoint().id();
-        let response = test_router_with(MockInventory::ok(vec![item]))
+        let response = test_router_with(Ok(vec![item]))
             .oneshot(
                 Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
                     .body(Body::empty())?,
@@ -704,7 +1493,7 @@ mod tests {
     async fn distinguishes_core_resource_route_states() -> Result<(), Box<dyn Error>> {
         let waiting = inventory_item("Waiting BMC", "https://192.0.2.20", 20, false)?;
         let endpoint_id = waiting.endpoint().id();
-        let waiting_router = test_router_with(MockInventory::ok(vec![waiting]));
+        let waiting_router = test_router_with(Ok(vec![waiting]));
 
         let bad_id = waiting_router
             .clone()
@@ -742,7 +1531,7 @@ mod tests {
             .await?;
         assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-        let unavailable = test_router_with(MockInventory::failed())
+        let unavailable = test_router_with(Err(MockWriteError))
             .oneshot(
                 Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
                     .body(Body::empty())?,
@@ -756,7 +1545,7 @@ mod tests {
 
         let corrupt = inventory_item("Corrupt BMC", "https://192.0.2.21", 21, true)?;
         let corrupt_id = corrupt.endpoint().id();
-        let corrupt = test_router_with(MockInventory::ok(vec![corrupt]))
+        let corrupt = test_router_with(Ok(vec![corrupt]))
             .oneshot(
                 Request::get(format!("/api/v1/endpoints/{corrupt_id}/resources"))
                     .body(Body::empty())?,
@@ -913,40 +1702,185 @@ mod tests {
         ))
     }
 
-    #[derive(Clone, Copy, Debug)]
-    struct MockInventoryError;
+    /// The services bundle serves the read-path inventory and reports a
+    /// controlled failure for every unconfigured write-path boundary.
+    #[derive(Clone)]
+    struct UnavailableWriteServices {
+        inventory: Result<Vec<EndpointInventoryItem>, MockWriteError>,
+    }
 
-    impl fmt::Display for MockInventoryError {
+    /// Every gateway boundary reports a controlled failure so the read-path
+    /// tests never touch the network.
+    #[derive(Clone, Copy)]
+    struct UnavailableGateway;
+
+    #[derive(Clone, Copy)]
+    struct UnavailableProtected;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct MockWriteError;
+
+    impl fmt::Display for MockWriteError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("mock inventory unavailable")
+            formatter.write_str("mock product services are unavailable")
         }
     }
 
-    impl Error for MockInventoryError {}
+    impl Error for MockWriteError {}
 
-    struct MockInventory {
-        result: Result<Vec<EndpointInventoryItem>, MockInventoryError>,
-    }
-
-    impl MockInventory {
-        fn ok(items: Vec<EndpointInventoryItem>) -> Self {
-            Self { result: Ok(items) }
-        }
-
-        fn failed() -> Self {
-            Self {
-                result: Err(MockInventoryError),
-            }
-        }
-    }
-
-    impl EndpointInventoryRepository for MockInventory {
-        type Error = MockInventoryError;
+    impl EndpointInventoryRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
 
         fn list_endpoint_inventory(
             &self,
         ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
-            Box::pin(async { self.result.clone() })
+            Box::pin(async { self.inventory.clone() })
+        }
+    }
+
+    impl CredentialInventoryRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn list_credentials(&self) -> BoundaryFuture<'_, Result<Vec<Credential>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CredentialSecretProtector for UnavailableWriteServices {
+        type Protected = UnavailableProtected;
+        type Error = MockWriteError;
+
+        fn protect(
+            &self,
+            _credential_id: CredentialId,
+            _version_id: CredentialVersionId,
+            _password: SecretString,
+        ) -> Result<Self::Protected, Self::Error> {
+            Err(MockWriteError)
+        }
+    }
+
+    impl CredentialCreationRepository<UnavailableProtected> for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn create_credential(
+            &self,
+            _creation: ProtectedCredentialCreation<UnavailableProtected>,
+        ) -> BoundaryFuture<'_, Result<Credential, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CredentialResolver for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn resolve(
+            &self,
+            _credential_id: CredentialId,
+        ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl TlsIdentityProbe for UnavailableGateway {
+        type Error = MockWriteError;
+
+        fn observe<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+        ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl DiscoveredEndpointRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn create_discovered_endpoint<'a>(
+            &'a self,
+            _endpoint: Endpoint,
+            _observations: &'a [EndpointCapabilityObservation],
+        ) -> BoundaryFuture<'a, Result<Endpoint, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl EndpointRefreshRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn find_endpoint(
+            &self,
+            _endpoint_id: EndpointId,
+        ) -> BoundaryFuture<'_, Result<Option<Endpoint>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn commit_resource_generation<'a>(
+            &'a self,
+            _endpoint_id: EndpointId,
+            _observations: &'a [ResourceObservation],
+            _observed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl AuditEventWriter for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn append_audit_event<'a>(
+            &'a self,
+            _event: &'a AuditEvent,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl RedfishDiscovery for UnavailableGateway {
+        type Error = MockWriteError;
+
+        fn probe_core_capabilities<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CoreResourceReader for UnavailableGateway {
+        type Error = MockWriteError;
+
+        fn read_core_resources<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl AuditEventQuery for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn list_recent_events(
+            &self,
+            _limit: NonZeroU64,
+        ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH
         }
     }
 }

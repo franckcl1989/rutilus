@@ -1,26 +1,51 @@
 use std::{
+    collections::VecDeque,
+    error::Error,
+    fmt,
     future::Future,
     io::{self, ErrorKind},
     net::{Ipv4Addr, SocketAddr},
+    num::NonZeroU64,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
-use rutilus_application::{BoundaryFuture, EndpointInventoryItem, EndpointInventoryRepository};
-use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
+use rutilus_application::{
+    AuditEventWriter, BoundaryFuture, Clock, CoreResourceReader, CredentialCreationRepository,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
+    EndpointRefreshRepository, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceObservation, TlsIdentityProbe,
+};
+use rutilus_domain::{
+    AuditActor, AuditEvent, Credential, CredentialId, CredentialVersionId, DeploymentPosture,
+    Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
+};
+use rutilus_infra_redfish::{NV_REDFISH_DEVELOPMENT_BASELINE, RedfishGateway, TlsProbeInitError};
 use rutilus_persistence::{
-    CloseStoreError, EndpointInventoryPersistenceError, OpenStoreError, SqliteStore,
+    AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
+    EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
+    NewCredential, OpenStoreError, SqliteStore,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
     MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
 };
-use rutilus_security::{MasterKey, MasterKeyProtectionError, recover_master_key};
-use rutilus_web::WebProductInfo;
+use rutilus_security::{
+    CredentialProtectionError, MasterKey, MasterKeyProtectionError, ProtectedCredentialVersion,
+    decrypt_credential, encrypt_credential, recover_master_key,
+};
+use rutilus_web::{AuditEventQuery, ProductServices, WebProductInfo, router};
+use secrecy::SecretString;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::StandaloneUnlock;
+use crate::{ActiveCredentialResolverError, StandaloneUnlock, SystemClock};
+
+/// Defensive upper bound for the in-memory recent-audit tail served by the
+/// Standalone console until persistence exposes a bounded listing query.
+const AUDIT_TAIL_EVENTS: usize = 1024;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -55,8 +80,9 @@ pub struct StandaloneInstance {
 
 struct StandaloneState {
     store: SqliteStore,
-    _master_key: MasterKey,
+    master_key: MasterKey,
     _runtime_lock: RuntimeLock,
+    audit_tail: Arc<Mutex<VecDeque<AuditEvent>>>,
 }
 
 impl EndpointInventoryRepository for StandaloneState {
@@ -68,6 +94,200 @@ impl EndpointInventoryRepository for StandaloneState {
         EndpointInventoryRepository::list_endpoint_inventory(&self.store)
     }
 }
+
+impl CredentialInventoryRepository for StandaloneState {
+    type Error = CredentialRepositoryError;
+
+    fn list_credentials(&self) -> BoundaryFuture<'_, Result<Vec<Credential>, Self::Error>> {
+        <SqliteStore as CredentialInventoryRepository>::list_credentials(&self.store)
+    }
+}
+
+impl CredentialSecretProtector for StandaloneState {
+    type Protected = ProtectedCredentialVersion;
+    type Error = CredentialProtectionError;
+
+    fn protect(
+        &self,
+        credential_id: CredentialId,
+        version_id: CredentialVersionId,
+        password: SecretString,
+    ) -> Result<Self::Protected, Self::Error> {
+        encrypt_credential(&self.master_key, credential_id, version_id, &password)
+    }
+}
+
+impl CredentialCreationRepository<ProtectedCredentialVersion> for StandaloneState {
+    type Error = CredentialRepositoryError;
+
+    /// Persists one identity-bound encrypted version, then returns the domain
+    /// projection requested by the application use case.
+    ///
+    /// The store assigns its own wall-clock timestamps to the persisted rows,
+    /// while `CredentialCreation` verifies that the returned credential
+    /// matches the protected creation's clock-derived timeline exactly. The
+    /// adapter therefore rebuilds the domain value from the preallocated
+    /// identities and the creation timestamp after the durable write, keeping
+    /// the closed loop consistent for this release.
+    fn create_credential(
+        &self,
+        creation: ProtectedCredentialCreation<ProtectedCredentialVersion>,
+    ) -> BoundaryFuture<'_, Result<Credential, Self::Error>> {
+        Box::pin(async move {
+            let (credential_id, version_id, name, username, protected, created_at) =
+                creation.into_parts();
+            let _persisted = self
+                .store
+                .create_credential(NewCredential::new(
+                    name.clone(),
+                    username.clone(),
+                    protected,
+                ))
+                .await?;
+            Credential::try_new(
+                credential_id,
+                name,
+                username,
+                version_id,
+                created_at,
+                created_at,
+            )
+            .map_err(CredentialRepositoryError::InvalidTimeline)
+        })
+    }
+}
+
+impl CredentialResolver for StandaloneState {
+    type Error = ActiveCredentialResolverError;
+
+    fn resolve(
+        &self,
+        credential_id: CredentialId,
+    ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
+        // The 'static resolver boundary cannot borrow the instance's store
+        // and master key, so the durable resolution logic is inlined here.
+        Box::pin(async move {
+            let Some(stored) = self
+                .store
+                .find_active_credential(credential_id)
+                .await
+                .map_err(ActiveCredentialResolverError::Repository)?
+            else {
+                return Ok(None);
+            };
+            let username = stored.metadata().username().clone();
+            let password = decrypt_credential(&self.master_key, stored.protected_secret())
+                .map_err(ActiveCredentialResolverError::Protection)?;
+            Ok(Some(ResolvedCredential::new(username, password)))
+        })
+    }
+}
+
+impl DiscoveredEndpointRepository for StandaloneState {
+    type Error = EndpointRepositoryError;
+
+    fn create_discovered_endpoint<'a>(
+        &'a self,
+        endpoint: Endpoint,
+        observations: &'a [EndpointCapabilityObservation],
+    ) -> BoundaryFuture<'a, Result<Endpoint, Self::Error>> {
+        <SqliteStore as DiscoveredEndpointRepository>::create_discovered_endpoint(
+            &self.store,
+            endpoint,
+            observations,
+        )
+    }
+}
+
+impl EndpointRefreshRepository for StandaloneState {
+    type Error = EndpointRefreshPersistenceError;
+
+    fn find_endpoint(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Endpoint>, Self::Error>> {
+        <SqliteStore as EndpointRefreshRepository>::find_endpoint(&self.store, endpoint_id)
+    }
+
+    fn commit_resource_generation<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        observations: &'a [ResourceObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
+        <SqliteStore as EndpointRefreshRepository>::commit_resource_generation(
+            &self.store,
+            endpoint_id,
+            observations,
+            observed_at,
+        )
+    }
+}
+
+impl AuditEventWriter for StandaloneState {
+    type Error = StandaloneAuditWriteError;
+
+    /// Persists the immutable fact first, then mirrors it into the bounded
+    /// in-memory tail served by the console audit query.
+    fn append_audit_event<'a>(
+        &'a self,
+        event: &'a AuditEvent,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            <SqliteStore as AuditEventWriter>::append_audit_event(&self.store, event)
+                .await
+                .map_err(StandaloneAuditWriteError::Store)?;
+            let mut tail = self
+                .audit_tail
+                .lock()
+                .map_err(|_| StandaloneAuditWriteError::Tail(StandaloneAuditTailError))?;
+            if tail.len() == AUDIT_TAIL_EVENTS {
+                tail.pop_front();
+            }
+            tail.push_back(event.clone());
+            Ok(())
+        })
+    }
+}
+
+impl AuditEventQuery for StandaloneState {
+    type Error = StandaloneAuditTailError;
+
+    fn list_recent_events(
+        &self,
+        limit: NonZeroU64,
+    ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+        Box::pin(async move {
+            let tail = self
+                .audit_tail
+                .lock()
+                .map_err(|_| StandaloneAuditTailError)?;
+            let take = usize::try_from(limit.get()).map_err(|_| StandaloneAuditTailError)?;
+            Ok(tail.iter().rev().take(take).cloned().collect())
+        })
+    }
+}
+
+/// A controlled failure while durably appending one audit fact.
+#[derive(Debug, Error)]
+pub enum StandaloneAuditWriteError {
+    #[error("failed to append the audit event: {0}")]
+    Store(#[source] AuditRepositoryError),
+    #[error("failed to record the in-memory audit tail: {0}")]
+    Tail(#[source] StandaloneAuditTailError),
+}
+
+/// The in-memory recent-audit tail cannot be read or bounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandaloneAuditTailError;
+
+impl fmt::Display for StandaloneAuditTailError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the in-memory audit tail is unavailable")
+    }
+}
+
+impl Error for StandaloneAuditTailError {}
 
 impl StandaloneInstance {
     /// Authenticates and opens a completed instance without recreating missing
@@ -100,8 +320,9 @@ impl StandaloneInstance {
         Ok(Self {
             state: Arc::new(StandaloneState {
                 store,
-                _master_key: master_key,
+                master_key,
                 _runtime_lock: runtime_lock,
+                audit_tail: Arc::new(Mutex::new(VecDeque::new())),
             }),
         })
     }
@@ -125,8 +346,9 @@ impl StandaloneInstance {
         })?;
         let StandaloneState {
             store,
-            _master_key,
+            master_key: _,
             _runtime_lock,
+            audit_tail: _,
         } = state;
         store
             .close()
@@ -193,21 +415,25 @@ impl StandaloneBinding {
         format!("http://{}/", self.address)
     }
 
-    /// Serves the embedded Web application from an authenticated inventory
-    /// provider until a tracked shutdown future resolves, then waits for
-    /// Axum's graceful drain to complete.
+    /// Serves the embedded Web application over the injected product services
+    /// until a tracked shutdown future resolves, then waits for Axum's
+    /// graceful drain to complete.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the bound listener fails while serving.
-    pub async fn serve_until<Repository, Shutdown>(
+    pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
         options: StandaloneRunOptions,
-        inventory: Arc<Repository>,
+        services: Arc<Services>,
+        gateway: Arc<Gateway>,
+        clock: Time,
         shutdown: Shutdown,
     ) -> io::Result<()>
     where
-        Repository: EndpointInventoryRepository + 'static,
+        Services: ProductServices + 'static,
+        Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+        Time: Clock + Clone + 'static,
         Shutdown: Future<Output = ()> + Send + 'static,
     {
         let url = self.url();
@@ -217,9 +443,13 @@ impl StandaloneBinding {
         }
         axum::serve(
             self.listener,
-            rutilus_web::router(
+            router(
                 WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
-                inventory,
+                AuditActor::LocalOperator,
+                DeploymentPosture::Standalone,
+                services,
+                gateway,
+                clock,
             ),
         )
         .with_graceful_shutdown(shutdown)
@@ -227,24 +457,28 @@ impl StandaloneBinding {
     }
 }
 
-/// Runs the foreground Standalone posture over an authenticated inventory
-/// provider until Ctrl-C, with structured Axum shutdown and no non-loopback
-/// plaintext mode.
+/// Runs the foreground Standalone posture over the injected product services
+/// until Ctrl-C, with structured Axum shutdown and no non-loopback plaintext
+/// mode.
 ///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when loopback binding, signal registration,
 /// or HTTP serving fails.
-pub async fn run_standalone<Repository>(
+pub async fn run_standalone<Services, Gateway, Time>(
     options: StandaloneRunOptions,
-    inventory: Arc<Repository>,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
 ) -> Result<(), StandaloneRunError>
 where
-    Repository: EndpointInventoryRepository + 'static,
+    Services: ProductServices + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
 {
     let binding = StandaloneBinding::bind().await?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let server = binding.serve_until(options, inventory, async move {
+    let server = binding.serve_until(options, services, gateway, clock, async move {
         let _result = shutdown_receiver.await;
     });
     tokio::pin!(server);
@@ -271,11 +505,14 @@ pub async fn run_initialized_standalone(
     unlock: &StandaloneUnlock,
     options: StandaloneRunOptions,
 ) -> Result<(), StandaloneExecutionError> {
+    let gateway = RedfishGateway::from_system_roots()
+        .await
+        .map_err(StandaloneExecutionError::Gateway)?;
     let instance = StandaloneInstance::open(paths, unlock)
         .await
         .map_err(StandaloneExecutionError::Open)?;
-    let inventory = Arc::clone(&instance.state);
-    let run_result = run_standalone(options, inventory).await;
+    let services = Arc::clone(&instance.state);
+    let run_result = run_standalone(options, services, Arc::new(gateway), SystemClock).await;
     let close_result = instance.close().await;
     match (run_result, close_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -346,6 +583,8 @@ pub enum StandaloneInstanceCloseError {
 /// A controlled failure across authenticated open, foreground serving, and close.
 #[derive(Debug, Error)]
 pub enum StandaloneExecutionError {
+    #[error("failed to load platform TLS trust for the Standalone server: {0}")]
+    Gateway(#[source] TlsProbeInitError),
     #[error("failed to open initialized Standalone state: {0}")]
     Open(#[source] StandaloneInstanceError),
     #[error("Standalone server failed: {0}")]
@@ -361,16 +600,76 @@ pub enum StandaloneExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, fmt};
 
+    use rutilus_application::{
+        BoundaryFuture, CoreResourceReader, EndpointDiscovery, RedfishDiscovery,
+        ResourceObservation, TlsIdentityObservation, TlsIdentityProbe,
+    };
+    use rutilus_domain::{CredentialUsername, EndpointAddress, TlsTrust};
+    use secrecy::SecretString;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
     };
 
     use super::*;
+
+    /// Every Redfish gateway boundary reports a controlled failure so the
+    /// loopback serving test never opens a socket or loads platform trust.
+    #[derive(Clone, Copy)]
+    struct UnavailableGateway;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct UnavailableGatewayError;
+
+    impl fmt::Display for UnavailableGatewayError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("test gateway is unavailable")
+        }
+    }
+
+    impl Error for UnavailableGatewayError {}
+
+    impl TlsIdentityProbe for UnavailableGateway {
+        type Error = UnavailableGatewayError;
+
+        fn observe<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+        ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+            Box::pin(async { Err(UnavailableGatewayError) })
+        }
+    }
+
+    impl RedfishDiscovery for UnavailableGateway {
+        type Error = UnavailableGatewayError;
+
+        fn probe_core_capabilities<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+            Box::pin(async { Err(UnavailableGatewayError) })
+        }
+    }
+
+    impl CoreResourceReader for UnavailableGateway {
+        type Error = UnavailableGatewayError;
+
+        fn read_core_resources<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+            Box::pin(async { Err(UnavailableGatewayError) })
+        }
+    }
     use crate::{StandaloneUnlock, initialize_standalone};
-    use secrecy::SecretString;
 
     #[tokio::test]
     async fn binds_only_loopback_and_serves_until_tracked_shutdown() -> Result<(), Box<dyn Error>> {
@@ -381,11 +680,16 @@ mod tests {
         assert_eq!(binding.url(), format!("http://{address}/"));
 
         let directory = tempfile::tempdir()?;
-        let store = Arc::new(SqliteStore::open(directory.path().join("rutilus.db")).await?);
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let server = tokio::spawn(binding.serve_until(
             StandaloneRunOptions::new(false),
-            Arc::clone(&store),
+            Arc::clone(&instance.state),
+            Arc::new(UnavailableGateway),
+            SystemClock,
             async move {
                 let _result = shutdown_receiver.await;
             },
@@ -418,10 +722,7 @@ mod tests {
             .send(())
             .map_err(|()| std::io::Error::other("server shutdown receiver was dropped"))?;
         server.await??;
-        Arc::try_unwrap(store)
-            .map_err(|_| std::io::Error::other("server retained the SQLite inventory"))?
-            .close()
-            .await?;
+        instance.close().await?;
         drop(directory);
         Ok(())
     }
@@ -484,8 +785,9 @@ mod tests {
             .map_err(|_| std::io::Error::other("test retained unexpected Standalone state"))?;
         let StandaloneState {
             store,
-            _master_key: master_key,
+            master_key,
             _runtime_lock: runtime_lock,
+            audit_tail: _,
         } = state;
         store.close().await?;
         drop((master_key, runtime_lock));

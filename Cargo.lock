@@ -3568,6 +3568,7 @@ dependencies = [
  "rutilus-api",
  "rutilus-application",
  "rutilus-domain",
+ "secrecy",
  "serde_json",
  "time",
  "tokio",
