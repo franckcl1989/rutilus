@@ -1,6 +1,8 @@
 use std::{
     error::Error as StdError,
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +16,10 @@ use nv_redfish::{
         BmcCredentials, CacheSettings, HttpBmc,
         reqwest::{BmcError, Client as NvHttpClient},
     },
+    chassis::{Chassis, ChassisCollection, NetworkAdapter},
+    computer_system::{ComputerSystem, SystemCollection},
     core::EntityTypeRef as _,
+    manager::{Manager, ManagerCollection},
     session_service::{Session, SessionCreate},
 };
 use reqwest::{Client as ReqwestClient, StatusCode, redirect::Policy as RedirectPolicy};
@@ -110,14 +115,25 @@ impl RedfishGateway {
         }
     }
 
-    /// Reads the Service Root and probes the 0.1 core capabilities through
-    /// public, typed `nv-redfish` navigation methods.
+    /// Reads the Service Root and probes the complete §2.1 standard feature
+    /// surface (30 capabilities) through public, typed `nv-redfish`
+    /// navigation methods.
     ///
     /// When `SessionService` is usable, the gateway creates an operation-scoped
     /// Session, authenticates subsequent reads with its in-memory token, and
     /// actively deletes the Session before returning. An unavailable or
     /// unauthorized `SessionService` falls back to Basic authentication and is
     /// retained as an explicit capability state.
+    ///
+    /// Root-level services are probed directly from the Service Root. The
+    /// Systems, Chassis, and Managers collections are probed once and their
+    /// typed members then carry the member-scoped feature probes (BIOS,
+    /// processors, power, thermal, network protocol, and so on). Member
+    /// probing stops at the first observation that is not `NotAdvertised`,
+    /// because advertisement is an endpoint-level property that later members
+    /// cannot change. When no member can be inspected (empty collection or
+    /// member fetch failure), member-scoped features inherit the collection's
+    /// observation gap instead of guessing at links that were never decoded.
     ///
     /// Capability reads are sequential. A TLS identity or validation failure
     /// stops the probe immediately, while endpoint-local authorization,
@@ -147,23 +163,24 @@ impl RedfishGateway {
         let service_root = ServiceRootSummary::from_root(&authenticated.root);
         let result = async {
             let systems =
-                classify_capability_probe(authenticated.root.systems().await, &identity, trust)?;
+                probe_collection(authenticated.root.systems().await, &identity, trust).await?;
             let chassis =
-                classify_capability_probe(authenticated.root.chassis().await, &identity, trust)?;
+                probe_collection(authenticated.root.chassis().await, &identity, trust).await?;
             let managers =
-                classify_capability_probe(authenticated.root.managers().await, &identity, trust)?;
-
+                probe_collection(authenticated.root.managers().await, &identity, trust).await?;
+            let observations = CapabilityObservations {
+                session: authenticated.session_state,
+                systems: systems.state,
+                chassis: chassis.state,
+                managers: managers.state,
+                root: probe_root_services(&authenticated.root, &identity, trust).await?,
+                systems_features: probe_system_features(&systems, &identity, trust).await?,
+                chassis_features: probe_chassis_features(&chassis, &identity, trust).await?,
+                manager_features: probe_manager_features(&managers, &identity, trust).await?,
+            };
             Ok(CoreEndpointDiscovery {
                 service_root,
-                capabilities: [
-                    EndpointCapabilityObservation::new(
-                        EndpointCapability::SessionService,
-                        authenticated.session_state,
-                    ),
-                    EndpointCapabilityObservation::new(EndpointCapability::Systems, systems),
-                    EndpointCapabilityObservation::new(EndpointCapability::Chassis, chassis),
-                    EndpointCapabilityObservation::new(EndpointCapability::Managers, managers),
-                ],
+                capabilities: build_observations(observations),
             })
         }
         .await;
@@ -500,11 +517,11 @@ impl CoreResourceProjection {
     }
 }
 
-/// Service metadata and the usable state of every 0.1 core capability.
+/// Service metadata and the usable state of every §2.1 standard capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreEndpointDiscovery {
     service_root: ServiceRootSummary,
-    capabilities: [EndpointCapabilityObservation; 4],
+    capabilities: Vec<EndpointCapabilityObservation>,
 }
 
 impl CoreEndpointDiscovery {
@@ -514,9 +531,13 @@ impl CoreEndpointDiscovery {
         &self.service_root
     }
 
-    /// Borrows all core observations in stable capability order.
+    /// Borrows all capability observations in §2.1 inventory order.
+    ///
+    /// The vector always carries exactly one observation per compiled standard
+    /// feature; [`super::probe_core_capabilities`] constructs it exhaustively
+    /// so a future capability cannot silently drop out of discovery.
     #[must_use]
-    pub const fn capabilities(&self) -> &[EndpointCapabilityObservation; 4] {
+    pub fn capabilities(&self) -> &[EndpointCapabilityObservation] {
         &self.capabilities
     }
 }
@@ -933,12 +954,23 @@ fn classify_capability_probe<T>(
     identity: &IdentityMonitor,
     trust: &TlsTrust,
 ) -> Result<CapabilityState, RedfishServiceRootError> {
-    let source = match result {
-        Ok(Some(_)) => return Ok(CapabilityState::Supported),
-        Ok(None) => return Ok(CapabilityState::NotAdvertised),
-        Err(source) => source,
-    };
+    match result {
+        Ok(Some(_)) => Ok(CapabilityState::Supported),
+        Ok(None) => Ok(CapabilityState::NotAdvertised),
+        Err(source) => classify_capability_error(source, identity, trust),
+    }
+}
 
+/// Classifies one typed navigation failure into a capability state.
+///
+/// TLS-safety failures stay hard errors so a capability probe can never paper
+/// over a changed identity; everything else becomes the state the capability
+/// ledger persists.
+fn classify_capability_error(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CapabilityState, RedfishServiceRootError> {
     match classify_service_root_error(source, identity, trust) {
         RedfishServiceRootError::AuthenticationFailed { .. }
         | RedfishServiceRootError::PermissionDenied { .. } => Ok(CapabilityState::Unauthorized),
@@ -959,6 +991,470 @@ fn classify_capability_probe<T>(
         | RedfishServiceRootError::SessionCleanupFailed
         | RedfishServiceRootError::OperationAndSessionCleanupFailed { .. }) => Err(source),
     }
+}
+
+/// One probed collection: its own capability state plus the typed members
+/// that carry the member-scoped feature probes.
+struct ProbedCollection<Member> {
+    state: CapabilityState,
+    members: Option<Vec<Member>>,
+    nested_state: CapabilityState,
+}
+
+/// Access to the typed members of one `nv-redfish` collection wrapper.
+trait CollectionMembers {
+    type Member;
+
+    async fn fetch_members(&self) -> Result<Vec<Self::Member>, UpstreamServiceRootError>;
+}
+
+impl CollectionMembers for SystemCollection<UpstreamBmc> {
+    type Member = ComputerSystem<UpstreamBmc>;
+
+    async fn fetch_members(&self) -> Result<Vec<Self::Member>, UpstreamServiceRootError> {
+        self.members().await
+    }
+}
+
+impl CollectionMembers for ChassisCollection<UpstreamBmc> {
+    type Member = Chassis<UpstreamBmc>;
+
+    async fn fetch_members(&self) -> Result<Vec<Self::Member>, UpstreamServiceRootError> {
+        self.members().await
+    }
+}
+
+impl CollectionMembers for ManagerCollection<UpstreamBmc> {
+    type Member = Manager<UpstreamBmc>;
+
+    async fn fetch_members(&self) -> Result<Vec<Self::Member>, UpstreamServiceRootError> {
+        self.members().await
+    }
+}
+
+/// Fetches one typed collection once and retains its members for the nested
+/// capability probes, so member-scoped links are discovered through decoded
+/// members instead of guessed paths.
+///
+/// When the collection is advertised but its members cannot be fetched, the
+/// member-scoped features inherit the classified member failure: they are
+/// observable in principle, so `NotAdvertised` would be a guess.
+async fn probe_collection<C: CollectionMembers>(
+    result: Result<Option<C>, UpstreamServiceRootError>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<ProbedCollection<C::Member>, RedfishServiceRootError> {
+    let (state, collection) = match result {
+        Ok(Some(collection)) => (CapabilityState::Supported, Some(collection)),
+        Ok(None) => (CapabilityState::NotAdvertised, None),
+        Err(source) => {
+            let state = classify_capability_error(source, identity, trust)?;
+            return Ok(ProbedCollection {
+                state,
+                members: None,
+                nested_state: state,
+            });
+        }
+    };
+    let Some(collection) = collection else {
+        return Ok(ProbedCollection {
+            state,
+            members: None,
+            nested_state: state,
+        });
+    };
+    match collection.fetch_members().await {
+        Ok(members) => Ok(ProbedCollection {
+            state,
+            members: Some(members),
+            nested_state: CapabilityState::NotAdvertised,
+        }),
+        Err(source) => {
+            let nested_state = classify_capability_error(source, identity, trust)?;
+            Ok(ProbedCollection {
+                state,
+                members: None,
+                nested_state,
+            })
+        }
+    }
+}
+
+/// Probes one member-scoped feature through every decoded member of a
+/// collection.
+///
+/// The first observation that is not `NotAdvertised` decides the endpoint
+/// state: advertisement is an endpoint-level property, so later members cannot
+/// change it, and stopping early keeps the probe bounded on dense services.
+async fn probe_nested<T, U>(
+    collection: &ProbedCollection<T>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    accessor: impl for<'a> Fn(
+        &'a T,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<U>, UpstreamServiceRootError>> + Send + 'a>,
+    >,
+) -> Result<CapabilityState, RedfishServiceRootError> {
+    let Some(members) = &collection.members else {
+        return Ok(collection.nested_state);
+    };
+    for member in members {
+        let observed = classify_capability_probe(accessor(member).await, identity, trust)?;
+        if observed != CapabilityState::NotAdvertised {
+            return Ok(observed);
+        }
+    }
+    Ok(CapabilityState::NotAdvertised)
+}
+
+/// Probes a member-scoped feature that has no `nv-redfish` fetch accessor by
+/// inspecting the typed navigation field of every decoded member.
+///
+/// The schema already decoded together with the member, so a present link is
+/// `Supported` and a missing link is `NotAdvertised` without an extra request;
+/// a decode failure cannot occur here because it would have failed the member
+/// fetch itself.
+fn probe_nested_presence<T>(
+    collection: &ProbedCollection<T>,
+    advertised: impl Fn(&T) -> bool,
+) -> CapabilityState {
+    match &collection.members {
+        Some(members) if members.iter().any(advertised) => CapabilityState::Supported,
+        Some(_) => CapabilityState::NotAdvertised,
+        None => collection.nested_state,
+    }
+}
+
+/// Probes the power-supplies capability through the modern `PowerSubsystem`
+/// surface.
+///
+/// The `nv-redfish` accessor returns an empty vector both when the
+/// `PowerSubsystem` link is missing and when no supply exists, so the typed
+/// link is checked first to keep `NotAdvertised` distinguishable from a
+/// decoded-but-empty subsystem.
+async fn probe_power_supplies(
+    collection: &ProbedCollection<Chassis<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CapabilityState, RedfishServiceRootError> {
+    let Some(members) = &collection.members else {
+        return Ok(collection.nested_state);
+    };
+    for chassis in members {
+        if chassis.raw().power_subsystem.is_none() {
+            continue;
+        }
+        return classify_capability_probe(
+            chassis.power_supplies().await.map(Some),
+            identity,
+            trust,
+        );
+    }
+    Ok(CapabilityState::NotAdvertised)
+}
+
+/// Probes the Chassis network-adapters collection and retains the decoded
+/// adapters, because the network-device-functions capability lives one level
+/// deeper on those adapters and re-fetching them would double the probe.
+async fn probe_network_adapters(
+    collection: &ProbedCollection<Chassis<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<(CapabilityState, Option<Vec<NetworkAdapter<UpstreamBmc>>>), RedfishServiceRootError> {
+    let Some(members) = &collection.members else {
+        return Ok((collection.nested_state, None));
+    };
+    for chassis in members {
+        match chassis.network_adapters().await {
+            Ok(Some(adapters)) => return Ok((CapabilityState::Supported, Some(adapters))),
+            Ok(None) => {}
+            Err(source) => {
+                let state = classify_capability_error(source, identity, trust)?;
+                return Ok((state, None));
+            }
+        }
+    }
+    Ok((CapabilityState::NotAdvertised, None))
+}
+
+/// Probes network-device-functions through the adapters already fetched by
+/// [`probe_network_adapters`].
+async fn probe_adapter_functions(
+    adapters: &[NetworkAdapter<UpstreamBmc>],
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CapabilityState, RedfishServiceRootError> {
+    for adapter in adapters {
+        let observed =
+            classify_capability_probe(adapter.network_device_functions().await, identity, trust)?;
+        if observed != CapabilityState::NotAdvertised {
+            return Ok(observed);
+        }
+    }
+    Ok(CapabilityState::NotAdvertised)
+}
+
+/// The observed states of the services linked directly from the Service Root.
+struct RootServiceProbe {
+    accounts: CapabilityState,
+    event_service: CapabilityState,
+    task_service: CapabilityState,
+    telemetry_service: CapabilityState,
+    update_service: CapabilityState,
+    power_equipment: CapabilityState,
+}
+
+/// The observed states of the features carried by `ComputerSystem` members.
+struct SystemFeatureProbe {
+    bios: CapabilityState,
+    boot_options: CapabilityState,
+    secure_boot: CapabilityState,
+    processors: CapabilityState,
+    memory: CapabilityState,
+    storages: CapabilityState,
+    pcie_devices: CapabilityState,
+}
+
+/// The observed states of the features carried by `Chassis` members.
+struct ChassisFeatureProbe {
+    assembly: CapabilityState,
+    power: CapabilityState,
+    thermal: CapabilityState,
+    sensors: CapabilityState,
+    controls: CapabilityState,
+    power_supplies: CapabilityState,
+    network_adapters: CapabilityState,
+    network_device_functions: CapabilityState,
+    environment_metrics: CapabilityState,
+}
+
+/// The observed states of the features carried by `Manager` members.
+struct ManagerFeatureProbe {
+    ethernet_interfaces: CapabilityState,
+    host_interfaces: CapabilityState,
+    manager_network_protocol: CapabilityState,
+    log_services: CapabilityState,
+}
+
+/// Every probed state grouped by origin, so the §2.1 observation vector can
+/// be assembled exhaustively without a 30-field hand-written tuple.
+struct CapabilityObservations {
+    session: CapabilityState,
+    systems: CapabilityState,
+    chassis: CapabilityState,
+    managers: CapabilityState,
+    root: RootServiceProbe,
+    systems_features: SystemFeatureProbe,
+    chassis_features: ChassisFeatureProbe,
+    manager_features: ManagerFeatureProbe,
+}
+
+async fn probe_root_services(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<RootServiceProbe, RedfishServiceRootError> {
+    Ok(RootServiceProbe {
+        accounts: classify_capability_probe(root.account_service().await, identity, trust)?,
+        event_service: classify_capability_probe(root.event_service().await, identity, trust)?,
+        task_service: classify_capability_probe(root.task_service().await, identity, trust)?,
+        telemetry_service: classify_capability_probe(
+            root.telemetry_service().await,
+            identity,
+            trust,
+        )?,
+        update_service: classify_capability_probe(root.update_service().await, identity, trust)?,
+        power_equipment: classify_capability_probe(root.power_equipment().await, identity, trust)?,
+    })
+}
+
+async fn probe_system_features(
+    systems: &ProbedCollection<ComputerSystem<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<SystemFeatureProbe, RedfishServiceRootError> {
+    Ok(SystemFeatureProbe {
+        bios: probe_nested(systems, identity, trust, |system| Box::pin(system.bios())).await?,
+        boot_options: probe_nested(systems, identity, trust, |system| {
+            Box::pin(system.boot_options())
+        })
+        .await?,
+        secure_boot: probe_nested(systems, identity, trust, |system| {
+            Box::pin(system.secure_boot())
+        })
+        .await?,
+        processors: probe_nested(systems, identity, trust, |system| {
+            Box::pin(system.processors())
+        })
+        .await?,
+        memory: probe_nested(systems, identity, trust, |system| {
+            Box::pin(system.memory_modules())
+        })
+        .await?,
+        storages: probe_nested(systems, identity, trust, |system| {
+            Box::pin(system.storage_controllers())
+        })
+        .await?,
+        pcie_devices: probe_nested_presence(systems, |system| system.raw().pcie_devices.is_some()),
+    })
+}
+
+async fn probe_chassis_features(
+    chassis: &ProbedCollection<Chassis<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<ChassisFeatureProbe, RedfishServiceRootError> {
+    let (network_adapters, adapter_members) =
+        probe_network_adapters(chassis, identity, trust).await?;
+    let network_device_functions = match &adapter_members {
+        Some(adapters) => probe_adapter_functions(adapters, identity, trust).await?,
+        None => network_adapters,
+    };
+    Ok(ChassisFeatureProbe {
+        assembly: probe_nested(chassis, identity, trust, |chassis| {
+            Box::pin(chassis.assembly())
+        })
+        .await?,
+        power: probe_nested(chassis, identity, trust, |chassis| {
+            Box::pin(chassis.power())
+        })
+        .await?,
+        thermal: probe_nested(chassis, identity, trust, |chassis| {
+            Box::pin(chassis.thermal())
+        })
+        .await?,
+        sensors: probe_nested(chassis, identity, trust, |chassis| {
+            Box::pin(chassis.sensor_links())
+        })
+        .await?,
+        controls: probe_nested(chassis, identity, trust, |chassis| {
+            Box::pin(chassis.controls())
+        })
+        .await?,
+        power_supplies: probe_power_supplies(chassis, identity, trust).await?,
+        network_adapters,
+        network_device_functions,
+        environment_metrics: probe_nested_presence(chassis, |chassis| {
+            chassis.raw().environment_metrics.is_some()
+        }),
+    })
+}
+
+async fn probe_manager_features(
+    managers: &ProbedCollection<Manager<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<ManagerFeatureProbe, RedfishServiceRootError> {
+    Ok(ManagerFeatureProbe {
+        ethernet_interfaces: probe_nested(managers, identity, trust, |manager| {
+            Box::pin(manager.ethernet_interfaces())
+        })
+        .await?,
+        host_interfaces: probe_nested(managers, identity, trust, |manager| {
+            Box::pin(manager.host_interfaces())
+        })
+        .await?,
+        manager_network_protocol: probe_nested(managers, identity, trust, |manager| {
+            Box::pin(manager.network_protocol())
+        })
+        .await?,
+        log_services: probe_nested(managers, identity, trust, |manager| {
+            Box::pin(manager.log_services())
+        })
+        .await?,
+    })
+}
+
+/// Assembles the §2.1 inventory in design-document order.
+///
+/// Every field of [`CapabilityObservations`] maps to exactly one entry, so a
+/// future capability cannot silently drop out of discovery.
+fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityObservation> {
+    let CapabilityObservations {
+        session,
+        systems,
+        chassis,
+        managers,
+        root,
+        systems_features,
+        chassis_features,
+        manager_features,
+    } = states;
+    vec![
+        EndpointCapabilityObservation::new(EndpointCapability::Accounts, root.accounts),
+        EndpointCapabilityObservation::new(EndpointCapability::Assembly, chassis_features.assembly),
+        EndpointCapabilityObservation::new(EndpointCapability::Bios, systems_features.bios),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::BootOptions,
+            systems_features.boot_options,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::Chassis, chassis),
+        EndpointCapabilityObservation::new(EndpointCapability::Systems, systems),
+        EndpointCapabilityObservation::new(EndpointCapability::Controls, chassis_features.controls),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::EnvironmentMetrics,
+            chassis_features.environment_metrics,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::EthernetInterfaces,
+            manager_features.ethernet_interfaces,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::EventService, root.event_service),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::HostInterfaces,
+            manager_features.host_interfaces,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::LogServices,
+            manager_features.log_services,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::ManagerNetworkProtocol,
+            manager_features.manager_network_protocol,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::Managers, managers),
+        EndpointCapabilityObservation::new(EndpointCapability::Memory, systems_features.memory),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::NetworkAdapters,
+            chassis_features.network_adapters,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::NetworkDeviceFunctions,
+            chassis_features.network_device_functions,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::PcieDevices,
+            systems_features.pcie_devices,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::Power, chassis_features.power),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::PowerEquipment,
+            root.power_equipment,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::PowerSupplies,
+            chassis_features.power_supplies,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::Processors,
+            systems_features.processors,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::SecureBoot,
+            systems_features.secure_boot,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::Sensors, chassis_features.sensors),
+        EndpointCapabilityObservation::new(EndpointCapability::SessionService, session),
+        EndpointCapabilityObservation::new(EndpointCapability::Storages, systems_features.storages),
+        EndpointCapabilityObservation::new(EndpointCapability::TaskService, root.task_service),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::TelemetryService,
+            root.telemetry_service,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::Thermal, chassis_features.thermal),
+        EndpointCapabilityObservation::new(EndpointCapability::UpdateService, root.update_service),
+    ]
 }
 
 fn classify_bmc_error(source: BmcError) -> RedfishServiceRootError {
@@ -1421,6 +1917,244 @@ mod tests {
         "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"#;
 
+    const FULL_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService"},
+        "EventService":{"@odata.id":"/redfish/v1/EventService"},
+        "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+        "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+        "PowerEquipment":{"@odata.id":"/redfish/v1/PowerEquipment"}
+    }"#;
+
+    const FULL_SYSTEMS_BODY: &str = r##"{
+        "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",
+        "@odata.id":"/redfish/v1/Systems",
+        "Name":"Computer System Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1"}]
+    }"##;
+
+    const FULL_SYSTEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Bios":{"@odata.id":"/redfish/v1/Systems/1/Bios"},
+        "Boot":{"BootOptions":{"@odata.id":"/redfish/v1/Systems/1/BootOptions"}},
+        "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
+        "Processors":{"@odata.id":"/redfish/v1/Systems/1/Processors"},
+        "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"},
+        "Storage":{"@odata.id":"/redfish/v1/Systems/1/Storage"},
+        "PCIeDevices":[{"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/1"}]
+    }"#;
+
+    const FULL_CHASSIS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"},
+        "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+        "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+        "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+        "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+        "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"},
+        "NetworkAdapters":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters"},
+        "EnvironmentMetrics":{"@odata.id":"/redfish/v1/Chassis/1/EnvironmentMetrics"}
+    }"#;
+
+    const FULL_MANAGER_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "EthernetInterfaces":{"@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces"},
+        "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+        "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+        "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"}
+    }"#;
+
+    const ACCOUNT_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/AccountService",
+        "Id":"AccountService",
+        "Name":"Account Service"
+    }"#;
+
+    const EVENT_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/EventService",
+        "Id":"EventService",
+        "Name":"Event Service"
+    }"#;
+
+    const TASK_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/TaskService",
+        "Id":"TaskService",
+        "Name":"Task Service",
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService/Tasks"}
+    }"#;
+
+    const TELEMETRY_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/TelemetryService",
+        "Id":"TelemetryService",
+        "Name":"Telemetry Service"
+    }"#;
+
+    const UPDATE_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/UpdateService",
+        "Id":"UpdateService",
+        "Name":"Update Service"
+    }"#;
+
+    const POWER_EQUIPMENT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/PowerEquipment",
+        "Id":"PowerEquipment",
+        "Name":"Power Equipment"
+    }"#;
+
+    const BIOS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Bios",
+        "Id":"Bios",
+        "Name":"BIOS"
+    }"#;
+
+    const BOOT_OPTIONS_BODY: &str = r##"{
+        "@odata.type":"#BootOptionCollection.BootOptionCollection",
+        "@odata.id":"/redfish/v1/Systems/1/BootOptions",
+        "Name":"Boot Option Collection",
+        "Members":[]
+    }"##;
+
+    const SECURE_BOOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+        "Id":"SecureBoot",
+        "Name":"Secure Boot"
+    }"#;
+
+    const PROCESSORS_BODY: &str = r##"{
+        "@odata.type":"#ProcessorCollection.ProcessorCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Processors",
+        "Name":"Processor Collection",
+        "Members":[]
+    }"##;
+
+    const MEMORY_BODY: &str = r##"{
+        "@odata.type":"#MemoryCollection.MemoryCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Memory",
+        "Name":"Memory Collection",
+        "Members":[]
+    }"##;
+
+    const STORAGE_BODY: &str = r##"{
+        "@odata.type":"#StorageCollection.StorageCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Storage",
+        "Name":"Storage Collection",
+        "Members":[]
+    }"##;
+
+    const ASSEMBLY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/Assembly",
+        "Id":"Assembly",
+        "Name":"Assembly"
+    }"#;
+
+    const POWER_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/Power",
+        "Id":"Power",
+        "Name":"Power"
+    }"#;
+
+    const THERMAL_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/Thermal",
+        "Id":"Thermal",
+        "Name":"Thermal"
+    }"#;
+
+    const SENSORS_BODY: &str = r##"{
+        "@odata.type":"#SensorCollection.SensorCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Sensors",
+        "Name":"Sensor Collection",
+        "Members":[]
+    }"##;
+
+    const CONTROLS_BODY: &str = r##"{
+        "@odata.type":"#ControlCollection.ControlCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls",
+        "Name":"Control Collection",
+        "Members":[]
+    }"##;
+
+    const POWER_SUBSYSTEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem",
+        "Id":"PowerSubsystem",
+        "Name":"Power Subsystem",
+        "PowerSupplies":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies"}
+    }"#;
+
+    const POWER_SUPPLIES_BODY: &str = r##"{
+        "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "Name":"Power Supply Collection",
+        "Members":[]
+    }"##;
+
+    const NETWORK_ADAPTERS_BODY: &str = r##"{
+        "@odata.type":"#NetworkAdapterCollection.NetworkAdapterCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters",
+        "Name":"Network Adapter Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1"}]
+    }"##;
+
+    const NETWORK_ADAPTER_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "Id":"1",
+        "Name":"Adapter One",
+        "NetworkDeviceFunctions":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions"}
+    }"#;
+
+    const NETWORK_DEVICE_FUNCTIONS_BODY: &str = r##"{
+        "@odata.type":"#NetworkDeviceFunctionCollection.NetworkDeviceFunctionCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions",
+        "Name":"Network Device Function Collection",
+        "Members":[]
+    }"##;
+
+    const ETHERNET_INTERFACES_BODY: &str = r##"{
+        "@odata.type":"#EthernetInterfaceCollection.EthernetInterfaceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/EthernetInterfaces",
+        "Name":"Ethernet Interface Collection",
+        "Members":[]
+    }"##;
+
+    const HOST_INTERFACES_BODY: &str = r##"{
+        "@odata.type":"#HostInterfaceCollection.HostInterfaceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/HostInterfaces",
+        "Name":"Host Interface Collection",
+        "Members":[]
+    }"##;
+
+    const NETWORK_PROTOCOL_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/NetworkProtocol",
+        "Id":"NetworkProtocol",
+        "Name":"Manager Network Protocol"
+    }"#;
+
+    const LOG_SERVICES_BODY: &str = r##"{
+        "@odata.type":"#LogServiceCollection.LogServiceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices",
+        "Name":"Log Service Collection",
+        "Members":[]
+    }"##;
+
     const CORE_REQUEST_PATHS: [&str; 8] = [
         "/redfish/v1",
         "/redfish/v1/SessionService",
@@ -1485,6 +2219,221 @@ mod tests {
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
+    /// Every request the complete 30-feature probe makes against a fixture
+    /// that advertises all root services and one member per core collection.
+    /// Order mirrors the probe sequence in `probe_core_capabilities`.
+    const FULL_PROBE_REQUEST_PATHS: [&str; 37] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/EventService",
+        "/redfish/v1/TaskService",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/PowerEquipment",
+        "/redfish/v1/Systems/1/Bios",
+        "/redfish/v1/Systems/1/BootOptions",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Systems/1/Processors",
+        "/redfish/v1/Systems/1/Memory",
+        "/redfish/v1/Systems/1/Storage",
+        "/redfish/v1/Chassis/1/NetworkAdapters",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions",
+        "/redfish/v1/Chassis/1/Assembly",
+        "/redfish/v1/Chassis/1/Power",
+        "/redfish/v1/Chassis/1/Thermal",
+        "/redfish/v1/Chassis/1/Sensors",
+        "/redfish/v1/Chassis/1/Controls",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Managers/1/EthernetInterfaces",
+        "/redfish/v1/Managers/1/HostInterfaces",
+        "/redfish/v1/Managers/1/NetworkProtocol",
+        "/redfish/v1/Managers/1/LogServices",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The §2.1 standard-feature inventory in design-document order, mirrored
+    /// from `rutilus_domain` so discovery can prove it covers every capability
+    /// exactly once.
+    const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 30] = [
+        EndpointCapability::Accounts,
+        EndpointCapability::Assembly,
+        EndpointCapability::Bios,
+        EndpointCapability::BootOptions,
+        EndpointCapability::Chassis,
+        EndpointCapability::Systems,
+        EndpointCapability::Controls,
+        EndpointCapability::EnvironmentMetrics,
+        EndpointCapability::EthernetInterfaces,
+        EndpointCapability::EventService,
+        EndpointCapability::HostInterfaces,
+        EndpointCapability::LogServices,
+        EndpointCapability::ManagerNetworkProtocol,
+        EndpointCapability::Managers,
+        EndpointCapability::Memory,
+        EndpointCapability::NetworkAdapters,
+        EndpointCapability::NetworkDeviceFunctions,
+        EndpointCapability::PcieDevices,
+        EndpointCapability::Power,
+        EndpointCapability::PowerEquipment,
+        EndpointCapability::PowerSupplies,
+        EndpointCapability::Processors,
+        EndpointCapability::SecureBoot,
+        EndpointCapability::Sensors,
+        EndpointCapability::SessionService,
+        EndpointCapability::Storages,
+        EndpointCapability::TaskService,
+        EndpointCapability::TelemetryService,
+        EndpointCapability::Thermal,
+        EndpointCapability::UpdateService,
+    ];
+
+    /// Builds the exact discovery vector a probe must return for one fixture
+    /// class, so every capability test asserts the full §2.1 inventory in
+    /// order instead of a hand-written subset.
+    fn expected_capabilities(states: CapabilityObservations) -> Vec<EndpointCapabilityObservation> {
+        let CapabilityObservations {
+            session,
+            systems,
+            chassis,
+            managers,
+            root,
+            systems_features,
+            chassis_features,
+            manager_features,
+        } = states;
+        let expected = [
+            (EndpointCapability::Accounts, root.accounts),
+            (EndpointCapability::Assembly, chassis_features.assembly),
+            (EndpointCapability::Bios, systems_features.bios),
+            (
+                EndpointCapability::BootOptions,
+                systems_features.boot_options,
+            ),
+            (EndpointCapability::Chassis, chassis),
+            (EndpointCapability::Systems, systems),
+            (EndpointCapability::Controls, chassis_features.controls),
+            (
+                EndpointCapability::EnvironmentMetrics,
+                chassis_features.environment_metrics,
+            ),
+            (
+                EndpointCapability::EthernetInterfaces,
+                manager_features.ethernet_interfaces,
+            ),
+            (EndpointCapability::EventService, root.event_service),
+            (
+                EndpointCapability::HostInterfaces,
+                manager_features.host_interfaces,
+            ),
+            (
+                EndpointCapability::LogServices,
+                manager_features.log_services,
+            ),
+            (
+                EndpointCapability::ManagerNetworkProtocol,
+                manager_features.manager_network_protocol,
+            ),
+            (EndpointCapability::Managers, managers),
+            (EndpointCapability::Memory, systems_features.memory),
+            (
+                EndpointCapability::NetworkAdapters,
+                chassis_features.network_adapters,
+            ),
+            (
+                EndpointCapability::NetworkDeviceFunctions,
+                chassis_features.network_device_functions,
+            ),
+            (
+                EndpointCapability::PcieDevices,
+                systems_features.pcie_devices,
+            ),
+            (EndpointCapability::Power, chassis_features.power),
+            (EndpointCapability::PowerEquipment, root.power_equipment),
+            (
+                EndpointCapability::PowerSupplies,
+                chassis_features.power_supplies,
+            ),
+            (EndpointCapability::Processors, systems_features.processors),
+            (EndpointCapability::SecureBoot, systems_features.secure_boot),
+            (EndpointCapability::Sensors, chassis_features.sensors),
+            (EndpointCapability::SessionService, session),
+            (EndpointCapability::Storages, systems_features.storages),
+            (EndpointCapability::TaskService, root.task_service),
+            (EndpointCapability::TelemetryService, root.telemetry_service),
+            (EndpointCapability::Thermal, chassis_features.thermal),
+            (EndpointCapability::UpdateService, root.update_service),
+        ];
+        assert_eq!(expected.len(), CAPABILITY_INVENTORY_ORDER.len());
+        for (observation, expected_capability) in expected.iter().zip(CAPABILITY_INVENTORY_ORDER) {
+            assert_eq!(observation.0, expected_capability);
+        }
+        expected
+            .into_iter()
+            .map(|(capability, state)| EndpointCapabilityObservation::new(capability, state))
+            .collect()
+    }
+
+    /// Assigns one uniform state to every feature inside a probe group, for
+    /// fixtures whose collections and member-scoped links share one fate.
+    fn uniform_group(
+        session: CapabilityState,
+        core: CapabilityState,
+        root_services: CapabilityState,
+        nested: CapabilityState,
+    ) -> CapabilityObservations {
+        CapabilityObservations {
+            session,
+            systems: core,
+            chassis: core,
+            managers: core,
+            root: RootServiceProbe {
+                accounts: root_services,
+                event_service: root_services,
+                task_service: root_services,
+                telemetry_service: root_services,
+                update_service: root_services,
+                power_equipment: root_services,
+            },
+            systems_features: SystemFeatureProbe {
+                bios: nested,
+                boot_options: nested,
+                secure_boot: nested,
+                processors: nested,
+                memory: nested,
+                storages: nested,
+                pcie_devices: nested,
+            },
+            chassis_features: ChassisFeatureProbe {
+                assembly: nested,
+                power: nested,
+                thermal: nested,
+                sensors: nested,
+                controls: nested,
+                power_supplies: nested,
+                network_adapters: nested,
+                network_device_functions: nested,
+                environment_metrics: nested,
+            },
+            manager_features: ManagerFeatureProbe {
+                ethernet_interfaces: nested,
+                host_interfaces: nested,
+                manager_network_protocol: nested,
+                log_services: nested,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn reads_service_root_through_system_ca_and_public_nv_redfish_api()
     -> Result<(), Box<dyn Error>> {
@@ -1517,13 +2466,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probes_every_advertised_core_capability_through_typed_navigation()
+    async fn probes_every_advertised_capability_through_typed_navigation()
     -> Result<(), Box<dyn Error>> {
-        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(&[
-            ("200 OK", SYSTEMS_BODY),
-            ("200 OK", CHASSIS_BODY),
-            ("200 OK", MANAGERS_BODY),
-        ]))
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", FULL_SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", FULL_CHASSIS_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", FULL_MANAGER_BODY),
+                ("200 OK", ACCOUNT_SERVICE_BODY),
+                ("200 OK", EVENT_SERVICE_BODY),
+                ("200 OK", TASK_SERVICE_BODY),
+                ("200 OK", TELEMETRY_SERVICE_BODY),
+                ("200 OK", UPDATE_SERVICE_BODY),
+                ("200 OK", POWER_EQUIPMENT_BODY),
+                ("200 OK", BIOS_BODY),
+                ("200 OK", BOOT_OPTIONS_BODY),
+                ("200 OK", SECURE_BOOT_BODY),
+                ("200 OK", PROCESSORS_BODY),
+                ("200 OK", MEMORY_BODY),
+                ("200 OK", STORAGE_BODY),
+                ("200 OK", NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTER_BODY),
+                ("200 OK", NETWORK_DEVICE_FUNCTIONS_BODY),
+                ("200 OK", ASSEMBLY_BODY),
+                ("200 OK", POWER_BODY),
+                ("200 OK", THERMAL_BODY),
+                ("200 OK", SENSORS_BODY),
+                ("200 OK", CONTROLS_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_BODY),
+                ("200 OK", ETHERNET_INTERFACES_BODY),
+                ("200 OK", HOST_INTERFACES_BODY),
+                ("200 OK", NETWORK_PROTOCOL_BODY),
+                ("200 OK", LOG_SERVICES_BODY),
+            ],
+        ))
         .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
@@ -1540,26 +2521,14 @@ mod tests {
         assert_eq!(discovery.service_root().vendor(), Some("Rutilus Test"));
         assert_eq!(
             discovery.capabilities(),
-            &[
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::SessionService,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Systems,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Chassis,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Managers,
-                    CapabilityState::Supported,
-                ),
-            ]
+            expected_capabilities(uniform_group(
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+            ))
         );
-        assert_session_requests(&server.finish_all().await?, &CORE_REQUEST_PATHS)?;
+        assert_session_requests(&server.finish_all().await?, &FULL_PROBE_REQUEST_PATHS)?;
         Ok(())
     }
 
@@ -1579,11 +2548,14 @@ mod tests {
             )
             .await?;
 
-        assert!(
-            discovery
-                .capabilities()
-                .iter()
-                .all(|observation| observation.state() == CapabilityState::NotAdvertised)
+        assert_eq!(
+            discovery.capabilities(),
+            expected_capabilities(uniform_group(
+                CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+            ))
         );
         assert_authenticated_requests(&server.finish_all().await?, &["/redfish/v1"])?;
         Ok(())
@@ -1614,24 +2586,46 @@ mod tests {
 
         assert_eq!(
             discovery.capabilities(),
-            &[
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::SessionService,
-                    CapabilityState::Unauthorized,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Systems,
-                    CapabilityState::SchemaIncompatible,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Chassis,
-                    CapabilityState::TemporarilyUnavailable,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Managers,
-                    CapabilityState::Supported,
-                ),
-            ]
+            expected_capabilities(CapabilityObservations {
+                session: CapabilityState::Unauthorized,
+                systems: CapabilityState::SchemaIncompatible,
+                chassis: CapabilityState::TemporarilyUnavailable,
+                managers: CapabilityState::Supported,
+                root: RootServiceProbe {
+                    accounts: CapabilityState::NotAdvertised,
+                    event_service: CapabilityState::NotAdvertised,
+                    task_service: CapabilityState::NotAdvertised,
+                    telemetry_service: CapabilityState::NotAdvertised,
+                    update_service: CapabilityState::NotAdvertised,
+                    power_equipment: CapabilityState::NotAdvertised,
+                },
+                systems_features: SystemFeatureProbe {
+                    bios: CapabilityState::SchemaIncompatible,
+                    boot_options: CapabilityState::SchemaIncompatible,
+                    secure_boot: CapabilityState::SchemaIncompatible,
+                    processors: CapabilityState::SchemaIncompatible,
+                    memory: CapabilityState::SchemaIncompatible,
+                    storages: CapabilityState::SchemaIncompatible,
+                    pcie_devices: CapabilityState::SchemaIncompatible,
+                },
+                chassis_features: ChassisFeatureProbe {
+                    assembly: CapabilityState::TemporarilyUnavailable,
+                    power: CapabilityState::TemporarilyUnavailable,
+                    thermal: CapabilityState::TemporarilyUnavailable,
+                    sensors: CapabilityState::TemporarilyUnavailable,
+                    controls: CapabilityState::TemporarilyUnavailable,
+                    power_supplies: CapabilityState::TemporarilyUnavailable,
+                    network_adapters: CapabilityState::TemporarilyUnavailable,
+                    network_device_functions: CapabilityState::TemporarilyUnavailable,
+                    environment_metrics: CapabilityState::TemporarilyUnavailable,
+                },
+                manager_features: ManagerFeatureProbe {
+                    ethernet_interfaces: CapabilityState::NotAdvertised,
+                    host_interfaces: CapabilityState::NotAdvertised,
+                    manager_network_protocol: CapabilityState::NotAdvertised,
+                    log_services: CapabilityState::NotAdvertised,
+                },
+            })
         );
         assert_authenticated_requests(&server.finish_all().await?, &BASIC_FALLBACK_REQUEST_PATHS)?;
         Ok(())
@@ -1664,24 +2658,12 @@ mod tests {
 
         assert_eq!(
             discovery.capabilities(),
-            &[
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::SessionService,
-                    CapabilityState::TemporarilyUnavailable,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Systems,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Chassis,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Managers,
-                    CapabilityState::Supported,
-                ),
-            ]
+            expected_capabilities(uniform_group(
+                CapabilityState::TemporarilyUnavailable,
+                CapabilityState::Supported,
+                CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+            ))
         );
         assert_session_creation_fallback_requests(
             &server.finish_all().await?,
@@ -1692,11 +2674,14 @@ mod tests {
 
     #[tokio::test]
     async fn reports_sanitized_transient_session_cleanup_failure() -> Result<(), Box<dyn Error>> {
-        let mut responses = session_response_sequence(&[
-            ("200 OK", SYSTEMS_BODY),
-            ("200 OK", CHASSIS_BODY),
-            ("200 OK", MANAGERS_BODY),
-        ]);
+        let mut responses = session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_BODY),
+                ("200 OK", CHASSIS_BODY),
+                ("200 OK", MANAGERS_BODY),
+            ],
+        );
         if let Some(cleanup) = responses.last_mut() {
             *cleanup = http_response("500 Internal Server Error", "{}");
         }
@@ -1762,24 +2747,12 @@ mod tests {
 
         assert_eq!(
             discovery.capabilities(),
-            &[
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::SessionService,
-                    CapabilityState::SchemaIncompatible,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Systems,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Chassis,
-                    CapabilityState::Supported,
-                ),
-                EndpointCapabilityObservation::new(
-                    EndpointCapability::Managers,
-                    CapabilityState::Supported,
-                ),
-            ]
+            expected_capabilities(uniform_group(
+                CapabilityState::SchemaIncompatible,
+                CapabilityState::Supported,
+                CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+            ))
         );
         assert_invalid_session_token_fallback_requests(
             &server.finish_all().await?,
@@ -1789,16 +2762,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn member_schema_failure_is_inherited_by_member_scoped_features()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", CHASSIS_BODY),
+                ("200 OK", MANAGERS_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(
+            discovery.capabilities(),
+            expected_capabilities(CapabilityObservations {
+                session: CapabilityState::Supported,
+                systems: CapabilityState::Supported,
+                chassis: CapabilityState::Supported,
+                managers: CapabilityState::Supported,
+                root: RootServiceProbe {
+                    accounts: CapabilityState::NotAdvertised,
+                    event_service: CapabilityState::NotAdvertised,
+                    task_service: CapabilityState::NotAdvertised,
+                    telemetry_service: CapabilityState::NotAdvertised,
+                    update_service: CapabilityState::NotAdvertised,
+                    power_equipment: CapabilityState::NotAdvertised,
+                },
+                systems_features: SystemFeatureProbe {
+                    bios: CapabilityState::SchemaIncompatible,
+                    boot_options: CapabilityState::SchemaIncompatible,
+                    secure_boot: CapabilityState::SchemaIncompatible,
+                    processors: CapabilityState::SchemaIncompatible,
+                    memory: CapabilityState::SchemaIncompatible,
+                    storages: CapabilityState::SchemaIncompatible,
+                    pcie_devices: CapabilityState::SchemaIncompatible,
+                },
+                chassis_features: ChassisFeatureProbe {
+                    assembly: CapabilityState::NotAdvertised,
+                    power: CapabilityState::NotAdvertised,
+                    thermal: CapabilityState::NotAdvertised,
+                    sensors: CapabilityState::NotAdvertised,
+                    controls: CapabilityState::NotAdvertised,
+                    power_supplies: CapabilityState::NotAdvertised,
+                    network_adapters: CapabilityState::NotAdvertised,
+                    network_device_functions: CapabilityState::NotAdvertised,
+                    environment_metrics: CapabilityState::NotAdvertised,
+                },
+                manager_features: ManagerFeatureProbe {
+                    ethernet_interfaces: CapabilityState::NotAdvertised,
+                    host_interfaces: CapabilityState::NotAdvertised,
+                    manager_network_protocol: CapabilityState::NotAdvertised,
+                    log_services: CapabilityState::NotAdvertised,
+                },
+            })
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Chassis",
+                "/redfish/v1/Managers",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn capability_state_derivation_maps_links_and_schema_failures() -> Result<(), Box<dyn Error>> {
+        let identity = IdentityMonitor::default();
+        let trust = pinned_trust(
+            generate_simple_self_signed([String::from("localhost")])?
+                .cert
+                .der(),
+        )?;
+
+        assert_eq!(
+            classify_capability_probe::<()>(Ok(Some(())), &identity, &trust)?,
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            classify_capability_probe::<()>(Ok(None), &identity, &trust)?,
+            CapabilityState::NotAdvertised
+        );
+        let schema_error = match serde_json::from_str::<()>("{") {
+            Ok(()) => return Err(io::Error::other("invalid JSON unexpectedly parsed").into()),
+            Err(source) => source,
+        };
+        assert_eq!(
+            classify_capability_probe::<()>(
+                Err(nv_redfish::Error::Json(schema_error)),
+                &identity,
+                &trust,
+            )?,
+            CapabilityState::SchemaIncompatible
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn presence_probe_derives_state_from_decoded_members() {
+        let collection = ProbedCollection {
+            state: CapabilityState::Supported,
+            members: Some(vec![1_u8, 2]),
+            nested_state: CapabilityState::NotAdvertised,
+        };
+        assert_eq!(
+            probe_nested_presence(&collection, |member| *member == 2),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            probe_nested_presence(&collection, |member| *member == 3),
+            CapabilityState::NotAdvertised
+        );
+        let unobservable = ProbedCollection {
+            state: CapabilityState::SchemaIncompatible,
+            members: None,
+            nested_state: CapabilityState::SchemaIncompatible,
+        };
+        assert_eq!(
+            probe_nested_presence(&unobservable, |_member: &u8| true),
+            CapabilityState::SchemaIncompatible
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_probe_stops_at_the_first_decisive_member() -> Result<(), Box<dyn Error>> {
+        let identity = IdentityMonitor::default();
+        let trust = pinned_trust(
+            generate_simple_self_signed([String::from("localhost")])?
+                .cert
+                .der(),
+        )?;
+        let collection = ProbedCollection {
+            state: CapabilityState::Supported,
+            members: Some(vec![0_u8, 1, 2]),
+            nested_state: CapabilityState::NotAdvertised,
+        };
+
+        let state = probe_nested(&collection, &identity, &trust, |member| {
+            Box::pin(async move {
+                match member {
+                    0 => Ok(None),
+                    _ => Ok(Some(())),
+                }
+            })
+        })
+        .await?;
+        assert_eq!(state, CapabilityState::Supported);
+
+        let absent = probe_nested(&collection, &identity, &trust, |_member| {
+            Box::pin(async { Ok(None::<()>) })
+        })
+        .await?;
+        assert_eq!(absent, CapabilityState::NotAdvertised);
+
+        let unobservable = ProbedCollection {
+            state: CapabilityState::TemporarilyUnavailable,
+            members: None,
+            nested_state: CapabilityState::TemporarilyUnavailable,
+        };
+        let inherited = probe_nested(&unobservable, &identity, &trust, |_member: &u8| {
+            Box::pin(async { Ok(None::<()>) })
+        })
+        .await?;
+        assert_eq!(inherited, CapabilityState::TemporarilyUnavailable);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reads_complete_core_resources_through_typed_navigation() -> Result<(), Box<dyn Error>>
     {
-        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(&[
-            ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
-            ("200 OK", SYSTEM_BODY),
-            ("200 OK", CHASSIS_WITH_MEMBER_BODY),
-            ("200 OK", CHASSIS_MEMBER_BODY),
-            ("200 OK", MANAGERS_WITH_MEMBER_BODY),
-            ("200 OK", MANAGER_BODY),
-        ]))
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
         .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
@@ -1951,8 +3114,10 @@ mod tests {
     #[tokio::test]
     async fn preserves_resource_and_sanitized_session_cleanup_failures()
     -> Result<(), Box<dyn Error>> {
-        let mut responses =
-            session_response_sequence(&[("200 OK", SYSTEMS_WITH_MEMBER_BODY), ("200 OK", "{}")]);
+        let mut responses = session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[("200 OK", SYSTEMS_WITH_MEMBER_BODY), ("200 OK", "{}")],
+        );
         if let Some(cleanup) = responses.last_mut() {
             *cleanup = http_response("500 Internal Server Error", "{}");
         }
@@ -2320,9 +3485,12 @@ mod tests {
         })
     }
 
-    fn session_response_sequence(after_session: &[(&str, &str)]) -> Vec<Vec<u8>> {
+    fn session_response_sequence(
+        service_root_body: &str,
+        after_session: &[(&str, &str)],
+    ) -> Vec<Vec<u8>> {
         let mut responses = vec![
-            http_response("200 OK", CORE_SERVICE_ROOT_BODY),
+            http_response("200 OK", service_root_body),
             http_response("200 OK", SESSION_SERVICE_BODY),
             http_response("200 OK", SESSIONS_BODY),
             http_response_with_headers(
