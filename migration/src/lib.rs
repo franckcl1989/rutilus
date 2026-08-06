@@ -11,6 +11,7 @@ mod m20260805_000006_remote_tasks;
 mod m20260805_000007_artifacts;
 mod m20260805_000008_events;
 mod m20260805_000009_telemetry;
+mod m20260805_000010_groups_tags;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000007_artifacts::Migration),
             Box::new(m20260805_000008_events::Migration),
             Box::new(m20260805_000009_telemetry::Migration),
+            Box::new(m20260805_000010_groups_tags::Migration),
         ]
     }
 }
