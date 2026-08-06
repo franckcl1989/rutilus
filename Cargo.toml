@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "platform", "security", "ui", "web"]
+members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "platform", "security", "test-support", "ui", "web"]
 default-members = ["app"]
 resolver = "3"
 
@@ -36,6 +36,7 @@ rutilus-migration = { path = "migration", version = "0.1.0" }
 rutilus-persistence = { path = "persistence", version = "0.1.0" }
 rutilus-platform = { path = "platform", version = "0.1.0" }
 rutilus-security = { path = "security", version = "0.1.0" }
+rutilus-test-support = { path = "test-support", version = "0.1.0" }
 rutilus-web = { path = "web", version = "0.1.0" }
 sea-orm = { version = "2.0.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 sea-orm-migration = { version = "2.0.1", default-features = false, features = ["runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
