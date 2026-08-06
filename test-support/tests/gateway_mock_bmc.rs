@@ -28,17 +28,21 @@ const MOCK_PASSWORD: &str = "password";
 
 /// The capability states the Mock BMC must achieve for the core §2.1 surface.
 ///
-/// Member-scoped features (BIOS, Power, ...) stay fixture-dependent, so only
-/// the inventory count and the core capability states are pinned here; a
-/// fixture change cannot silently shrink the inventory, but a richer mock
+/// Member-scoped features (Power, Thermal, ...) stay fixture-dependent, so
+/// only the inventory count and the core capability states are pinned here;
+/// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 6] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
     EndpointCapability::Managers,
     EndpointCapability::Processors,
     EndpointCapability::Memory,
+    EndpointCapability::Accounts,
+    EndpointCapability::Bios,
+    EndpointCapability::BootOptions,
+    EndpointCapability::SecureBoot,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -166,10 +170,11 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
 
-    // The mock serves one System with two Processors and one Memory module,
-    // one Chassis, and one Manager; typed navigation must visit every family
-    // exactly in the documented read order.
-    assert_eq!(resources.len(), 7);
+    // The mock serves one System with its configuration surface (Bios,
+    // BootOptions, SecureBoot), two Processors and one Memory module, one
+    // Chassis, one Manager, and one Account; typed navigation must visit
+    // every family exactly in the documented read order.
+    assert_eq!(resources.len(), 11);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -179,22 +184,34 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
         [
             ResourceFeature::ServiceRoot,
             ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
             ResourceFeature::Processors,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Chassis,
             ResourceFeature::Managers,
+            ResourceFeature::Accounts,
         ]
     );
 
     assert_projection_payload(&resources[0], "Id", "RootService")?;
     assert_projection_payload(&resources[0], "RedfishVersion", "1.20.0")?;
     assert_projection_payload(&resources[1], "SystemType", "Physical")?;
-    assert_projection_payload(&resources[2], "ProcessorType", "CPU")?;
-    assert_projection_payload(&resources[3], "ProcessorType", "CPU")?;
-    assert_projection_payload(&resources[4], "MemoryDeviceType", "DDR4")?;
-    assert_projection_payload(&resources[5], "ChassisType", "RackMount")?;
-    assert_projection_payload(&resources[6], "ManagerType", "BMC")?;
+    assert_projection_payload(
+        &resources[2],
+        "AttributeRegistry",
+        "BiosAttributeRegistryP11.v1_2_0",
+    )?;
+    assert_projection_payload(&resources[3], "DisplayName", "PXE Network Boot")?;
+    assert_projection_payload(&resources[4], "SecureBootMode", "UserMode")?;
+    assert_projection_payload(&resources[5], "ProcessorType", "CPU")?;
+    assert_projection_payload(&resources[6], "ProcessorType", "CPU")?;
+    assert_projection_payload(&resources[7], "MemoryDeviceType", "DDR4")?;
+    assert_projection_payload(&resources[8], "ChassisType", "RackMount")?;
+    assert_projection_payload(&resources[9], "ManagerType", "BMC")?;
+    assert_projection_payload(&resources[10], "RoleId", "Administrator")?;
 
     // Identifiers and ETags survive the projection intact; the mock signs
     // every resource with its own ETag, so presence plus exact URI is the
@@ -203,18 +220,34 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
     assert_eq!(resources[1].odata_id().as_str(), "/redfish/v1/Systems/1");
     assert_eq!(
         resources[2].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Processors/CPU1"
+        "/redfish/v1/Systems/1/Bios"
     );
     assert_eq!(
         resources[3].odata_id().as_str(),
-        "/redfish/v1/Systems/1/Processors/CPU2"
+        "/redfish/v1/Systems/1/BootOptions/PXE-1"
     );
     assert_eq!(
         resources[4].odata_id().as_str(),
+        "/redfish/v1/Systems/1/SecureBoot"
+    );
+    assert_eq!(
+        resources[5].odata_id().as_str(),
+        "/redfish/v1/Systems/1/Processors/CPU1"
+    );
+    assert_eq!(
+        resources[6].odata_id().as_str(),
+        "/redfish/v1/Systems/1/Processors/CPU2"
+    );
+    assert_eq!(
+        resources[7].odata_id().as_str(),
         "/redfish/v1/Systems/1/Memory/DIMM1"
     );
-    assert_eq!(resources[5].odata_id().as_str(), "/redfish/v1/Chassis/1");
-    assert_eq!(resources[6].odata_id().as_str(), "/redfish/v1/Managers/1");
+    assert_eq!(resources[8].odata_id().as_str(), "/redfish/v1/Chassis/1");
+    assert_eq!(resources[9].odata_id().as_str(), "/redfish/v1/Managers/1");
+    assert_eq!(
+        resources[10].odata_id().as_str(),
+        "/redfish/v1/AccountService/Accounts/admin"
+    );
     for resource in &resources {
         assert!(
             resource.etag().is_some(),
@@ -253,6 +286,10 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("POST", "/redfish/v1/SessionService/Sessions"),
             ("GET", "/redfish/v1/Systems"),
             ("GET", "/redfish/v1/Systems/1"),
+            ("GET", "/redfish/v1/Systems/1/Bios"),
+            ("GET", "/redfish/v1/Systems/1/BootOptions"),
+            ("GET", "/redfish/v1/Systems/1/BootOptions/PXE-1"),
+            ("GET", "/redfish/v1/Systems/1/SecureBoot"),
             ("GET", "/redfish/v1/Systems/1/Processors"),
             ("GET", "/redfish/v1/Systems/1/Processors/CPU1"),
             ("GET", "/redfish/v1/Systems/1/Processors/CPU2"),
@@ -262,6 +299,9 @@ async fn session_lifecycle_posts_create_and_deletes_through_the_gateway()
             ("GET", "/redfish/v1/Chassis/1"),
             ("GET", "/redfish/v1/Managers"),
             ("GET", "/redfish/v1/Managers/1"),
+            ("GET", "/redfish/v1/AccountService"),
+            ("GET", "/redfish/v1/AccountService/Accounts"),
+            ("GET", "/redfish/v1/AccountService/Accounts/admin"),
             ("DELETE", "/redfish/v1/SessionService/Sessions/1"),
         ],
     );

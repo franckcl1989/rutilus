@@ -4,15 +4,16 @@
 //! already decode with `nv-redfish` 0.13 (same `@odata.type` versions, same
 //! field sets, same enum spellings), so the mock cannot drift from what the
 //! product actually parses. The tree is deliberately small: one System with
-//! two Processors and one Memory module, one Chassis, one Manager, and the
-//! `SessionService`. Links the tree does not serve are omitted entirely, so
-//! the capability probe reports `NotAdvertised` for them instead of guessing
-//! paths.
+//! two Processors, one Memory module, one Bios singleton, one Boot Option,
+//! and one Secure Boot singleton, one Chassis, one Manager, the
+//! `SessionService`, and one `AccountService` with a single account. Links
+//! the tree does not serve are omitted entirely, so the capability probe
+//! reports `NotAdvertised` for them instead of guessing paths.
 
 /// `GET /redfish/v1` -- the Service Root.
 ///
-/// Only the core navigation links are advertised (`SessionService`, Systems,
-/// Chassis, Managers); the root services (`AccountService`, `EventService`,
+/// The core navigation links plus the 0.2 `AccountService` root service are
+/// advertised; the remaining root services (`EventService`, `TaskService`,
 /// and friends) stay absent so the probe reports them as `NotAdvertised`.
 pub(crate) const SERVICE_ROOT: &str = r##"{
     "@odata.id":"/redfish/v1/",
@@ -27,7 +28,8 @@ pub(crate) const SERVICE_ROOT: &str = r##"{
     "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
     "Systems":{"@odata.id":"/redfish/v1/Systems"},
     "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
-    "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"}
 }"##;
 
 /// `GET /redfish/v1/SessionService` -- the session service, enabled so the
@@ -40,6 +42,45 @@ pub(crate) const SESSION_SERVICE: &str = r#"{
     "Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}
 }"#;
 
+/// `GET /redfish/v1/AccountService` -- the account service, advertising the
+/// 0.2 `accounts` family through its `Accounts` collection link. The
+/// document mirrors the probe fixture shape `rutilus-infra-redfish` already
+/// decodes (no `@odata.type` is served because the type is known from the
+/// Service Root navigation).
+pub(crate) const ACCOUNT_SERVICE: &str = r#"{
+    "@odata.id":"/redfish/v1/AccountService",
+    "Id":"AccountService",
+    "Name":"Account Service",
+    "Accounts":{"@odata.id":"/redfish/v1/AccountService/Accounts"}
+}"#;
+
+/// `GET /redfish/v1/AccountService/Accounts` -- the manager account
+/// collection with the single built-in account member.
+pub(crate) const ACCOUNTS_COLLECTION: &str = r##"{
+    "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+    "@odata.id":"/redfish/v1/AccountService/Accounts",
+    "Name":"Account Collection",
+    "Members":[{"@odata.id":"/redfish/v1/AccountService/Accounts/admin"}]
+}"##;
+
+/// `GET /redfish/v1/AccountService/Accounts/admin` -- the built-in
+/// administrator account. `AccountTypes` is `Redfish.Required` in the
+/// schema and must stay present to decode, matching the full member shape
+/// `rutilus-infra-redfish` projects in its own tests.
+pub(crate) const ACCOUNT_ADMIN: &str = r##"{
+    "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+    "@odata.id":"/redfish/v1/AccountService/Accounts/admin",
+    "@odata.etag":"W/\"account-1\"",
+    "Id":"admin",
+    "Name":"Administrator Account",
+    "Description":"Built-in administrator account",
+    "UserName":"admin",
+    "RoleId":"Administrator",
+    "Enabled":true,
+    "Locked":false,
+    "AccountTypes":["Redfish","IPMI"]
+}"##;
+
 /// `GET /redfish/v1/Systems` -- the computer system collection.
 pub(crate) const SYSTEMS_COLLECTION: &str = r##"{
     "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",
@@ -48,8 +89,67 @@ pub(crate) const SYSTEMS_COLLECTION: &str = r##"{
     "Members":[{"@odata.id":"/redfish/v1/Systems/1"}]
 }"##;
 
+/// `GET /redfish/v1/Systems/1/Bios` -- the BIOS configuration singleton.
+///
+/// The full `Attributes` bag is served (the schema decodes it) but stays
+/// outside the typed snapshot contract, exactly like the
+/// `rutilus-infra-redfish` fixture the product's decoder already accepts.
+pub(crate) const BIOS: &str = r##"{
+    "@odata.type":"#Bios.v1_2_0.Bios",
+    "@odata.id":"/redfish/v1/Systems/1/Bios",
+    "@odata.etag":"W/\"bios-1\"",
+    "Id":"Bios",
+    "Name":"BIOS Configuration",
+    "Description":"BIOS attribute registry",
+    "AttributeRegistry":"BiosAttributeRegistryP11.v1_2_0",
+    "ResetBiosToDefaultsPending":false,
+    "Attributes":{"BootMode":"Uefi","QuietBoot":"Enabled"}
+}"##;
+
+/// `GET /redfish/v1/Systems/1/BootOptions` -- the boot option collection
+/// with the single PXE member.
+pub(crate) const BOOT_OPTIONS_COLLECTION: &str = r##"{
+    "@odata.type":"#BootOptionCollection.BootOptionCollection",
+    "@odata.id":"/redfish/v1/Systems/1/BootOptions",
+    "Name":"Boot Option Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Systems/1/BootOptions/PXE-1"}]
+}"##;
+
+/// `GET /redfish/v1/Systems/1/BootOptions/PXE-1` -- the PXE boot option with
+/// every optional contract field populated, mirroring the full member shape
+/// `rutilus-infra-redfish` projects in its own tests.
+pub(crate) const BOOT_OPTION_PXE1: &str = r##"{
+    "@odata.type":"#BootOption.v1_1_0.BootOption",
+    "@odata.id":"/redfish/v1/Systems/1/BootOptions/PXE-1",
+    "@odata.etag":"W/\"boot-option-1\"",
+    "Id":"PXE-1",
+    "Name":"Network Boot Option",
+    "Description":"PXE boot option",
+    "BootOptionReference":"Boot0001",
+    "DisplayName":"PXE Network Boot",
+    "BootOptionEnabled":true,
+    "UefiDevicePath":"PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)",
+    "Alias":"Pxe"
+}"##;
+
+/// `GET /redfish/v1/Systems/1/SecureBoot` -- the Secure Boot configuration
+/// singleton with every optional contract field populated, matching the
+/// full shape `rutilus-infra-redfish` projects in its own tests.
+pub(crate) const SECURE_BOOT: &str = r##"{
+    "@odata.type":"#SecureBoot.v1_1_0.SecureBoot",
+    "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+    "@odata.etag":"W/\"secure-boot-1\"",
+    "Id":"SecureBoot",
+    "Name":"Secure Boot",
+    "Description":"UEFI Secure Boot configuration",
+    "SecureBootEnable":true,
+    "SecureBootCurrentBoot":"Enabled",
+    "SecureBootMode":"UserMode"
+}"##;
+
 /// `GET /redfish/v1/Systems/1` -- the compute system, advertising the 0.2
-/// Processors and Memory families through typed navigation links.
+/// Bios, `BootOptions`, `SecureBoot`, `Processors`, and `Memory` families
+/// through typed navigation links.
 pub(crate) const SYSTEM: &str = r#"{
     "@odata.id":"/redfish/v1/Systems/1",
     "@odata.etag":"W/\"system-1\"",
@@ -66,6 +166,9 @@ pub(crate) const SYSTEM: &str = r#"{
     "BiosVersion":"2.3.4",
     "PowerState":"On",
     "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Bios":{"@odata.id":"/redfish/v1/Systems/1/Bios"},
+    "Boot":{"BootOptions":{"@odata.id":"/redfish/v1/Systems/1/BootOptions"}},
+    "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
     "Processors":{"@odata.id":"/redfish/v1/Systems/1/Processors"},
     "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"}
 }"#;

@@ -58,10 +58,12 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
    printed by `mock-bmc` (it will) and accept the Pin.
 3. Select or create a credential (`admin` / `password` works; the mock
    accepts any user name) and run the enrollment.
-4. The resource page shows the typed core tree (ServiceRoot, System 1 with
-   CPU1/CPU2 and DIMM1, Chassis 1, Manager 1); the capability page shows the
-   30-capability probe result: SessionService/Systems/Chassis/Managers/
-   Processors/Memory `Supported`, everything the fixture does not serve
+4. The resource page shows the typed core tree (ServiceRoot; System 1 with
+   its Bios singleton, the PXE-1 boot option, Secure Boot, CPU1/CPU2, and
+   DIMM1; Chassis 1; Manager 1; the built-in `admin` account); the capability
+   page shows the 30-capability probe result:
+   SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
+   BootOptions/SecureBoot `Supported`, everything the fixture does not serve
    honestly `NotAdvertised`.
 5. Refresh the endpoint: the same tree is re-read through a fresh transient
    Session, which the product deletes before returning.
@@ -70,13 +72,20 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers) |
+| GET | `/redfish/v1` | Service Root (Vendor "Rutilus Test", Product "Mock BMC", RedfishVersion "1.20.0", `Links.Sessions`, typed links to SessionService/Systems/Chassis/Managers/AccountService) |
 | GET | `/redfish/v1/SessionService` | Session Service, `ServiceEnabled: true` |
 | GET | `/redfish/v1/SessionService/Sessions` | Session collection listing the active ledger |
 | POST | `/redfish/v1/SessionService/Sessions` | `201` + `X-Auth-Token: test-session-token` + `Location` + Session document (echoes `UserName`) |
 | DELETE | `/redfish/v1/SessionService/Sessions/{id}` | `204`, or `404` for an unknown/expired Session |
+| GET | `/redfish/v1/AccountService` | Account Service advertising its Accounts collection |
+| GET | `/redfish/v1/AccountService/Accounts` | ManagerAccount collection (admin) |
+| GET | `/redfish/v1/AccountService/Accounts/admin` | Built-in administrator account (RoleId "Administrator", AccountTypes Redfish/IPMI) |
 | GET | `/redfish/v1/Systems` | System collection, one member |
-| GET | `/redfish/v1/Systems/1` | ComputerSystem with Processors/Memory links |
+| GET | `/redfish/v1/Systems/1` | ComputerSystem with Bios/BootOptions/SecureBoot/Processors/Memory links |
+| GET | `/redfish/v1/Systems/1/Bios` | BIOS configuration singleton (AttributeRegistry, no raw Attributes bag in the snapshot) |
+| GET | `/redfish/v1/Systems/1/BootOptions` | Boot option collection (PXE-1) |
+| GET | `/redfish/v1/Systems/1/BootOptions/PXE-1` | Boot option (UEFI PXE, alias "Pxe") |
+| GET | `/redfish/v1/Systems/1/SecureBoot` | Secure Boot singleton (enabled, UserMode) |
 | GET | `/redfish/v1/Systems/1/Processors` | Processor collection (CPU1, CPU2) |
 | GET | `/redfish/v1/Systems/1/Processors/CPU1` | Processor (64 cores, LGA4189) |
 | GET | `/redfish/v1/Systems/1/Processors/CPU2` | Processor (32 cores) |

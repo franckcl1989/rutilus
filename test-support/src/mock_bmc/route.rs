@@ -47,8 +47,23 @@ pub(crate) fn dispatch(
         (HttpMethod::Delete, path) if path.starts_with(SESSIONS_PREFIX) => {
             delete_session(path, state)
         }
+        (HttpMethod::Get, "/redfish/v1/AccountService") => json_ok(fixtures::ACCOUNT_SERVICE),
+        (HttpMethod::Get, "/redfish/v1/AccountService/Accounts") => {
+            json_ok(fixtures::ACCOUNTS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/AccountService/Accounts/admin") => {
+            json_ok(fixtures::ACCOUNT_ADMIN)
+        }
         (HttpMethod::Get, "/redfish/v1/Systems") => json_ok(fixtures::SYSTEMS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Systems/1") => json_ok(fixtures::SYSTEM),
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Bios") => json_ok(fixtures::BIOS),
+        (HttpMethod::Get, "/redfish/v1/Systems/1/BootOptions") => {
+            json_ok(fixtures::BOOT_OPTIONS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Systems/1/BootOptions/PXE-1") => {
+            json_ok(fixtures::BOOT_OPTION_PXE1)
+        }
+        (HttpMethod::Get, "/redfish/v1/Systems/1/SecureBoot") => json_ok(fixtures::SECURE_BOOT),
         (HttpMethod::Get, "/redfish/v1/Systems/1/Processors") => {
             json_ok(fixtures::PROCESSORS_COLLECTION)
         }

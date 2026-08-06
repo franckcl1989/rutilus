@@ -26,20 +26,22 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 6] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 10] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
     EndpointCapability::Managers,
     EndpointCapability::Processors,
     EndpointCapability::Memory,
+    EndpointCapability::Accounts,
+    EndpointCapability::Bios,
+    EndpointCapability::BootOptions,
+    EndpointCapability::SecureBoot,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
 /// must report as `NotAdvertised` instead of guessing paths.
-const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 6] = [
-    EndpointCapability::Accounts,
-    EndpointCapability::Bios,
+const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 4] = [
     EndpointCapability::EthernetInterfaces,
     EndpointCapability::Power,
     EndpointCapability::Thermal,
@@ -48,17 +50,21 @@ const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 6] = [
 
 /// The gateway's request count for one complete `read_core_resources` flow:
 /// root, `SessionService`, Sessions collection, Session create, Systems
-/// collection + member, Processors collection + CPU1 + CPU2, Memory
+/// collection + member, `Bios` singleton, `BootOptions` collection + member,
+/// `SecureBoot` singleton, Processors collection + CPU1 + CPU2, Memory
 /// collection + DIMM1, Chassis collection + member, Managers collection +
-/// member, Session delete.
-const RESOURCE_READ_REQUEST_COUNT: u64 = 16;
+/// member, `AccountService` + Accounts collection + member, Session delete.
+const RESOURCE_READ_REQUEST_COUNT: u64 = 23;
 
 /// The gateway's request count for one complete `probe_core_capabilities`
 /// flow with this fixture: root, `SessionService`, Sessions collection,
 /// Session create, the three core collections with their members, the
-/// Processors and Memory collection fetches (which eagerly fetch their
-/// members), and the Session delete. Unadvertised features add no requests.
-const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 16;
+/// Processors and Memory member fetches, the `Bios`, `BootOptions`, and
+/// `SecureBoot` navigation (the `BootOptions` probe fetches only the
+/// collection document, matching the `nv-redfish` wrapper), the
+/// `AccountService` document, and the Session delete. Unadvertised features
+/// add no requests.
+const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 20;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -230,9 +236,17 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
     assert_resource_order(&resources);
-    assert_payload(&resources[2], "TotalCores", "64")?;
-    assert_payload(&resources[4], "CapacityMiB", "32768")?;
-    assert_payload(&resources[6], "FirmwareVersion", "1.2.3")?;
+    assert_payload(
+        &resources[2],
+        "AttributeRegistry",
+        "BiosAttributeRegistryP11.v1_2_0",
+    )?;
+    assert_payload(&resources[3], "DisplayName", "PXE Network Boot")?;
+    assert_payload(&resources[4], "SecureBootMode", "UserMode")?;
+    assert_payload(&resources[5], "TotalCores", "64")?;
+    assert_payload(&resources[7], "CapacityMiB", "32768")?;
+    assert_payload(&resources[9], "FirmwareVersion", "1.2.3")?;
+    assert_payload(&resources[10], "RoleId", "Administrator")?;
     for resource in &resources {
         assert!(
             resource.etag().is_some(),
@@ -274,11 +288,15 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
         [
             ResourceFeature::ServiceRoot,
             ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
             ResourceFeature::Processors,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Chassis,
             ResourceFeature::Managers,
+            ResourceFeature::Accounts,
         ]
     );
     let odata_ids: Vec<&str> = resources
@@ -290,11 +308,15 @@ fn assert_resource_order(resources: &[CoreResourceProjection]) {
         [
             "/redfish/v1/",
             "/redfish/v1/Systems/1",
+            "/redfish/v1/Systems/1/Bios",
+            "/redfish/v1/Systems/1/BootOptions/PXE-1",
+            "/redfish/v1/Systems/1/SecureBoot",
             "/redfish/v1/Systems/1/Processors/CPU1",
             "/redfish/v1/Systems/1/Processors/CPU2",
             "/redfish/v1/Systems/1/Memory/DIMM1",
             "/redfish/v1/Chassis/1",
             "/redfish/v1/Managers/1",
+            "/redfish/v1/AccountService/Accounts/admin",
         ]
     );
 }
