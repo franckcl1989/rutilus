@@ -3,11 +3,15 @@
 //! One background task ticks every [`TICK_INTERVAL`]. Each tick sweeps the
 //! persisted operation store and dispatches the work it finds:
 //!
-//! - the executor pass drives new `Queued` work and the §13.6 in-flight
-//!   recovery states (`Validating`/`Running`/`Verifying`) through the
-//!   [`OperationExecutor`] — the executor accepts only `Queued` operations
-//!   and rejects the recovery states defensively, which is the honest
-//!   semantics until the re-check recovery lands (see [`run_tick`]);
+//! - the executor pass drives the work by state through the
+//!   [`OperationExecutor`] — fresh `Queued` work and crash-resumed
+//!   `Validating` work run the execution flow
+//!   ([`OperationDriver::execute_operation`], whose `Validating` resume is
+//!   safe because the state is persisted before dispatch), while `Running`
+//!   and `Verifying` orphans are resolved through
+//!   [`OperationDriver::recover_operation`] — the §13.5 re-read-and-decide
+//!   recovery, since the write may already have landed and must never be
+//!   re-dispatched blindly;
 //! - the monitor pass resumes every `WaitingRemote` operation through the
 //!   [`TaskMonitor`] — the §13.6 Task polling that continues after a restart.
 //!
@@ -124,8 +128,19 @@ pub(crate) trait OperationDriver {
     /// so the loop stays independent of the executor's error vocabulary.
     type Error: Error;
 
-    /// Drives one operation toward its terminal state (§13.3).
+    /// Drives one operation through the execution flow (§13.3): fresh
+    /// `Queued` work, or work resumed from `Validating` after a crash (the
+    /// state is persisted before dispatch, so the write was never issued).
     fn execute_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Operation, Self::Error>>;
+
+    /// Resolves the §13.5/§13.6 recovery of one operation stranded in
+    /// `Running` or `Verifying`: the write may already have landed, so the
+    /// outcome is judged by re-reading the target (or the persisted Task
+    /// record) instead of re-dispatching.
+    fn recover_operation(
         &self,
         operation_id: OperationId,
     ) -> BoundaryFuture<'_, Result<Operation, Self::Error>>;
@@ -172,6 +187,13 @@ where
         operation_id: OperationId,
     ) -> BoundaryFuture<'_, Result<Operation, Self::Error>> {
         Box::pin(OperationExecutor::execute_operation(self, operation_id))
+    }
+
+    fn recover_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Operation, Self::Error>> {
+        Box::pin(OperationExecutor::recover_operation(self, operation_id))
     }
 }
 
@@ -260,14 +282,21 @@ pub(crate) async fn run<Store, Executor, Monitor, Time>(
 ///
 /// 1. The executor pass lists the §13.6 recovery states
 ///    (`Validating`/`Running`/`WaitingRemote`/`Verifying`) and the new
-///    `Queued` work, then drives every `Queued`/`Validating`/`Running`/
-///    `Verifying` operation through [`OperationDriver::execute_operation`].
-///    The executor accepts only `Queued` work and rejects the recovery
-///    states with a defensive error, which is the designed behavior: the
-///    re-check semantics that resume the in-flight states are the next
-///    iteration's work, so each rejection is recorded and the sweep
-///    continues. `WaitingRemote` operations are skipped here — the monitor
-///    pass owns them.
+///    `Queued` work, then dispatches each operation by its state:
+///    - `Queued` and `Validating` run the execution flow through
+///      [`OperationDriver::execute_operation`] — fresh work, and the
+///      crash-resumed validation whose write was provably never issued
+///      (design section 13.6);
+///    - `Running` and `Verifying` are resolved through
+///      [`OperationDriver::recover_operation`] — the §13.5
+///      re-read-and-decide recovery for work whose write may already have
+///      landed and must never be re-dispatched blindly;
+///    - `WaitingRemote` operations are skipped here — the monitor pass owns
+///      them.
+///
+///    Both lists are snapshots; the driver rejects any state a second driver
+///    advanced in the meantime, and that rejection is recorded like any
+///    per-operation failure.
 /// 2. The monitor pass lists the `WaitingRemote` operations through
 ///    [`TaskPollDriver::recover_tasks`] (the §13.6 resume scan) and polls
 ///    each with the sweep's shared instant.
@@ -298,9 +327,7 @@ where
     Monitor: TaskPollDriver,
 {
     // The §13.6 recovery states first (they are why a crash must not strand
-    // operations), then the queued work submitted since the last sweep. Both
-    // lists are snapshots; the executor rejects any state a second driver
-    // advanced in the meantime.
+    // operations), then the queued work submitted since the last sweep.
     let recovered = engine
         .recover_pending()
         .await
@@ -311,12 +338,25 @@ where
         .map_err(TickSweepError::QueuedListing)?;
     for operation in recovered.into_iter().chain(queued) {
         let operation_id = operation.id();
-        if operation.state() == OperationState::WaitingRemote {
-            // The monitor pass owns WaitingRemote work; the executor would
-            // only reject it defensively.
-            continue;
-        }
-        if let Err(error) = executor.execute_operation(operation_id).await {
+        // Dispatch by state: the execution flow owns fresh and resumable
+        // work, the recovery flow owns the states whose write may already
+        // have landed, and the monitor pass owns Task polling. The terminal
+        // states can never appear in either listing, but the arm keeps the
+        // dispatch exhaustive over the whole state vocabulary.
+        let outcome = match operation.state() {
+            OperationState::Queued | OperationState::Validating => {
+                executor.execute_operation(operation_id).await
+            }
+            OperationState::Running | OperationState::Verifying => {
+                executor.recover_operation(operation_id).await
+            }
+            OperationState::WaitingRemote
+            | OperationState::Succeeded
+            | OperationState::Failed
+            | OperationState::Unknown
+            | OperationState::Cancelled => continue,
+        };
+        if let Err(error) = outcome {
             // One failed operation never stops the sweep; the next tick
             // re-lists it and tries again.
             eprintln!("operation {operation_id} could not be driven: {error}");
@@ -561,7 +601,17 @@ mod tests {
         }
     }
 
-    /// Scripted executor double recording every driven operation.
+    /// One recorded driver call with the seam method that produced it.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DriverCall {
+        /// [`OperationDriver::execute_operation`] drove the operation.
+        Execute(OperationId),
+        /// [`OperationDriver::recover_operation`] drove the operation.
+        Recover(OperationId),
+    }
+
+    /// Scripted executor double recording every driven operation and the
+    /// seam method that drove it.
     ///
     /// The script pops one entry per call; an `Ok` entry records a completed
     /// drive, an `Err` entry records the fake's controlled failure, and an
@@ -569,7 +619,7 @@ mod tests {
     /// the assertion instead of silently succeeding.
     #[derive(Clone, Debug)]
     struct FakeExecutor {
-        calls: Arc<Mutex<Vec<OperationId>>>,
+        calls: Arc<Mutex<Vec<DriverCall>>>,
         script: Arc<Mutex<VecDeque<Result<(), MockError>>>>,
         gate: Option<Arc<Notify>>,
     }
@@ -593,11 +643,48 @@ mod tests {
             }
         }
 
-        fn recorded_calls(&self) -> Result<Vec<OperationId>, MockError> {
+        fn recorded_calls(&self) -> Result<Vec<DriverCall>, MockError> {
             self.calls
                 .lock()
                 .map(|calls| calls.clone())
                 .map_err(|_| MockError::Events)
+        }
+
+        /// One scripted drive, shared by both seam methods.
+        async fn drive(&self, call: DriverCall) -> Result<Operation, MockError> {
+            self.calls.lock().map_err(|_| MockError::Events)?.push(call);
+            if let Some(gate) = &self.gate {
+                // The release future is registered before the call
+                // blocks, so a release fired while the call is in flight
+                // is never lost.
+                let released = gate.notified();
+                released.await;
+            }
+            match self
+                .script
+                .lock()
+                .map_err(|_| MockError::Events)?
+                .pop_front()
+            {
+                Some(Ok(())) => Ok(Operation::new(
+                    call.operation_id(),
+                    OperationSource::Standalone,
+                    vec![one_target()],
+                    one_command(),
+                    created_at(),
+                )),
+                Some(Err(error)) => Err(error),
+                None => Err(MockError::EmptyScript),
+            }
+        }
+    }
+
+    impl DriverCall {
+        /// The operation id the call drove.
+        const fn operation_id(self) -> OperationId {
+            match self {
+                Self::Execute(operation_id) | Self::Recover(operation_id) => operation_id,
+            }
         }
     }
 
@@ -608,35 +695,14 @@ mod tests {
             &self,
             operation_id: OperationId,
         ) -> BoundaryFuture<'_, Result<Operation, Self::Error>> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map_err(|_| MockError::Events)?
-                    .push(operation_id);
-                if let Some(gate) = &self.gate {
-                    // The release future is registered before the call
-                    // blocks, so a release fired while the call is in flight
-                    // is never lost.
-                    let released = gate.notified();
-                    released.await;
-                }
-                match self
-                    .script
-                    .lock()
-                    .map_err(|_| MockError::Events)?
-                    .pop_front()
-                {
-                    Some(Ok(())) => Ok(Operation::new(
-                        operation_id,
-                        OperationSource::Standalone,
-                        vec![one_target()],
-                        one_command(),
-                        created_at(),
-                    )),
-                    Some(Err(error)) => Err(error),
-                    None => Err(MockError::EmptyScript),
-                }
-            })
+            Box::pin(async move { self.drive(DriverCall::Execute(operation_id)).await })
+        }
+
+        fn recover_operation(
+            &self,
+            operation_id: OperationId,
+        ) -> BoundaryFuture<'_, Result<Operation, Self::Error>> {
+            Box::pin(async move { self.drive(DriverCall::Recover(operation_id)).await })
         }
     }
 
@@ -741,9 +807,11 @@ mod tests {
         store.insert(queued.clone())?;
         let validating = parked_operation(OperationState::Validating)?;
         store.insert(validating.clone())?;
+        let running = parked_operation(OperationState::Running)?;
+        store.insert(running.clone())?;
         let waiting = parked_operation(OperationState::WaitingRemote)?;
         store.insert(waiting.clone())?;
-        let executor = FakeExecutor::new(vec![Ok(()), Ok(())]);
+        let executor = FakeExecutor::new(vec![Ok(()), Ok(()), Ok(())]);
         let monitor = FakeMonitor::new(vec![waiting.clone()], vec![Ok(())]);
         let now = created_at() + Duration::SECOND * 4;
 
@@ -757,10 +825,18 @@ mod tests {
                 StoreCall::List(Some(OperationState::Queued)),
             ]
         );
-        // The executor pass drives the recovered Validating operation and
-        // the queued operation, and skips the WaitingRemote operation (the
-        // monitor pass owns it).
-        assert_eq!(executor.recorded_calls()?, [validating.id(), queued.id()]);
+        // The executor pass dispatches by state: the recovered Validating
+        // operation and the queued operation run the execution flow, the
+        // recovered Running operation runs the §13.5 recovery flow, and the
+        // WaitingRemote operation is skipped (the monitor pass owns it). The
+        // two recovered operations are driven in store order, which the fake
+        // lists in hash-map order, so their relative order is not pinned —
+        // only the state-to-seam mapping is.
+        let driven = executor.recorded_calls()?;
+        assert_eq!(driven.len(), 3);
+        assert!(driven.contains(&DriverCall::Execute(validating.id())));
+        assert!(driven.contains(&DriverCall::Recover(running.id())));
+        assert!(driven.contains(&DriverCall::Execute(queued.id())));
         // The monitor pass polls exactly the waiting operations with the
         // sweep's shared instant.
         assert_eq!(monitor.recorded_polls()?, [(waiting.id(), now)]);
@@ -788,8 +864,8 @@ mod tests {
         // queued operations may be driven in either order.
         let driven = executor.recorded_calls()?;
         assert_eq!(driven.len(), 2);
-        assert!(driven.contains(&first.id()));
-        assert!(driven.contains(&second.id()));
+        assert!(driven.contains(&DriverCall::Execute(first.id())));
+        assert!(driven.contains(&DriverCall::Execute(second.id())));
         assert_eq!(monitor.recorded_polls()?, [(waiting.id(), now)]);
         Ok(())
     }
@@ -882,7 +958,10 @@ mod tests {
             }
         }
         // The executor pass completed before the monitor pass failed.
-        assert_eq!(executor.recorded_calls()?, [queued.id()]);
+        assert_eq!(
+            executor.recorded_calls()?,
+            [DriverCall::Execute(queued.id())]
+        );
         assert_eq!(monitor.recorded_polls()?, Vec::new());
         Ok(())
     }
