@@ -732,6 +732,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_processor_and_memory_features() -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::Processors,
+                "/redfish/v1/Systems/1/Processors/CPU1",
+                "Processor One",
+            )?
+            .with_odata_type(ResourceODataType::parse("#Processor.v1_15_0.Processor")?),
+            observation(
+                ResourceFeature::Memory,
+                "/redfish/v1/Systems/1/Memory/DIMM1",
+                "Memory Module One",
+            )?,
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let processor = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::Processors)
+            .ok_or("processor snapshot is missing")?;
+        assert_eq!(
+            processor.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Processors/CPU1"
+        );
+        assert_eq!(
+            processor.odata_type().map(ResourceODataType::as_str),
+            Some("#Processor.v1_15_0.Processor")
+        );
+        assert!(processor.payload().as_str().contains("Processor One"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|snapshot| snapshot.feature() == ResourceFeature::Processors)
+                .count(),
+            1
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|snapshot| snapshot.feature() == ResourceFeature::Memory)
+                .count(),
+            1
+        );
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot | ResourceFeature::Processors | ResourceFeature::Memory
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
