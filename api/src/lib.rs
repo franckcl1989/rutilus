@@ -753,7 +753,11 @@ impl ResourceStatusResponse {
 }
 
 /// Feature-specific, explicitly tagged core Redfish resource fields.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
+/// carry numeric readings (`f64`, matching the compiled `Edm.Decimal` type of
+/// nv-redfish 0.13), and `f64` cannot implement `Eq`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(
     tag = "resource_type",
     content = "details",
@@ -916,10 +920,63 @@ pub enum CoreResourceDetailsResponse {
         secure_boot_enable: Option<bool>,
         secure_boot_mode: Option<String>,
     },
+    /// One §2.1 `power` family member projected from the typed Redfish power
+    /// schema (`Power_v1`, nv-redfish-schema 0.13).
+    ///
+    /// The `Power` resource itself declares no `Status` property and no
+    /// reading or metadata properties in `Power_v1`: consumption and capacity
+    /// readings (`PowerConsumedWatts`, `PowerCapacityWatts`) exist only on the
+    /// `PowerSupply` type, which belongs to the separate §2.1 `power-supplies`
+    /// family. The variant therefore carries no details — a never-populated
+    /// uniform field would break the strict `deny_unknown_fields` alignment
+    /// with the infra payload.
+    Power {},
+    /// One §2.1 `thermal` family member projected from the typed Redfish
+    /// thermal schema (`Thermal_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Only `Status` exists on the `Thermal` resource itself. A
+    /// `temperature_celsius` field was considered, but `TemperatureCelsius`
+    /// exists only on members of the `Temperatures` collection, and
+    /// `fan_speed_rpm` likewise only on `Fans` members, so neither belongs in
+    /// this strictly projectable field set.
+    Thermal {
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `sensors` family member projected from the typed Redfish
+    /// sensor schema (`Sensor_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `Reading`, `ReadingUnits`, and `ReadingType`
+    /// properties. A `sensor_type` field was considered, but `Sensor_v1`
+    /// declares no `SensorType` property: `ReadingType` is the enumeration
+    /// that names the measured quantity (`Temperature`, `Power`, `Voltage`,
+    /// ...), retained as a string so the console renders it without
+    /// re-parsing text. `reading` stays numeric (`Edm.Decimal` compiles to
+    /// `f64` in nv-redfish 0.13) so the console renders the value without
+    /// re-parsing text.
+    Sensor {
+        reading: Option<f64>,
+        reading_units: Option<String>,
+        reading_type: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `controls` family member projected from the typed Redfish
+    /// control schema (`Control_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `ControlType` and `SetPoint` properties.
+    /// `ControlType` is an enumeration retained as a string so the console
+    /// renders it without re-parsing text; `set_point` stays numeric
+    /// (`Edm.Decimal` compiles to `f64` in nv-redfish 0.13).
+    Control {
+        control_type: Option<String>,
+        set_point: Option<f64>,
+        status: Option<ResourceStatusResponse>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// `PartialEq` (not `Eq`) because the details enum carries `f64` readings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreResourceResponse {
     source: CoreResourceSourceResponse,
@@ -959,7 +1016,9 @@ impl CoreResourceResponse {
 
 /// Whether an endpoint awaits its first refresh or exposes one complete typed
 /// core-resource Generation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// `PartialEq` (not `Eq`) because the resource details carry `f64` readings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(
     tag = "state",
     content = "details",
@@ -992,7 +1051,9 @@ impl EndpointResourceSnapshotResponse {
 }
 
 /// Stable endpoint identity and its latest core-resource snapshot state.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// `PartialEq` (not `Eq`) because the resource details carry `f64` readings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointResourceInventoryResponse {
     endpoint: EndpointIdentityResponse,
@@ -2675,6 +2736,197 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn core_resource_contract_carries_power_wire_values() -> Result<(), Box<dyn Error>> {
+        let power = power_resource();
+
+        assert_eq!(
+            serde_json::to_value(&power)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789db",
+                    "odata_id": "/redfish/v1/Chassis/1/Power",
+                    "odata_type": "#Power.v1_7_3.Power",
+                    "etag": "W/\"power-1\""
+                },
+                "common": {
+                    "id": "Power",
+                    "name": "Power",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "power",
+                    "details": {}
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&power)?)?,
+            power
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "power",
+                "details": {
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_thermal_wire_values() -> Result<(), Box<dyn Error>> {
+        let thermal = thermal_resource();
+
+        assert_eq!(
+            serde_json::to_value(&thermal)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789dc",
+                    "odata_id": "/redfish/v1/Chassis/1/Thermal",
+                    "odata_type": "#Thermal.v1_7_3.Thermal",
+                    "etag": null
+                },
+                "common": {
+                    "id": "Thermal",
+                    "name": "Thermal",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "thermal",
+                    "details": {
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&thermal)?)?,
+            thermal
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "thermal",
+                "details": {
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_sensor_wire_values() -> Result<(), Box<dyn Error>> {
+        let sensor = sensor_resource();
+
+        assert_eq!(
+            serde_json::to_value(&sensor)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789dd",
+                    "odata_id": "/redfish/v1/Chassis/1/Sensors/Temp1",
+                    "odata_type": "#Sensor.v1_12_0.Sensor",
+                    "etag": "W/\"sensor-1\""
+                },
+                "common": {
+                    "id": "Temp1",
+                    "name": "Inlet Temperature",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "sensor",
+                    "details": {
+                        "reading": 33.5,
+                        "reading_units": "Cel",
+                        "reading_type": "Temperature",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&sensor)?)?,
+            sensor
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "sensor",
+                "details": {
+                    "reading": null,
+                    "reading_units": null,
+                    "reading_type": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_control_wire_values() -> Result<(), Box<dyn Error>> {
+        let control = control_resource();
+
+        assert_eq!(
+            serde_json::to_value(&control)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789de",
+                    "odata_id": "/redfish/v1/Chassis/1/Controls/FanCtl1",
+                    "odata_type": "#Control.v1_7_0.Control",
+                    "etag": "W/\"control-1\""
+                },
+                "common": {
+                    "id": "FanCtl1",
+                    "name": "Fan Speed Control",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "control",
+                    "details": {
+                        "control_type": "Power",
+                        "set_point": 500.0,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&control)?)?,
+            control
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "control",
+                "details": {
+                    "control_type": null,
+                    "set_point": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
     fn account_resource() -> CoreResourceResponse {
         CoreResourceResponse::new(
             CoreResourceSourceResponse::new(
@@ -2752,6 +3004,89 @@ mod tests {
             CoreResourceDetailsResponse::SecureBoot {
                 secure_boot_enable: Some(true),
                 secure_boot_mode: Some("DeployedMode".to_owned()),
+            },
+        )
+    }
+
+    fn power_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789db"),
+                "/redfish/v1/Chassis/1/Power".to_owned(),
+                Some("#Power.v1_7_3.Power".to_owned()),
+                Some("W/\"power-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("Power".to_owned(), "Power".to_owned(), None),
+            CoreResourceDetailsResponse::Power {},
+        )
+    }
+
+    fn thermal_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789dc"),
+                "/redfish/v1/Chassis/1/Thermal".to_owned(),
+                Some("#Thermal.v1_7_3.Thermal".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new("Thermal".to_owned(), "Thermal".to_owned(), None),
+            CoreResourceDetailsResponse::Thermal {
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn sensor_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789dd"),
+                "/redfish/v1/Chassis/1/Sensors/Temp1".to_owned(),
+                Some("#Sensor.v1_12_0.Sensor".to_owned()),
+                Some("W/\"sensor-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "Temp1".to_owned(),
+                "Inlet Temperature".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Sensor {
+                reading: Some(33.5),
+                reading_units: Some("Cel".to_owned()),
+                reading_type: Some("Temperature".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn control_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789de"),
+                "/redfish/v1/Chassis/1/Controls/FanCtl1".to_owned(),
+                Some("#Control.v1_7_0.Control".to_owned()),
+                Some("W/\"control-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "FanCtl1".to_owned(),
+                "Fan Speed Control".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Control {
+                control_type: Some("Power".to_owned()),
+                set_point: Some(500.0),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
             },
         )
     }
