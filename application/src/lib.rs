@@ -13,6 +13,7 @@ mod endpoint_refresh;
 mod endpoint_resources;
 mod endpoint_trust;
 mod operation_executor;
+mod operation_submission;
 mod task_monitor;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
@@ -67,6 +68,13 @@ pub use endpoint_trust::{
     SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe, TrustedEndpoint,
 };
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
+pub use operation_submission::{OperationSubmission, SubmissionError};
 pub use task_monitor::{
     MonitorAuditStage, TaskMonitor, TaskMonitorError, TaskObservation, TaskPoll, TaskReader,
 };
+
+/// The persistence boundary of the Operation lifecycle, re-exported from the
+/// engine so the Web crate can aggregate it into its product-services bundle
+/// without a direct engine dependency; the application use cases compose the
+/// same trait behind this facade.
+pub use rutilus_operation_engine::OperationStore;
