@@ -3549,6 +3549,7 @@ dependencies = [
  "gloo-net",
  "leptos",
  "rutilus-api",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]
