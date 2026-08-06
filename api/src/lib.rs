@@ -971,6 +971,52 @@ pub enum CoreResourceDetailsResponse {
         set_point: Option<f64>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `log-services` family member projected from the typed Redfish
+    /// log-service schema (`LogService_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `ServiceEnabled` and `MaxNumberOfRecords`
+    /// properties and the `Status` property; `max_log_entries` stays numeric
+    /// so the console renders the retention bound without re-parsing text. A
+    /// `log_entry_count` field was considered, but `LogService_v1` declares no
+    /// direct entry-count property (counts live on the linked
+    /// `LogEntryCollection`), so it stays out of this strictly projectable
+    /// field set. Log entries are themselves separate `LogEntry` resources in
+    /// that collection, so this round projects `LogService` metadata only;
+    /// reading entries is deferred to a later iteration.
+    LogService {
+        service_enabled: Option<bool>,
+        max_log_entries: Option<u64>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `manager-network-protocol` family member projected from the
+    /// typed Redfish manager-network-protocol schema
+    /// (`ManagerNetworkProtocol_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Only top-level metadata is projected: the `HostName`, `FQDN`, and
+    /// `Status` properties. A `protocol_enabled` field was considered, but
+    /// `ProtocolEnabled` is not a top-level property — each protocol's
+    /// settings (`HTTP`, `HTTPS`, `SSH`, and others) live in its own nested
+    /// `Protocol` object, and the protocol set grows with every schema
+    /// release — so a per-protocol projection is deferred to a later
+    /// iteration.
+    ManagerNetworkProtocol {
+        host_name: Option<String>,
+        fqdn: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `host-interfaces` family member projected from the typed
+    /// Redfish host-interface schema (`HostInterface_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `InterfaceEnabled` and `Status` properties. A
+    /// `host_name` field was considered, but `HostInterface_v1` declares no
+    /// host-name property (host identity lives in the linked
+    /// `HostEthernetInterfaces` and `ManagerEthernetInterface` resources), so
+    /// it stays out of this strictly projectable field set.
+    HostInterface {
+        interface_enabled: Option<bool>,
+        status: Option<ResourceStatusResponse>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -2927,6 +2973,160 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn core_resource_contract_carries_log_service_wire_values() -> Result<(), Box<dyn Error>> {
+        let log_service = log_service_resource();
+
+        assert_eq!(
+            serde_json::to_value(&log_service)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789df",
+                    "odata_id": "/redfish/v1/Managers/1/LogServices/SEL",
+                    "odata_type": "#LogService.v1_9_0.LogService",
+                    "etag": "W/\"log-service-1\""
+                },
+                "common": {
+                    "id": "SEL",
+                    "name": "System Event Log",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "log_service",
+                    "details": {
+                        "service_enabled": true,
+                        "max_log_entries": 10000,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&log_service)?)?,
+            log_service
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "log_service",
+                "details": {
+                    "service_enabled": null,
+                    "max_log_entries": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_manager_network_protocol_wire_values()
+    -> Result<(), Box<dyn Error>> {
+        let manager_network_protocol = manager_network_protocol_resource();
+
+        assert_eq!(
+            serde_json::to_value(&manager_network_protocol)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e0",
+                    "odata_id": "/redfish/v1/Managers/1/NetworkProtocol",
+                    "odata_type": "#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol",
+                    "etag": null
+                },
+                "common": {
+                    "id": "NetworkProtocol",
+                    "name": "Manager Network Protocol",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "manager_network_protocol",
+                    "details": {
+                        "host_name": "bmc-rack-a",
+                        "fqdn": "bmc-rack-a.example.test",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &manager_network_protocol
+            )?)?,
+            manager_network_protocol
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "manager_network_protocol",
+                "details": {
+                    "host_name": null,
+                    "fqdn": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_host_interface_wire_values() -> Result<(), Box<dyn Error>> {
+        let host_interface = host_interface_resource();
+
+        assert_eq!(
+            serde_json::to_value(&host_interface)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e2",
+                    "odata_id": "/redfish/v1/Managers/1/HostInterfaces/1",
+                    "odata_type": "#HostInterface.v1_3_3.HostInterface",
+                    "etag": "W/\"host-interface-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Host Interface One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "host_interface",
+                    "details": {
+                        "interface_enabled": true,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&host_interface)?)?,
+            host_interface
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "host_interface",
+                "details": {
+                    "interface_enabled": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
     fn account_resource() -> CoreResourceResponse {
         CoreResourceResponse::new(
             CoreResourceSourceResponse::new(
@@ -3082,6 +3282,72 @@ mod tests {
             CoreResourceDetailsResponse::Control {
                 control_type: Some("Power".to_owned()),
                 set_point: Some(500.0),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn log_service_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789df"),
+                "/redfish/v1/Managers/1/LogServices/SEL".to_owned(),
+                Some("#LogService.v1_9_0.LogService".to_owned()),
+                Some("W/\"log-service-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("SEL".to_owned(), "System Event Log".to_owned(), None),
+            CoreResourceDetailsResponse::LogService {
+                service_enabled: Some(true),
+                max_log_entries: Some(10000),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn manager_network_protocol_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e0"),
+                "/redfish/v1/Managers/1/NetworkProtocol".to_owned(),
+                Some("#ManagerNetworkProtocol.v1_12_0.ManagerNetworkProtocol".to_owned()),
+                None,
+            ),
+            CoreResourceCommonResponse::new(
+                "NetworkProtocol".to_owned(),
+                "Manager Network Protocol".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::ManagerNetworkProtocol {
+                host_name: Some("bmc-rack-a".to_owned()),
+                fqdn: Some("bmc-rack-a.example.test".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn host_interface_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e2"),
+                "/redfish/v1/Managers/1/HostInterfaces/1".to_owned(),
+                Some("#HostInterface.v1_3_3.HostInterface".to_owned()),
+                Some("W/\"host-interface-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("1".to_owned(), "Host Interface One".to_owned(), None),
+            CoreResourceDetailsResponse::HostInterface {
+                interface_enabled: Some(true),
                 status: Some(ResourceStatusResponse::new(
                     Some("Enabled".to_owned()),
                     Some("OK".to_owned()),
