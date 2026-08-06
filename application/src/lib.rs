@@ -4,6 +4,7 @@ mod audit_log;
 mod endpoint_csv;
 mod endpoint_csv_import;
 mod endpoint_enrollment;
+mod endpoint_inventory;
 mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_trust;
@@ -20,6 +21,10 @@ pub use endpoint_csv_import::{
 };
 pub use endpoint_enrollment::{
     EndpointEnroller, EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint,
+};
+pub use endpoint_inventory::{
+    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryQuery,
+    EndpointInventoryQueryError, EndpointInventoryRepository,
 };
 pub use endpoint_onboarding::{
     AuditedEndpointOnboarding, AuditedOnboardEndpointError, BoundaryFuture, Clock,
