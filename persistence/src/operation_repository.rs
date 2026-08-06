@@ -1,6 +1,6 @@
 use rutilus_domain::{
     Operation, OperationId, OperationSource, OperationSourceParseError, OperationState,
-    OperationStateParseError, OperationTarget, OperationTimelineError,
+    OperationStateParseError, OperationTarget, OperationTimelineError, RedfishCommand,
 };
 use rutilus_entity::{operation, operation_target};
 use sea_orm::{
@@ -15,6 +15,13 @@ use crate::SqliteStore;
 impl SqliteStore {
     /// Atomically persists one operation and all of its targets.
     ///
+    /// The typed command is stored as its serde JSON serialization — the §9.4
+    /// `TypedPayloadJson` rule applied to commands: the column can only ever
+    /// hold JSON produced by a type successfully serialized, never arbitrary
+    /// hand-written JSON, and the database does not parse the structure.
+    /// Reading it back goes through the domain type again (see
+    /// [`Self::find_operation`]).
+    ///
     /// Delivery is at-least-once (design §15.4), so re-creating an operation
     /// id that is already stored is a no-op: the persisted row is
     /// authoritative and is never rewritten, which is what keeps a Center
@@ -25,8 +32,8 @@ impl SqliteStore {
     /// # Errors
     ///
     /// Returns [`OperationRepositoryError`] when write coordination fails, the
-    /// transaction cannot commit, or a stored row violates an aggregate
-    /// invariant.
+    /// transaction cannot commit, the command cannot be serialized, or a
+    /// stored row violates an aggregate invariant.
     pub async fn create_operation(
         &self,
         operation: &Operation,
@@ -50,6 +57,18 @@ impl SqliteStore {
     }
 
     /// Reads one complete operation aggregate by stable identity.
+    ///
+    /// The stored command JSON is rehydrated through the domain
+    /// [`RedfishCommand`] deserializer. A payload this build cannot
+    /// deserialize — a family, payload shape, or member this build does not
+    /// know — makes the whole aggregate [`OperationRepositoryError::Corrupt`]
+    /// instead of being half-understood, exactly like an unknown state or
+    /// source code (`InvalidState` precedent). Upgrade order therefore
+    /// matters: records written by a newer build must not be read by an older
+    /// one, so in-flight operations must be drained (or the product must not
+    /// be rolled back) before a downgrade — the same discipline as the §0.5.0
+    /// OEM records, which only builds with the OEM mapping compiled in can
+    /// interpret.
     ///
     /// # Errors
     ///
@@ -153,7 +172,10 @@ impl SqliteStore {
     /// (`WaitingRemote` and other in-flight states) and the §13.7 batch
     /// outcome summary, both of which need one exact-state query. Results are
     /// ordered by creation time and identity so recovery replays in
-    /// acceptance order.
+    /// acceptance order. Each listed row is rehydrated as a complete
+    /// aggregate — including its command — so one corrupt command poisons the
+    /// whole listing; recovery must surface that rather than silently drop
+    /// the unreadable operation.
     ///
     /// # Errors
     ///
@@ -213,6 +235,7 @@ where
         id: Set(operation_id.into_uuid()),
         source: Set(domain.source().as_str().to_owned()),
         state: Set(domain.state().as_str().to_owned()),
+        command: Set(serialize_command(&domain.command())?),
         created_at: Set(domain.created_at()),
         updated_at: Set(domain.updated_at()),
     }
@@ -250,6 +273,12 @@ where
         .parse::<OperationState>()
         .map_err(StoredOperationError::InvalidState)
         .map_err(|source| corrupt(operation_id, source))?;
+    // Rehydration goes through the domain type, never through string
+    // inspection: the deserializer is the only judge of what the stored JSON
+    // means, and anything it refuses corrupts the whole aggregate (§9.4).
+    let command = serde_json::from_str(&model.command)
+        .map_err(StoredOperationError::InvalidCommand)
+        .map_err(|source| corrupt(operation_id, source))?;
     // Targets are reconstructed in target-identity order so the recovery
     // scan and batch reporting always see the same deterministic list.
     let targets = operation_target::Entity::find()
@@ -269,12 +298,25 @@ where
         operation_id,
         source,
         domain_targets,
+        command,
         state,
         model.created_at,
         model.updated_at,
     )
     .map_err(StoredOperationError::InvalidTimeline)
     .map_err(|source| corrupt(operation_id, source))
+}
+
+/// Encodes the typed command as its §9.4 serde JSON form.
+///
+/// # Errors
+///
+/// Returns [`OperationRepositoryError::CommandEncode`] when the command value
+/// cannot be serialized. The domain command types are plain value types, so
+/// this is only reachable through a serde contract violation; it exists for
+/// totality — persistence never writes a string it could not produce.
+fn serialize_command(command: &RedfishCommand) -> Result<String, OperationRepositoryError> {
+    serde_json::to_string(command).map_err(OperationRepositoryError::CommandEncode)
 }
 
 fn corrupt(operation_id: OperationId, source: StoredOperationError) -> OperationRepositoryError {
@@ -306,6 +348,11 @@ pub enum OperationRepositoryError {
     },
     #[error("operation database operation failed: {0}")]
     Database(#[source] DbErr),
+    /// The typed command could not be serialized before writing. The domain
+    /// command types are plain value types, so this is a totality guard that
+    /// no value written by this product can actually trigger.
+    #[error("operation command cannot be serialized as JSON: {0}")]
+    CommandEncode(#[source] serde_json::Error),
 }
 
 /// Why persisted operation data cannot be mapped into valid product types.
@@ -315,6 +362,13 @@ pub enum StoredOperationError {
     InvalidState(#[source] OperationStateParseError),
     #[error("operation source code is invalid: {0}")]
     InvalidSource(#[source] OperationSourceParseError),
+    /// The stored command JSON cannot be deserialized by this build: a
+    /// malformed document, an unknown command family, or a payload shape this
+    /// build does not know. The whole aggregate is refused rather than
+    /// half-understood; see [`super::SqliteStore::find_operation`] for the
+    /// upgrade-order consequence.
+    #[error("operation command JSON is invalid: {0}")]
+    InvalidCommand(#[source] serde_json::Error),
     #[error("operation timeline is invalid: {0}")]
     InvalidTimeline(#[source] OperationTimelineError),
 }
@@ -323,7 +377,12 @@ pub enum StoredOperationError {
 mod tests {
     use std::error::Error;
 
-    use rutilus_domain::{EndpointId, TargetId};
+    use rutilus_domain::{
+        BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
+        CreateSubscription, EndpointId, EventCommand, EventDestinationProtocol,
+        EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType,
+        ResetType, SecureBootCommand, SetBootSourceOverride, SystemCommand, TargetId,
+    };
     use rutilus_entity::{operation, operation_target};
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
     use time::{Duration, OffsetDateTime};
@@ -357,6 +416,7 @@ mod tests {
         let operation = queued_operation(
             OperationSource::Standalone,
             &three_sorted_targets(),
+            one_command(),
             OffsetDateTime::now_utc(),
         );
 
@@ -381,8 +441,12 @@ mod tests {
     async fn repeated_delivery_never_rewrites_the_stored_row() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let created_at = OffsetDateTime::now_utc();
-        let operation =
-            queued_operation(OperationSource::Center, &three_sorted_targets(), created_at);
+        let operation = queued_operation(
+            OperationSource::Center,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
 
         store.create_operation(&operation).await?;
         store.create_operation(&operation).await?;
@@ -414,8 +478,12 @@ mod tests {
     async fn apply_transition_records_each_step_and_its_time() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let created_at = OffsetDateTime::now_utc();
-        let operation =
-            queued_operation(OperationSource::Site, &three_sorted_targets(), created_at);
+        let operation = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
         store.create_operation(&operation).await?;
         let operation_id = operation.id();
 
@@ -464,6 +532,7 @@ mod tests {
         let operation = queued_operation(
             OperationSource::Standalone,
             &three_sorted_targets(),
+            one_command(),
             created_at,
         );
         store.create_operation(&operation).await?;
@@ -506,8 +575,12 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let created_at = OffsetDateTime::now_utc();
-        let operation =
-            queued_operation(OperationSource::Site, &three_sorted_targets(), created_at);
+        let operation = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
         store.create_operation(&operation).await?;
         let operation_id = operation.id();
         let first_at = created_at + Duration::SECOND;
@@ -575,8 +648,12 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let created_at = OffsetDateTime::now_utc();
-        let operation =
-            queued_operation(OperationSource::Site, &three_sorted_targets(), created_at);
+        let operation = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
         store.create_operation(&operation).await?;
         let operation_id = operation.id();
         let first_at = created_at + Duration::SECOND;
@@ -619,20 +696,28 @@ mod tests {
     async fn list_operations_filters_by_state_in_acceptance_order() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let base = OffsetDateTime::now_utc();
-        let waiting_a = queued_operation(OperationSource::Site, &three_sorted_targets(), base);
+        let waiting_a = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            base,
+        );
         let queued = queued_operation(
             OperationSource::Standalone,
             &three_sorted_targets(),
+            one_command(),
             base + Duration::SECOND,
         );
         let waiting_b = queued_operation(
             OperationSource::Center,
             &three_sorted_targets(),
+            one_command(),
             base + Duration::SECOND * 2,
         );
         let succeeded = queued_operation(
             OperationSource::Site,
             &three_sorted_targets(),
+            one_command(),
             base + Duration::SECOND * 3,
         );
         for operation in [&waiting_a, &queued, &waiting_b, &succeeded] {
@@ -698,6 +783,7 @@ mod tests {
         let operation = queued_operation(
             OperationSource::Standalone,
             &three_sorted_targets(),
+            one_command(),
             OffsetDateTime::now_utc(),
         );
         store.create_operation(&operation).await?;
@@ -732,7 +818,8 @@ mod tests {
         let (directory, store) = store_with_directory().await?;
         let mut created_at = OffsetDateTime::now_utc();
         for source in ALL_SOURCES {
-            let operation = queued_operation(source, &three_sorted_targets(), created_at);
+            let operation =
+                queued_operation(source, &three_sorted_targets(), one_command(), created_at);
             store.create_operation(&operation).await?;
             assert_eq!(
                 store.find_operation(operation.id()).await?,
@@ -743,8 +830,12 @@ mod tests {
             created_at += Duration::SECOND;
         }
         for state in ALL_STATES {
-            let operation =
-                queued_operation(OperationSource::Center, &three_sorted_targets(), created_at);
+            let operation = queued_operation(
+                OperationSource::Center,
+                &three_sorted_targets(),
+                one_command(),
+                created_at,
+            );
             store.create_operation(&operation).await?;
             store
                 .apply_transition(operation.id(), state, created_at + Duration::SECOND)
@@ -773,11 +864,14 @@ mod tests {
         let created_at = OffsetDateTime::now_utc();
         // The database has no timeline constraint, so a row with a backwards
         // update time is written directly; reading it back must refuse it.
+        // The command JSON is valid on purpose, so the failure is exactly the
+        // timeline error and not a command deserialization error.
         let operation_id = OperationId::generate();
         operation::ActiveModel {
             id: Set(operation_id.into_uuid()),
             source: Set(String::from("standalone")),
             state: Set(String::from("queued")),
+            command: Set(serialize_command(&one_command())?),
             created_at: Set(created_at),
             updated_at: Set(created_at - Duration::SECOND),
         }
@@ -790,6 +884,114 @@ mod tests {
                 operation_id: id,
                 source: StoredOperationError::InvalidTimeline(_),
             }) if id == operation_id
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commands_round_trip_across_every_family() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let mut created_at = OffsetDateTime::now_utc();
+        for command in all_commands()? {
+            let operation = queued_operation(
+                OperationSource::Standalone,
+                &three_sorted_targets(),
+                command.clone(),
+                created_at,
+            );
+            let operation_id = operation.id();
+            store.create_operation(&operation).await?;
+            assert_eq!(
+                store.find_operation(operation_id).await?,
+                Some(operation),
+                "command family {} must survive persistence unchanged",
+                command.as_str()
+            );
+            let stored = store
+                .find_operation(operation_id)
+                .await?
+                .ok_or("stored operation is missing")?;
+            assert_eq!(stored.command(), command);
+            created_at += Duration::SECOND;
+        }
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_command_json_this_build_cannot_deserialize() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let now = OffsetDateTime::now_utc();
+        // A deferred family (design section 7.5: `Account`, `Bios`, `Storage`,
+        // `Update`, `Telemetry`, `Oem`) and a truncated document are both
+        // written directly, bypassing the repository's serializer — exactly
+        // what a future build's row would look like to this build. Rehydration
+        // must refuse the whole aggregate, never guess at the command.
+        for command in ["{\"Storage\": {}}", r#"{"System":"PowerCycle"}"#] {
+            let operation_id = OperationId::generate();
+            operation::ActiveModel {
+                id: Set(operation_id.into_uuid()),
+                source: Set(String::from("standalone")),
+                state: Set(String::from("queued")),
+                command: Set(String::from(command)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&store.database)
+            .await?;
+            assert!(matches!(
+                store.find_operation(operation_id).await,
+                Err(OperationRepositoryError::Corrupt {
+                    operation_id: id,
+                    source: StoredOperationError::InvalidCommand(_),
+                }) if id == operation_id
+            ));
+        }
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_corrupt_command_poisons_the_whole_listing() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let now = OffsetDateTime::now_utc();
+        // A readable row next to the unreadable one proves the poisoning is
+        // caused by the corrupt command, not by an empty table: the §13.6
+        // recovery scan reads back complete aggregates, so it must surface
+        // the corruption instead of silently dropping the unreadable
+        // operation (promised by `list_operations`).
+        let valid = queued_operation(
+            OperationSource::Standalone,
+            &three_sorted_targets(),
+            one_command(),
+            now,
+        );
+        store.create_operation(&valid).await?;
+        let corrupt_id = OperationId::generate();
+        operation::ActiveModel {
+            id: Set(corrupt_id.into_uuid()),
+            source: Set(String::from("standalone")),
+            state: Set(String::from("queued")),
+            command: Set(String::from(r#"{"Storage": {}}"#)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&store.database)
+        .await?;
+
+        assert!(matches!(
+            store.list_operations(None).await,
+            Err(OperationRepositoryError::Corrupt {
+                operation_id,
+                source: StoredOperationError::InvalidCommand(_),
+            }) if operation_id == corrupt_id
         ));
 
         store.close().await?;
@@ -823,14 +1025,51 @@ mod tests {
     fn queued_operation(
         source: OperationSource,
         targets: &[OperationTarget],
+        command: RedfishCommand,
         created_at: OffsetDateTime,
     ) -> Operation {
         Operation::new(
             OperationId::generate(),
             source,
             targets.to_vec(),
+            command,
             created_at,
         )
+    }
+
+    /// One representative command for tests whose subject is not the command
+    /// itself; the command round-trip across every family is covered by
+    /// [`commands_round_trip_across_every_family`].
+    fn one_command() -> RedfishCommand {
+        RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle))
+    }
+
+    /// One representative command per §7.5 family, mirroring the domain's
+    /// exhaustive family list so a newly added family cannot hide from
+    /// persistence tests.
+    fn all_commands() -> Result<Vec<RedfishCommand>, EventSubscriptionError> {
+        Ok(vec![
+            one_command(),
+            RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
+            RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
+            RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                SetBootSourceOverride::new(
+                    BootSource::Pxe,
+                    BootSourceOverrideEnabled::Once,
+                    BootSourceOverrideMode::Uefi,
+                ),
+            )),
+            RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(
+                ResetKeysType::ResetAllKeysToDefault,
+            )),
+            RedfishCommand::Event(EventCommand::CreateSubscription(
+                CreateSubscription::try_new(
+                    "https://192.0.2.10/events".to_owned(),
+                    EventDestinationProtocol::Redfish,
+                    vec![EventType::Alert],
+                )?,
+            )),
+        ])
     }
 
     async fn store_with_directory() -> Result<(tempfile::TempDir, SqliteStore), Box<dyn Error>> {

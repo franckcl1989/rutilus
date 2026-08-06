@@ -14,6 +14,7 @@ rutilus-operation-engine.workspace = true
 rutilus-security = { path = "../security", version = "0.1.0" }
 sea-orm.workspace = true
 sea-orm-migration.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

@@ -3456,6 +3456,7 @@ dependencies = [
 name = "rutilus-domain"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "time",
@@ -3526,6 +3527,7 @@ dependencies = [
  "sea-orm",
  "sea-orm-migration",
  "secrecy",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "time",

@@ -247,8 +247,9 @@ mod tests {
         CapabilityState, CredentialId, CredentialName, CredentialUsername, CredentialVersionId,
         DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
         EndpointDisplayName, EndpointId, Operation, OperationEvent, OperationId, OperationSource,
-        OperationState, OperationTarget, ProductPermission, ResourceFeature, ResourceODataId,
-        ResourceSnapshotPayload, TargetId, TlsCertificate, TlsTrust,
+        OperationState, OperationTarget, ProductPermission, RedfishCommand, ResetType,
+        ResourceFeature, ResourceODataId, ResourceSnapshotPayload, SystemCommand, TargetId,
+        TlsCertificate, TlsTrust,
     };
     use rutilus_operation_engine::{OperationEngine, OperationStore};
     use rutilus_security::{MasterKey, encrypt_credential};
@@ -715,6 +716,7 @@ mod tests {
                 TargetId::generate(),
                 EndpointId::generate(),
             )],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
             created_at,
         );
 
@@ -762,9 +764,15 @@ mod tests {
 
         // The engine persists through the adapter into real SQLite and re-reads
         // the stored aggregate after every step (§13.3), so the returned value
-        // is exactly what the database holds.
+        // is exactly what the database holds. The command travels with the
+        // operation from creation through every transition.
         let created = engine
-            .create(OperationSource::Site, vec![target], created_at)
+            .create(
+                OperationSource::Site,
+                vec![target],
+                RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                created_at,
+            )
             .await?;
         assert_eq!(created.state(), OperationState::Queued);
         let operation_id = created.id();
