@@ -69,11 +69,28 @@ define_id!(
     AuditOperationId,
     "The correlation identity shared by one audited operation's events."
 );
+define_id!(
+    OperationId,
+    "The stable identity of one persisted product operation (§13.1).\n\n\
+     This is the identity of the operation record driven by the §13.2 state\n\
+     machine. It is distinct from `AuditOperationId`: an `AuditOperationId`\n\
+     correlates the append-only audit events that record the operation\n\
+     lifecycle for accountability, while an `OperationId` names the operation\n\
+     record itself. The two identifiers never interchange."
+);
+define_id!(
+    TargetId,
+    "The stable identity of one operation target (§13.1).\n\n\
+     A target is one logical object (for example, one resource or one\n\
+     endpoint instance) that an operation acts on; an `OperationTarget`\n\
+     binds it to the endpoint that actually receives the Redfish request."
+);
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, ResourceId,
+        AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, OperationId,
+        ResourceId, TargetId,
     };
 
     #[test]
@@ -123,6 +140,18 @@ mod tests {
             operation.to_string().parse::<AuditOperationId>()?,
             operation
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_and_target_identifiers_are_uuid_v7_and_round_trip() -> Result<(), uuid::Error> {
+        let operation = OperationId::generate();
+        let target = TargetId::generate();
+
+        assert_eq!(operation.into_uuid().get_version_num(), 7);
+        assert_eq!(target.into_uuid().get_version_num(), 7);
+        assert_eq!(operation.to_string().parse::<OperationId>()?, operation);
+        assert_eq!(target.to_string().parse::<TargetId>()?, target);
         Ok(())
     }
 }

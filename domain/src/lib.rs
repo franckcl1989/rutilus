@@ -8,6 +8,7 @@ mod credential;
 mod endpoint;
 mod endpoint_address;
 mod ids;
+mod operation;
 mod resource_snapshot;
 
 pub use audit::{
@@ -33,7 +34,12 @@ pub use endpoint::{
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
 pub use ids::{
-    AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, ResourceId,
+    AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId, OperationId,
+    ResourceId, TargetId,
+};
+pub use operation::{
+    InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,
+    OperationState, OperationStateParseError, OperationTarget, OperationTimelineError, transition,
 };
 pub use resource_snapshot::{
     RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,
