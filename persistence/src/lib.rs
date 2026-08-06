@@ -24,6 +24,7 @@ mod migration_backup;
 mod operation_repository;
 mod remote_task_repository;
 mod resource_snapshot_repository;
+mod telemetry_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
 pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
@@ -41,6 +42,9 @@ pub use operation_repository::{OperationRepositoryError, StoredOperationError};
 pub use remote_task_repository::{RemoteTaskRepositoryError, StoredRemoteTaskError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
+};
+pub use telemetry_repository::{
+    StoredTelemetryError, TelemetryPruneSummary, TelemetryRepositoryError,
 };
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
