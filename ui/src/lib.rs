@@ -9,14 +9,18 @@ use std::{collections::BTreeSet, fmt};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
-    AboutResponse, AuditEventResponse, AuditQueryResponse, CapabilityEntryResponse,
-    CapabilityStateResponse, CoreResourceDetailsResponse, CoreResourceResponse,
-    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
-    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
-    EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, ResourceStatusResponse,
-    TlsTrustModeResponse, UiLocationResponse,
+    AboutResponse, AuditEventResponse, AuditQueryResponse, BootCommand, BootSource,
+    BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
+    CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
+    CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
+    EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
+    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
+    EndpointTrustExpectationRequest, EventCommand, EventDestinationProtocol, EventType,
+    ManagerCommand, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand,
+    SetBootSourceOverride, SystemCommand, TlsTrustModeResponse, UiLocationResponse,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1339,17 +1343,19 @@ enum ConsoleView {
     Import,
     Audit,
     Capabilities,
+    Operations,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 6] = [
+    const ALL: [ConsoleView; 7] = [
         Self::Overview,
         Self::Credentials,
         Self::AddEndpoint,
         Self::Import,
         Self::Audit,
         Self::Capabilities,
+        Self::Operations,
     ];
 
     const fn label(self) -> &'static str {
@@ -1360,6 +1366,7 @@ impl ConsoleView {
             Self::Import => "Import",
             Self::Audit => "Audit",
             Self::Capabilities => "Capabilities",
+            Self::Operations => "Operations",
         }
     }
 }
@@ -2319,6 +2326,1337 @@ impl From<&AuditEventResponse> for AuditEventCardProjection {
     }
 }
 
+/// The §13.2 lifecycle phase of one persisted operation, as display vocabulary.
+///
+/// The wire contract (the `rutilus-api` operation DTOs) is parsed before this
+/// projection exists, so this view type is the UI's own closed vocabulary of
+/// the nine phases; the DTO-to-view mapping lives with the fetch layer.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationStateView {
+    Queued,
+    Validating,
+    Running,
+    WaitingRemote,
+    Verifying,
+    Succeeded,
+    Failed,
+    Unknown,
+    Cancelled,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationStateView {
+    /// Static English badge label for one phase.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Validating => "Validating",
+            Self::Running => "Running",
+            Self::WaitingRemote => "Waiting for BMC",
+            Self::Verifying => "Verifying",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Unknown => "Unknown",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Semantic badge styling for one phase.
+    ///
+    /// The four tiers mirror the capability badge vocabulary: `Succeeded` is
+    /// the only ok (green) phase; `Failed` is the only error (red) phase;
+    /// `Unknown` and `Cancelled` are terminal without a proven result, so
+    /// they read as off (gray) instead of red; the five in-flight phases
+    /// read as active (blue).
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Succeeded => "operation-state operation-ok",
+            Self::Failed => "operation-state operation-error",
+            Self::Unknown | Self::Cancelled => "operation-state operation-off",
+            Self::Queued
+            | Self::Validating
+            | Self::Running
+            | Self::WaitingRemote
+            | Self::Verifying => "operation-state operation-active",
+        }
+    }
+}
+
+/// Where a persisted operation originated (§13.1), as display vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationSourceView {
+    Standalone,
+    Site,
+    Center,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationSourceView {
+    /// Static English label for one operation origin.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Standalone => "Standalone",
+            Self::Site => "Site",
+            Self::Center => "Center",
+        }
+    }
+}
+
+/// The §7.5 command family chosen in the operation form, as display
+/// vocabulary. The three reset families stay separate variants exactly like
+/// the domain, because they target different CSDL resources.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandFamilyView {
+    SystemReset,
+    ManagerReset,
+    ChassisReset,
+    BootOverride,
+    SecureBoot,
+    EventSubscription,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl CommandFamilyView {
+    /// Every family in §7.5 order, so the form cannot miss a variant.
+    const ALL: [Self; 6] = [
+        Self::SystemReset,
+        Self::ManagerReset,
+        Self::ChassisReset,
+        Self::BootOverride,
+        Self::SecureBoot,
+        Self::EventSubscription,
+    ];
+
+    /// The stable §7.5 family code, matching the domain's wire vocabulary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SystemReset => "system",
+            Self::ManagerReset => "manager",
+            Self::ChassisReset => "chassis",
+            Self::BootOverride => "boot",
+            Self::SecureBoot => "secure-boot",
+            Self::EventSubscription => "event",
+        }
+    }
+
+    /// Static English label for one command family.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SystemReset => "System reset",
+            Self::ManagerReset => "Manager reset",
+            Self::ChassisReset => "Chassis reset",
+            Self::BootOverride => "Boot source override",
+            Self::SecureBoot => "Secure Boot",
+            Self::EventSubscription => "Event subscription",
+        }
+    }
+}
+
+/// The reset action argument used by system, manager, and chassis resets.
+///
+/// The member set mirrors the domain `ResetType` exactly, which follows the
+/// `nv-redfish-schema` 0.13.0 `Resource_v1.xml` `ResetType` enum; the
+/// const member-set test keeps this aligned, and the form dropdown offers
+/// every member.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the shared `Force` prefix is accepted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetTypeView {
+    On,
+    ForceOff,
+    GracefulShutdown,
+    GracefulRestart,
+    ForceRestart,
+    Nmi,
+    ForceOn,
+    PushPowerButton,
+    PowerCycle,
+    Suspend,
+    Pause,
+    Resume,
+    FullPowerCycle,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ResetTypeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 13] = [
+        Self::On,
+        Self::ForceOff,
+        Self::GracefulShutdown,
+        Self::GracefulRestart,
+        Self::ForceRestart,
+        Self::Nmi,
+        Self::ForceOn,
+        Self::PushPowerButton,
+        Self::PowerCycle,
+        Self::Suspend,
+        Self::Pause,
+        Self::Resume,
+        Self::FullPowerCycle,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "On",
+            Self::ForceOff => "ForceOff",
+            Self::GracefulShutdown => "GracefulShutdown",
+            Self::GracefulRestart => "GracefulRestart",
+            Self::ForceRestart => "ForceRestart",
+            Self::Nmi => "Nmi",
+            Self::ForceOn => "ForceOn",
+            Self::PushPowerButton => "PushPowerButton",
+            Self::PowerCycle => "PowerCycle",
+            Self::Suspend => "Suspend",
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+            Self::FullPowerCycle => "FullPowerCycle",
+        }
+    }
+}
+
+/// The boot source selected by a boot source override.
+///
+/// The member set mirrors the domain `BootSource` exactly, which follows the
+/// `nv-redfish-schema` 0.13.0 `ComputerSystem_v1.xml` `BootSource` enum.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the shared `Uefi` prefix is accepted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootSourceView {
+    None,
+    Pxe,
+    Floppy,
+    Cd,
+    Usb,
+    Hdd,
+    BiosSetup,
+    Utilities,
+    Diags,
+    UefiShell,
+    UefiTarget,
+    SdCard,
+    UefiHttp,
+    RemoteDrive,
+    UefiBootNext,
+    Recovery,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BootSourceView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 16] = [
+        Self::None,
+        Self::Pxe,
+        Self::Floppy,
+        Self::Cd,
+        Self::Usb,
+        Self::Hdd,
+        Self::BiosSetup,
+        Self::Utilities,
+        Self::Diags,
+        Self::UefiShell,
+        Self::UefiTarget,
+        Self::SdCard,
+        Self::UefiHttp,
+        Self::RemoteDrive,
+        Self::UefiBootNext,
+        Self::Recovery,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Pxe => "Pxe",
+            Self::Floppy => "Floppy",
+            Self::Cd => "Cd",
+            Self::Usb => "Usb",
+            Self::Hdd => "Hdd",
+            Self::BiosSetup => "BiosSetup",
+            Self::Utilities => "Utilities",
+            Self::Diags => "Diags",
+            Self::UefiShell => "UefiShell",
+            Self::UefiTarget => "UefiTarget",
+            Self::SdCard => "SDCard",
+            Self::UefiHttp => "UefiHttp",
+            Self::RemoteDrive => "RemoteDrive",
+            Self::UefiBootNext => "UefiBootNext",
+            Self::Recovery => "Recovery",
+        }
+    }
+}
+
+/// How long a boot source override applies.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootEnabledView {
+    Disabled,
+    Once,
+    Continuous,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BootEnabledView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 3] = [Self::Disabled, Self::Once, Self::Continuous];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::Once => "Once",
+            Self::Continuous => "Continuous",
+        }
+    }
+}
+
+/// The boot mode a boot source override applies to; the CSDL member is
+/// `UEFI` (all caps), not `Uefi`.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootModeView {
+    Legacy,
+    Uefi,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BootModeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 2] = [Self::Legacy, Self::Uefi];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "Legacy",
+            Self::Uefi => "UEFI",
+        }
+    }
+}
+
+/// The key set reset requested from the Secure Boot service.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetKeysTypeView {
+    ResetAllKeysToDefault,
+    DeleteAllKeys,
+    DeletePk,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ResetKeysTypeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 3] = [
+        Self::ResetAllKeysToDefault,
+        Self::DeleteAllKeys,
+        Self::DeletePk,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResetAllKeysToDefault => "ResetAllKeysToDefault",
+            Self::DeleteAllKeys => "DeleteAllKeys",
+            Self::DeletePk => "DeletePK",
+        }
+    }
+}
+
+/// One Secure Boot command selectable in the form; `ResetKeys` carries the
+/// key set to reset.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecureBootActionView {
+    Enable,
+    Disable,
+    ResetKeys(ResetKeysTypeView),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl SecureBootActionView {
+    /// Static English label for one Secure Boot action.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Enable => "Enable",
+            Self::Disable => "Disable",
+            Self::ResetKeys(_) => "Reset keys",
+        }
+    }
+}
+
+/// One event subscription action selectable in the form.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventActionView {
+    CreateSubscription,
+    DeleteSubscription,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl EventActionView {
+    /// Every action in §7.5 order.
+    const ALL: [Self; 2] = [Self::CreateSubscription, Self::DeleteSubscription];
+
+    /// Static English label for one event action.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CreateSubscription => "Create subscription",
+            Self::DeleteSubscription => "Delete subscription",
+        }
+    }
+}
+
+/// The protocol an event subscription delivers events through.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the shared `Syslog`/`SNMP` prefixes are
+// accepted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventProtocolView {
+    Redfish,
+    Kafka,
+    Snmpv1,
+    Snmpv2c,
+    Snmpv3,
+    Smtp,
+    SyslogTls,
+    SyslogTcp,
+    SyslogUdp,
+    SyslogRelp,
+    Oem,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl EventProtocolView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 11] = [
+        Self::Redfish,
+        Self::Kafka,
+        Self::Snmpv1,
+        Self::Snmpv2c,
+        Self::Snmpv3,
+        Self::Smtp,
+        Self::SyslogTls,
+        Self::SyslogTcp,
+        Self::SyslogUdp,
+        Self::SyslogRelp,
+        Self::Oem,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redfish => "Redfish",
+            Self::Kafka => "Kafka",
+            Self::Snmpv1 => "SNMPv1",
+            Self::Snmpv2c => "SNMPv2c",
+            Self::Snmpv3 => "SNMPv3",
+            Self::Smtp => "SMTP",
+            Self::SyslogTls => "SyslogTLS",
+            Self::SyslogTcp => "SyslogTCP",
+            Self::SyslogUdp => "SyslogUDP",
+            Self::SyslogRelp => "SyslogRELP",
+            Self::Oem => "OEM",
+        }
+    }
+}
+
+/// The Redfish event type an event subscription requests.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the shared `Resource` prefix is accepted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventTypeView {
+    StatusChange,
+    ResourceUpdated,
+    ResourceAdded,
+    ResourceRemoved,
+    Alert,
+    MetricReport,
+    Other,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl EventTypeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 7] = [
+        Self::StatusChange,
+        Self::ResourceUpdated,
+        Self::ResourceAdded,
+        Self::ResourceRemoved,
+        Self::Alert,
+        Self::MetricReport,
+        Self::Other,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StatusChange => "StatusChange",
+            Self::ResourceUpdated => "ResourceUpdated",
+            Self::ResourceAdded => "ResourceAdded",
+            Self::ResourceRemoved => "ResourceRemoved",
+            Self::Alert => "Alert",
+            Self::MetricReport => "MetricReport",
+            Self::Other => "Other",
+        }
+    }
+}
+
+/// The reset target resource family carried by a reset command draft.
+///
+/// Keeping the reset families in their own type (instead of reusing
+/// [`CommandFamilyView`]) makes a reset draft unable to carry a non-reset
+/// family in the first place, so no match site ever needs an impossible arm.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetResourceView {
+    System,
+    Manager,
+    Chassis,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ResetResourceView {
+    /// Static English label for one reset target.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "System reset",
+            Self::Manager => "Manager reset",
+            Self::Chassis => "Chassis reset",
+        }
+    }
+}
+
+/// The typed command assembled from the operation form (§7.5).
+///
+/// This is the form-side counterpart of the domain `RedfishCommand`: the
+/// same six families with the same CSDL member vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationCommandDraft {
+    Reset {
+        family: ResetResourceView,
+        reset_type: ResetTypeView,
+    },
+    BootOverride {
+        source: BootSourceView,
+        enabled: BootEnabledView,
+        mode: BootModeView,
+    },
+    SecureBoot(SecureBootActionView),
+    Event(EventActionDraft),
+}
+
+/// The event-command payload assembled from the operation form.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EventActionDraft {
+    /// A subscription that requests no events can never deliver anything, so
+    /// the form rejects an empty event type set before submission.
+    CreateSubscription {
+        destination: String,
+        protocol: EventProtocolView,
+        event_types: Vec<EventTypeView>,
+    },
+    /// The `@odata.id` tail segment of the subscription to delete.
+    DeleteSubscription { subscription_id: String },
+}
+
+/// One-line summary of a typed command for the operation card and the form
+/// preview: the family label plus a compact payload description.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandSummaryProjection {
+    family: &'static str,
+    payload: String,
+}
+
+/// Projects one command draft into its one-line card summary.
+///
+/// The same projection feeds the form preview (what will be submitted) and
+/// the operation card (what was submitted), so the two can never disagree on
+/// how a command reads.
+#[cfg(any(target_arch = "wasm32", test))]
+fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection {
+    match command {
+        OperationCommandDraft::Reset { family, reset_type } => CommandSummaryProjection {
+            family: family.label(),
+            payload: reset_type.as_str().to_owned(),
+        },
+        OperationCommandDraft::BootOverride {
+            source,
+            enabled,
+            mode,
+        } => CommandSummaryProjection {
+            family: CommandFamilyView::BootOverride.label(),
+            payload: format!(
+                "{} · {} · {}",
+                source.as_str(),
+                enabled.as_str(),
+                mode.as_str()
+            ),
+        },
+        OperationCommandDraft::SecureBoot(action) => {
+            let payload = match action {
+                SecureBootActionView::Enable => "Enable".to_owned(),
+                SecureBootActionView::Disable => "Disable".to_owned(),
+                SecureBootActionView::ResetKeys(kind) => {
+                    format!("Reset keys · {}", kind.as_str())
+                }
+            };
+            CommandSummaryProjection {
+                family: CommandFamilyView::SecureBoot.label(),
+                payload,
+            }
+        }
+        OperationCommandDraft::Event(action) => {
+            let payload = match action {
+                EventActionDraft::CreateSubscription {
+                    destination,
+                    protocol,
+                    event_types,
+                } => format!(
+                    "Create · {} · {} · {}",
+                    destination,
+                    protocol.as_str(),
+                    event_types
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                EventActionDraft::DeleteSubscription { subscription_id } => {
+                    format!("Delete · {subscription_id}")
+                }
+            };
+            CommandSummaryProjection {
+                family: CommandFamilyView::EventSubscription.label(),
+                payload,
+            }
+        }
+    }
+}
+
+/// Client-side draft of one operation submission (§13.1).
+///
+/// The user picks one or more endpoints, one command family, and that
+/// family's parameters; `try_build` mirrors the domain boundaries (a batch
+/// is a list of targets, a subscription needs at least one event type) so an
+/// incomplete draft is rejected before any request is sent.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationFormDraft {
+    selected_endpoint_ids: Vec<String>,
+    family: Option<CommandFamilyView>,
+    reset_type: Option<ResetTypeView>,
+    boot_source: Option<BootSourceView>,
+    boot_enabled: Option<BootEnabledView>,
+    boot_mode: Option<BootModeView>,
+    secure_boot_action: Option<SecureBootActionView>,
+    reset_keys_type: Option<ResetKeysTypeView>,
+    event_action: Option<EventActionView>,
+    destination: String,
+    protocol: Option<EventProtocolView>,
+    event_types: Vec<EventTypeView>,
+    subscription_id: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationFormDraft {
+    /// Builds an empty draft: no targets, no family, no parameters.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            selected_endpoint_ids: Vec::new(),
+            family: None,
+            reset_type: None,
+            boot_source: None,
+            boot_enabled: None,
+            boot_mode: None,
+            secure_boot_action: None,
+            reset_keys_type: None,
+            event_action: None,
+            destination: String::new(),
+            protocol: None,
+            event_types: Vec::new(),
+            subscription_id: String::new(),
+        }
+    }
+
+    /// Reports whether one endpoint is currently a target of the draft.
+    #[must_use]
+    pub fn is_endpoint_selected(&self, endpoint_id: &str) -> bool {
+        self.selected_endpoint_ids
+            .iter()
+            .any(|id| id == endpoint_id)
+    }
+
+    /// Toggles one endpoint in the target list; a batch (§13.7) may carry
+    /// several endpoints.
+    pub fn toggle_endpoint(&mut self, endpoint_id: String) {
+        if let Some(index) = self
+            .selected_endpoint_ids
+            .iter()
+            .position(|id| *id == endpoint_id)
+        {
+            self.selected_endpoint_ids.remove(index);
+        } else {
+            self.selected_endpoint_ids.push(endpoint_id);
+        }
+    }
+
+    /// Builds the typed command draft, rejecting every incomplete form.
+    ///
+    /// Validation order follows the submission flow: targets first (an
+    /// operation without a target could never execute), then the family,
+    /// then that family's parameters. The first invalid field wins, exactly
+    /// like the credential draft validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first invalid field as [`OperationFormError`].
+    pub fn try_build(&self) -> Result<OperationCommandDraft, OperationFormError> {
+        if self.selected_endpoint_ids.is_empty() {
+            return Err(OperationFormError::EndpointsRequired);
+        }
+        let Some(family) = self.family else {
+            return Err(OperationFormError::FamilyRequired);
+        };
+        match family {
+            CommandFamilyView::SystemReset
+            | CommandFamilyView::ManagerReset
+            | CommandFamilyView::ChassisReset => {
+                let Some(reset_type) = self.reset_type else {
+                    return Err(OperationFormError::ResetTypeRequired);
+                };
+                let family = match family {
+                    CommandFamilyView::SystemReset => ResetResourceView::System,
+                    CommandFamilyView::ManagerReset => ResetResourceView::Manager,
+                    CommandFamilyView::ChassisReset => ResetResourceView::Chassis,
+                    CommandFamilyView::BootOverride
+                    | CommandFamilyView::SecureBoot
+                    | CommandFamilyView::EventSubscription => {
+                        // Refused rather than fabricated: the reset arm only
+                        // ever receives a reset family from the outer match.
+                        return Err(OperationFormError::FamilyRequired);
+                    }
+                };
+                Ok(OperationCommandDraft::Reset { family, reset_type })
+            }
+            CommandFamilyView::BootOverride => {
+                let Some(source) = self.boot_source else {
+                    return Err(OperationFormError::BootSourceRequired);
+                };
+                let Some(enabled) = self.boot_enabled else {
+                    return Err(OperationFormError::BootEnabledRequired);
+                };
+                let Some(mode) = self.boot_mode else {
+                    return Err(OperationFormError::BootModeRequired);
+                };
+                Ok(OperationCommandDraft::BootOverride {
+                    source,
+                    enabled,
+                    mode,
+                })
+            }
+            CommandFamilyView::SecureBoot => {
+                let Some(action) = self.secure_boot_action else {
+                    return Err(OperationFormError::SecureBootActionRequired);
+                };
+                let action = match action {
+                    SecureBootActionView::ResetKeys(_) => {
+                        let Some(kind) = self.reset_keys_type else {
+                            return Err(OperationFormError::ResetKeysTypeRequired);
+                        };
+                        SecureBootActionView::ResetKeys(kind)
+                    }
+                    _ => action,
+                };
+                Ok(OperationCommandDraft::SecureBoot(action))
+            }
+            CommandFamilyView::EventSubscription => {
+                let Some(action) = self.event_action else {
+                    return Err(OperationFormError::EventActionRequired);
+                };
+                match action {
+                    EventActionView::CreateSubscription => {
+                        event_destination_draft_error(&self.destination)?;
+                        let Some(protocol) = self.protocol else {
+                            return Err(OperationFormError::ProtocolRequired);
+                        };
+                        if self.event_types.is_empty() {
+                            return Err(OperationFormError::EventTypesRequired);
+                        }
+                        Ok(OperationCommandDraft::Event(
+                            EventActionDraft::CreateSubscription {
+                                destination: self.destination.trim().to_owned(),
+                                protocol,
+                                event_types: self.event_types.clone(),
+                            },
+                        ))
+                    }
+                    EventActionView::DeleteSubscription => {
+                        let subscription_id = self.subscription_id.trim();
+                        if subscription_id.is_empty() {
+                            return Err(OperationFormError::SubscriptionIdRequired);
+                        }
+                        Ok(OperationCommandDraft::Event(
+                            EventActionDraft::DeleteSubscription {
+                                subscription_id: subscription_id.to_owned(),
+                            },
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Why an operation draft cannot be submitted.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationFormError {
+    EndpointsRequired,
+    FamilyRequired,
+    ResetTypeRequired,
+    BootSourceRequired,
+    BootEnabledRequired,
+    BootModeRequired,
+    SecureBootActionRequired,
+    ResetKeysTypeRequired,
+    EventActionRequired,
+    DestinationRequired,
+    DestinationInvalid,
+    ProtocolRequired,
+    EventTypesRequired,
+    SubscriptionIdRequired,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationFormError {
+    /// Static message shown under the offending field.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::EndpointsRequired => "Select at least one endpoint.",
+            Self::FamilyRequired => "Choose a command family.",
+            Self::ResetTypeRequired => "Choose a reset type.",
+            Self::BootSourceRequired => "Choose a boot source.",
+            Self::BootEnabledRequired => "Choose how long the override applies.",
+            Self::BootModeRequired => "Choose a boot mode.",
+            Self::SecureBootActionRequired => "Choose a Secure Boot action.",
+            Self::ResetKeysTypeRequired => "Choose the key set to reset.",
+            Self::EventActionRequired => "Choose an event action.",
+            Self::DestinationRequired => "A destination URL is required.",
+            Self::DestinationInvalid => "The destination must be a URL with a host.",
+            Self::ProtocolRequired => "Choose a delivery protocol.",
+            Self::EventTypesRequired => "Select at least one event type.",
+            Self::SubscriptionIdRequired => "A subscription ID is required.",
+        }
+    }
+}
+
+/// Checks one event subscription destination URL.
+///
+/// The server remains authoritative during submission; this client-side
+/// check only rejects drafts that could never be a URL (empty, whitespace,
+/// no scheme, no host), mirroring the endpoint-address draft rules.
+#[cfg(any(target_arch = "wasm32", test))]
+fn event_destination_draft_error(value: &str) -> Result<(), OperationFormError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(OperationFormError::DestinationRequired);
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(OperationFormError::DestinationInvalid);
+    }
+    let Some(rest) = trimmed.split_once("://") else {
+        return Err(OperationFormError::DestinationInvalid);
+    };
+    let host = rest.1.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(OperationFormError::DestinationInvalid);
+    }
+    Ok(())
+}
+
+/// The submission phase of one operation form.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationSubmitState {
+    Idle,
+    InFlight,
+    Succeeded,
+    Failed(&'static str),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationSubmitState {
+    /// Static message for a rejected submission; the route may have refused
+    /// the request or the network may have failed, so the fields are the
+    /// only actionable advice.
+    const FAILURE_MESSAGE: &'static str =
+        "The operation could not be submitted. Check the fields and try again.";
+
+    const fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight)
+    }
+
+    const fn is_succeeded(&self) -> bool {
+        matches!(self, Self::Succeeded)
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed(message) => message,
+            Self::Idle | Self::InFlight | Self::Succeeded => "",
+        }
+    }
+}
+
+/// The loading state of the §13 operations list.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationsListState {
+    Loading,
+    Ready(Vec<OperationCardProjection>),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationsListState {
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    fn has_empty_list(&self) -> bool {
+        matches!(self, Self::Ready(cards) if cards.is_empty())
+    }
+
+    /// One-line count heading, e.g. "3 operations".
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(cards) => cards.len(),
+            Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 operation".to_owned(),
+            _ => format!("{count} operations"),
+        }
+    }
+
+    fn cards(&self) -> Vec<OperationCardProjection> {
+        match self {
+            Self::Ready(cards) => cards.clone(),
+            Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+}
+
+/// One §13 operation projected for a list card.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationCardProjection {
+    operation_id: String,
+    short_id: String,
+    source: OperationSourceView,
+    target_count: usize,
+    state: OperationStateView,
+    command: CommandSummaryProjection,
+    created_at_text: String,
+    updated_at_text: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationCardProjection {
+    /// Static badge label of the current phase.
+    #[must_use]
+    pub const fn state_label(&self) -> &'static str {
+        self.state.label()
+    }
+
+    /// Semantic badge styling of the current phase.
+    #[must_use]
+    pub const fn state_class(&self) -> &'static str {
+        self.state.class()
+    }
+
+    /// Static label of the operation origin.
+    #[must_use]
+    pub const fn source_label(&self) -> &'static str {
+        self.source.label()
+    }
+}
+
+/// Compact card identity for one operation id: its first 8 characters.
+///
+/// Operation ids are UUID v7 strings; the full id stays available as the
+/// card title attribute while the short form keeps the card grid scannable.
+#[cfg(any(target_arch = "wasm32", test))]
+fn short_operation_id(operation_id: &str) -> String {
+    operation_id.chars().take(8).collect()
+}
+
+/// One endpoint offered as an operation target, projected from the local
+/// inventory.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationEndpointChoice {
+    endpoint_id: String,
+    display_name: String,
+    address: String,
+}
+
+/// Projects the endpoint inventory into the operation form's target choices.
+#[cfg(any(target_arch = "wasm32", test))]
+fn operation_endpoint_choices(
+    inventory: &EndpointInventoryResponse,
+) -> Vec<OperationEndpointChoice> {
+    inventory
+        .endpoints()
+        .iter()
+        .map(|endpoint| {
+            let identity = endpoint.identity();
+            OperationEndpointChoice {
+                endpoint_id: identity.endpoint_id().to_string(),
+                display_name: identity.display_name().to_owned(),
+                address: identity.address().to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Maps the wire operation source onto the display vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<OperationSourceResponse> for OperationSourceView {
+    fn from(source: OperationSourceResponse) -> Self {
+        match source {
+            OperationSourceResponse::Standalone => Self::Standalone,
+            OperationSourceResponse::Site => Self::Site,
+            OperationSourceResponse::Center => Self::Center,
+        }
+    }
+}
+
+/// Maps the wire operation phase onto the display vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<OperationStateResponse> for OperationStateView {
+    fn from(state: OperationStateResponse) -> Self {
+        match state {
+            OperationStateResponse::Queued => Self::Queued,
+            OperationStateResponse::Validating => Self::Validating,
+            OperationStateResponse::Running => Self::Running,
+            OperationStateResponse::WaitingRemote => Self::WaitingRemote,
+            OperationStateResponse::Verifying => Self::Verifying,
+            OperationStateResponse::Succeeded => Self::Succeeded,
+            OperationStateResponse::Failed => Self::Failed,
+            OperationStateResponse::Unknown => Self::Unknown,
+            OperationStateResponse::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Maps the form reset-type vocabulary onto the domain reset type.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_reset_type(reset_type: ResetTypeView) -> ResetType {
+    match reset_type {
+        ResetTypeView::On => ResetType::On,
+        ResetTypeView::ForceOff => ResetType::ForceOff,
+        ResetTypeView::GracefulShutdown => ResetType::GracefulShutdown,
+        ResetTypeView::GracefulRestart => ResetType::GracefulRestart,
+        ResetTypeView::ForceRestart => ResetType::ForceRestart,
+        ResetTypeView::Nmi => ResetType::Nmi,
+        ResetTypeView::ForceOn => ResetType::ForceOn,
+        ResetTypeView::PushPowerButton => ResetType::PushPowerButton,
+        ResetTypeView::PowerCycle => ResetType::PowerCycle,
+        ResetTypeView::Suspend => ResetType::Suspend,
+        ResetTypeView::Pause => ResetType::Pause,
+        ResetTypeView::Resume => ResetType::Resume,
+        ResetTypeView::FullPowerCycle => ResetType::FullPowerCycle,
+    }
+}
+
+/// Maps the form boot-source vocabulary onto the domain boot source.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_boot_source(source: BootSourceView) -> BootSource {
+    match source {
+        BootSourceView::None => BootSource::None,
+        BootSourceView::Pxe => BootSource::Pxe,
+        BootSourceView::Floppy => BootSource::Floppy,
+        BootSourceView::Cd => BootSource::Cd,
+        BootSourceView::Usb => BootSource::Usb,
+        BootSourceView::Hdd => BootSource::Hdd,
+        BootSourceView::BiosSetup => BootSource::BiosSetup,
+        BootSourceView::Utilities => BootSource::Utilities,
+        BootSourceView::Diags => BootSource::Diags,
+        BootSourceView::UefiShell => BootSource::UefiShell,
+        BootSourceView::UefiTarget => BootSource::UefiTarget,
+        BootSourceView::SdCard => BootSource::SdCard,
+        BootSourceView::UefiHttp => BootSource::UefiHttp,
+        BootSourceView::RemoteDrive => BootSource::RemoteDrive,
+        BootSourceView::UefiBootNext => BootSource::UefiBootNext,
+        BootSourceView::Recovery => BootSource::Recovery,
+    }
+}
+
+/// Maps the form override-duration vocabulary onto the domain vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_boot_enabled(enabled: BootEnabledView) -> BootSourceOverrideEnabled {
+    match enabled {
+        BootEnabledView::Disabled => BootSourceOverrideEnabled::Disabled,
+        BootEnabledView::Once => BootSourceOverrideEnabled::Once,
+        BootEnabledView::Continuous => BootSourceOverrideEnabled::Continuous,
+    }
+}
+
+/// Maps the form boot-mode vocabulary onto the domain vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_boot_mode(mode: BootModeView) -> BootSourceOverrideMode {
+    match mode {
+        BootModeView::Legacy => BootSourceOverrideMode::Legacy,
+        BootModeView::Uefi => BootSourceOverrideMode::Uefi,
+    }
+}
+
+/// Maps the form key-set vocabulary onto the domain vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_reset_keys(kind: ResetKeysTypeView) -> ResetKeysType {
+    match kind {
+        ResetKeysTypeView::ResetAllKeysToDefault => ResetKeysType::ResetAllKeysToDefault,
+        ResetKeysTypeView::DeleteAllKeys => ResetKeysType::DeleteAllKeys,
+        ResetKeysTypeView::DeletePk => ResetKeysType::DeletePk,
+    }
+}
+
+/// Maps the form protocol vocabulary onto the domain vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_protocol(protocol: EventProtocolView) -> EventDestinationProtocol {
+    match protocol {
+        EventProtocolView::Redfish => EventDestinationProtocol::Redfish,
+        EventProtocolView::Kafka => EventDestinationProtocol::Kafka,
+        EventProtocolView::Snmpv1 => EventDestinationProtocol::Snmpv1,
+        EventProtocolView::Snmpv2c => EventDestinationProtocol::Snmpv2c,
+        EventProtocolView::Snmpv3 => EventDestinationProtocol::Snmpv3,
+        EventProtocolView::Smtp => EventDestinationProtocol::Smtp,
+        EventProtocolView::SyslogTls => EventDestinationProtocol::SyslogTls,
+        EventProtocolView::SyslogTcp => EventDestinationProtocol::SyslogTcp,
+        EventProtocolView::SyslogUdp => EventDestinationProtocol::SyslogUdp,
+        EventProtocolView::SyslogRelp => EventDestinationProtocol::SyslogRelp,
+        EventProtocolView::Oem => EventDestinationProtocol::Oem,
+    }
+}
+
+/// Maps the form event-type vocabulary onto the domain vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_event_type(event_type: EventTypeView) -> EventType {
+    match event_type {
+        EventTypeView::StatusChange => EventType::StatusChange,
+        EventTypeView::ResourceUpdated => EventType::ResourceUpdated,
+        EventTypeView::ResourceAdded => EventType::ResourceAdded,
+        EventTypeView::ResourceRemoved => EventType::ResourceRemoved,
+        EventTypeView::Alert => EventType::Alert,
+        EventTypeView::MetricReport => EventType::MetricReport,
+        EventTypeView::Other => EventType::Other,
+    }
+}
+
+/// Builds the typed §7.5 command from a validated form draft.
+///
+/// The command is the domain's own write surface, so the submission carries
+/// exactly what the executor will dispatch (§13.3 step 7). Every form
+/// vocabulary member maps to exactly one domain member; the const member-set
+/// tests keep the two vocabularies aligned.
+#[cfg(any(target_arch = "wasm32", test))]
+fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, OperationFormError> {
+    match command {
+        OperationCommandDraft::Reset { family, reset_type } => {
+            let reset_type = domain_reset_type(*reset_type);
+            let command = match family {
+                ResetResourceView::System => {
+                    RedfishCommand::System(SystemCommand::Reset(reset_type))
+                }
+                ResetResourceView::Manager => {
+                    RedfishCommand::Manager(ManagerCommand::Reset(reset_type))
+                }
+                ResetResourceView::Chassis => {
+                    RedfishCommand::Chassis(ChassisCommand::Reset(reset_type))
+                }
+            };
+            Ok(command)
+        }
+        OperationCommandDraft::BootOverride {
+            source,
+            enabled,
+            mode,
+        } => Ok(RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+            SetBootSourceOverride::new(
+                domain_boot_source(*source),
+                domain_boot_enabled(*enabled),
+                domain_boot_mode(*mode),
+            ),
+        ))),
+        OperationCommandDraft::SecureBoot(action) => {
+            let command = match action {
+                SecureBootActionView::Enable => {
+                    RedfishCommand::SecureBoot(SecureBootCommand::Enable)
+                }
+                SecureBootActionView::Disable => {
+                    RedfishCommand::SecureBoot(SecureBootCommand::Disable)
+                }
+                SecureBootActionView::ResetKeys(kind) => RedfishCommand::SecureBoot(
+                    SecureBootCommand::ResetKeys(domain_reset_keys(*kind)),
+                ),
+            };
+            Ok(command)
+        }
+        OperationCommandDraft::Event(action) => match action {
+            EventActionDraft::CreateSubscription {
+                destination,
+                protocol,
+                event_types,
+            } => {
+                let event_types = event_types
+                    .iter()
+                    .map(|kind| domain_event_type(*kind))
+                    .collect();
+                let subscription = CreateSubscription::try_new(
+                    destination.clone(),
+                    domain_protocol(*protocol),
+                    event_types,
+                )
+                .map_err(|_| OperationFormError::EventTypesRequired)?;
+                Ok(RedfishCommand::Event(EventCommand::CreateSubscription(
+                    subscription,
+                )))
+            }
+            EventActionDraft::DeleteSubscription { subscription_id } => Ok(RedfishCommand::Event(
+                EventCommand::DeleteSubscription(DeleteSubscription::new(subscription_id.clone())),
+            )),
+        },
+    }
+}
+
+/// Projects the wire §7.5 command into its one-line card summary.
+///
+/// This is the response-side counterpart of [`command_summary`]: both render
+/// the same family label and payload vocabulary, so the card of a submitted
+/// operation reads exactly like the form preview that produced it.
+#[cfg(any(target_arch = "wasm32", test))]
+fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
+    match command {
+        RedfishCommand::System(SystemCommand::Reset(reset_type)) => CommandSummaryProjection {
+            family: ResetResourceView::System.label(),
+            payload: reset_type.to_string(),
+        },
+        RedfishCommand::Manager(ManagerCommand::Reset(reset_type)) => CommandSummaryProjection {
+            family: ResetResourceView::Manager.label(),
+            payload: reset_type.to_string(),
+        },
+        RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => CommandSummaryProjection {
+            family: ResetResourceView::Chassis.label(),
+            payload: reset_type.to_string(),
+        },
+        RedfishCommand::Boot(BootCommand::SetBootSourceOverride(override_value)) => {
+            CommandSummaryProjection {
+                family: CommandFamilyView::BootOverride.label(),
+                payload: format!(
+                    "{} · {} · {}",
+                    override_value.source(),
+                    override_value.enabled(),
+                    override_value.mode()
+                ),
+            }
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::Enable) => CommandSummaryProjection {
+            family: CommandFamilyView::SecureBoot.label(),
+            payload: "Enable".to_owned(),
+        },
+        RedfishCommand::SecureBoot(SecureBootCommand::Disable) => CommandSummaryProjection {
+            family: CommandFamilyView::SecureBoot.label(),
+            payload: "Disable".to_owned(),
+        },
+        RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(kind)) => {
+            CommandSummaryProjection {
+                family: CommandFamilyView::SecureBoot.label(),
+                payload: format!("Reset keys · {kind}"),
+            }
+        }
+        RedfishCommand::Event(EventCommand::CreateSubscription(subscription)) => {
+            CommandSummaryProjection {
+                family: CommandFamilyView::EventSubscription.label(),
+                payload: format!(
+                    "Create · {} · {} · {}",
+                    subscription.destination(),
+                    subscription.protocol(),
+                    subscription
+                        .event_types()
+                        .iter()
+                        .map(EventType::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        RedfishCommand::Event(EventCommand::DeleteSubscription(deletion)) => {
+            CommandSummaryProjection {
+                family: CommandFamilyView::EventSubscription.label(),
+                payload: format!("Delete · {}", deletion.subscription_id()),
+            }
+        }
+    }
+}
+
+/// Projects one wire operation onto its list card.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&OperationResponse> for OperationCardProjection {
+    fn from(response: &OperationResponse) -> Self {
+        let operation_id = response.operation_id().to_string();
+        Self {
+            short_id: short_operation_id(&operation_id),
+            operation_id,
+            source: OperationSourceView::from(response.source()),
+            target_count: response.targets().len(),
+            state: OperationStateView::from(response.state()),
+            command: wire_command_summary(response.command()),
+            created_at_text: format_observed_at(&response.created_at()),
+            updated_at_text: format_observed_at(&response.updated_at()),
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use gloo_net::http::Request;
@@ -2330,24 +3668,30 @@ mod browser {
     };
     use rutilus_api::{
         AboutResponse, AuditQueryResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
-        CreateCredentialRequest, CredentialInventoryResponse, CredentialSummaryResponse,
-        EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
-        EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-        EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-        TrustedEndpointResponse,
+        CreateCredentialRequest, CreateOperationRequest, CredentialInventoryResponse,
+        CredentialSummaryResponse, EndpointCapabilityInventoryResponse, EndpointCsvImportRequest,
+        EndpointCsvImportResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+        EndpointResourceInventoryResponse, EndpointTrustChallengeResponse,
+        EndpointTrustExpectationRequest, EnrollEndpointRequest, OperationListResponse,
+        OperationResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     use super::{
-        AuditEventCardProjection, AuditListState, CapabilityEntryProjection,
-        CapabilityGroupProjection, CapabilityLoadFailure, CapabilityMatrixProjection,
-        CapabilityMatrixState, CapabilityTargetProjection, ConsoleLoadFailure, ConsoleLoadState,
-        ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
+        AuditEventCardProjection, AuditListState, BootEnabledView, BootModeView, BootSourceView,
+        CapabilityEntryProjection, CapabilityGroupProjection, CapabilityLoadFailure,
+        CapabilityMatrixProjection, CapabilityMatrixState, CapabilityTargetProjection,
+        CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState, ConsoleView,
+        CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
-        ImportFailure, ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
-        TrustChallengeProjection, endpoint_address_draft_error, trust_mode_label,
+        EventActionView, EventProtocolView, EventTypeView, ImportFailure, ImportState,
+        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
+        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
+        OperationSubmitState, OperationsListState, ResetKeysTypeView, ResetTypeView,
+        SecureBootActionView, TrustChallengeProjection, build_command, command_summary,
+        endpoint_address_draft_error, operation_endpoint_choices, trust_mode_label,
     };
 
     #[wasm_bindgen(start)]
@@ -2509,6 +3853,7 @@ mod browser {
                     set_triggered=set_capability_triggered
                     on_back=on_back_to_overview
                 />
+                <OperationsView view=view load_state=state />
             </main>
         }
     }
@@ -4195,6 +5540,863 @@ mod browser {
             .await
             .map_err(|_| ImportFailure::MalformedReport)?;
         Ok(CsvImportReportProjection::from_response(&report))
+    }
+
+    /// Loads the persisted §13 operation list.
+    ///
+    /// Any transport failure or non-200 status maps to the single static
+    /// unavailable message, exactly like the audit and credential lists;
+    /// a 200 body that violates the strict shared contract maps to the same
+    /// failure because a list that cannot be projected is as useless as a
+    /// list that never arrived.
+    async fn fetch_operations() -> OperationsListState {
+        let response = Request::get("/api/v1/operations")
+            .header("Accept", "application/json")
+            .send()
+            .await;
+        let Ok(response) = response else {
+            return OperationsListState::Failed;
+        };
+        if !response.ok() {
+            return OperationsListState::Failed;
+        }
+        match response.json::<OperationListResponse>().await {
+            Ok(list) => OperationsListState::Ready(
+                list.operations()
+                    .iter()
+                    .map(OperationCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => OperationsListState::Failed,
+        }
+    }
+
+    /// Submits one operation draft (§13.1).
+    ///
+    /// The draft must already be validated (the form only calls this after
+    /// `try_build` succeeds); a refused submission maps to the single static
+    /// failure message because the route's rejection reasons are not part of
+    /// the current console contract.
+    async fn submit_operation(
+        draft: &OperationFormDraft,
+        command: &OperationCommandDraft,
+    ) -> Result<(), &'static str> {
+        let targets: Result<Vec<_>, _> = draft
+            .selected_endpoint_ids
+            .iter()
+            .map(|id| id.parse())
+            .collect();
+        let Ok(targets) = targets else {
+            return Err(OperationSubmitState::FAILURE_MESSAGE);
+        };
+        let Ok(command) = build_command(command) else {
+            return Err(OperationSubmitState::FAILURE_MESSAGE);
+        };
+        let request = CreateOperationRequest::new(None, targets, command);
+        let response = Request::post("/api/v1/operations")
+            .json(&request)
+            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?
+            .send()
+            .await
+            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
+        if !response.ok() {
+            return Err(OperationSubmitState::FAILURE_MESSAGE);
+        }
+        response
+            .json::<OperationResponse>()
+            .await
+            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
+        Ok(())
+    }
+
+    #[component]
+    fn OperationsView(
+        view: ReadSignal<ConsoleView>,
+        load_state: ReadSignal<ConsoleLoadState>,
+    ) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Operations;
+        let (list_state, set_list_state) = signal(OperationsListState::Loading);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (draft, set_draft) = signal(OperationFormDraft::new());
+        let (draft_error, set_draft_error) = signal(None::<OperationFormError>);
+        let (submit_state, set_submit_state) = signal(OperationSubmitState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(OperationsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(fetch_operations().await);
+                });
+            }
+        });
+
+        let on_refresh = move |_| {
+            set_list_state.set(OperationsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(fetch_operations().await);
+            });
+        };
+
+        let on_toggle_endpoint = Callback::new(move |endpoint_id: String| {
+            set_draft.update(|draft| draft.toggle_endpoint(endpoint_id));
+            set_draft_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        });
+
+        let on_select_family = Callback::new(move |family: CommandFamilyView| {
+            set_draft.update(|draft| {
+                draft.family = Some(family);
+                // Switching families clears every other family's parameters,
+                // so a later submission can never carry stale selections.
+                draft.reset_type = None;
+                draft.boot_source = None;
+                draft.boot_enabled = None;
+                draft.boot_mode = None;
+                draft.secure_boot_action = None;
+                draft.reset_keys_type = None;
+                draft.event_action = None;
+                draft.protocol = None;
+            });
+            set_draft_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        });
+
+        let on_submit = Callback::new(move |()| {
+            let submitted = draft.get();
+            let command = match submitted.try_build() {
+                Ok(command) => command,
+                Err(error) => {
+                    set_draft_error.set(Some(error));
+                    return;
+                }
+            };
+            set_draft_error.set(None);
+            set_submit_state.set(OperationSubmitState::InFlight);
+            spawn_local(async move {
+                match submit_operation(&submitted, &command).await {
+                    Ok(()) => {
+                        set_submit_state.set(OperationSubmitState::Succeeded);
+                        set_draft.set(OperationFormDraft::new());
+                        set_draft_error.set(None);
+                        set_list_state.set(OperationsListState::Loading);
+                        set_list_state.set(fetch_operations().await);
+                    }
+                    Err(message) => set_submit_state.set(OperationSubmitState::Failed(message)),
+                }
+            });
+        });
+
+        let endpoint_choices = move || match &load_state.get() {
+            ConsoleLoadState::Ready(data) => operation_endpoint_choices(&data.inventory),
+            ConsoleLoadState::Loading | ConsoleLoadState::Failed(_) => Vec::new(),
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Operation tasks"</p>
+                        <h2>{move || list_state.get().count_text()}</h2>
+                    </div>
+                    <p>"Every write is a persisted, typed operation before it executes."</p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || list_state.get().is_loading()
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !list_state.get().is_loading()>
+                    "Loading operations..."
+                </p>
+                <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                    "The operation list is temporarily unavailable."
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !list_state.get().is_ready() || !list_state.get().has_empty_list()
+                    }
+                >
+                    "No operations have been submitted yet."
+                </p>
+                <div class="resource-list">
+                    {move || {
+                        list_state
+                            .get()
+                            .cards()
+                            .into_iter()
+                            .map(|card| view! { <OperationCard card=card /> })
+                            .collect_view()
+                    }}
+                </div>
+                <OperationSubmitForm
+                    endpoint_choices=endpoint_choices
+                    draft=draft
+                    set_draft=set_draft
+                    error=draft_error
+                    set_error=set_draft_error
+                    submit_state=submit_state
+                    set_submit_state=set_submit_state
+                    on_toggle_endpoint=on_toggle_endpoint
+                    on_select_family=on_select_family
+                    on_submit=on_submit
+                />
+            </section>
+        }
+    }
+
+    #[component]
+    fn OperationSubmitForm(
+        endpoint_choices: impl Fn() -> Vec<OperationEndpointChoice> + Send + 'static,
+        draft: ReadSignal<OperationFormDraft>,
+        set_draft: WriteSignal<OperationFormDraft>,
+        error: ReadSignal<Option<OperationFormError>>,
+        set_error: WriteSignal<Option<OperationFormError>>,
+        submit_state: ReadSignal<OperationSubmitState>,
+        set_submit_state: WriteSignal<OperationSubmitState>,
+        on_toggle_endpoint: Callback<String>,
+        on_select_family: Callback<CommandFamilyView>,
+        on_submit: Callback<()>,
+    ) -> impl IntoView {
+        let on_reset_type_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = ResetTypeView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.reset_type = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_boot_source_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = BootSourceView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.boot_source = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_boot_enabled_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = BootEnabledView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.boot_enabled = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_boot_mode_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = BootModeView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.boot_mode = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_secure_boot_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = match value.as_str() {
+                "enable" => Some(SecureBootActionView::Enable),
+                "disable" => Some(SecureBootActionView::Disable),
+                "reset-keys" => Some(SecureBootActionView::ResetKeys(
+                    ResetKeysTypeView::ResetAllKeysToDefault,
+                )),
+                _ => None,
+            };
+            set_draft.update(|draft| draft.secure_boot_action = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_reset_keys_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = ResetKeysTypeView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.reset_keys_type = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_event_action_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = match value.as_str() {
+                "create" => Some(EventActionView::CreateSubscription),
+                "delete" => Some(EventActionView::DeleteSubscription),
+                _ => None,
+            };
+            set_draft.update(|draft| draft.event_action = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_protocol_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = EventProtocolView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.protocol = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_destination_input = move |event| {
+            set_draft.update(|draft| draft.destination = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_subscription_id_input = move |event| {
+            set_draft.update(|draft| draft.subscription_id = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_toggle_event_type = Callback::new(move |kind: EventTypeView| {
+            set_draft.update(|draft| {
+                if let Some(index) = draft.event_types.iter().position(|t| *t == kind) {
+                    draft.event_types.remove(index);
+                } else {
+                    draft.event_types.push(kind);
+                }
+            });
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        });
+
+        // The reset families share one parameter block; any of the three
+        // selections shows it.
+        let reset_family_selected = move || {
+            matches!(
+                draft.get().family,
+                Some(
+                    CommandFamilyView::SystemReset
+                        | CommandFamilyView::ManagerReset
+                        | CommandFamilyView::ChassisReset
+                )
+            )
+        };
+        let family_selected = move |family: CommandFamilyView| draft.get().family == Some(family);
+        let is_reset_keys = move || {
+            matches!(
+                draft.get().secure_boot_action,
+                Some(SecureBootActionView::ResetKeys(_))
+            )
+        };
+        let is_create_subscription =
+            move || draft.get().event_action == Some(EventActionView::CreateSubscription);
+        let is_delete_subscription =
+            move || draft.get().event_action == Some(EventActionView::DeleteSubscription);
+        // The live preview shows exactly what the card of a submitted
+        // operation will render, because both use the same projection.
+        let preview_text = move || match draft.get().try_build() {
+            Ok(command) => {
+                let summary = command_summary(&command);
+                format!("{} · {}", summary.family, summary.payload)
+            }
+            Err(_) => String::new(),
+        };
+        let field_error = move |candidate: OperationFormError| match error.get() {
+            Some(error) if error == candidate => error.message(),
+            _ => "",
+        };
+
+        view! {
+            <div class="form-panel">
+                <p class="section-label">"Submit operation"</p>
+                <p class="form-hint">
+                    "Choose the target endpoints and the typed command. The submission is persisted before it is executed."
+                </p>
+
+                <p class="section-label">"Targets"</p>
+                <div class="command-choice-grid">
+                    {endpoint_choices()
+                        .into_iter()
+                        .map(|choice| {
+                            // The id is cloned before the template closures,
+                            // because the selected check and the click handler
+                            // both move-capture it while the template moves
+                            // the display fields.
+                            let endpoint_id = choice.endpoint_id.clone();
+                            let selected_endpoint_id = endpoint_id.clone();
+                            let display_name = choice.display_name;
+                            let address = choice.address;
+                            let is_selected = move || {
+                                draft.get().is_endpoint_selected(&selected_endpoint_id)
+                            };
+                            let class = move || {
+                                if is_selected() {
+                                    "command-choice is-selected"
+                                } else {
+                                    "command-choice"
+                                }
+                            };
+                            view! {
+                                <button
+                                    type="button"
+                                    class=class
+                                    on:click=move |_| {
+                                        on_toggle_endpoint.run(endpoint_id.clone());
+                                    }
+                                >
+                                    <span class="command-choice-name">{display_name}</span>
+                                    <span class="command-choice-detail">{address}</span>
+                                </button>
+                            }
+                        })
+                        .collect_view()}
+                </div>
+                <p
+                    class="form-error"
+                    hidden=move || field_error(OperationFormError::EndpointsRequired).is_empty()
+                >
+                    {OperationFormError::EndpointsRequired.message()}
+                </p>
+
+                <p class="section-label">"Command"</p>
+                <div class="command-choice-grid">
+                    {CommandFamilyView::ALL
+                        .into_iter()
+                        .map(|family| {
+                            let is_selected = move || family_selected(family);
+                            let class = move || {
+                                if is_selected() {
+                                    "command-choice is-selected"
+                                } else {
+                                    "command-choice"
+                                }
+                            };
+                            view! {
+                                <button
+                                    type="button"
+                                    class=class
+                                    on:click=move |_| on_select_family.run(family)
+                                >
+                                    <span class="command-choice-name">{family.label()}</span>
+                                    <span class="command-choice-detail">{family.as_str()}</span>
+                                </button>
+                            }
+                        })
+                        .collect_view()}
+                </div>
+                <p
+                    class="form-error"
+                    hidden=move || field_error(OperationFormError::FamilyRequired).is_empty()
+                >
+                    {OperationFormError::FamilyRequired.message()}
+                </p>
+
+                <div class="form-field" hidden=move || !reset_family_selected()>
+                    <label for="operation-reset-type">"Reset type"</label>
+                    <select
+                        id="operation-reset-type"
+                        class="form-select"
+                        prop:value=move || {
+                            draft
+                                .get()
+                                .reset_type
+                                .map_or_else(String::new, |t| t.as_str().to_owned())
+                        }
+                        on:change=on_reset_type_change
+                    >
+                        <option value="">"Choose a reset type"</option>
+                        {ResetTypeView::ALL
+                            .into_iter()
+                            .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
+                            .collect_view()}
+                    </select>
+                    <p
+                        class="form-error"
+                        hidden=move || field_error(OperationFormError::ResetTypeRequired).is_empty()
+                    >
+                        {OperationFormError::ResetTypeRequired.message()}
+                    </p>
+                </div>
+
+                <div class="form-field" hidden=move || !family_selected(CommandFamilyView::BootOverride)>
+                    <label for="operation-boot-source">"Boot source"</label>
+                    <select
+                        id="operation-boot-source"
+                        class="form-select"
+                        prop:value=move || {
+                            draft
+                                .get()
+                                .boot_source
+                                .map_or_else(String::new, |s| s.as_str().to_owned())
+                        }
+                        on:change=on_boot_source_change
+                    >
+                        <option value="">"Choose a boot source"</option>
+                        {BootSourceView::ALL
+                            .into_iter()
+                            .map(|s| view! { <option value=s.as_str()>{s.as_str()}</option> })
+                            .collect_view()}
+                    </select>
+                    <div class="form-field-inline">
+                        <div class="form-field">
+                            <label for="operation-boot-enabled">"Applies"</label>
+                            <select
+                                id="operation-boot-enabled"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .boot_enabled
+                                        .map_or_else(String::new, |e| e.as_str().to_owned())
+                                }
+                                on:change=on_boot_enabled_change
+                            >
+                                <option value="">"Choose"</option>
+                                {BootEnabledView::ALL
+                                    .into_iter()
+                                    .map(|e| view! { <option value=e.as_str()>{e.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-boot-mode">"Mode"</label>
+                            <select
+                                id="operation-boot-mode"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .boot_mode
+                                        .map_or_else(String::new, |m| m.as_str().to_owned())
+                                }
+                                on:change=on_boot_mode_change
+                            >
+                                <option value="">"Choose"</option>
+                                {BootModeView::ALL
+                                    .into_iter()
+                                    .map(|m| view! { <option value=m.as_str()>{m.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                        </div>
+                    </div>
+                    <p
+                        class="form-error"
+                        hidden=move || {
+                            field_error(OperationFormError::BootSourceRequired).is_empty()
+                                && field_error(OperationFormError::BootEnabledRequired).is_empty()
+                                && field_error(OperationFormError::BootModeRequired).is_empty()
+                        }
+                    >
+                        {move || {
+                            [
+                                OperationFormError::BootSourceRequired,
+                                OperationFormError::BootEnabledRequired,
+                                OperationFormError::BootModeRequired,
+                            ]
+                            .into_iter()
+                            .find_map(|candidate| {
+                                let message = field_error(candidate);
+                                if message.is_empty() { None } else { Some(message) }
+                            })
+                        }}
+                    </p>
+                </div>
+
+                <div class="form-field" hidden=move || !family_selected(CommandFamilyView::SecureBoot)>
+                    <label for="operation-secure-boot-action">"Action"</label>
+                    <select
+                        id="operation-secure-boot-action"
+                        class="form-select"
+                        prop:value=move || match draft.get().secure_boot_action {
+                            Some(SecureBootActionView::Enable) => "enable".to_owned(),
+                            Some(SecureBootActionView::Disable) => "disable".to_owned(),
+                            Some(SecureBootActionView::ResetKeys(_)) => "reset-keys".to_owned(),
+                            None => String::new(),
+                        }
+                        on:change=on_secure_boot_change
+                    >
+                        <option value="">"Choose an action"</option>
+                        <option value="enable">{SecureBootActionView::Enable.label()}</option>
+                        <option value="disable">{SecureBootActionView::Disable.label()}</option>
+                        <option value="reset-keys">
+                            {SecureBootActionView::ResetKeys(ResetKeysTypeView::DeleteAllKeys)
+                                .label()}
+                        </option>
+                    </select>
+                    <div class="form-field" hidden=move || !is_reset_keys()>
+                        <label for="operation-reset-keys-type">"Key set"</label>
+                        <select
+                            id="operation-reset-keys-type"
+                            class="form-select"
+                            prop:value=move || {
+                                draft
+                                    .get()
+                                    .reset_keys_type
+                                    .map_or_else(String::new, |k| k.as_str().to_owned())
+                            }
+                            on:change=on_reset_keys_change
+                        >
+                            <option value="">"Choose a key set"</option>
+                            {ResetKeysTypeView::ALL
+                                .into_iter()
+                                .map(|k| view! { <option value=k.as_str()>{k.as_str()}</option> })
+                                .collect_view()}
+                        </select>
+                    </div>
+                    <p
+                        class="form-error"
+                        hidden=move || {
+                            field_error(OperationFormError::SecureBootActionRequired).is_empty()
+                                && field_error(OperationFormError::ResetKeysTypeRequired).is_empty()
+                        }
+                    >
+                        {move || {
+                            [
+                                OperationFormError::SecureBootActionRequired,
+                                OperationFormError::ResetKeysTypeRequired,
+                            ]
+                            .into_iter()
+                            .find_map(|candidate| {
+                                let message = field_error(candidate);
+                                if message.is_empty() { None } else { Some(message) }
+                            })
+                        }}
+                    </p>
+                </div>
+
+                <div
+                    class="form-field"
+                    hidden=move || !family_selected(CommandFamilyView::EventSubscription)
+                >
+                    <label for="operation-event-action">"Action"</label>
+                    <select
+                        id="operation-event-action"
+                        class="form-select"
+                        prop:value=move || match draft.get().event_action {
+                            Some(EventActionView::CreateSubscription) => "create".to_owned(),
+                            Some(EventActionView::DeleteSubscription) => "delete".to_owned(),
+                            None => String::new(),
+                        }
+                        on:change=on_event_action_change
+                    >
+                        <option value="">"Choose an action"</option>
+                        {EventActionView::ALL
+                            .into_iter()
+                            .map(|action| {
+                                let value = match action {
+                                    EventActionView::CreateSubscription => "create",
+                                    EventActionView::DeleteSubscription => "delete",
+                                };
+                                view! {
+                                    <option value=value>{action.label()}</option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                    <p
+                        class="form-error"
+                        hidden=move || field_error(OperationFormError::EventActionRequired).is_empty()
+                    >
+                        {OperationFormError::EventActionRequired.message()}
+                    </p>
+
+                    <div class="form-panel create-panel" hidden=move || !is_create_subscription()>
+                        <div class="form-field">
+                            <label for="operation-destination">"Destination URL"</label>
+                            <input
+                                id="operation-destination"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="https://subscriber.example.test/events"
+                                prop:value=move || draft.get().destination
+                                on:input=on_destination_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::DestinationRequired).is_empty()
+                                        && field_error(OperationFormError::DestinationInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::DestinationRequired
+                                            | OperationFormError::DestinationInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-protocol">"Protocol"</label>
+                            <select
+                                id="operation-protocol"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .protocol
+                                        .map_or_else(String::new, |p| p.as_str().to_owned())
+                                }
+                                on:change=on_protocol_change
+                            >
+                                <option value="">"Choose a protocol"</option>
+                                {EventProtocolView::ALL
+                                    .into_iter()
+                                    .map(|p| view! { <option value=p.as_str()>{p.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::ProtocolRequired).is_empty()
+                            >
+                                {OperationFormError::ProtocolRequired.message()}
+                            </p>
+                        </div>
+                        <p class="section-label">"Event types"</p>
+                        <div class="command-choice-grid">
+                            {EventTypeView::ALL
+                                .into_iter()
+                                .map(|kind| {
+                                    let is_selected = move || {
+                                        draft.get().event_types.contains(&kind)
+                                    };
+                                    let class = move || {
+                                        if is_selected() {
+                                            "command-choice is-selected"
+                                        } else {
+                                            "command-choice"
+                                        }
+                                    };
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class=class
+                                            on:click=move |_| on_toggle_event_type.run(kind)
+                                        >
+                                            <span class="command-choice-name">{kind.as_str()}</span>
+                                        </button>
+                                    }
+                                })
+                                .collect_view()}
+                        </div>
+                        <p
+                            class="form-error"
+                            hidden=move || field_error(OperationFormError::EventTypesRequired).is_empty()
+                        >
+                            {OperationFormError::EventTypesRequired.message()}
+                        </p>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !is_delete_subscription()>
+                        <div class="form-field">
+                            <label for="operation-subscription-id">"Subscription ID"</label>
+                            <input
+                                id="operation-subscription-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="Sub-1"
+                                prop:value=move || draft.get().subscription_id
+                                on:input=on_subscription_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::SubscriptionIdRequired).is_empty()
+                                }
+                            >
+                                {OperationFormError::SubscriptionIdRequired.message()}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <p class="form-hint" hidden=move || preview_text().is_empty()>
+                    {move || preview_text()}
+                </p>
+                <div class="form-actions">
+                    <button
+                        type="button"
+                        class="btn btn-primary"
+                        disabled=move || submit_state.get().is_in_flight()
+                        on:click=move |_| on_submit.run(())
+                    >
+                        "Submit operation"
+                    </button>
+                </div>
+                <p
+                    class="inline-status"
+                    hidden=move || !submit_state.get().is_in_flight()
+                >
+                    "Submitting the operation..."
+                </p>
+                <p
+                    class="inline-status success"
+                    hidden=move || !submit_state.get().is_succeeded()
+                >
+                    "Operation submitted."
+                </p>
+                <p
+                    class="inline-status error"
+                    hidden=move || submit_state.get().failure_message().is_empty()
+                >
+                    {move || submit_state.get().failure_message()}
+                </p>
+            </div>
+        }
+    }
+
+    #[component]
+    fn OperationCard(card: OperationCardProjection) -> impl IntoView {
+        let state_label = card.state_label();
+        let state_class = card.state_class();
+        let source_label = card.source_label();
+        let OperationCardProjection {
+            operation_id,
+            short_id,
+            target_count,
+            command,
+            created_at_text,
+            updated_at_text,
+            ..
+        } = card;
+        let command_family = command.family;
+        let command_payload = command.payload;
+        let operation_id_title = operation_id.clone();
+        let targets_text = match target_count {
+            1 => "1 target".to_owned(),
+            _ => format!("{target_count} targets"),
+        };
+
+        view! {
+            <article class="credential-card">
+                <div class="operation-card-heading">
+                    <div>
+                        <h3>{command_family}</h3>
+                        <p class="operation-card-id" title=operation_id_title>{short_id}</p>
+                    </div>
+                    <span class=state_class>{state_label}</span>
+                </div>
+                <p class="operation-command-summary">
+                    <span>{source_label}</span>
+                    {command_payload}
+                </p>
+                <dl class="resource-facts">
+                    <div>
+                        <dt>"Targets"</dt>
+                        <dd>{targets_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Created"</dt>
+                        <dd>{created_at_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Updated"</dt>
+                        <dd>{updated_at_text}</dd>
+                    </div>
+                </dl>
+            </article>
+        }
     }
 
     /// Reads the first selected file of a file input as a `Blob`.
@@ -6721,6 +8923,7 @@ mod tests {
                 ConsoleView::Import,
                 ConsoleView::Audit,
                 ConsoleView::Capabilities,
+                ConsoleView::Operations,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -6729,6 +8932,7 @@ mod tests {
         assert_eq!(ConsoleView::Import.label(), "Import");
         assert_eq!(ConsoleView::Audit.label(), "Audit");
         assert_eq!(ConsoleView::Capabilities.label(), "Capabilities");
+        assert_eq!(ConsoleView::Operations.label(), "Operations");
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(
@@ -6953,5 +9157,747 @@ mod tests {
         assert_eq!(target.endpoint_id, "01989abc-def0-7abc-8def-0123456789ac");
         assert_eq!(target.display_name, "Rack B BMC");
         assert_eq!(target.address, "https://192.0.2.11/");
+    }
+
+    #[test]
+    fn operation_state_views_cover_all_nine_phases_with_labels_and_classes() {
+        let all_states = [
+            OperationStateView::Queued,
+            OperationStateView::Validating,
+            OperationStateView::Running,
+            OperationStateView::WaitingRemote,
+            OperationStateView::Verifying,
+            OperationStateView::Succeeded,
+            OperationStateView::Failed,
+            OperationStateView::Unknown,
+            OperationStateView::Cancelled,
+        ];
+        assert_eq!(all_states.len(), 9);
+        for (state, label) in [
+            (OperationStateView::Queued, "Queued"),
+            (OperationStateView::Validating, "Validating"),
+            (OperationStateView::Running, "Running"),
+            (OperationStateView::WaitingRemote, "Waiting for BMC"),
+            (OperationStateView::Verifying, "Verifying"),
+            (OperationStateView::Succeeded, "Succeeded"),
+            (OperationStateView::Failed, "Failed"),
+            (OperationStateView::Unknown, "Unknown"),
+            (OperationStateView::Cancelled, "Cancelled"),
+        ] {
+            assert!(all_states.contains(&state));
+            assert_eq!(state.label(), label);
+        }
+        // The four semantic tiers: ok, error, off, active.
+        assert_eq!(
+            OperationStateView::Succeeded.class(),
+            "operation-state operation-ok"
+        );
+        assert_eq!(
+            OperationStateView::Failed.class(),
+            "operation-state operation-error"
+        );
+        assert_eq!(
+            OperationStateView::Unknown.class(),
+            "operation-state operation-off"
+        );
+        assert_eq!(
+            OperationStateView::Cancelled.class(),
+            "operation-state operation-off"
+        );
+        for state in [
+            OperationStateView::Queued,
+            OperationStateView::Validating,
+            OperationStateView::Running,
+            OperationStateView::WaitingRemote,
+            OperationStateView::Verifying,
+        ] {
+            assert_eq!(state.class(), "operation-state operation-active");
+        }
+    }
+
+    #[test]
+    fn operation_sources_and_command_families_render_static_labels() {
+        assert_eq!(OperationSourceView::Standalone.label(), "Standalone");
+        assert_eq!(OperationSourceView::Site.label(), "Site");
+        assert_eq!(OperationSourceView::Center.label(), "Center");
+
+        assert_eq!(
+            CommandFamilyView::ALL,
+            [
+                CommandFamilyView::SystemReset,
+                CommandFamilyView::ManagerReset,
+                CommandFamilyView::ChassisReset,
+                CommandFamilyView::BootOverride,
+                CommandFamilyView::SecureBoot,
+                CommandFamilyView::EventSubscription,
+            ]
+        );
+        for (family, code, label) in [
+            (CommandFamilyView::SystemReset, "system", "System reset"),
+            (CommandFamilyView::ManagerReset, "manager", "Manager reset"),
+            (CommandFamilyView::ChassisReset, "chassis", "Chassis reset"),
+            (
+                CommandFamilyView::BootOverride,
+                "boot",
+                "Boot source override",
+            ),
+            (CommandFamilyView::SecureBoot, "secure-boot", "Secure Boot"),
+            (
+                CommandFamilyView::EventSubscription,
+                "event",
+                "Event subscription",
+            ),
+        ] {
+            assert_eq!(family.as_str(), code);
+            assert_eq!(family.label(), label);
+        }
+        // The family codes are the §7.5 wire contract; the deferred families
+        // must not be claimed by a form family.
+        assert_eq!(CommandFamilyView::ALL.len(), 6);
+    }
+
+    #[test]
+    fn reset_type_view_members_follow_the_csdl() {
+        let members = [
+            (ResetTypeView::On, "On"),
+            (ResetTypeView::ForceOff, "ForceOff"),
+            (ResetTypeView::GracefulShutdown, "GracefulShutdown"),
+            (ResetTypeView::GracefulRestart, "GracefulRestart"),
+            (ResetTypeView::ForceRestart, "ForceRestart"),
+            (ResetTypeView::Nmi, "Nmi"),
+            (ResetTypeView::ForceOn, "ForceOn"),
+            (ResetTypeView::PushPowerButton, "PushPowerButton"),
+            (ResetTypeView::PowerCycle, "PowerCycle"),
+            (ResetTypeView::Suspend, "Suspend"),
+            (ResetTypeView::Pause, "Pause"),
+            (ResetTypeView::Resume, "Resume"),
+            (ResetTypeView::FullPowerCycle, "FullPowerCycle"),
+        ];
+        assert_eq!(ResetTypeView::ALL.len(), members.len());
+        for (member, wire) in members {
+            assert_eq!(member.as_str(), wire);
+        }
+    }
+
+    #[test]
+    fn boot_secure_boot_and_event_view_members_follow_the_csdl() {
+        let boot_sources = [
+            (BootSourceView::None, "None"),
+            (BootSourceView::Pxe, "Pxe"),
+            (BootSourceView::Floppy, "Floppy"),
+            (BootSourceView::Cd, "Cd"),
+            (BootSourceView::Usb, "Usb"),
+            (BootSourceView::Hdd, "Hdd"),
+            (BootSourceView::BiosSetup, "BiosSetup"),
+            (BootSourceView::Utilities, "Utilities"),
+            (BootSourceView::Diags, "Diags"),
+            (BootSourceView::UefiShell, "UefiShell"),
+            (BootSourceView::UefiTarget, "UefiTarget"),
+            (BootSourceView::SdCard, "SDCard"),
+            (BootSourceView::UefiHttp, "UefiHttp"),
+            (BootSourceView::RemoteDrive, "RemoteDrive"),
+            (BootSourceView::UefiBootNext, "UefiBootNext"),
+            (BootSourceView::Recovery, "Recovery"),
+        ];
+        assert_eq!(BootSourceView::ALL.len(), boot_sources.len());
+        for (member, wire) in boot_sources {
+            assert_eq!(member.as_str(), wire);
+        }
+        let enabled_members = [
+            (BootEnabledView::Disabled, "Disabled"),
+            (BootEnabledView::Once, "Once"),
+            (BootEnabledView::Continuous, "Continuous"),
+        ];
+        assert_eq!(BootEnabledView::ALL.len(), enabled_members.len());
+        for (member, wire) in enabled_members {
+            assert_eq!(member.as_str(), wire);
+        }
+        let mode_members = [
+            (BootModeView::Legacy, "Legacy"),
+            (BootModeView::Uefi, "UEFI"),
+        ];
+        assert_eq!(BootModeView::ALL.len(), mode_members.len());
+        for (member, wire) in mode_members {
+            assert_eq!(member.as_str(), wire);
+        }
+        let keys_members = [
+            (
+                ResetKeysTypeView::ResetAllKeysToDefault,
+                "ResetAllKeysToDefault",
+            ),
+            (ResetKeysTypeView::DeleteAllKeys, "DeleteAllKeys"),
+            (ResetKeysTypeView::DeletePk, "DeletePK"),
+        ];
+        assert_eq!(ResetKeysTypeView::ALL.len(), keys_members.len());
+        for (member, wire) in keys_members {
+            assert_eq!(member.as_str(), wire);
+        }
+        let protocol_members = [
+            (EventProtocolView::Redfish, "Redfish"),
+            (EventProtocolView::Kafka, "Kafka"),
+            (EventProtocolView::Snmpv1, "SNMPv1"),
+            (EventProtocolView::Snmpv2c, "SNMPv2c"),
+            (EventProtocolView::Snmpv3, "SNMPv3"),
+            (EventProtocolView::Smtp, "SMTP"),
+            (EventProtocolView::SyslogTls, "SyslogTLS"),
+            (EventProtocolView::SyslogTcp, "SyslogTCP"),
+            (EventProtocolView::SyslogUdp, "SyslogUDP"),
+            (EventProtocolView::SyslogRelp, "SyslogRELP"),
+            (EventProtocolView::Oem, "OEM"),
+        ];
+        assert_eq!(EventProtocolView::ALL.len(), protocol_members.len());
+        for (member, wire) in protocol_members {
+            assert_eq!(member.as_str(), wire);
+        }
+        let event_type_members = [
+            (EventTypeView::StatusChange, "StatusChange"),
+            (EventTypeView::ResourceUpdated, "ResourceUpdated"),
+            (EventTypeView::ResourceAdded, "ResourceAdded"),
+            (EventTypeView::ResourceRemoved, "ResourceRemoved"),
+            (EventTypeView::Alert, "Alert"),
+            (EventTypeView::MetricReport, "MetricReport"),
+            (EventTypeView::Other, "Other"),
+        ];
+        assert_eq!(EventTypeView::ALL.len(), event_type_members.len());
+        for (member, wire) in event_type_members {
+            assert_eq!(member.as_str(), wire);
+        }
+        assert_eq!(EventActionView::ALL.len(), 2);
+        assert_eq!(SecureBootActionView::Enable.label(), "Enable");
+        assert_eq!(SecureBootActionView::Disable.label(), "Disable");
+        assert_eq!(
+            SecureBootActionView::ResetKeys(ResetKeysTypeView::DeleteAllKeys).label(),
+            "Reset keys"
+        );
+        assert_eq!(
+            EventActionView::CreateSubscription.label(),
+            "Create subscription"
+        );
+        assert_eq!(
+            EventActionView::DeleteSubscription.label(),
+            "Delete subscription"
+        );
+    }
+
+    #[test]
+    fn command_summaries_render_every_family_and_payload() {
+        for (command, family, payload) in [
+            (
+                OperationCommandDraft::Reset {
+                    family: ResetResourceView::System,
+                    reset_type: ResetTypeView::PowerCycle,
+                },
+                "System reset",
+                "PowerCycle",
+            ),
+            (
+                OperationCommandDraft::Reset {
+                    family: ResetResourceView::Manager,
+                    reset_type: ResetTypeView::GracefulRestart,
+                },
+                "Manager reset",
+                "GracefulRestart",
+            ),
+            (
+                OperationCommandDraft::Reset {
+                    family: ResetResourceView::Chassis,
+                    reset_type: ResetTypeView::ForceOff,
+                },
+                "Chassis reset",
+                "ForceOff",
+            ),
+            (
+                OperationCommandDraft::BootOverride {
+                    source: BootSourceView::Pxe,
+                    enabled: BootEnabledView::Once,
+                    mode: BootModeView::Uefi,
+                },
+                "Boot source override",
+                "Pxe · Once · UEFI",
+            ),
+            (
+                OperationCommandDraft::SecureBoot(SecureBootActionView::Enable),
+                "Secure Boot",
+                "Enable",
+            ),
+            (
+                OperationCommandDraft::SecureBoot(SecureBootActionView::Disable),
+                "Secure Boot",
+                "Disable",
+            ),
+            (
+                OperationCommandDraft::SecureBoot(SecureBootActionView::ResetKeys(
+                    ResetKeysTypeView::ResetAllKeysToDefault,
+                )),
+                "Secure Boot",
+                "Reset keys · ResetAllKeysToDefault",
+            ),
+        ] {
+            let summary = command_summary(&command);
+            assert_eq!(summary.family, family);
+            assert_eq!(summary.payload, payload);
+        }
+
+        let create = OperationCommandDraft::Event(EventActionDraft::CreateSubscription {
+            destination: "https://subscriber.example.test/events".to_owned(),
+            protocol: EventProtocolView::Redfish,
+            event_types: vec![EventTypeView::Alert, EventTypeView::StatusChange],
+        });
+        let summary = command_summary(&create);
+        assert_eq!(summary.family, "Event subscription");
+        assert_eq!(
+            summary.payload,
+            "Create · https://subscriber.example.test/events · Redfish · Alert, StatusChange"
+        );
+
+        let delete = OperationCommandDraft::Event(EventActionDraft::DeleteSubscription {
+            subscription_id: "Sub-1".to_owned(),
+        });
+        let summary = command_summary(&delete);
+        assert_eq!(summary.family, "Event subscription");
+        assert_eq!(summary.payload, "Delete · Sub-1");
+    }
+
+    #[test]
+    fn operation_form_validation_rejects_incomplete_drafts() {
+        let fresh = OperationFormDraft::new();
+        assert_eq!(
+            fresh.try_build(),
+            Err(OperationFormError::EndpointsRequired)
+        );
+
+        let mut no_family = fresh.clone();
+        no_family
+            .selected_endpoint_ids
+            .push("01989abc-def0-7abc-8def-0123456789ab".to_owned());
+        assert_eq!(
+            no_family.try_build(),
+            Err(OperationFormError::FamilyRequired)
+        );
+
+        let mut no_reset_type = no_family.clone();
+        no_reset_type.family = Some(CommandFamilyView::SystemReset);
+        assert_eq!(
+            no_reset_type.try_build(),
+            Err(OperationFormError::ResetTypeRequired)
+        );
+
+        let mut no_boot_params = no_family.clone();
+        no_boot_params.family = Some(CommandFamilyView::BootOverride);
+        assert_eq!(
+            no_boot_params.try_build(),
+            Err(OperationFormError::BootSourceRequired)
+        );
+        let mut boot = no_boot_params.clone();
+        boot.boot_source = Some(BootSourceView::Pxe);
+        assert_eq!(
+            boot.try_build(),
+            Err(OperationFormError::BootEnabledRequired)
+        );
+        boot.boot_enabled = Some(BootEnabledView::Once);
+        assert_eq!(boot.try_build(), Err(OperationFormError::BootModeRequired));
+
+        let mut no_secure_boot_action = no_family.clone();
+        no_secure_boot_action.family = Some(CommandFamilyView::SecureBoot);
+        assert_eq!(
+            no_secure_boot_action.try_build(),
+            Err(OperationFormError::SecureBootActionRequired)
+        );
+        let mut reset_keys = no_secure_boot_action.clone();
+        reset_keys.secure_boot_action = Some(SecureBootActionView::ResetKeys(
+            ResetKeysTypeView::DeleteAllKeys,
+        ));
+        assert_eq!(
+            reset_keys.try_build(),
+            Err(OperationFormError::ResetKeysTypeRequired)
+        );
+
+        let mut no_event_action = no_family.clone();
+        no_event_action.family = Some(CommandFamilyView::EventSubscription);
+        assert_eq!(
+            no_event_action.try_build(),
+            Err(OperationFormError::EventActionRequired)
+        );
+        let mut create = no_event_action.clone();
+        create.event_action = Some(EventActionView::CreateSubscription);
+        assert_eq!(
+            create.try_build(),
+            Err(OperationFormError::DestinationRequired)
+        );
+        create.destination = "not a url".to_owned();
+        assert_eq!(
+            create.try_build(),
+            Err(OperationFormError::DestinationInvalid)
+        );
+        create.destination = "https://subscriber.example.test/events".to_owned();
+        assert_eq!(
+            create.try_build(),
+            Err(OperationFormError::ProtocolRequired)
+        );
+        create.protocol = Some(EventProtocolView::Redfish);
+        assert_eq!(
+            create.try_build(),
+            Err(OperationFormError::EventTypesRequired)
+        );
+        let mut delete = no_event_action.clone();
+        delete.event_action = Some(EventActionView::DeleteSubscription);
+        assert_eq!(
+            delete.try_build(),
+            Err(OperationFormError::SubscriptionIdRequired)
+        );
+    }
+
+    #[test]
+    fn operation_form_drafts_build_typed_commands_and_toggle_endpoints() {
+        let mut draft = OperationFormDraft::new();
+        let endpoint_a = "01989abc-def0-7abc-8def-0123456789ab".to_owned();
+        let endpoint_b = "01989abc-def0-7abc-8def-0123456789ac".to_owned();
+        draft.toggle_endpoint(endpoint_a.clone());
+        draft.toggle_endpoint(endpoint_b.clone());
+        assert!(draft.is_endpoint_selected(&endpoint_a));
+        assert!(draft.is_endpoint_selected(&endpoint_b));
+        draft.toggle_endpoint(endpoint_a.clone());
+        assert!(!draft.is_endpoint_selected(&endpoint_a));
+        assert!(draft.is_endpoint_selected(&endpoint_b));
+
+        draft.family = Some(CommandFamilyView::SystemReset);
+        draft.reset_type = Some(ResetTypeView::On);
+        assert_eq!(
+            draft.try_build(),
+            Ok(OperationCommandDraft::Reset {
+                family: ResetResourceView::System,
+                reset_type: ResetTypeView::On,
+            })
+        );
+
+        let mut event = OperationFormDraft::new();
+        event.toggle_endpoint(endpoint_a);
+        event.family = Some(CommandFamilyView::EventSubscription);
+        event.event_action = Some(EventActionView::CreateSubscription);
+        event.destination = "https://subscriber.example.test/events".to_owned();
+        event.protocol = Some(EventProtocolView::Redfish);
+        event.event_types = vec![EventTypeView::Alert];
+        assert_eq!(
+            event.try_build(),
+            Ok(OperationCommandDraft::Event(
+                EventActionDraft::CreateSubscription {
+                    destination: "https://subscriber.example.test/events".to_owned(),
+                    protocol: EventProtocolView::Redfish,
+                    event_types: vec![EventTypeView::Alert],
+                }
+            ))
+        );
+
+        let mut delete = OperationFormDraft::new();
+        delete.toggle_endpoint(endpoint_b);
+        delete.family = Some(CommandFamilyView::EventSubscription);
+        delete.event_action = Some(EventActionView::DeleteSubscription);
+        delete.subscription_id = "  Sub-1  ".to_owned();
+        assert_eq!(
+            delete.try_build(),
+            Ok(OperationCommandDraft::Event(
+                EventActionDraft::DeleteSubscription {
+                    subscription_id: "Sub-1".to_owned(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn operation_list_and_submit_states_render_static_messages_and_counts()
+    -> Result<(), Box<dyn Error>> {
+        assert!(OperationsListState::Loading.is_loading());
+        assert!(OperationsListState::Failed.is_failed());
+        assert_eq!(OperationsListState::Loading.count_text(), "0 operations");
+        assert_eq!(OperationsListState::Failed.count_text(), "0 operations");
+        let empty = OperationsListState::Ready(Vec::new());
+        assert!(empty.is_ready());
+        assert!(empty.has_empty_list());
+        assert_eq!(empty.count_text(), "0 operations");
+        assert_eq!(empty.cards().len(), 0);
+        let one = OperationsListState::Ready(vec![OperationCardProjection {
+            operation_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
+            short_id: short_operation_id("01989abc-def0-7abc-8def-0123456789ab"),
+            source: OperationSourceView::Standalone,
+            target_count: 1,
+            state: OperationStateView::Succeeded,
+            command: CommandSummaryProjection {
+                family: "System reset",
+                payload: "PowerCycle".to_owned(),
+            },
+            created_at_text: "2026-08-06T09:10:11Z".to_owned(),
+            updated_at_text: "2026-08-06T09:12:13Z".to_owned(),
+        }]);
+        assert_eq!(one.count_text(), "1 operation");
+        assert!(!one.has_empty_list());
+        let cards = one.cards();
+        let card = cards.first().ok_or("the ready list must carry its card")?;
+        assert_eq!(card.short_id, "01989abc");
+        assert_eq!(card.state_label(), "Succeeded");
+        assert_eq!(card.state_class(), "operation-state operation-ok");
+        assert_eq!(card.source_label(), "Standalone");
+        assert_eq!(
+            short_operation_id("01989abc-def0-7abc-8def-0123456789ab"),
+            "01989abc"
+        );
+        assert_eq!(short_operation_id("short"), "short");
+
+        assert_eq!(OperationSubmitState::Idle.failure_message(), "");
+        assert_eq!(OperationSubmitState::InFlight.failure_message(), "");
+        assert_eq!(OperationSubmitState::Succeeded.failure_message(), "");
+        assert!(OperationSubmitState::InFlight.is_in_flight());
+        assert!(OperationSubmitState::Succeeded.is_succeeded());
+        assert_eq!(
+            OperationSubmitState::Failed(OperationSubmitState::FAILURE_MESSAGE).failure_message(),
+            OperationSubmitState::FAILURE_MESSAGE
+        );
+        assert_eq!(
+            OperationSubmitState::FAILURE_MESSAGE,
+            "The operation could not be submitted. Check the fields and try again."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_endpoint_choices_project_the_inventory() -> Result<(), Box<dyn Error>> {
+        let choices = operation_endpoint_choices(&inventory()?);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices[0].endpoint_id,
+            "01989abc-def0-7abc-8def-0123456789ab"
+        );
+        assert_eq!(choices[0].display_name, "Rack A BMC");
+        assert_eq!(choices[0].address, "https://192.0.2.10/");
+        assert_eq!(
+            choices[1].endpoint_id,
+            "01989abc-def0-7abc-8def-0123456789ac"
+        );
+        assert_eq!(choices[1].display_name, "Rack B BMC");
+        assert_eq!(choices[1].address, "https://192.0.2.11/");
+        Ok(())
+    }
+
+    /// One wire operation fixture with the given state code, pinned against
+    /// the console contract exercised by the Web path tests.
+    fn operation_response_fixture(state: &str) -> Result<OperationResponse, serde_json::Error> {
+        serde_json::from_value(json!({
+            "operation_id": "01989abc-def0-7abc-8def-0123456789ab",
+            "source": "standalone",
+            "targets": [
+                {
+                    "target_id": "01989abc-def0-7abc-8def-0123456789ac",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789ad"
+                },
+                {
+                    "target_id": "01989abc-def0-7abc-8def-0123456789ae",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789af"
+                }
+            ],
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": state,
+            "created_at": "2026-08-06T09:10:11Z",
+            "updated_at": "2026-08-06T09:12:13Z"
+        }))
+    }
+
+    #[test]
+    fn operation_card_projection_parses_fixtures_for_all_nine_states() -> Result<(), Box<dyn Error>>
+    {
+        for (state_code, label, class) in [
+            ("queued", "Queued", "operation-state operation-active"),
+            (
+                "validating",
+                "Validating",
+                "operation-state operation-active",
+            ),
+            ("running", "Running", "operation-state operation-active"),
+            (
+                "waiting_remote",
+                "Waiting for BMC",
+                "operation-state operation-active",
+            ),
+            ("verifying", "Verifying", "operation-state operation-active"),
+            ("succeeded", "Succeeded", "operation-state operation-ok"),
+            ("failed", "Failed", "operation-state operation-error"),
+            ("unknown", "Unknown", "operation-state operation-off"),
+            ("cancelled", "Cancelled", "operation-state operation-off"),
+        ] {
+            let response = operation_response_fixture(state_code)?;
+            let card = OperationCardProjection::from(&response);
+            assert_eq!(card.operation_id, "01989abc-def0-7abc-8def-0123456789ab");
+            assert_eq!(card.short_id, "01989abc");
+            assert_eq!(card.source_label(), "Standalone");
+            assert_eq!(card.target_count, 2);
+            assert_eq!(card.command.family, "System reset");
+            assert_eq!(card.command.payload, "PowerCycle");
+            assert_eq!(card.created_at_text, "2026-08-06T09:10:11Z");
+            assert_eq!(card.updated_at_text, "2026-08-06T09:12:13Z");
+            assert_eq!(card.state_label(), label);
+            assert_eq!(card.state_class(), class);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operation_card_projection_parses_center_and_site_sources() -> Result<(), Box<dyn Error>> {
+        let mut site = serde_json::from_value::<OperationResponse>(json!({
+            "operation_id": "01989abc-def0-7abc-8def-0123456789c0",
+            "source": "site",
+            "targets": [
+                {
+                    "target_id": "01989abc-def0-7abc-8def-0123456789ac",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789ad"
+                }
+            ],
+            "command": { "Manager": { "Reset": "GracefulRestart" } },
+            "state": "succeeded",
+            "created_at": "2026-08-06T09:10:11Z",
+            "updated_at": "2026-08-06T09:12:13Z"
+        }))?;
+        let card = OperationCardProjection::from(&site);
+        assert_eq!(card.source_label(), "Site");
+        assert_eq!(card.command.family, "Manager reset");
+        assert_eq!(card.command.payload, "GracefulRestart");
+        assert_eq!(card.target_count, 1);
+        assert_eq!(card.state_label(), "Succeeded");
+
+        site = serde_json::from_value(json!({
+            "operation_id": "01989abc-def0-7abc-8def-0123456789c0",
+            "source": "center",
+            "targets": [],
+            "command": { "Chassis": { "Reset": "ForceOff" } },
+            "state": "cancelled",
+            "created_at": "2026-08-06T09:10:11Z",
+            "updated_at": "2026-08-06T09:12:13Z"
+        }))?;
+        let card = OperationCardProjection::from(&site);
+        assert_eq!(card.source_label(), "Center");
+        assert_eq!(card.command.family, "Chassis reset");
+        assert_eq!(card.command.payload, "ForceOff");
+        assert_eq!(card.target_count, 0);
+        assert_eq!(card.state_label(), "Cancelled");
+        Ok(())
+    }
+
+    #[test]
+    fn wire_command_summaries_render_every_family() -> Result<(), Box<dyn Error>> {
+        for (wire, family, payload) in [
+            (json!({ "System": { "Reset": "On" } }), "System reset", "On"),
+            (
+                json!({ "Manager": { "Reset": "GracefulRestart" } }),
+                "Manager reset",
+                "GracefulRestart",
+            ),
+            (
+                json!({ "Chassis": { "Reset": "ForceOff" } }),
+                "Chassis reset",
+                "ForceOff",
+            ),
+            (
+                json!({
+                    "Boot": {
+                        "SetBootSourceOverride": {
+                            "source": "Pxe",
+                            "enabled": "Once",
+                            "mode": "UEFI"
+                        }
+                    }
+                }),
+                "Boot source override",
+                "Pxe · Once · UEFI",
+            ),
+            (json!({ "SecureBoot": "Enable" }), "Secure Boot", "Enable"),
+            (json!({ "SecureBoot": "Disable" }), "Secure Boot", "Disable"),
+            (
+                json!({ "SecureBoot": { "ResetKeys": "ResetAllKeysToDefault" } }),
+                "Secure Boot",
+                "Reset keys · ResetAllKeysToDefault",
+            ),
+            (
+                json!({
+                    "Event": {
+                        "CreateSubscription": {
+                            "destination": "https://subscriber.example.test/events",
+                            "protocol": "Redfish",
+                            "event_types": ["Alert", "StatusChange"]
+                        }
+                    }
+                }),
+                "Event subscription",
+                "Create · https://subscriber.example.test/events · Redfish · Alert, StatusChange",
+            ),
+            (
+                json!({ "Event": { "DeleteSubscription": { "subscription_id": "Sub-1" } } }),
+                "Event subscription",
+                "Delete · Sub-1",
+            ),
+        ] {
+            let command = serde_json::from_value::<RedfishCommand>(wire)?;
+            let summary = wire_command_summary(&command);
+            assert_eq!(summary.family, family);
+            assert_eq!(summary.payload, payload);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn built_commands_serialize_to_the_canonical_wire_contract() -> Result<(), Box<dyn Error>> {
+        for (draft, golden) in [
+            (
+                OperationCommandDraft::Reset {
+                    family: ResetResourceView::System,
+                    reset_type: ResetTypeView::PowerCycle,
+                },
+                json!({ "System": { "Reset": "PowerCycle" } }),
+            ),
+            (
+                OperationCommandDraft::BootOverride {
+                    source: BootSourceView::Pxe,
+                    enabled: BootEnabledView::Once,
+                    mode: BootModeView::Uefi,
+                },
+                json!({
+                    "Boot": {
+                        "SetBootSourceOverride": {
+                            "source": "Pxe",
+                            "enabled": "Once",
+                            "mode": "UEFI"
+                        }
+                    }
+                }),
+            ),
+            (
+                OperationCommandDraft::SecureBoot(SecureBootActionView::ResetKeys(
+                    ResetKeysTypeView::DeletePk,
+                )),
+                json!({ "SecureBoot": { "ResetKeys": "DeletePK" } }),
+            ),
+            (
+                OperationCommandDraft::Event(EventActionDraft::CreateSubscription {
+                    destination: "https://subscriber.example.test/events".to_owned(),
+                    protocol: EventProtocolView::Redfish,
+                    event_types: vec![EventTypeView::Alert],
+                }),
+                json!({
+                    "Event": {
+                        "CreateSubscription": {
+                            "destination": "https://subscriber.example.test/events",
+                            "protocol": "Redfish",
+                            "event_types": ["Alert"]
+                        }
+                    }
+                }),
+            ),
+            (
+                OperationCommandDraft::Event(EventActionDraft::DeleteSubscription {
+                    subscription_id: "Sub-1".to_owned(),
+                }),
+                json!({ "Event": { "DeleteSubscription": { "subscription_id": "Sub-1" } } }),
+            ),
+        ] {
+            let command = build_command(&draft).map_err(|error| error.message().to_owned())?;
+            assert_eq!(serde_json::to_value(&command)?, golden);
+        }
+        Ok(())
     }
 }
