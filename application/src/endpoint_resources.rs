@@ -117,6 +117,28 @@ pub enum CoreResourceDetails {
         model: Option<String>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `storages` family member; the counts come from the
+    /// `StorageControllers` and `Drives` collections of the typed schema and
+    /// stay numeric so no layer re-parses text.
+    Storage {
+        controller_count: Option<u64>,
+        drive_count: Option<u64>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `network-adapters` family member.
+    NetworkAdapter {
+        manufacturer: Option<String>,
+        model: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `ethernet-interfaces` family member; `speed_mbps` stays
+    /// numeric so the console renders the link speed without re-parsing text.
+    EthernetInterface {
+        mac_address: Option<String>,
+        speed_mbps: Option<u64>,
+        interface_enabled: Option<bool>,
+        status: Option<ResourceStatusSummary>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -282,84 +304,15 @@ where
 {
     let payload = snapshot.payload().as_str();
     let (common, details) = match snapshot.feature() {
-        ResourceFeature::ServiceRoot => {
-            project_typed::<ServiceRootPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::ServiceRoot {
-                    vendor: parsed.vendor,
-                    product: parsed.product,
-                    redfish_version: parsed.redfish_version,
-                }
-            })?
-        }
-        ResourceFeature::Systems => {
-            project_typed::<SystemPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::System {
-                    system_type: parsed.system_type,
-                    manufacturer: parsed.manufacturer,
-                    model: parsed.model,
-                    part_number: parsed.part_number,
-                    serial_number: parsed.serial_number,
-                    sku: parsed.sku,
-                    host_name: parsed.host_name,
-                    bios_version: parsed.bios_version,
-                    power_state: parsed.power_state,
-                    status: parsed.status.map(ResourceStatusPayload::into_summary),
-                }
-            })?
-        }
-        ResourceFeature::Chassis => {
-            project_typed::<ChassisPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::Chassis {
-                    chassis_type: parsed.chassis_type,
-                    manufacturer: parsed.manufacturer,
-                    model: parsed.model,
-                    part_number: parsed.part_number,
-                    serial_number: parsed.serial_number,
-                    sku: parsed.sku,
-                    asset_tag: parsed.asset_tag,
-                    power_state: parsed.power_state,
-                    status: parsed.status.map(ResourceStatusPayload::into_summary),
-                }
-            })?
-        }
-        ResourceFeature::Managers => {
-            project_typed::<ManagerPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::Manager {
-                    manager_type: parsed.manager_type,
-                    manufacturer: parsed.manufacturer,
-                    model: parsed.model,
-                    part_number: parsed.part_number,
-                    serial_number: parsed.serial_number,
-                    firmware_version: parsed.firmware_version,
-                    version: parsed.version,
-                    power_state: parsed.power_state,
-                    status: parsed.status.map(ResourceStatusPayload::into_summary),
-                }
-            })?
-        }
-        ResourceFeature::Processors => {
-            project_typed::<ProcessorPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::Processor {
-                    processor_type: parsed.processor_type,
-                    socket: parsed.socket,
-                    manufacturer: parsed.manufacturer,
-                    model: parsed.model,
-                    total_cores: parsed.total_cores,
-                    status: parsed.status.map(ResourceStatusPayload::into_summary),
-                }
-            })?
-        }
-        ResourceFeature::Memory => {
-            project_typed::<MemoryPayload, _, RepositoryError>(snapshot, payload, |parsed| {
-                CoreResourceDetails::Memory {
-                    memory_device_type: parsed.memory_device_type,
-                    capacity_mib: parsed.capacity_mib,
-                    manufacturer: parsed.manufacturer,
-                    model: parsed.model,
-                    status: parsed.status.map(ResourceStatusPayload::into_summary),
-                }
-            })?
-        }
+        ResourceFeature::ServiceRoot => project_service_root(snapshot, payload)?,
+        ResourceFeature::Systems => project_system(snapshot, payload)?,
+        ResourceFeature::Chassis => project_chassis(snapshot, payload)?,
+        ResourceFeature::Managers => project_manager(snapshot, payload)?,
+        ResourceFeature::Processors => project_processor(snapshot, payload)?,
+        ResourceFeature::Memory => project_memory(snapshot, payload)?,
+        ResourceFeature::Storages => project_storage(snapshot, payload)?,
+        ResourceFeature::NetworkAdapters => project_network_adapter(snapshot, payload)?,
+        ResourceFeature::EthernetInterfaces => project_ethernet_interface(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -369,6 +322,202 @@ where
         etag: snapshot.etag().cloned(),
         common,
         details,
+    })
+}
+
+fn project_service_root<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ServiceRootPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::ServiceRoot {
+            vendor: parsed.vendor,
+            product: parsed.product,
+            redfish_version: parsed.redfish_version,
+        }
+    })
+}
+
+fn project_system<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<SystemPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::System {
+            system_type: parsed.system_type,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            part_number: parsed.part_number,
+            serial_number: parsed.serial_number,
+            sku: parsed.sku,
+            host_name: parsed.host_name,
+            bios_version: parsed.bios_version,
+            power_state: parsed.power_state,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_chassis<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ChassisPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Chassis {
+            chassis_type: parsed.chassis_type,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            part_number: parsed.part_number,
+            serial_number: parsed.serial_number,
+            sku: parsed.sku,
+            asset_tag: parsed.asset_tag,
+            power_state: parsed.power_state,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_manager<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ManagerPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Manager {
+            manager_type: parsed.manager_type,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            part_number: parsed.part_number,
+            serial_number: parsed.serial_number,
+            firmware_version: parsed.firmware_version,
+            version: parsed.version,
+            power_state: parsed.power_state,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_processor<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<ProcessorPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Processor {
+            processor_type: parsed.processor_type,
+            socket: parsed.socket,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            total_cores: parsed.total_cores,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_memory<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<MemoryPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Memory {
+            memory_device_type: parsed.memory_device_type,
+            capacity_mib: parsed.capacity_mib,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_storage<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<StoragePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Storage {
+            controller_count: parsed.controller_count,
+            drive_count: parsed.drive_count,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_network_adapter<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<NetworkAdapterPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::NetworkAdapter {
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_ethernet_interface<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<EthernetInterfacePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::EthernetInterface {
+            mac_address: parsed.mac_address,
+            speed_mbps: parsed.speed_mbps,
+            interface_enabled: parsed.interface_enabled,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
     })
 }
 
@@ -644,6 +793,89 @@ impl CommonPayload for MemoryPayload {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoragePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ControllerCount")]
+    controller_count: Option<u64>,
+    #[serde(rename = "DriveCount")]
+    drive_count: Option<u64>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for StoragePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkAdapterPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for NetworkAdapterPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EthernetInterfacePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "MACAddress")]
+    mac_address: Option<String>,
+    #[serde(rename = "SpeedMbps")]
+    speed_mbps: Option<u64>,
+    #[serde(rename = "InterfaceEnabled")]
+    interface_enabled: Option<bool>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for EthernetInterfacePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -820,6 +1052,114 @@ mod tests {
                 && model == "Model P"
                 && status.state() == Some("Enabled")
                 && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_storage_network_and_ethernet_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(11)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Storages,
+                    "/redfish/v1/Systems/1/Storage/SATA-1",
+                    r#"{"Id":"SATA-1","Name":"Storage Subsystem One","Description":"SATA storage subsystem","ControllerCount":2,"DriveCount":6,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::NetworkAdapters,
+                    "/redfish/v1/Chassis/1/NetworkAdapters/1",
+                    r#"{"Id":"1","Name":"Network Adapter One","Manufacturer":"Vendor A","Model":"NA-25G-2P","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::EthernetInterfaces,
+                    "/redfish/v1/Managers/1/EthernetInterfaces/1",
+                    r#"{"Id":"1","Name":"Ethernet Interface One","MACAddress":"52:54:00:12:34:56","SpeedMbps":10000,"InterfaceEnabled":true,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.observed_at(), Some(observed_at));
+        assert_eq!(result.resources().len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the chassis
+        // network adapter sorts before the manager ethernet interface, which
+        // sorts before the system storage subsystem.
+        let network = &result.resources()[1];
+        assert_eq!(network.feature(), ResourceFeature::NetworkAdapters);
+        assert_eq!(
+            network.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/NetworkAdapters/1"
+        );
+        assert_eq!(network.common().name(), "Network Adapter One");
+        assert!(matches!(
+            network.details(),
+            CoreResourceDetails::NetworkAdapter {
+                manufacturer: Some(manufacturer),
+                model: Some(model),
+                status: Some(status),
+                ..
+            } if manufacturer == "Vendor A"
+                && model == "NA-25G-2P"
+                && status.state() == Some("Enabled")
+        ));
+        let ethernet = &result.resources()[2];
+        assert_eq!(ethernet.feature(), ResourceFeature::EthernetInterfaces);
+        assert_eq!(
+            ethernet.odata_id().as_str(),
+            "/redfish/v1/Managers/1/EthernetInterfaces/1"
+        );
+        assert!(matches!(
+            ethernet.details(),
+            CoreResourceDetails::EthernetInterface {
+                mac_address: Some(mac_address),
+                speed_mbps: Some(10000),
+                interface_enabled: Some(true),
+                status: Some(status),
+                ..
+            } if mac_address == "52:54:00:12:34:56"
+                && status.health() == Some("OK")
+        ));
+        let storage = &result.resources()[3];
+        assert_eq!(storage.feature(), ResourceFeature::Storages);
+        assert_eq!(
+            storage.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Storage/SATA-1"
+        );
+        assert_eq!(storage.common().name(), "Storage Subsystem One");
+        assert!(matches!(
+            storage.details(),
+            CoreResourceDetails::Storage {
+                controller_count: Some(2),
+                drive_count: Some(6),
+                status: Some(status),
+                ..
+            } if status.health() == Some("OK")
         ));
         Ok(())
     }
