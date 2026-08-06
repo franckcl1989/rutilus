@@ -29,6 +29,18 @@ pub enum ResourceFeature {
     /// snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
     Memory,
+    /// The §2.1 `storages` feature, added as a typed resource family in the
+    /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
+    /// both inventories address the same wire surface.
+    Storages,
+    /// The §2.1 `network-adapters` feature, added as a typed resource family
+    /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    NetworkAdapters,
+    /// The §2.1 `ethernet-interfaces` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface.
+    EthernetInterfaces,
 }
 
 impl ResourceFeature {
@@ -42,6 +54,9 @@ impl ResourceFeature {
             Self::Managers => "managers",
             Self::Processors => "processors",
             Self::Memory => "memory",
+            Self::Storages => "storages",
+            Self::NetworkAdapters => "network-adapters",
+            Self::EthernetInterfaces => "ethernet-interfaces",
         }
     }
 }
@@ -63,6 +78,9 @@ impl FromStr for ResourceFeature {
             "managers" => Ok(Self::Managers),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
+            "storages" => Ok(Self::Storages),
+            "network-adapters" => Ok(Self::NetworkAdapters),
+            "ethernet-interfaces" => Ok(Self::EthernetInterfaces),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -604,6 +622,9 @@ mod tests {
             ResourceFeature::Managers,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
+            ResourceFeature::Storages,
+            ResourceFeature::NetworkAdapters,
+            ResourceFeature::EthernetInterfaces,
         ];
 
         for feature in features {
@@ -616,34 +637,33 @@ mod tests {
     }
 
     #[test]
-    fn processors_and_memory_codes_round_trip_and_match_the_capability_ledger() {
+    fn typed_family_codes_round_trip_and_match_the_capability_ledger() {
         // The snapshot feature and the §2.1 capability ledger must speak the
         // same wire string, so persistence and protocol layers never translate
-        // between two inventories for the same surface.
-        assert_eq!(
-            ResourceFeature::Processors.as_str(),
-            EndpointCapability::Processors.as_str()
-        );
-        assert_eq!(
-            ResourceFeature::Memory.as_str(),
-            EndpointCapability::Memory.as_str()
-        );
-        assert_eq!(
-            "processors".parse::<ResourceFeature>(),
-            Ok(ResourceFeature::Processors)
-        );
-        assert_eq!(
-            "memory".parse::<ResourceFeature>(),
-            Ok(ResourceFeature::Memory)
-        );
-        assert_eq!(
-            "processors".parse::<EndpointCapability>(),
-            Ok(EndpointCapability::Processors)
-        );
-        assert_eq!(
-            "memory".parse::<EndpointCapability>(),
-            Ok(EndpointCapability::Memory)
-        );
+        // between two inventories for the same surface. Every typed resource
+        // family (0.2 Processors/Memory and the Storage/Network iteration) is
+        // asserted here so a new family cannot land with a private code.
+        let families = [
+            (ResourceFeature::Processors, EndpointCapability::Processors),
+            (ResourceFeature::Memory, EndpointCapability::Memory),
+            (ResourceFeature::Storages, EndpointCapability::Storages),
+            (
+                ResourceFeature::NetworkAdapters,
+                EndpointCapability::NetworkAdapters,
+            ),
+            (
+                ResourceFeature::EthernetInterfaces,
+                EndpointCapability::EthernetInterfaces,
+            ),
+        ];
+        for (feature, capability) in families {
+            assert_eq!(feature.as_str(), capability.as_str());
+            assert_eq!(feature.as_str().parse(), Ok(feature));
+            assert_eq!(
+                feature.as_str().parse::<EndpointCapability>(),
+                Ok(capability)
+            );
+        }
     }
 
     #[test]
@@ -659,6 +679,15 @@ mod tests {
             "memory-",
             "Processors",
             "Memory",
+            "storage",
+            "network-adapter",
+            "ethernet-interface",
+            "storages/",
+            "network-adapters/",
+            "ethernet-interfaces-",
+            "Storages",
+            "NetworkAdapters",
+            "EthernetInterfaces",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
