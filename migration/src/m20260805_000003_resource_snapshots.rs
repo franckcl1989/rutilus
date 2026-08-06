@@ -66,6 +66,9 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "thermal",
                         "sensors",
                         "controls",
+                        "log-services",
+                        "manager-network-protocol",
+                        "host-interfaces",
                     ]),
                 ))
                 .to_owned(),
