@@ -16,11 +16,12 @@ use std::{
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, Clock, CoreResourceReader, CredentialCreationRepository,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
-    ResourceObservation, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CoreResourceReader,
+    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryRepository, EndpointRefreshRepository, ProtectedCredentialCreation,
+    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
+    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CapabilityState, Credential, CredentialId, CredentialName,
@@ -314,6 +315,17 @@ impl AuditEventQuery for MockServices {
                 .cloned()
                 .collect())
         })
+    }
+}
+
+impl CapabilityQueryRepository for MockServices {
+    type Error = MockError;
+
+    fn find_endpoint_capabilities(
+        &self,
+        _endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
     }
 }
 

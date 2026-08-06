@@ -11,11 +11,11 @@ use std::{
 };
 
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, Clock, CoreResourceReader, CredentialCreationRepository,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
-    ResourceObservation, TlsIdentityProbe,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CoreResourceReader,
+    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryRepository, EndpointRefreshRepository, ProtectedCredentialCreation,
+    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, Credential, CredentialId, CredentialVersionId, DeploymentPosture,
@@ -265,6 +265,20 @@ impl AuditEventQuery for StandaloneState {
             let take = usize::try_from(limit.get()).map_err(|_| StandaloneAuditTailError)?;
             Ok(tail.iter().rev().take(take).cloned().collect())
         })
+    }
+}
+
+impl CapabilityQueryRepository for StandaloneState {
+    type Error = <SqliteStore as CapabilityQueryRepository>::Error;
+
+    fn find_endpoint_capabilities(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+        <SqliteStore as CapabilityQueryRepository>::find_endpoint_capabilities(
+            &self.store,
+            endpoint_id,
+        )
     }
 }
 

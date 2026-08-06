@@ -16,36 +16,40 @@ use axum::{
 use rust_embed::RustEmbed;
 use rutilus_api::{
     AboutResponse, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
-    AuditTargetResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
+    AuditTargetResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
+    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
     CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
     CoreResourceResponse, CoreResourceSourceResponse, CreateCredentialRequest,
-    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCsvImportRequest,
-    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
-    EndpointEnrollmentResponse, EndpointIdentityResponse, EndpointInventoryResponse,
-    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
+    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
+    EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
+    EndpointInventoryResponse, EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
     EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
     ErrorResponse, HealthResponse, ResourceStatusResponse, TlsTrustModeResponse,
-    TrustRejectedResponse, TrustedEndpointResponse,
+    TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
-    AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, Clock, CoreResourceDetails,
-    CoreResourceReader, CoreResourceSummary, CredentialCreation, CredentialCreationError,
-    CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointCsvImportExecutor, EndpointCsvImportReport,
-    EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError,
-    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
-    EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
-    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
-    EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
-    EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
-    RedfishDiscovery, ResourceStatusSummary, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, CapabilityLedgerEntry,
+    CapabilityQueryRepository, Clock, CoreResourceDetails, CoreResourceReader, CoreResourceSummary,
+    CredentialCreation, CredentialCreationError, CredentialCreationRepository,
+    CredentialInventoryQuery, CredentialInventoryQueryError, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointCsvImportExecutor,
+    EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment,
+    EndpointEnrollmentError, EndpointInventoryItem, EndpointInventoryQuery,
+    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointRefreshRepository,
+    EndpointResourceInventory, EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
+    EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
+    EndpointTrustExpectationError, EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError,
+    OnboardEndpointRequest, RedfishDiscovery, ResourceStatusSummary, TlsIdentityProbe,
+    TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
-    AuditActor, AuditEvent, CertificateFingerprintParseError, Credential, CredentialId,
-    CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointDisplayName, EndpointId, ResourceFeature, ResourceSnapshot, TlsTrust,
+    AuditActor, AuditEvent, CapabilityClassification, CapabilityState,
+    CertificateFingerprintParseError, Credential, CredentialId, CredentialName, CredentialUsername,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, ResourceFeature,
+    ResourceSnapshot, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -131,6 +135,7 @@ pub trait ProductServices:
     + EndpointRefreshRepository
     + AuditEventWriter
     + AuditEventQuery
+    + CapabilityQueryRepository
 {
 }
 
@@ -144,6 +149,7 @@ impl<T> ProductServices for T where
         + EndpointRefreshRepository
         + AuditEventWriter
         + AuditEventQuery
+        + CapabilityQueryRepository
 {
 }
 
@@ -201,6 +207,10 @@ where
         .route(
             "/api/v1/endpoints/{endpoint_id}/resources",
             get(endpoint_resources::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/capabilities",
+            get(endpoint_capabilities::<Services, Gateway, Time>),
         )
         .route(
             "/api/v1/credentials",
@@ -326,6 +336,44 @@ where
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = Json(response).into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Returns one endpoint's complete capability ledger in design-document
+/// order, with the observed state where a probe has already run.
+async fn endpoint_capabilities<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(endpoint_id): AxumPath<String>,
+) -> Response
+where
+    Services: CapabilityQueryRepository,
+{
+    let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
+        return uncached_status(StatusCode::BAD_REQUEST);
+    };
+    let entries = match EndpointCapabilityQuery::new(state.services.as_ref(), endpoint_id)
+        .execute()
+        .await
+    {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return uncached_status(StatusCode::NOT_FOUND),
+        Err(EndpointCapabilityQueryError::Repository(_)) => {
+            return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(EndpointCapabilityQueryError::DuplicateObservation { .. }) => {
+            return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let mut response = Json(EndpointCapabilityInventoryResponse::new(
+        endpoint_id.into_uuid(),
+        entries
+            .iter()
+            .copied()
+            .map(project_capability_entry)
+            .collect(),
+    ))
+    .into_response();
     no_store(&mut response);
     response
 }
@@ -1147,6 +1195,74 @@ fn project_resource_status(status: &ResourceStatusSummary) -> ResourceStatusResp
     )
 }
 
+fn project_capability_entry(entry: CapabilityLedgerEntry) -> CapabilityEntryResponse {
+    CapabilityEntryResponse::new(
+        entry.capability().as_str().to_owned(),
+        entry.upstream_feature().to_owned(),
+        project_capability_classification(entry.classification()),
+        project_ui_location(entry.ui_location()),
+        entry.state().map(project_capability_state),
+        entry.observed_at(),
+    )
+}
+
+fn project_capability_classification(
+    classification: CapabilityClassification,
+) -> CapabilityClassificationResponse {
+    match classification {
+        CapabilityClassification::UserFacing => CapabilityClassificationResponse::UserFacing,
+        CapabilityClassification::Infrastructure => {
+            CapabilityClassificationResponse::Infrastructure
+        }
+        CapabilityClassification::LegacyCompatibility => {
+            CapabilityClassificationResponse::LegacyCompatibility
+        }
+        CapabilityClassification::Internal => CapabilityClassificationResponse::Internal,
+    }
+}
+
+fn project_capability_state(state: CapabilityState) -> CapabilityStateResponse {
+    match state {
+        CapabilityState::Supported => CapabilityStateResponse::Supported,
+        CapabilityState::ReadOnly => CapabilityStateResponse::ReadOnly,
+        CapabilityState::Unauthorized => CapabilityStateResponse::Unauthorized,
+        CapabilityState::TemporarilyUnavailable => CapabilityStateResponse::TemporarilyUnavailable,
+        CapabilityState::SchemaIncompatible => CapabilityStateResponse::SchemaIncompatible,
+        CapabilityState::NotAdvertised => CapabilityStateResponse::NotAdvertised,
+        CapabilityState::NotCompiled => CapabilityStateResponse::NotCompiled,
+    }
+}
+
+fn project_ui_location(location: UiLocation) -> UiLocationResponse {
+    match location {
+        UiLocation::Overview => UiLocationResponse::Overview,
+        UiLocation::Systems => UiLocationResponse::Systems,
+        UiLocation::Chassis => UiLocationResponse::Chassis,
+        UiLocation::Managers => UiLocationResponse::Managers,
+        UiLocation::Assembly => UiLocationResponse::Assembly,
+        UiLocation::Processors => UiLocationResponse::Processors,
+        UiLocation::Memory => UiLocationResponse::Memory,
+        UiLocation::Pcie => UiLocationResponse::Pcie,
+        UiLocation::Network => UiLocationResponse::Network,
+        UiLocation::Power => UiLocationResponse::Power,
+        UiLocation::Thermal => UiLocationResponse::Thermal,
+        UiLocation::Sensors => UiLocationResponse::Sensors,
+        UiLocation::Bios => UiLocationResponse::Bios,
+        UiLocation::Boot => UiLocationResponse::Boot,
+        UiLocation::SecureBoot => UiLocationResponse::SecureBoot,
+        UiLocation::Storage => UiLocationResponse::Storage,
+        UiLocation::Accounts => UiLocationResponse::Accounts,
+        UiLocation::Logs => UiLocationResponse::Logs,
+        UiLocation::Events => UiLocationResponse::Events,
+        UiLocation::Telemetry => UiLocationResponse::Telemetry,
+        UiLocation::Update => UiLocationResponse::Update,
+        UiLocation::Tasks => UiLocationResponse::Tasks,
+        UiLocation::Oem => UiLocationResponse::Oem,
+        UiLocation::Diagnostics => UiLocationResponse::Diagnostics,
+        UiLocation::Infrastructure => UiLocationResponse::Infrastructure,
+    }
+}
+
 fn count_resources(
     item: &EndpointInventoryItem,
     feature: ResourceFeature,
@@ -1221,7 +1337,7 @@ mod tests {
     use http_body_util::BodyExt as _;
     use rutilus_application::{
         BoundaryFuture, EndpointDiscovery, ProtectedCredentialCreation, ResolvedCredential,
-        ResourceObservation, TlsIdentityObservation,
+        ResourceObservation, StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
         CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
@@ -1871,6 +1987,17 @@ mod tests {
             &self,
             _limit: NonZeroU64,
         ) -> BoundaryFuture<'_, Result<Vec<AuditEvent>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CapabilityQueryRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn find_endpoint_capabilities(
+            &self,
+            _endpoint_id: EndpointId,
+        ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
     }
