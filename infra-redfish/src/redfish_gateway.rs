@@ -18,15 +18,20 @@ use nv_redfish::{
     },
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
-    core::{EntityTypeRef, NavProperty, ReferenceLeaf},
+    core::{EntityTypeRef, ModificationResponse, NavProperty, ODataId, ReferenceLeaf},
     manager::{Manager, ManagerCollection},
     schema::{
-        assembly::Assembly as AssemblySchema, assembly::AssemblyData as AssemblyDataSchema,
-        bios::Bios as BiosSchema, boot_option::BootOption as BootOptionSchema,
+        assembly::Assembly as AssemblySchema,
+        assembly::AssemblyData as AssemblyDataSchema,
+        bios::Bios as BiosSchema,
+        boot_option::BootOption as BootOptionSchema,
         boot_option_collection::BootOptionCollection as BootOptionCollectionSchema,
         chassis::Chassis as ChassisSchema,
         chassis_collection::ChassisCollection as ChassisCollectionSchema,
-        computer_system::ComputerSystem as ComputerSystemSchema,
+        computer_system::{
+            BootUpdate as BootUpdateSchema, ComputerSystem as ComputerSystemSchema,
+            ComputerSystemUpdate as ComputerSystemUpdateSchema,
+        },
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
         control::Control as ControlSchema,
         control_collection::ControlCollection as ControlCollectionSchema,
@@ -37,7 +42,8 @@ use nv_redfish::{
         host_interface_collection::HostInterfaceCollection as HostInterfaceCollectionSchema,
         log_service::LogService as LogServiceSchema,
         log_service_collection::LogServiceCollection as LogServiceCollectionSchema,
-        manager::Manager as ManagerSchema, manager_account::ManagerAccount as ManagerAccountSchema,
+        manager::Manager as ManagerSchema,
+        manager_account::ManagerAccount as ManagerAccountSchema,
         manager_account_collection::ManagerAccountCollection as ManagerAccountCollectionSchema,
         manager_collection::ManagerCollection as ManagerCollectionSchema,
         manager_network_protocol::ManagerNetworkProtocol as ManagerNetworkProtocolSchema,
@@ -49,17 +55,21 @@ use nv_redfish::{
         metric_report_collection::MetricReportCollection as MetricReportCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
-        pcie_device::PcieDevice as PcieDeviceSchema, power::Power as PowerSchema,
+        pcie_device::PcieDevice as PcieDeviceSchema,
+        power::Power as PowerSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
         resource::Resource as ResourceSchema,
         resource::ResourceCollection as ResourceCollectionSchema,
-        secure_boot::SecureBoot as SecureBootSchema, sensor::Sensor as SensorSchema,
+        secure_boot::SecureBoot as SecureBootSchema,
+        secure_boot::SecureBootUpdate as SecureBootUpdateSchema,
+        sensor::Sensor as SensorSchema,
         sensor_collection::SensorCollection as SensorCollectionSchema,
         software_inventory::SoftwareInventory as SoftwareInventorySchema,
         software_inventory_collection::SoftwareInventoryCollection as SoftwareInventoryCollectionSchema,
         storage::Storage as StorageSchema,
-        storage_collection::StorageCollection as StorageCollectionSchema, task::Task as TaskSchema,
+        storage_collection::StorageCollection as StorageCollectionSchema,
+        task::Task as TaskSchema,
         task_collection::TaskCollection as TaskCollectionSchema,
         task_service::TaskService as TaskServiceSchema,
         telemetry_service::TelemetryService as TelemetryServiceSchema,
@@ -78,10 +88,13 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rutilus_domain::{
-    CapabilityState, CertificateFingerprint, CredentialUsername, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, ResourceEtag, ResourceEtagError,
-    ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
-    ResourceSnapshotPayloadError, TlsIdentityChanged, TlsTrust,
+    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
+    CertificateFingerprint, ChassisCommand, CreateSubscription, CredentialUsername,
+    DeleteSubscription, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
+    EventCommand, EventDestinationProtocol, EventType, ManagerCommand, RedfishCommand,
+    ResetKeysType, ResetType, ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId,
+    ResourceODataIdError, ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
+    SetBootSourceOverride, SystemCommand, TlsIdentityChanged, TlsTrust,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -297,6 +310,171 @@ impl RedfishGateway {
         )
         .await;
         finish_core_resource_read(result, authenticated.session, &identity, trust).await
+    }
+
+    /// Executes one typed write command against the endpoint (§13.3 step 7)
+    /// exclusively through the public `nv-redfish` typed API (§7.4): the
+    /// `Bmc::action`, `Bmc::update`, `Bmc::create`, and `Bmc::delete` methods
+    /// — never a raw `reqwest` request.
+    ///
+    /// The command families map onto the typed write surface as follows:
+    ///
+    /// - `System`, `Manager`, and `Chassis` resets run the `Reset` action
+    ///   decoded from the endpoint's first advertised member of the family
+    ///   (§13.3 step 2: a missing family link or missing action rejects the
+    ///   command before any write is sent);
+    /// - `Boot` patches the system's `Boot` properties through the compiled
+    ///   `ComputerSystemUpdate`/`BootUpdate` schema types;
+    /// - `SecureBoot` `Enable`/`Disable` patch the `SecureBootEnable`
+    ///   property — the standard CSDL exposes no Enable/Disable actions, only
+    ///   `ResetKeys` — and `ResetKeys` runs the decoded
+    ///   `#SecureBoot.ResetKeys` action;
+    /// - `Event` `CreateSubscription` posts the CSDL `EventDestination`
+    ///   shape onto the decoded `Subscriptions` link, and
+    ///   `DeleteSubscription` deletes the link URI extended by the typed
+    ///   subscription id (the one URI the command payload contributes; the
+    ///   product never accepts BMC URLs from outside, §15.6).
+    ///
+    /// The transient Session lifecycle is identical to the read surfaces: a
+    /// Session is established when usable, every member fetch and the write
+    /// authenticate with its token, and the Session is deleted before
+    /// returning. The §13.4 `ETag` precondition is a later iteration — the
+    /// typed `update` sends the transport's existence-only `If-Match: *` —
+    /// and the §13.6 Task path is a later iteration: a `202` response is
+    /// reported as [`CommandExecutionError::AsyncTaskAccepted`], never as
+    /// acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandExecutionError`] for a provable rejection
+    /// ([`CommandExecutionError::Rejected`]), a client-side failure that
+    /// provably prevented dispatch, a dispatched write whose outcome cannot
+    /// be proven (§13.5), or a `202` Task acceptance. Only the outcome-class
+    /// failures must drive the operation to `Unknown`; every other error
+    /// proves the write was not executed.
+    pub async fn execute_command(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+        command: &RedfishCommand,
+    ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(CommandExecutionError::from)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(classify_command_preparation_error(source, &identity, trust));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(source.into()),
+        };
+        let result = execute_authenticated_command(
+            authenticated.bmc.as_ref(),
+            &authenticated.root,
+            &identity,
+            trust,
+            command,
+        )
+        .await;
+        finish_command_execution(result, authenticated.session, &identity, trust).await
+    }
+
+    /// Re-reads the target of one previously accepted write command and
+    /// checks the expected result (§13.3 steps 9–10).
+    ///
+    /// Only `Accepted` operations reach the verifier, so every failure here
+    /// proves nothing about the write: the scheduler records `Unknown`
+    /// (§13.5) instead of a failure. The expected result is derived from the
+    /// command itself:
+    ///
+    /// - `Event` `CreateSubscription` — the re-read `Subscriptions`
+    ///   collection must contain a member whose `Destination` matches the
+    ///   command payload; an absent destination is `Mismatched`.
+    /// - `Event` `DeleteSubscription` — the subscription id must be absent
+    ///   from the re-read collection (matched by the member `@odata.id` tail
+    ///   segment, the same identity the deletion payload uses).
+    /// - Reset, Boot, and Secure Boot commands — "accepted" verification:
+    ///   the target resource must re-read without error, and the verifier
+    ///   returns `Confirmed` without asserting the physical effect (power
+    ///   state, boot override, key state), which takes effect asynchronously
+    ///   on most BMCs; claiming the effect from a successful read would
+    ///   fabricate a result. This is the same honest re-read pattern §13.6
+    ///   recovery uses.
+    ///
+    /// The re-reads go through the same typed navigation and Session
+    /// lifecycle as the write itself, and the endpoint's own URI structure is
+    /// never guessed (§11.1): subscriptions are re-read through the decoded
+    /// `EventService` `Subscriptions` link, and targets through the decoded
+    /// collection members.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandVerificationError`] when the target cannot be
+    /// re-read at all — a failed re-read proves nothing about the write, so
+    /// the scheduler records `Unknown` (§13.5).
+    pub async fn verify_command(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+        command: &RedfishCommand,
+    ) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(CommandVerificationError::from)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(CommandVerificationError::from(classify_service_root_error(
+                    source, &identity, trust,
+                )));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(source.into()),
+        };
+        let result = verify_authenticated_command(
+            authenticated.bmc.as_ref(),
+            &authenticated.root,
+            &identity,
+            trust,
+            command,
+        )
+        .await;
+        finish_command_verification(result, authenticated.session, &identity, trust).await
     }
 
     fn authenticated_bmc(
@@ -1143,6 +1321,41 @@ impl EntityTypeRef for EventSubscriptionCollectionSchema {
     }
 }
 
+/// The typed `POST` payload of one event subscription creation.
+///
+/// `EventDestination` is not compiled into nv-redfish 0.13 (the
+/// `Subscriptions` navigation is a bare [`ReferenceLeaf`], which is why
+/// [`EventSubscriptionSchema`] is declared locally too), so the create body
+/// is declared here with the exact `EventDestination_v1` CSDL property
+/// names. The protocol and event-type member sets come from the domain
+/// projections, whose const member-set tests pin the CSDL enumerations —
+/// reusing the domain types keeps the wire values under the same pinned
+/// contract instead of duplicating the member sets in this crate.
+#[derive(Serialize)]
+struct EventDestinationCreateBody {
+    #[serde(rename = "Destination")]
+    destination: String,
+    #[serde(rename = "Protocol")]
+    protocol: EventDestinationProtocol,
+    #[serde(rename = "EventTypes")]
+    event_types: Vec<EventType>,
+}
+
+/// The wire response projection of one created event subscription.
+///
+/// Vendor create responses differ — the full `EventDestination` document, a
+/// `Location`-only reference, or no body at all — so every field stays
+/// optional and the projection accepts all of them. The outcome contract
+/// needs only the acceptance; the created `@odata.id` is decoded but not
+/// consumed yet, because the subscription-lifecycle iterations that follow
+/// (verification, Task recovery) read it from this projection.
+#[derive(Deserialize)]
+struct EventDestinationWriteSchema {
+    #[serde(rename = "@odata.id", default)]
+    #[allow(dead_code)]
+    odata_id: Option<String>,
+}
+
 /// Projects one advertised singleton with the member-level skip semantics.
 ///
 /// `Bios` and `SecureBoot` are singletons, not collections, so they share
@@ -1481,6 +1694,837 @@ async fn finish_core_resource_read(
             read: Box::new(operation),
             cleanup: Box::new(cleanup),
         }),
+    }
+}
+
+/// Dispatches one typed write command through the authenticated transport.
+///
+/// The match is exhaustive over every §7.5 family, so adding a command
+/// family fails to compile until a typed execution path exists here.
+async fn execute_authenticated_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    command: &RedfishCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    match command {
+        RedfishCommand::System(SystemCommand::Reset(reset_type)) => {
+            execute_system_reset(bmc, root, identity, trust, *reset_type).await
+        }
+        RedfishCommand::Manager(ManagerCommand::Reset(reset_type)) => {
+            execute_manager_reset(bmc, root, identity, trust, *reset_type).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => {
+            execute_chassis_reset(bmc, root, identity, trust, *reset_type).await
+        }
+        RedfishCommand::Boot(BootCommand::SetBootSourceOverride(override_value)) => {
+            execute_boot_override(bmc, root, identity, trust, override_value).await
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::Enable) => {
+            execute_secure_boot_enable(bmc, root, identity, trust, true).await
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::Disable) => {
+            execute_secure_boot_enable(bmc, root, identity, trust, false).await
+        }
+        RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(kind)) => {
+            execute_secure_boot_reset_keys(bmc, root, identity, trust, *kind).await
+        }
+        RedfishCommand::Event(EventCommand::CreateSubscription(payload)) => {
+            execute_create_subscription(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
+            execute_delete_subscription(bmc, root, identity, trust, payload).await
+        }
+    }
+}
+
+/// Fetches the first advertised member of one core collection.
+///
+/// The write surfaces of this iteration are endpoint-scoped: a command acts
+/// on the endpoint's primary resource of the family — the first member of
+/// the decoded collection. The persisted `Operation` already carries
+/// `TargetId`s, but mapping a target identity to a specific member is the
+/// engine's later iteration; the endpoint-scoped rule is documented here so
+/// the resolution stays deterministic until then. Member links always come
+/// from the decoded collection document, never from a guessed path (§11.1).
+///
+/// A missing link or an empty collection is `None`: the family is simply not
+/// advertised ("资源存在才呈现"), which the callers surface as
+/// [`CommandRejection::CapabilityUnavailable`].
+async fn first_collection_member<C>(
+    nav: Option<&NavProperty<C>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<C::Member>>, CommandExecutionError>
+where
+    C: MemberCollection,
+{
+    let Some(collection_nav) = nav else {
+        return Ok(None);
+    };
+    let collection = collection_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let Some(member_nav) = collection.members().first() else {
+        return Ok(None);
+    };
+    let member = member_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    Ok(Some(member))
+}
+
+/// Executes a `System` reset through the decoded `#ComputerSystem.Reset`
+/// action (§13.3 step 7).
+///
+/// The action is invoked through the `Bmc::action` typed API with the
+/// compiled `ComputerSystemResetAction` parameter type; the wrapper
+/// convenience method (`ComputerSystem::reset`) is not used because it
+/// requires the upstream `ActionError` bound that the HTTP BMC error type
+/// does not satisfy — the underlying `Bmc::action` has no such bound.
+async fn execute_system_reset(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    reset_type: ResetType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(system) =
+        first_collection_member(root.root.systems.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = system
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset.as_ref())
+    else {
+        // §13.3 step 2: the decoded system does not advertise the Reset
+        // action, so the command is provably unsupported on this endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::computer_system::ComputerSystemResetAction {
+        reset_type: Some(map_reset_type(reset_type)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::computer_system::ComputerSystemResetAction, ()>(
+            action, &params,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a `Manager` reset through the decoded `#Manager.Reset` action.
+async fn execute_manager_reset(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    reset_type: ResetType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(manager) =
+        first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = manager
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset.as_ref())
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::manager::ManagerResetAction {
+        reset_type: Some(map_reset_type(reset_type)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::manager::ManagerResetAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a `Chassis` reset through the decoded `#Chassis.Reset` action.
+async fn execute_chassis_reset(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    reset_type: ResetType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = chassis
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset.as_ref())
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::chassis::ChassisResetAction {
+        reset_type: Some(map_reset_type(reset_type)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::chassis::ChassisResetAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a boot source override as a typed `Boot` property `PATCH`.
+///
+/// The update carries the three CSDL properties
+/// (`BootSourceOverrideTarget`, `BootSourceOverrideEnabled`,
+/// `BootSourceOverrideMode`) through the compiled
+/// [`ComputerSystemUpdateSchema`]/[`BootUpdateSchema`] types, so the wire
+/// payload is produced by the upstream schema, not by a hand-written JSON
+/// request (§7.4). The response is projected as a [`NavProperty`] so both a
+/// full resource body and a `204` are handled; a body that decodes to
+/// neither classifies as an outcome-unknown error because the write itself
+/// was accepted by the success status (§13.5).
+async fn execute_boot_override(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    override_value: &SetBootSourceOverride,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(system) =
+        first_collection_member(root.root.systems.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    if system.boot.is_none() {
+        // §13.3 step 2: the decoded system carries no `Boot` object, so a
+        // boot override is provably unsupported on this endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    }
+    let update = ComputerSystemUpdateSchema::default().with_boot(
+        BootUpdateSchema::default()
+            .with_boot_source_override_target(map_boot_source(override_value.source()))
+            .with_boot_source_override_enabled(map_boot_override_enabled(override_value.enabled()))
+            .with_boot_source_override_mode(map_boot_override_mode(override_value.mode())),
+    );
+    let response = match bmc
+        .update::<ComputerSystemUpdateSchema, NavProperty<ComputerSystemSchema>>(
+            system.odata_id(),
+            None,
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a `SecureBoot` enable or disable as a typed
+/// `SecureBootEnable` property `PATCH`.
+///
+/// The standard `SecureBoot` CSDL defines no Enable/Disable actions — the
+/// member is a `SecureBootEnable` boolean property — so the domain's
+/// `Enable`/`Disable` commands map onto the compiled
+/// [`SecureBootUpdateSchema`] type exactly like the boot override maps onto
+/// its update type.
+async fn execute_secure_boot_enable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    enabled: bool,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(secure_boot) = secure_boot_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let update = SecureBootUpdateSchema::default().with_secure_boot_enable(enabled);
+    let response = match bmc
+        .update::<SecureBootUpdateSchema, NavProperty<SecureBootSchema>>(
+            secure_boot.odata_id(),
+            None,
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a Secure Boot key reset through the decoded
+/// `#SecureBoot.ResetKeys` action.
+async fn execute_secure_boot_reset_keys(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    kind: ResetKeysType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(secure_boot) = secure_boot_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = secure_boot
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset_keys.as_ref())
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::secure_boot::SecureBootResetKeysAction {
+        reset_keys_type: Some(map_reset_keys_type(kind)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::secure_boot::SecureBootResetKeysAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the typed `SecureBoot` document of the endpoint's first system.
+///
+/// The document is fetched through the system's decoded `SecureBoot`
+/// navigation property, so the `PATCH`/action target URI is never guessed
+/// (§11.1). A missing system or a missing `SecureBoot` link is `None`.
+async fn secure_boot_document(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<SecureBootSchema>>, CommandExecutionError> {
+    let Some(system) =
+        first_collection_member(root.root.systems.as_ref(), bmc, identity, trust).await?
+    else {
+        return Ok(None);
+    };
+    let Some(secure_boot_nav) = system.secure_boot.as_ref() else {
+        return Ok(None);
+    };
+    let secure_boot = secure_boot_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    Ok(Some(secure_boot))
+}
+
+/// Executes an event subscription creation as a typed `POST`.
+///
+/// The create targets the decoded `Subscriptions` link of the `EventService`
+/// document — never a constructed collection path (§11.1) — and the body is
+/// the local CSDL projection of the `EventDestination` shape (see
+/// [`EventDestinationCreateBody`]). The response projection keeps every
+/// field optional because vendor create responses differ (full document,
+/// `Location`-only reference, or no body); the outcome contract needs only
+/// the acceptance.
+async fn execute_create_subscription(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateSubscription,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(event_service) = event_service_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(subscriptions) = event_service.subscriptions.as_ref() else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let create = EventDestinationCreateBody {
+        destination: payload.destination().to_owned(),
+        protocol: payload.protocol(),
+        event_types: payload.event_types().to_vec(),
+    };
+    let response = match bmc
+        .create::<EventDestinationCreateBody, EventDestinationWriteSchema>(
+            &subscriptions.odata_id,
+            &create,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes an event subscription deletion as a typed `DELETE`.
+///
+/// The deletion target is the decoded `Subscriptions` collection URI
+/// extended by the typed subscription id — the one URI segment the command
+/// payload contributes. This is a product-internal operation on a typed
+/// subscription id (§15.6: the Center never hands down BMC URLs; the product
+/// maps its own persisted subscription identity onto the collection). The id
+/// is validated as a single safe path segment first so a corrupt or hostile
+/// id cannot escape the collection.
+async fn execute_delete_subscription(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteSubscription,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(subscription_id) = validate_subscription_id(payload.subscription_id()) else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        ));
+    };
+    let Some(event_service) = event_service_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(subscriptions) = event_service.subscriptions.as_ref() else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let uri = ODataId::from(format!("{}/{}", subscriptions.odata_id, subscription_id));
+    let response = match bmc.delete::<EventSubscriptionSchema>(&uri).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the typed `EventService` document through its root navigation
+/// property; a missing link is `None`.
+async fn event_service_document(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<EventServiceSchema>>, CommandExecutionError> {
+    let Some(event_service) = root.root.event_service.as_ref() else {
+        return Ok(None);
+    };
+    let service = event_service
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    Ok(Some(service))
+}
+
+/// Validates a subscription id as a single safe URI path segment.
+///
+/// The id is joined onto the decoded `Subscriptions` collection URI to form
+/// the deletion target, so only one plain segment may participate: the
+/// charset is ASCII alphanumerics, `-`, and `_`, which excludes the
+/// separators and escape characters (`/`, `\`, `?`, `#`, `%`) and the dot
+/// segments (`.`, `..`) that could redirect the request outside the
+/// collection, and excludes whitespace and control characters that could
+/// smuggle request structure.
+fn validate_subscription_id(value: &str) -> Option<&str> {
+    let safe = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    safe.then_some(value)
+}
+
+/// Projects one typed modification response onto the outcome space.
+///
+/// A fully handled synchronous success (`200`/`201`/`204` body handled) is
+/// [`CommandExecutionOutcome::Accepted`] — the target still must be verified
+/// (§13.3 steps 9–10). A `202` Task acceptance is deliberately not
+/// acceptance: Task monitoring (§13.6) is a later iteration, so the
+/// implementation surfaces it as [`CommandExecutionError::AsyncTaskAccepted`]
+/// whose verdict is outcome-unknown — the BMC accepted the write and this
+/// build cannot yet verify its result.
+fn outcome_from_modification<T>(
+    response: ModificationResponse<T>,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    match response {
+        ModificationResponse::Entity(_) | ModificationResponse::Empty => {
+            Ok(CommandExecutionOutcome::Accepted)
+        }
+        ModificationResponse::Task(task) => Err(CommandExecutionError::AsyncTaskAccepted {
+            task_location: task.location.0,
+        }),
+    }
+}
+
+/// Completes one command execution with the transient Session lifecycle.
+///
+/// A known write outcome always stands: when the write itself produced a
+/// result (acceptance or provable rejection), a Session cleanup failure
+/// cannot change what the BMC did, and shadowing the outcome with a
+/// session-hygiene error would push a known result into the §13.5 `Unknown`
+/// class and block the verification step the operation model expects after a
+/// proven outcome. When the write itself failed AND cleanup failed, both
+/// failures are preserved so the classification of the write still decides
+/// the verdict.
+async fn finish_command_execution(
+    outcome: Result<CommandExecutionOutcome, CommandExecutionError>,
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let cleanup = cleanup_session(session, identity, trust).await;
+    match cleanup {
+        Ok(()) => outcome,
+        Err(cleanup) => match outcome {
+            // A known write outcome stands despite the hygiene failure.
+            Ok(value) => Ok(value),
+            Err(operation) => Err(CommandExecutionError::OperationAndSessionCleanupFailed {
+                operation: Box::new(operation),
+                cleanup: Box::new(cleanup),
+            }),
+        },
+    }
+}
+
+/// Dispatches one post-execution verification re-read (§13.3 steps 9–10).
+///
+/// The match is exhaustive over every §7.5 family, so adding a command
+/// family fails to compile until a verification path exists here.
+async fn verify_authenticated_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    command: &RedfishCommand,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match command {
+        // Both families verify by re-reading the endpoint's first system
+        // ("accepted" semantics).
+        RedfishCommand::System(SystemCommand::Reset(_))
+        | RedfishCommand::Boot(BootCommand::SetBootSourceOverride(_)) => {
+            verify_system_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Manager(ManagerCommand::Reset(_)) => {
+            verify_manager_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::Reset(_)) => {
+            verify_chassis_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::SecureBoot(_) => {
+            verify_secure_boot_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Event(EventCommand::CreateSubscription(payload)) => {
+            verify_subscription_created(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
+            verify_subscription_deleted(bmc, root, identity, trust, payload).await
+        }
+    }
+}
+
+/// Re-reads the endpoint's first member of a core collection for
+/// verification.
+///
+/// This mirrors [`first_collection_member`] with the verification error
+/// contract: every re-read failure becomes [`CommandVerificationError`],
+/// because after an accepted write any unreadable target leaves the outcome
+/// unprovable (§13.5) regardless of why the re-read failed.
+async fn verify_first_collection_member<C>(
+    nav: Option<&NavProperty<C>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<C::Member>>, CommandVerificationError>
+where
+    C: MemberCollection,
+{
+    let Some(collection_nav) = nav else {
+        return Ok(None);
+    };
+    let collection = collection_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(member_nav) = collection.members().first() else {
+        return Ok(None);
+    };
+    let member = member_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    Ok(Some(member))
+}
+
+/// Classifies one verification re-read failure.
+///
+/// Every failure class converges on [`CommandVerificationError::ReReadFailed`]
+/// with the classified source preserved: the verifier only runs after an
+/// accepted write, so an authentication refusal, a transport failure, and a
+/// schema incompatibility all prove the same thing — nothing — and the
+/// scheduler records `Unknown` (§13.5).
+fn command_verification_read_error(
+    source: BmcError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CommandVerificationError {
+    CommandVerificationError::ReReadFailed(Box::new(classify_service_root_error(
+        nv_redfish::Error::Bmc(source),
+        identity,
+        trust,
+    )))
+}
+
+/// "Accepted" verification of a `System` Reset or Boot command: the
+/// endpoint's first system must re-read without error. The physical effect
+/// is deliberately not asserted (see [`RedfishGateway::verify_command`]).
+async fn verify_system_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match verify_first_collection_member(root.root.systems.as_ref(), bmc, identity, trust).await? {
+        Some(_) => Ok(CommandVerificationOutcome::Confirmed),
+        None => Err(CommandVerificationError::CapabilityUnavailable),
+    }
+}
+
+/// "Accepted" verification of a `Manager` Reset command: the endpoint's
+/// first manager must re-read without error.
+async fn verify_manager_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match verify_first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await? {
+        Some(_) => Ok(CommandVerificationOutcome::Confirmed),
+        None => Err(CommandVerificationError::CapabilityUnavailable),
+    }
+}
+
+/// "Accepted" verification of a `Chassis` Reset command: the endpoint's
+/// first chassis must re-read without error.
+async fn verify_chassis_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await? {
+        Some(_) => Ok(CommandVerificationOutcome::Confirmed),
+        None => Err(CommandVerificationError::CapabilityUnavailable),
+    }
+}
+
+/// "Accepted" verification of a Secure Boot command: the `SecureBoot`
+/// document must re-read without error through the system's decoded
+/// navigation property.
+async fn verify_secure_boot_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(system) =
+        verify_first_collection_member(root.root.systems.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let Some(secure_boot_nav) = system.secure_boot.as_ref() else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let _secure_boot = secure_boot_nav
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Verifies a subscription creation: the re-read `Subscriptions` collection
+/// must contain a member whose `Destination` matches the command payload.
+///
+/// The destination is matched by exact string equality against the decoded
+/// `Destination` property — the property the create posted. A member that
+/// cannot be fetched makes the check inconclusive and is an error (never a
+/// `Mismatched`): skipping it could hide the proof of the write (§13.5).
+async fn verify_subscription_created(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateSubscription,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let subscriptions = re_read_subscriptions(bmc, root, identity, trust).await?;
+    for member_nav in subscriptions.members() {
+        let member = member_nav
+            .get(bmc)
+            .await
+            .map_err(|source| command_verification_read_error(source, identity, trust))?;
+        if member.destination.as_deref() == Some(payload.destination()) {
+            return Ok(CommandVerificationOutcome::Confirmed);
+        }
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a subscription deletion: the subscription id must be absent from
+/// the re-read `Subscriptions` collection.
+///
+/// Members are matched by the `@odata.id` tail segment — the same identity
+/// the deletion payload names (the id is the last path segment of the
+/// subscription's `@odata.id`). A member that cannot be fetched makes the
+/// check inconclusive and is an error, for the same reason as in
+/// [`verify_subscription_created`].
+async fn verify_subscription_deleted(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteSubscription,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let subscriptions = re_read_subscriptions(bmc, root, identity, trust).await?;
+    for member_nav in subscriptions.members() {
+        let member = member_nav
+            .get(bmc)
+            .await
+            .map_err(|source| command_verification_read_error(source, identity, trust))?;
+        if member.odata_id().last_segment() == Some(payload.subscription_id()) {
+            return Ok(CommandVerificationOutcome::Mismatched);
+        }
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `EventSubscriptions` collection through the decoded
+/// `EventService` `Subscriptions` link (§11.1: no guessed path).
+async fn re_read_subscriptions(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Arc<EventSubscriptionCollectionSchema>, CommandVerificationError> {
+    let Some(event_service) = root.root.event_service.as_ref() else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let service = event_service
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(subscriptions) = service.subscriptions.as_ref() else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    bmc.get::<EventSubscriptionCollectionSchema>(&subscriptions.odata_id)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))
+}
+
+/// Completes one verification re-read with the transient Session lifecycle.
+///
+/// A known verification outcome stands despite a Session cleanup failure,
+/// for the same reason the write outcome stands: the re-read evidence is a
+/// fact about the BMC, and degrading it would push a proven result into the
+/// §13.5 `Unknown` class. When the re-read itself failed AND cleanup failed,
+/// both failures are preserved.
+async fn finish_command_verification(
+    outcome: Result<CommandVerificationOutcome, CommandVerificationError>,
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let cleanup = cleanup_session(session, identity, trust).await;
+    match cleanup {
+        Ok(()) => outcome,
+        Err(cleanup) => match outcome {
+            Ok(value) => Ok(value),
+            Err(verification) => Err(
+                CommandVerificationError::VerificationAndSessionCleanupFailed {
+                    verification: Box::new(verification),
+                    cleanup: Box::new(cleanup),
+                },
+            ),
+        },
     }
 }
 
@@ -3047,6 +4091,166 @@ pub enum RedfishServiceRootError {
     },
 }
 
+/// The provable outcome of one dispatched write command (§13.3 step 7).
+///
+/// The application boundary consumes this through `CommandOutcome`:
+/// [`Self::Accepted`] maps to the application `Accepted` outcome, every
+/// provable refusal is [`CommandExecutionError::Rejected`], and every
+/// failure whose outcome cannot be proven (§13.5) is one of the
+/// outcome-unknown error variants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandExecutionOutcome {
+    /// The BMC accepted the write: a synchronous success response
+    /// (`200`/`201`/`204`) was received and fully handled (§13.3 step 8).
+    /// A success status alone is not business success — the target still
+    /// must be re-read and verified (§13.3 steps 9–10). A `202` Task
+    /// acceptance is deliberately NOT this variant: Task monitoring (§13.6)
+    /// is a later iteration, so a `202` surfaces as
+    /// [`CommandExecutionError::AsyncTaskAccepted`] instead.
+    Accepted,
+}
+
+/// The provable reason a command was not executed.
+///
+/// Every reason here proves the BMC never executed the write, so the
+/// operation scheduler records `Failed` (§13.5). The reason is the
+/// classification contract between the gateway and the application
+/// boundary; the vendor response bodies behind a rejection are deliberately
+/// not embedded — they can carry arbitrary vendor content, and the reason
+/// is what the boundary consumes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandRejection {
+    /// Authentication failed (`401`): the credentials were refused.
+    AuthenticationFailed,
+    /// The credentials are valid but lack permission for the write (`403`).
+    PermissionDenied,
+    /// The endpoint does not expose the resource, link, or action the
+    /// command needs (§13.3 step 2: the gateway-side capability check).
+    CapabilityUnavailable,
+    /// The command payload cannot be represented safely on the wire (for
+    /// example a subscription id that would escape its collection URI).
+    InvalidCommandPayload,
+    /// The BMC refused the write with another client error (`4xx`), proving
+    /// the request was not executed.
+    RefusedByBmc,
+    /// The endpoint could not be reached or decoded before the write was
+    /// dispatched (failed root/session/target reads), proving the write was
+    /// never sent.
+    EndpointUnavailable,
+}
+
+impl fmt::Display for CommandRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AuthenticationFailed => "authentication failed",
+            Self::PermissionDenied => "permission denied",
+            Self::CapabilityUnavailable => "capability unavailable",
+            Self::InvalidCommandPayload => "invalid command payload",
+            Self::RefusedByBmc => "refused by the BMC",
+            Self::EndpointUnavailable => "endpoint unavailable",
+        })
+    }
+}
+
+/// A controlled failure while executing one typed write command.
+///
+/// The variants are the §13.5 classification surface for the application
+/// boundary: [`Self::outcome_is_unknown`] separates the failures that prove
+/// the write was never executed from the failures after which the BMC may
+/// already have applied the write. Only the outcome-unknown class may drive
+/// an operation to `Unknown`; everything else records `Failed`.
+#[derive(Debug, Error)]
+pub enum CommandExecutionError {
+    #[error("the BMC provably refused the command: {0}")]
+    Rejected(CommandRejection),
+    #[error("the command was not dispatched because of a client-side failure: {0}")]
+    NotDispatched(#[source] Box<RedfishServiceRootError>),
+    #[error("the write request was dispatched but its outcome cannot be proven: {0}")]
+    OutcomeUnknown(#[source] Box<RedfishServiceRootError>),
+    #[error(
+        "the BMC accepted the write as an asynchronous Task at {task_location}; Task monitoring is a later iteration"
+    )]
+    AsyncTaskAccepted {
+        /// The `Location` of the accepted Task; the §13.6 iteration resumes
+        /// monitoring from here.
+        task_location: nv_redfish::core::ODataId,
+    },
+    #[error(
+        "the write failed and the transient Session cleanup failed; operation: {operation}; cleanup: {cleanup}"
+    )]
+    OperationAndSessionCleanupFailed {
+        operation: Box<CommandExecutionError>,
+        #[source]
+        cleanup: Box<RedfishServiceRootError>,
+    },
+}
+
+impl CommandExecutionError {
+    /// Reports whether the BMC may already have executed the write (§13.5).
+    ///
+    /// Only the outcome-unknown class (a dispatched write with a lost,
+    /// dropped, timed-out, server-failed, or undecodable response, or a
+    /// `202` Task acceptance) returns `true`; the operation scheduler must
+    /// never blindly retry a write in this class.
+    #[must_use]
+    pub const fn outcome_is_unknown(&self) -> bool {
+        match self {
+            Self::OutcomeUnknown(_) | Self::AsyncTaskAccepted { .. } => true,
+            Self::Rejected(_) | Self::NotDispatched(_) => false,
+            Self::OperationAndSessionCleanupFailed { operation, .. } => {
+                operation.outcome_is_unknown()
+            }
+        }
+    }
+}
+
+impl From<RedfishServiceRootError> for CommandExecutionError {
+    fn from(source: RedfishServiceRootError) -> Self {
+        Self::NotDispatched(Box::new(source))
+    }
+}
+
+/// The verdict of a post-execution target re-read (§13.3 steps 9–10).
+///
+/// The application boundary consumes this through `VerificationVerdict`:
+/// `Confirmed` records the operation `Succeeded`, `Mismatched` records
+/// `Failed` (the re-read proves the expected result is absent).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandVerificationOutcome {
+    /// The re-read confirmed the expected result.
+    Confirmed,
+    /// The re-read proves the expected result is absent.
+    Mismatched,
+}
+
+/// A controlled failure while re-reading the target of an accepted write.
+///
+/// Every failure in this boundary proves nothing about the write: the
+/// verifier only runs after an `Accepted` dispatch, so a failed re-read
+/// records `Unknown` (§13.5) instead of a failure, no matter why the
+/// re-read failed.
+#[derive(Debug, Error)]
+pub enum CommandVerificationError {
+    #[error("the verification re-read failed; this proves nothing about the write: {0}")]
+    ReReadFailed(#[source] Box<RedfishServiceRootError>),
+    #[error("the endpoint no longer advertises the resource the command targeted")]
+    CapabilityUnavailable,
+    #[error(
+        "the verification re-read and the transient Session cleanup both failed; verification: {verification}; cleanup: {cleanup}"
+    )]
+    VerificationAndSessionCleanupFailed {
+        verification: Box<CommandVerificationError>,
+        #[source]
+        cleanup: Box<RedfishServiceRootError>,
+    },
+}
+
+impl From<RedfishServiceRootError> for CommandVerificationError {
+    fn from(source: RedfishServiceRootError) -> Self {
+        Self::ReReadFailed(Box::new(source))
+    }
+}
+
 /// TLS identity evidence could not be retained because its synchronization
 /// state was poisoned.
 #[derive(Clone, Copy, Debug, Error)]
@@ -3629,6 +4833,231 @@ fn json_error_category(error: &reqwest::Error) -> Option<JsonErrorCategory> {
         source = current.source();
     }
     None
+}
+
+/// Classifies one failure that occurred before the write request was
+/// dispatched (§13.3 steps 1–6).
+///
+/// Every failure in this phase proves the write was never sent, so none of
+/// them is outcome-unknown (§13.5): authentication and permission failures
+/// become their rejection reasons, unreachable or undecodable read surfaces
+/// become [`CommandRejection::EndpointUnavailable`], and TLS-safety
+/// failures become [`CommandExecutionError::NotDispatched`] because the
+/// trust boundary broke before any write could go out.
+fn classify_command_preparation_error(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CommandExecutionError {
+    match classify_service_root_error(source, identity, trust) {
+        RedfishServiceRootError::AuthenticationFailed { .. } => {
+            CommandExecutionError::Rejected(CommandRejection::AuthenticationFailed)
+        }
+        RedfishServiceRootError::PermissionDenied { .. } => {
+            CommandExecutionError::Rejected(CommandRejection::PermissionDenied)
+        }
+        RedfishServiceRootError::NotRedfishService { .. }
+        | RedfishServiceRootError::NetworkTimeout { .. }
+        | RedfishServiceRootError::Network { .. }
+        | RedfishServiceRootError::RemoteResponse { .. }
+        | RedfishServiceRootError::SchemaIncompatible { .. }
+        | RedfishServiceRootError::Upstream(_) => {
+            CommandExecutionError::Rejected(CommandRejection::EndpointUnavailable)
+        }
+        source @ (RedfishServiceRootError::TlsConfiguration(_)
+        | RedfishServiceRootError::ClientBuild(_)
+        | RedfishServiceRootError::TlsIdentityState(_)
+        | RedfishServiceRootError::TlsIdentityChanged(_)
+        | RedfishServiceRootError::TlsRejected { .. }
+        | RedfishServiceRootError::SessionCleanupTlsRejected
+        | RedfishServiceRootError::SessionCleanupFailed
+        | RedfishServiceRootError::OperationAndSessionCleanupFailed { .. }) => {
+            CommandExecutionError::NotDispatched(Box::new(source))
+        }
+    }
+}
+
+/// Converts one pre-dispatch `BmcError` into the error value the command
+/// resolvers propagate through `map_err`.
+fn command_preparation_error(
+    source: BmcError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CommandExecutionError {
+    classify_command_preparation_error(nv_redfish::Error::Bmc(source), identity, trust)
+}
+
+/// Classifies one failure of the write request itself.
+///
+/// The classification mirrors §13.5 exactly: a received client error
+/// response (`4xx`) proves the BMC refused the write and becomes a
+/// rejection; a timeout, a dropped or lost response, a server-side failure
+/// (`5xx`), an undecodable success payload, or a TLS-safety failure all
+/// leave the request's outcome unprovable and become
+/// [`CommandExecutionError::OutcomeUnknown`].
+fn classify_command_write_error(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CommandExecutionError {
+    match identity.take_change(trust) {
+        Ok(Some(changed)) => {
+            return CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::TlsIdentityChanged(changed),
+            ));
+        }
+        Err(source) => {
+            return CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::TlsIdentityState(source),
+            ));
+        }
+        Ok(None) => {}
+    }
+    let tls_rejected = identity.validation_rejected();
+    match source {
+        nv_redfish::Error::Bmc(source) if tls_rejected => {
+            CommandExecutionError::OutcomeUnknown(Box::new(RedfishServiceRootError::TlsRejected {
+                source,
+            }))
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. }) => match status {
+            StatusCode::UNAUTHORIZED => {
+                CommandExecutionError::Rejected(CommandRejection::AuthenticationFailed)
+            }
+            StatusCode::FORBIDDEN => {
+                CommandExecutionError::Rejected(CommandRejection::PermissionDenied)
+            }
+            value if value.is_client_error() => {
+                CommandExecutionError::Rejected(CommandRejection::RefusedByBmc)
+            }
+            // A server-side failure while handling the write: the
+            // request may already have been applied (§13.5).
+            _ => CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::RemoteResponse { source },
+            )),
+        },
+        nv_redfish::Error::Bmc(source @ (BmcError::JsonError(_) | BmcError::DecodeError(_))) => {
+            CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::SchemaIncompatible {
+                    source: nv_redfish::Error::Bmc(source),
+                },
+            ))
+        }
+        nv_redfish::Error::Bmc(BmcError::ReqwestError(error))
+            if matches!(
+                json_error_category(&error),
+                Some(JsonErrorCategory::Syntax | JsonErrorCategory::Eof)
+            ) =>
+        {
+            CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::NotRedfishService {
+                    source: BmcError::ReqwestError(error),
+                },
+            ))
+        }
+        nv_redfish::Error::Bmc(BmcError::ReqwestError(error)) if error.is_decode() => {
+            CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::SchemaIncompatible {
+                    source: nv_redfish::Error::Bmc(BmcError::ReqwestError(error)),
+                },
+            ))
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::ReqwestError(_)) => {
+            // A timeout or a dropped connection after dispatch: the request
+            // may already have been applied (§13.5).
+            CommandExecutionError::OutcomeUnknown(Box::new(RedfishServiceRootError::Network {
+                source,
+            }))
+        }
+        nv_redfish::Error::ActionNotAvailable => {
+            CommandExecutionError::Rejected(CommandRejection::CapabilityUnavailable)
+        }
+        source => CommandExecutionError::OutcomeUnknown(Box::new(
+            RedfishServiceRootError::Upstream(source),
+        )),
+    }
+}
+
+/// Maps the domain `ResetType` projection onto the compiled CSDL
+/// `ResetType` member set. The domain member set is pinned to the CSDL by
+/// const tests, so this match cannot drift silently.
+fn map_reset_type(value: ResetType) -> nv_redfish::schema::resource::ResetType {
+    use nv_redfish::schema::resource::ResetType as NvResetType;
+    match value {
+        ResetType::On => NvResetType::On,
+        ResetType::ForceOff => NvResetType::ForceOff,
+        ResetType::GracefulShutdown => NvResetType::GracefulShutdown,
+        ResetType::GracefulRestart => NvResetType::GracefulRestart,
+        ResetType::ForceRestart => NvResetType::ForceRestart,
+        ResetType::Nmi => NvResetType::Nmi,
+        ResetType::ForceOn => NvResetType::ForceOn,
+        ResetType::PushPowerButton => NvResetType::PushPowerButton,
+        ResetType::PowerCycle => NvResetType::PowerCycle,
+        ResetType::Suspend => NvResetType::Suspend,
+        ResetType::Pause => NvResetType::Pause,
+        ResetType::Resume => NvResetType::Resume,
+        ResetType::FullPowerCycle => NvResetType::FullPowerCycle,
+    }
+}
+
+/// Maps the domain `BootSource` projection onto the compiled CSDL
+/// `BootSource` member set (including the `SDCard` wire name).
+fn map_boot_source(value: BootSource) -> nv_redfish::schema::computer_system::BootSource {
+    use nv_redfish::schema::computer_system::BootSource as NvBootSource;
+    match value {
+        BootSource::None => NvBootSource::None,
+        BootSource::Pxe => NvBootSource::Pxe,
+        BootSource::Floppy => NvBootSource::Floppy,
+        BootSource::Cd => NvBootSource::Cd,
+        BootSource::Usb => NvBootSource::Usb,
+        BootSource::Hdd => NvBootSource::Hdd,
+        BootSource::BiosSetup => NvBootSource::BiosSetup,
+        BootSource::Utilities => NvBootSource::Utilities,
+        BootSource::Diags => NvBootSource::Diags,
+        BootSource::UefiShell => NvBootSource::UefiShell,
+        BootSource::UefiTarget => NvBootSource::UefiTarget,
+        BootSource::SdCard => NvBootSource::SdCard,
+        BootSource::UefiHttp => NvBootSource::UefiHttp,
+        BootSource::RemoteDrive => NvBootSource::RemoteDrive,
+        BootSource::UefiBootNext => NvBootSource::UefiBootNext,
+        BootSource::Recovery => NvBootSource::Recovery,
+    }
+}
+
+/// Maps the domain override-enabled projection onto the compiled CSDL
+/// member set.
+fn map_boot_override_enabled(
+    value: BootSourceOverrideEnabled,
+) -> nv_redfish::schema::computer_system::BootSourceOverrideEnabled {
+    use nv_redfish::schema::computer_system::BootSourceOverrideEnabled as NvEnabled;
+    match value {
+        BootSourceOverrideEnabled::Disabled => NvEnabled::Disabled,
+        BootSourceOverrideEnabled::Once => NvEnabled::Once,
+        BootSourceOverrideEnabled::Continuous => NvEnabled::Continuous,
+    }
+}
+
+/// Maps the domain override-mode projection onto the compiled CSDL member
+/// set (the CSDL member is the all-caps `UEFI`).
+fn map_boot_override_mode(
+    value: BootSourceOverrideMode,
+) -> nv_redfish::schema::computer_system::BootSourceOverrideMode {
+    use nv_redfish::schema::computer_system::BootSourceOverrideMode as NvMode;
+    match value {
+        BootSourceOverrideMode::Legacy => NvMode::Legacy,
+        BootSourceOverrideMode::Uefi => NvMode::Uefi,
+    }
+}
+
+/// Maps the domain `ResetKeysType` projection onto the compiled CSDL
+/// member set (including the `DeletePK` wire name).
+fn map_reset_keys_type(value: ResetKeysType) -> nv_redfish::schema::secure_boot::ResetKeysType {
+    use nv_redfish::schema::secure_boot::ResetKeysType as NvResetKeysType;
+    match value {
+        ResetKeysType::ResetAllKeysToDefault => NvResetKeysType::ResetAllKeysToDefault,
+        ResetKeysType::DeleteAllKeys => NvResetKeysType::DeleteAllKeys,
+        ResetKeysType::DeletePk => NvResetKeysType::DeletePk,
+    }
 }
 
 impl TlsProbe {
@@ -9877,6 +11306,1773 @@ mod tests {
         })
     }
 
+    /// The System document for write tests: advertises the `Boot` object,
+    /// the `SecureBoot` link, and the `#ComputerSystem.Reset` action.
+    const COMMAND_SYSTEM_WITH_RESET_ACTION_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Boot":{
+            "BootSourceOverrideTarget":"None",
+            "BootSourceOverrideEnabled":"Disabled",
+            "BootSourceOverrideMode":"UEFI"
+        },
+        "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
+        "Actions":{
+            "#ComputerSystem.Reset":{"target":"/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}
+        }
+    }"##;
+
+    /// A System document that advertises no write capability at all: no
+    /// `Actions`, no `Boot` object, and no `SecureBoot` link. Used to pin
+    /// the §13.3 step 2 capability checks.
+    const COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical"
+    }"#;
+
+    /// The Chassis document for write tests: advertises the
+    /// `#Chassis.Reset` action.
+    const COMMAND_CHASSIS_WITH_RESET_ACTION_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Actions":{
+            "#Chassis.Reset":{"target":"/redfish/v1/Chassis/1/Actions/Chassis.Reset"}
+        }
+    }"##;
+
+    /// The Manager document for write tests: advertises the
+    /// `#Manager.Reset` action.
+    const COMMAND_MANAGER_WITH_RESET_ACTION_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Actions":{
+            "#Manager.Reset":{"target":"/redfish/v1/Managers/1/Actions/Manager.Reset"}
+        }
+    }"##;
+
+    /// The `SecureBoot` document for write tests: advertises the
+    /// `#SecureBoot.ResetKeys` action.
+    const COMMAND_SECURE_BOOT_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+        "Id":"SecureBoot",
+        "Name":"UEFI Secure Boot",
+        "SecureBootEnable":true,
+        "SecureBootCurrentBoot":"Enabled",
+        "Actions":{
+            "#SecureBoot.ResetKeys":{
+                "target":"/redfish/v1/Systems/1/SecureBoot/Actions/SecureBoot.ResetKeys"
+            }
+        }
+    }"##;
+
+    /// The `EventService` document for write tests: advertises the
+    /// `Subscriptions` collection.
+    const COMMAND_EVENT_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/EventService",
+        "Id":"EventService",
+        "Name":"Event Service",
+        "ServiceEnabled":true,
+        "Subscriptions":{"@odata.id":"/redfish/v1/EventService/Subscriptions"}
+    }"#;
+
+    /// An `EventService` document that advertises no `Subscriptions` link.
+    const COMMAND_EVENT_SERVICE_WITHOUT_SUBSCRIPTIONS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/EventService",
+        "Id":"EventService",
+        "Name":"Event Service",
+        "ServiceEnabled":true
+    }"#;
+
+    /// The `201` create response of one event subscription.
+    const COMMAND_EVENT_SUBSCRIPTION_CREATED_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/EventService/Subscriptions/Sub-1",
+        "Id":"Sub-1",
+        "Name":"Event Subscription",
+        "Destination":"https://example.com/hook",
+        "Protocol":"Redfish",
+        "EventTypes":["Alert"]
+    }"#;
+
+    /// The request order of one System/Manager/Chassis reset: the Session
+    /// lifecycle around the collection, member, and action requests.
+    const RESET_COMMAND_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one Boot override: the Session lifecycle around
+    /// the collection, member, and typed `PATCH` requests.
+    const BOOT_OVERRIDE_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one Secure Boot property command: the Session
+    /// lifecycle around the collection, member, `SecureBoot` document, and the
+    /// `PATCH` of the `SecureBoot` document itself.
+    const SECURE_BOOT_COMMAND_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one Secure Boot action command: identical to
+    /// [`SECURE_BOOT_COMMAND_REQUEST_PATHS`] except that the write is the
+    /// decoded `#SecureBoot.ResetKeys` action target.
+    const SECURE_BOOT_ACTION_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/Systems/1/SecureBoot/Actions/SecureBoot.ResetKeys",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one event subscription creation: the Session
+    /// lifecycle around the `EventService` document and the `POST` onto the
+    /// `Subscriptions` collection.
+    const EVENT_SUBSCRIPTION_CREATE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one event subscription deletion: identical to
+    /// [`EVENT_SUBSCRIPTION_CREATE_REQUEST_PATHS`] except that the write is
+    /// the `DELETE` of the typed subscription id joined onto the decoded
+    /// collection URI.
+    const EVENT_SUBSCRIPTION_DELETE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions/Sub-1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// Builds the Session lifecycle responses around one write response, so
+    /// a test can vary the write status (or drop the connection with an
+    /// empty response) without repeating the lifecycle.
+    fn command_write_sequence(
+        service_root_body: &str,
+        before_write: &[(&str, &str)],
+        write: Vec<u8>,
+    ) -> Vec<Vec<u8>> {
+        let mut responses = vec![
+            http_response("200 OK", service_root_body),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response_with_headers(
+                "201 Created",
+                SESSION_BODY,
+                &[
+                    ("X-Auth-Token", "test-session-token"),
+                    ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                ],
+            ),
+        ];
+        responses.extend(
+            before_write
+                .iter()
+                .map(|(status, body)| http_response(status, body)),
+        );
+        responses.push(write);
+        responses.push(http_response("204 No Content", ""));
+        responses
+    }
+
+    /// Extracts the body of one captured request.
+    fn request_body(request: &[u8]) -> Option<&str> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        std::str::from_utf8(request.get(header_end + 4..)?).ok()
+    }
+
+    /// Asserts the request sequence of one command execution: the standard
+    /// Session lifecycle (index 3 creates the Session, the last request
+    /// deletes it over the Basic transport) around one
+    /// token-authenticated write request at `last - 1`.
+    ///
+    /// `write_method` and `expected_write_body` pin the wire form of the
+    /// write request itself.
+    fn assert_command_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+        write_method: &str,
+        expected_write_body: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        let last = requests.len().saturating_sub(1);
+        let write_index = last.saturating_sub(1);
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = match index {
+                3 => "POST",
+                value if value == write_index => write_method,
+                value if value == last => "DELETE",
+                _ => "GET",
+            };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n")),
+                "request {index} must be {expected_method} {expected_path}, was: {request}"
+            );
+            let authorization = request_header(request, "authorization");
+            let token = request_header(request, "x-auth-token");
+            match index {
+                3 => {
+                    assert!(authorization.is_none());
+                    assert!(token.is_none());
+                }
+                4.. if index < last => {
+                    assert!(authorization.is_none());
+                    assert_eq!(token, Some("test-session-token"));
+                }
+                _ => {
+                    assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                    assert!(token.is_none());
+                }
+            }
+            if index != 3 {
+                assert!(!request.contains("password"));
+            }
+            if index == write_index {
+                assert_eq!(
+                    request_body(request.as_bytes()),
+                    Some(expected_write_body),
+                    "write request body at index {index}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_system_reset_through_the_typed_action_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &RESET_COMMAND_REQUEST_PATHS,
+            "POST",
+            r#"{"ResetType":"PowerCycle"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_manager_reset_through_the_typed_action_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Managers",
+                "/redfish/v1/Managers/1",
+                "/redfish/v1/Managers/1/Actions/Manager.Reset",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            r#"{"ResetType":"GracefulRestart"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_chassis_reset_through_the_typed_action_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Chassis",
+                "/redfish/v1/Chassis/1",
+                "/redfish/v1/Chassis/1/Actions/Chassis.Reset",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            r#"{"ResetType":"ForceOff"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_boot_override_through_the_typed_patch_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                    SetBootSourceOverride::new(
+                        BootSource::Pxe,
+                        BootSourceOverrideEnabled::Once,
+                        BootSourceOverrideMode::Uefi,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        let requests = server.finish_all().await?;
+        assert_command_requests(
+            &requests,
+            &BOOT_OVERRIDE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"Boot":{"BootSourceOverrideTarget":"Pxe","BootSourceOverrideEnabled":"Once","BootSourceOverrideMode":"UEFI"}}"#,
+        )?;
+        let write = std::str::from_utf8(&requests[6])?;
+        assert_eq!(request_header(write, "if-match"), Some("*"));
+        assert_eq!(
+            request_header(write, "content-type"),
+            Some("application/json")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_secure_boot_enable_through_the_typed_patch_api() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SECURE_BOOT_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &SECURE_BOOT_COMMAND_REQUEST_PATHS,
+            "PATCH",
+            r#"{"SecureBootEnable":true}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_secure_boot_disable_through_the_typed_patch_api() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SECURE_BOOT_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::Disable),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &SECURE_BOOT_COMMAND_REQUEST_PATHS,
+            "PATCH",
+            r#"{"SecureBootEnable":false}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_secure_boot_reset_keys_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SECURE_BOOT_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(
+                    ResetKeysType::ResetAllKeysToDefault,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &SECURE_BOOT_ACTION_REQUEST_PATHS,
+            "POST",
+            r#"{"ResetKeysType":"ResetAllKeysToDefault"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_event_subscription_creation_through_the_typed_create_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_EVENT_SERVICE_BODY)],
+            http_response("201 Created", COMMAND_EVENT_SUBSCRIPTION_CREATED_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://example.com/hook".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &EVENT_SUBSCRIPTION_CREATE_REQUEST_PATHS,
+            "POST",
+            r#"{"Destination":"https://example.com/hook","Protocol":"Redfish","EventTypes":["Alert"]}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_event_subscription_deletion_through_the_typed_delete_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_EVENT_SERVICE_BODY)],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "Sub-1".to_owned(),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &EVENT_SUBSCRIPTION_DELETE_REQUEST_PATHS,
+            "DELETE",
+            "",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_system_reset_when_the_reset_action_is_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        // The capability check rejects the command after the member fetch,
+        // so no write response is ever served: the sequence is exactly the
+        // Session lifecycle plus the collection and member reads.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        // The capability check stops the sequence before any write request:
+        // the collection and member are read, then the Session is deleted.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/Systems/1/Actions"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_boot_override_when_the_system_carries_no_boot_object()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                    SetBootSourceOverride::new(
+                        BootSource::Pxe,
+                        BootSourceOverrideEnabled::Once,
+                        BootSourceOverrideMode::Uefi,
+                    ),
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"PATCH /redfish/v1/Systems/1 "))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_secure_boot_commands_when_the_secure_boot_link_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"PATCH /redfish/v1/Systems/1/SecureBoot "))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_subscription_creation_when_the_subscriptions_link_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_EVENT_SERVICE_WITHOUT_SUBSCRIPTIONS_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://example.com/hook".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(requests
+            .iter()
+            .all(|request| !request.starts_with(b"POST /redfish/v1/EventService/Subscriptions")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_subscription_deletion_with_an_unsafe_subscription_id()
+    -> Result<(), Box<dyn Error>> {
+        for unsafe_id in [
+            "../Systems/1",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a%2Fb",
+            "a b",
+            "..",
+            ".",
+            "",
+        ] {
+            // The payload validation stops the sequence before the
+            // EventService fetch, so only the Session lifecycle is served.
+            let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+                FULL_SERVICE_ROOT_BODY,
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &RedfishCommand::Event(EventCommand::DeleteSubscription(
+                        DeleteSubscription::new(unsafe_id.to_owned()),
+                    )),
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(CommandExecutionError::Rejected(
+                        CommandRejection::InvalidCommandPayload
+                    ))
+                ),
+                "subscription id {unsafe_id:?} must be rejected before any request"
+            );
+            // The payload validation stops the sequence before the
+            // EventService fetch: only the Session lifecycle requests were
+            // made, and no deletion was ever dispatched.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.starts_with(b"DELETE /redfish/v1/EventService/"))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_commands_when_the_service_root_authentication_fails()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_sequence(&[("401 Unauthorized", "")]).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::AuthenticationFailed
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(b"GET /redfish/v1 HTTP/1.1\r\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_the_write_when_the_bmc_refuses_authentication() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("401 Unauthorized", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::AuthenticationFailed
+            ))
+        ));
+        assert_command_requests(
+            &server.finish_all().await?,
+            &RESET_COMMAND_REQUEST_PATHS,
+            "POST",
+            r#"{"ResetType":"On"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_the_write_when_permission_is_denied() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("403 Forbidden", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::PermissionDenied
+            ))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_the_write_when_the_bmc_returns_another_client_error()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response(
+                "400 Bad Request",
+                r#"{"error":{"code":"Base.1.0.GeneralError","message":"ResetType not allowed"}}"#,
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::RefusedByBmc
+            ))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_a_server_failure_during_the_write_as_result_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response(
+                "500 Internal Server Error",
+                r#"{"error":{"code":"Base.1.0.InternalError","message":"boom"}}"#,
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(accepted) => {
+                return Err(format!("a 5xx during the write must fail, got {accepted:?}").into());
+            }
+        };
+        assert!(
+            error.outcome_is_unknown(),
+            "a 5xx response may mean the write was applied: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_a_dropped_connection_during_the_write_as_result_unknown()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            Vec::new(),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(accepted) => {
+                return Err(
+                    format!("a dropped write connection must fail, got {accepted:?}").into(),
+                );
+            }
+        };
+        assert!(
+            error.outcome_is_unknown(),
+            "the write may already have been applied: {error}"
+        );
+        // The write request itself was captured before the connection
+        // dropped, proving the write was actually dispatched.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 8);
+        let write = std::str::from_utf8(&requests[6])?;
+        assert!(write.starts_with("POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset"));
+        assert_eq!(request_body(&requests[6]), Some(r#"{"ResetType":"On"}"#));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn surfaces_an_accepted_task_as_an_outcome_unknown_error() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response_with_headers(
+                "202 Accepted",
+                "",
+                &[("Location", "/redfish/v1/TaskService/Tasks/42")],
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        let task_location = match outcome {
+            Err(CommandExecutionError::AsyncTaskAccepted { task_location }) => task_location,
+            other => {
+                return Err(
+                    format!("a 202 must surface as AsyncTaskAccepted, got {other:?}").into(),
+                );
+            }
+        };
+        assert_eq!(
+            task_location.to_string(),
+            "/redfish/v1/TaskService/Tasks/42"
+        );
+        assert!(
+            CommandExecutionError::AsyncTaskAccepted { task_location }.outcome_is_unknown(),
+            "a 202 means the BMC accepted the write, so the outcome is unprovable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn subscription_id_validation_accepts_only_single_safe_segments() {
+        for safe in ["Sub-1", "sub_1", "42", "aBcD-9_x"] {
+            assert_eq!(validate_subscription_id(safe), Some(safe));
+        }
+        for unsafe_id in [
+            "", "/", "a/b", "..", ".", "a%2Fb", "a b", "a#b", "a?b", "a\\b", "a\tb",
+        ] {
+            assert_eq!(
+                validate_subscription_id(unsafe_id),
+                None,
+                "id {unsafe_id:?} must not form a deletion URI"
+            );
+        }
+    }
+
+    #[test]
+    fn command_error_verdicts_match_the_design_13_5_classification() -> Result<(), Box<dyn Error>> {
+        let url = url::Url::parse("https://192.0.2.1/redfish/v1")?;
+        let bmc_error = |status| BmcError::InvalidResponse {
+            url: url.clone(),
+            status,
+            text: String::new(),
+        };
+
+        let network =
+            CommandExecutionError::OutcomeUnknown(Box::new(RedfishServiceRootError::Network {
+                source: bmc_error(StatusCode::INTERNAL_SERVER_ERROR),
+            }));
+        assert!(network.outcome_is_unknown());
+
+        let rejected = CommandExecutionError::Rejected(CommandRejection::RefusedByBmc);
+        assert!(!rejected.outcome_is_unknown());
+
+        let not_dispatched =
+            CommandExecutionError::NotDispatched(Box::new(RedfishServiceRootError::TlsRejected {
+                source: bmc_error(StatusCode::UNAUTHORIZED),
+            }));
+        assert!(!not_dispatched.outcome_is_unknown());
+
+        let combined = CommandExecutionError::OperationAndSessionCleanupFailed {
+            operation: Box::new(CommandExecutionError::OutcomeUnknown(Box::new(
+                RedfishServiceRootError::NetworkTimeout {
+                    source: bmc_error(StatusCode::REQUEST_TIMEOUT),
+                },
+            ))),
+            cleanup: Box::new(RedfishServiceRootError::SessionCleanupFailed),
+        };
+        assert!(combined.outcome_is_unknown());
+
+        let combined_not_dispatched = CommandExecutionError::OperationAndSessionCleanupFailed {
+            operation: Box::new(rejected),
+            cleanup: Box::new(RedfishServiceRootError::SessionCleanupFailed),
+        };
+        assert!(!combined_not_dispatched.outcome_is_unknown());
+        Ok(())
+    }
+
+    /// Builds the bare Session lifecycle responses (root read, `SessionService`
+    /// read, Sessions read, Session create, Session delete) without any
+    /// post-session response, for tests whose command is rejected before it
+    /// can dispatch a write.
+    /// A `Subscriptions` collection whose single member is a subscription
+    /// with a different `Destination` than the verification payload, used to
+    /// pin the `Mismatched` verdict.
+    const COMMAND_SUBSCRIPTIONS_WITH_ONE_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#EventDestinationCollection.EventDestinationCollection",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions",
+        "Name":"Event Subscription Collection",
+        "Members":[{"@odata.id":"/redfish/v1/EventService/Subscriptions/1"}]
+    }"##;
+
+    /// A `Subscriptions` collection whose single member is the freshly
+    /// created subscription (`Sub-1`), used by the deletion verification
+    /// tests.
+    const COMMAND_SUBSCRIPTIONS_WITH_CREATED_MEMBER_BODY: &str = r##"{
+        "@odata.type":"#EventDestinationCollection.EventDestinationCollection",
+        "@odata.id":"/redfish/v1/EventService/Subscriptions",
+        "Name":"Event Subscription Collection",
+        "Members":[{"@odata.id":"/redfish/v1/EventService/Subscriptions/Sub-1"}]
+    }"##;
+
+    /// The request order of one subscription-create verification: the
+    /// Session lifecycle around the `EventService` document, the
+    /// `Subscriptions` collection, and the single member fetch.
+    const VERIFY_SUBSCRIPTION_CREATE_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/EventService/Subscriptions/Sub-1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one subscription verification against a
+    /// collection with one member: the Session lifecycle around the
+    /// `EventService` document, the `Subscriptions` collection, and the
+    /// member fetch.
+    const VERIFY_SUBSCRIPTION_ONE_MEMBER_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/EventService/Subscriptions/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one subscription verification against an empty
+    /// collection (or one whose collection fetch fails): the Session
+    /// lifecycle around the `EventService` document and the `Subscriptions`
+    /// collection.
+    const VERIFY_SUBSCRIPTION_COLLECTION_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/EventService",
+        "/redfish/v1/EventService/Subscriptions",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one system-family verification ("accepted"
+    /// semantics): the Session lifecycle around the collection and member
+    /// reads.
+    const VERIFY_SYSTEM_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one Secure Boot verification: the Session
+    /// lifecycle around the system and `SecureBoot` document reads.
+    const VERIFY_SECURE_BOOT_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/SecureBoot",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// Asserts the request sequence of one verification re-read: the
+    /// standard Session lifecycle (index 3 creates the Session, the last
+    /// request deletes it over the Basic transport) around
+    /// token-authenticated `GET` re-reads.
+    fn assert_verification_requests(
+        requests: &[Vec<u8>],
+        expected_paths: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(requests.len(), expected_paths.len());
+        let last = requests.len().saturating_sub(1);
+        for (index, (request, expected_path)) in requests.iter().zip(expected_paths).enumerate() {
+            let request = std::str::from_utf8(request)?;
+            let expected_method = match index {
+                3 => "POST",
+                value if value == last => "DELETE",
+                _ => "GET",
+            };
+            assert!(
+                request.starts_with(&format!("{expected_method} {expected_path} HTTP/1.1\r\n")),
+                "request {index} must be {expected_method} {expected_path}, was: {request}"
+            );
+            let authorization = request_header(request, "authorization");
+            let token = request_header(request, "x-auth-token");
+            match index {
+                3 => {
+                    assert!(authorization.is_none());
+                    assert!(token.is_none());
+                }
+                4.. if index < last => {
+                    assert!(authorization.is_none());
+                    assert_eq!(token, Some("test-session-token"));
+                }
+                _ => {
+                    assert!(authorization.is_some_and(|value| value.starts_with("Basic ")));
+                    assert!(token.is_none());
+                }
+            }
+            if index != 3 {
+                assert!(!request.contains("password"));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_creation_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("200 OK", COMMAND_SUBSCRIPTIONS_WITH_CREATED_MEMBER_BODY),
+                ("200 OK", COMMAND_EVENT_SUBSCRIPTION_CREATED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://example.com/hook".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_CREATE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_deletion_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("200 OK", EVENT_SUBSCRIPTIONS_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "Sub-1".to_owned(),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_COLLECTION_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_creation_as_mismatched_when_the_destination_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("200 OK", COMMAND_SUBSCRIPTIONS_WITH_ONE_MEMBER_BODY),
+                ("200 OK", EVENT_SUBSCRIPTION_ONE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://example.com/hook".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_ONE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_deletion_as_mismatched_when_the_id_is_still_present()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("200 OK", COMMAND_SUBSCRIPTIONS_WITH_CREATED_MEMBER_BODY),
+                ("200 OK", COMMAND_EVENT_SUBSCRIPTION_CREATED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "Sub-1".to_owned(),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_CREATE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_system_and_boot_commands_by_re_reading_the_target()
+    -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                SetBootSourceOverride::new(
+                    BootSource::Pxe,
+                    BootSourceOverrideEnabled::Once,
+                    BootSourceOverrideMode::Uefi,
+                ),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", FULL_SYSTEMS_BODY),
+                    ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+            assert_verification_requests(
+                &server.finish_all().await?,
+                &VERIFY_SYSTEM_REQUEST_PATHS,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_manager_and_chassis_resets_by_re_reading_the_targets()
+    -> Result<(), Box<dyn Error>> {
+        for (command, paths, member) in [
+            (
+                RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Managers",
+                    "/redfish/v1/Managers/1",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
+            ),
+            (
+                RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Chassis",
+                    "/redfish/v1/Chassis/1",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", COMMAND_CHASSIS_WITH_RESET_ACTION_BODY),
+            ),
+        ] {
+            let collection = if matches!(command, RedfishCommand::Manager(_)) {
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY)
+            } else {
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY)
+            };
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[collection, member],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+            assert_verification_requests(&server.finish_all().await?, &paths)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_secure_boot_commands_by_re_reading_the_document() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SECURE_BOOT_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(
+                    ResetKeysType::ResetAllKeysToDefault,
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SECURE_BOOT_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_commands_as_an_error_when_the_collection_cannot_be_re_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "Sub-1".to_owned(),
+                ))),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(CommandVerificationError::ReReadFailed(_))),
+            "an unreadable collection proves nothing about the write: {verdict:?}"
+        );
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_COLLECTION_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_creation_as_an_error_when_a_member_cannot_be_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_EVENT_SERVICE_BODY),
+                ("200 OK", COMMAND_SUBSCRIPTIONS_WITH_ONE_MEMBER_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::CreateSubscription(
+                    CreateSubscription::try_new(
+                        "https://example.com/hook".to_owned(),
+                        EventDestinationProtocol::Redfish,
+                        vec![EventType::Alert],
+                    )?,
+                )),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(CommandVerificationError::ReReadFailed(_))),
+            "an unreadable member must not be reported as Mismatched: {verdict:?}"
+        );
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &VERIFY_SUBSCRIPTION_ONE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_reset_commands_as_an_error_when_the_target_cannot_be_re_read()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        assert!(
+            matches!(verdict, Err(CommandVerificationError::ReReadFailed(_))),
+            "an unreadable target proves nothing about the write: {verdict:?}"
+        );
+        assert_verification_requests(&server.finish_all().await?, &VERIFY_SYSTEM_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_subscription_commands_as_an_error_when_the_link_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_EVENT_SERVICE_WITHOUT_SUBSCRIPTIONS_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                    "Sub-1".to_owned(),
+                ))),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                verdict,
+                Err(CommandVerificationError::CapabilityUnavailable)
+            ),
+            "a vanished subscription link cannot confirm anything: {verdict:?}"
+        );
+        Ok(())
+    }
+
+    fn session_lifecycle_sequence(service_root_body: &str) -> Vec<Vec<u8>> {
+        let mut responses = vec![
+            http_response("200 OK", service_root_body),
+            http_response("200 OK", SESSION_SERVICE_BODY),
+            http_response("200 OK", SESSIONS_BODY),
+            http_response_with_headers(
+                "201 Created",
+                SESSION_BODY,
+                &[
+                    ("X-Auth-Token", "test-session-token"),
+                    ("Location", "/redfish/v1/SessionService/Sessions/1"),
+                ],
+            ),
+        ];
+        responses.push(http_response("204 No Content", ""));
+        responses
+    }
+
     fn session_response_sequence(
         service_root_body: &str,
         after_session: &[(&str, &str)],
@@ -10026,7 +13222,15 @@ mod tests {
                 requests.push(Vec::new());
                 continue;
             };
-            let request = read_request_headers(&mut stream).await?;
+            let request = read_request(&mut stream).await?;
+            if response.is_empty() {
+                // An empty response encodes a dropped connection: the
+                // request is captured (so the test can assert it was
+                // attempted) and the connection closes without any response,
+                // which the client observes as a broken connection.
+                requests.push(request);
+                continue;
+            }
             stream.write_all(&response).await?;
             stream.shutdown().await?;
             requests.push(request);
@@ -10034,13 +13238,13 @@ mod tests {
         Ok(requests)
     }
 
-    async fn read_request_headers(
+    async fn read_request(
         stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     ) -> Result<Vec<u8>, io::Error> {
         const MAX_REQUEST_BYTES: usize = 16 * 1024;
         let mut request = Vec::new();
         let mut chunk = [0_u8; 1024];
-        loop {
+        let header_end = loop {
             let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test HTTP request"))??;
@@ -10054,9 +13258,38 @@ mod tests {
                     "test HTTP request headers exceeded limit",
                 ));
             }
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                return Ok(request);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        // Write tests assert the exact request body, so the body is captured
+        // after the headers. The body length comes from `Content-Length`;
+        // the gateway's JSON requests always carry it.
+        let content_length = std::str::from_utf8(&request[..header_end])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "test request headers"))?
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test HTTP request body"))??;
+            if bytes == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..bytes]);
+            if request.len() > MAX_REQUEST_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "test HTTP request body exceeded limit",
+                ));
             }
         }
+        Ok(request)
     }
 }
