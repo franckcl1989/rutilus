@@ -73,6 +73,18 @@ pub enum ResourceFeature {
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code
     /// so both inventories address the same wire surface.
     Controls,
+    /// The §2.1 `log-services` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    LogServices,
+    /// The §2.1 `manager-network-protocol` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface.
+    ManagerNetworkProtocol,
+    /// The §2.1 `host-interfaces` feature, added as a typed resource family
+    /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    HostInterfaces,
 }
 
 impl ResourceFeature {
@@ -97,6 +109,9 @@ impl ResourceFeature {
             Self::Thermal => "thermal",
             Self::Sensors => "sensors",
             Self::Controls => "controls",
+            Self::LogServices => "log-services",
+            Self::ManagerNetworkProtocol => "manager-network-protocol",
+            Self::HostInterfaces => "host-interfaces",
         }
     }
 }
@@ -129,6 +144,9 @@ impl FromStr for ResourceFeature {
             "thermal" => Ok(Self::Thermal),
             "sensors" => Ok(Self::Sensors),
             "controls" => Ok(Self::Controls),
+            "log-services" => Ok(Self::LogServices),
+            "manager-network-protocol" => Ok(Self::ManagerNetworkProtocol),
+            "host-interfaces" => Ok(Self::HostInterfaces),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -681,6 +699,9 @@ mod tests {
             ResourceFeature::Thermal,
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
         ];
 
         for feature in features {
@@ -697,8 +718,10 @@ mod tests {
         // The snapshot feature and the §2.1 capability ledger must speak the
         // same wire string, so persistence and protocol layers never translate
         // between two inventories for the same surface. Every typed resource
-        // family (0.2 Processors/Memory and the Storage/Network iteration) is
-        // asserted here so a new family cannot land with a private code.
+        // family (0.2 Processors/Memory, the Storage/Network/Accounts
+        // iteration, and the Manager-facing LogServices/ManagerNetworkProtocol/
+        // HostInterfaces iteration) is asserted here so a new family cannot
+        // land with a private code.
         let families = [
             (ResourceFeature::Processors, EndpointCapability::Processors),
             (ResourceFeature::Memory, EndpointCapability::Memory),
@@ -725,6 +748,22 @@ mod tests {
             (ResourceFeature::Thermal, EndpointCapability::Thermal),
             (ResourceFeature::Sensors, EndpointCapability::Sensors),
             (ResourceFeature::Controls, EndpointCapability::Controls),
+            // The 0.2 Manager-facing families reuse the §2.1 codes the
+            // ledger already persists for `log-services`,
+            // `manager-network-protocol`, and `host-interfaces`, so the
+            // feature and capability inventories cannot drift on the wire.
+            (
+                ResourceFeature::LogServices,
+                EndpointCapability::LogServices,
+            ),
+            (
+                ResourceFeature::ManagerNetworkProtocol,
+                EndpointCapability::ManagerNetworkProtocol,
+            ),
+            (
+                ResourceFeature::HostInterfaces,
+                EndpointCapability::HostInterfaces,
+            ),
         ];
         for (feature, capability) in families {
             assert_eq!(feature.as_str(), capability.as_str());
@@ -788,6 +827,23 @@ mod tests {
             "controls/",
             "Controls",
             "environment-metrics",
+            "log-service",
+            "log-services/",
+            "logservice",
+            "LogServices",
+            "logs",
+            "log",
+            "manager-network-protocol/",
+            "manager-networkprotocol",
+            "manager-network-protocols",
+            "manager-net-protocol",
+            "ManagerNetworkProtocol",
+            "manager-network",
+            "host-interface",
+            "host-interfaces/",
+            "hostinterface",
+            "HostInterfaces",
+            "host-interfaces-",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
