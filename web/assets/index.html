@@ -8,17 +8,15 @@
     <link rel="stylesheet" href="/app.css">
   </head>
   <body>
-    <main id="app" aria-live="polite">
-      <section class="shell">
-        <p class="eyebrow">Local Redfish management</p>
-        <h1>Rutilus</h1>
-        <p id="status">Starting the local management console…</p>
-        <dl id="build" hidden>
-          <div><dt>Product</dt><dd id="product-version"></dd></div>
-          <div><dt>nv-redfish</dt><dd id="redfish-version"></dd></div>
-        </dl>
-      </section>
-    </main>
+    <noscript>
+      <main id="app" aria-live="polite">
+        <section class="shell">
+          <p class="eyebrow">Local Redfish management</p>
+          <h1>Rutilus</h1>
+          <p id="status">JavaScript and WebAssembly are required to use this console.</p>
+        </section>
+      </main>
+    </noscript>
     <script type="module" src="/bootstrap.js"></script>
   </body>
 </html>

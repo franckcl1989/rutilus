@@ -23,7 +23,7 @@ const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
 const PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
 const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
-const CSP: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'; form-action 'self'";
+const CSP: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; form-action 'self'";
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -219,6 +219,25 @@ mod tests {
         );
         assert!(text_body(index).await?.contains("id=\"app\""));
 
+        let javascript = test_router()
+            .oneshot(Request::get("/rutilus_ui.js").body(Body::empty())?)
+            .await?;
+        assert_eq!(javascript.status(), StatusCode::OK);
+        assert_eq!(
+            javascript.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/javascript; charset=utf-8"))
+        );
+
+        let wasm = test_router()
+            .oneshot(Request::get("/rutilus_ui_bg.wasm").body(Body::empty())?)
+            .await?;
+        assert_eq!(wasm.status(), StatusCode::OK);
+        assert_eq!(
+            wasm.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/wasm"))
+        );
+        assert!(bytes_body(wasm).await?.starts_with(b"\0asm"));
+
         let spa = test_router()
             .oneshot(Request::get("/endpoints").body(Body::empty())?)
             .await?;
@@ -254,8 +273,12 @@ mod tests {
     }
 
     async fn text_body(response: Response) -> Result<String, Box<dyn Error>> {
-        let bytes = response.into_body().collect().await?.to_bytes();
+        let bytes = bytes_body(response).await?;
         Ok(String::from_utf8(bytes.to_vec())?)
+    }
+
+    async fn bytes_body(response: Response) -> Result<axum::body::Bytes, Box<dyn Error>> {
+        Ok(response.into_body().collect().await?.to_bytes())
     }
 
     #[test]

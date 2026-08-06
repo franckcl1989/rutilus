@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "platform", "security", "web"]
+members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "platform", "security", "ui", "web"]
 default-members = ["app"]
 resolver = "3"
 
@@ -18,7 +18,9 @@ console = { version = "0.16.4", default-features = false, features = ["std"] }
 csv = "1.4.0"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 getrandom = "0.4.3"
+gloo-net = { version = "0.6.0", default-features = false, features = ["http", "json"] }
 http-body-util = "0.1.4"
+leptos = { version = "=0.8.20", default-features = false, features = ["csr"] }
 nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
@@ -50,6 +52,8 @@ tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["set-header"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v7"] }
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "=0.4.76"
 webbrowser = { version = "1.2.4", features = ["hardened"] }
 zeroize = "1.9.0"
 

@@ -1,19 +1,29 @@
-const status = document.querySelector("#status");
-const build = document.querySelector("#build");
-const productVersion = document.querySelector("#product-version");
-const redfishVersion = document.querySelector("#redfish-version");
+import init from "/rutilus_ui.js";
 
 try {
-  const response = await fetch("/api/v1/about", {
-    credentials: "same-origin",
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) throw new Error("metadata unavailable");
-  const about = await response.json();
-  productVersion.textContent = about.product_version;
-  redfishVersion.textContent = about.nv_redfish_baseline;
-  build.hidden = false;
-  status.textContent = "The embedded console is ready.";
+  await init();
 } catch {
-  status.textContent = "The local console could not load product metadata.";
+  document.querySelector("#app")?.remove();
+
+  const main = document.createElement("main");
+  main.id = "app";
+  main.setAttribute("aria-live", "polite");
+
+  const shell = document.createElement("section");
+  shell.className = "shell";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "eyebrow";
+  eyebrow.textContent = "Local Redfish management";
+
+  const heading = document.createElement("h1");
+  heading.textContent = "Rutilus";
+
+  const status = document.createElement("p");
+  status.id = "status";
+  status.textContent = "The embedded console could not start.";
+
+  shell.append(eyebrow, heading, status);
+  main.append(shell);
+  document.body.prepend(main);
 }

@@ -6,6 +6,7 @@ targets = [
     "aarch64-pc-windows-msvc",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
+    "wasm32-unknown-unknown",
 ]
 all-features = true
 
@@ -17,12 +18,22 @@ all-features = true
 # RUSTSEC-2026-0194 and RUSTSEC-2026-0195 cannot process runtime, device, or
 # user-controlled XML; remove both exceptions as soon as upstream accepts
 # quick-xml 0.41 or later.
-ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+# Leptos 0.8.20 transitively retains the unmaintained compile-time-only paste
+# and proc-macro-error2 crates, with no safe stable upgrade. Neither is linked
+# into the browser runtime; remove both exceptions when stable Leptos does.
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0173",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
@@ -48,13 +59,18 @@ deny = [
 ]
 skip = [
     { crate = "block-buffer@0.10.4", reason = "SQLx 0.9 and the audited encryption stack use different digest generations" },
+    { crate = "convert_case@0.6.0", reason = "Leptos configuration and current Leptos macros use incompatible case-conversion generations" },
     { crate = "cpufeatures@0.2.17", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
     { crate = "crypto-common@0.1.6", reason = "SQLx 0.9 SHA-2 and the audited encryption stack use different digest generations" },
     { crate = "getrandom@0.2.17", reason = "ring 0.17 uses its audited legacy RNG API while Rutilus and UUID use getrandom 0.4" },
     { crate = "hashbrown@0.16.1", reason = "SQLx 0.9 currently uses two non-compatible hashbrown generations internally" },
     { crate = "heck@0.4.1", reason = "SeaORM 2.0 macros have not fully converged on heck 0.5" },
     { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
+    { crate = "thiserror@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },
+    { crate = "thiserror-impl@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },
+    { crate = "toml@1.1.4", reason = "Leptos build configuration and nv-redfish's build-only CSDL compiler require incompatible TOML generations" },
     { crate = "toml_datetime@0.7.5", reason = "nv-redfish's build-only CSDL compiler and tagged-types macros use incompatible TOML generations" },
+    { crate = "wasm-streams@0.5.0", reason = "Leptos server_fn and Reqwest currently use incompatible Web stream adapter generations" },
     { crate = "windows-sys@0.52.0", reason = "ring 0.17 retains its audited Windows bindings while Tokio and the CLI use windows-sys 0.61" },
     { crate = "winnow@0.7.15", reason = "nv-redfish's build-only CSDL compiler and tagged-types macros use incompatible parser generations" },
 ]
