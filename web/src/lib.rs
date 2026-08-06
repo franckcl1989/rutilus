@@ -736,9 +736,10 @@ fn project_enrollment(
             ResourceFeature::Managers => managers += 1,
             // The 0.2 resource families (Processors, Memory, Storage,
             // Network, Accounts, Bios, BootOptions, SecureBoot, the
-            // Power/Thermal/Sensors/Controls telemetry families, and the
+            // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface) intentionally stay out of the three-field enrollment
+            // surface, and the PcieDevices/Assembly/SoftwareInventory read
+            // families) intentionally stay out of the three-field enrollment
             // counts; the typed resource-inventory route carries their full
             // snapshots instead.
             ResourceFeature::ServiceRoot
@@ -757,7 +758,10 @@ fn project_enrollment(
             | ResourceFeature::Controls
             | ResourceFeature::LogServices
             | ResourceFeature::ManagerNetworkProtocol
-            | ResourceFeature::HostInterfaces => {}
+            | ResourceFeature::HostInterfaces
+            | ResourceFeature::PcieDevices
+            | ResourceFeature::Assembly
+            | ResourceFeature::SoftwareInventory => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1162,6 +1166,11 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
             project_manager_network_protocol_details(details)
         }
         CoreResourceDetails::HostInterface { .. } => project_host_interface_details(details),
+        CoreResourceDetails::PcieDevice { .. } => project_pcie_device_details(details),
+        CoreResourceDetails::Assembly { .. } => project_assembly_details(details),
+        CoreResourceDetails::SoftwareInventory { .. } => {
+            project_software_inventory_details(details)
+        }
     }
 }
 
@@ -1729,6 +1738,87 @@ fn project_host_interface_details(details: &CoreResourceDetails) -> CoreResource
     };
     CoreResourceDetailsResponse::HostInterface {
         interface_enabled: *interface_enabled,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 pcie-devices family into the shared wire contract,
+/// preserving the typed `DeviceType` enumeration string so the console
+/// renders the device class without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `PcieDevice` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_pcie_device_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::PcieDevice {
+        device_type,
+        manufacturer,
+        model,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::PcieDevice {
+            device_type: None,
+            manufacturer: None,
+            model: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::PcieDevice {
+        device_type: device_type.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 assembly family into the shared wire contract, carrying
+/// the `AssemblyData` member's `Producer` exactly as published.
+///
+/// The dispatcher guarantees this receives the `Assembly` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_assembly_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Assembly { producer, status } = details else {
+        return CoreResourceDetailsResponse::Assembly {
+            producer: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Assembly {
+        producer: producer.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the `software-inventory` family under the §2.1 `update-service`
+/// feature into the shared wire contract, keeping the typed `ReleaseDate`
+/// instant so the console renders the release date without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `SoftwareInventory` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_software_inventory_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::SoftwareInventory {
+        software_id,
+        version,
+        release_date,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::SoftwareInventory {
+            software_id: None,
+            version: None,
+            release_date: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::SoftwareInventory {
+        software_id: software_id.clone(),
+        version: version.clone(),
+        release_date: *release_date,
         status: status.as_ref().map(project_resource_status),
     }
 }
@@ -2379,6 +2469,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_pcie_devices_assembly_and_software_inventory_typed_resources()
+    -> Result<(), Box<dyn Error>> {
+        let item = device_family_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the root sorts
+        // first, the chassis assembly member sorts before the system PCIe
+        // device, which sorts before the update-service inventory member.
+        assert_eq!(resources[1]["resource"]["resource_type"], "assembly");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Fan Assembly");
+        assert_eq!(resources[1]["resource"]["details"]["producer"], "Vendor D");
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        assert_eq!(resources[2]["resource"]["resource_type"], "pcie_device");
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1"
+        );
+        assert_eq!(resources[2]["common"]["name"], "PCIe Device One");
+        assert_eq!(
+            resources[2]["resource"]["details"]["device_type"],
+            "SingleFunction"
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["manufacturer"],
+            "Vendor C"
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["model"],
+            "PCIE-GEN4-X16"
+        );
+        assert_eq!(
+            resources[3]["resource"]["resource_type"],
+            "software_inventory"
+        );
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS"
+        );
+        assert_eq!(resources[3]["common"]["name"], "System BIOS");
+        assert_eq!(
+            resources[3]["resource"]["details"]["software_id"],
+            "BIOS-2026-1"
+        );
+        assert_eq!(resources[3]["resource"]["details"]["version"], "2.7.0");
+        assert_eq!(
+            resources[3]["resource"]["details"]["release_date"],
+            "2026-05-01T00:00:00Z"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["status"]["state"],
+            "Enabled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_power_thermal_sensors_and_controls_typed_resources()
     -> Result<(), Box<dyn Error>> {
         let item = telemetry_inventory_item()?;
@@ -2902,6 +3067,68 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, log_service, network_protocol, host_interface],
+        )?)
+    }
+
+    fn device_family_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Device family BMC")?,
+            EndpointAddress::parse("https://192.0.2.35")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![35])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(7)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let assembly = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Assembly,
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+            r#"{"Id":"0","Name":"Fan Assembly","Description":"Cooling fan","Producer":"Vendor D","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Assembly.v1_5_0.AssemblyData")?)
+        .with_etag(ResourceEtag::parse("W/\"assembly-data-0\"")?);
+        let pcie_device = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::PcieDevices,
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+            r#"{"Id":"GPU1","Name":"PCIe Device One","Description":"GPU accelerator","DeviceType":"SingleFunction","Manufacturer":"Vendor C","Model":"PCIE-GEN4-X16","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#PCIeDevice.v1_12_0.PCIeDevice")?)
+        .with_etag(ResourceEtag::parse("W/\"pcie-device-1\"")?);
+        let software_inventory = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::SoftwareInventory,
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+            r#"{"Id":"BIOS","Name":"System BIOS","Description":"Host firmware","SoftwareId":"BIOS-2026-1","Version":"2.7.0","ReleaseDate":"2026-05-01T00:00:00Z","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#SoftwareInventory.v1_7_0.SoftwareInventory",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"sw-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, assembly, pcie_device, software_inventory],
         )?)
     }
 
