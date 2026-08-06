@@ -1017,6 +1017,51 @@ pub enum CoreResourceDetailsResponse {
         interface_enabled: Option<bool>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `pcie-devices` family member projected from the typed Redfish
+    /// PCIe-device schema (`PCIeDevice_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `DeviceType`, `Manufacturer`, `Model`, and
+    /// `Status` properties. `device_type` is the `DeviceType` enumeration
+    /// (`SingleFunction`, `MultiFunction`, `Simulated`, `Retimer`) retained as
+    /// a string so the console renders it without re-parsing text. A
+    /// `slot_type` field was considered, but `SlotType` entered
+    /// `PCIeDevice_v1` only in `v1_9_0` and older devices may never expose it,
+    /// so it stays out of this strictly projectable field set.
+    PcieDevice {
+        device_type: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `assembly` family member projected from the typed Redfish
+    /// assembly schema (`Assembly_v1` `AssemblyData`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `Producer` and `Status` properties of the
+    /// `AssemblyData` member (`Status` appears since `v1_1_0`). An
+    /// `assembly_type` field was considered, but `Assembly_v1` declares no
+    /// `AssemblyType` property anywhere in nv-redfish-schema 0.13 — the type
+    /// of an assembly is expressed through the `PhysicalContext` property
+    /// added in `v1_2_0` — so it stays out of this strictly projectable
+    /// field set.
+    Assembly {
+        producer: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One `software-inventory` family member under the §2.1 `update-service`
+    /// feature, projected from the typed Redfish software-inventory schema
+    /// (`SoftwareInventory_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `SoftwareId`, `Version`, `ReleaseDate`, and
+    /// `Status` properties. `release_date` stays an RFC 3339 timestamp
+    /// because `ReleaseDate` is `Edm.DateTimeOffset` in the schema, so the
+    /// console renders the release date without re-parsing text.
+    SoftwareInventory {
+        software_id: Option<String>,
+        version: Option<String>,
+        #[serde(with = "time::serde::rfc3339::option")]
+        release_date: Option<OffsetDateTime>,
+        status: Option<ResourceStatusResponse>,
+    },
 }
 
 /// One read-only core Redfish resource in a complete refresh Generation.
@@ -3355,6 +3400,234 @@ mod tests {
                 )),
             },
         )
+    }
+
+    #[test]
+    fn core_resource_contract_carries_pcie_device_wire_values() -> Result<(), Box<dyn Error>> {
+        let pcie_device = pcie_device_resource();
+
+        assert_eq!(
+            serde_json::to_value(&pcie_device)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e3",
+                    "odata_id": "/redfish/v1/Chassis/1/PCIeDevices/GPU1",
+                    "odata_type": "#PCIeDevice.v1_12_0.PCIeDevice",
+                    "etag": "W/\"pcie-device-1\""
+                },
+                "common": {
+                    "id": "GPU1",
+                    "name": "PCIe Device One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "pcie_device",
+                    "details": {
+                        "device_type": "SingleFunction",
+                        "manufacturer": "Vendor C",
+                        "model": "PCIE-GEN4-X16",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&pcie_device)?)?,
+            pcie_device
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "pcie_device",
+                "details": {
+                    "device_type": null,
+                    "manufacturer": null,
+                    "model": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_assembly_wire_values() -> Result<(), Box<dyn Error>> {
+        let assembly = assembly_resource();
+
+        assert_eq!(
+            serde_json::to_value(&assembly)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e4",
+                    "odata_id": "/redfish/v1/Chassis/1/Assembly",
+                    "odata_type": "#Assembly.v1_5_0.Assembly",
+                    "etag": "W/\"assembly-1\""
+                },
+                "common": {
+                    "id": "Assembly",
+                    "name": "Chassis Assembly",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "assembly",
+                    "details": {
+                        "producer": "Vendor D",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&assembly)?)?,
+            assembly
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "assembly",
+                "details": {
+                    "producer": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_software_inventory_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let software_inventory = software_inventory_resource()?;
+
+        assert_eq!(
+            serde_json::to_value(&software_inventory)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789e5",
+                    "odata_id": "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+                    "odata_type": "#SoftwareInventory.v1_7_0.SoftwareInventory",
+                    "etag": "W/\"sw-1\""
+                },
+                "common": {
+                    "id": "BIOS",
+                    "name": "System BIOS",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "software_inventory",
+                    "details": {
+                        "software_id": "BIOS-2026-1",
+                        "version": "2.7.0",
+                        "release_date": "2026-05-01T00:00:00Z",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &software_inventory
+            )?)?,
+            software_inventory
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "software_inventory",
+                "details": {
+                    "software_id": null,
+                    "version": null,
+                    "release_date": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn pcie_device_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e3"),
+                "/redfish/v1/Chassis/1/PCIeDevices/GPU1".to_owned(),
+                Some("#PCIeDevice.v1_12_0.PCIeDevice".to_owned()),
+                Some("W/\"pcie-device-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("GPU1".to_owned(), "PCIe Device One".to_owned(), None),
+            CoreResourceDetailsResponse::PcieDevice {
+                device_type: Some("SingleFunction".to_owned()),
+                manufacturer: Some("Vendor C".to_owned()),
+                model: Some("PCIE-GEN4-X16".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn assembly_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e4"),
+                "/redfish/v1/Chassis/1/Assembly".to_owned(),
+                Some("#Assembly.v1_5_0.Assembly".to_owned()),
+                Some("W/\"assembly-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "Assembly".to_owned(),
+                "Chassis Assembly".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::Assembly {
+                producer: Some("Vendor D".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn software_inventory_resource() -> Result<CoreResourceResponse, &'static str> {
+        let release_date = OffsetDateTime::parse("2026-05-01T00:00:00Z", &Rfc3339)
+            .map_err(|_| "test release date must parse")?;
+        Ok(CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789e5"),
+                "/redfish/v1/UpdateService/SoftwareInventory/BIOS".to_owned(),
+                Some("#SoftwareInventory.v1_7_0.SoftwareInventory".to_owned()),
+                Some("W/\"sw-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("BIOS".to_owned(), "System BIOS".to_owned(), None),
+            CoreResourceDetailsResponse::SoftwareInventory {
+                software_id: Some("BIOS-2026-1".to_owned()),
+                version: Some("2.7.0".to_owned()),
+                release_date: Some(release_date),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        ))
     }
 
     fn ethernet_interface_resource() -> CoreResourceResponse {
