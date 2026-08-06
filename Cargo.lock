@@ -3483,6 +3483,7 @@ dependencies = [
  "rustls-native-certs",
  "rutilus-application",
  "rutilus-domain",
+ "rutilus-operation-engine",
  "secrecy",
  "serde",
  "serde_json",

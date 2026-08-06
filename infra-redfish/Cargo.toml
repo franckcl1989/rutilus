@@ -10,6 +10,7 @@ nv-redfish.workspace = true
 reqwest.workspace = true
 rutilus-application.workspace = true
 rutilus-domain.workspace = true
+rutilus-operation-engine.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 secrecy.workspace = true
