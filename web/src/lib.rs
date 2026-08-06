@@ -738,10 +738,12 @@ fn project_enrollment(
             // Network, Accounts, Bios, BootOptions, SecureBoot, the
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, and the PcieDevices/Assembly/SoftwareInventory read
-            // families) intentionally stay out of the three-field enrollment
-            // counts; the typed resource-inventory route carries their full
-            // snapshots instead.
+            // surface, the PcieDevices/Assembly/SoftwareInventory read
+            // families, and the EventService/EventSubscription/
+            // TelemetryService/MetricDefinition/MetricReport/TaskService/Task
+            // service families) intentionally stay out of the three-field
+            // enrollment counts; the typed resource-inventory route carries
+            // their full snapshots instead.
             ResourceFeature::ServiceRoot
             | ResourceFeature::Processors
             | ResourceFeature::Memory
@@ -761,7 +763,14 @@ fn project_enrollment(
             | ResourceFeature::HostInterfaces
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
-            | ResourceFeature::SoftwareInventory => {}
+            | ResourceFeature::SoftwareInventory
+            | ResourceFeature::EventService
+            | ResourceFeature::EventSubscription
+            | ResourceFeature::TelemetryService
+            | ResourceFeature::MetricDefinition
+            | ResourceFeature::MetricReport
+            | ResourceFeature::TaskService
+            | ResourceFeature::Task => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1171,6 +1180,15 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::SoftwareInventory { .. } => {
             project_software_inventory_details(details)
         }
+        CoreResourceDetails::EventService { .. } => project_event_service_details(details),
+        CoreResourceDetails::EventSubscription { .. } => {
+            project_event_subscription_details(details)
+        }
+        CoreResourceDetails::TelemetryService { .. } => project_telemetry_service_details(details),
+        CoreResourceDetails::MetricDefinition { .. } => project_metric_definition_details(details),
+        CoreResourceDetails::MetricReport { .. } => project_metric_report_details(details),
+        CoreResourceDetails::TaskService { .. } => project_task_service_details(details),
+        CoreResourceDetails::Task { .. } => project_task_details(details),
     }
 }
 
@@ -1820,6 +1838,185 @@ fn project_software_inventory_details(
         version: version.clone(),
         release_date: *release_date,
         status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 event-service family into the shared wire contract,
+/// carrying the service posture: the enabled flag and the resource-level
+/// status values.
+///
+/// The dispatcher guarantees this receives the `EventService` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_event_service_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::EventService {
+        service_enabled,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::EventService {
+            service_enabled: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::EventService {
+        service_enabled: *service_enabled,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects one subscription under the §2.1 `event-service` family into the
+/// shared wire contract, carrying the destination, protocol, context, and
+/// event-type filters exactly as published.
+///
+/// The dispatcher guarantees this receives the `EventSubscription` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_event_subscription_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::EventSubscription {
+        destination,
+        protocol,
+        context,
+        event_types,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::EventSubscription {
+            destination: None,
+            protocol: None,
+            context: None,
+            event_types: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::EventSubscription {
+        destination: destination.clone(),
+        protocol: protocol.clone(),
+        context: context.clone(),
+        event_types: event_types.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 telemetry-service family into the shared wire contract,
+/// carrying the resource-level status values. The compiled
+/// `TelemetryService` type exposes `ServiceEnabled` and the service-capacity
+/// fields, but the product defers them to the 0.4.0 telemetry iteration, so
+/// there is no enabled flag to project this round.
+///
+/// The dispatcher guarantees this receives the `TelemetryService` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_telemetry_service_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::TelemetryService { status } = details else {
+        return CoreResourceDetailsResponse::TelemetryService { status: None };
+    };
+    CoreResourceDetailsResponse::TelemetryService {
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects one metric definition under the §2.1 `telemetry-service` family
+/// into the shared wire contract, preserving the `MetricType` enumeration
+/// string and the UCUM units so clients render them without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `MetricDefinition` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_metric_definition_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::MetricDefinition { units, metric_type } = details else {
+        return CoreResourceDetailsResponse::MetricDefinition {
+            units: None,
+            metric_type: None,
+        };
+    };
+    CoreResourceDetailsResponse::MetricDefinition {
+        units: units.clone(),
+        metric_type: metric_type.clone(),
+    }
+}
+
+/// Projects one metric report under the §2.1 `telemetry-service` family into
+/// the shared wire contract, carrying the derived metric-values count so
+/// clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `MetricReport` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_metric_report_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::MetricReport {
+        metric_values_count,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::MetricReport {
+            metric_values_count: None,
+        };
+    };
+    CoreResourceDetailsResponse::MetricReport {
+        metric_values_count: *metric_values_count,
+    }
+}
+
+/// Projects the §2.1 task-service family into the shared wire contract,
+/// carrying the service posture and the completed-task overwrite policy as
+/// the schema enumeration string.
+///
+/// The dispatcher guarantees this receives the `TaskService` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_task_service_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::TaskService {
+        service_enabled,
+        completed_task_overwrite_policy,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::TaskService {
+            service_enabled: None,
+            completed_task_overwrite_policy: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::TaskService {
+        service_enabled: *service_enabled,
+        completed_task_overwrite_policy: completed_task_overwrite_policy.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects one task under the §2.1 `task-service` family into the shared
+/// wire contract, keeping the state and status enumeration strings, the
+/// numeric completion percentage, and the typed RFC 3339 timeline instants so
+/// clients render the task without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `Task` variant; the fallback
+/// keeps a stable empty projection instead of panicking if that contract is
+/// ever violated.
+fn project_task_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Task {
+        task_state,
+        task_status,
+        percent_complete,
+        start_time,
+        end_time,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Task {
+            task_state: None,
+            task_status: None,
+            percent_complete: None,
+            start_time: None,
+            end_time: None,
+        };
+    };
+    CoreResourceDetailsResponse::Task {
+        task_state: task_state.clone(),
+        task_status: task_status.clone(),
+        percent_complete: *percent_complete,
+        start_time: *start_time,
+        end_time: *end_time,
     }
 }
 
@@ -2544,6 +2741,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_event_and_task_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = event_task_family_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 5);
+        // The inventory orders snapshots by `@odata.id`, so the root sorts
+        // first, the event-service singleton with its subscription member
+        // sorts before the task-service singleton with its task member.
+        assert_eq!(resources[1]["resource"]["resource_type"], "event_service");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/EventService"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Event Service");
+        assert_eq!(resources[1]["resource"]["details"]["service_enabled"], true);
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        assert_eq!(
+            resources[2]["resource"]["resource_type"],
+            "event_subscription"
+        );
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/EventService/Subscriptions/1"
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["destination"],
+            "https://subscriber.example.test/events"
+        );
+        assert_eq!(resources[2]["resource"]["details"]["protocol"], "Redfish");
+        assert_eq!(
+            resources[2]["resource"]["details"]["event_types"],
+            json!(["Alert", "StatusChange"])
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "task_service");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/TaskService"
+        );
+        assert_eq!(resources[3]["common"]["name"], "Task Service");
+        assert_eq!(
+            resources[3]["resource"]["details"]["completed_task_overwrite_policy"],
+            "Oldest"
+        );
+        assert_eq!(resources[4]["resource"]["resource_type"], "task");
+        assert_eq!(
+            resources[4]["source"]["odata_id"],
+            "/redfish/v1/TaskService/Tasks/1"
+        );
+        assert_eq!(resources[4]["common"]["name"], "Firmware Update Task");
+        assert_eq!(resources[4]["resource"]["details"]["task_state"], "Running");
+        assert_eq!(resources[4]["resource"]["details"]["task_status"], "OK");
+        assert_eq!(resources[4]["resource"]["details"]["percent_complete"], 42);
+        assert_eq!(
+            resources[4]["resource"]["details"]["start_time"],
+            "2026-08-05T10:20:00Z"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["end_time"],
+            serde_json::Value::Null
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exposes_telemetry_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = telemetry_family_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so the root sorts
+        // first, the telemetry-service singleton sorts before its definitions
+        // collection member, which sorts before the reports collection member.
+        assert_eq!(
+            resources[1]["resource"]["resource_type"],
+            "telemetry_service"
+        );
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/TelemetryService"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["status"]["state"],
+            "Enabled"
+        );
+        assert_eq!(
+            resources[2]["resource"]["resource_type"],
+            "metric_definition"
+        );
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/TelemetryService/MetricDefinitions/1"
+        );
+        assert_eq!(resources[2]["resource"]["details"]["units"], "Cel");
+        assert_eq!(
+            resources[2]["resource"]["details"]["metric_type"],
+            "Numeric"
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "metric_report");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/TelemetryService/MetricReports/1"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["metric_values_count"],
+            12
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_power_thermal_sensors_and_controls_typed_resources()
     -> Result<(), Box<dyn Error>> {
         let item = telemetry_inventory_item()?;
@@ -3129,6 +3461,143 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, assembly, pcie_device, software_inventory],
+        )?)
+    }
+
+    fn event_task_family_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Event and task BMC")?,
+            EndpointAddress::parse("https://192.0.2.36")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![36])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(8)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let event_service = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::EventService,
+            "/redfish/v1/EventService",
+            r#"{"Id":"EventService","Name":"Event Service","Description":"Event subscription service","ServiceEnabled":true,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#EventService.v1_12_0.EventService",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"event-service-1\"")?);
+        let subscription = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::EventSubscription,
+            "/redfish/v1/EventService/Subscriptions/1",
+            r#"{"Id":"1","Name":"Subscription One","Destination":"https://subscriber.example.test/events","Protocol":"Redfish","Context":"Rack A","EventTypes":["Alert","StatusChange"],"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#EventDestination.v1_16_0.EventDestination",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"subscription-1\"")?);
+        let task_service = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::TaskService,
+            "/redfish/v1/TaskService",
+            r#"{"Id":"TaskService","Name":"Task Service","Description":"Asynchronous task service","ServiceEnabled":true,"CompletedTaskOverWritePolicy":"Oldest","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#TaskService.v1_3_0.TaskService")?);
+        let task = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Task,
+            "/redfish/v1/TaskService/Tasks/1",
+            r#"{"Id":"1","Name":"Firmware Update Task","Description":"BIOS firmware update","TaskState":"Running","TaskStatus":"OK","PercentComplete":42,"StartTime":"2026-08-05T10:20:00Z","EndTime":null}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Task.v1_7_4.Task")?)
+        .with_etag(ResourceEtag::parse("W/\"task-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, event_service, subscription, task_service, task],
+        )?)
+    }
+
+    fn telemetry_family_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Telemetry BMC")?,
+            EndpointAddress::parse("https://192.0.2.37")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![37])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(9)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let telemetry_service = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::TelemetryService,
+            "/redfish/v1/TelemetryService",
+            r#"{"Id":"TelemetryService","Name":"Telemetry Service","Description":"Telemetry collection service","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#TelemetryService.v1_4_0.TelemetryService",
+        )?);
+        let metric_definition = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::MetricDefinition,
+            "/redfish/v1/TelemetryService/MetricDefinitions/1",
+            r#"{"Id":"1","Name":"Inlet Temperature Definition","MetricType":"Numeric","Units":"Cel"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#MetricDefinition.v1_3_5.MetricDefinition",
+        )?);
+        let metric_report = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::MetricReport,
+            "/redfish/v1/TelemetryService/MetricReports/1",
+            r#"{"Id":"1","Name":"Inlet Temperature Report","MetricValuesCount":12}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#MetricReport.v1_5_2.MetricReport",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"report-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, telemetry_service, metric_definition, metric_report],
         )?)
     }
 
