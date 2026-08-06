@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod audit_log;
+mod capability_query;
 mod credential_management;
 mod endpoint_csv;
 mod endpoint_csv_import;
@@ -12,6 +13,10 @@ mod endpoint_resources;
 mod endpoint_trust;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
+pub use capability_query::{
+    CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
+    EndpointCapabilityQueryError, StoredCapability,
+};
 pub use credential_management::{
     CREDENTIAL_SECRET_MAX_BYTES, CredentialCreation, CredentialCreationError,
     CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
