@@ -19,6 +19,7 @@ mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
 mod migration_backup;
+mod operation_repository;
 mod resource_snapshot_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
@@ -31,6 +32,7 @@ pub use endpoint_capability_repository::{
 };
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
 pub use migration_backup::{MigrationBackup, MigrationBackupError};
+pub use operation_repository::{OperationRepositoryError, StoredOperationError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
 };

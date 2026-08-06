@@ -10,6 +10,7 @@ rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-entity.workspace = true
 rutilus-migration.workspace = true
+rutilus-operation-engine.workspace = true
 rutilus-security = { path = "../security", version = "0.1.0" }
 sea-orm.workspace = true
 sea-orm-migration.workspace = true

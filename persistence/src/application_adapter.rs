@@ -5,14 +5,17 @@ use rutilus_application::{
     ResourceObservation, StoredCapability,
 };
 use rutilus_domain::{
-    AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
+    AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, Operation,
+    OperationId, OperationState, ResourceSnapshot,
 };
+use rutilus_operation_engine::{BoundaryFuture as OperationBoundaryFuture, OperationStore};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
     AuditRepositoryError, CredentialRepositoryError, EndpointCapabilityRepositoryError,
-    EndpointRepositoryError, NewResourceSnapshot, ResourceSnapshotRepositoryError, SqliteStore,
+    EndpointRepositoryError, NewResourceSnapshot, OperationRepositoryError,
+    ResourceSnapshotRepositoryError, SqliteStore,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -126,6 +129,42 @@ impl EndpointRefreshRepository for SqliteStore {
     }
 }
 
+impl OperationStore for SqliteStore {
+    type Error = OperationRepositoryError;
+
+    fn create_operation<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::create_operation(self, operation).await })
+    }
+
+    fn find_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_operation(self, operation_id).await })
+    }
+
+    fn apply_transition(
+        &self,
+        operation_id: OperationId,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::apply_transition(self, operation_id, new_state, occurred_at).await
+        })
+    }
+
+    fn list_operations(
+        &self,
+        state: Option<OperationState>,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_operations(self, state).await })
+    }
+}
+
 impl EndpointInventoryRepository for SqliteStore {
     type Error = EndpointInventoryPersistenceError;
 
@@ -207,9 +246,11 @@ mod tests {
         AuditParameterSummary, AuditRedfishOperation, AuditTarget, CAPABILITY_LEDGER_ORDER,
         CapabilityState, CredentialId, CredentialName, CredentialUsername, CredentialVersionId,
         DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
-        EndpointDisplayName, EndpointId, ProductPermission, ResourceFeature, ResourceODataId,
-        ResourceSnapshotPayload, TlsCertificate, TlsTrust,
+        EndpointDisplayName, EndpointId, Operation, OperationEvent, OperationId, OperationSource,
+        OperationState, OperationTarget, ProductPermission, ResourceFeature, ResourceODataId,
+        ResourceSnapshotPayload, TargetId, TlsCertificate, TlsTrust,
     };
+    use rutilus_operation_engine::{OperationEngine, OperationStore};
     use rutilus_security::{MasterKey, encrypt_credential};
     use secrecy::SecretString;
     use time::{Duration, OffsetDateTime};
@@ -652,6 +693,142 @@ mod tests {
             credentials[1].username().as_str(),
             "operator",
             "deterministic inventory order must pair name and username"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_operation_store_boundary() -> Result<(), Box<dyn Error>> {
+        fn assert_repository<Repository: OperationStore>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let created_at = OffsetDateTime::now_utc();
+        let operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Site,
+            vec![OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            created_at,
+        );
+
+        OperationStore::create_operation(&store, &operation).await?;
+        assert_eq!(
+            OperationStore::find_operation(&store, operation.id()).await?,
+            Some(operation.clone())
+        );
+        let occurred_at = created_at + Duration::SECOND;
+        OperationStore::apply_transition(
+            &store,
+            operation.id(),
+            OperationState::Validating,
+            occurred_at,
+        )
+        .await?;
+        let stored = OperationStore::find_operation(&store, operation.id())
+            .await?
+            .ok_or("stored operation is missing")?;
+        assert_eq!(stored.state(), OperationState::Validating);
+        assert_eq!(stored.updated_at(), occurred_at);
+        assert_eq!(
+            OperationStore::list_operations(&store, None).await?.len(),
+            1
+        );
+        assert_eq!(
+            OperationStore::list_operations(&store, Some(OperationState::Validating))
+                .await?
+                .len(),
+            1
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operation_engine_drives_the_sqlite_store_end_to_end() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let engine = OperationEngine::new(&store);
+        let created_at = OffsetDateTime::now_utc();
+        let target = OperationTarget::new(TargetId::generate(), EndpointId::generate());
+
+        // The engine persists through the adapter into real SQLite and re-reads
+        // the stored aggregate after every step (§13.3), so the returned value
+        // is exactly what the database holds.
+        let created = engine
+            .create(OperationSource::Site, vec![target], created_at)
+            .await?;
+        assert_eq!(created.state(), OperationState::Queued);
+        let operation_id = created.id();
+        assert_eq!(
+            OperationStore::find_operation(&store, operation_id).await?,
+            Some(created.clone())
+        );
+
+        let validating_at = created_at + Duration::SECOND;
+        let validating = engine
+            .apply(
+                operation_id,
+                OperationEvent::ValidationStarted,
+                validating_at,
+            )
+            .await?;
+        assert_eq!(validating.state(), OperationState::Validating);
+        let running_at = validating_at + Duration::SECOND;
+        let running = engine
+            .apply(operation_id, OperationEvent::ValidationPassed, running_at)
+            .await?;
+        assert_eq!(running.state(), OperationState::Running);
+        let waiting_at = running_at + Duration::SECOND;
+        let waiting = engine
+            .apply(operation_id, OperationEvent::RemoteTaskStarted, waiting_at)
+            .await?;
+        assert_eq!(waiting.state(), OperationState::WaitingRemote);
+
+        // The §13.6 recovery scan finds the interrupted in-flight operation.
+        let recovered = engine.recover_pending().await?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id(), operation_id);
+
+        let verifying_at = waiting_at + Duration::SECOND;
+        let verifying = engine
+            .apply(
+                operation_id,
+                OperationEvent::RemoteTaskCompleted,
+                verifying_at,
+            )
+            .await?;
+        assert_eq!(verifying.state(), OperationState::Verifying);
+        let succeeded_at = verifying_at + Duration::SECOND;
+        let succeeded = engine
+            .apply(
+                operation_id,
+                OperationEvent::VerificationPassed,
+                succeeded_at,
+            )
+            .await?;
+        assert_eq!(succeeded.state(), OperationState::Succeeded);
+        assert!(succeeded.is_terminal());
+
+        // A finished operation is never reported as recoverable again, and
+        // the batch summary boundary (§13.7) still sees it by exact state.
+        assert!(
+            engine.recover_pending().await?.is_empty(),
+            "a finished operation must never be recovered"
+        );
+        assert_eq!(
+            OperationStore::list_operations(&store, Some(OperationState::Succeeded))
+                .await?
+                .len(),
+            1
         );
 
         store.close().await?;
