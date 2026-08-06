@@ -18,10 +18,10 @@ use rutilus_api::{
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
-    EventDestinationProtocol, EventType, ManagerCommand, OperationResponse,
-    OperationSourceResponse, OperationStateResponse, RedfishCommand, ResetKeysType, ResetType,
-    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
-    TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
+    EventDestinationProtocol, EventListResponse, EventResponse, EventType, ManagerCommand,
+    OperationResponse, OperationSourceResponse, OperationStateResponse, RedfishCommand,
+    ResetKeysType, ResetType, ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride,
+    StartUpdate, SystemCommand, TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1345,12 +1345,13 @@ enum ConsoleView {
     Audit,
     Capabilities,
     Operations,
+    Events,
     Artifacts,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 8] = [
+    const ALL: [ConsoleView; 9] = [
         Self::Overview,
         Self::Credentials,
         Self::AddEndpoint,
@@ -1358,6 +1359,7 @@ impl ConsoleView {
         Self::Audit,
         Self::Capabilities,
         Self::Operations,
+        Self::Events,
         Self::Artifacts,
     ];
 
@@ -1370,6 +1372,7 @@ impl ConsoleView {
             Self::Audit => "Audit",
             Self::Capabilities => "Capabilities",
             Self::Operations => "Operations",
+            Self::Events => "Events",
             Self::Artifacts => "Artifacts",
         }
     }
@@ -2328,6 +2331,182 @@ impl From<&AuditEventResponse> for AuditEventCardProjection {
             message: event.message().to_owned(),
         }
     }
+}
+
+/// The lazy-loading state of the bounded §14.4 event-history query.
+///
+/// The server answers `GET /api/v1/events?limit=N` with a bounded list,
+/// newest first by the product receive time (`observed_at`) with the event
+/// id as tiebreaker — the persistence listing order — with obvious
+/// duplicates already removed (§14.4); this view additionally re-establishes
+/// that exact newest-first order defensively in
+/// [`EventsListState::event_cards`], so a misordered payload can never
+/// present an older event above a newer one. The console renders exactly
+/// what the bounded query returned — the bound hint shows the returned
+/// count, which is smaller than the requested limit while the history is
+/// shorter than the bound.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EventsListState {
+    Idle,
+    Loading,
+    Ready(EventListResponse),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl EventsListState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn has_empty_events(&self) -> bool {
+        matches!(self, Self::Ready(query) if query.events().is_empty())
+    }
+
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(query) => query.events().len(),
+            Self::Idle | Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 event".to_owned(),
+            _ => format!("{count} events"),
+        }
+    }
+
+    /// The bounded-query hint: how many events the server actually returned,
+    /// which may be fewer than the requested limit when the history is
+    /// shorter than the bound.
+    fn bound_text(&self) -> String {
+        let count = match self {
+            Self::Ready(query) => query.events().len(),
+            Self::Idle | Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "Showing the latest 1 event".to_owned(),
+            _ => format!("Showing the latest {count} events"),
+        }
+    }
+
+    /// Static failure copy for the whole-section error state.
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The event history is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn event_cards(&self) -> Vec<EventCardProjection> {
+        match self {
+            Self::Ready(query) => {
+                let mut events = query.events().to_vec();
+                // Why re-sort: the operator reads the card list top-down as a
+                // time axis, so the bounded list is re-ordered here by the
+                // same key the query itself orders by — receive time
+                // (`observed_at`) descending, then event id descending — to
+                // make a misordered payload harmless. The stable sort keeps
+                // server order for events that tie on both keys.
+                events.sort_by(|left, right| {
+                    right
+                        .observed_at()
+                        .cmp(&left.observed_at())
+                        .then_with(|| right.id().cmp(&left.id()))
+                });
+                events.iter().map(EventCardProjection::from).collect()
+            }
+            Self::Idle | Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+}
+
+/// Display label for one §14.4 severity code.
+///
+/// The wire contract is the three stable lowercase codes (`ok`, `warning`,
+/// `critical`); the api refuses any other code at ingestion, so this mapping
+/// covers the closed vocabulary. The fallback renders the raw code itself,
+/// so an unexpected code is shown verbatim (§14.4), never relabeled.
+#[cfg(any(target_arch = "wasm32", test))]
+fn severity_label(severity: &str) -> String {
+    match severity {
+        "ok" => "OK".to_owned(),
+        "warning" => "Warning".to_owned(),
+        "critical" => "Critical".to_owned(),
+        _ => severity.to_owned(),
+    }
+}
+
+/// Badge styling for one severity code: ok is the success color, warning the
+/// warn color, and critical the failure color — the same tri-state palette
+/// the capability matrix applies. The fallback uses the neutral off palette
+/// for a code the build cannot classify. Not `const`: matching on `str`
+/// needs const `PartialEq`, which is not stable yet.
+#[cfg(any(target_arch = "wasm32", test))]
+fn severity_class(severity: &str) -> &'static str {
+    match severity {
+        "ok" => "event-severity event-ok",
+        "warning" => "event-severity event-warn",
+        "critical" => "event-severity event-critical",
+        _ => "event-severity event-neutral",
+    }
+}
+
+/// One §14.4 event projected for a history card.
+///
+/// The `message_id` is the BMC's raw `MessageId` value, displayed verbatim —
+/// the design document mandates raw `MessageId` and `Severity` presentation,
+/// so the projection never normalizes, localizes, or strips the registry id.
+/// The source endpoint appears as its short id (first 8 characters), while
+/// the full event id stays available as the card title attribute and in the
+/// facts list.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventCardProjection {
+    event_id: String,
+    endpoint_short_id: String,
+    message_id: String,
+    severity_label: String,
+    severity_class: &'static str,
+    message: String,
+    event_timestamp_text: String,
+    observed_at_text: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&EventResponse> for EventCardProjection {
+    fn from(event: &EventResponse) -> Self {
+        let severity = event.severity();
+        Self {
+            event_id: event.id().to_string(),
+            endpoint_short_id: short_endpoint_id(&event.endpoint_id().to_string()),
+            message_id: event.message_id().to_owned(),
+            severity_label: severity_label(severity),
+            severity_class: severity_class(severity),
+            // Redfish events may carry no message text; the card then shows
+            // no message paragraph instead of a placeholder.
+            message: event.message().unwrap_or_default().to_owned(),
+            event_timestamp_text: format_observed_at(&event.event_timestamp()),
+            observed_at_text: format_observed_at(&event.observed_at()),
+        }
+    }
+}
+
+/// Compact card identity for one endpoint id: its first 8 characters.
+///
+/// Endpoint ids are UUID v7 strings; the full id stays available in the
+/// endpoint inventory while the short form keeps the card list scannable,
+/// mirroring the operation-card short id convention.
+#[cfg(any(target_arch = "wasm32", test))]
+fn short_endpoint_id(endpoint_id: &str) -> String {
+    endpoint_id.chars().take(8).collect()
 }
 
 /// The §13.2 lifecycle phase of one persisted operation, as display vocabulary.
@@ -4457,7 +4636,7 @@ mod browser {
         EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
         EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-        OperationListResponse, OperationResponse, TrustedEndpointResponse,
+        EventListResponse, OperationListResponse, OperationResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -4471,13 +4650,13 @@ mod browser {
         ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
-        EventActionView, EventProtocolView, EventTypeView, ImportFailure, ImportState,
-        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
-        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
-        OperationSubmitState, OperationsListState, ResetKeysTypeView, ResetTypeView,
-        SecureBootActionView, TrustChallengeProjection, UpdateArtifactChoice,
-        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
-        command_summary, endpoint_address_draft_error, format_artifact_size,
+        EventActionView, EventCardProjection, EventProtocolView, EventTypeView, EventsListState,
+        ImportFailure, ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
+        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
+        OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
+        ResetKeysTypeView, ResetTypeView, SecureBootActionView, TrustChallengeProjection,
+        UpdateArtifactChoice, artifact_chunk_range_at, artifact_upload_status_text, base64_encode,
+        build_command, command_summary, endpoint_address_draft_error, format_artifact_size,
         operation_endpoint_choices, sha256_hex, trust_mode_label, update_artifact_choices,
     };
 
@@ -4641,6 +4820,7 @@ mod browser {
                     on_back=on_back_to_overview
                 />
                 <OperationsView view=view load_state=state />
+                <EventsView view=view />
                 <ArtifactsView view=view />
             </main>
         }
@@ -6024,6 +6204,148 @@ mod browser {
     }
 
     #[component]
+    fn EventsView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Events;
+        let (state, set_state) = signal(EventsListState::Idle);
+        let (triggered, set_triggered) = signal(false);
+
+        Effect::new(move |_| {
+            if active() && !triggered.get() {
+                set_triggered.set(true);
+                set_state.set(EventsListState::Loading);
+                spawn_local(async move {
+                    let state = match fetch_events().await {
+                        Some(query) => EventsListState::Ready(query),
+                        None => EventsListState::Failed,
+                    };
+                    set_state.set(state);
+                });
+            }
+        });
+
+        let on_refresh = move |_| {
+            set_state.set(EventsListState::Loading);
+            spawn_local(async move {
+                let state = match fetch_events().await {
+                    Some(query) => EventsListState::Ready(query),
+                    None => EventsListState::Failed,
+                };
+                set_state.set(state);
+            });
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Event history"</p>
+                        <h2>{move || state.get().count_text()}</h2>
+                    </div>
+                    <p>"BMC event records, newest first"</p>
+                </div>
+                <p
+                    class="event-bound"
+                    hidden=move || {
+                        !state.get().is_ready() || state.get().has_empty_events()
+                    }
+                >
+                    {move || state.get().bound_text()}
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !state.get().is_ready() || !state.get().has_empty_events()
+                    }
+                >
+                    "No events have been recorded yet."
+                </p>
+                <div class="resource-list">
+                    {move || {
+                        state
+                            .get()
+                            .event_cards()
+                            .into_iter()
+                            .map(|card| view! { <EventCard card=card /> })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || state.get().is_loading()
+                        hidden=move || {
+                            !state.get().is_ready() && !state.get().is_failed()
+                        }
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="form-error" hidden=move || !state.get().is_failed()>
+                    {move || state.get().failure_message()}
+                </p>
+            </section>
+        }
+    }
+
+    #[component]
+    fn EventCard(card: EventCardProjection) -> impl IntoView {
+        let EventCardProjection {
+            event_id,
+            endpoint_short_id,
+            message_id,
+            severity_label,
+            severity_class,
+            message,
+            event_timestamp_text,
+            observed_at_text,
+        } = card;
+        // The card header and the facts list both need these values; each
+        // interpolation moves its own copy into the static view surface.
+        let event_id_title = event_id.clone();
+        let event_time_text = event_timestamp_text.clone();
+        let source_endpoint_text = endpoint_short_id.clone();
+        // Redfish events may carry no message text; the message paragraph is
+        // then omitted instead of rendering an empty block.
+        let message_empty = message.is_empty();
+
+        view! {
+            <article class="credential-card">
+                <div class="credential-title">
+                    <div>
+                        <h3 class="event-message-id" title=event_id_title>{message_id}</h3>
+                        <p class="credential-username">
+                            {event_timestamp_text}
+                            <span class="event-source">" · endpoint "{endpoint_short_id}</span>
+                        </p>
+                    </div>
+                    <span class=severity_class>{severity_label}</span>
+                </div>
+                <p class="audit-message" hidden=message_empty>{message}</p>
+                <dl class="resource-facts">
+                    <div>
+                        <dt>"Event time"</dt>
+                        <dd>{event_time_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Observed at"</dt>
+                        <dd>{observed_at_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Source endpoint"</dt>
+                        <dd>{source_endpoint_text}</dd>
+                    </div>
+                    <div>
+                        <dt>"Event id"</dt>
+                        <dd>{event_id}</dd>
+                    </div>
+                </dl>
+            </article>
+        }
+    }
+
+    #[component]
     fn CapabilitiesView(
         view: ReadSignal<ConsoleView>,
         target: ReadSignal<Option<CapabilityTargetProjection>>,
@@ -6217,6 +6539,25 @@ mod browser {
             return None;
         }
         response.json::<AuditQueryResponse>().await.ok()
+    }
+
+    /// How many recent events the console requests from the bounded §14.4
+    /// history query. The server may return fewer while the history is
+    /// shorter than the bound, and the view's bound hint reports the count
+    /// actually returned.
+    const EVENT_QUERY_LIMIT: u32 = 50;
+
+    async fn fetch_events() -> Option<EventListResponse> {
+        let url = format!("/api/v1/events?limit={EVENT_QUERY_LIMIT}");
+        let response = Request::get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        response.json::<EventListResponse>().await.ok()
     }
 
     async fn fetch_credentials() -> Option<CredentialInventoryResponse> {
@@ -9660,6 +10001,196 @@ mod tests {
     }
 
     #[test]
+    fn event_query_projection_renders_raw_message_ids_and_severity_badges()
+    -> Result<(), Box<dyn Error>> {
+        let query = serde_json::from_value::<EventListResponse>(json!({
+            "events": [
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f1",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "message_id": "Base.1.18.ResourceUpdated",
+                    "severity": "ok",
+                    "message": "The resource was updated by a configuration change.",
+                    "event_timestamp": "2026-08-06T11:12:13Z",
+                    "observed_at": "2026-08-06T11:12:14Z"
+                },
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f2",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a2",
+                    "message_id": "OEM.ACME.1.0.CoolingThresholdApproaching",
+                    "severity": "warning",
+                    "message": "Inlet temperature is approaching the warning threshold.",
+                    "event_timestamp": "2026-08-06T11:11:00Z",
+                    "observed_at": "2026-08-06T11:11:01Z"
+                },
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f3",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a3",
+                    "message_id": "ResourceEvent.1.0.ResourceErrorsDetected",
+                    "severity": "critical",
+                    "message": "Errors were detected on the resource.",
+                    "event_timestamp": "2026-08-06T11:10:00Z",
+                    "observed_at": "2026-08-06T11:10:02Z"
+                }
+            ]
+        }))?;
+        let state = EventsListState::Ready(query);
+        assert!(state.is_ready());
+        assert!(!state.is_failed());
+        assert_eq!(state.count_text(), "3 events");
+        assert_eq!(state.bound_text(), "Showing the latest 3 events");
+
+        let cards = state.event_cards();
+        let updated = cards.first().ok_or("ok event card must exist")?;
+        assert_eq!(updated.event_id, "01989abc-def0-7abc-8def-0123456789f1");
+        assert_eq!(updated.endpoint_short_id, "01989abc");
+        assert_eq!(updated.message_id, "Base.1.18.ResourceUpdated");
+        assert_eq!(updated.severity_label, "OK");
+        assert_eq!(updated.severity_class, "event-severity event-ok");
+        assert_eq!(
+            updated.message,
+            "The resource was updated by a configuration change."
+        );
+        assert_eq!(updated.event_timestamp_text, "2026-08-06T11:12:13Z");
+        assert_eq!(updated.observed_at_text, "2026-08-06T11:12:14Z");
+
+        let warning = cards.get(1).ok_or("warning event card must exist")?;
+        assert_eq!(
+            warning.message_id,
+            "OEM.ACME.1.0.CoolingThresholdApproaching"
+        );
+        assert_eq!(warning.severity_label, "Warning");
+        assert_eq!(warning.severity_class, "event-severity event-warn");
+
+        let critical = cards.get(2).ok_or("critical event card must exist")?;
+        assert_eq!(
+            critical.message_id,
+            "ResourceEvent.1.0.ResourceErrorsDetected"
+        );
+        assert_eq!(critical.severity_label, "Critical");
+        assert_eq!(critical.severity_class, "event-severity event-critical");
+        Ok(())
+    }
+
+    #[test]
+    fn event_cards_reestablish_newest_first_order() -> Result<(), Box<dyn Error>> {
+        // The fixture deliberately arrives out of order, and its BMC event
+        // timestamps run against the receive times: the bounded history
+        // contract is newest-first by the product receive time, and the view
+        // re-orders defensively on exactly that key, so a misordered payload
+        // or a drifted BMC clock can never present an older event above a
+        // newer one.
+        let query = serde_json::from_value::<EventListResponse>(json!({
+            "events": [
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f2",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a2",
+                    "message_id": "Base.1.18.ResourceUpdated",
+                    "severity": "ok",
+                    "message": "Received first",
+                    "event_timestamp": "2026-08-06T12:00:00Z",
+                    "observed_at": "2026-08-06T09:00:01Z"
+                },
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f3",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a3",
+                    "message_id": "Base.1.18.ResourceErrorsDetected",
+                    "severity": "critical",
+                    "message": "Received last",
+                    "event_timestamp": "2026-08-06T09:00:00Z",
+                    "observed_at": "2026-08-06T12:00:02Z"
+                },
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f1",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "message_id": "Base.1.18.ResourceStatusChanged",
+                    "severity": "warning",
+                    "message": "Received second",
+                    "event_timestamp": "2026-08-06T10:30:00Z",
+                    "observed_at": "2026-08-06T10:30:01Z"
+                }
+            ]
+        }))?;
+        let cards = EventsListState::Ready(query).event_cards();
+        assert_eq!(cards.len(), 3);
+        let messages = cards
+            .iter()
+            .map(|card| card.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            ["Received last", "Received second", "Received first"]
+        );
+        let observed = cards
+            .iter()
+            .map(|card| card.observed_at_text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                "2026-08-06T12:00:02Z",
+                "2026-08-06T10:30:01Z",
+                "2026-08-06T09:00:01Z"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_severity_code_renders_raw_code_with_neutral_badge() -> Result<(), Box<dyn Error>> {
+        // The api refuses unclassifiable severities at ingestion, but the
+        // projection stays total: an unexpected code is shown verbatim with
+        // the neutral badge instead of being relabeled as one of the three
+        // known severities.
+        let query = serde_json::from_value::<EventListResponse>(json!({
+            "events": [
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f9",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a9",
+                    "message_id": "Base.1.18.ResourceUpdated",
+                    "severity": "informational",
+                    "message": null,
+                    "event_timestamp": "2026-08-06T11:12:13Z",
+                    "observed_at": "2026-08-06T11:12:14Z"
+                }
+            ]
+        }))?;
+        let card = EventsListState::Ready(query)
+            .event_cards()
+            .into_iter()
+            .next()
+            .ok_or("event card must exist")?;
+        assert_eq!(card.severity_label, "informational");
+        assert_eq!(card.severity_class, "event-severity event-neutral");
+        assert_eq!(card.message, "");
+        Ok(())
+    }
+
+    #[test]
+    fn events_list_state_failure_uses_static_copy() {
+        assert!(EventsListState::Failed.is_failed());
+        assert!(!EventsListState::Failed.is_ready());
+        assert_eq!(
+            EventsListState::Failed.failure_message(),
+            "The event history is temporarily unavailable."
+        );
+        assert_eq!(EventsListState::Idle.failure_message(), "");
+        assert_eq!(EventsListState::Failed.event_cards().len(), 0);
+        assert_eq!(EventsListState::Failed.count_text(), "0 events");
+        assert!(EventsListState::Loading.is_loading());
+    }
+
+    #[test]
+    fn events_list_state_renders_empty_history() {
+        let empty = EventsListState::Ready(EventListResponse::new(Vec::new()));
+        assert!(empty.has_empty_events());
+        assert!(!empty.is_failed());
+        assert_eq!(empty.count_text(), "0 events");
+        assert_eq!(empty.event_cards().len(), 0);
+        assert_eq!(EventsListState::Idle.event_cards().len(), 0);
+    }
+
+    #[test]
     fn credential_inventory_projection_produces_secret_free_cards() -> Result<(), Box<dyn Error>> {
         let inventory = serde_json::from_value::<CredentialInventoryResponse>(json!({
             "credentials": [
@@ -10346,6 +10877,7 @@ mod tests {
                 ConsoleView::Audit,
                 ConsoleView::Capabilities,
                 ConsoleView::Operations,
+                ConsoleView::Events,
                 ConsoleView::Artifacts,
             ]
         );
@@ -10356,6 +10888,7 @@ mod tests {
         assert_eq!(ConsoleView::Audit.label(), "Audit");
         assert_eq!(ConsoleView::Capabilities.label(), "Capabilities");
         assert_eq!(ConsoleView::Operations.label(), "Operations");
+        assert_eq!(ConsoleView::Events.label(), "Events");
         assert_eq!(ConsoleView::Artifacts.label(), "Artifacts");
 
         assert!(ConsoleLoadState::Loading.is_loading());

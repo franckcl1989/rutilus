@@ -997,3 +997,50 @@ dd {
   background: linear-gradient(90deg, #3f7cb8, #83bff3);
   transition: width 180ms ease-out;
 }
+
+/* ----- Event history view (design 12.1, 14.4) ----- */
+.event-severity {
+  flex: none;
+  border-radius: 999px;
+  padding: 0.18rem 0.55rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.event-ok {
+  color: #7fd4a8;
+  background: rgb(64 152 108 / 22%);
+}
+
+.event-warn {
+  color: #e8c078;
+  background: rgb(214 158 60 / 20%);
+}
+
+.event-critical {
+  color: #e89a9a;
+  background: rgb(190 90 90 / 22%);
+}
+
+.event-neutral {
+  color: #93a5bf;
+  background: rgb(143 171 207 / 14%);
+}
+
+.event-message-id {
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+
+.event-bound {
+  margin: 0 0 0.6rem;
+  color: #8495ad;
+  font-size: 0.75rem;
+}
+
+.event-source {
+  color: #8495ad;
+}
