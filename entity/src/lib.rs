@@ -15,3 +15,5 @@ pub mod operation_target;
 pub mod remote_task;
 pub mod resource;
 pub mod resource_snapshot;
+pub mod telemetry_sample;
+pub mod telemetry_series;
