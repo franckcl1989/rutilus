@@ -9,24 +9,27 @@ use std::{
     error::Error,
     fmt,
     num::NonZeroU64,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
-    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
-    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, OperationStore,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
+    ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
+    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
+    EndpointRefreshRepository, OperationStore, ProtectedCredentialCreation, RedfishDiscovery,
+    ResolvedCredential, ResourceObservation, StoredCapability, SystemCaEvaluation,
+    TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    AuditActor, AuditEvent, CAPABILITY_LEDGER_ORDER, CapabilityState, Credential, CredentialId,
-    CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Operation,
-    OperationId, OperationState, RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CAPABILITY_LEDGER_ORDER,
+    CapabilityState, Credential, CredentialId, CredentialUsername, CredentialVersionId,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapability,
+    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Operation, OperationId,
+    OperationState, RefreshGeneration, ResourceFeature, ResourceId, ResourceODataId,
     ResourceSnapshot, ResourceSnapshotPayload, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
@@ -383,6 +386,47 @@ impl TlsIdentityProbe for MockGateway {
 ///
 /// The capability read-path tests never submit operations, so every operation
 /// call reports the controlled failure instead of mutating the mock state.
+impl ArtifactRepository for MockServices {
+    type Error = MockError;
+
+    fn create_artifact<'a>(
+        &'a self,
+        _artifact: &'a Artifact,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn find_artifact(
+        &self,
+        _artifact_id: ArtifactId,
+    ) -> BoundaryFuture<'_, Result<Option<Artifact>, Self::Error>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn list_artifacts_by_state(
+        &self,
+        _state: ArtifactState,
+    ) -> BoundaryFuture<'_, Result<Vec<Artifact>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn update_artifact(
+        &self,
+        _artifact_id: ArtifactId,
+        _uploaded_bytes: u64,
+        _state: ArtifactState,
+        _occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn artifact_file_path(&self, _artifact_id: ArtifactId) -> PathBuf {
+        // The artifact paths are never exercised by this suite; the path
+        // contract is covered by the artifact_path e2e tests.
+        PathBuf::from("unused-artifact-path")
+    }
+}
+
 impl OperationStore for MockServices {
     type Error = MockError;
 

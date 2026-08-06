@@ -5,7 +5,7 @@ use std::{error::Error, num::NonZeroU64, path::Path, sync::Arc};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{
         HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
@@ -15,11 +15,13 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use rutilus_api::{
-    AboutResponse, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
-    AuditTargetResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
-    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
-    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
-    CoreResourceResponse, CoreResourceSourceResponse, CreateCredentialRequest,
+    AboutResponse, AppendArtifactChunkRequest, ArtifactFinalizeFailureResponse,
+    ArtifactListResponse, ArtifactProgressResponse, ArtifactResponse, ArtifactStateResponse,
+    AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse, AuditTargetResponse,
+    BeginEndpointTrustRequest, CapabilityClassificationResponse, CapabilityEntryResponse,
+    CapabilityStateResponse, ConfirmEndpointTrustRequest, CoreResourceCommonResponse,
+    CoreResourceCountsResponse, CoreResourceDetailsResponse, CoreResourceResponse,
+    CoreResourceSourceResponse, CreateArtifactRequest, CreateCredentialRequest,
     CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
     EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
     EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse,
@@ -32,31 +34,43 @@ use rutilus_api::{
     TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
-    AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, CapabilityLedgerEntry,
-    CapabilityQueryRepository, CapabilitySnapshotRepository, Clock, CoreResourceDetails,
-    CoreResourceReader, CoreResourceSummary, CredentialCreation, CredentialCreationError,
-    CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointCapabilityQuery, EndpointCapabilityQueryError,
-    EndpointCsvImportExecutor, EndpointCsvImportReport, EndpointCsvRowOutcome,
-    EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError, EndpointInventoryItem,
-    EndpointInventoryQuery, EndpointInventoryQueryError, EndpointInventoryRepository,
-    EndpointRefreshRepository, EndpointResourceInventory, EndpointResourceInventoryQuery,
-    EndpointResourceInventoryQueryError, EndpointTrustChallenge, EndpointTrustEstablishment,
-    EndpointTrustExpectation, EndpointTrustExpectationError, EnrolledEndpoint,
-    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, OperationStore,
-    OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError,
+    ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
+    ArtifactStoreError, AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture,
+    CapabilityLedgerEntry, CapabilityQueryRepository, CapabilitySnapshotRepository, Clock,
+    CoreResourceDetails, CoreResourceReader, CoreResourceSummary, CredentialCreation,
+    CredentialCreationError, CredentialCreationRepository, CredentialInventoryQuery,
+    CredentialInventoryQueryError, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointCapabilityQuery,
+    EndpointCapabilityQueryError, EndpointCsvImportExecutor, EndpointCsvImportReport,
+    EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError,
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
+    EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
+    EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
+    EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
+    OperationStore, OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError,
     TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
-    AuditActor, AuditEvent, CapabilityClassification, CapabilityState,
-    CertificateFingerprintParseError, Credential, CredentialId, CredentialName, CredentialUsername,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, Operation,
-    OperationId, OperationSource, OperationState, OperationTarget, ResourceFeature,
-    ResourceSnapshot, TargetId, TlsTrust, UiLocation,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityClassification,
+    CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
+    CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
+    EndpointId, Operation, OperationId, OperationSource, OperationState, OperationTarget,
+    ResourceFeature, ResourceSnapshot, TargetId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
+/// The HTTP body limit of one chunk request: the 4 MiB base64 protocol limit
+/// plus JSON framing headroom, so the handler's own
+/// [`ARTIFACT_CHUNK_BASE64_MAX_BYTES`] validation stays reachable. Bodies far
+/// beyond the protocol limit are rejected by the transport layer with 413
+/// before any decoding work.
+///
+/// The cast cannot truncate on any supported pointer width: 4 MiB fits even
+/// a 32-bit `usize`, so the protocol limit and the transport limit never
+/// drift.
+#[allow(clippy::cast_possible_truncation)]
+const ARTIFACT_CHUNK_BODY_LIMIT_BYTES: usize = ARTIFACT_CHUNK_BASE64_MAX_BYTES as usize + 1024;
 const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
 const CROSS_ORIGIN_OPENER_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-opener-policy");
@@ -137,6 +151,14 @@ where
 /// The embedding runtime supplies the `OperationStore` implementation (the
 /// Standalone posture delegates to its `SqliteStore`, which already
 /// implements the boundary) and the application composes it per request.
+///
+/// The artifact boundary (§14.3) is [`ArtifactRepository`]: the five-method
+/// contract that drives the upload store (create, find, per-state listing,
+/// progress/state update, and the deterministic `artifact_file_path`). The
+/// contract mirrors the `SqliteStore` artifact surface exactly — the
+/// embedding runtime delegates its five methods to the store, which persists
+/// the manifest and the upload progress while the application use case owns
+/// the file bytes (`spawn_blocking`, §7.8).
 pub trait ProductServices:
     EndpointInventoryRepository
     + CredentialInventoryRepository
@@ -150,6 +172,7 @@ pub trait ProductServices:
     + AuditEventQuery
     + CapabilityQueryRepository
     + OperationStore
+    + ArtifactRepository
 {
 }
 
@@ -166,6 +189,7 @@ impl<T> ProductServices for T where
         + AuditEventQuery
         + CapabilityQueryRepository
         + OperationStore
+        + ArtifactRepository
 {
 }
 
@@ -200,6 +224,10 @@ where
 /// can serve Standalone loopback and a future HTTPS Site listener. All write
 /// paths are composed from the injected application boundaries at request
 /// time, keeping the Web crate free of persistence and security internals.
+///
+/// The function is a declarative route table; the line count grows with the
+/// product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
 pub fn router<Services, Gateway, Time>(
     product: WebProductInfo,
     actor: AuditActor,
@@ -264,6 +292,27 @@ where
         .route(
             "/api/v1/operations/{operation_id}",
             get(operation_detail::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/artifacts",
+            post(create_artifact::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/artifacts",
+            get(list_artifacts::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/chunks",
+            post(append_artifact_chunk::<Services, Gateway, Time>)
+                .layer(DefaultBodyLimit::max(ARTIFACT_CHUNK_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/finalize",
+            post(finalize_artifact::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}",
+            get(artifact_detail::<Services, Gateway, Time>),
         )
         .fallback(static_asset)
         .with_state(WebState {
@@ -813,6 +862,270 @@ where
             | SubmissionError::Inventory(_),
         ) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// Declares one firmware artifact manifest before any byte is transferred
+/// (§14.3) and returns its `Uploading` projection.
+///
+/// The name and digest are validated by their domain types and `size_bytes`
+/// must be positive; every declaration failure is a client error (400). The
+/// artifact starts with zero bytes received, so the client immediately knows
+/// the offset the first chunk must carry.
+async fn create_artifact<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CreateArtifactRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Time: Clock,
+{
+    let store = ArtifactStore::new(state.services.as_ref());
+    let now = state.clock.now();
+    match store
+        .create(request.name(), request.size_bytes(), request.sha256(), now)
+        .await
+    {
+        Ok(artifact) => json_created(Json(project_artifact(&artifact))),
+        Err(ArtifactStoreError::InvalidName(_)) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact name is invalid".to_owned(),
+        ),
+        Err(ArtifactStoreError::InvalidSha256(_)) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact SHA-256 digest is invalid".to_owned(),
+        ),
+        Err(ArtifactStoreError::ZeroSize) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact size must be at least one byte".to_owned(),
+        ),
+        Err(ArtifactStoreError::Repository(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact persistence failed".to_owned(),
+        ),
+        // The remaining verdicts cannot be produced by a declaration.
+        Err(
+            ArtifactStoreError::NotFound { .. }
+            | ArtifactStoreError::InvalidBase64(_)
+            | ArtifactStoreError::ChunkTooLarge { .. }
+            | ArtifactStoreError::ChunkExceedsSize { .. }
+            | ArtifactStoreError::OutOfOrder { .. }
+            | ArtifactStoreError::NotUploading { .. }
+            | ArtifactStoreError::AlreadyFailed { .. }
+            | ArtifactStoreError::FinalizeFailed { .. }
+            | ArtifactStoreError::Domain(_)
+            | ArtifactStoreError::Restore(_)
+            | ArtifactStoreError::File(_),
+        ) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// Lists every artifact across all three lifecycle phases in declaration
+/// order (§9.3 artifact inventory).
+async fn list_artifacts<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let store = ArtifactStore::new(state.services.as_ref());
+    let artifacts = match store.list().await {
+        Ok(artifacts) => artifacts,
+        Err(ArtifactStoreError::Repository(_)) => {
+            return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        // The remaining verdicts cannot be produced by a listing.
+        Err(_) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut response = Json(ArtifactListResponse::new(
+        artifacts.iter().map(project_artifact).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Returns one artifact's secret-free projection by id.
+async fn artifact_detail<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(artifact_id): AxumPath<String>,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let Ok(artifact_id) = artifact_id.parse::<ArtifactId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "artifact id is invalid".to_owned());
+    };
+    let store = ArtifactStore::new(state.services.as_ref());
+    match store.find(artifact_id).await {
+        Ok(Some(artifact)) => json_ok(Json(project_artifact(&artifact))),
+        Ok(None) => uncached_status(StatusCode::NOT_FOUND),
+        Err(ArtifactStoreError::Repository(_)) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+        // The remaining verdicts cannot be produced by a single-record read.
+        Err(_) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// Receives one base64-encoded byte range of an artifact upload (§14.3) and
+/// returns the current progress as the resume point.
+///
+/// A chunk whose offset lies in the already-received range is acknowledged
+/// with the unchanged progress — the §15.4 at-least-once retransmission
+/// discipline — while a chunk whose offset lies beyond it is refused (400):
+/// the protocol never opens a hole. State conflicts (chunking an artifact
+/// that already finished) are a 409: the client's assumption about the
+/// artifact state is wrong, and a read settles it.
+async fn append_artifact_chunk<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(artifact_id): AxumPath<String>,
+    Json(request): Json<AppendArtifactChunkRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Time: Clock,
+{
+    let Ok(artifact_id) = artifact_id.parse::<ArtifactId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "artifact id is invalid".to_owned());
+    };
+    let store = ArtifactStore::new(state.services.as_ref());
+    let now = state.clock.now();
+    match store
+        .append_chunk(artifact_id, request.offset(), request.data(), now)
+        .await
+    {
+        Ok(progress) => json_ok(Json(project_artifact_progress(&progress))),
+        Err(ArtifactStoreError::NotFound { .. }) => uncached_status(StatusCode::NOT_FOUND),
+        Err(ArtifactStoreError::InvalidBase64(_)) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact chunk is not valid base64".to_owned(),
+        ),
+        Err(ArtifactStoreError::ChunkTooLarge { .. }) => json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "artifact chunk exceeds the {ARTIFACT_CHUNK_BASE64_MAX_BYTES} character base64 limit"
+            ),
+        ),
+        Err(ArtifactStoreError::ChunkExceedsSize { .. }) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact chunk exceeds the declared size".to_owned(),
+        ),
+        Err(ArtifactStoreError::OutOfOrder { .. }) => json_error(
+            StatusCode::BAD_REQUEST,
+            "artifact chunk is out of order; resume from the last acknowledged offset".to_owned(),
+        ),
+        Err(ArtifactStoreError::NotUploading { .. }) => json_error(
+            StatusCode::CONFLICT,
+            "artifact no longer accepts chunks".to_owned(),
+        ),
+        Err(ArtifactStoreError::Repository(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact persistence failed".to_owned(),
+        ),
+        // The remaining verdicts cannot be produced by a chunk append.
+        Err(
+            ArtifactStoreError::InvalidName(_)
+            | ArtifactStoreError::InvalidSha256(_)
+            | ArtifactStoreError::ZeroSize
+            | ArtifactStoreError::AlreadyFailed { .. }
+            | ArtifactStoreError::FinalizeFailed { .. }
+            | ArtifactStoreError::Domain(_)
+            | ArtifactStoreError::Restore(_)
+            | ArtifactStoreError::File(_),
+        ) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// Verifies one complete upload against its declared SHA-256 digest (§14.3)
+/// and returns the terminal verdict.
+///
+/// The verdict statuses: a verified digest returns the `Ready` projection
+/// (200); a digest mismatch or an incomplete upload returns 422
+/// [`ArtifactFinalizeFailureResponse`] carrying the now-terminal `Failed`
+/// projection and the exact reason — the request itself is well formed, but
+/// its subject content cannot be validated, mirroring the unprocessable
+/// verdict of a body-referenced unknown endpoint. An already `Failed`
+/// artifact is a state conflict (409), and an already `Ready` artifact
+/// finalizes again as an idempotent success (the §15.4 duplicate-acceptance
+/// discipline).
+async fn finalize_artifact<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(artifact_id): AxumPath<String>,
+) -> Response
+where
+    Services: ProductServices,
+    Time: Clock,
+{
+    let Ok(artifact_id) = artifact_id.parse::<ArtifactId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "artifact id is invalid".to_owned());
+    };
+    let store = ArtifactStore::new(state.services.as_ref());
+    let now = state.clock.now();
+    match store.finalize(artifact_id, now).await {
+        Ok(artifact) => json_ok(Json(project_artifact(&artifact))),
+        Err(ArtifactStoreError::NotFound { .. }) => uncached_status(StatusCode::NOT_FOUND),
+        Err(ArtifactStoreError::AlreadyFailed { .. }) => json_error(
+            StatusCode::CONFLICT,
+            "artifact already failed; declare a new artifact".to_owned(),
+        ),
+        Err(ArtifactStoreError::FinalizeFailed {
+            artifact, reason, ..
+        }) => json_error_with_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ArtifactFinalizeFailureResponse::new(
+                project_artifact(&artifact),
+                reason,
+            )),
+        ),
+        Err(ArtifactStoreError::File(_)) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the stored artifact file could not be read".to_owned(),
+        ),
+        Err(ArtifactStoreError::Repository(_)) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact persistence failed".to_owned(),
+        ),
+        // The remaining verdicts cannot be produced by a finalize.
+        Err(
+            ArtifactStoreError::InvalidName(_)
+            | ArtifactStoreError::InvalidSha256(_)
+            | ArtifactStoreError::ZeroSize
+            | ArtifactStoreError::InvalidBase64(_)
+            | ArtifactStoreError::ChunkTooLarge { .. }
+            | ArtifactStoreError::ChunkExceedsSize { .. }
+            | ArtifactStoreError::OutOfOrder { .. }
+            | ArtifactStoreError::NotUploading { .. }
+            | ArtifactStoreError::Domain(_)
+            | ArtifactStoreError::Restore(_),
+        ) => uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+fn project_artifact(artifact: &Artifact) -> ArtifactResponse {
+    ArtifactResponse::new(
+        artifact.id().into_uuid(),
+        artifact.name().to_string(),
+        artifact.size_bytes(),
+        artifact.sha256().to_string(),
+        project_artifact_state(artifact.state()),
+        artifact.uploaded_bytes(),
+        artifact.created_at(),
+        artifact.updated_at(),
+    )
+}
+
+fn project_artifact_state(state: ArtifactState) -> ArtifactStateResponse {
+    match state {
+        ArtifactState::Uploading => ArtifactStateResponse::Uploading,
+        ArtifactState::Ready => ArtifactStateResponse::Ready,
+        ArtifactState::Failed => ArtifactStateResponse::Failed,
+    }
+}
+
+fn project_artifact_progress(progress: &ArtifactProgress) -> ArtifactProgressResponse {
+    ArtifactProgressResponse::new(
+        progress.artifact_id().into_uuid(),
+        progress.uploaded_bytes(),
+        progress.size_bytes(),
+    )
 }
 
 fn project_operation(operation: &Operation) -> OperationResponse {
@@ -4145,6 +4458,45 @@ mod tests {
             _state: Option<OperationState>,
         ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl ArtifactRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn create_artifact<'a>(
+            &'a self,
+            _artifact: &'a Artifact,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn find_artifact(
+            &self,
+            _artifact_id: ArtifactId,
+        ) -> BoundaryFuture<'_, Result<Option<Artifact>, Self::Error>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list_artifacts_by_state(
+            &self,
+            _state: ArtifactState,
+        ) -> BoundaryFuture<'_, Result<Vec<Artifact>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn update_artifact(
+            &self,
+            _artifact_id: ArtifactId,
+            _uploaded_bytes: u64,
+            _state: ArtifactState,
+            _occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn artifact_file_path(&self, _artifact_id: ArtifactId) -> std::path::PathBuf {
+            std::path::PathBuf::from("unused-artifact-path")
         }
     }
 

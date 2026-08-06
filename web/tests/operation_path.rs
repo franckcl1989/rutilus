@@ -13,25 +13,27 @@ use std::{
     error::Error,
     fmt,
     num::NonZeroU64,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
-    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
-    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, OperationStore,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, TlsIdentityObservation, TlsIdentityProbe,
+    ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
+    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
+    EndpointRefreshRepository, OperationStore, ProtectedCredentialCreation, RedfishDiscovery,
+    ResolvedCredential, ResourceObservation, StoredCapability, TlsIdentityObservation,
+    TlsIdentityProbe,
 };
 use rutilus_domain::{
-    AuditActor, AuditEvent, Credential, CredentialId, CredentialUsername, CredentialVersionId,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
-    EndpointDisplayName, EndpointId, Operation, OperationId, OperationSource, OperationState,
-    OperationTarget, RedfishCommand, ResetType, ResourceSnapshot, SystemCommand, TargetId,
-    TlsCertificate, TlsTrust,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
+    CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Operation, OperationId,
+    OperationSource, OperationState, OperationTarget, RedfishCommand, ResetType, ResourceSnapshot,
+    SystemCommand, TargetId, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -82,6 +84,47 @@ impl Error for MockError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MockProtected;
+
+impl ArtifactRepository for MockServices {
+    type Error = MockError;
+
+    fn create_artifact<'a>(
+        &'a self,
+        _artifact: &'a Artifact,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn find_artifact(
+        &self,
+        _artifact_id: ArtifactId,
+    ) -> BoundaryFuture<'_, Result<Option<Artifact>, Self::Error>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn list_artifacts_by_state(
+        &self,
+        _state: ArtifactState,
+    ) -> BoundaryFuture<'_, Result<Vec<Artifact>, Self::Error>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn update_artifact(
+        &self,
+        _artifact_id: ArtifactId,
+        _uploaded_bytes: u64,
+        _state: ArtifactState,
+        _occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn artifact_file_path(&self, _artifact_id: ArtifactId) -> PathBuf {
+        // The artifact paths are never exercised by this suite; the path
+        // contract is covered by the artifact_path e2e tests.
+        PathBuf::from("unused-artifact-path")
+    }
+}
 
 impl OperationStore for MockServices {
     type Error = MockError;

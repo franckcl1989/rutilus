@@ -2102,6 +2102,265 @@ impl OperationListResponse {
     }
 }
 
+/// The §14.3 lifecycle state of one firmware upload artifact.
+///
+/// The three wire values mirror the domain state codes exactly, so the
+/// console renders an artifact card without translating a persistence
+/// vocabulary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStateResponse {
+    /// Bytes are still being received; no finalize has succeeded yet.
+    Uploading,
+    /// The complete byte range was received and its SHA-256 verified.
+    Ready,
+    /// A finalize attempt could not validate the received bytes.
+    Failed,
+}
+
+/// Declares one firmware artifact before any byte is transferred (§14.3).
+///
+/// `sha256` is the lowercase hex-encoded digest the complete file must match;
+/// the server verifies it when the finalize step reads back the stored file,
+/// so a truncated or corrupted upload surfaces as a clean `failed` verdict
+/// instead of reaching a BMC.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateArtifactRequest {
+    name: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+impl CreateArtifactRequest {
+    #[must_use]
+    pub const fn new(name: String, size_bytes: u64, sha256: String) -> Self {
+        Self {
+            name,
+            size_bytes,
+            sha256,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// One §9.3 `artifacts` row projected without file content.
+///
+/// The projection is deliberately secret-free and content-free: the console
+/// renders metadata and upload progress, and the file bytes are only ever
+/// read back by the server for the finalize checksum.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactResponse {
+    artifact_id: Uuid,
+    name: String,
+    size_bytes: u64,
+    sha256: String,
+    state: ArtifactStateResponse,
+    uploaded_bytes: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl ArtifactResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        artifact_id: Uuid,
+        name: String,
+        size_bytes: u64,
+        sha256: String,
+        state: ArtifactStateResponse,
+        uploaded_bytes: u64,
+        created_at: OffsetDateTime,
+        updated_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            artifact_id,
+            name,
+            size_bytes,
+            sha256,
+            state,
+            uploaded_bytes,
+            created_at,
+            updated_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact_id(&self) -> Uuid {
+        self.artifact_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> ArtifactStateResponse {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn uploaded_bytes(&self) -> u64 {
+        self.uploaded_bytes
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> OffsetDateTime {
+        self.updated_at
+    }
+}
+
+/// Stable envelope for the §9.3 artifact inventory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactListResponse {
+    artifacts: Vec<ArtifactResponse>,
+}
+
+impl ArtifactListResponse {
+    #[must_use]
+    pub const fn new(artifacts: Vec<ArtifactResponse>) -> Self {
+        Self { artifacts }
+    }
+
+    #[must_use]
+    pub fn artifacts(&self) -> &[ArtifactResponse] {
+        &self.artifacts
+    }
+}
+
+/// One base64-encoded byte range of an artifact upload (§14.3).
+///
+/// `data` is RFC 4648 §4 standard base64 with padding; the server decodes it
+/// before writing. `offset` must equal the bytes already received, so a
+/// client resumes from the last acknowledged progress and the server never
+/// has to merge a hole.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppendArtifactChunkRequest {
+    offset: u64,
+    data: String,
+}
+
+impl AppendArtifactChunkRequest {
+    #[must_use]
+    pub const fn new(offset: u64, data: String) -> Self {
+        Self { offset, data }
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+}
+
+/// The upload progress of one artifact after a chunk append.
+///
+/// The client resumes from `uploaded_bytes`: the next chunk must carry exactly
+/// that offset, which makes an interrupted upload recoverable by re-running
+/// the remaining chunks.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactProgressResponse {
+    artifact_id: Uuid,
+    uploaded_bytes: u64,
+    size_bytes: u64,
+}
+
+impl ArtifactProgressResponse {
+    #[must_use]
+    pub const fn new(artifact_id: Uuid, uploaded_bytes: u64, size_bytes: u64) -> Self {
+        Self {
+            artifact_id,
+            uploaded_bytes,
+            size_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact_id(&self) -> Uuid {
+        self.artifact_id
+    }
+
+    #[must_use]
+    pub const fn uploaded_bytes(&self) -> u64 {
+        self.uploaded_bytes
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+/// A finalize attempt that could not validate the received bytes (§14.3).
+///
+/// Carries the artifact's terminal `failed` projection plus the exact reason
+/// so the console can explain why verification did not pass in one round
+/// trip, without a follow-up read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactFinalizeFailureResponse {
+    artifact: ArtifactResponse,
+    reason: String,
+}
+
+impl ArtifactFinalizeFailureResponse {
+    #[must_use]
+    pub const fn new(artifact: ArtifactResponse, reason: String) -> Self {
+        Self { artifact, reason }
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> &ArtifactResponse {
+        &self.artifact
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
@@ -5134,6 +5393,227 @@ mod tests {
                 "total": 0
             }))
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_create_and_chunk_contracts_round_trip() -> Result<(), Box<dyn Error>> {
+        let request = CreateArtifactRequest::new(
+            "firmware.bin".to_owned(),
+            6,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+        );
+        let chunk = AppendArtifactChunkRequest::new(0, "aGVsbG8=".to_owned());
+
+        assert_eq!(request.name(), "firmware.bin");
+        assert_eq!(request.size_bytes(), 6);
+        assert_eq!(
+            request.sha256(),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+        assert_eq!(chunk.offset(), 0);
+        assert_eq!(chunk.data(), "aGVsbG8=");
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "name": "firmware.bin",
+                "size_bytes": 6,
+                "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateArtifactRequest>(serde_json::to_value(&request)?)?,
+            request
+        );
+        assert_eq!(
+            serde_json::to_value(&chunk)?,
+            json!({ "offset": 0, "data": "aGVsbG8=" })
+        );
+        assert!(
+            serde_json::from_value::<AppendArtifactChunkRequest>(json!({
+                "offset": 0,
+                "data": "aGVsbG8=",
+                "checksum": "ignored"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_response_contract_pins_the_wire_projection() -> Result<(), Box<dyn Error>> {
+        let created_at = OffsetDateTime::parse("2026-08-06T10:11:12Z", &Rfc3339)?;
+        let updated_at = OffsetDateTime::parse("2026-08-06T10:12:13Z", &Rfc3339)?;
+        let artifact_id = uuid!("01989abc-def0-7abc-8def-0123456789d5");
+        let response = ArtifactResponse::new(
+            artifact_id,
+            "firmware.bin".to_owned(),
+            6,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            ArtifactStateResponse::Uploading,
+            2,
+            created_at,
+            updated_at,
+        );
+        let progress = ArtifactProgressResponse::new(artifact_id, 2, 6);
+
+        assert_eq!(response.artifact_id(), artifact_id);
+        assert_eq!(response.name(), "firmware.bin");
+        assert_eq!(response.size_bytes(), 6);
+        assert_eq!(response.state(), ArtifactStateResponse::Uploading);
+        assert_eq!(response.uploaded_bytes(), 2);
+        assert_eq!(response.created_at(), created_at);
+        assert_eq!(response.updated_at(), updated_at);
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "artifact_id": artifact_id,
+                "name": "firmware.bin",
+                "size_bytes": 6,
+                "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "state": "uploading",
+                "uploaded_bytes": 2,
+                "created_at": "2026-08-06T10:11:12Z",
+                "updated_at": "2026-08-06T10:12:13Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ArtifactResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert_eq!(
+            serde_json::to_value(&progress)?,
+            json!({
+                "artifact_id": artifact_id,
+                "uploaded_bytes": 2,
+                "size_bytes": 6
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ArtifactProgressResponse>(serde_json::to_value(&progress)?)?,
+            progress
+        );
+        assert!(
+            serde_json::from_value::<ArtifactResponse>(json!({
+                "artifact_id": artifact_id,
+                "name": "firmware.bin",
+                "size_bytes": 6,
+                "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "state": "paused",
+                "uploaded_bytes": 2,
+                "created_at": "2026-08-06T10:11:12Z",
+                "updated_at": "2026-08-06T10:12:13Z"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ArtifactResponse>(json!({
+                "artifact_id": artifact_id,
+                "name": "firmware.bin",
+                "size_bytes": 6,
+                "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "state": "uploading",
+                "uploaded_bytes": 2,
+                "created_at": "2026-08-06T10:11:12Z",
+                "updated_at": "2026-08-06T10:12:13Z",
+                "location": "/tmp/firmware.bin"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_states_and_list_envelope_round_trip() -> Result<(), Box<dyn Error>> {
+        let created_at = OffsetDateTime::parse("2026-08-06T10:11:12Z", &Rfc3339)?;
+        let states = [
+            (ArtifactStateResponse::Uploading, "uploading"),
+            (ArtifactStateResponse::Ready, "ready"),
+            (ArtifactStateResponse::Failed, "failed"),
+        ];
+        for (state, wire) in states {
+            assert_eq!(serde_json::to_value(state)?, json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ArtifactStateResponse>(json!(wire))?,
+                state
+            );
+        }
+        assert!(serde_json::from_value::<ArtifactStateResponse>(json!("aborted")).is_err());
+
+        let list = ArtifactListResponse::new(vec![ArtifactResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789d6"),
+            "firmware.bin".to_owned(),
+            6,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            ArtifactStateResponse::Ready,
+            6,
+            created_at,
+            created_at,
+        )]);
+        let encoded = serde_json::to_value(&list)?;
+
+        assert_eq!(encoded["artifacts"][0]["state"], json!("ready"));
+        assert_eq!(encoded["artifacts"][0]["uploaded_bytes"], json!(6));
+        assert_eq!(
+            serde_json::from_value::<ArtifactListResponse>(encoded)?,
+            list
+        );
+        assert_eq!(
+            serde_json::from_value::<ArtifactListResponse>(json!({ "artifacts": [] }))?,
+            ArtifactListResponse::new(Vec::new())
+        );
+        assert!(
+            serde_json::from_value::<ArtifactListResponse>(json!({
+                "artifacts": [],
+                "next_page": null
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_finalize_failure_contract_carries_reason() -> Result<(), Box<dyn Error>> {
+        let created_at = OffsetDateTime::parse("2026-08-06T10:11:12Z", &Rfc3339)?;
+        let artifact = ArtifactResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789d7"),
+            "firmware.bin".to_owned(),
+            6,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            ArtifactStateResponse::Failed,
+            6,
+            created_at,
+            created_at,
+        );
+        let failure = ArtifactFinalizeFailureResponse::new(
+            artifact.clone(),
+            "SHA-256 verification failed".to_owned(),
+        );
+
+        assert_eq!(failure.artifact(), &artifact);
+        assert_eq!(failure.reason(), "SHA-256 verification failed");
+        assert_eq!(
+            serde_json::to_value(&failure)?,
+            json!({
+                "artifact": {
+                    "artifact_id": "01989abc-def0-7abc-8def-0123456789d7",
+                    "name": "firmware.bin",
+                    "size_bytes": 6,
+                    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                    "state": "failed",
+                    "uploaded_bytes": 6,
+                    "created_at": "2026-08-06T10:11:12Z",
+                    "updated_at": "2026-08-06T10:11:12Z"
+                },
+                "reason": "SHA-256 verification failed"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ArtifactFinalizeFailureResponse>(serde_json::to_value(
+                &failure
+            )?,)?,
+            failure
         );
         Ok(())
     }
