@@ -4,15 +4,17 @@ use rutilus_domain::{
     AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
     AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
     AuditRedfishOperation, AuditSequence, AuditTarget, CredentialId, CredentialUsername,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointId, ProductPermission, ResourceEtag,
-    ResourceFeature, ResourceODataId, ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload,
-    TlsTrust,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointId,
+    ProductPermission, ResourceEtag, ResourceFeature, ResourceODataId, ResourceODataType,
+    ResourceSnapshot, ResourceSnapshotPayload, TlsTrust,
 };
 use secrecy::SecretString;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::{AuditEventWriter, AuditRecordError, BoundaryFuture, Clock, CredentialResolver};
+use crate::{
+    AuditEventWriter, AuditRecordError, BoundaryFuture, Clock, CredentialResolver, RedfishDiscovery,
+};
 
 /// A typed Redfish resource projection returned by the BMC boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +150,61 @@ where
     }
 }
 
+/// Replaces one endpoint's complete capability snapshot as one atomic write.
+///
+/// The refresh re-probes the endpoint's advertised capabilities after the
+/// resource Generation commits and hands every observation to this boundary
+/// with a single refresh-clock timestamp. The implementation must replace the
+/// whole previous snapshot (delete-then-insert inside one transaction) rather
+/// than merge with it, so a capability that stopped advertising disappears
+/// and a partially refreshed capability page is impossible — the same
+/// whole-snapshot contract that enrollment's `create_discovered_endpoint`
+/// upholds.
+///
+/// The boundary lives on the same repository parameter as
+/// [`EndpointRefreshRepository`] instead of a separate constructor slot:
+/// every runtime persists endpoint aggregates and their capability rows
+/// through one implementation (enrollment already writes both atomically
+/// through a single repository), so splitting the parameter would force every
+/// caller to pass the same object twice.
+pub trait CapabilitySnapshotRepository: Send + Sync {
+    type Error: Error + Send + Sync + 'static;
+
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        observations: &'a [EndpointCapabilityObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>>;
+}
+
+impl<Repository> CapabilitySnapshotRepository for &Repository
+where
+    Repository: CapabilitySnapshotRepository + ?Sized,
+{
+    type Error = Repository::Error;
+
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        observations: &'a [EndpointCapabilityObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Repository::replace_endpoint_capabilities(*self, endpoint_id, observations, observed_at)
+    }
+}
+
 /// Coordinates an authenticated, complete refresh of one managed endpoint.
+///
+/// `Reader` stays a single constructor parameter although it now plays two
+/// roles: every runtime composes one Redfish gateway object implementing both
+/// `CoreResourceReader` and `RedfishDiscovery` (the web gateway contract
+/// already demands `TlsIdentityProbe + RedfishDiscovery + CoreResourceReader`
+/// on the same gateway), so a separate discovery parameter would only force
+/// the caller to pass the same object twice. `Repository` likewise remains one
+/// parameter because the capability snapshot belongs to the same persisted
+/// endpoint aggregate — enrollment already writes endpoint and capability rows
+/// atomically through one repository.
 pub struct EndpointRefresh<Repository, Credentials, Reader, Time> {
     repository: Repository,
     credentials: Credentials,
@@ -158,9 +214,9 @@ pub struct EndpointRefresh<Repository, Credentials, Reader, Time> {
 
 impl<Repository, Credentials, Reader, Time> EndpointRefresh<Repository, Credentials, Reader, Time>
 where
-    Repository: EndpointRefreshRepository,
+    Repository: EndpointRefreshRepository + CapabilitySnapshotRepository,
     Credentials: CredentialResolver,
-    Reader: CoreResourceReader,
+    Reader: CoreResourceReader + RedfishDiscovery,
     Time: Clock,
 {
     #[must_use]
@@ -179,18 +235,37 @@ where
     }
 
     /// Loads the exact endpoint and selected credential, performs a typed core
-    /// read, then commits all observations as one new Generation.
+    /// read, commits all observations as one new Generation, then re-probes
+    /// the endpoint's advertised capabilities and atomically replaces the
+    /// complete capability snapshot at the refresh clock time.
+    ///
+    /// The capability snapshot is written only after the resource Generation
+    /// commits, and a failed probe or failed replace fails the whole refresh
+    /// (see [`EndpointRefreshError::CapabilityProbe`] and
+    /// [`EndpointRefreshError::CapabilityCommit`]) instead of reporting
+    /// success over a stale capability page: §9.5 keeps the last complete
+    /// snapshot on any refresh failure, and §13.7 forbids partial success
+    /// masquerading as whole success. The snapshot repository is never called
+    /// when the probe itself fails, so the previous snapshot is always
+    /// retained as one intact whole.
     ///
     /// # Errors
     ///
     /// Returns [`EndpointRefreshError`] when endpoint lookup, credential
-    /// resolution, typed Redfish reading, or Generation commit fails.
+    /// resolution, typed Redfish reading, Generation commit, capability
+    /// re-probe, or capability snapshot replacement fails.
     pub async fn execute(
         &self,
         endpoint_id: EndpointId,
     ) -> Result<
         Vec<ResourceSnapshot>,
-        EndpointRefreshError<Repository::Error, Credentials::Error, Reader::Error>,
+        EndpointRefreshError<
+            <Repository as EndpointRefreshRepository>::Error,
+            <Repository as CapabilitySnapshotRepository>::Error,
+            Credentials::Error,
+            <Reader as CoreResourceReader>::Error,
+            <Reader as RedfishDiscovery>::Error,
+        >,
     > {
         let endpoint = self
             .repository
@@ -215,15 +290,38 @@ where
             )
             .await
             .map_err(EndpointRefreshError::Read)?;
-        self.repository
+        let snapshots = self
+            .repository
             .commit_resource_generation(endpoint_id, &observations, self.clock.now())
             .await
-            .map_err(EndpointRefreshError::Commit)
+            .map_err(EndpointRefreshError::Commit)?;
+        let discovery = self
+            .reader
+            .probe_core_capabilities(
+                endpoint.address(),
+                endpoint.trust(),
+                credential.username(),
+                credential.password(),
+            )
+            .await
+            .map_err(EndpointRefreshError::CapabilityProbe)?;
+        self.repository
+            .replace_endpoint_capabilities(endpoint_id, discovery.capabilities(), self.clock.now())
+            .await
+            .map_err(EndpointRefreshError::CapabilityCommit)?;
+        Ok(snapshots)
     }
 }
 
 /// Performs one complete endpoint refresh inside a mandatory append-only
 /// audit lifecycle.
+///
+/// The terminal audit event confirms `Succeeded` only when the resource
+/// Generation and the capability snapshot both committed. A failed capability
+/// re-probe or snapshot replace records `Failed` with `RedfishDiscoveryFailed`
+/// or `SnapshotPersistenceFailed` instead, so a refresh that retained the
+/// previous capability snapshot (§9.5) is never presented as a whole success
+/// (§13.7).
 pub struct AuditedEndpointRefresh<Repository, Credentials, Reader, Audit, Time> {
     repository: Repository,
     credentials: Credentials,
@@ -237,9 +335,9 @@ pub struct AuditedEndpointRefresh<Repository, Credentials, Reader, Audit, Time> 
 impl<Repository, Credentials, Reader, Audit, Time>
     AuditedEndpointRefresh<Repository, Credentials, Reader, Audit, Time>
 where
-    Repository: EndpointRefreshRepository,
+    Repository: EndpointRefreshRepository + CapabilitySnapshotRepository,
     Credentials: CredentialResolver,
-    Reader: CoreResourceReader,
+    Reader: CoreResourceReader + RedfishDiscovery,
     Audit: AuditEventWriter,
     Time: Clock,
 {
@@ -279,9 +377,11 @@ where
     ) -> Result<
         Vec<ResourceSnapshot>,
         AuditedEndpointRefreshError<
-            Repository::Error,
+            <Repository as EndpointRefreshRepository>::Error,
+            <Repository as CapabilitySnapshotRepository>::Error,
             Credentials::Error,
-            Reader::Error,
+            <Reader as CoreResourceReader>::Error,
+            <Reader as RedfishDiscovery>::Error,
             Audit::Error,
         >,
     > {
@@ -340,19 +440,40 @@ where
         Ok(snapshots)
     }
 
-    async fn record_refresh_failure(
+    async fn record_refresh_failure<
+        RepositoryError,
+        CapabilityError,
+        CredentialError,
+        ReaderError,
+        DiscoveryError,
+    >(
         &self,
         context: AuditOperationContext,
         sequence: AuditSequence,
         started_at: OffsetDateTime,
         endpoint_id: EndpointId,
-        refresh: EndpointRefreshError<Repository::Error, Credentials::Error, Reader::Error>,
+        refresh: EndpointRefreshError<
+            RepositoryError,
+            CapabilityError,
+            CredentialError,
+            ReaderError,
+            DiscoveryError,
+        >,
     ) -> AuditedEndpointRefreshError<
-        Repository::Error,
-        Credentials::Error,
-        Reader::Error,
+        RepositoryError,
+        CapabilityError,
+        CredentialError,
+        ReaderError,
+        DiscoveryError,
         Audit::Error,
-    > {
+    >
+    where
+        RepositoryError: Error + 'static,
+        CapabilityError: Error + 'static,
+        CredentialError: Error + 'static,
+        ReaderError: Error + 'static,
+        DiscoveryError: Error + 'static,
+    {
         let (failure, verification) = classify_refresh_failure(&refresh);
         let failed = match AuditEvent::failed(
             context,
@@ -392,9 +513,11 @@ where
     ) -> Result<
         (),
         AuditedEndpointRefreshError<
-            Repository::Error,
+            <Repository as EndpointRefreshRepository>::Error,
+            <Repository as CapabilitySnapshotRepository>::Error,
             Credentials::Error,
-            Reader::Error,
+            <Reader as CoreResourceReader>::Error,
+            <Reader as RedfishDiscovery>::Error,
             Audit::Error,
         >,
     > {
@@ -435,13 +558,27 @@ fn refresh_audit_context(
     )
 }
 
-fn classify_refresh_failure<RepositoryError, CredentialError, ReaderError>(
-    failure: &EndpointRefreshError<RepositoryError, CredentialError, ReaderError>,
+fn classify_refresh_failure<
+    RepositoryError,
+    CapabilityError,
+    CredentialError,
+    ReaderError,
+    DiscoveryError,
+>(
+    failure: &EndpointRefreshError<
+        RepositoryError,
+        CapabilityError,
+        CredentialError,
+        ReaderError,
+        DiscoveryError,
+    >,
 ) -> (AuditFailure, AuditFailureVerification)
 where
     RepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     CredentialError: Error + 'static,
     ReaderError: Error + 'static,
+    DiscoveryError: Error + 'static,
 {
     match failure {
         EndpointRefreshError::LoadEndpoint(_) | EndpointRefreshError::EndpointNotFound { .. } => (
@@ -456,8 +593,12 @@ where
             AuditFailure::CoreResourceReadFailed,
             AuditFailureVerification::Inconclusive,
         ),
-        EndpointRefreshError::Commit(_) => (
+        EndpointRefreshError::Commit(_) | EndpointRefreshError::CapabilityCommit(_) => (
             AuditFailure::SnapshotPersistenceFailed,
+            AuditFailureVerification::Inconclusive,
+        ),
+        EndpointRefreshError::CapabilityProbe(_) => (
+            AuditFailure::RedfishDiscoveryFailed,
             AuditFailureVerification::Inconclusive,
         ),
     }
@@ -485,11 +626,19 @@ impl fmt::Display for RefreshAuditStage {
 
 /// A controlled failure while refreshing an endpoint under mandatory audit.
 #[derive(Debug, Error)]
-pub enum AuditedEndpointRefreshError<RepositoryError, CredentialError, ReaderError, AuditError>
-where
+pub enum AuditedEndpointRefreshError<
+    RepositoryError,
+    CapabilityError,
+    CredentialError,
+    ReaderError,
+    DiscoveryError,
+    AuditError,
+> where
     RepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     CredentialError: Error + 'static,
     ReaderError: Error + 'static,
+    DiscoveryError: Error + 'static,
     AuditError: Error + 'static,
 {
     #[error("endpoint {endpoint_id} refresh audit {stage} failed")]
@@ -504,7 +653,15 @@ where
     Refresh {
         endpoint_id: EndpointId,
         #[source]
-        source: Box<EndpointRefreshError<RepositoryError, CredentialError, ReaderError>>,
+        source: Box<
+            EndpointRefreshError<
+                RepositoryError,
+                CapabilityError,
+                CredentialError,
+                ReaderError,
+                DiscoveryError,
+            >,
+        >,
     },
     #[error(
         "endpoint {endpoint_id} refresh failed and its terminal audit fact also failed: {audit}"
@@ -512,17 +669,34 @@ where
     RefreshAndAudit {
         endpoint_id: EndpointId,
         #[source]
-        refresh: Box<EndpointRefreshError<RepositoryError, CredentialError, ReaderError>>,
+        refresh: Box<
+            EndpointRefreshError<
+                RepositoryError,
+                CapabilityError,
+                CredentialError,
+                ReaderError,
+                DiscoveryError,
+            >,
+        >,
         audit: AuditRecordError<AuditError>,
     },
 }
 
-impl<RepositoryError, CredentialError, ReaderError, AuditError>
-    AuditedEndpointRefreshError<RepositoryError, CredentialError, ReaderError, AuditError>
+impl<RepositoryError, CapabilityError, CredentialError, ReaderError, DiscoveryError, AuditError>
+    AuditedEndpointRefreshError<
+        RepositoryError,
+        CapabilityError,
+        CredentialError,
+        ReaderError,
+        DiscoveryError,
+        AuditError,
+    >
 where
     RepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     CredentialError: Error + 'static,
     ReaderError: Error + 'static,
+    DiscoveryError: Error + 'static,
     AuditError: Error + 'static,
 {
     /// Reports whether the resource Generation committed before audit
@@ -551,11 +725,18 @@ where
 
 /// A controlled failure while refreshing one managed endpoint.
 #[derive(Debug, Error)]
-pub enum EndpointRefreshError<RepositoryError, CredentialError, ReaderError>
-where
+pub enum EndpointRefreshError<
+    RepositoryError,
+    CapabilityError,
+    CredentialError,
+    ReaderError,
+    DiscoveryError,
+> where
     RepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     CredentialError: Error + 'static,
     ReaderError: Error + 'static,
+    DiscoveryError: Error + 'static,
 {
     #[error("failed to load endpoint for refresh: {0}")]
     LoadEndpoint(#[source] RepositoryError),
@@ -569,6 +750,10 @@ where
     Read(#[source] ReaderError),
     #[error("failed to commit the complete resource Generation: {0}")]
     Commit(#[source] RepositoryError),
+    #[error("capability re-probe failed after the resource Generation committed: {0}")]
+    CapabilityProbe(#[source] DiscoveryError),
+    #[error("failed to atomically replace the endpoint capability snapshot: {0}")]
+    CapabilityCommit(#[source] CapabilityError),
 }
 
 #[cfg(test)]
@@ -579,17 +764,19 @@ mod tests {
     };
 
     use rutilus_domain::{
-        AuditOutcomeKind, AuditVerification, CredentialId, CredentialUsername, EndpointDisplayName,
-        RefreshGeneration, ResourceId, TlsCertificate,
+        AuditOutcomeKind, AuditVerification, CAPABILITY_LEDGER_ORDER, CapabilityState,
+        CredentialId, CredentialUsername, EndpointDisplayName, RefreshGeneration, ResourceId,
+        TlsCertificate,
     };
     use time::Duration;
 
-    use crate::ResolvedCredential;
+    use crate::{EndpointDiscovery, ResolvedCredential};
 
     use super::*;
 
     #[tokio::test]
-    async fn loads_resolves_reads_then_commits_one_generation() -> Result<(), Box<dyn Error>> {
+    async fn loads_resolves_reads_commits_then_replaces_capabilities() -> Result<(), Box<dyn Error>>
+    {
         let events = Arc::new(Mutex::new(Vec::new()));
         let endpoint = endpoint()?;
         let observed_at = endpoint.updated_at() + Duration::SECOND;
@@ -602,7 +789,10 @@ mod tests {
 
         let snapshots = service.execute(endpoint.id()).await?;
 
-        assert_eq!(recorded(&events)?, ["load", "credential", "read", "commit"]);
+        assert_eq!(
+            recorded(&events)?,
+            ["load", "credential", "read", "commit", "probe", "snapshot"]
+        );
         assert_eq!(snapshots.len(), 2);
         assert!(
             snapshots
@@ -616,8 +806,10 @@ mod tests {
     async fn missing_endpoint_or_credential_stops_before_redfish() -> Result<(), Box<dyn Error>> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let endpoint = endpoint()?;
+        let missing_repository = MockRepository::missing(Arc::clone(&events));
+        let missing_snapshot_calls = missing_repository.snapshot_calls();
         let missing_endpoint = EndpointRefresh::new(
-            MockRepository::missing(Arc::clone(&events)),
+            missing_repository,
             MockCredentials::available(Arc::clone(&events)),
             MockReader::succeed(Arc::clone(&events)),
             FixedClock(endpoint.updated_at()),
@@ -627,6 +819,7 @@ mod tests {
             Err(EndpointRefreshError::EndpointNotFound { .. })
         ));
         assert_eq!(recorded(&events)?, ["load"]);
+        assert_eq!(recorded_snapshot_calls(&missing_snapshot_calls)?.len(), 0);
 
         clear(&events)?;
         let credential_id = endpoint.credential_id();
@@ -649,8 +842,10 @@ mod tests {
     async fn read_or_commit_failure_never_reports_a_generation() -> Result<(), Box<dyn Error>> {
         let endpoint = endpoint()?;
         let read_events = Arc::new(Mutex::new(Vec::new()));
+        let read_repository = MockRepository::succeed(endpoint.clone(), Arc::clone(&read_events));
+        let read_snapshot_calls = read_repository.snapshot_calls();
         let read_failure = EndpointRefresh::new(
-            MockRepository::succeed(endpoint.clone(), Arc::clone(&read_events)),
+            read_repository,
             MockCredentials::available(Arc::clone(&read_events)),
             MockReader::fail(Arc::clone(&read_events)),
             FixedClock(endpoint.updated_at()),
@@ -660,10 +855,14 @@ mod tests {
             Err(EndpointRefreshError::Read(MockError::Reader))
         ));
         assert_eq!(recorded(&read_events)?, ["load", "credential", "read"]);
+        assert_eq!(recorded_snapshot_calls(&read_snapshot_calls)?.len(), 0);
 
         let commit_events = Arc::new(Mutex::new(Vec::new()));
+        let commit_repository =
+            MockRepository::fail_commit(endpoint.clone(), Arc::clone(&commit_events));
+        let commit_snapshot_calls = commit_repository.snapshot_calls();
         let commit_failure = EndpointRefresh::new(
-            MockRepository::fail_commit(endpoint.clone(), Arc::clone(&commit_events)),
+            commit_repository,
             MockCredentials::available(Arc::clone(&commit_events)),
             MockReader::succeed(Arc::clone(&commit_events)),
             FixedClock(endpoint.updated_at()),
@@ -676,6 +875,7 @@ mod tests {
             recorded(&commit_events)?,
             ["load", "credential", "read", "commit"]
         );
+        assert_eq!(recorded_snapshot_calls(&commit_snapshot_calls)?.len(), 0);
         Ok(())
     }
 
@@ -701,12 +901,25 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(
             recorded(&lifecycle)?,
-            ["audit", "load", "credential", "read", "commit", "audit"]
+            [
+                "audit",
+                "load",
+                "credential",
+                "read",
+                "commit",
+                "probe",
+                "snapshot",
+                "audit"
+            ]
         );
         let audit = recorded_audit_events(&audit_state)?;
         assert_eq!(audit.len(), 2);
         assert_eq!(audit[0].outcome().kind(), AuditOutcomeKind::Started);
         assert_eq!(audit[1].outcome().kind(), AuditOutcomeKind::Succeeded);
+        assert_eq!(
+            audit[1].outcome().verification(),
+            Some(AuditVerification::Confirmed)
+        );
         assert_eq!(audit[0].context(), audit[1].context());
         assert_eq!(
             audit[0].context().target(),
@@ -863,7 +1076,212 @@ mod tests {
         assert_eq!(recorded_audit_events(&audit_state)?.len(), 1);
         assert_eq!(
             recorded(&lifecycle)?,
-            ["audit", "load", "credential", "read", "commit", "audit"]
+            [
+                "audit",
+                "load",
+                "credential",
+                "read",
+                "commit",
+                "probe",
+                "snapshot",
+                "audit"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replaces_the_complete_capability_snapshot_at_the_refresh_clock_time()
+    -> Result<(), Box<dyn Error>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = endpoint()?;
+        let observed_at = endpoint.updated_at() + Duration::SECOND;
+        let repository = MockRepository::succeed(endpoint.clone(), Arc::clone(&events));
+        let snapshot_calls = repository.snapshot_calls();
+        let service = EndpointRefresh::new(
+            repository,
+            MockCredentials::available(Arc::clone(&events)),
+            MockReader::succeed(Arc::clone(&events)),
+            FixedClock(observed_at),
+        );
+
+        let snapshots = service.execute(endpoint.id()).await?;
+
+        assert_eq!(snapshots.len(), 2);
+        let calls = recorded_snapshot_calls(&snapshot_calls)?;
+        assert_eq!(calls.len(), 1, "one whole-snapshot replace per refresh");
+        let call = &calls[0];
+        assert_eq!(call.endpoint_id, endpoint.id());
+        assert_eq!(call.observed_at, observed_at);
+        assert_eq!(call.observations, capability_observations());
+        assert_eq!(
+            call.observations.len(),
+            CAPABILITY_LEDGER_ORDER.len(),
+            "the re-probed snapshot must cover the complete 30-entry §2.1 ledger"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_probe_failure_keeps_the_last_snapshot_and_fails_the_refresh()
+    -> Result<(), Box<dyn Error>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = endpoint()?;
+        let repository = MockRepository::succeed(endpoint.clone(), Arc::clone(&events));
+        let snapshot_calls = repository.snapshot_calls();
+        let service = EndpointRefresh::new(
+            repository,
+            MockCredentials::available(Arc::clone(&events)),
+            MockReader::fail_probe(Arc::clone(&events)),
+            FixedClock(endpoint.updated_at()),
+        );
+
+        let result = service.execute(endpoint.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(EndpointRefreshError::CapabilityProbe(MockError::Reader))
+        ));
+        assert_eq!(
+            recorded(&events)?,
+            ["load", "credential", "read", "commit", "probe"]
+        );
+        assert_eq!(
+            recorded_snapshot_calls(&snapshot_calls)?.len(),
+            0,
+            "a failed probe must never touch the capability snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_replace_failure_propagates() -> Result<(), Box<dyn Error>> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = endpoint()?;
+        let service = EndpointRefresh::new(
+            MockRepository::fail_snapshot(endpoint.clone(), Arc::clone(&events)),
+            MockCredentials::available(Arc::clone(&events)),
+            MockReader::succeed(Arc::clone(&events)),
+            FixedClock(endpoint.updated_at()),
+        );
+
+        assert!(matches!(
+            service.execute(endpoint.id()).await,
+            Err(EndpointRefreshError::CapabilityCommit(
+                MockError::Repository
+            ))
+        ));
+        assert_eq!(
+            recorded(&events)?,
+            ["load", "credential", "read", "commit", "probe", "snapshot"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audited_refresh_records_typed_capability_probe_failure() -> Result<(), Box<dyn Error>>
+    {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let service = AuditedEndpointRefresh::new(
+            MockRepository::succeed(endpoint, Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockReader::fail_probe(Arc::clone(&lifecycle)),
+            MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
+            FixedClock(OffsetDateTime::now_utc()),
+            AuditActor::System,
+            DeploymentPosture::Site,
+        );
+
+        let result = service.execute(endpoint_id).await;
+
+        assert!(matches!(
+            result,
+            Err(AuditedEndpointRefreshError::Refresh {
+                endpoint_id: id,
+                source,
+            }) if id == endpoint_id
+                && matches!(*source, EndpointRefreshError::CapabilityProbe(MockError::Reader))
+        ));
+        let audit = recorded_audit_events(&audit_state)?;
+        assert_eq!(audit.len(), 2);
+        assert_eq!(
+            audit[1].outcome().failure(),
+            Some(AuditFailure::RedfishDiscoveryFailed)
+        );
+        assert_eq!(
+            audit[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        assert_eq!(
+            recorded(&lifecycle)?,
+            [
+                "audit",
+                "load",
+                "credential",
+                "read",
+                "commit",
+                "probe",
+                "audit"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audited_refresh_records_typed_capability_commit_failure() -> Result<(), Box<dyn Error>>
+    {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let service = AuditedEndpointRefresh::new(
+            MockRepository::fail_snapshot(endpoint, Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockReader::succeed(Arc::clone(&lifecycle)),
+            MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
+            FixedClock(OffsetDateTime::now_utc()),
+            AuditActor::System,
+            DeploymentPosture::Site,
+        );
+
+        let result = service.execute(endpoint_id).await;
+
+        assert!(matches!(
+            result,
+            Err(AuditedEndpointRefreshError::Refresh {
+                endpoint_id: id,
+                source,
+            }) if id == endpoint_id
+                && matches!(
+                    *source,
+                    EndpointRefreshError::CapabilityCommit(MockError::Repository)
+                )
+        ));
+        let audit = recorded_audit_events(&audit_state)?;
+        assert_eq!(audit.len(), 2);
+        assert_eq!(
+            audit[1].outcome().failure(),
+            Some(AuditFailure::SnapshotPersistenceFailed)
+        );
+        assert_eq!(
+            audit[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        assert_eq!(
+            recorded(&lifecycle)?,
+            [
+                "audit",
+                "load",
+                "credential",
+                "read",
+                "commit",
+                "probe",
+                "snapshot",
+                "audit"
+            ]
         );
         Ok(())
     }
@@ -942,10 +1360,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct MockSnapshotCall {
+        endpoint_id: EndpointId,
+        observations: Vec<EndpointCapabilityObservation>,
+        observed_at: OffsetDateTime,
+    }
+
     struct MockRepository {
         endpoint: Option<Endpoint>,
         events: Arc<Mutex<Vec<&'static str>>>,
         commit_succeeds: bool,
+        snapshot_succeeds: bool,
+        snapshot_calls: Arc<Mutex<Vec<MockSnapshotCall>>>,
     }
 
     impl MockRepository {
@@ -954,6 +1381,8 @@ mod tests {
                 endpoint: Some(endpoint),
                 events,
                 commit_succeeds: true,
+                snapshot_succeeds: true,
+                snapshot_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -962,6 +1391,8 @@ mod tests {
                 endpoint: None,
                 events,
                 commit_succeeds: true,
+                snapshot_succeeds: true,
+                snapshot_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -970,7 +1401,24 @@ mod tests {
                 endpoint: Some(endpoint),
                 events,
                 commit_succeeds: false,
+                snapshot_succeeds: true,
+                snapshot_calls: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn fail_snapshot(endpoint: Endpoint, events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                endpoint: Some(endpoint),
+                events,
+                commit_succeeds: true,
+                snapshot_succeeds: false,
+                snapshot_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        #[must_use]
+        fn snapshot_calls(&self) -> Arc<Mutex<Vec<MockSnapshotCall>>> {
+            Arc::clone(&self.snapshot_calls)
         }
     }
 
@@ -1013,6 +1461,33 @@ mod tests {
                         )
                     })
                     .collect())
+            })
+        }
+    }
+
+    impl CapabilitySnapshotRepository for MockRepository {
+        type Error = MockError;
+
+        fn replace_endpoint_capabilities<'a>(
+            &'a self,
+            endpoint_id: EndpointId,
+            observations: &'a [EndpointCapabilityObservation],
+            observed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                record(&self.events, "snapshot")?;
+                if !self.snapshot_succeeds {
+                    return Err(MockError::Repository);
+                }
+                self.snapshot_calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(MockSnapshotCall {
+                        endpoint_id,
+                        observations: observations.to_vec(),
+                        observed_at,
+                    });
+                Ok(())
             })
         }
     }
@@ -1063,6 +1538,7 @@ mod tests {
     struct MockReader {
         events: Arc<Mutex<Vec<&'static str>>>,
         succeeds: bool,
+        probe_succeeds: bool,
     }
 
     impl MockReader {
@@ -1070,6 +1546,7 @@ mod tests {
             Self {
                 events,
                 succeeds: true,
+                probe_succeeds: true,
             }
         }
 
@@ -1077,6 +1554,15 @@ mod tests {
             Self {
                 events,
                 succeeds: false,
+                probe_succeeds: true,
+            }
+        }
+
+        fn fail_probe(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                succeeds: true,
+                probe_succeeds: false,
             }
         }
     }
@@ -1095,6 +1581,27 @@ mod tests {
                 record(&self.events, "read")?;
                 if self.succeeds {
                     observations().map_err(|_| MockError::Reader)
+                } else {
+                    Err(MockError::Reader)
+                }
+            })
+        }
+    }
+
+    impl RedfishDiscovery for MockReader {
+        type Error = MockError;
+
+        fn probe_core_capabilities<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+            Box::pin(async move {
+                record(&self.events, "probe")?;
+                if self.probe_succeeds {
+                    Ok(EndpointDiscovery::new(capability_observations()))
                 } else {
                     Err(MockError::Reader)
                 }
@@ -1139,6 +1646,27 @@ mod tests {
                 ResourceSnapshotPayload::parse(r#"{"Name":"System"}"#)?,
             ),
         ])
+    }
+
+    /// Every §2.1 capability as a `Supported` observation, so the refresh
+    /// snapshot assertions cover the complete compiled ledger instead of a
+    /// hand-picked subset — the same surface the infra probe produces.
+    fn capability_observations() -> Vec<EndpointCapabilityObservation> {
+        CAPABILITY_LEDGER_ORDER
+            .into_iter()
+            .map(|capability| {
+                EndpointCapabilityObservation::new(capability, CapabilityState::Supported)
+            })
+            .collect()
+    }
+
+    fn recorded_snapshot_calls(
+        calls: &Mutex<Vec<MockSnapshotCall>>,
+    ) -> Result<Vec<MockSnapshotCall>, MockError> {
+        calls
+            .lock()
+            .map(|calls| calls.clone())
+            .map_err(|_| MockError::Events)
     }
 
     fn record(events: &Mutex<Vec<&'static str>>, value: &'static str) -> Result<(), MockError> {

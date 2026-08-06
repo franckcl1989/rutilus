@@ -5,9 +5,10 @@ use thiserror::Error;
 
 use crate::{
     AuditEventWriter, AuditedEndpointOnboarding, AuditedEndpointRefresh,
-    AuditedEndpointRefreshError, AuditedOnboardEndpointError, BoundaryFuture, Clock,
-    CoreResourceReader, CredentialResolver, DiscoveredEndpointRepository,
-    EndpointRefreshRepository, OnboardEndpointRequest, OnboardedEndpoint, RedfishDiscovery,
+    AuditedEndpointRefreshError, AuditedOnboardEndpointError, BoundaryFuture,
+    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialResolver,
+    DiscoveredEndpointRepository, EndpointRefreshRepository, OnboardEndpointRequest,
+    OnboardedEndpoint, RedfishDiscovery,
 };
 
 /// Enrolls one already trusted endpoint and returns its stable identity.
@@ -70,7 +71,10 @@ pub struct EndpointEnrollment<Repository, Credentials, Gateway, Time> {
 impl<Repository, Credentials, Gateway, Time>
     EndpointEnrollment<Repository, Credentials, Gateway, Time>
 where
-    Repository: DiscoveredEndpointRepository + EndpointRefreshRepository + AuditEventWriter,
+    Repository: DiscoveredEndpointRepository
+        + EndpointRefreshRepository
+        + CapabilitySnapshotRepository
+        + AuditEventWriter,
     Credentials: CredentialResolver,
     Gateway: RedfishDiscovery + CoreResourceReader,
     Time: Clock,
@@ -120,6 +124,7 @@ where
             <Gateway as RedfishDiscovery>::Error,
             <Repository as DiscoveredEndpointRepository>::Error,
             <Repository as EndpointRefreshRepository>::Error,
+            <Repository as CapabilitySnapshotRepository>::Error,
             <Gateway as CoreResourceReader>::Error,
             <Repository as AuditEventWriter>::Error,
         >,
@@ -176,7 +181,10 @@ where
 impl<Repository, Credentials, Gateway, Time> EndpointEnroller
     for EndpointEnrollment<Repository, Credentials, Gateway, Time>
 where
-    Repository: DiscoveredEndpointRepository + EndpointRefreshRepository + AuditEventWriter,
+    Repository: DiscoveredEndpointRepository
+        + EndpointRefreshRepository
+        + CapabilitySnapshotRepository
+        + AuditEventWriter,
     Credentials: CredentialResolver,
     Gateway: RedfishDiscovery + CoreResourceReader,
     Time: Clock,
@@ -186,6 +194,7 @@ where
         <Gateway as RedfishDiscovery>::Error,
         <Repository as DiscoveredEndpointRepository>::Error,
         <Repository as EndpointRefreshRepository>::Error,
+        <Repository as CapabilitySnapshotRepository>::Error,
         <Gateway as CoreResourceReader>::Error,
         <Repository as AuditEventWriter>::Error,
     >;
@@ -209,6 +218,7 @@ pub enum EndpointEnrollmentError<
     DiscoveryError,
     OnboardingRepositoryError,
     RefreshRepositoryError,
+    CapabilityError,
     ReaderError,
     AuditError,
 > where
@@ -216,6 +226,7 @@ pub enum EndpointEnrollmentError<
     DiscoveryError: Error + 'static,
     OnboardingRepositoryError: Error + 'static,
     RefreshRepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     ReaderError: Error + 'static,
     AuditError: Error + 'static,
 {
@@ -253,8 +264,10 @@ pub enum EndpointEnrollmentError<
         source: Box<
             AuditedEndpointRefreshError<
                 RefreshRepositoryError,
+                CapabilityError,
                 CredentialError,
                 ReaderError,
+                DiscoveryError,
                 AuditError,
             >,
         >,
@@ -268,8 +281,10 @@ pub enum EndpointEnrollmentError<
         source: Box<
             AuditedEndpointRefreshError<
                 RefreshRepositoryError,
+                CapabilityError,
                 CredentialError,
                 ReaderError,
+                DiscoveryError,
                 AuditError,
             >,
         >,
@@ -336,6 +351,8 @@ mod tests {
                 "credential",
                 "read",
                 "commit",
+                "discover",
+                "snapshot",
                 "audit",
             ]
         );
@@ -545,6 +562,8 @@ mod tests {
                 "credential",
                 "read",
                 "commit",
+                "discover",
+                "snapshot",
                 "audit",
             ]
         );
@@ -614,6 +633,22 @@ mod tests {
                 state.events.push("create");
                 state.endpoint = Some(endpoint.clone());
                 Ok(endpoint)
+            })
+        }
+    }
+
+    impl CapabilitySnapshotRepository for MockRepository {
+        type Error = MockError;
+
+        fn replace_endpoint_capabilities<'a>(
+            &'a self,
+            _endpoint_id: EndpointId,
+            _observations: &'a [EndpointCapabilityObservation],
+            _observed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                lock_state(&self.state)?.events.push("snapshot");
+                Ok(())
             })
         }
     }
