@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod event_listener;
 mod initialization_runtime;
 mod onboarding_runtime;
 mod scheduler;

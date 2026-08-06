@@ -23,12 +23,15 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+# `CancellationToken` (§7.8: every long-lived connection has a cancellation
+# token) is available without tokio-util features in 0.7.
+tokio-util = { version = "0.7.19", default-features = false }
 
 [dev-dependencies]
 rcgen.workspace = true
-time.workspace = true
 url.workspace = true
 
 [lints]
