@@ -69,6 +69,9 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "log-services",
                         "manager-network-protocol",
                         "host-interfaces",
+                        "pcie-devices",
+                        "assembly",
+                        "software-inventory",
                     ]),
                 ))
                 .to_owned(),
