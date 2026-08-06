@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod audit_log;
+mod credential_management;
 mod endpoint_csv;
 mod endpoint_csv_import;
 mod endpoint_enrollment;
@@ -11,6 +12,12 @@ mod endpoint_resources;
 mod endpoint_trust;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
+pub use credential_management::{
+    CREDENTIAL_SECRET_MAX_BYTES, CredentialCreation, CredentialCreationError,
+    CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
+    CredentialInventoryRepository, CredentialSecretError, CredentialSecretProtector,
+    NewCredentialRequest, ProtectedCredentialCreation,
+};
 pub use endpoint_csv::{
     ENDPOINT_CSV_HEADERS, ENDPOINT_CSV_MAX_BYTES, ENDPOINT_CSV_MAX_ROWS, EndpointCsvImport,
     EndpointCsvImportError, EndpointCsvRequiredField, EndpointCsvRow, EndpointImportTrust,
