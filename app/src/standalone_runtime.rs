@@ -3,10 +3,14 @@ use std::{
     io::{self, ErrorKind},
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
 };
 
+use rutilus_application::{BoundaryFuture, EndpointInventoryItem, EndpointInventoryRepository};
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
-use rutilus_persistence::{CloseStoreError, OpenStoreError, SqliteStore};
+use rutilus_persistence::{
+    CloseStoreError, EndpointInventoryPersistenceError, OpenStoreError, SqliteStore,
+};
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
     MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
@@ -46,9 +50,23 @@ impl Default for StandaloneRunOptions {
 
 /// A fully authenticated Standalone instance held exclusively for one process.
 pub struct StandaloneInstance {
+    state: Arc<StandaloneState>,
+}
+
+struct StandaloneState {
     store: SqliteStore,
     _master_key: MasterKey,
     _runtime_lock: RuntimeLock,
+}
+
+impl EndpointInventoryRepository for StandaloneState {
+    type Error = EndpointInventoryPersistenceError;
+
+    fn list_endpoint_inventory(
+        &self,
+    ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
+        EndpointInventoryRepository::list_endpoint_inventory(&self.store)
+    }
 }
 
 impl StandaloneInstance {
@@ -80,29 +98,40 @@ impl StandaloneInstance {
             .await
             .map_err(StandaloneInstanceError::OpenStore)?;
         Ok(Self {
-            store,
-            _master_key: master_key,
-            _runtime_lock: runtime_lock,
+            state: Arc::new(StandaloneState {
+                store,
+                _master_key: master_key,
+                _runtime_lock: runtime_lock,
+            }),
         })
     }
 
     #[must_use]
     pub fn database_path(&self) -> &std::path::Path {
-        self.store.database_path()
+        self.state.store.database_path()
     }
 
     /// Closes `SQLite` before releasing the master key and process lock.
     ///
     /// # Errors
     ///
-    /// Returns [`CloseStoreError`] when coordinated `SQLite` shutdown fails.
-    pub async fn close(self) -> Result<(), CloseStoreError> {
-        let Self {
+    /// Returns [`StandaloneInstanceCloseError`] if a Web request still owns
+    /// authenticated state or coordinated `SQLite` shutdown fails.
+    pub async fn close(self) -> Result<(), StandaloneInstanceCloseError> {
+        let state = Arc::try_unwrap(self.state).map_err(|state| {
+            StandaloneInstanceCloseError::OutstandingReferences {
+                owners: Arc::strong_count(&state),
+            }
+        })?;
+        let StandaloneState {
             store,
             _master_key,
             _runtime_lock,
-        } = self;
-        store.close().await
+        } = state;
+        store
+            .close()
+            .await
+            .map_err(StandaloneInstanceCloseError::Store)
     }
 }
 
@@ -164,18 +193,21 @@ impl StandaloneBinding {
         format!("http://{}/", self.address)
     }
 
-    /// Serves the embedded Web application until a tracked shutdown future
-    /// resolves, then waits for Axum's graceful drain to complete.
+    /// Serves the embedded Web application from an authenticated inventory
+    /// provider until a tracked shutdown future resolves, then waits for
+    /// Axum's graceful drain to complete.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the bound listener fails while serving.
-    pub async fn serve_until<Shutdown>(
+    pub async fn serve_until<Repository, Shutdown>(
         self,
         options: StandaloneRunOptions,
+        inventory: Arc<Repository>,
         shutdown: Shutdown,
     ) -> io::Result<()>
     where
+        Repository: EndpointInventoryRepository + 'static,
         Shutdown: Future<Output = ()> + Send + 'static,
     {
         let url = self.url();
@@ -185,27 +217,34 @@ impl StandaloneBinding {
         }
         axum::serve(
             self.listener,
-            rutilus_web::router(WebProductInfo::new(
-                PRODUCT_VERSION,
-                NV_REDFISH_DEVELOPMENT_BASELINE,
-            )),
+            rutilus_web::router(
+                WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
+                inventory,
+            ),
         )
         .with_graceful_shutdown(shutdown)
         .await
     }
 }
 
-/// Runs the foreground Standalone posture until Ctrl-C, with structured Axum
-/// shutdown and no non-loopback plaintext mode.
+/// Runs the foreground Standalone posture over an authenticated inventory
+/// provider until Ctrl-C, with structured Axum shutdown and no non-loopback
+/// plaintext mode.
 ///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when loopback binding, signal registration,
 /// or HTTP serving fails.
-pub async fn run_standalone(options: StandaloneRunOptions) -> Result<(), StandaloneRunError> {
+pub async fn run_standalone<Repository>(
+    options: StandaloneRunOptions,
+    inventory: Arc<Repository>,
+) -> Result<(), StandaloneRunError>
+where
+    Repository: EndpointInventoryRepository + 'static,
+{
     let binding = StandaloneBinding::bind().await?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let server = binding.serve_until(options, async move {
+    let server = binding.serve_until(options, inventory, async move {
         let _result = shutdown_receiver.await;
     });
     tokio::pin!(server);
@@ -235,7 +274,8 @@ pub async fn run_initialized_standalone(
     let instance = StandaloneInstance::open(paths, unlock)
         .await
         .map_err(StandaloneExecutionError::Open)?;
-    let run_result = run_standalone(options).await;
+    let inventory = Arc::clone(&instance.state);
+    let run_result = run_standalone(options, inventory).await;
     let close_result = instance.close().await;
     match (run_result, close_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -294,6 +334,15 @@ pub enum StandaloneInstanceError {
     OpenStore(#[source] OpenStoreError),
 }
 
+/// A controlled failure while releasing authenticated Standalone state.
+#[derive(Debug, Error)]
+pub enum StandaloneInstanceCloseError {
+    #[error("Standalone Web state still has {owners} live owners during shutdown")]
+    OutstandingReferences { owners: usize },
+    #[error("failed to close Standalone SQLite state: {0}")]
+    Store(#[source] CloseStoreError),
+}
+
 /// A controlled failure across authenticated open, foreground serving, and close.
 #[derive(Debug, Error)]
 pub enum StandaloneExecutionError {
@@ -302,11 +351,11 @@ pub enum StandaloneExecutionError {
     #[error("Standalone server failed: {0}")]
     Run(#[source] StandaloneRunError),
     #[error("Standalone server stopped but SQLite shutdown failed: {0}")]
-    Close(#[source] CloseStoreError),
+    Close(#[source] StandaloneInstanceCloseError),
     #[error("Standalone server and SQLite shutdown both failed (server: {run}; close: {close})")]
     RunAndClose {
         run: StandaloneRunError,
-        close: CloseStoreError,
+        close: StandaloneInstanceCloseError,
     },
 }
 
@@ -331,9 +380,12 @@ mod tests {
         assert_ne!(address.port(), 0);
         assert_eq!(binding.url(), format!("http://{address}/"));
 
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(SqliteStore::open(directory.path().join("rutilus.db")).await?);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let server = tokio::spawn(binding.serve_until(
             StandaloneRunOptions::new(false),
+            Arc::clone(&store),
             async move {
                 let _result = shutdown_receiver.await;
             },
@@ -350,10 +402,27 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("{\"status\":\"ok\"}"));
 
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(
+                b"GET /api/v1/endpoints HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response = String::from_utf8(response)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("{\"endpoints\":[]}"));
+
         shutdown_sender
             .send(())
             .map_err(|()| std::io::Error::other("server shutdown receiver was dropped"))?;
         server.await??;
+        Arc::try_unwrap(store)
+            .map_err(|_| std::io::Error::other("server retained the SQLite inventory"))?
+            .close()
+            .await?;
+        drop(directory);
         Ok(())
     }
 
@@ -400,7 +469,26 @@ mod tests {
                 RuntimeLockError::AlreadyHeld { .. }
             ))
         ));
-        instance.close().await?;
+        let retained_state = Arc::clone(&instance.state);
+        assert!(matches!(
+            instance.close().await,
+            Err(StandaloneInstanceCloseError::OutstandingReferences { owners: 2 })
+        ));
+        assert!(matches!(
+            StandaloneInstance::open(&paths, &correct).await,
+            Err(StandaloneInstanceError::RuntimeLock(
+                RuntimeLockError::AlreadyHeld { .. }
+            ))
+        ));
+        let state = Arc::try_unwrap(retained_state)
+            .map_err(|_| std::io::Error::other("test retained unexpected Standalone state"))?;
+        let StandaloneState {
+            store,
+            _master_key: master_key,
+            _runtime_lock: runtime_lock,
+        } = state;
+        store.close().await?;
+        drop((master_key, runtime_lock));
         StandaloneInstance::open(&paths, &correct)
             .await?
             .close()

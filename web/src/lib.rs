@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::{num::NonZeroU64, path::Path, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -14,7 +14,14 @@ use axum::{
     routing::get,
 };
 use rust_embed::RustEmbed;
-use rutilus_api::{AboutResponse, HealthResponse};
+use rutilus_api::{
+    AboutResponse, CoreResourceCountsResponse, EndpointIdentityResponse, EndpointInventoryResponse,
+    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, HealthResponse, TlsTrustModeResponse,
+};
+use rutilus_application::{
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryRepository,
+};
+use rutilus_domain::{ResourceFeature, TlsTrust};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
@@ -56,16 +63,34 @@ impl WebProductInfo {
     }
 }
 
+struct WebState<Repository> {
+    product: WebProductInfo,
+    inventory: Arc<Repository>,
+}
+
+impl<Repository> Clone for WebState<Repository> {
+    fn clone(&self) -> Self {
+        Self {
+            product: self.product,
+            inventory: Arc::clone(&self.inventory),
+        }
+    }
+}
+
 /// Builds the local Web application without binding a socket.
 ///
 /// Socket policy remains an app/platform responsibility, so the same Router
 /// can serve Standalone loopback and a future HTTPS Site listener.
-pub fn router(product: WebProductInfo) -> Router {
+pub fn router<Repository>(product: WebProductInfo, inventory: Arc<Repository>) -> Router
+where
+    Repository: EndpointInventoryRepository + 'static,
+{
     Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/about", get(about))
+        .route("/api/v1/about", get(about::<Repository>))
+        .route("/api/v1/endpoints", get(endpoint_inventory::<Repository>))
         .fallback(static_asset)
-        .with_state(product)
+        .with_state(WebState { product, inventory })
         .layer(SetResponseHeaderLayer::overriding(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(CSP),
@@ -92,12 +117,94 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse::healthy())
 }
 
-async fn about(State(product): State<WebProductInfo>) -> Json<AboutResponse> {
+async fn about<Repository>(State(state): State<WebState<Repository>>) -> Json<AboutResponse> {
     Json(AboutResponse::new(
         "rutilus".to_owned(),
-        product.product_version().to_owned(),
-        product.nv_redfish_baseline().to_owned(),
+        state.product.product_version().to_owned(),
+        state.product.nv_redfish_baseline().to_owned(),
     ))
+}
+
+async fn endpoint_inventory<Repository>(State(state): State<WebState<Repository>>) -> Response
+where
+    Repository: EndpointInventoryRepository,
+{
+    let Ok(items) = EndpointInventoryQuery::new(state.inventory.as_ref())
+        .execute()
+        .await
+    else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Ok(endpoints) = items
+        .iter()
+        .map(project_endpoint_summary)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let mut response = Json(EndpointInventoryResponse::new(endpoints)).into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
+    response
+}
+
+fn project_endpoint_summary(
+    item: &EndpointInventoryItem,
+) -> Result<EndpointSummaryResponse, EndpointInventoryProjectionError> {
+    let endpoint = item.endpoint();
+    let trust = match endpoint.trust() {
+        TlsTrust::SystemCa { .. } => TlsTrustModeResponse::SystemCa,
+        TlsTrust::PinnedCertificate { .. } => TlsTrustModeResponse::PinnedCertificate,
+    };
+    let identity = EndpointIdentityResponse::new(
+        endpoint.id().into_uuid(),
+        endpoint.display_name().to_string(),
+        endpoint.address().to_string(),
+        trust,
+        endpoint.created_at(),
+        endpoint.updated_at(),
+    );
+    let snapshot = match item.generation() {
+        None => EndpointSnapshotSummaryResponse::AwaitingFirstRefresh,
+        Some(generation) => EndpointSnapshotSummaryResponse::current(
+            NonZeroU64::new(generation.get())
+                .ok_or(EndpointInventoryProjectionError::ZeroGeneration)?,
+            item.last_successful_refresh_at()
+                .ok_or(EndpointInventoryProjectionError::MissingRefreshTime)?,
+            CoreResourceCountsResponse::new(
+                count_resources(item, ResourceFeature::Systems)?,
+                count_resources(item, ResourceFeature::Chassis)?,
+                count_resources(item, ResourceFeature::Managers)?,
+            ),
+        ),
+    };
+    Ok(EndpointSummaryResponse::new(identity, snapshot))
+}
+
+fn count_resources(
+    item: &EndpointInventoryItem,
+    feature: ResourceFeature,
+) -> Result<u64, EndpointInventoryProjectionError> {
+    u64::try_from(item.resource_count(feature))
+        .map_err(|_| EndpointInventoryProjectionError::ResourceCountOverflow)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointInventoryProjectionError {
+    ZeroGeneration,
+    MissingRefreshTime,
+    ResourceCountOverflow,
+}
+
+fn uncached_status(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
+    response
 }
 
 async fn static_asset(uri: Uri) -> Response {
@@ -143,17 +250,31 @@ fn content_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, fmt};
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
+    use rutilus_application::BoundaryFuture;
+    use rutilus_domain::{
+        CredentialId, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId,
+        RefreshGeneration, ResourceId, ResourceODataId, ResourceSnapshot, ResourceSnapshotPayload,
+        TlsCertificate,
+    };
     use serde_json::{Value, json};
+    use time::{Duration, OffsetDateTime};
     use tower::ServiceExt as _;
 
     use super::*;
 
     fn test_router() -> Router {
-        router(WebProductInfo::new("0.1.0-test", "0.13.0-test"))
+        test_router_with(MockInventory::ok(Vec::new()))
+    }
+
+    fn test_router_with(inventory: MockInventory) -> Router {
+        router(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            Arc::new(inventory),
+        )
     }
 
     #[tokio::test]
@@ -267,6 +388,77 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn exposes_secret_free_complete_endpoint_inventory() -> Result<(), Box<dyn Error>> {
+        let waiting = inventory_item("Rack A BMC", "https://192.0.2.10", 10, false)?;
+        let current = inventory_item("Rack B BMC", "https://192.0.2.11", 11, true)?;
+        let waiting_id = waiting.endpoint().id().to_string();
+        let current_id = current.endpoint().id().to_string();
+        let response = test_router_with(MockInventory::ok(vec![current, waiting]))
+            .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        assert_eq!(
+            json_body(response).await?,
+            json!({
+                "endpoints": [
+                    {
+                        "identity": {
+                            "endpoint_id": waiting_id,
+                            "display_name": "Rack A BMC",
+                            "address": "https://192.0.2.10/",
+                            "tls_trust_mode": "pinned_certificate",
+                            "created_at": "1970-01-01T00:00:00Z",
+                            "updated_at": "1970-01-01T00:00:00Z"
+                        },
+                        "snapshot": { "state": "awaiting_first_refresh" }
+                    },
+                    {
+                        "identity": {
+                            "endpoint_id": current_id,
+                            "display_name": "Rack B BMC",
+                            "address": "https://192.0.2.11/",
+                            "tls_trust_mode": "pinned_certificate",
+                            "created_at": "1970-01-01T00:00:00Z",
+                            "updated_at": "1970-01-01T00:00:00Z"
+                        },
+                        "snapshot": {
+                            "state": "current",
+                            "details": {
+                                "generation": 1,
+                                "last_successful_refresh_at": "1970-01-01T00:00:01Z",
+                                "resource_counts": {
+                                    "systems": 1,
+                                    "chassis": 0,
+                                    "managers": 0
+                                }
+                            }
+                        }
+                    }
+                ]
+            })
+        );
+
+        let failed = test_router_with(MockInventory::failed())
+            .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            failed.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        let wrong_method = test_router()
+            .oneshot(Request::post("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
     async fn json_body(response: Response) -> Result<Value, Box<dyn Error>> {
         let bytes = response.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&bytes)?)
@@ -290,5 +482,104 @@ mod tests {
         assert_eq!(content_type("icon.svg"), "image/svg+xml");
         assert_eq!(content_type("icon.png"), "image/png");
         assert_eq!(content_type("unknown.bin"), "application/octet-stream");
+    }
+
+    fn inventory_item(
+        display_name: &str,
+        address: &str,
+        certificate_byte: u8,
+        refreshed: bool,
+    ) -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse(display_name)?,
+            EndpointAddress::parse(address)?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![certificate_byte])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let resources = if refreshed {
+            let observed_at = created_at + Duration::SECOND;
+            let generation = RefreshGeneration::new(1)?;
+            vec![
+                resource_snapshot(
+                    endpoint.id(),
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    observed_at,
+                    generation,
+                )?,
+                resource_snapshot(
+                    endpoint.id(),
+                    ResourceFeature::Systems,
+                    "/redfish/v1/Systems/1",
+                    observed_at,
+                    generation,
+                )?,
+            ]
+        } else {
+            Vec::new()
+        };
+        Ok(EndpointInventoryItem::try_new(endpoint, resources)?)
+    }
+
+    fn resource_snapshot(
+        endpoint_id: EndpointId,
+        feature: ResourceFeature,
+        odata_id: &str,
+        observed_at: OffsetDateTime,
+        generation: RefreshGeneration,
+    ) -> Result<ResourceSnapshot, Box<dyn Error>> {
+        Ok(ResourceSnapshot::new(
+            ResourceId::generate(),
+            endpoint_id,
+            feature,
+            ResourceODataId::parse(odata_id)?,
+            ResourceSnapshotPayload::parse(r#"{"Name":"Web test"}"#)?,
+            observed_at,
+            generation,
+        ))
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct MockInventoryError;
+
+    impl fmt::Display for MockInventoryError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("mock inventory unavailable")
+        }
+    }
+
+    impl Error for MockInventoryError {}
+
+    struct MockInventory {
+        result: Result<Vec<EndpointInventoryItem>, MockInventoryError>,
+    }
+
+    impl MockInventory {
+        fn ok(items: Vec<EndpointInventoryItem>) -> Self {
+            Self { result: Ok(items) }
+        }
+
+        fn failed() -> Self {
+            Self {
+                result: Err(MockInventoryError),
+            }
+        }
+    }
+
+    impl EndpointInventoryRepository for MockInventory {
+        type Error = MockInventoryError;
+
+        fn list_endpoint_inventory(
+            &self,
+        ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
+            Box::pin(async { self.result.clone() })
+        }
     }
 }
