@@ -379,3 +379,299 @@ dd {
     to { opacity: 1; transform: translateY(0); }
   }
 }
+
+/* ----- Console section navigation ----- */
+.view-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1.5rem;
+}
+
+.view-nav-item {
+  padding: 0.55rem 1.05rem;
+  border: 1px solid rgb(143 171 207 / 22%);
+  border-radius: 999px;
+  color: #aebbd0;
+  background: rgb(16 25 40 / 72%);
+  font-size: 0.85rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.view-nav-item:hover {
+  color: #e8edf5;
+  border-color: rgb(143 171 207 / 40%);
+}
+
+.view-nav-item.is-active {
+  color: #0a1019;
+  background: #83bff3;
+  border-color: #83bff3;
+}
+
+/* ----- View sections, forms and buttons ----- */
+.view-section { margin-top: clamp(2rem, 5vw, 4rem); }
+
+.inventory-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 1.2rem;
+}
+
+.form-panel {
+  max-width: 46rem;
+  padding: 1.5rem;
+  border: 1px solid rgb(143 171 207 / 18%);
+  border-radius: 1.15rem;
+  background: rgb(14 23 36 / 86%);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 18%);
+}
+
+.form-panel + .form-panel { margin-top: 1rem; }
+
+.create-panel { margin-top: 1rem; }
+
+.form-grid { display: grid; gap: 1rem; }
+
+.form-field label {
+  display: block;
+  margin-bottom: 0.4rem;
+  color: #ccd7e5;
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.form-input {
+  width: 100%;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid rgb(143 171 207 / 26%);
+  border-radius: 0.65rem;
+  color: #f3f7fc;
+  background: rgb(10 16 25 / 80%);
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: #83bff3;
+}
+
+.form-error {
+  margin: 0.4rem 0 0;
+  color: #f2a0a0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.form-hint {
+  margin: 0.5rem 0 0;
+  color: #8495ad;
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.btn {
+  padding: 0.6rem 1.1rem;
+  border: 1px solid rgb(143 171 207 / 26%);
+  border-radius: 0.65rem;
+  color: #e8edf5;
+  background: rgb(123 155 194 / 12%);
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn:hover {
+  color: #f3f7fc;
+  border-color: rgb(143 171 207 / 44%);
+}
+
+.btn-primary {
+  color: #0a1019;
+  background: #83bff3;
+  border-color: #83bff3;
+}
+
+.btn-primary:hover {
+  color: #0a1019;
+  background: #a6d0f7;
+}
+
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.inline-status { margin: 0.7rem 0 0; color: #aebbd0; font-size: 0.82rem; }
+.inline-status.success { color: #83d5c4; }
+.inline-status.error { color: #f2a0a0; }
+
+/* ----- Credential list and choices ----- */
+.resource-list {
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.credential-card {
+  min-width: 0;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid rgb(143 171 207 / 18%);
+  border-radius: 1.05rem;
+  background: rgb(14 23 36 / 86%);
+  box-shadow: 0 1rem 3rem rgb(0 0 0 / 18%);
+}
+
+.credential-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.credential-title h3 { margin: 0; font-size: 1.05rem; }
+
+.credential-username {
+  margin: 0.3rem 0 0;
+  color: #92a3ba;
+  font-size: 0.8rem;
+}
+
+.credential-id {
+  flex: none;
+  overflow-wrap: anywhere;
+  color: #9eb1c8;
+  font-size: 0.68rem;
+}
+
+.credential-choice-grid {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.credential-choice {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid rgb(143 171 207 / 18%);
+  border-radius: 0.8rem;
+  color: #d7e0eb;
+  background: rgb(123 155 194 / 5%);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.credential-choice.is-selected {
+  border-color: rgb(99 205 185 / 55%);
+  background: rgb(45 126 111 / 16%);
+}
+
+.credential-choice-name { font-weight: 700; }
+
+.credential-choice-username {
+  color: #92a3ba;
+  font-size: 0.76rem;
+}
+
+/* ----- Trust fingerprint panels ----- */
+.fingerprint-panel {
+  padding: 1.1rem 1.25rem;
+  border: 1px solid rgb(143 171 207 / 14%);
+  border-radius: 0.9rem;
+  background: rgb(123 155 194 / 5%);
+}
+
+.fingerprint-block {
+  display: block;
+  margin-top: 0.5rem;
+  overflow-wrap: anywhere;
+  color: #d7e0eb;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+
+.trust-state {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 1rem 0 0;
+  font-size: 0.84rem;
+  font-weight: 650;
+}
+
+.trust-state-ok { color: #83d5c4; }
+.trust-state-warn { color: #d5ae68; }
+
+/* ----- Import results ----- */
+.result-panel { margin-top: 1rem; }
+
+.raw-response {
+  max-height: 24rem;
+  margin: 0.9rem 0 0;
+  padding: 1rem;
+  overflow: auto;
+  border: 1px solid rgb(143 171 207 / 14%);
+  border-radius: 0.8rem;
+  color: #9eb1c8;
+  background: rgb(10 16 25 / 70%);
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.74rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ----- Import report table ----- */
+.results-table {
+  width: 100%;
+  margin-top: 0.9rem;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.results-table th,
+.results-table td {
+  padding: 0.55rem 0.7rem;
+  border-bottom: 1px solid rgb(143 171 207 / 12%);
+  text-align: left;
+  vertical-align: top;
+}
+
+.results-table th {
+  color: #8495ad;
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.result-address,
+.result-detail {
+  overflow-wrap: anywhere;
+  color: #9eb1c8;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 0.74rem;
+}
+
+.result-success { color: #83d5c4; }
+.result-failure { color: #f2a0a0; }
+.result-neutral { color: #d5ae68; }
+
+/* ----- Audit event cards ----- */
+.audit-message {
+  margin: 0.7rem 0 0;
+  color: #ccd7e5;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.audit-actor { color: #8495ad; }
