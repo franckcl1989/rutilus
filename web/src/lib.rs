@@ -734,7 +734,13 @@ fn project_enrollment(
             ResourceFeature::Systems => systems += 1,
             ResourceFeature::Chassis => chassis += 1,
             ResourceFeature::Managers => managers += 1,
-            ResourceFeature::ServiceRoot => {}
+            // The 0.2 resource families (Processors, Memory, and later
+            // Storage, Network, Accounts) intentionally stay out of the
+            // three-field enrollment counts; the typed resource-inventory
+            // route carries their full snapshots instead.
+            ResourceFeature::ServiceRoot
+            | ResourceFeature::Processors
+            | ResourceFeature::Memory => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1115,80 +1121,236 @@ fn project_core_resource(resource: &CoreResourceSummary) -> CoreResourceResponse
 
 fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
     match details {
-        CoreResourceDetails::ServiceRoot {
-            vendor,
-            product,
-            redfish_version,
-        } => CoreResourceDetailsResponse::ServiceRoot {
-            vendor: vendor.clone(),
-            product: product.clone(),
-            redfish_version: redfish_version.clone(),
-        },
-        CoreResourceDetails::System {
-            system_type,
-            manufacturer,
-            model,
-            part_number,
-            serial_number,
-            sku,
-            host_name,
-            bios_version,
-            power_state,
-            status,
-        } => CoreResourceDetailsResponse::System {
-            system_type: system_type.clone(),
-            manufacturer: manufacturer.clone(),
-            model: model.clone(),
-            part_number: part_number.clone(),
-            serial_number: serial_number.clone(),
-            sku: sku.clone(),
-            host_name: host_name.clone(),
-            bios_version: bios_version.clone(),
-            power_state: power_state.clone(),
-            status: status.as_ref().map(project_resource_status),
-        },
-        CoreResourceDetails::Chassis {
-            chassis_type,
-            manufacturer,
-            model,
-            part_number,
-            serial_number,
-            sku,
-            asset_tag,
-            power_state,
-            status,
-        } => CoreResourceDetailsResponse::Chassis {
-            chassis_type: chassis_type.clone(),
-            manufacturer: manufacturer.clone(),
-            model: model.clone(),
-            part_number: part_number.clone(),
-            serial_number: serial_number.clone(),
-            sku: sku.clone(),
-            asset_tag: asset_tag.clone(),
-            power_state: power_state.clone(),
-            status: status.as_ref().map(project_resource_status),
-        },
-        CoreResourceDetails::Manager {
-            manager_type,
-            manufacturer,
-            model,
-            part_number,
-            serial_number,
-            firmware_version,
-            version,
-            power_state,
-            status,
-        } => CoreResourceDetailsResponse::Manager {
-            manager_type: manager_type.clone(),
-            manufacturer: manufacturer.clone(),
-            model: model.clone(),
-            part_number: part_number.clone(),
-            serial_number: serial_number.clone(),
-            firmware_version: firmware_version.clone(),
-            version: version.clone(),
-            power_state: power_state.clone(),
-            status: status.as_ref().map(project_resource_status),
-        },
+        CoreResourceDetails::ServiceRoot { .. } => project_service_root_details(details),
+        CoreResourceDetails::System { .. } => project_system_details(details),
+        CoreResourceDetails::Chassis { .. } => project_chassis_details(details),
+        CoreResourceDetails::Manager { .. } => project_manager_details(details),
+        CoreResourceDetails::Processor { .. } => project_processor_details(details),
+        CoreResourceDetails::Memory { .. } => project_memory_details(details),
+    }
+}
+
+/// Projects the Service Root projection into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `ServiceRoot` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_service_root_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::ServiceRoot {
+        vendor,
+        product,
+        redfish_version,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::ServiceRoot {
+            vendor: None,
+            product: None,
+            redfish_version: None,
+        };
+    };
+    CoreResourceDetailsResponse::ServiceRoot {
+        vendor: vendor.clone(),
+        product: product.clone(),
+        redfish_version: redfish_version.clone(),
+    }
+}
+
+/// Projects the System projection into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `System` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_system_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::System {
+        system_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        sku,
+        host_name,
+        bios_version,
+        power_state,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::System {
+            system_type: None,
+            manufacturer: None,
+            model: None,
+            part_number: None,
+            serial_number: None,
+            sku: None,
+            host_name: None,
+            bios_version: None,
+            power_state: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::System {
+        system_type: system_type.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        part_number: part_number.clone(),
+        serial_number: serial_number.clone(),
+        sku: sku.clone(),
+        host_name: host_name.clone(),
+        bios_version: bios_version.clone(),
+        power_state: power_state.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the Chassis projection into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `Chassis` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_chassis_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Chassis {
+        chassis_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        sku,
+        asset_tag,
+        power_state,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Chassis {
+            chassis_type: String::new(),
+            manufacturer: None,
+            model: None,
+            part_number: None,
+            serial_number: None,
+            sku: None,
+            asset_tag: None,
+            power_state: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Chassis {
+        chassis_type: chassis_type.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        part_number: part_number.clone(),
+        serial_number: serial_number.clone(),
+        sku: sku.clone(),
+        asset_tag: asset_tag.clone(),
+        power_state: power_state.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the Manager projection into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `Manager` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_manager_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Manager {
+        manager_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        firmware_version,
+        version,
+        power_state,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Manager {
+            manager_type: None,
+            manufacturer: None,
+            model: None,
+            part_number: None,
+            serial_number: None,
+            firmware_version: None,
+            version: None,
+            power_state: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Manager {
+        manager_type: manager_type.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        part_number: part_number.clone(),
+        serial_number: serial_number.clone(),
+        firmware_version: firmware_version.clone(),
+        version: version.clone(),
+        power_state: power_state.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 processor family into the shared wire contract,
+/// preserving the numeric core count so clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `Processor` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_processor_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Processor {
+        processor_type,
+        socket,
+        manufacturer,
+        model,
+        total_cores,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Processor {
+            processor_type: None,
+            socket: None,
+            manufacturer: None,
+            model: None,
+            total_cores: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Processor {
+        processor_type: processor_type.clone(),
+        socket: socket.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        total_cores: *total_cores,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 memory family into the shared wire contract,
+/// preserving the numeric capacity so clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `Memory` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_memory_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Memory {
+        memory_device_type,
+        capacity_mib,
+        manufacturer,
+        model,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Memory {
+            memory_device_type: None,
+            capacity_mib: None,
+            manufacturer: None,
+            model: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::Memory {
+        memory_device_type: memory_device_type.clone(),
+        capacity_mib: *capacity_mib,
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        status: status.as_ref().map(project_resource_status),
     }
 }
 
@@ -1583,7 +1745,7 @@ mod tests {
         let resources = body["snapshot"]["details"]["resources"]
             .as_array()
             .ok_or("resources must be an array")?;
-        assert_eq!(resources.len(), 2);
+        assert_eq!(resources.len(), 4);
         assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
         assert_eq!(resources[0]["common"]["name"], "Root Service");
         assert_eq!(
@@ -1603,6 +1765,29 @@ mod tests {
         );
         assert_eq!(
             resources[1]["resource"]["details"]["status"]["health"],
+            "OK"
+        );
+        assert_eq!(resources[2]["resource"]["resource_type"], "memory");
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Memory/DIMM1"
+        );
+        assert_eq!(resources[2]["common"]["name"], "Memory Module One");
+        assert_eq!(resources[2]["resource"]["details"]["capacity_mib"], 32768);
+        assert_eq!(
+            resources[2]["resource"]["details"]["memory_device_type"],
+            "DDR4"
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "processor");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Processors/CPU1"
+        );
+        assert_eq!(resources[3]["common"]["name"], "Processor One");
+        assert_eq!(resources[3]["resource"]["details"]["total_cores"], 64);
+        assert_eq!(resources[3]["resource"]["details"]["socket"], "LGA4189");
+        assert_eq!(
+            resources[3]["resource"]["details"]["status"]["health"],
             "OK"
         );
         let encoded = serde_json::to_string(&body)?;
@@ -1782,9 +1967,31 @@ mod tests {
             "#ComputerSystem.v1_20_0.ComputerSystem",
         )?)
         .with_etag(ResourceEtag::parse("W/\"system-1\"")?);
+        let processor = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Processors,
+            "/redfish/v1/Systems/1/Processors/CPU1",
+            r#"{"Id":"CPU1","Name":"Processor One","Description":"Primary CPU","ProcessorType":"CPU","Socket":"LGA4189","Manufacturer":"Vendor A","Model":"Model P","TotalCores":64,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#Processor.v1_15_0.Processor",
+        )?);
+        let memory = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Memory,
+            "/redfish/v1/Systems/1/Memory/DIMM1",
+            r#"{"Id":"DIMM1","Name":"Memory Module One","MemoryDeviceType":"DDR4","CapacityMiB":32768,"Manufacturer":"Vendor B","Model":"Model MEM","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#Memory.v1_15_0.Memory",
+        )?);
         Ok(EndpointInventoryItem::try_new(
             endpoint,
-            vec![system, root],
+            vec![processor, memory, system, root],
         )?)
     }
 
