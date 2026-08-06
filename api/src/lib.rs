@@ -2681,6 +2681,208 @@ impl ArtifactFinalizeFailureResponse {
     }
 }
 
+/// The §14.2 static-grouping input: a group name declared before creation.
+///
+/// The server parses and validates the name against the domain `GroupName`
+/// rules; an invalid name is rejected with 400 and a duplicate name with 409,
+/// so the console never submits a name the product cannot persist (§9.3
+/// `groups`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateGroupRequest {
+    name: String,
+}
+
+impl CreateGroupRequest {
+    #[must_use]
+    pub const fn new(name: String) -> Self {
+        Self { name }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// One §9.3 `groups` row projected for the §12.1 Groups navigation and the
+/// §14.2 static-group filter.
+///
+/// `member_endpoint_ids` lists the managed endpoints currently in the group
+/// in deterministic product order. Timestamps stay RFC 3339 so the console
+/// renders group age and last change without re-parsing text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupResponse {
+    group_id: Uuid,
+    name: String,
+    member_endpoint_ids: Vec<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl GroupResponse {
+    #[must_use]
+    pub const fn new(
+        group_id: Uuid,
+        name: String,
+        member_endpoint_ids: Vec<Uuid>,
+        created_at: OffsetDateTime,
+        updated_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            group_id,
+            name,
+            member_endpoint_ids,
+            created_at,
+            updated_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn group_id(&self) -> Uuid {
+        self.group_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn member_endpoint_ids(&self) -> &[Uuid] {
+        &self.member_endpoint_ids
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> OffsetDateTime {
+        self.updated_at
+    }
+}
+
+/// Stable envelope for the complete static-group inventory (§12.1).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupListResponse {
+    groups: Vec<GroupResponse>,
+}
+
+impl GroupListResponse {
+    #[must_use]
+    pub const fn new(groups: Vec<GroupResponse>) -> Self {
+        Self { groups }
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[GroupResponse] {
+        &self.groups
+    }
+}
+
+/// The §14.2 tag-assignment input binding one managed endpoint to one tag
+/// name.
+///
+/// The server parses and validates `tag_name` against the domain `TagName`
+/// rules and rejects unknown endpoints with 404. Assignment is an idempotent
+/// create-or-keep operation, so re-assigning the same name to the same
+/// endpoint succeeds and returns the existing binding (§9.3 `tags`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignTagRequest {
+    endpoint_id: Uuid,
+    tag_name: String,
+}
+
+impl AssignTagRequest {
+    #[must_use]
+    pub const fn new(endpoint_id: Uuid, tag_name: String) -> Self {
+        Self {
+            endpoint_id,
+            tag_name,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn tag_name(&self) -> &str {
+        &self.tag_name
+    }
+}
+
+/// One §9.3 tag binding projected for the §14.2 tag filter.
+///
+/// A tag binds exactly one tag name to one managed endpoint. The tag model
+/// carries no timestamp (the binding is immutable once assigned, tag.rs), so
+/// the wire shape stays `{tag_id, endpoint_id, name}`. `tag_id` names the
+/// tag-name row: the same tag name on different endpoints shares the name
+/// row while keeping independent bindings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagResponse {
+    tag_id: Uuid,
+    endpoint_id: Uuid,
+    name: String,
+}
+
+impl TagResponse {
+    #[must_use]
+    pub const fn new(tag_id: Uuid, endpoint_id: Uuid, name: String) -> Self {
+        Self {
+            tag_id,
+            endpoint_id,
+            name,
+        }
+    }
+
+    #[must_use]
+    pub const fn tag_id(&self) -> Uuid {
+        self.tag_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Stable envelope for every tag across all managed endpoints (§14.2).
+///
+/// The console builds the tag filter from this complete union and resolves
+/// each tag back to its bound endpoint through `endpoint_id`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagListResponse {
+    tags: Vec<TagResponse>,
+}
+
+impl TagListResponse {
+    #[must_use]
+    pub const fn new(tags: Vec<TagResponse>) -> Self {
+        Self { tags }
+    }
+
+    #[must_use]
+    pub fn tags(&self) -> &[TagResponse] {
+        &self.tags
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
@@ -6173,6 +6375,171 @@ mod tests {
                 "extra": true
             }))
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_contract_pins_name_members_and_timestamps() -> Result<(), Box<dyn Error>> {
+        let created_at = OffsetDateTime::parse("2026-08-07T04:00:01Z", &Rfc3339)?;
+        let updated_at = OffsetDateTime::parse("2026-08-07T04:00:02Z", &Rfc3339)?;
+        let group_id = uuid!("0198c1ec-7e10-7f5e-8f2a-123456789201");
+        let first_member = uuid!("0198c1ec-7e10-7f5e-8f2a-123456789202");
+        let second_member = uuid!("0198c1ec-7e10-7f5e-8f2a-123456789203");
+        let response = GroupResponse::new(
+            group_id,
+            "Rack A".to_owned(),
+            vec![first_member, second_member],
+            created_at,
+            updated_at,
+        );
+        let encoded = serde_json::to_value(&response)?;
+
+        assert_eq!(response.group_id(), group_id);
+        assert_eq!(response.name(), "Rack A");
+        assert_eq!(
+            response.member_endpoint_ids(),
+            &[first_member, second_member]
+        );
+        assert_eq!(response.created_at(), created_at);
+        assert_eq!(response.updated_at(), updated_at);
+        assert_eq!(
+            encoded,
+            json!({
+                "group_id": group_id,
+                "name": "Rack A",
+                "member_endpoint_ids": [first_member, second_member],
+                "created_at": "2026-08-07T04:00:01Z",
+                "updated_at": "2026-08-07T04:00:02Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GroupResponse>(encoded)?,
+            response,
+            "the group contract must round-trip"
+        );
+        assert!(
+            serde_json::from_value::<GroupResponse>(json!({
+                "group_id": group_id,
+                "name": "Rack A",
+                "member_endpoint_ids": [],
+                "created_at": "2026-08-07T04:00:01Z",
+                "updated_at": "2026-08-07T04:00:02Z",
+                "owner": "must not exist"
+            }))
+            .is_err(),
+            "unknown group fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_request_and_list_envelope_contracts_are_strict() -> Result<(), Box<dyn Error>> {
+        let request = CreateGroupRequest::new("Rack A".to_owned());
+        assert_eq!(request.name(), "Rack A");
+        assert_eq!(serde_json::to_value(&request)?, json!({ "name": "Rack A" }));
+        assert_eq!(
+            serde_json::from_value::<CreateGroupRequest>(serde_json::to_value(&request)?)?,
+            request
+        );
+        assert!(
+            serde_json::from_value::<CreateGroupRequest>(
+                json!({ "name": "Rack A", "color": "#f00" })
+            )
+            .is_err(),
+            "unknown group creation fields must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<CreateGroupRequest>(json!({ "rename": "Rack A" })).is_err(),
+            "a group creation request without the name field must be rejected"
+        );
+
+        let group = GroupResponse::new(
+            uuid!("0198c1ec-7e10-7f5e-8f2a-123456789204"),
+            "Rack A".to_owned(),
+            Vec::new(),
+            OffsetDateTime::parse("2026-08-07T04:00:03Z", &Rfc3339)?,
+            OffsetDateTime::parse("2026-08-07T04:00:03Z", &Rfc3339)?,
+        );
+        let list = GroupListResponse::new(vec![group.clone()]);
+        assert_eq!(list.groups(), &[group]);
+        assert_eq!(
+            serde_json::to_value(list)?,
+            json!({ "groups": [{
+                "group_id": "0198c1ec-7e10-7f5e-8f2a-123456789204",
+                "name": "Rack A",
+                "member_endpoint_ids": [],
+                "created_at": "2026-08-07T04:00:03Z",
+                "updated_at": "2026-08-07T04:00:03Z"
+            }] })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tag_contract_binds_name_to_endpoint_and_stays_strict() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = uuid!("0198c1ec-7e10-7f5e-8f2a-123456789301");
+        let tag_id = uuid!("0198c1ec-7e10-7f5e-8f2a-123456789302");
+        let request = AssignTagRequest::new(endpoint_id, "production".to_owned());
+
+        assert_eq!(request.endpoint_id(), endpoint_id);
+        assert_eq!(request.tag_name(), "production");
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({ "endpoint_id": endpoint_id, "tag_name": "production" })
+        );
+        assert_eq!(
+            serde_json::from_value::<AssignTagRequest>(serde_json::to_value(&request)?)?,
+            request
+        );
+        assert!(
+            serde_json::from_value::<AssignTagRequest>(json!({
+                "endpoint_id": endpoint_id,
+                "tag_name": "production",
+                "color": "#0f0"
+            }))
+            .is_err(),
+            "unknown tag assignment fields must be rejected"
+        );
+
+        let response = TagResponse::new(tag_id, endpoint_id, "production".to_owned());
+        let encoded = serde_json::to_value(&response)?;
+        assert_eq!(response.tag_id(), tag_id);
+        assert_eq!(response.endpoint_id(), endpoint_id);
+        assert_eq!(response.name(), "production");
+        assert_eq!(
+            encoded,
+            json!({
+                "tag_id": tag_id,
+                "endpoint_id": endpoint_id,
+                "name": "production"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<TagResponse>(encoded)?,
+            response,
+            "the tag contract must round-trip"
+        );
+        assert!(
+            serde_json::from_value::<TagResponse>(json!({
+                "tag_id": tag_id,
+                "endpoint_id": endpoint_id,
+                "name": "production",
+                "owner": "must not exist"
+            }))
+            .is_err(),
+            "unknown tag fields must be rejected"
+        );
+
+        let list = TagListResponse::new(vec![response]);
+        assert_eq!(list.tags().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<TagListResponse>(serde_json::to_value(list)?)?,
+            TagListResponse::new(vec![TagResponse::new(
+                tag_id,
+                endpoint_id,
+                "production".to_owned(),
+            )])
         );
         Ok(())
     }

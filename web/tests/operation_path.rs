@@ -403,6 +403,90 @@ impl CapabilitySnapshotRepository for MockServices {
     }
 }
 
+impl rutilus_application::GroupRepository for MockServices {
+    type Error = MockError;
+
+    fn create<'a>(
+        &'a self,
+        _group: &'a rutilus_domain::Group,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<rutilus_domain::Group, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn find(
+        &self,
+        _group_id: rutilus_domain::GroupId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<Option<rutilus_domain::Group>, Self::Error>>
+    {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list(
+        &self,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<Vec<rutilus_domain::Group>, Self::Error>>
+    {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn add_member(
+        &self,
+        _group_id: rutilus_domain::GroupId,
+        _endpoint_id: rutilus_domain::EndpointId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn remove_member(
+        &self,
+        _group_id: rutilus_domain::GroupId,
+        _endpoint_id: rutilus_domain::EndpointId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn delete(
+        &self,
+        _group_id: rutilus_domain::GroupId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+impl rutilus_application::TagRepository for MockServices {
+    type Error = MockError;
+
+    fn assign<'a>(
+        &'a self,
+        _tag: &'a rutilus_domain::Tag,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<rutilus_domain::Tag, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        _endpoint_id: rutilus_domain::EndpointId,
+        _tag_name: &'a rutilus_domain::TagName,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_for_endpoint(
+        &self,
+        _endpoint_id: rutilus_domain::EndpointId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<Vec<rutilus_domain::Tag>, Self::Error>>
+    {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_by_tag<'a>(
+        &'a self,
+        _tag_name: &'a rutilus_domain::TagName,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<Vec<rutilus_domain::Tag>, Self::Error>>
+    {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
 impl TlsIdentityProbe for MockGateway {
     type Error = MockError;
 

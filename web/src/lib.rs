@@ -11,29 +11,30 @@ use axum::{
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use rust_embed::RustEmbed;
 use rutilus_api::{
     AboutResponse, AppendArtifactChunkRequest, ArtifactFinalizeFailureResponse,
     ArtifactListResponse, ArtifactProgressResponse, ArtifactResponse, ArtifactStateResponse,
-    AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse, AuditTargetResponse,
-    BeginEndpointTrustRequest, CapabilityClassificationResponse, CapabilityEntryResponse,
-    CapabilityStateResponse, ConfirmEndpointTrustRequest, CoreResourceCommonResponse,
-    CoreResourceCountsResponse, CoreResourceDetailsResponse, CoreResourceResponse,
-    CoreResourceSourceResponse, CreateArtifactRequest, CreateCredentialRequest,
-    CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
-    EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
-    EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse,
-    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
-    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, EventListResponse,
-    EventResponse, HealthResponse, MetricValueResponse, OperationListResponse, OperationResponse,
+    AssignTagRequest, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
+    AuditTargetResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
+    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
+    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
+    CoreResourceResponse, CoreResourceSourceResponse, CreateArtifactRequest,
+    CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
+    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
+    EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
+    EndpointInventoryResponse, EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
+    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
+    ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
+    HealthResponse, MetricValueResponse, OperationListResponse, OperationResponse,
     OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    ResourceStatusResponse, TelemetrySampleListResponse, TelemetrySampleResponse,
-    TelemetrySeriesListResponse, TelemetrySeriesResponse, TlsTrustModeResponse,
-    TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
+    ResourceStatusResponse, TagListResponse, TagResponse, TelemetrySampleListResponse,
+    TelemetrySampleResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
+    TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -49,18 +50,19 @@ use rutilus_application::{
     EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
     EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
     EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
-    EnrolledEndpoint, EventRepository, NewCredentialRequest, OnboardEndpointError,
-    OnboardEndpointRequest, OperationStore, OperationSubmission, RedfishDiscovery,
-    ResourceStatusSummary, SubmissionError, TelemetryRepository, TlsIdentityProbe, TrustedEndpoint,
+    EnrolledEndpoint, EventRepository, GroupManagement, GroupManagementError, GroupRepository,
+    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, OperationStore,
+    OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError, TagManagement,
+    TagManagementError, TagRepository, TelemetryRepository, TlsIdentityProbe, TrustedEndpoint,
     parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityClassification,
     CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
     CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
-    EndpointId, Event, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-    ResourceFeature, ResourceSnapshot, TargetId, TelemetrySample, TelemetrySeries,
-    TelemetrySeriesId, TlsTrust, UiLocation,
+    EndpointId, Event, Group, GroupId, GroupName, Operation, OperationId, OperationSource,
+    OperationState, OperationTarget, ResourceFeature, ResourceSnapshot, Tag, TagName, TargetId,
+    TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -163,6 +165,14 @@ where
 /// embedding runtime delegates its five methods to the store, which persists
 /// the manifest and the upload progress while the application use case owns
 /// the file bytes (`spawn_blocking`, §7.8).
+///
+/// The grouping boundaries (§12.1, §14.2) are [`GroupRepository`] and
+/// [`TagRepository`]: the six-method static-group contract (`create`, `find`,
+/// `list`, `add_member`, `remove_member`, `delete`) and the four-method
+/// tag-binding contract (`assign`, `remove`, `list_for_endpoint`,
+/// `list_by_tag`), both composed by the application use cases per request.
+/// The embedding runtime delegates them to the `groups`, `group_members`,
+/// `tags`, and `endpoint_tags` tables (§9.3).
 pub trait ProductServices:
     EndpointInventoryRepository
     + CredentialInventoryRepository
@@ -179,6 +189,8 @@ pub trait ProductServices:
     + ArtifactRepository
     + EventRepository
     + TelemetryRepository
+    + GroupRepository
+    + TagRepository
 {
 }
 
@@ -198,6 +210,8 @@ impl<T> ProductServices for T where
         + ArtifactRepository
         + EventRepository
         + TelemetryRepository
+        + GroupRepository
+        + TagRepository
 {
 }
 
@@ -333,6 +347,39 @@ where
         .route(
             "/api/v1/artifacts/{artifact_id}",
             get(artifact_detail::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups",
+            get(group_inventory::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups",
+            post(create_group::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups/{group_id}",
+            get(group_detail::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups/{group_id}",
+            delete(delete_group::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups/{group_id}/members/{endpoint_id}",
+            put(add_group_member::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/groups/{group_id}/members/{endpoint_id}",
+            delete(remove_group_member::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/tags",
+            get(tag_inventory::<Services, Gateway, Time>),
+        )
+        .route("/api/v1/tags", put(assign_tag::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/endpoints/{endpoint_id}/tags/{tag_name}",
+            delete(remove_tag::<Services, Gateway, Time>),
         )
         .fallback(static_asset)
         .with_state(WebState {
@@ -1793,6 +1840,305 @@ where
             format!("endpoint persistence failed: {source}"),
         ),
     }
+}
+
+/// Lists every §12.1 static group in deterministic product order.
+async fn group_inventory<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+{
+    let groups = match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .list()
+        .await
+    {
+        Ok(groups) => groups,
+        Err(error) => return group_error_response(&error),
+    };
+    json_ok(Json(GroupListResponse::new(
+        groups.iter().map(project_group).collect(),
+    )))
+}
+
+/// Creates one §9.3 group from a validated name at the product clock time.
+async fn create_group<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CreateGroupRequest>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+    Time: Clock,
+{
+    let Ok(name) = GroupName::parse(request.name()) else {
+        return json_error(StatusCode::BAD_REQUEST, "group name is invalid".to_owned());
+    };
+    let group = match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .create(name, state.clock.now())
+        .await
+    {
+        Ok(group) => group,
+        Err(error) => return group_error_response(&error),
+    };
+    json_created(Json(project_group(&group)))
+}
+
+/// Loads one group with its current member set.
+async fn group_detail<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(group_id): AxumPath<String>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+{
+    let Ok(group_id) = group_id.parse::<GroupId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "group id is invalid".to_owned());
+    };
+    let group = match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .find(group_id)
+        .await
+    {
+        Ok(group) => group,
+        Err(error) => return group_error_response(&error),
+    };
+    json_ok(Json(project_group(&group)))
+}
+
+/// Deletes one group and all of its memberships.
+async fn delete_group<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(group_id): AxumPath<String>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+{
+    let Ok(group_id) = group_id.parse::<GroupId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "group id is invalid".to_owned());
+    };
+    match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .delete(group_id)
+        .await
+    {
+        Ok(()) => no_content(),
+        Err(error) => group_error_response(&error),
+    }
+}
+
+/// Adds one endpoint membership to one group (idempotent PUT).
+async fn add_group_member<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath((group_id, endpoint_id)): AxumPath<(String, String)>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+{
+    let (Ok(group_id), Ok(endpoint_id)) = (
+        group_id.parse::<GroupId>(),
+        endpoint_id.parse::<EndpointId>(),
+    ) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "group or endpoint id is invalid".to_owned(),
+        );
+    };
+    match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .add_member(group_id, endpoint_id)
+        .await
+    {
+        Ok(()) => no_content(),
+        Err(error) => group_error_response(&error),
+    }
+}
+
+/// Removes one endpoint membership from one group (idempotent DELETE).
+async fn remove_group_member<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath((group_id, endpoint_id)): AxumPath<(String, String)>,
+) -> Response
+where
+    Services: GroupRepository + EndpointRefreshRepository,
+{
+    let (Ok(group_id), Ok(endpoint_id)) = (
+        group_id.parse::<GroupId>(),
+        endpoint_id.parse::<EndpointId>(),
+    ) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "group or endpoint id is invalid".to_owned(),
+        );
+    };
+    match GroupManagement::new(state.services.as_ref(), state.services.as_ref())
+        .remove_member(group_id, endpoint_id)
+        .await
+    {
+        Ok(()) => no_content(),
+        Err(error) => group_error_response(&error),
+    }
+}
+
+/// Lists every tag binding across every managed endpoint — the §14.2
+/// homepage tag-filter union.
+async fn tag_inventory<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: TagRepository + EndpointRefreshRepository + EndpointInventoryRepository,
+{
+    let tags = match TagManagement::new(state.services.as_ref(), state.services.as_ref())
+        .list_all()
+        .await
+    {
+        Ok(tags) => tags,
+        Err(error) => return tag_error_response(&error),
+    };
+    json_ok(Json(TagListResponse::new(
+        tags.iter().map(project_tag).collect(),
+    )))
+}
+
+/// Binds one tag name to one managed endpoint (idempotent PUT).
+async fn assign_tag<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<AssignTagRequest>,
+) -> Response
+where
+    Services: TagRepository + EndpointRefreshRepository + EndpointInventoryRepository,
+{
+    let endpoint_id = EndpointId::from_uuid(request.endpoint_id());
+    let Ok(name) = TagName::parse(request.tag_name()) else {
+        return json_error(StatusCode::BAD_REQUEST, "tag name is invalid".to_owned());
+    };
+    match TagManagement::new(state.services.as_ref(), state.services.as_ref())
+        .assign(endpoint_id, name)
+        .await
+    {
+        Ok(_) => no_content(),
+        Err(error) => tag_error_response(&error),
+    }
+}
+
+/// Removes one tag binding from one managed endpoint (idempotent DELETE).
+///
+/// Removal is a convergent cleanup that never depends on the endpoint's
+/// continued existence: an endpoint that was deleted after its tags were
+/// assigned leaves residual bindings behind, and this path must stay able to
+/// remove them (mirroring the group member removal semantics), so an
+/// endpoint outside the managed set still returns 204. A malformed identity
+/// remains 400.
+///
+/// The tag name arrives percent-decoded by the path extractor, so names with
+/// spaces (for example `Rack A`) need no special handling in the console;
+/// names containing a `/` are sent as `%2F`.
+async fn remove_tag<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath((endpoint_id, tag_name)): AxumPath<(String, String)>,
+) -> Response
+where
+    Services: TagRepository + EndpointRefreshRepository + EndpointInventoryRepository,
+{
+    let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "endpoint id is invalid".to_owned());
+    };
+    let Ok(name) = TagName::parse(&tag_name) else {
+        return json_error(StatusCode::BAD_REQUEST, "tag name is invalid".to_owned());
+    };
+    match TagManagement::new(state.services.as_ref(), state.services.as_ref())
+        .remove(endpoint_id, &name)
+        .await
+    {
+        Ok(()) => no_content(),
+        Err(error) => tag_error_response(&error),
+    }
+}
+
+/// Maps one group-workflow failure to its HTTP status and console message.
+fn group_error_response<GroupError, EndpointError>(
+    error: &GroupManagementError<GroupError, EndpointError>,
+) -> Response
+where
+    GroupError: Error + 'static,
+    EndpointError: Error + 'static,
+{
+    let (status, message) = match error {
+        GroupManagementError::GroupRepository(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "group persistence failed")
+        }
+        GroupManagementError::EndpointRepository(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "endpoint existence check failed",
+        ),
+        GroupManagementError::NameConflict { .. } => (
+            StatusCode::CONFLICT,
+            "a group with this name already exists",
+        ),
+        GroupManagementError::GroupNotFound { .. } => {
+            (StatusCode::NOT_FOUND, "group does not exist")
+        }
+        GroupManagementError::UnknownEndpoint { .. } => {
+            (StatusCode::NOT_FOUND, "endpoint does not exist")
+        }
+        GroupManagementError::DuplicateGroup { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "group inventory is incoherent",
+        ),
+    };
+    json_error(status, message.to_owned())
+}
+
+/// Maps one tag-workflow failure to its HTTP status and console message.
+fn tag_error_response<TagError, EndpointError, InventoryError>(
+    error: &TagManagementError<TagError, EndpointError, InventoryError>,
+) -> Response
+where
+    TagError: Error + 'static,
+    EndpointError: Error + 'static,
+    InventoryError: Error + 'static,
+{
+    let (status, message) = match error {
+        TagManagementError::TagRepository(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "tag persistence failed")
+        }
+        TagManagementError::EndpointRepository(_) | TagManagementError::InventoryRepository(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "endpoint enumeration failed",
+        ),
+        TagManagementError::UnknownEndpoint { .. } => {
+            (StatusCode::NOT_FOUND, "endpoint does not exist")
+        }
+        TagManagementError::DuplicateTag { .. } | TagManagementError::DuplicateEndpoint { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tag inventory is incoherent",
+        ),
+    };
+    json_error(status, message.to_owned())
+}
+
+fn project_group(group: &Group) -> GroupResponse {
+    GroupResponse::new(
+        group.id().into_uuid(),
+        group.name().as_str().to_owned(),
+        group
+            .member_endpoint_ids()
+            .iter()
+            .map(|endpoint_id| endpoint_id.into_uuid())
+            .collect(),
+        group.created_at(),
+        group.updated_at(),
+    )
+}
+
+fn project_tag(tag: &Tag) -> TagResponse {
+    TagResponse::new(
+        tag.id().into_uuid(),
+        tag.endpoint_id().into_uuid(),
+        tag.name().as_str().to_owned(),
+    )
+}
+
+fn no_content() -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    no_store(&mut response);
+    response
 }
 
 fn json_ok<Body: IntoResponse>(body: Body) -> Response {
@@ -4803,6 +5149,78 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             OffsetDateTime::UNIX_EPOCH
+        }
+    }
+
+    impl GroupRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn create<'a>(
+            &'a self,
+            _group: &'a Group,
+        ) -> BoundaryFuture<'a, Result<Group, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn find(
+            &self,
+            _group_id: GroupId,
+        ) -> BoundaryFuture<'_, Result<Option<Group>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list(&self) -> BoundaryFuture<'_, Result<Vec<Group>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn add_member(
+            &self,
+            _group_id: GroupId,
+            _endpoint_id: EndpointId,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn remove_member(
+            &self,
+            _group_id: GroupId,
+            _endpoint_id: EndpointId,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn delete(&self, _group_id: GroupId) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl TagRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn assign<'a>(&'a self, _tag: &'a Tag) -> BoundaryFuture<'a, Result<Tag, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            _endpoint_id: EndpointId,
+            _tag_name: &'a TagName,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_for_endpoint(
+            &self,
+            _endpoint_id: EndpointId,
+        ) -> BoundaryFuture<'_, Result<Vec<Tag>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_by_tag<'a>(
+            &'a self,
+            _tag_name: &'a TagName,
+        ) -> BoundaryFuture<'a, Result<Vec<Tag>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
         }
     }
 }
