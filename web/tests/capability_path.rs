@@ -15,12 +15,12 @@ use std::{
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
-    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
+    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CAPABILITY_LEDGER_ORDER, CapabilityState, Credential, CredentialId,
@@ -340,6 +340,29 @@ impl CapabilityQueryRepository for MockServices {
     }
 }
 
+/// Replaces the whole stored capability page exactly like the atomic store
+/// write, so an enrolled endpoint's refresh re-probe is visible to the
+/// capability read path.
+impl CapabilitySnapshotRepository for MockServices {
+    type Error = MockError;
+
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        observations: &'a [EndpointCapabilityObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().map_err(|_| MockError::Lock)?;
+            state.capabilities = observations
+                .iter()
+                .map(|observation| StoredCapability::new(*observation, observed_at))
+                .collect();
+            Ok(())
+        })
+    }
+}
+
 impl TlsIdentityProbe for MockGateway {
     type Error = MockError;
 
@@ -640,6 +663,48 @@ async fn reports_storage_failures_as_service_unavailable() -> Result<(), Box<dyn
     assert_eq!(
         response.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response.headers().get("cache-control"),
+        Some(&axum::http::HeaderValue::from_static(
+            "no-store, must-revalidate"
+        ))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_duplicate_observations_as_internal_error() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = known_endpoint()?;
+    let endpoint_id = endpoint.id();
+    {
+        let mut state = state.lock().map_err(|_| MockError::Lock)?;
+        state.endpoints.push(endpoint);
+        // A corrupted store can repeat one capability across two rows; the
+        // query boundary must surface the inconsistency as an internal fault
+        // rather than guessing which observation wins.
+        state.capabilities = vec![
+            stored_entry(EndpointCapability::Systems, 0)?,
+            stored_entry(EndpointCapability::Systems, 1)?,
+        ];
+    }
+    let router = test_router(
+        MockServices::new(Arc::clone(&state)),
+        MockGateway::verified(TlsCertificate::from_der(
+            b"duplicate capability certificate".to_vec(),
+        )?),
+    );
+
+    let response = get(
+        &router,
+        &format!("/api/v1/endpoints/{endpoint_id}/capabilities"),
+    )
+    .await?;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
         response.headers().get("cache-control"),

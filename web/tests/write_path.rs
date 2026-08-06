@@ -16,12 +16,12 @@ use std::{
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
-    SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
+    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CapabilityState, Credential, CredentialId, CredentialName,
@@ -326,6 +326,22 @@ impl CapabilityQueryRepository for MockServices {
         _endpoint_id: EndpointId,
     ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
         Box::pin(async { Err(MockError::Persistence) })
+    }
+}
+
+/// The refresh's capability write must succeed so enrollment completes, but
+/// this file never reads the capability page back (the query boundary above
+/// is intentionally unavailable), so the snapshot is accepted and discarded.
+impl CapabilitySnapshotRepository for MockServices {
+    type Error = MockError;
+
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        _endpoint_id: EndpointId,
+        _observations: &'a [EndpointCapabilityObservation],
+        _observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
