@@ -11,11 +11,12 @@ use std::{
 };
 
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability, TlsIdentityProbe,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
+    Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, Credential, CredentialId, CredentialVersionId, DeploymentPosture,
@@ -278,6 +279,27 @@ impl CapabilityQueryRepository for StandaloneState {
         <SqliteStore as CapabilityQueryRepository>::find_endpoint_capabilities(
             &self.store,
             endpoint_id,
+        )
+    }
+}
+
+impl CapabilitySnapshotRepository for StandaloneState {
+    type Error = <SqliteStore as CapabilitySnapshotRepository>::Error;
+
+    /// The refresh writes the capability snapshot through the same store that
+    /// owns the endpoint aggregate, so both rows move atomically and the
+    /// whole-snapshot rejection rules cannot diverge between use cases.
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        observations: &'a [EndpointCapabilityObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        <SqliteStore as CapabilitySnapshotRepository>::replace_endpoint_capabilities(
+            &self.store,
+            endpoint_id,
+            observations,
+            observed_at,
         )
     }
 }

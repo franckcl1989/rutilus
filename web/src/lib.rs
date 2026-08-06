@@ -31,19 +31,19 @@ use rutilus_api::{
 };
 use rutilus_application::{
     AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture, CapabilityLedgerEntry,
-    CapabilityQueryRepository, Clock, CoreResourceDetails, CoreResourceReader, CoreResourceSummary,
-    CredentialCreation, CredentialCreationError, CredentialCreationRepository,
-    CredentialInventoryQuery, CredentialInventoryQueryError, CredentialInventoryRepository,
-    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointCsvImportExecutor,
-    EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment,
-    EndpointEnrollmentError, EndpointInventoryItem, EndpointInventoryQuery,
-    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointRefreshRepository,
-    EndpointResourceInventory, EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
-    EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
-    EndpointTrustExpectationError, EnrolledEndpoint, NewCredentialRequest, OnboardEndpointError,
-    OnboardEndpointRequest, RedfishDiscovery, ResourceStatusSummary, TlsIdentityProbe,
-    TrustedEndpoint, parse_endpoint_csv,
+    CapabilityQueryRepository, CapabilitySnapshotRepository, Clock, CoreResourceDetails,
+    CoreResourceReader, CoreResourceSummary, CredentialCreation, CredentialCreationError,
+    CredentialCreationRepository, CredentialInventoryQuery, CredentialInventoryQueryError,
+    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
+    DiscoveredEndpointRepository, EndpointCapabilityQuery, EndpointCapabilityQueryError,
+    EndpointCsvImportExecutor, EndpointCsvImportReport, EndpointCsvRowOutcome,
+    EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError, EndpointInventoryItem,
+    EndpointInventoryQuery, EndpointInventoryQueryError, EndpointInventoryRepository,
+    EndpointRefreshRepository, EndpointResourceInventory, EndpointResourceInventoryQuery,
+    EndpointResourceInventoryQueryError, EndpointTrustChallenge, EndpointTrustEstablishment,
+    EndpointTrustExpectation, EndpointTrustExpectationError, EnrolledEndpoint,
+    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, RedfishDiscovery,
+    ResourceStatusSummary, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, CapabilityClassification, CapabilityState,
@@ -133,6 +133,7 @@ pub trait ProductServices:
     + CredentialResolver
     + DiscoveredEndpointRepository
     + EndpointRefreshRepository
+    + CapabilitySnapshotRepository
     + AuditEventWriter
     + AuditEventQuery
     + CapabilityQueryRepository
@@ -147,6 +148,7 @@ impl<T> ProductServices for T where
         + CredentialResolver
         + DiscoveredEndpointRepository
         + EndpointRefreshRepository
+        + CapabilitySnapshotRepository
         + AuditEventWriter
         + AuditEventQuery
         + CapabilityQueryRepository
@@ -890,6 +892,7 @@ fn enrollment_error_response<
     DiscoveryError,
     OnboardingRepositoryError,
     RefreshRepositoryError,
+    CapabilityError,
     ReaderError,
     AuditError,
 >(
@@ -898,6 +901,7 @@ fn enrollment_error_response<
         DiscoveryError,
         OnboardingRepositoryError,
         RefreshRepositoryError,
+        CapabilityError,
         ReaderError,
         AuditError,
     >,
@@ -907,6 +911,7 @@ where
     DiscoveryError: Error + 'static,
     OnboardingRepositoryError: Error + 'static,
     RefreshRepositoryError: Error + 'static,
+    CapabilityError: Error + 'static,
     ReaderError: Error + 'static,
     AuditError: Error + 'static,
 {
@@ -1336,8 +1341,9 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
     use rutilus_application::{
-        BoundaryFuture, EndpointDiscovery, ProtectedCredentialCreation, ResolvedCredential,
-        ResourceObservation, StoredCapability, TlsIdentityObservation,
+        BoundaryFuture, CapabilitySnapshotRepository, EndpointDiscovery,
+        ProtectedCredentialCreation, ResolvedCredential, ResourceObservation, StoredCapability,
+        TlsIdentityObservation,
     };
     use rutilus_domain::{
         CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
@@ -1937,6 +1943,19 @@ mod tests {
             _observations: &'a [ResourceObservation],
             _observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    impl CapabilitySnapshotRepository for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn replace_endpoint_capabilities<'a>(
+            &'a self,
+            _endpoint_id: EndpointId,
+            _observations: &'a [EndpointCapabilityObservation],
+            _observed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
     }

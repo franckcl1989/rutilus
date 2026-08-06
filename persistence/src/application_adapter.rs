@@ -1,7 +1,8 @@
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CredentialInventoryRepository,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryItemError,
-    EndpointInventoryRepository, EndpointRefreshRepository, ResourceObservation, StoredCapability,
+    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
+    CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryItemError, EndpointInventoryRepository, EndpointRefreshRepository,
+    ResourceObservation, StoredCapability,
 };
 use rutilus_domain::{
     AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
@@ -45,6 +46,26 @@ impl CapabilityQueryRepository for SqliteStore {
                     })
                     .collect()
             }))
+        })
+    }
+}
+
+impl CapabilitySnapshotRepository for SqliteStore {
+    type Error = EndpointCapabilityRepositoryError;
+
+    /// Forwards the whole-snapshot write unchanged: the atomic store
+    /// transaction already rejects empty and duplicated pages, which is the
+    /// same contract the refresh use case promises, so no boundary-side
+    /// validation or error shaping is needed here.
+    fn replace_endpoint_capabilities<'a>(
+        &'a self,
+        endpoint_id: EndpointId,
+        observations: &'a [EndpointCapabilityObservation],
+        observed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::replace_endpoint_capabilities(self, endpoint_id, observations, observed_at)
+                .await
         })
     }
 }
@@ -176,10 +197,10 @@ mod tests {
     use std::error::Error;
 
     use rutilus_application::{
-        AuditEventWriter, CapabilityQueryRepository, CredentialInventoryQuery,
-        CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointCapabilityQuery,
-        EndpointInventoryQuery, EndpointInventoryRepository, EndpointRefreshRepository,
-        ResourceObservation,
+        AuditEventWriter, CapabilityQueryRepository, CapabilitySnapshotRepository,
+        CredentialInventoryQuery, CredentialInventoryRepository, DiscoveredEndpointRepository,
+        EndpointCapabilityQuery, EndpointInventoryQuery, EndpointInventoryRepository,
+        EndpointRefreshRepository, ResourceObservation,
     };
     use rutilus_domain::{
         AuditAction, AuditActor, AuditEvent, AuditOperationContext, AuditOperationId,
@@ -194,8 +215,8 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use crate::{
-        EndpointRefreshPersistenceError, EndpointRepositoryError, NewCredential,
-        ResourceSnapshotRepositoryError, SqliteStore,
+        EndpointCapabilityRepositoryError, EndpointRefreshPersistenceError,
+        EndpointRepositoryError, NewCredential, ResourceSnapshotRepositoryError, SqliteStore,
     };
 
     #[tokio::test]
@@ -515,6 +536,70 @@ mod tests {
                 EndpointCapabilityObservation::new(capability, STATES[index % STATES.len()])
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_capability_snapshot_boundary() -> Result<(), Box<dyn Error>>
+    {
+        fn assert_repository<Repository: CapabilitySnapshotRepository>() {}
+        assert_repository::<SqliteStore>();
+
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let (endpoint, created_at) = capability_endpoint(&store).await?;
+        store.create_endpoint(endpoint.clone()).await?;
+        let endpoint_id = endpoint.id();
+
+        // The atomic store contract stays intact at the application boundary:
+        // empty and internally duplicated pages are rejected before any
+        // existing observation can change.
+        assert!(matches!(
+            CapabilitySnapshotRepository::replace_endpoint_capabilities(
+                &store,
+                endpoint_id,
+                &[],
+                created_at,
+            )
+            .await,
+            Err(EndpointCapabilityRepositoryError::EmptySnapshot { .. })
+        ));
+        let observations = all_capability_observations();
+        let duplicated = [observations[0], observations[0]];
+        assert!(matches!(
+            CapabilitySnapshotRepository::replace_endpoint_capabilities(
+                &store,
+                endpoint_id,
+                &duplicated,
+                created_at,
+            )
+            .await,
+            Err(EndpointCapabilityRepositoryError::DuplicateCapability { .. })
+        ));
+
+        // One valid call replaces the whole snapshot and reads back through
+        // the query boundary with the same observed time.
+        let observed_at = created_at + Duration::SECOND;
+        CapabilitySnapshotRepository::replace_endpoint_capabilities(
+            &store,
+            endpoint_id,
+            &observations,
+            observed_at,
+        )
+        .await?;
+        let stored = CapabilityQueryRepository::find_endpoint_capabilities(&store, endpoint_id)
+            .await?
+            .ok_or("endpoint capabilities are missing")?;
+        assert_eq!(stored.len(), CAPABILITY_LEDGER_ORDER.len());
+        assert!(
+            stored
+                .iter()
+                .all(|capability| capability.observed_at() == observed_at),
+            "every persisted observation must carry the refresh clock time"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
     }
 
     #[tokio::test]
