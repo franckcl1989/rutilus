@@ -239,6 +239,40 @@ pub enum CoreResourceDetails {
         interface_enabled: Option<bool>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `pcie-devices` family member (a `PCIeDevice_v1` member linked
+    /// from the computer system). `device_type` stays the original schema
+    /// enumeration string so the console renders the device class without
+    /// re-parsing text; `SlotType` entered `PCIeDevice_v1` only in `v1_9_0`
+    /// and the schema compiles no such property, so it stays out of this
+    /// strictly projectable field set.
+    PcieDevice {
+        device_type: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `assembly` family member (an `AssemblyData` member inside a
+    /// chassis `Assembly` document; the `Assembly_v1` resource itself declares
+    /// no `Id` property, so the member's `MemberId` array index is its stable
+    /// identifier). Only the direct `Producer` and `Status` properties of the
+    /// member schema are projectable: the type of an assembly is expressed
+    /// through the `PhysicalContext` property, which stays out of this first
+    /// strictly projectable field set.
+    Assembly {
+        producer: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One `software-inventory` family member under the §2.1 `update-service`
+    /// feature (a `SoftwareInventory_v1` collection member under the root
+    /// `UpdateService`). `release_date` stays the RFC 3339 timestamp of the
+    /// compiled `Edm.DateTimeOffset` type so the console renders the release
+    /// date without re-parsing text.
+    SoftwareInventory {
+        software_id: Option<String>,
+        version: Option<String>,
+        release_date: Option<OffsetDateTime>,
+        status: Option<ResourceStatusSummary>,
+    },
 }
 
 /// One immutable core-resource snapshot ready for an API or UI boundary.
@@ -431,6 +465,9 @@ where
             project_manager_network_protocol(snapshot, payload)?
         }
         ResourceFeature::HostInterfaces => project_host_interface(snapshot, payload)?,
+        ResourceFeature::PcieDevices => project_pcie_device(snapshot, payload)?,
+        ResourceFeature::Assembly => project_assembly(snapshot, payload)?,
+        ResourceFeature::SoftwareInventory => project_software_inventory(snapshot, payload)?,
     };
     Ok(CoreResourceSummary {
         resource_id: snapshot.resource_id(),
@@ -836,6 +873,64 @@ where
     project_typed::<HostInterfacePayload, _, RepositoryError>(snapshot, payload, |parsed| {
         CoreResourceDetails::HostInterface {
             interface_enabled: parsed.interface_enabled,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_pcie_device<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<PcieDevicePayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::PcieDevice {
+            device_type: parsed.device_type,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_assembly<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<AssemblyPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::Assembly {
+            producer: parsed.producer,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_software_inventory<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<SoftwareInventoryPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::SoftwareInventory {
+            software_id: parsed.software_id,
+            version: parsed.version,
+            release_date: parsed.release_date,
             status: parsed.status.map(ResourceStatusPayload::into_summary),
         }
     })
@@ -1482,6 +1577,92 @@ struct HostInterfacePayload {
 }
 
 impl CommonPayload for HostInterfacePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PcieDevicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "DeviceType")]
+    device_type: Option<String>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for PcieDevicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssemblyPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Producer")]
+    producer: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for AssemblyPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoftwareInventoryPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "SoftwareId")]
+    software_id: Option<String>,
+    #[serde(rename = "Version")]
+    version: Option<String>,
+    /// `ReleaseDate` keeps the RFC 3339 timestamp of the compiled
+    /// `Edm.DateTimeOffset` type, so the projection carries the typed instant
+    /// instead of a string the console would have to re-parse.
+    #[serde(rename = "ReleaseDate", with = "time::serde::rfc3339::option")]
+    release_date: Option<OffsetDateTime>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for SoftwareInventoryPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -2223,6 +2404,178 @@ mod tests {
                 status: Some(status),
             } if host_name == "bmc-1"
                 && fqdn == "bmc-1.example.com"
+                && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_pcie_devices_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(19)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::PcieDevices,
+                    "/redfish/v1/Systems/1/PCIeDevices/GPU1",
+                    r#"{"Id":"GPU1","Name":"PCIe Device One","Description":"GPU accelerator","DeviceType":"SingleFunction","Manufacturer":"Vendor C","Model":"PCIE-GEN4-X16","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let pcie_device = &result.resources()[1];
+        assert_eq!(pcie_device.feature(), ResourceFeature::PcieDevices);
+        assert_eq!(
+            pcie_device.odata_id().as_str(),
+            "/redfish/v1/Systems/1/PCIeDevices/GPU1"
+        );
+        assert_eq!(pcie_device.common().id(), "GPU1");
+        assert_eq!(pcie_device.common().description(), Some("GPU accelerator"));
+        assert!(matches!(
+            pcie_device.details(),
+            CoreResourceDetails::PcieDevice {
+                device_type: Some(device_type),
+                manufacturer: Some(manufacturer),
+                model: Some(model),
+                status: Some(status),
+            } if device_type == "SingleFunction"
+                && manufacturer == "Vendor C"
+                && model == "PCIE-GEN4-X16"
+                && status.health() == Some("OK")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_assembly_family_without_losing_source_values() -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(20)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Assembly,
+                    "/redfish/v1/Chassis/1/Assembly#/Assemblies/0",
+                    r#"{"Id":"0","Name":"Fan Assembly","Description":"Cooling fan","Producer":"Vendor D","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let assembly = &result.resources()[1];
+        assert_eq!(assembly.feature(), ResourceFeature::Assembly);
+        assert_eq!(
+            assembly.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/Assembly#/Assemblies/0"
+        );
+        // The `AssemblyData` member schema declares no `Id` property, so the
+        // member's `MemberId` array index is its stable identifier.
+        assert_eq!(assembly.common().id(), "0");
+        assert_eq!(assembly.common().name(), "Fan Assembly");
+        assert!(matches!(
+            assembly.details(),
+            CoreResourceDetails::Assembly {
+                producer: Some(producer),
+                status: Some(status),
+            } if producer == "Vendor D"
+                && status.state() == Some("Enabled")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_software_inventory_family_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(21)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::SoftwareInventory,
+                    "/redfish/v1/UpdateService/SoftwareInventory/BIOS",
+                    r#"{"Id":"BIOS","Name":"System BIOS","Description":"Host firmware","SoftwareId":"BIOS-2026-1","Version":"2.7.0","ReleaseDate":"2026-05-01T00:00:00Z","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let software_inventory = &result.resources()[1];
+        assert_eq!(
+            software_inventory.feature(),
+            ResourceFeature::SoftwareInventory
+        );
+        assert_eq!(
+            software_inventory.odata_id().as_str(),
+            "/redfish/v1/UpdateService/SoftwareInventory/BIOS"
+        );
+        assert_eq!(software_inventory.common().name(), "System BIOS");
+        assert!(matches!(
+            software_inventory.details(),
+            CoreResourceDetails::SoftwareInventory {
+                software_id: Some(software_id),
+                version: Some(version),
+                release_date: Some(release_date),
+                status: Some(status),
+            } if software_id == "BIOS-2026-1"
+                && version == "2.7.0"
+                // The typed `ReleaseDate` instant of the fixture timestamp
+                // `2026-05-01T00:00:00Z` (epoch seconds 1777593600) survives
+                // the projection unchanged.
+                && *release_date
+                    == OffsetDateTime::from_unix_timestamp(1_777_593_600)
+                        .map_err(|_| "fixture release date must convert")?
                 && status.health() == Some("OK")
         ));
         Ok(())
