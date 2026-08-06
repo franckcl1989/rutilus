@@ -13,9 +13,9 @@ pub use application_adapter::{
 pub use redfish_gateway::{
     CommandExecutionError, CommandExecutionOutcome, CommandRejection, CommandVerificationError,
     CommandVerificationOutcome, CoreEndpointDiscovery, CoreResourceProjection,
-    CoreResourceReadError, RedfishGateway, RedfishServiceRootError, ServiceRootSummary,
-    TaskMessageObservation, TaskObservation, TaskReadError, TlsIdentityStateError,
-    UpdateArtifactUpload,
+    CoreResourceReadError, EndpointEvent, EventStream, EventStreamError, EventStreamOpenError,
+    RedfishGateway, RedfishServiceRootError, ServiceRootSummary, TaskMessageObservation,
+    TaskObservation, TaskReadError, TlsIdentityStateError, UpdateArtifactUpload,
 };
 pub use tls_probe::{
     SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,

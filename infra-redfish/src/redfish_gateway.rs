@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     error::Error as StdError,
     fmt,
     future::Future,
@@ -10,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::TryStreamExt as _;
 use futures_util::io::Cursor;
 use nv_redfish::{
     Bmc as _, Resource as NvResource, ServiceRoot,
@@ -20,9 +22,10 @@ use nv_redfish::{
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
     core::{
-        DataStream, EntityTypeRef, HttpPushUriUpdateRequest, ModificationResponse,
+        BoxTryStream, DataStream, EntityTypeRef, HttpPushUriUpdateRequest, ModificationResponse,
         MultipartUpdateRequest, NavProperty, ODataId, ReferenceLeaf, ToSnakeCase, UploadStream,
     },
+    event_service::EventStreamPayload,
     manager::{Manager, ManagerCollection},
     schema::{
         assembly::Assembly as AssemblySchema,
@@ -41,6 +44,7 @@ use nv_redfish::{
         control_collection::ControlCollection as ControlCollectionSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
+        event::EventRecord as EventRecordSchema,
         event_service::EventService as EventServiceSchema,
         host_interface::HostInterface as HostInterfaceSchema,
         host_interface_collection::HostInterfaceCollection as HostInterfaceCollectionSchema,
@@ -63,6 +67,7 @@ use nv_redfish::{
         power::Power as PowerSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
+        resource::Health as HealthSchema,
         resource::Resource as ResourceSchema,
         resource::ResourceCollection as ResourceCollectionSchema,
         secure_boot::SecureBoot as SecureBootSchema,
@@ -97,15 +102,18 @@ use rutilus_domain::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
     CertificateFingerprint, ChassisCommand, CreateSubscription, CredentialUsername,
     DeleteSubscription, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
-    EventCommand, EventDestinationProtocol, EventType, ManagerCommand, RedfishCommand,
-    ResetKeysType, ResetType, ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId,
-    ResourceODataIdError, ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
+    EndpointId, Event, EventCommand, EventDestinationProtocol, EventId, EventSeverity, EventType,
+    ManagerCommand, MessageId, RedfishCommand, ResetKeysType, ResetType, ResourceEtag,
+    ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
+    ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
     SetBootSourceOverride, SystemCommand, TlsIdentityChanged, TlsTrust,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category as JsonErrorCategory;
 use thiserror::Error;
+use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
 use crate::{TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError};
 
@@ -737,6 +745,105 @@ impl RedfishGateway {
         finish_task_read(result, authenticated.session, &identity, trust).await
     }
 
+    /// Opens the endpoint's `EventService` SSE stream (§14.4) and binds it
+    /// to one transient Session for the stream's whole lifetime.
+    ///
+    /// The stream is opened through the endpoint's advertised
+    /// `ServerSentEventUri` (`EventService::events`), so no SSE URI is ever
+    /// guessed (§11.1). Unlike every other authenticated operation — where
+    /// the Session is deleted before returning — the returned [`EventStream`]
+    /// OWNS the Session and deletes it when the stream reaches its terminal
+    /// state: the upstream closes, a fatal error is delivered, or `cancel`
+    /// fires. The caller must therefore poll `next()` to completion or call
+    /// `shutdown()`; abandoning the stream without a terminal state closes
+    /// the SSE connection (the stream is dropped) but leaves the Session
+    /// alive until the BMC expires it (§7.8 forbids untraceable detached
+    /// cleanup tasks).
+    ///
+    /// Each yielded [`EndpointEvent`] is bound to `endpoint_id` and carries
+    /// the complete domain [`Event`] — `MessageId`, severity, message, BMC
+    /// timestamp, the product-side receive time, and the derived dedup key
+    /// already stamped (§14.4 记录事件来源 and 去除明显重复), exactly as the
+    /// application `EventStream` boundary consumes it.
+    ///
+    /// # Cancellation
+    ///
+    /// Firing `cancel` stops the stream at the next poll: mapped events that
+    /// were not yet delivered are discarded, the SSE connection is closed,
+    /// and the Session is deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventStreamOpenError`]: `EventServiceNotAdvertised` or
+    /// `ServerSentEventsUnavailable` when the endpoint has no SSE surface,
+    /// `TrustOrSession` when the trust-bound Session setup failed, and
+    /// `Reconnectable`/`Terminal` when the SSE request itself failed. A
+    /// session already created for the failed open is deleted before the
+    /// error returns.
+    pub async fn open_event_stream(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+        endpoint_id: EndpointId,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, EventStreamOpenError> {
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(EventStreamOpenError::TrustOrSession)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(EventStreamOpenError::TrustOrSession(
+                    classify_service_root_error(source, &identity, trust),
+                ));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(EventStreamOpenError::TrustOrSession(source)),
+        };
+        let result = open_authenticated_event_stream(&authenticated.root, &identity, trust).await;
+        match result {
+            Ok(upstream) => Ok(EventStream::new(
+                endpoint_id,
+                upstream,
+                cancel,
+                authenticated.session,
+                authenticated.bmc,
+                identity,
+                trust.clone(),
+            )),
+            Err(operation) => {
+                // The stream never opened: delete the transient Session
+                // before surfacing the failure, exactly like
+                // `finish_redfish_operation`.
+                let cleanup = cleanup_session(authenticated.session, &identity, trust).await;
+                match cleanup {
+                    Ok(()) => Err(operation),
+                    Err(cleanup) => Err(EventStreamOpenError::OpenAndSessionCleanupFailed {
+                        open: Box::new(operation),
+                        cleanup: Box::new(cleanup),
+                    }),
+                }
+            }
+        }
+    }
+
     fn authenticated_bmc(
         &self,
         address: &EndpointAddress,
@@ -766,6 +873,261 @@ impl RedfishGateway {
         );
         let bmc = build_bmc(address, http.clone(), credentials);
         Ok((bmc, http, identity))
+    }
+}
+
+/// Opens the typed SSE stream of the root's `EventService` (§14.4).
+///
+/// A missing `EventService` link and an `EventService` without a
+/// `ServerSentEventUri` are endpoint-level capability facts: the endpoint
+/// has no SSE surface and no retry can change that. Every other open
+/// failure is classified into the reconnectable/terminal contract the
+/// application reconnect loop consumes.
+async fn open_authenticated_event_stream(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<BoxTryStream<EventStreamPayload, UpstreamServiceRootError>, EventStreamOpenError> {
+    let Some(service) = root
+        .event_service()
+        .await
+        .map_err(|source| classify_event_stream_open_error(source, identity, trust))?
+    else {
+        return Err(EventStreamOpenError::EventServiceNotAdvertised);
+    };
+    service
+        .events()
+        .await
+        .map_err(|source| classify_event_stream_open_error(source, identity, trust))
+}
+
+/// Classifies a failure to OPEN the endpoint's SSE stream.
+///
+/// The stream opens through a GET on `ServerSentEventUri`; a status on that
+/// request is the endpoint's live decision, so 401 (Session token
+/// invalidated) and 5xx are reconnectable while 403 (permission) and other
+/// 4xx are not. TLS-safety failures are never reconnectable: the persisted
+/// trust decision must be re-evaluated before any retry.
+fn classify_event_stream_open_error(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> EventStreamOpenError {
+    match identity.take_change(trust) {
+        Ok(Some(changed)) => {
+            return EventStreamOpenError::TrustOrSession(
+                RedfishServiceRootError::TlsIdentityChanged(changed),
+            );
+        }
+        Err(state) => {
+            return EventStreamOpenError::TrustOrSession(
+                RedfishServiceRootError::TlsIdentityState(state),
+            );
+        }
+        Ok(None) => {}
+    }
+    if identity.validation_rejected() {
+        return match source {
+            nv_redfish::Error::Bmc(source) => {
+                EventStreamOpenError::Terminal(RedfishServiceRootError::TlsRejected { source })
+            }
+            source => EventStreamOpenError::Terminal(RedfishServiceRootError::Upstream(source)),
+        };
+    }
+    match source {
+        nv_redfish::Error::EventServiceServerSentEventUriNotAvailable => {
+            EventStreamOpenError::ServerSentEventsUnavailable
+        }
+        nv_redfish::Error::Json(_) => {
+            EventStreamOpenError::Terminal(RedfishServiceRootError::SchemaIncompatible { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. }) => {
+            if status == StatusCode::UNAUTHORIZED {
+                EventStreamOpenError::Reconnectable(RedfishServiceRootError::AuthenticationFailed {
+                    source,
+                })
+            } else if status == StatusCode::FORBIDDEN {
+                EventStreamOpenError::Terminal(RedfishServiceRootError::PermissionDenied { source })
+            } else if status == StatusCode::NOT_FOUND {
+                EventStreamOpenError::Terminal(RedfishServiceRootError::NotRedfishService {
+                    source,
+                })
+            } else if status.is_server_error() {
+                EventStreamOpenError::Reconnectable(RedfishServiceRootError::RemoteResponse {
+                    source,
+                })
+            } else {
+                EventStreamOpenError::Terminal(RedfishServiceRootError::RemoteResponse { source })
+            }
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::ReqwestError(_))
+            if is_transport_timeout(&source) =>
+        {
+            EventStreamOpenError::Reconnectable(RedfishServiceRootError::NetworkTimeout { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::ReqwestError(_)) => {
+            EventStreamOpenError::Reconnectable(RedfishServiceRootError::Network { source })
+        }
+        nv_redfish::Error::Bmc(source @ (BmcError::JsonError(_) | BmcError::DecodeError(_))) => {
+            EventStreamOpenError::Terminal(RedfishServiceRootError::SchemaIncompatible {
+                source: nv_redfish::Error::Bmc(source),
+            })
+        }
+        nv_redfish::Error::Bmc(
+            source @ (BmcError::SseStreamError(_) | BmcError::SseIdleTimeout { .. }),
+        ) => EventStreamOpenError::Reconnectable(RedfishServiceRootError::Upstream(
+            nv_redfish::Error::Bmc(source),
+        )),
+        nv_redfish::Error::Bmc(source) => EventStreamOpenError::Terminal(
+            RedfishServiceRootError::Upstream(nv_redfish::Error::Bmc(source)),
+        ),
+        source => EventStreamOpenError::Terminal(RedfishServiceRootError::Upstream(source)),
+    }
+}
+
+/// Classifies one mid-stream failure of the SSE stream.
+///
+/// The upstream terminates the stream for every error except a per-event
+/// JSON decode failure (filtered by [`is_skippable_event_stream_item`]), so
+/// every error seen here ends the stream. Transport failures (connect/read
+/// EOF/timeout) and SSE framing decode failures are reconnectable: the next
+/// connection may decode cleanly. An event that exceeds the fixed 1 MiB
+/// buffering budget is terminal: the budget is a compiled upstream default,
+/// so reconnecting cannot succeed for that endpoint.
+fn classify_event_stream_error(source: UpstreamServiceRootError) -> EventStreamError {
+    match source {
+        nv_redfish::Error::Json(_) => {
+            EventStreamError::Terminal(RedfishServiceRootError::SchemaIncompatible { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::ReqwestError(_))
+            if is_transport_timeout(&source) =>
+        {
+            EventStreamError::Reconnectable(RedfishServiceRootError::NetworkTimeout { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::ReqwestError(_)) => {
+            EventStreamError::Reconnectable(RedfishServiceRootError::Network { source })
+        }
+        nv_redfish::Error::Bmc(
+            source @ (BmcError::SseStreamError(_) | BmcError::SseIdleTimeout { .. }),
+        ) => EventStreamError::Reconnectable(RedfishServiceRootError::Upstream(
+            nv_redfish::Error::Bmc(source),
+        )),
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. })
+            if status == StatusCode::UNAUTHORIZED =>
+        {
+            EventStreamError::Reconnectable(RedfishServiceRootError::AuthenticationFailed {
+                source,
+            })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. })
+            if status == StatusCode::FORBIDDEN =>
+        {
+            EventStreamError::Terminal(RedfishServiceRootError::PermissionDenied { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. })
+            if status.is_server_error() =>
+        {
+            EventStreamError::Reconnectable(RedfishServiceRootError::RemoteResponse { source })
+        }
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { .. }) => {
+            EventStreamError::Terminal(RedfishServiceRootError::RemoteResponse { source })
+        }
+        nv_redfish::Error::Bmc(source @ (BmcError::JsonError(_) | BmcError::DecodeError(_))) => {
+            EventStreamError::Terminal(RedfishServiceRootError::SchemaIncompatible {
+                source: nv_redfish::Error::Bmc(source),
+            })
+        }
+        // Every remaining `BmcError` — including `SseEventTooLarge`, whose
+        // 1 MiB budget is a compiled upstream default — is terminal: no
+        // transport error class reaches this catch-all, and an oversized
+        // event is deterministic for the endpoint.
+        nv_redfish::Error::Bmc(source) => EventStreamError::Terminal(
+            RedfishServiceRootError::Upstream(nv_redfish::Error::Bmc(source)),
+        ),
+        source => EventStreamError::Terminal(RedfishServiceRootError::Upstream(source)),
+    }
+}
+
+/// Reports whether a transport failure was a timeout.
+fn is_transport_timeout(source: &BmcError) -> bool {
+    matches!(source, BmcError::ReqwestError(error) if error.is_timeout())
+}
+
+/// Reports whether a mid-stream failure is scoped to one event and must not
+/// end the stream.
+///
+/// The upstream surfaces only JSON decode failures this way (the payload
+/// failed to deserialize into `EventStreamPayload`); every other error ends
+/// the stream, so skipping keeps the SSE connection alive past a malformed
+/// event instead of churning the reconnect loop.
+fn is_skippable_event_stream_item(source: &UpstreamServiceRootError) -> bool {
+    matches!(source, nv_redfish::Error::Json(_))
+}
+
+/// Builds the complete domain [`Event`] from one Redfish `EventRecord`
+/// (§14.4).
+///
+/// Returns `None` — and the stream continues — for records the domain model
+/// refuses: an unparseable `MessageId`, a severity outside the DMTF
+/// vocabulary, or an event timestamp after the product receive time. The
+/// domain treats a stored row with an unknown severity code or an inverted
+/// timeline as corrupt (§9.3), so the stream never invents a value and never
+/// clamps a BMC clock: a refused record is dropped, keeping the stream alive
+/// and the boundary honest. These rejection decisions all live here, exactly
+/// where the application `EventStream` boundary contract places them.
+///
+/// `event_timestamp` falls back to `observed_at` when the record carries no
+/// timestamp, so a record without one stays recordable; the product receive
+/// time is stamped by the stream (the product clock) and the dedup key is
+/// derived inside [`Event::new`] (去除明显重复).
+fn map_event_record(
+    record: &EventRecordSchema,
+    endpoint_id: EndpointId,
+    observed_at: OffsetDateTime,
+) -> Option<Event> {
+    let message_id = MessageId::parse(&record.message_id).ok()?;
+    let severity = map_event_severity(record.severity.as_deref(), record.message_severity)?;
+    let event_timestamp = record
+        .event_timestamp
+        .map_or(observed_at, OffsetDateTime::from);
+    // The timeline rejection: a BMC clock ahead of the product clock cannot
+    // be recorded (§9.3), so the record is refused like every other domain
+    // rejection — dropped, never clamped or invented.
+    Event::new(
+        EventId::generate(),
+        endpoint_id,
+        message_id,
+        severity,
+        record.message.clone(),
+        event_timestamp,
+        observed_at,
+    )
+    .ok()
+}
+
+/// Maps the Redfish severity fields onto the domain [`EventSeverity`].
+///
+/// `Severity` (the service-provided string) takes precedence over
+/// `MessageSeverity` (the registry-typed `Health`), because the schema lets
+/// services replace the registry value with a value more applicable to the
+/// implementation. DMTF defines exactly `OK`/`Warning`/`Critical`; a value
+/// outside that vocabulary — including a vendor extension — returns `None`
+/// so the record is refused instead of guessing a severity the domain
+/// refuses to store.
+fn map_event_severity(
+    severity: Option<&str>,
+    message_severity: Option<HealthSchema>,
+) -> Option<EventSeverity> {
+    match severity {
+        Some("OK") => Some(EventSeverity::Ok),
+        Some("Warning") => Some(EventSeverity::Warning),
+        Some("Critical") => Some(EventSeverity::Critical),
+        _ => match message_severity {
+            Some(HealthSchema::Ok) => Some(EventSeverity::Ok),
+            Some(HealthSchema::Warning) => Some(EventSeverity::Warning),
+            Some(HealthSchema::Critical) => Some(EventSeverity::Critical),
+            Some(HealthSchema::UnsupportedValue) | None => None,
+        },
     }
 }
 
@@ -3428,6 +3790,45 @@ impl TaskMessageObservation {
     }
 }
 
+/// One endpoint event consumed from an [`EventStream`], bound to the
+/// endpoint that produced it (§14.4 记录事件来源).
+///
+/// The wrapped [`Event`] is the complete persisted domain model: it carries
+/// the same `endpoint_id`, the product-side receive time, and the derived
+/// dedup key (§14.4 去除明显重复). The field is repeated on the binding
+/// because the ingestion layer consumes this binding and must never reach
+/// into the domain aggregate to learn its source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndpointEvent {
+    endpoint_id: EndpointId,
+    event: Event,
+}
+
+impl EndpointEvent {
+    #[must_use]
+    pub const fn new(endpoint_id: EndpointId, event: Event) -> Self {
+        Self { endpoint_id, event }
+    }
+
+    /// Returns the identity of the endpoint that produced the event.
+    #[must_use]
+    pub const fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    /// Borrows the persisted domain event.
+    #[must_use]
+    pub const fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Consumes the event into its source identity and domain record.
+    #[must_use]
+    pub fn into_parts(self) -> (EndpointId, Event) {
+        (self.endpoint_id, self.event)
+    }
+}
+
 #[derive(Serialize)]
 struct CommonResourcePayload {
     #[serde(rename = "Id")]
@@ -5105,6 +5506,257 @@ impl From<RedfishServiceRootError> for TaskReadError {
     }
 }
 
+/// A live SSE stream of one endpoint's Redfish events (§14.4).
+///
+/// Consumed through [`Self::next`], which returns one [`EndpointEvent`] per
+/// Redfish `EventRecord` until the stream reaches its terminal state: the
+/// upstream closed, a fatal error was delivered, or the `cancel` token given
+/// to [`RedfishGateway::open_event_stream`] fired. The terminal phase then
+/// deletes the transient Session the stream owns — never before, so the
+/// session lives exactly as long as the stream (§7.8: long-lived connections
+/// have a shutdown signal).
+///
+/// Dropping the stream without reaching a terminal state closes the SSE
+/// connection but abandons the Session until the BMC expires it;
+/// [`Self::shutdown`] is the structured drain path (§7.8: no untraceable
+/// detached cleanup tasks).
+///
+/// The stream is consumed through the inherent `next`/`shutdown` methods
+/// rather than a `Stream` impl, because the terminal phase performs an
+/// asynchronous Session deletion that cannot run inside `poll_next`.
+pub struct EventStream {
+    endpoint_id: EndpointId,
+    upstream: Option<BoxTryStream<EventStreamPayload, UpstreamServiceRootError>>,
+    cancel: CancellationToken,
+    /// The Session deleted in the terminal phase; `None` once the stream
+    /// closed or the Session was moved into cleanup.
+    session: Option<Session<UpstreamBmc>>,
+    identity: IdentityMonitor,
+    trust: TlsTrust,
+    bmc: Arc<UpstreamBmc>,
+    pending: VecDeque<EndpointEvent>,
+    /// The single terminal error item still to be delivered.
+    terminal: Option<EventStreamError>,
+    /// The terminal phase already ran; nothing more will be delivered.
+    finished: bool,
+}
+
+/// The outcome of one poll of the upstream SSE stream.
+///
+/// The item is boxed so the enum stays small: `Cancelled` is a zero-size
+/// variant and the payload error type is large.
+enum EventStreamPoll {
+    /// The cancellation token fired before the upstream produced an item.
+    Cancelled,
+    /// The upstream produced one item (`Ok(Some(..))`), ended (`Ok(None)`),
+    /// or failed.
+    Item(Box<Result<Option<EventStreamPayload>, UpstreamServiceRootError>>),
+}
+
+impl EventStream {
+    fn new(
+        endpoint_id: EndpointId,
+        upstream: BoxTryStream<EventStreamPayload, UpstreamServiceRootError>,
+        cancel: CancellationToken,
+        session: Option<Session<UpstreamBmc>>,
+        bmc: Arc<UpstreamBmc>,
+        identity: IdentityMonitor,
+        trust: TlsTrust,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            upstream: Some(upstream),
+            cancel,
+            session,
+            identity,
+            trust,
+            bmc,
+            pending: VecDeque::new(),
+            terminal: None,
+            finished: false,
+        }
+    }
+
+    /// Returns the endpoint identity every delivered event is bound to.
+    #[must_use]
+    pub const fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    /// Consumes the next endpoint event from the SSE stream.
+    ///
+    /// Returns `Some(Ok(..))` for each delivered event, then — once — the
+    /// terminal error if the stream ended in failure or its Session could
+    /// not be deleted, and finally `None` when nothing more will be
+    /// delivered. After `cancel` fires, the next call returns the terminal
+    /// state promptly: mapped events not yet delivered are discarded, the
+    /// SSE connection is closed, and the Session is deleted.
+    pub async fn next(&mut self) -> Option<Result<EndpointEvent, EventStreamError>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(Ok(event));
+            }
+            if let Some(terminal) = self.terminal.take() {
+                return Some(Err(terminal));
+            }
+            if self.finished {
+                return None;
+            }
+            let Some(upstream) = self.upstream.as_mut() else {
+                // The terminal phase already consumed the upstream; nothing
+                // more can be delivered.
+                return None;
+            };
+            let item = tokio::select! {
+                () = self.cancel.cancelled() => EventStreamPoll::Cancelled,
+                item = upstream.try_next() => EventStreamPoll::Item(Box::new(item)),
+            };
+            match item {
+                EventStreamPoll::Cancelled => {
+                    self.finish(None).await;
+                }
+                EventStreamPoll::Item(item) => match *item {
+                    Ok(Some(EventStreamPayload::Event(event))) => {
+                        for record in &event.events {
+                            // A bare `@odata.id` reference carries no
+                            // payload; only inline records are mappable
+                            // events.
+                            if !matches!(record, NavProperty::Expanded(_)) {
+                                continue;
+                            }
+                            // `get` on an already-expanded property is a
+                            // zero-copy Arc return, never a fetch.
+                            let Ok(record) = record.get(self.bmc.as_ref()).await else {
+                                continue;
+                            };
+                            let observed_at = OffsetDateTime::now_utc();
+                            if let Some(event) =
+                                map_event_record(record.as_ref(), self.endpoint_id, observed_at)
+                            {
+                                self.pending
+                                    .push_back(EndpointEvent::new(self.endpoint_id, event));
+                            }
+                        }
+                    }
+                    Ok(Some(EventStreamPayload::MetricReport(_))) => {
+                        // A telemetry payload is not an event: the boundary
+                        // record models BMC events only, and §14.4 keeps
+                        // Telemetry a separate surface. Skipping keeps the
+                        // stream alive.
+                    }
+                    Ok(None) => {
+                        self.finish(None).await;
+                    }
+                    Err(source) if is_skippable_event_stream_item(&source) => {
+                        // One malformed event must not kill the stream; the
+                        // vendor's next record may decode cleanly.
+                    }
+                    Err(source) => {
+                        self.finish(Some(classify_event_stream_error(source))).await;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Cancels the stream and drains it to its terminal state, deleting the
+    /// transient Session. Safe to call multiple times and after the stream
+    /// already ended.
+    pub async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        while self.next().await.is_some() {}
+    }
+
+    /// Runs the terminal phase exactly once: closes the SSE connection,
+    /// deletes the Session, and records the one terminal item to deliver.
+    ///
+    /// The cleanup classification mirrors `cleanup_session`: a failed
+    /// deletion surfaces as its own error item instead of masking the
+    /// stream's termination reason, or combined with it when both failed.
+    async fn finish(&mut self, failure: Option<EventStreamError>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // Drop the SSE connection before the Session DELETE so the BMC
+        // stops streaming into a connection the stream is abandoning.
+        self.upstream.take();
+        let cleanup = cleanup_session(self.session.take(), &self.identity, &self.trust).await;
+        self.terminal = match (failure, cleanup) {
+            (None, Ok(())) => None,
+            (None, Err(cleanup)) => Some(EventStreamError::SessionCleanup(cleanup)),
+            (Some(failure), Ok(())) => Some(failure),
+            (Some(failure), Err(cleanup)) => {
+                Some(EventStreamError::StreamAndSessionCleanupFailed {
+                    stream: Box::new(failure),
+                    cleanup: Box::new(EventStreamError::SessionCleanup(cleanup)),
+                })
+            }
+        };
+    }
+}
+
+/// Why opening an endpoint's `EventService` SSE stream failed.
+#[derive(Debug, Error)]
+pub enum EventStreamOpenError {
+    /// The endpoint does not advertise the Redfish `EventService` at all
+    /// (§14.4 使用 `EventService` 公开能力): there is nothing to stream.
+    #[error("the endpoint does not advertise the Redfish EventService")]
+    EventServiceNotAdvertised,
+    /// The endpoint's `EventService` exists but exposes no
+    /// `ServerSentEventUri`: SSE is not available on this endpoint.
+    #[error("the endpoint's EventService does not expose an SSE stream URI")]
+    ServerSentEventsUnavailable,
+    /// Session establishment, TLS identity, or trust-bound transport
+    /// failed; the persisted trust decision must be re-evaluated before
+    /// retrying.
+    #[error("the event stream could not be set up with the current trust decision: {0}")]
+    TrustOrSession(#[source] RedfishServiceRootError),
+    /// The SSE request failed transiently (network, 5xx, or an invalidated
+    /// Session token); reopening with the same inputs may succeed.
+    #[error("the SSE stream could not be opened but may succeed when retried: {0}")]
+    Reconnectable(#[source] RedfishServiceRootError),
+    /// The SSE request failed and cannot succeed with the same inputs
+    /// (permission, schema incompatibility, TLS rejection).
+    #[error("the SSE stream cannot be opened: {0}")]
+    Terminal(#[source] RedfishServiceRootError),
+    #[error(
+        "the SSE stream could not be opened and the transient Session cleanup also failed; open: {open}; cleanup: {cleanup}"
+    )]
+    OpenAndSessionCleanupFailed {
+        open: Box<EventStreamOpenError>,
+        #[source]
+        cleanup: Box<RedfishServiceRootError>,
+    },
+}
+
+/// A failure of a live [`EventStream`].
+#[derive(Debug, Error)]
+pub enum EventStreamError {
+    /// The stream failed transiently; re-establishing the Session and
+    /// reopening the stream may succeed (network drop, 5xx, invalidated
+    /// Session token, SSE framing decode failure).
+    #[error("the SSE stream failed transiently and can be reopened: {0}")]
+    Reconnectable(#[source] RedfishServiceRootError),
+    /// The stream terminated and cannot be resumed with the same trust
+    /// decision or endpoint configuration (permission, schema
+    /// incompatibility, oversized event budget).
+    #[error("the SSE stream terminated and cannot be reopened: {0}")]
+    Terminal(#[source] RedfishServiceRootError),
+    /// The stream ended but its transient Session could not be deleted; the
+    /// token lingers until the BMC expires it.
+    #[error("the transient Session could not be deleted after the event stream closed: {0}")]
+    SessionCleanup(#[source] RedfishServiceRootError),
+    #[error(
+        "the SSE stream failed and the transient Session cleanup also failed; stream: {stream}; cleanup: {cleanup}"
+    )]
+    StreamAndSessionCleanupFailed {
+        stream: Box<EventStreamError>,
+        #[source]
+        cleanup: Box<EventStreamError>,
+    },
+}
+
 fn classify_service_root_error(
     source: UpstreamServiceRootError,
     identity: &IdentityMonitor,
@@ -6165,7 +6817,7 @@ mod tests {
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
     use rutilus_domain::{StartUpdate, TlsCertificate, TlsTrust, UpdateCommand};
-    use time::OffsetDateTime;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -15015,6 +15667,618 @@ mod tests {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // §14.4 Event SSE stream consumption
+    // ------------------------------------------------------------------
+
+    const EVENT_SERVICE_WITH_SSE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/EventService",
+        "Id":"EventService",
+        "Name":"Event Service",
+        "ServerSentEventUri":"/redfish/v1/EventService/SSE"
+    }"#;
+
+    /// The one-shot responses of the Session lifecycle around one SSE
+    /// connection: Service Root, `SessionService`, Sessions, Session create,
+    /// `EventService` document, and the Session delete the stream's terminal
+    /// phase sends. The SSE connection itself (index 5) is served by the
+    /// streaming mock.
+    fn sse_lifecycle_responses() -> Vec<Vec<u8>> {
+        session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", EVENT_SERVICE_WITH_SSE_BODY)],
+        )
+    }
+
+    fn sse_frame(payload: &str) -> Vec<u8> {
+        format!("data: {payload}\r\n\r\n").into_bytes()
+    }
+
+    /// One Redfish SSE frame carrying an `Event` resource with the given
+    /// `Events` array.
+    fn event_frame(records: &serde_json::Value) -> Vec<u8> {
+        sse_frame(
+            &serde_json::json!({
+                "@odata.type": "#Event.v1_6_0.Event",
+                "@odata.id": "/redfish/v1/EventService/SSE#/Event1",
+                "Id": "1",
+                "Name": "Event Array",
+                "Context": "rutilus",
+                "Events": records,
+            })
+            .to_string(),
+        )
+    }
+
+    // The stream-under-test drives every mapping decision in one place, so
+    // the scenario stays readable as one sequence instead of scattered
+    // fragments.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn streams_events_with_severity_mapping_timestamp_fallback_and_refusals()
+    -> Result<(), Box<dyn Error>> {
+        let records_with_bmc_time = serde_json::json!([
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/1",
+                "MemberId": "1",
+                "EventId": "e1",
+                "EventType": "Alert",
+                "EventTimestamp": "2026-02-19T03:55:29+00:00",
+                "Message": "The resource has been removed successfully.",
+                "MessageId": "ResourceEvent.1.2.ResourceRemoved",
+                // The service-provided `Severity` string replaces the
+                // registry's `MessageSeverity`.
+                "MessageSeverity": "OK",
+                "Severity": "Warning"
+            },
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/2",
+                "MemberId": "2",
+                "EventId": "e2",
+                "EventType": "Alert",
+                // No EventTimestamp: the domain event must fall back to the
+                // product receive time.
+                "Message": "A power supply lost input",
+                "MessageId": "Alert.1.0.PowerSupplyFailure",
+                "MessageSeverity": "Critical"
+            },
+            // A bare reference carries no event payload and is skipped.
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/99"
+            }
+        ]);
+        let unclassifiable_severity = serde_json::json!([
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/4",
+                "MemberId": "4",
+                "EventId": "e4",
+                "EventType": "Other",
+                "MessageId": "Vendor.1.0.CustomSeverity",
+                "Severity": "vendor-specific"
+            }
+        ]);
+        let future_timestamp = serde_json::json!([
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/5",
+                "MemberId": "5",
+                "EventId": "e5",
+                "EventType": "Alert",
+                // The BMC clock runs ahead of the product clock: the
+                // timeline rejection drops the record instead of clamping
+                // it (§9.3 refuses an inverted timeline).
+                "EventTimestamp": "2030-01-01T00:00:00+00:00",
+                "Message": "The resource has been updated successfully.",
+                "MessageId": "ResourceEvent.1.2.ResourceUpdated",
+                "Severity": "OK"
+            }
+        ]);
+        let metric_report = sse_frame(
+            &serde_json::json!({
+                "@odata.type": "#MetricReport.v1_3_0.MetricReport",
+                "@odata.id": "/redfish/v1/TelemetryService/MetricReports/AvgPlatformPowerUsage",
+                "Id": "AvgPlatformPowerUsage",
+                "Name": "Average Platform Power Usage metric report",
+                "MetricReportDefinition": {
+                    "@odata.id": "/redfish/v1/TelemetryService/MetricReportDefinitions/AvgPlatformPowerUsage"
+                },
+                "MetricValues": [
+                    {
+                        "MetricId": "AverageConsumedWatts",
+                        "MetricValue": "100",
+                        "Timestamp": "2016-11-08T12:25:00-05:00",
+                        "MetricProperty": "/redfish/v1/Chassis/Tray_1/Power#/0/PowerConsumedWatts"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+
+        let server = TestSseServer::start_sse(
+            sse_lifecycle_responses(),
+            5,
+            vec![
+                event_frame(&records_with_bmc_time),
+                metric_report,
+                event_frame(&unclassifiable_severity),
+                event_frame(&future_timestamp),
+            ],
+            SseEnd::Clean,
+        )
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let endpoint_id = EndpointId::generate();
+
+        let mut stream = gateway
+            .open_event_stream(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                endpoint_id,
+                CancellationToken::new(),
+            )
+            .await?;
+
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("expected the first event"))??;
+        assert_eq!(first.endpoint_id(), endpoint_id);
+        assert_eq!(first.event().endpoint_id(), endpoint_id);
+        assert_eq!(
+            first.event().message_id().as_str(),
+            "ResourceEvent.1.2.ResourceRemoved"
+        );
+        assert_eq!(
+            first.event().severity(),
+            EventSeverity::Warning,
+            "the service-provided `Severity` must win over `MessageSeverity`"
+        );
+        assert_eq!(
+            first.event().message(),
+            Some("The resource has been removed successfully.")
+        );
+        assert_eq!(
+            first.event().event_timestamp(),
+            OffsetDateTime::parse("2026-02-19T03:55:29+00:00", &Rfc3339)?
+        );
+
+        let second = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("expected the second event"))??;
+        assert_eq!(second.endpoint_id(), endpoint_id);
+        assert_eq!(
+            second.event().message_id().as_str(),
+            "Alert.1.0.PowerSupplyFailure"
+        );
+        assert_eq!(
+            second.event().severity(),
+            EventSeverity::Critical,
+            "`MessageSeverity` must fill in when `Severity` is absent"
+        );
+        assert_eq!(
+            second.event().event_timestamp(),
+            second.event().observed_at(),
+            "a record without `EventTimestamp` must fall back to the receive time"
+        );
+
+        assert!(
+            stream.next().await.is_none(),
+            "the cleanly closed stream must end without an error; the vendor-severity \
+             record, the future-timestamp record, the bare reference, and the metric \
+             report must all be refused or skipped while the stream stays alive"
+        );
+
+        let requests = server.finish_all().await?;
+        assert_session_requests(
+            &requests,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/EventService",
+                "/redfish/v1/EventService/SSE",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
+        // The SSE request itself carried the Session token and the
+        // event-stream accept header on the typed `ServerSentEventUri`.
+        let sse_request = std::str::from_utf8(&requests[5])?;
+        assert!(sse_request.starts_with("GET /redfish/v1/EventService/SSE HTTP/1.1\r\n"));
+        assert_eq!(
+            request_header(sse_request, "accept"),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            request_header(sse_request, "x-auth-token"),
+            Some("test-session-token")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_malformed_events_and_keeps_the_stream_alive() -> Result<(), Box<dyn Error>> {
+        let malformed = sse_frame(
+            &serde_json::json!({
+                "@odata.type": "#Event.v1_6_0.Event",
+                "Events": [{"MessageId": 42}]
+            })
+            .to_string(),
+        );
+        let valid_records = serde_json::json!([
+            {
+                "@odata.id": "/redfish/v1/EventService/SSE#/Events/1",
+                "MemberId": "1",
+                "EventType": "Alert",
+                "MessageId": "ResourceEvent.1.2.ResourceRemoved",
+                "MessageSeverity": "OK"
+            }
+        ]);
+        let valid = event_frame(&valid_records);
+
+        let server = TestSseServer::start_sse(
+            sse_lifecycle_responses(),
+            5,
+            vec![malformed, valid],
+            SseEnd::Clean,
+        )
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let mut stream = gateway
+            .open_event_stream(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                EndpointId::generate(),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        let event = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("expected the event after the malformed one"))??;
+        assert_eq!(
+            event.event().message_id().as_str(),
+            "ResourceEvent.1.2.ResourceRemoved",
+            "a malformed event must be dropped without ending the stream"
+        );
+        assert!(stream.next().await.is_none());
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_an_abruptly_interrupted_stream_as_reconnectable()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestSseServer::start_sse(
+            sse_lifecycle_responses(),
+            5,
+            vec![{
+                let records = serde_json::json!([
+                {
+                    "@odata.id": "/redfish/v1/EventService/SSE#/Events/1",
+                    "MemberId": "1",
+                    "EventType": "Alert",
+                    "MessageId": "ResourceEvent.1.2.ResourceRemoved",
+                    "MessageSeverity": "OK"
+                }
+                ]);
+                event_frame(&records)
+            }],
+            SseEnd::Abrupt,
+        )
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let mut stream = gateway
+            .open_event_stream(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                EndpointId::generate(),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        let event = stream
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("expected the event before the interruption"))??;
+        assert_eq!(
+            event.event().message_id().as_str(),
+            "ResourceEvent.1.2.ResourceRemoved"
+        );
+        assert!(
+            matches!(
+                stream.next().await,
+                Some(Err(EventStreamError::Reconnectable(_)))
+            ),
+            "an EOF before the terminating chunk is a transport failure, not a clean end"
+        );
+        assert!(stream.next().await.is_none());
+        // The terminal phase deleted the Session even though the stream
+        // failed, so the reconnect loop starts from a clean slate.
+        let requests = server.finish_all().await?;
+        assert_session_requests(
+            &requests,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/EventService",
+                "/redfish/v1/EventService/SSE",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_sse_framing_decode_failures_as_reconnectable() -> Result<(), Box<dyn Error>>
+    {
+        // A line without a `:` is invalid SSE framing; the upstream decoder
+        // terminates the stream with `SseStreamError`.
+        let malformed_framing =
+            b"data: {\"@odata.type\":\"#Event.v1_6_0.Event\",\"Events\":[]}\r\nno-colon-line\r\n\r\n"
+                .to_vec();
+        let server = TestSseServer::start_sse(
+            sse_lifecycle_responses(),
+            5,
+            vec![malformed_framing],
+            SseEnd::Clean,
+        )
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let mut stream = gateway
+            .open_event_stream(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                EndpointId::generate(),
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert!(
+            matches!(
+                stream.next().await,
+                Some(Err(EventStreamError::Reconnectable(_)))
+            ),
+            "an undecodable SSE stream is a reconnectable failure, not a terminal one"
+        );
+        assert!(stream.next().await.is_none());
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_an_oversized_sse_event_as_terminal() {
+        // The 1 MiB per-event budget is a compiled upstream default that no
+        // gateway configuration can change, so an event that exceeds it is
+        // deterministic for the endpoint: every reconnect reproduces the
+        // same refusal, and a reconnect loop would churn instead of
+        // recovering. The classification must therefore be terminal, not
+        // reconnectable.
+        let oversized = nv_redfish::Error::Bmc(BmcError::SseEventTooLarge { limit: 1024 * 1024 });
+
+        assert!(
+            matches!(
+                classify_event_stream_error(oversized),
+                EventStreamError::Terminal(RedfishServiceRootError::Upstream(
+                    nv_redfish::Error::Bmc(BmcError::SseEventTooLarge { .. })
+                ))
+            ),
+            "an event over the fixed budget must terminate the stream, never prompt a reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_the_session_when_the_stream_is_cancelled() -> Result<(), Box<dyn Error>> {
+        let server =
+            TestSseServer::start_sse(sse_lifecycle_responses(), 5, Vec::new(), SseEnd::HoldOpen)
+                .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let cancel = CancellationToken::new();
+
+        let mut stream = gateway
+            .open_event_stream(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                EndpointId::generate(),
+                cancel.clone(),
+            )
+            .await?;
+
+        cancel.cancel();
+        assert!(
+            timeout(Duration::from_secs(5), stream.next())
+                .await?
+                .is_none(),
+            "a cancelled stream must reach its terminal state promptly"
+        );
+        drop(stream);
+        // The terminal phase deleted the Session despite the stream having
+        // produced nothing: the mock's SSE connection saw the client close,
+        // and the Session DELETE arrived on a fresh connection.
+        let requests = server.finish_all().await?;
+        assert_session_requests(
+            &requests,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/EventService",
+                "/redfish/v1/EventService/SSE",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_event_stream_open_failures() -> Result<(), Box<dyn Error>> {
+        let expected_paths = [
+            "/redfish/v1",
+            "/redfish/v1/SessionService",
+            "/redfish/v1/SessionService/Sessions",
+            "/redfish/v1/SessionService/Sessions",
+            "/redfish/v1/EventService",
+            "/redfish/v1/EventService/SSE",
+            "/redfish/v1/SessionService/Sessions/1",
+        ];
+        let credentials = (
+            CredentialUsername::parse("admin")?,
+            SecretString::from("password"),
+        );
+
+        // A 5xx on the SSE request is transient: reopening may succeed.
+        let transient = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", EVENT_SERVICE_WITH_SSE_BODY),
+                ("500 Internal Server Error", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(transient.certificate.clone())?;
+        let trust = system_ca_trust(&transient.certificate)?;
+        assert!(
+            matches!(
+                gateway
+                    .open_event_stream(
+                        &transient.address,
+                        &trust,
+                        &credentials.0,
+                        &credentials.1,
+                        EndpointId::generate(),
+                        CancellationToken::new(),
+                    )
+                    .await,
+                Err(EventStreamOpenError::Reconnectable(_))
+            ),
+            "a 5xx SSE response is a reconnectable open failure"
+        );
+        assert_session_requests(&transient.finish_all().await?, &expected_paths)?;
+
+        // A 403 on the SSE request is an authorization decision: retrying
+        // with the same account cannot succeed.
+        let forbidden = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", EVENT_SERVICE_WITH_SSE_BODY),
+                ("403 Forbidden", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(forbidden.certificate.clone())?;
+        let trust = system_ca_trust(&forbidden.certificate)?;
+        assert!(
+            matches!(
+                gateway
+                    .open_event_stream(
+                        &forbidden.address,
+                        &trust,
+                        &credentials.0,
+                        &credentials.1,
+                        EndpointId::generate(),
+                        CancellationToken::new(),
+                    )
+                    .await,
+                Err(EventStreamOpenError::Terminal(_))
+            ),
+            "a 403 SSE response is a terminal open failure"
+        );
+        // Both failures deleted the Session created for the failed open.
+        assert_session_requests(&forbidden.finish_all().await?, &expected_paths)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_open_a_stream_without_an_sse_surface() -> Result<(), Box<dyn Error>> {
+        // No EventService link on the Service Root: nothing to stream.
+        let without_event_service = TestRedfishServer::start_raw_sequence(
+            session_lifecycle_sequence(CORE_SERVICE_ROOT_BODY),
+        )
+        .await?;
+        let gateway = gateway_with_root(without_event_service.certificate.clone())?;
+        let trust = system_ca_trust(&without_event_service.certificate)?;
+        assert!(
+            matches!(
+                gateway
+                    .open_event_stream(
+                        &without_event_service.address,
+                        &trust,
+                        &CredentialUsername::parse("admin")?,
+                        &SecretString::from("password"),
+                        EndpointId::generate(),
+                        CancellationToken::new(),
+                    )
+                    .await,
+                Err(EventStreamOpenError::EventServiceNotAdvertised)
+            ),
+            "a root without EventService must refuse the stream, not guess a path"
+        );
+        // The Session created before the capability check was deleted.
+        assert_session_requests(
+            &without_event_service.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
+
+        // EventService exists but exposes no ServerSentEventUri.
+        let without_sse_uri = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", EVENT_SERVICE_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(without_sse_uri.certificate.clone())?;
+        let trust = system_ca_trust(&without_sse_uri.certificate)?;
+        assert!(
+            matches!(
+                gateway
+                    .open_event_stream(
+                        &without_sse_uri.address,
+                        &trust,
+                        &CredentialUsername::parse("admin")?,
+                        &SecretString::from("password"),
+                        EndpointId::generate(),
+                        CancellationToken::new(),
+                    )
+                    .await,
+                Err(EventStreamOpenError::ServerSentEventsUnavailable)
+            ),
+            "an EventService without an SSE URI must refuse the stream"
+        );
+        let requests = without_sse_uri.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].starts_with(b"DELETE /redfish/v1/SessionService/Sessions/1"));
+        Ok(())
+    }
+
     fn session_lifecycle_sequence(service_root_body: &str) -> Vec<Vec<u8>> {
         let mut responses = vec![
             http_response("200 OK", service_root_body),
@@ -15196,6 +16460,160 @@ mod tests {
             requests.push(request);
         }
         Ok(requests)
+    }
+
+    /// How a mock SSE connection ends.
+    #[derive(Clone, Copy)]
+    enum SseEnd {
+        /// Send the terminating `0` chunk: the client observes a clean end.
+        Clean,
+        /// Close without the terminating chunk: the client's chunked
+        /// decoder fails, which is how a mid-stream network drop is
+        /// observed.
+        Abrupt,
+        /// Keep the connection open until the client closes it (used by
+        /// cancellation tests).
+        HoldOpen,
+    }
+
+    /// A TLS test server that streams SSE frames on one connection.
+    ///
+    /// The `sse_index`-th connection (0-based, in client request order)
+    /// answers with a chunked `text/event-stream` response carrying `frames`
+    /// and ending per `end`; every other connection serves one `responses`
+    /// entry with `Connection: close`, exactly like `TestRedfishServer`.
+    struct TestSseServer {
+        address: EndpointAddress,
+        certificate: CertificateDer<'static>,
+        task: JoinHandle<Result<Vec<Vec<u8>>, io::Error>>,
+    }
+
+    impl TestSseServer {
+        async fn start_sse(
+            responses: Vec<Vec<u8>>,
+            sse_index: usize,
+            frames: Vec<Vec<u8>>,
+            end: SseEnd,
+        ) -> Result<Self, Box<dyn Error>> {
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed([String::from("localhost")])?;
+            let certificate = cert.der().clone();
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], key)?;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+            let socket = listener.local_addr()?;
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let task = tokio::spawn(run_sse_server(
+                listener, acceptor, responses, sse_index, frames, end,
+            ));
+            Ok(Self {
+                address: endpoint_address(socket, "localhost")?,
+                certificate,
+                task,
+            })
+        }
+
+        async fn finish_all(self) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+            Ok(self.task.await??)
+        }
+    }
+
+    async fn run_sse_server(
+        listener: TcpListener,
+        acceptor: TlsAcceptor,
+        responses: Vec<Vec<u8>>,
+        sse_index: usize,
+        frames: Vec<Vec<u8>>,
+        end: SseEnd,
+    ) -> Result<Vec<Vec<u8>>, io::Error> {
+        let total_connections = responses.len() + 1;
+        let mut responses = responses.into_iter();
+        let mut requests = Vec::with_capacity(total_connections);
+        for connection in 0..total_connections {
+            let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
+            let Ok(mut stream) = timeout(Duration::from_secs(5), acceptor.accept(tcp))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
+            else {
+                requests.push(Vec::new());
+                continue;
+            };
+            let request = read_request(&mut stream).await?;
+            requests.push(request);
+            if connection == sse_index {
+                write_sse_response(&mut stream, &frames, end).await?;
+            } else {
+                let Some(response) = responses.next() else {
+                    // The response plan is exhausted; close the connection so
+                    // the client observes a clean EOF instead of a hang.
+                    stream.shutdown().await?;
+                    continue;
+                };
+                if response.is_empty() {
+                    // An empty response encodes a dropped connection, like
+                    // `run_server_sequence`.
+                    continue;
+                }
+                stream.write_all(&response).await?;
+                stream.shutdown().await?;
+            }
+        }
+        Ok(requests)
+    }
+
+    /// Writes one chunked `text/event-stream` response and ends it per
+    /// `end`.
+    ///
+    /// Mid-stream read and write failures are tolerated: they are expected
+    /// whenever the client aborts the stream (cancellation and abrupt-drop
+    /// tests), so the server task reports the captured requests instead of
+    /// the client's close.
+    async fn write_sse_response(
+        stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        frames: &[Vec<u8>],
+        end: SseEnd,
+    ) -> Result<(), io::Error> {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await?;
+        for frame in frames {
+            let header = format!("{:x}\r\n", frame.len());
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(frame).await?;
+            stream.write_all(b"\r\n").await?;
+        }
+        match end {
+            SseEnd::Clean => {
+                stream.write_all(b"0\r\n\r\n").await?;
+                stream.shutdown().await?;
+            }
+            SseEnd::Abrupt => {
+                let _ = stream.shutdown().await;
+            }
+            SseEnd::HoldOpen => {
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "test SSE hold-open")
+                        })??;
+                    if bytes == 0 {
+                        break;
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
+        }
+        Ok(())
     }
 
     async fn read_request(
