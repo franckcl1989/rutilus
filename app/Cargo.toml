@@ -12,6 +12,7 @@ console.workspace = true
 rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-infra-redfish.workspace = true
+rutilus-operation-engine.workspace = true
 rutilus-persistence.workspace = true
 rutilus-platform.workspace = true
 rutilus-security.workspace = true

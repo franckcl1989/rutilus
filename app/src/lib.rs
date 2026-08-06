@@ -2,6 +2,7 @@
 
 mod initialization_runtime;
 mod onboarding_runtime;
+mod scheduler;
 mod standalone_runtime;
 
 pub use initialization_runtime::{

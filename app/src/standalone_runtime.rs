@@ -15,18 +15,24 @@ use rutilus_application::{
     Clock, CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
     CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
     EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, TlsIdentityProbe,
+    OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceObservation, StoredCapability, TaskMonitor, TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, AuditEvent, Credential, CredentialId, CredentialVersionId, DeploymentPosture,
-    Endpoint, EndpointCapabilityObservation, EndpointId, ResourceSnapshot,
+    Endpoint, EndpointCapabilityObservation, EndpointId, Operation, OperationId, OperationState,
+    ResourceSnapshot,
 };
-use rutilus_infra_redfish::{NV_REDFISH_DEVELOPMENT_BASELINE, RedfishGateway, TlsProbeInitError};
+use rutilus_infra_redfish::{
+    NV_REDFISH_DEVELOPMENT_BASELINE, RedfishCommandExecutor, RedfishGateway, TlsProbeInitError,
+};
+use rutilus_operation_engine::{
+    BoundaryFuture as OperationBoundaryFuture, OperationEngine, OperationStore,
+};
 use rutilus_persistence::{
     AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
     EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
-    NewCredential, OpenStoreError, SqliteStore,
+    NewCredential, OpenStoreError, OperationRepositoryError, SqliteStore,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
@@ -42,7 +48,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
 
-use crate::{ActiveCredentialResolverError, StandaloneUnlock, SystemClock};
+use crate::{ActiveCredentialResolverError, StandaloneUnlock, SystemClock, scheduler};
 
 /// Defensive upper bound for the in-memory recent-audit tail served by the
 /// Standalone console until persistence exposes a bounded listing query.
@@ -280,6 +286,50 @@ impl CapabilityQueryRepository for StandaloneState {
             &self.store,
             endpoint_id,
         )
+    }
+}
+
+impl OperationStore for StandaloneState {
+    type Error = OperationRepositoryError;
+
+    /// Delegates the operation lifecycle to the same `SqliteStore` that owns
+    /// every other aggregate, so the Web layer's operation submission and
+    /// listing paths (which compose the `OperationStore` boundary of the
+    /// product-services bundle) and the local scheduling loop always observe
+    /// one authoritative record.
+    fn create_operation<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        <SqliteStore as OperationStore>::create_operation(&self.store, operation)
+    }
+
+    fn find_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
+        <SqliteStore as OperationStore>::find_operation(&self.store, operation_id)
+    }
+
+    fn apply_transition(
+        &self,
+        operation_id: OperationId,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        <SqliteStore as OperationStore>::apply_transition(
+            &self.store,
+            operation_id,
+            new_state,
+            occurred_at,
+        )
+    }
+
+    fn list_operations(
+        &self,
+        state: Option<OperationState>,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        <SqliteStore as OperationStore>::list_operations(&self.store, state)
     }
 }
 
@@ -532,6 +582,14 @@ where
 /// Opens an initialized instance, serves until Ctrl-C, closes `SQLite`, and only
 /// then releases the process lock and master key.
 ///
+/// Besides the console, the foreground Standalone run starts the operation
+/// scheduling loop (design sections 13.3 and 13.6): one background task
+/// sweeps the persisted operations every [`scheduler::TICK_INTERVAL`] while
+/// the HTTP server serves. Both stop through one stop signal, drained in the
+/// design §7.8 order — scheduling first (the in-flight tick finishes), then
+/// the server — before `SQLite` closes, so no task ever touches the store
+/// after shutdown begins.
+///
 /// # Errors
 ///
 /// Returns [`StandaloneExecutionError`] while preserving both server and close
@@ -547,14 +605,149 @@ pub async fn run_initialized_standalone(
     let instance = StandaloneInstance::open(paths, unlock)
         .await
         .map_err(StandaloneExecutionError::Open)?;
-    let services = Arc::clone(&instance.state);
-    let run_result = run_standalone(options, services, Arc::new(gateway), SystemClock).await;
+    let gateway = Arc::new(gateway);
+    let run_result = async {
+        let binding = StandaloneBinding::bind().await?;
+        // One stop signal stops the scheduler and drains the server in
+        // order; the loop task owns its own Arc clones of the authenticated
+        // state and the gateway, so it is `'static` and spawnable.
+        let (stop_signal, stop_watch) = scheduler::StopSignal::new();
+        let scheduler = tokio::spawn(run_operation_scheduler(
+            stop_watch.clone(),
+            Arc::clone(&instance.state),
+            gateway.clone(),
+        ));
+        run_standalone_with_scheduler(
+            binding,
+            options,
+            Arc::clone(&instance.state),
+            gateway,
+            stop_watch,
+            stop_signal,
+            scheduler,
+        )
+        .await
+    }
+    .await;
     let close_result = instance.close().await;
     match (run_result, close_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(source), Ok(())) => Err(StandaloneExecutionError::Run(source)),
         (Ok(()), Err(source)) => Err(StandaloneExecutionError::Close(source)),
         (Err(run), Err(close)) => Err(StandaloneExecutionError::RunAndClose { run, close }),
+    }
+}
+
+/// Assembles the operation scheduling loop over the authenticated Standalone
+/// state and runs it until the stop watch fires.
+///
+/// # Why the composition lives here
+///
+/// The loop's executor and monitor compose the concrete `StandaloneState`
+/// (store, credential resolver, audit writer) and the `RedfishGateway`, and
+/// the state type is private to this module, so the composition cannot live
+/// in `scheduler`. The task owns its Arc clones, so the composition is
+/// `'static` and spawnable.
+async fn run_operation_scheduler(
+    stop: scheduler::StopWatch,
+    state: Arc<StandaloneState>,
+    gateway: Arc<RedfishGateway>,
+) {
+    // One gateway clone serves both the executor (dispatch + verification)
+    // and the monitor (Task reads + verification); every boundary resolves
+    // the endpoint and credential rows itself, so the loop never sees
+    // secrets or transport details (design section 7.2).
+    // Every boundary composes over `&StandaloneState` (the Arc itself
+    // implements no boundary): the state implements the credential resolver
+    // and audit writer roles next to the store's persistence roles.
+    let command_executor =
+        RedfishCommandExecutor::new(gateway.as_ref().clone(), &state.store, state.as_ref());
+    let executor = OperationExecutor::new(
+        &state.store,
+        &command_executor,
+        state.as_ref(),
+        SystemClock,
+        AuditActor::LocalOperator,
+        DeploymentPosture::Standalone,
+    );
+    let monitor = TaskMonitor::new(
+        &state.store,
+        &command_executor,
+        state.as_ref(),
+        AuditActor::LocalOperator,
+        DeploymentPosture::Standalone,
+    );
+    let engine = OperationEngine::new(&state.store);
+    scheduler::run(
+        stop,
+        engine,
+        executor,
+        monitor,
+        scheduler::TICK_INTERVAL,
+        SystemClock,
+    )
+    .await;
+}
+
+/// Serves the Standalone console with the operation scheduling loop until
+/// Ctrl-C, then drains in the design §7.8 order: stop scheduling first (the
+/// loop finishes its in-flight tick), drain the HTTP server, and only then
+/// return so `SQLite` can close.
+///
+/// # Errors
+///
+/// Returns [`StandaloneRunError`] when loopback binding, signal registration,
+/// or HTTP serving fails; the scheduler's own shutdown is always awaited
+/// before the store close.
+async fn run_standalone_with_scheduler(
+    binding: StandaloneBinding,
+    options: StandaloneRunOptions,
+    services: Arc<StandaloneState>,
+    gateway: Arc<RedfishGateway>,
+    stop_watch: scheduler::StopWatch,
+    stop_signal: scheduler::StopSignal,
+    mut scheduler: tokio::task::JoinHandle<()>,
+) -> Result<(), StandaloneRunError> {
+    // The server's graceful drain waits for the scheduler to have fully
+    // stopped first (design §7.8: stop scheduling, then serve): the channel
+    // is fired only after the loop task is joined.
+    let (scheduler_done_sender, scheduler_done_receiver) = oneshot::channel();
+    let server = binding.serve_until(options, services, gateway, SystemClock, async move {
+        let mut stop = stop_watch;
+        stop.stopped().await;
+        let _ = scheduler_done_receiver.await;
+    });
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            // The server stopped on its own (a serving failure): stop the
+            // scheduler too, and wait for its drain before closing the store.
+            stop_signal.signal();
+            drain_scheduler(&mut scheduler).await;
+            let _ = scheduler_done_sender.send(());
+            result.map_err(StandaloneRunError::Serve)
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(StandaloneRunError::Signal)?;
+            // §7.8: stop the scheduler first; its in-flight tick finishes.
+            stop_signal.signal();
+            drain_scheduler(&mut scheduler).await;
+            let _ = scheduler_done_sender.send(());
+            // The server's shutdown future resolves now; await its drain.
+            server.await.map_err(StandaloneRunError::Serve)
+        }
+    }
+}
+
+/// Waits for the scheduling-loop task and reports an unexpected failure.
+///
+/// The loop never returns an error — it exits only on the stop signal — so a
+/// `JoinError` means the task panicked or was cancelled, a programming
+/// defect worth surfacing but not a blocker for the `SQLite` close that
+/// follows.
+async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
+    if let Err(join_error) = scheduler.await {
+        eprintln!("The operation scheduling loop failed: {join_error}");
     }
 }
 
