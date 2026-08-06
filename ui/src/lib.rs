@@ -248,8 +248,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // three-line counts summary keeps its 0.1 wire shape. The
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, and the PcieDevice/Assembly/SoftwareInventory read
-            // families follow the same rule.
+            // surface, the PcieDevice/Assembly/SoftwareInventory read
+            // families, and the EventService/EventSubscription/
+            // TelemetryService/MetricDefinition/MetricReport/TaskService/Task
+            // service families follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
@@ -269,7 +271,14 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::HostInterface { .. }
             | CoreResourceDetailsResponse::PcieDevice { .. }
             | CoreResourceDetailsResponse::Assembly { .. }
-            | CoreResourceDetailsResponse::SoftwareInventory { .. } => {}
+            | CoreResourceDetailsResponse::SoftwareInventory { .. }
+            | CoreResourceDetailsResponse::EventService { .. }
+            | CoreResourceDetailsResponse::EventSubscription { .. }
+            | CoreResourceDetailsResponse::TelemetryService { .. }
+            | CoreResourceDetailsResponse::MetricDefinition { .. }
+            | CoreResourceDetailsResponse::MetricReport { .. }
+            | CoreResourceDetailsResponse::TaskService { .. }
+            | CoreResourceDetailsResponse::Task { .. } => {}
             CoreResourceDetailsResponse::System { .. } => counts.systems += 1,
             CoreResourceDetailsResponse::Chassis { .. } => counts.chassis += 1,
             CoreResourceDetailsResponse::Manager { .. } => counts.managers += 1,
@@ -351,6 +360,19 @@ fn card_facts(
         CoreResourceDetailsResponse::SoftwareInventory { .. } => {
             software_inventory_card_facts(resource)
         }
+        CoreResourceDetailsResponse::EventService { .. } => event_service_card_facts(resource),
+        CoreResourceDetailsResponse::EventSubscription { .. } => {
+            event_subscription_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::TelemetryService { .. } => {
+            telemetry_service_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::MetricDefinition { .. } => {
+            metric_definition_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::MetricReport { .. } => metric_report_card_facts(resource),
+        CoreResourceDetailsResponse::TaskService { .. } => task_service_card_facts(resource),
+        CoreResourceDetailsResponse::Task { .. } => task_card_facts(resource),
     }
 }
 
@@ -1033,6 +1055,213 @@ fn software_inventory_card_facts(
     );
     push_status_facts(&mut facts, status.as_ref());
     ("Software inventory", facts)
+}
+
+/// Facts for a §2.1 event-service card; the service-enabled flag renders as
+/// Yes/No and the resource-level status follows. The retry-policy fields
+/// stay out of the strictly projectable field set, so the card shows the
+/// service posture only.
+///
+/// The dispatcher guarantees this receives the `EventService` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn event_service_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::EventService {
+        service_enabled,
+        status,
+    } = resource
+    else {
+        return ("Event Service", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Service enabled",
+        service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Event Service", facts)
+}
+
+/// Facts for one subscription under the §2.1 `event-service` family; the
+/// destination, protocol, context, and event-type filters render exactly as
+/// published, so the card shows who receives which events and how.
+///
+/// The dispatcher guarantees this receives the `EventSubscription` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn event_subscription_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::EventSubscription {
+        destination,
+        protocol,
+        context,
+        event_types,
+        status,
+    } = resource
+    else {
+        return ("Event subscription", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Destination", destination.as_deref());
+    push_fact(&mut facts, "Protocol", protocol.as_deref());
+    push_fact(&mut facts, "Context", context.as_deref());
+    push_fact(
+        &mut facts,
+        "Event types",
+        event_types
+            .as_deref()
+            .map(|types| types.join(", "))
+            .as_deref(),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Event subscription", facts)
+}
+
+/// Facts for a §2.1 telemetry-service card; the compiled `TelemetryService`
+/// type exposes `ServiceEnabled` and the service-capacity fields, but the
+/// product defers them to the 0.4.0 telemetry iteration, so the card renders
+/// the resource-level status values only this round.
+///
+/// The dispatcher guarantees this receives the `TelemetryService` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn telemetry_service_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::TelemetryService { status } = resource else {
+        return ("Telemetry Service", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_status_facts(&mut facts, status.as_ref());
+    ("Telemetry Service", facts)
+}
+
+/// Facts for one metric definition under the §2.1 `telemetry-service` family;
+/// the units and the `MetricType` enumeration render as published, so the
+/// card shows what the metric measures and how.
+///
+/// The dispatcher guarantees this receives the `MetricDefinition` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn metric_definition_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::MetricDefinition { units, metric_type } = resource else {
+        return ("Metric definition", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Units", units.as_deref());
+    push_fact(&mut facts, "Metric type", metric_type.as_deref());
+    ("Metric definition", facts)
+}
+
+/// Facts for one metric report under the §2.1 `telemetry-service` family; the
+/// derived metric-values count stays numeric as published so the card renders
+/// the sample size without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `MetricReport` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn metric_report_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::MetricReport {
+        metric_values_count,
+    } = resource
+    else {
+        return ("Metric report", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_u64_fact(&mut facts, "Metric values", *metric_values_count);
+    ("Metric report", facts)
+}
+
+/// Facts for a §2.1 task-service card; the service-enabled flag renders as
+/// Yes/No, the completed-task overwrite policy stays the schema enumeration
+/// string, and the resource-level status follows.
+///
+/// The dispatcher guarantees this receives the `TaskService` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn task_service_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::TaskService {
+        service_enabled,
+        completed_task_overwrite_policy,
+        status,
+    } = resource
+    else {
+        return ("Task Service", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Service enabled",
+        service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_fact(
+        &mut facts,
+        "Completed task policy",
+        completed_task_overwrite_policy.as_deref(),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Task Service", facts)
+}
+
+/// Facts for one task under the §2.1 `task-service` family; the state and
+/// status enumeration strings, the numeric completion percentage, and the
+/// typed RFC 3339 timeline instants render as published, so the card shows
+/// the task progress without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `Task` variant; the fallback
+/// keeps a stable empty facts list instead of panicking if that contract is
+/// ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn task_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::Task {
+        task_state,
+        task_status,
+        percent_complete,
+        start_time,
+        end_time,
+    } = resource
+    else {
+        return ("Task", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Task state", task_state.as_deref());
+    push_fact(&mut facts, "Task status", task_status.as_deref());
+    push_u64_fact(&mut facts, "Percent complete", *percent_complete);
+    push_fact(
+        &mut facts,
+        "Start time",
+        start_time
+            .as_ref()
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        "End time",
+        end_time
+            .as_ref()
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .as_deref(),
+    );
+    ("Task", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -4135,7 +4364,14 @@ mod tests {
                             host_interface_resource(),
                             pcie_device_resource(),
                             assembly_resource(),
-                            software_inventory_resource()
+                            software_inventory_resource(),
+                            event_service_resource(),
+                            event_subscription_resource(),
+                            telemetry_service_resource(),
+                            metric_definition_resource(),
+                            metric_report_resource(),
+                            task_service_resource(),
+                            task_resource()
                         ]
                     }
                 }
@@ -4846,6 +5082,188 @@ mod tests {
         })
     }
 
+    fn event_service_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e6",
+                "odata_id": "/redfish/v1/EventService",
+                "odata_type": "#EventService.v1_12_0.EventService",
+                "etag": "W/\"event-service-1\""
+            },
+            "common": {
+                "id": "EventService",
+                "name": "Event Service",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "event_service",
+                "details": {
+                    "service_enabled": true,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn event_subscription_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e7",
+                "odata_id": "/redfish/v1/EventService/Subscriptions/1",
+                "odata_type": "#EventDestination.v1_16_0.EventDestination",
+                "etag": "W/\"subscription-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Subscription One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "event_subscription",
+                "details": {
+                    "destination": "https://subscriber.example.test/events",
+                    "protocol": "Redfish",
+                    "context": "Rack A",
+                    "event_types": ["Alert", "StatusChange"],
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn telemetry_service_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e8",
+                "odata_id": "/redfish/v1/TelemetryService",
+                "odata_type": "#TelemetryService.v1_4_0.TelemetryService",
+                "etag": null
+            },
+            "common": {
+                "id": "TelemetryService",
+                "name": "Telemetry Service",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "telemetry_service",
+                "details": {
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn metric_definition_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e9",
+                "odata_id": "/redfish/v1/TelemetryService/MetricDefinitions/1",
+                "odata_type": "#MetricDefinition.v1_3_5.MetricDefinition",
+                "etag": null
+            },
+            "common": {
+                "id": "1",
+                "name": "Inlet Temperature Definition",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "metric_definition",
+                "details": {
+                    "units": "Cel",
+                    "metric_type": "Numeric"
+                }
+            }
+        })
+    }
+
+    fn metric_report_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789ea",
+                "odata_id": "/redfish/v1/TelemetryService/MetricReports/1",
+                "odata_type": "#MetricReport.v1_5_2.MetricReport",
+                "etag": "W/\"report-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Inlet Temperature Report",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "metric_report",
+                "details": {
+                    "metric_values_count": 12
+                }
+            }
+        })
+    }
+
+    fn task_service_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789eb",
+                "odata_id": "/redfish/v1/TaskService",
+                "odata_type": "#TaskService.v1_3_0.TaskService",
+                "etag": null
+            },
+            "common": {
+                "id": "TaskService",
+                "name": "Task Service",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "task_service",
+                "details": {
+                    "service_enabled": true,
+                    "completed_task_overwrite_policy": "Oldest",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn task_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789ec",
+                "odata_id": "/redfish/v1/TaskService/Tasks/1",
+                "odata_type": "#Task.v1_7_4.Task",
+                "etag": "W/\"task-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Firmware Update Task",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "task",
+                "details": {
+                    "task_state": "Running",
+                    "task_status": "OK",
+                    "percent_complete": 42,
+                    "start_time": "2026-08-05T10:20:00Z",
+                    "end_time": null
+                }
+            }
+        })
+    }
+
     fn capability_inventory(
         states: &[Option<&str>],
     ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
@@ -4921,9 +5339,10 @@ mod tests {
         assert!(waiting.resources.is_empty());
         // The complete fixture tree carries every typed family: the 0.1
         // triad, the 0.2 configuration, storage/network, telemetry, and
-        // manager surfaces, plus the pcie-devices, assembly, and
-        // software-inventory read families.
-        assert_eq!(current.resources.len(), 23);
+        // manager surfaces, plus the pcie-devices, assembly,
+        // software-inventory, event, telemetry-service, and task read
+        // families.
+        assert_eq!(current.resources.len(), 30);
         let system = current
             .resources
             .iter()
@@ -6121,6 +6540,164 @@ mod tests {
         assert!(software_inventory.facts.contains(&ResourceFactProjection {
             label: "Release date",
             value: "2026-05-01T00:00:00Z".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_and_task_service_cards_render_family_facts() -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let event_service = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Event Service")
+            .ok_or("event service resource must exist")?;
+        assert_eq!(event_service.name, "Event Service");
+        assert_eq!(event_service.source, "/redfish/v1/EventService");
+        assert!(event_service.facts.contains(&ResourceFactProjection {
+            label: "Service enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(event_service.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        let subscription = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Event subscription")
+            .ok_or("event subscription resource must exist")?;
+        assert_eq!(subscription.name, "Subscription One");
+        assert_eq!(
+            subscription.source,
+            "/redfish/v1/EventService/Subscriptions/1"
+        );
+        assert!(subscription.facts.contains(&ResourceFactProjection {
+            label: "Destination",
+            value: "https://subscriber.example.test/events".to_owned(),
+        }));
+        assert!(subscription.facts.contains(&ResourceFactProjection {
+            label: "Protocol",
+            value: "Redfish".to_owned(),
+        }));
+        assert!(subscription.facts.contains(&ResourceFactProjection {
+            label: "Event types",
+            value: "Alert, StatusChange".to_owned(),
+        }));
+        let task_service = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Task Service")
+            .ok_or("task service resource must exist")?;
+        assert_eq!(task_service.name, "Task Service");
+        assert_eq!(task_service.source, "/redfish/v1/TaskService");
+        assert!(task_service.facts.contains(&ResourceFactProjection {
+            label: "Service enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(task_service.facts.contains(&ResourceFactProjection {
+            label: "Completed task policy",
+            value: "Oldest".to_owned(),
+        }));
+        let task = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Task")
+            .ok_or("task resource must exist")?;
+        assert_eq!(task.name, "Firmware Update Task");
+        assert_eq!(task.source, "/redfish/v1/TaskService/Tasks/1");
+        assert!(task.facts.contains(&ResourceFactProjection {
+            label: "Task state",
+            value: "Running".to_owned(),
+        }));
+        assert!(task.facts.contains(&ResourceFactProjection {
+            label: "Task status",
+            value: "OK".to_owned(),
+        }));
+        assert!(task.facts.contains(&ResourceFactProjection {
+            label: "Percent complete",
+            value: "42".to_owned(),
+        }));
+        assert!(task.facts.contains(&ResourceFactProjection {
+            label: "Start time",
+            value: "2026-08-05T10:20:00Z".to_owned(),
+        }));
+        assert_eq!(
+            current.resource_counts,
+            Some(ResourceCountsProjection {
+                systems: 1,
+                chassis: 1,
+                managers: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_service_cards_render_family_facts() -> Result<(), Box<dyn Error>> {
+        let current =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?)
+                .endpoint_cards()
+                .into_iter()
+                .find(|card| card.resource_counts.is_some())
+                .ok_or("current endpoint card must exist")?;
+
+        let telemetry_service = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Telemetry Service")
+            .ok_or("telemetry service resource must exist")?;
+        assert_eq!(telemetry_service.name, "Telemetry Service");
+        assert_eq!(telemetry_service.source, "/redfish/v1/TelemetryService");
+        assert!(telemetry_service.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        let definition = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Metric definition")
+            .ok_or("metric definition resource must exist")?;
+        assert_eq!(definition.name, "Inlet Temperature Definition");
+        assert_eq!(
+            definition.source,
+            "/redfish/v1/TelemetryService/MetricDefinitions/1"
+        );
+        assert!(definition.facts.contains(&ResourceFactProjection {
+            label: "Units",
+            value: "Cel".to_owned(),
+        }));
+        assert!(definition.facts.contains(&ResourceFactProjection {
+            label: "Metric type",
+            value: "Numeric".to_owned(),
+        }));
+        let report = current
+            .resources
+            .iter()
+            .find(|resource| resource.type_label == "Metric report")
+            .ok_or("metric report resource must exist")?;
+        assert_eq!(report.name, "Inlet Temperature Report");
+        assert_eq!(
+            report.source,
+            "/redfish/v1/TelemetryService/MetricReports/1"
+        );
+        assert!(report.facts.contains(&ResourceFactProjection {
+            label: "Metric values",
+            value: "12".to_owned(),
         }));
         assert_eq!(
             current.resource_counts,
