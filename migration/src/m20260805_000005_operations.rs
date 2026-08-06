@@ -6,6 +6,13 @@ use sea_orm_migration::prelude::*;
 /// execution tables (`operation_steps`, `remote_tasks`) and the event log
 /// (`operation_events`) are deliberately deferred to the execution-flow
 /// milestone, because nothing in this milestone runs or observes a step.
+///
+/// Revision note: the `command` column was added to this pre-release
+/// migration in place (the same way `resource_snapshots` was revised for its
+/// feature-code CHECK before 0.2.0 shipped — the audit confirmed that is
+/// acceptable before any release, because no database can already exist). An
+/// already-published migration would instead need a follow-up `ALTER TABLE`,
+/// which is how future schema additions to this table must be shipped.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -24,6 +31,13 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Operation::Source).string().not_null())
                     .col(ColumnDef::new(Operation::State).string().not_null())
+                    // The typed write command as serde JSON (§9.4
+                    // `TypedPayloadJson` rule). Deliberately no CHECK: the
+                    // command is a JSON document of an open, versioned type
+                    // that only the repository deserializes through the
+                    // domain type — the database never parses it, exactly like
+                    // `resource_snapshots.typed_payload_json`.
+                    .col(ColumnDef::new(Operation::Command).text().not_null())
                     .col(
                         ColumnDef::new(Operation::CreatedAt)
                             .timestamp_with_time_zone()
@@ -131,6 +145,7 @@ enum Operation {
     Id,
     Source,
     State,
+    Command,
     CreatedAt,
     UpdatedAt,
 }

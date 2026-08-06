@@ -26,6 +26,14 @@ const OPERATION_STATES: [&str; 9] = [
     "cancelled",
 ];
 
+/// A representative typed-command JSON document (§9.4).
+///
+/// The migration only guarantees the column stores and returns the text
+/// verbatim; the typed serde round trip is proven by the persistence
+/// repository tests against the real domain serialization, so this literal
+/// does not need to track the domain's exact output shape.
+const COMMAND_JSON: &str = r#"{"reset":{"reset_type":"graceful"}}"#;
+
 #[tokio::test]
 async fn operations_migration_preserves_aggregate_invariants() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
@@ -53,15 +61,26 @@ async fn verify_operation_constraints(
     now: OffsetDateTime,
 ) -> Result<(), Box<dyn Error>> {
     let operation_id = Uuid::now_v7();
+    let command = String::from(COMMAND_JSON);
     operation::ActiveModel {
         id: Set(operation_id),
         source: Set(String::from("standalone")),
         state: Set(String::from("queued")),
+        command: Set(command.clone()),
         created_at: Set(now),
         updated_at: Set(now),
     }
     .insert(database)
     .await?;
+    let stored_command = operation::Entity::find_by_id(operation_id)
+        .one(database)
+        .await?
+        .ok_or("inserted operation is missing")?
+        .command;
+    assert_eq!(
+        stored_command, command,
+        "the command column must store and return the JSON text verbatim"
+    );
     let first_target_id = Uuid::now_v7();
     for (target_id, endpoint_id) in [
         (first_target_id, Uuid::now_v7()),
@@ -83,6 +102,7 @@ async fn verify_operation_constraints(
             id: Set(Uuid::now_v7()),
             source: Set(String::from("standalone")),
             state: Set(String::from(state)),
+            command: Set(String::from(COMMAND_JSON)),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -96,6 +116,7 @@ async fn verify_operation_constraints(
         id: Set(Uuid::now_v7()),
         source: Set(String::from("cluster")),
         state: Set(String::from("queued")),
+        command: Set(String::from(COMMAND_JSON)),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -108,6 +129,7 @@ async fn verify_operation_constraints(
         id: Set(Uuid::now_v7()),
         source: Set(String::from("standalone")),
         state: Set(String::from("pending")),
+        command: Set(String::from(COMMAND_JSON)),
         created_at: Set(now),
         updated_at: Set(now),
     }
