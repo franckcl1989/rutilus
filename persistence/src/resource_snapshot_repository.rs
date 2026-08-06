@@ -973,6 +973,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_and_reads_back_power_thermal_sensors_and_controls_features()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::Power,
+                "/redfish/v1/Chassis/1/Power",
+                "Power",
+            )?
+            .with_odata_type(ResourceODataType::parse("#Power.v1_17_0.Power")?),
+            observation(
+                ResourceFeature::Thermal,
+                "/redfish/v1/Chassis/1/Thermal",
+                "Thermal",
+            )?,
+            observation(
+                ResourceFeature::Sensors,
+                "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                "Chassis Inlet Temperature",
+            )?,
+            observation(
+                ResourceFeature::Controls,
+                "/redfish/v1/Chassis/1/Controls/FanDuty",
+                "Chassis Fan Duty",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"control-fan-1\"")?),
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let power = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::Power)
+            .ok_or("power snapshot is missing")?;
+        assert_eq!(power.odata_id().as_str(), "/redfish/v1/Chassis/1/Power");
+        assert_eq!(
+            power.odata_type().map(ResourceODataType::as_str),
+            Some("#Power.v1_17_0.Power")
+        );
+        assert!(power.payload().as_str().contains("Power"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for (feature, expected) in [
+            (ResourceFeature::Power, 1),
+            (ResourceFeature::Thermal, 1),
+            (ResourceFeature::Sensors, 1),
+            (ResourceFeature::Controls, 1),
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                expected,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::Power
+                | ResourceFeature::Thermal
+                | ResourceFeature::Sensors
+                | ResourceFeature::Controls
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
