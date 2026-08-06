@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "persistence", "platform", "security", "test-support", "ui", "web"]
+members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "operation-engine", "persistence", "platform", "security", "test-support", "ui", "web"]
 default-members = ["app"]
 resolver = "3"
 
@@ -33,6 +33,7 @@ rutilus-application = { path = "application", version = "0.1.0" }
 rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
 rutilus-entity = { path = "entity", version = "0.1.0" }
 rutilus-migration = { path = "migration", version = "0.1.0" }
+rutilus-operation-engine = { path = "operation-engine", version = "0.1.0" }
 rutilus-persistence = { path = "persistence", version = "0.1.0" }
 rutilus-platform = { path = "platform", version = "0.1.0" }
 rutilus-security = { path = "security", version = "0.1.0" }
