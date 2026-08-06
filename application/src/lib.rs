@@ -2,6 +2,7 @@
 
 mod audit_log;
 mod capability_query;
+mod command_executor;
 mod credential_management;
 mod endpoint_csv;
 mod endpoint_csv_import;
@@ -11,11 +12,16 @@ mod endpoint_onboarding;
 mod endpoint_refresh;
 mod endpoint_resources;
 mod endpoint_trust;
+mod operation_executor;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
+};
+pub use command_executor::{
+    CommandExecutor, CommandOutcome, CommandVerifier, DispatchVerdict, DispatchVerdictClassifier,
+    VerificationVerdict,
 };
 pub use credential_management::{
     CREDENTIAL_SECRET_MAX_BYTES, CredentialCreation, CredentialCreationError,
@@ -59,3 +65,4 @@ pub use endpoint_trust::{
     EndpointTrustExpectationError, EndpointTrustTimelineError, PendingEndpointTrust,
     SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe, TrustedEndpoint,
 };
+pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
