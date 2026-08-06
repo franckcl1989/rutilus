@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+time = { workspace = true, features = ["serde", "serde-well-known"] }
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 serde_json.workspace = true

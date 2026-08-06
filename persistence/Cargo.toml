@@ -16,7 +16,7 @@ sea-orm-migration.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 secrecy.workspace = true
