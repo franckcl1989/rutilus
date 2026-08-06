@@ -13,6 +13,7 @@ mod endpoint_refresh;
 mod endpoint_resources;
 mod endpoint_trust;
 mod operation_executor;
+mod task_monitor;
 
 pub use audit_log::{AuditEventWriter, AuditRecordError};
 pub use capability_query::{
@@ -66,3 +67,6 @@ pub use endpoint_trust::{
     SystemCaEvaluation, TlsIdentityObservation, TlsIdentityProbe, TrustedEndpoint,
 };
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
+pub use task_monitor::{
+    MonitorAuditStage, TaskMonitor, TaskMonitorError, TaskObservation, TaskPoll, TaskReader,
+};

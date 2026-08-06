@@ -1,39 +1,55 @@
-//! The write-side Redfish boundary contract (design sections 13.3 and 13.5).
+//! The write-side Redfish boundary contract (design sections 13.3, 13.5, and
+//! 13.6).
 //!
 //! [`CommandExecutor`] dispatches one typed write to one endpoint and handles
-//! the synchronous response; [`CommandVerifier`] re-reads the target after the
-//! write and checks the expected result (design section 13.3 steps 7 and
-//! 9-10). `rutilus-infra-redfish` implements both contracts on its gateway;
-//! the operation scheduler in `operation_executor` consumes only these
+//! the response; [`CommandVerifier`] re-reads the target after the write and
+//! checks the expected result (design section 13.3 steps 7 and 9-10).
+//! `rutilus-infra-redfish` implements both contracts on its gateway; the
+//! operation scheduler in `operation_executor` consumes only these
 //! boundaries, so the gateway's `nv-redfish` and transport details never leak
 //! into the use case (design section 7.2).
 //!
-//! The asynchronous Task path (a `202` response, design section 13.6) is a
-//! later iteration: this cut deliberately defines no `TaskStarted` outcome,
-//! and [`CommandExecutor`] documents how an implementer must surface a `202`
-//! until Task monitoring exists. No empty shells are stubbed for the Task
-//! machinery.
+//! The asynchronous Task branch (a `202` response, design section 13.6) is
+//! handled as [`CommandOutcome::AsyncTaskAccepted`]: the scheduler persists
+//! the accepted Task and moves the operation to `WaitingRemote`, where the
+//! [`crate::TaskMonitor`] resumes it. An implementation that does not
+//! surface the async outcome must keep reporting a `202` as an error whose
+//! verdict is [`DispatchVerdict::OutcomeUnknown`] — the BMC accepted the
+//! write and its outcome cannot be proven (§13.5), and the operation is
+//! never blindly re-dispatched.
 
 use std::error::Error;
 
 use rutilus_domain::{EndpointId, RedfishCommand};
+use rutilus_operation_engine::TaskUri;
 
 use crate::BoundaryFuture;
 
-/// The synchronous outcome of one dispatched write (design section 13.3 step
-/// 7, step 8 synchronous branch).
+/// The outcome of one dispatched write (design section 13.3 step 7, step 8).
 ///
-/// HTTP `200`/`201`/`204` alone never equal business success (design section
-/// 13.3): `Accepted` means the synchronous response was received AND fully
-/// handled by the implementation, and the target still must be verified
-/// (steps 9-10).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// HTTP `200`/`201`/`202`/`204` alone never equal business success (design
+/// section 13.3): `Accepted` means the synchronous response was received AND
+/// fully handled by the implementation, and the target still must be verified
+/// (steps 9-10); `AsyncTaskAccepted` means the BMC returned `202` and the
+/// result is only observable through the accepted Task (design section 13.6).
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutcome {
     /// The BMC accepted the write synchronously — a `200`/`201`/`204`
     /// response was received and fully handled — and the target must now be
     /// re-read and verified (design section 13.3 steps 9-10). Maps to
     /// [`rutilus_domain::OperationEvent::ExecutionAccepted`].
     Accepted,
+    /// The BMC accepted the write as an asynchronous Task — a `202` response
+    /// whose `Location` names the Task (design section 13.3 step 8 async
+    /// branch). The write may or may not eventually complete; the product
+    /// persists the Task location and polls it (design section 13.6). The
+    /// location is an exact identifier validated before it reaches this
+    /// boundary, never a vendor URL the product follows (§15.6). Maps to
+    /// [`rutilus_domain::OperationEvent::RemoteTaskStarted`].
+    AsyncTaskAccepted {
+        /// The `Location` of the accepted Task, to be persisted and polled.
+        task_location: TaskUri,
+    },
     /// The BMC provably refused the write: an error response, a permission
     /// denial, or a capability unavailable at dispatch time. The write was
     /// not executed and the product can account for the outcome. Maps to
@@ -57,10 +73,11 @@ pub enum DispatchVerdict {
     /// for the outcome, so the operation is recorded `Failed`.
     NotExecuted,
     /// The write may already have been accepted by the BMC: a timeout after
-    /// sending, a connection dropped mid-response, a lost response, or an
-    /// accepted asynchronous Task this build does not track yet. Only a
-    /// re-read can decide (design section 13.5), so the operation moves to the
-    /// explicit terminal state [`rutilus_domain::OperationState::Unknown`].
+    /// sending, a connection dropped mid-response, a lost response, or a `202`
+    /// Task acceptance surfaced as an error by an implementation that does
+    /// not expose [`CommandOutcome::AsyncTaskAccepted`]. Only a re-read can
+    /// decide (design section 13.5), so the operation moves to the explicit
+    /// terminal state [`rutilus_domain::OperationState::Unknown`].
     OutcomeUnknown,
 }
 
@@ -87,16 +104,17 @@ pub trait DispatchVerdictClassifier: Error + Send + Sync + 'static {
 ///
 /// - [`CommandOutcome::Accepted`] — the BMC completed the write synchronously
 ///   (`200`/`201`/`204` fully handled); the target must now be verified.
+/// - [`CommandOutcome::AsyncTaskAccepted`] — the BMC returned `202` and the
+///   write's result is only observable through the accepted Task; the
+///   scheduler persists the Task location and polls it (design section 13.6).
 /// - [`CommandOutcome::Rejected`] — the BMC provably refused the write; it
 ///   was not executed.
 ///
-/// A `202` (Task accepted) is deliberately NOT [`CommandOutcome::Accepted`]
-/// in this iteration: Task monitoring (design section 13.6) is the next
-/// iteration's work, so this contract defines no `TaskStarted` outcome yet.
-/// An implementation that receives `202` must surface it as an error whose
-/// verdict is [`DispatchVerdict::OutcomeUnknown`] — the BMC accepted the
-/// write and the product cannot yet verify its result. The Task iteration
-/// replaces that mapping with a `TaskStarted` outcome.
+/// An implementation that does not surface a `202` as
+/// [`CommandOutcome::AsyncTaskAccepted`] must keep reporting it as an error
+/// whose verdict is [`DispatchVerdict::OutcomeUnknown`] — the BMC accepted
+/// the write and the outcome cannot be proven (design section 13.5) — never
+/// as `Accepted`.
 ///
 /// # Errors
 ///

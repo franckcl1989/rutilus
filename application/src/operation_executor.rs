@@ -1,21 +1,25 @@
-//! The synchronous command execution scheduler (design sections 13.3 and
-//! 13.5).
+//! The command execution scheduler (design sections 13.3, 13.5, and 13.6).
 //!
-//! [`OperationExecutor`] drives one persisted operation from `Queued` to a
-//! terminal state through the §13.2 state machine. It performs the first cut
-//! of the §13.3 pre-flight checks (steps 1-2: endpoint existence and
+//! [`OperationExecutor`] drives one persisted operation from `Queued` toward
+//! a terminal state through the §13.2 state machine. It performs the first
+//! cut of the §13.3 pre-flight checks (steps 1-2: endpoint existence and
 //! capability availability), dispatches the typed command through the
-//! [`CommandExecutor`] boundary (step 7), re-reads and verifies the target
-//! through the [`CommandVerifier`] boundary (steps 9-10), and records the
-//! §16.3 audit lifecycle (start + terminal fact) through
-//! [`AuditEventWriter`].
+//! [`CommandExecutor`] boundary (step 7), and handles the §13.3 step 8
+//! branch that the response selects:
 //!
-//! The asynchronous Task path (`202` responses,
-//! [`OperationState::WaitingRemote`]) is deliberately absent from this cut:
-//! Task monitoring (design section 13.6) is the next iteration's work. The
-//! boundary contracts already document how a `202` must surface until then
-//! (see [`CommandExecutor`]), and no empty shells are stubbed for the Task
-//! machinery.
+//! - synchronous acceptance (`Accepted`) is re-read and verified through the
+//!   [`CommandVerifier`] boundary (steps 9-10) to a terminal state;
+//! - a `202` ([`CommandOutcome::AsyncTaskAccepted`]) is persisted as a
+//!   [`RemoteTask`] observation row (design section 13.6) and the operation
+//!   moves to `WaitingRemote`, where the [`crate::TaskMonitor`] resumes it
+//!   until the Task reaches a terminal state and verification finishes;
+//! - a provable refusal (`Rejected`) and every classified dispatch error end
+//!   the operation in `Failed` or `Unknown` (design section 13.5).
+//!
+//! The §16.3 audit start fact is recorded here before any dispatch; the
+//! terminal fact of a synchronous execution is recorded here too, while the
+//! terminal fact of an asynchronous execution is recorded by the Task
+//! monitor once the Task completes (§13.6 recovery verification).
 
 use std::{error::Error, fmt};
 
@@ -26,7 +30,9 @@ use rutilus_domain::{
     EndpointCapability, EndpointId, Operation, OperationEvent, OperationId, OperationState,
     ProductPermission, RedfishCommand,
 };
-use rutilus_operation_engine::{EngineError, OperationEngine, OperationStore};
+use rutilus_operation_engine::{
+    EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -39,27 +45,29 @@ use crate::{
 
 /// The concrete failure type of one execution attempt.
 ///
-/// The generic parameters are the six boundary error types, in
+/// The generic parameters are the seven boundary error types, in
 /// [`ExecutorError`] order: operation store, endpoint lookup, capability
-/// query, command dispatch, verification, and audit. Keeping them separate
-/// preserves every source chain, exactly like the refresh use case's error.
+/// query, remote-task store, command dispatch, verification, and audit.
+/// Keeping them separate preserves every source chain, exactly like the
+/// refresh use case's error.
 type ExecutorErrorOf<Store, Gateway, Audit> = ExecutorError<
     <Store as OperationStore>::Error,
     <Store as EndpointRefreshRepository>::Error,
     <Store as CapabilityQueryRepository>::Error,
+    <Store as RemoteTaskStore>::Error,
     <Gateway as CommandExecutor>::Error,
     <Gateway as CommandVerifier>::Error,
     <Audit as AuditEventWriter>::Error,
 >;
 
-/// Drives one persisted operation through the synchronous execution flow.
+/// Drives one persisted operation through the execution flow.
 ///
-/// `Store` stays one constructor parameter although it plays three roles —
-/// operation lifecycle, endpoint lookup, and capability ledger — because
-/// every runtime composes one `SqliteStore` implementing all three, exactly
-/// like the refresh use case's repository. `Gateway` implements both dispatch
-/// and verification on the same Redfish gateway object, and `Audit` appends
-/// the §16.3 lifecycle facts.
+/// `Store` stays one constructor parameter although it plays four roles —
+/// operation lifecycle, endpoint lookup, capability ledger, and remote-task
+/// observation rows — because every runtime composes one `SqliteStore`
+/// implementing all four, exactly like the refresh use case's repository.
+/// `Gateway` implements both dispatch and verification on the same Redfish
+/// gateway object, and `Audit` appends the §16.3 lifecycle facts.
 pub struct OperationExecutor<Store, Gateway, Audit, Time> {
     store: Store,
     gateway: Gateway,
@@ -71,7 +79,7 @@ pub struct OperationExecutor<Store, Gateway, Audit, Time> {
 
 impl<Store, Gateway, Audit, Time> OperationExecutor<Store, Gateway, Audit, Time>
 where
-    Store: OperationStore + EndpointRefreshRepository + CapabilityQueryRepository,
+    Store: OperationStore + EndpointRefreshRepository + CapabilityQueryRepository + RemoteTaskStore,
     Gateway: CommandExecutor + CommandVerifier,
     Audit: AuditEventWriter,
     Time: Clock,
@@ -117,14 +125,18 @@ where
     /// 4. Persist `ValidationStarted` → `ValidationPassed` → `Running`
     ///    (§13.3 step 6, then the dispatch of step 7).
     /// 5. Dispatch through [`CommandExecutor`]. `Accepted` (synchronous
-    ///    `200`/`201`/`204` handled) persists `ExecutionAccepted`; `Rejected`
-    ///    (provable BMC refusal) persists `Failed`. A dispatch error is
-    ///    classified by its own [`DispatchVerdict`] (design section 13.5):
-    ///    errors that prove the write was never executed persist `Failed`,
-    ///    errors that cannot prove it persist `OutcomeUnknown` → `Unknown`;
-    ///    either way the operation reaches its honest terminal state and the
-    ///    underlying error escapes as [`ExecutorError::Gateway`] with its
-    ///    source chain intact.
+    ///    `200`/`201`/`204` handled) persists `ExecutionAccepted`;
+    ///    `AsyncTaskAccepted` (`202`) persists the [`RemoteTask`] observation
+    ///    row (design section 13.6) and `RemoteTaskStarted` → `WaitingRemote`,
+    ///    returning the waiting operation to the scheduler — the Task monitor
+    ///    (`crate::TaskMonitor`) resumes it; `Rejected` (provable BMC
+    ///    refusal) persists `Failed`. A dispatch error is classified by its
+    ///    own [`DispatchVerdict`] (design section 13.5): errors that prove
+    ///    the write was never executed persist `Failed`, errors that cannot
+    ///    prove it persist `OutcomeUnknown` → `Unknown`; either way the
+    ///    operation reaches its honest terminal state and the underlying
+    ///    error escapes as [`ExecutorError::Gateway`] with its source chain
+    ///    intact.
     /// 6. Verify through [`CommandVerifier`] (§13.3 steps 9-10). `Confirmed`
     ///    persists `VerificationPassed` → `Succeeded`; `Mismatched` (the
     ///    re-read proves the expected result absent) persists `Failed`; a
@@ -371,15 +383,20 @@ where
             })
     }
 
-    /// Dispatches the write (§13.3 step 7) and drives the synchronous outcome
-    /// (§13.3 step 8) including the §13.5 classification of failed dispatches.
+    /// Dispatches the write (§13.3 step 7) and drives the outcome of the
+    /// §13.3 step 8 branch the response selects, including the §13.5
+    /// classification of failed dispatches.
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::Gateway`] with the classified dispatch error
     /// as its source after the operation has been persisted into its honest
     /// terminal state (`Failed` or `Unknown`) and the terminal audit fact has
-    /// been recorded.
+    /// been recorded, and [`ExecutorError::RemoteTask`] when the §13.6
+    /// observation row of an accepted Task cannot be persisted — the
+    /// operation is recorded `Unknown` (§13.5, because the BMC already
+    /// accepted the write and it must never be re-dispatched) and the
+    /// terminal audit fact is recorded before the error escapes.
     async fn dispatch_and_verify(
         &self,
         engine: &OperationEngine<&Store>,
@@ -389,6 +406,44 @@ where
         started: &StartedAudit,
     ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
         match self.gateway.execute(endpoint_id, command).await {
+            Ok(CommandOutcome::AsyncTaskAccepted { task_location }) => {
+                // §13.3 step 8, asynchronous acceptance: the BMC accepted the
+                // write as a Task whose result is only observable by polling.
+                // The observation row is persisted BEFORE the state step —
+                // the row is what a crash between acceptance and the first
+                // poll must not lose (§13.6) — and then the operation moves
+                // to WaitingRemote, where the Task monitor resumes it. The
+                // TaskMonitor URI is unknown at acceptance time (it is
+                // discovered from the first Task read) and the placeholder
+                // observation state `New` is truthful: the product has not
+                // observed the Task executing yet.
+                let task = RemoteTask::new(
+                    operation_id,
+                    endpoint_id,
+                    task_location,
+                    None,
+                    self.clock.now(),
+                );
+                if let Err(source) = self.store.save_remote_task(&task).await {
+                    // The BMC already accepted the write, so the operation
+                    // must never be left retryable: re-dispatching would
+                    // execute it twice. The product cannot track the Task it
+                    // cannot persist, so the outcome cannot be proven and the
+                    // operation is recorded Unknown (§13.5), then the error
+                    // escapes with its source chain.
+                    self.apply_step(engine, operation_id, OperationEvent::OutcomeUnknown)
+                        .await?;
+                    self.record_failure(
+                        started,
+                        AuditFailure::RedfishDiscoveryFailed,
+                        AuditFailureVerification::Inconclusive,
+                    )
+                    .await?;
+                    return Err(ExecutorError::RemoteTask(source));
+                }
+                self.apply_step(engine, operation_id, OperationEvent::RemoteTaskStarted)
+                    .await
+            }
             Ok(CommandOutcome::Rejected) => {
                 // §13.3 step 8, synchronous rejection: the BMC provably
                 // refused, so the write was not executed and the product can
@@ -578,6 +633,9 @@ struct StartedAudit {
 
 /// Builds the audit context of one operation execution attempt.
 ///
+/// Shared by the executor (start + synchronous terminal facts) and the Task
+/// monitor (the asynchronous terminal fact, design section 13.6).
+///
 /// # Why the refresh vocabulary
 ///
 /// The 0.1 domain audit vocabulary (§16.3) accepts exactly three
@@ -599,7 +657,7 @@ struct StartedAudit {
 ///
 /// Returns [`AuditOperationContextError`] when the combination is not one the
 /// 0.1 vocabulary accepts.
-fn operation_audit_context(
+pub(crate) fn operation_audit_context(
     endpoint_id: EndpointId,
     actor: AuditActor,
     origin: DeploymentPosture,
@@ -675,17 +733,20 @@ impl fmt::Display for OperationAuditStage {
     }
 }
 
-/// A controlled failure while driving one operation to its terminal state.
+/// A controlled failure while driving one operation toward its terminal
+/// state.
 ///
-/// The six generic parameters are the boundary error types in dependency
+/// The seven generic parameters are the boundary error types in dependency
 /// order: the operation store, the endpoint lookup, the capability query, the
-/// command dispatch, the post-execution verification, and the audit append.
-/// Every variant keeps its boundary source on the error chain.
+/// remote-task store, the command dispatch, the post-execution verification,
+/// and the audit append. Every variant keeps its boundary source on the error
+/// chain.
 #[derive(Debug, Error)]
 pub enum ExecutorError<
     StoreError,
     RepositoryError,
     CapabilityError,
+    RemoteTaskStoreError,
     GatewayError,
     VerifierError,
     AuditError,
@@ -693,6 +754,7 @@ pub enum ExecutorError<
     StoreError: Error + 'static,
     RepositoryError: Error + 'static,
     CapabilityError: Error + 'static,
+    RemoteTaskStoreError: Error + 'static,
     GatewayError: Error + 'static,
     VerifierError: Error + 'static,
     AuditError: Error + 'static,
@@ -729,6 +791,15 @@ pub enum ExecutorError<
     /// The capability pre-flight (§13.3 step 2) could not be evaluated.
     #[error("capability pre-flight query failed: {0}")]
     CapabilityPreflight(#[source] EndpointCapabilityQueryError<CapabilityError>),
+    /// The §13.6 observation row of an accepted Task could not be persisted.
+    ///
+    /// The BMC already accepted the write (the `202` was dispatched), so the
+    /// operation is recorded `Unknown` — the product cannot prove the outcome
+    /// of a Task it cannot track (§13.5), and re-dispatching would execute
+    /// the write twice — and the terminal audit fact is recorded before this
+    /// error is returned.
+    #[error("remote task observation could not be persisted: {0}")]
+    RemoteTask(#[source] RemoteTaskStoreError),
     /// The command dispatch (§13.3 step 7) failed.
     ///
     /// The operation has already been persisted into its honest terminal
@@ -769,7 +840,9 @@ mod tests {
         OperationSource, OperationTarget, ResetType, ResourceSnapshot, SystemCommand, TargetId,
         TlsCertificate, TlsTrust,
     };
-    use rutilus_operation_engine::BoundaryFuture as OperationBoundaryFuture;
+    use rutilus_operation_engine::{
+        BoundaryFuture as OperationBoundaryFuture, RemoteTaskState, TaskUri,
+    };
     use time::Duration;
 
     use crate::{BoundaryFuture, ResourceObservation, StoredCapability};
@@ -866,6 +939,7 @@ mod tests {
         ApplyTransition(OperationId, OperationState),
         FindEndpoint(EndpointId),
         FindCapabilities(EndpointId),
+        SaveRemoteTask(OperationId),
     }
 
     /// The single failure mode armed for the next matching store call.
@@ -875,17 +949,19 @@ mod tests {
         Write,
         EndpointLookup,
         CapabilityLookup,
+        RemoteTaskWrite,
     }
 
     /// In-memory store implementing every repository role the executor uses.
     ///
     /// One struct implements `OperationStore`, `EndpointRefreshRepository`,
-    /// and `CapabilityQueryRepository` exactly like the production
-    /// `SqliteStore`, so the executor composes over a single test object.
-    /// `apply_transition` upholds the store contract: unknown ids and writes
-    /// onto terminal states are rejected.
+    /// `CapabilityQueryRepository`, and `RemoteTaskStore` exactly like the
+    /// production `SqliteStore`, so the executor composes over a single test
+    /// object. `apply_transition` upholds the store contract: unknown ids and
+    /// writes onto terminal states are rejected.
     struct FakeStore {
         rows: Mutex<HashMap<OperationId, Operation>>,
+        remote_tasks: Mutex<HashMap<OperationId, RemoteTask>>,
         endpoint: Option<Endpoint>,
         capabilities: Vec<StoredCapability>,
         calls: Mutex<Vec<Call>>,
@@ -896,6 +972,7 @@ mod tests {
         fn new(endpoint: Option<Endpoint>, capabilities: Vec<StoredCapability>) -> Self {
             Self {
                 rows: Mutex::new(HashMap::new()),
+                remote_tasks: Mutex::new(HashMap::new()),
                 endpoint,
                 capabilities,
                 calls: Mutex::new(Vec::new()),
@@ -928,6 +1005,16 @@ mod tests {
 
         fn find_owned(&self, operation_id: OperationId) -> Result<Option<Operation>, MockError> {
             self.rows
+                .lock()
+                .map_err(|_| MockError::Events)
+                .map(|rows| rows.get(&operation_id).cloned())
+        }
+
+        fn find_remote_task_owned(
+            &self,
+            operation_id: OperationId,
+        ) -> Result<Option<RemoteTask>, MockError> {
+            self.remote_tasks
                 .lock()
                 .map_err(|_| MockError::Events)
                 .map(|rows| rows.get(&operation_id).cloned())
@@ -1079,6 +1166,46 @@ mod tests {
         }
     }
 
+    impl RemoteTaskStore for FakeStore {
+        type Error = MockError;
+
+        fn save_remote_task<'a>(
+            &'a self,
+            task: &'a RemoteTask,
+        ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(Call::SaveRemoteTask(task.operation_id()));
+                if self.consume_failure(FailureKind::RemoteTaskWrite)? {
+                    return Err(MockError::RemoteTaskStore);
+                }
+                self.remote_tasks
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .insert(task.operation_id(), task.clone());
+                Ok(())
+            })
+        }
+
+        fn find_remote_task(
+            &self,
+            operation_id: OperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Option<RemoteTask>, Self::Error>> {
+            Box::pin(async move { self.find_remote_task_owned(operation_id) })
+        }
+
+        fn list_remote_tasks_by_state(
+            &self,
+            _state: RemoteTaskState,
+        ) -> OperationBoundaryFuture<'_, Result<Vec<RemoteTask>, Self::Error>> {
+            // The executor never lists task rows; the Task monitor owns that
+            // projection, so this stub is unreachable here.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
+
     /// One recorded gateway call with the exact endpoint and command.
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct GatewayCall {
@@ -1139,7 +1266,7 @@ mod tests {
                         endpoint_id,
                         command: command.clone(),
                     });
-                self.outcome
+                self.outcome.clone()
             })
         }
     }
@@ -1173,6 +1300,7 @@ mod tests {
         Store,
         Repository,
         Capability,
+        RemoteTaskStore,
         GatewayNotExecuted,
         GatewayUnknown,
         Verifier,
@@ -1925,6 +2053,113 @@ mod tests {
             audit.recorded_events()?.len(),
             1,
             "only the start fact landed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_task_acceptance_persists_the_task_row_and_waits() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = queued_operation(endpoint_id);
+        store.insert(operation.clone())?;
+        let task_location = TaskUri::parse("/redfish/v1/TaskService/Tasks/42")?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::AsyncTaskAccepted {
+                task_location: task_location.clone(),
+            }),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let waiting = executor.execute_operation(operation_id).await?;
+
+        // The operation is handed back to the scheduler in WaitingRemote, not
+        // terminal: the Task monitor resumes it from the persisted row.
+        assert_eq!(waiting.id(), operation_id);
+        assert_eq!(waiting.state(), OperationState::WaitingRemote);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::WaitingRemote,
+            ]
+        );
+        // The observation row exists with the exact task location from the
+        // `202` `Location` header, bound to the operation and its endpoint;
+        // the placeholder state `New` is truthful (nothing observed yet) and
+        // the acceptance clock time is the first check time.
+        let task = store
+            .find_remote_task_owned(operation_id)?
+            .ok_or("the accepted task row must be persisted")?;
+        assert_eq!(task.operation_id(), operation_id);
+        assert_eq!(task.endpoint_id(), endpoint_id);
+        assert_eq!(task.task_uri(), &task_location);
+        assert_eq!(task.task_monitor_uri(), None);
+        assert_eq!(task.last_state(), RemoteTaskState::New);
+        assert_eq!(task.last_checked_at(), clock_time());
+        // The write landed asynchronously, so only the start fact is audited;
+        // the terminal fact belongs to the Task monitor (§13.6).
+        assert_eq!(audit.recorded_events()?.len(), 1);
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Execute,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "an accepted Task must never be verified synchronously"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_task_save_failure_records_unknown_and_propagates_the_source()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        store.arm_failure(FailureKind::RemoteTaskWrite)?;
+        let operation = queued_operation(endpoint_id);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::AsyncTaskAccepted {
+                task_location: TaskUri::parse("/redfish/v1/TaskService/Tasks/43")?,
+            }),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        let error = result
+            .err()
+            .ok_or("the row persistence failure must escape")?;
+        assert!(matches!(
+            error,
+            ExecutorError::RemoteTask(MockError::RemoteTaskStore)
+        ));
+        assert_error_source(&error, MockError::RemoteTaskStore)?;
+        // The BMC already accepted the write, so the operation must never be
+        // left retryable: it is recorded Unknown (§13.5 cannot-prove), which
+        // the scheduler never re-dispatches.
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [
+                OperationState::Validating,
+                OperationState::Running,
+                OperationState::Unknown,
+            ]
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
         );
         Ok(())
     }
