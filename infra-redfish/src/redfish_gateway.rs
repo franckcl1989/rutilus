@@ -18,7 +18,7 @@ use nv_redfish::{
     },
     chassis::{Chassis, ChassisCollection, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
-    core::{EntityTypeRef, ModificationResponse, NavProperty, ODataId, ReferenceLeaf},
+    core::{EntityTypeRef, ModificationResponse, NavProperty, ODataId, ReferenceLeaf, ToSnakeCase},
     manager::{Manager, ManagerCollection},
     schema::{
         assembly::Assembly as AssemblySchema,
@@ -340,9 +340,11 @@ impl RedfishGateway {
     /// authenticate with its token, and the Session is deleted before
     /// returning. The §13.4 `ETag` precondition is a later iteration — the
     /// typed `update` sends the transport's existence-only `If-Match: *` —
-    /// and the §13.6 Task path is a later iteration: a `202` response is
-    /// reported as [`CommandExecutionError::AsyncTaskAccepted`], never as
-    /// acceptance.
+    /// and a `202` response is reported as
+    /// [`CommandExecutionError::AsyncTaskAccepted`], never as acceptance:
+    /// the gateway itself never polls Tasks, so the application adapter maps
+    /// that error onto the `AsyncTaskAccepted` outcome the Task monitor
+    /// polls (§13.6).
     ///
     /// # Errors
     ///
@@ -475,6 +477,76 @@ impl RedfishGateway {
         )
         .await;
         finish_command_verification(result, authenticated.session, &identity, trust).await
+    }
+
+    /// Reads one Redfish `Task` resource by its `@odata.id` (§13.6) through
+    /// the public, typed `nv-redfish` API — the same `Bmc::get` navigation
+    /// the core resource read uses, never a raw HTTP request (§7.4).
+    ///
+    /// The Task URI comes from the BMC itself — the `Location` header of the
+    /// `202` acceptance or the `TaskMonitor` property of a Task document —
+    /// and is validated as an exact identifier before it reaches this method
+    /// (§15.6: the product never accepts BMC URLs from outside). The typed
+    /// `Bmc::get` resolves the identifier against the endpoint origin with
+    /// redirects, proxies, and cleartext disabled, so a stored identifier
+    /// cannot escape the endpoint's own service.
+    ///
+    /// The transient Session lifecycle is identical to the read surfaces: a
+    /// Session is established when usable, the Task read authenticates with
+    /// its token, and the Session is deleted before returning. When the Task
+    /// document advertises a `TaskMonitor` URI, the observation carries it so
+    /// the §13.6 monitor can poll the monitor instead of the Task; the
+    /// `Retry-After` header of `TaskMonitor` responses is not part of the
+    /// `Task_v1` CSDL and the typed API does not expose it, so the polling
+    /// cadence stays a scheduler decision until a raw-header iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskReadError`] with a distinct disappearance
+    /// ([`TaskReadError::TaskGone`]) and the shared read classification
+    /// (authentication, permission, schema, timeout, network, response,
+    /// preparation) for everything else. `TaskGone` means the BMC no longer
+    /// tracks the Task: the §13.6 recovery must re-verify the operation
+    /// target instead of continuing the poll.
+    pub async fn read_task(
+        &self,
+        address: &EndpointAddress,
+        trust: &TlsTrust,
+        username: &CredentialUsername,
+        password: &SecretString,
+        task_uri: &ResourceODataId,
+    ) -> Result<TaskObservation, TaskReadError> {
+        let (bmc, http, identity) = self
+            .authenticated_bmc(address, trust, username, password)
+            .map_err(TaskReadError::from)?;
+        let root = match ServiceRoot::new(Arc::clone(&bmc)).await {
+            Ok(root) => root,
+            Err(source) => {
+                return Err(TaskReadError::from(classify_service_root_error(
+                    source, &identity, trust,
+                )));
+            }
+        };
+        let authenticated = match establish_preferred_authentication(
+            root,
+            SessionSetup {
+                bmc,
+                http,
+                address,
+                username,
+                password,
+            },
+            &identity,
+            trust,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(source) => return Err(TaskReadError::from(source)),
+        };
+        let result =
+            read_authenticated_task(authenticated.bmc.as_ref(), task_uri, &identity, trust).await;
+        finish_task_read(result, authenticated.session, &identity, trust).await
     }
 
     fn authenticated_bmc(
@@ -1697,6 +1769,94 @@ async fn finish_core_resource_read(
     }
 }
 
+/// Reads one Task document through the transport the Session logic selected.
+///
+/// The Task URI is fetched directly with `Bmc::get`, so the read depends on
+/// no collection navigation: the §13.6 recovery scan re-reads the exact URI
+/// the BMC returned, whether it identifies the Task or its `TaskMonitor`.
+async fn read_authenticated_task(
+    bmc: &UpstreamBmc,
+    task_uri: &ResourceODataId,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<TaskObservation, TaskReadError> {
+    let odata_id = ODataId::from(task_uri.as_str().to_owned());
+    match bmc.get::<TaskSchema>(&odata_id).await {
+        Ok(task) => Ok(TaskObservation::from_task(&task, task_uri)),
+        Err(source) => Err(classify_task_fetch_error(
+            nv_redfish::Error::Bmc(source),
+            task_uri,
+            identity,
+            trust,
+        )),
+    }
+}
+
+/// Classifies one Task-document fetch failure (§13.6).
+///
+/// A `404` from the Task URI itself means the BMC deleted or overwrote the
+/// Task (`TaskService` auto-deletes completed tasks): the monitor must stop
+/// polling and re-verify the operation target, because the write may already
+/// have completed. TLS-safety failures keep precedence over the status so a
+/// changed or rejected identity is never misread as a vanished Task, and
+/// every other failure keeps the shared read classification (authentication,
+/// permission, schema, timeout, network, response) for the monitor to decide
+/// between retry and surface.
+fn classify_task_fetch_error(
+    source: UpstreamServiceRootError,
+    task_uri: &ResourceODataId,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> TaskReadError {
+    match identity.take_change(trust) {
+        Ok(Some(changed)) => {
+            return TaskReadError::ReadFailed {
+                task_uri: task_uri.clone(),
+                source: Box::new(RedfishServiceRootError::TlsIdentityChanged(changed)),
+            };
+        }
+        Err(source) => {
+            return TaskReadError::ReadFailed {
+                task_uri: task_uri.clone(),
+                source: Box::new(RedfishServiceRootError::TlsIdentityState(source)),
+            };
+        }
+        Ok(None) => {}
+    }
+    match source {
+        nv_redfish::Error::Bmc(source @ BmcError::InvalidResponse { status, .. })
+            if status == StatusCode::NOT_FOUND && !identity.validation_rejected() =>
+        {
+            TaskReadError::TaskGone {
+                task_uri: task_uri.clone(),
+                source,
+            }
+        }
+        source => TaskReadError::ReadFailed {
+            task_uri: task_uri.clone(),
+            source: Box::new(classify_service_root_error(source, identity, trust)),
+        },
+    }
+}
+
+async fn finish_task_read(
+    operation: Result<TaskObservation, TaskReadError>,
+    session: Option<Session<UpstreamBmc>>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<TaskObservation, TaskReadError> {
+    let cleanup = cleanup_session(session, identity, trust).await;
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Err(operation), Err(cleanup)) => Err(TaskReadError::ReadAndSessionCleanupFailed {
+            read: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
 /// Dispatches one typed write command through the authenticated transport.
 ///
 /// The match is exhaustive over every §7.5 family, so adding a command
@@ -2220,10 +2380,11 @@ fn validate_subscription_id(value: &str) -> Option<&str> {
 /// A fully handled synchronous success (`200`/`201`/`204` body handled) is
 /// [`CommandExecutionOutcome::Accepted`] — the target still must be verified
 /// (§13.3 steps 9–10). A `202` Task acceptance is deliberately not
-/// acceptance: Task monitoring (§13.6) is a later iteration, so the
-/// implementation surfaces it as [`CommandExecutionError::AsyncTaskAccepted`]
-/// whose verdict is outcome-unknown — the BMC accepted the write and this
-/// build cannot yet verify its result.
+/// acceptance: the gateway itself never polls Tasks, so it surfaces the
+/// acceptance as [`CommandExecutionError::AsyncTaskAccepted`] whose verdict
+/// is outcome-unknown at this boundary — the BMC accepted the write and the
+/// application adapter maps the error onto the `AsyncTaskAccepted` outcome
+/// the Task monitor polls (§13.6).
 fn outcome_from_modification<T>(
     response: ModificationResponse<T>,
 ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
@@ -2623,6 +2784,153 @@ impl ServiceRootSummary {
     #[must_use]
     pub fn redfish_version(&self) -> Option<&str> {
         self.redfish_version.as_deref()
+    }
+}
+
+/// The typed observation of one Redfish `Task` resource (§13.6).
+///
+/// This is the §7.2 projection the Task monitor consumes: `nv-redfish` types
+/// never cross the gateway. `task_state` and `task_status` carry the
+/// product's stable snake-case codes — the exact `nv-redfish`
+/// `to_snake_case` values the `remote_tasks` persistence contract pins — so
+/// the operation engine maps them onto its `RemoteTaskState` enumeration
+/// without depending on `nv-redfish`. A wire value this build cannot
+/// classify surfaces as `unsupported_value` instead of failing the read:
+/// unknown states are an observation, not an endpoint condition.
+///
+/// `percent_complete` collapses the schema's nullable double-option onto
+/// `None` when the BMC omits or nulls it, matching the core resource
+/// projection. A `TaskMonitor` URI or `ETag` the gateway cannot represent as
+/// exact text is left behind rather than failing the observation — one odd
+/// value does not erase the rest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskObservation {
+    task_uri: ResourceODataId,
+    task_monitor: Option<ResourceODataId>,
+    etag: Option<ResourceEtag>,
+    task_state: Option<String>,
+    task_status: Option<String>,
+    percent_complete: Option<i64>,
+    messages: Vec<TaskMessageObservation>,
+}
+
+impl TaskObservation {
+    fn from_task(task: &TaskSchema, task_uri: &ResourceODataId) -> Self {
+        Self {
+            task_uri: task_uri.clone(),
+            task_monitor: task
+                .task_monitor
+                .as_deref()
+                .and_then(|uri| ResourceODataId::parse(uri).ok()),
+            etag: task
+                .etag()
+                .and_then(|value| ResourceEtag::parse(&value.to_string()).ok()),
+            task_state: task
+                .task_state
+                .map(|state| state.to_snake_case().to_owned()),
+            task_status: task
+                .task_status
+                .map(|status| status.to_snake_case().to_owned()),
+            percent_complete: task.percent_complete.as_ref().copied().flatten(),
+            messages: task
+                .messages
+                .as_ref()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .map(TaskMessageObservation::from_message)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Borrows the exact Task identifier the BMC returned.
+    #[must_use]
+    pub const fn task_uri(&self) -> &ResourceODataId {
+        &self.task_uri
+    }
+
+    /// Borrows the `TaskMonitor` URI the Task document advertises, when the
+    /// BMC provided one the gateway can represent as exact text.
+    #[must_use]
+    pub const fn task_monitor(&self) -> Option<&ResourceODataId> {
+        self.task_monitor.as_ref()
+    }
+
+    /// Borrows the optional entity tag of the Task document.
+    #[must_use]
+    pub const fn etag(&self) -> Option<&ResourceEtag> {
+        self.etag.as_ref()
+    }
+
+    /// Borrows the stable code of the last observed `TaskState`
+    /// (`running`, `completed`, …; `unsupported_value` for a wire value this
+    /// build cannot classify).
+    #[must_use]
+    pub fn task_state(&self) -> Option<&str> {
+        self.task_state.as_deref()
+    }
+
+    /// Borrows the stable code of the last observed `TaskStatus` health
+    /// (`ok`, `warning`, `critical`, `unsupported_value`).
+    #[must_use]
+    pub fn task_status(&self) -> Option<&str> {
+        self.task_status.as_deref()
+    }
+
+    /// Returns the last observed completion percentage (0–100), when the
+    /// BMC provided one.
+    #[must_use]
+    pub const fn percent_complete(&self) -> Option<i64> {
+        self.percent_complete
+    }
+
+    /// Borrows every message the Task document reports, in wire order; the
+    /// §13.6 `LastMessage` contract consumes the last one.
+    #[must_use]
+    pub fn messages(&self) -> &[TaskMessageObservation] {
+        &self.messages
+    }
+}
+
+/// One Redfish `Task` message, projected for the §13.6 `LastMessage`
+/// contract.
+///
+/// The `MessageId` is required by the CSDL; the human-readable `Message` and
+/// the registry `Severity` are optional on the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskMessageObservation {
+    message_id: String,
+    message: Option<String>,
+    severity: Option<String>,
+}
+
+impl TaskMessageObservation {
+    fn from_message(message: &nv_redfish::schema::message::Message) -> Self {
+        Self {
+            message_id: message.message_id.clone(),
+            message: message.message.clone(),
+            severity: message.severity.clone(),
+        }
+    }
+
+    /// Borrows the message registry identifier (`Base.1.0.Progress`, …).
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    /// Borrows the optional human-readable message text.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    /// Borrows the optional registry severity text (`OK`, `Warning`, …).
+    #[must_use]
+    pub fn severity(&self) -> Option<&str> {
+        self.severity.as_deref()
     }
 }
 
@@ -4104,9 +4412,10 @@ pub enum CommandExecutionOutcome {
     /// (`200`/`201`/`204`) was received and fully handled (§13.3 step 8).
     /// A success status alone is not business success — the target still
     /// must be re-read and verified (§13.3 steps 9–10). A `202` Task
-    /// acceptance is deliberately NOT this variant: Task monitoring (§13.6)
-    /// is a later iteration, so a `202` surfaces as
-    /// [`CommandExecutionError::AsyncTaskAccepted`] instead.
+    /// acceptance is deliberately NOT this variant: the gateway never polls
+    /// Tasks, so a `202` surfaces as
+    /// [`CommandExecutionError::AsyncTaskAccepted`] and the application
+    /// adapter maps it onto the async outcome the Task monitor polls.
     Accepted,
 }
 
@@ -4168,11 +4477,12 @@ pub enum CommandExecutionError {
     #[error("the write request was dispatched but its outcome cannot be proven: {0}")]
     OutcomeUnknown(#[source] Box<RedfishServiceRootError>),
     #[error(
-        "the BMC accepted the write as an asynchronous Task at {task_location}; Task monitoring is a later iteration"
+        "the BMC accepted the write as an asynchronous Task at {task_location}; the gateway itself never polls Tasks, so the application adapter hands the Task to the monitor"
     )]
     AsyncTaskAccepted {
-        /// The `Location` of the accepted Task; the §13.6 iteration resumes
-        /// monitoring from here.
+        /// The `Location` of the accepted Task; the application adapter
+        /// validates and persists it, and the Task monitor resumes polling
+        /// from it (§13.6).
         task_location: nv_redfish::core::ODataId,
     },
     #[error(
@@ -4256,6 +4566,50 @@ impl From<RedfishServiceRootError> for CommandVerificationError {
 #[derive(Clone, Copy, Debug, Error)]
 #[error("TLS identity synchronization failed")]
 pub struct TlsIdentityStateError;
+
+/// A controlled failure while observing one Redfish `Task` (§13.6).
+///
+/// [`Self::TaskGone`] is the recovery contract: the BMC no longer tracks the
+/// Task (auto-delete or manual cleanup), so the monitor must stop polling and
+/// re-verify the operation target — the write may already have completed.
+/// Every other Task-document failure keeps the shared read classification
+/// inside [`Self::ReadFailed`] so the monitor can separate transient causes
+/// (timeout, network, remote response) and preparation failures — retry
+/// later — from endpoint-local causes (authentication, permission, schema,
+/// TLS) that must surface instead.
+#[derive(Debug, Error)]
+pub enum TaskReadError {
+    #[error("the Task read failed before the Task request was sent: {0}")]
+    Preparation(#[source] Box<RedfishServiceRootError>),
+    #[error(
+        "the Task at {task_uri} no longer exists (404): the BMC deleted or overwrote it, so the operation target must be re-verified instead of continuing the poll (§13.6)"
+    )]
+    TaskGone {
+        task_uri: ResourceODataId,
+        #[source]
+        source: BmcError,
+    },
+    #[error("the Task at {task_uri} could not be read: {source}")]
+    ReadFailed {
+        task_uri: ResourceODataId,
+        #[source]
+        source: Box<RedfishServiceRootError>,
+    },
+    #[error(
+        "Task read and transient Session cleanup both failed; read: {read}; cleanup: {cleanup}"
+    )]
+    ReadAndSessionCleanupFailed {
+        read: Box<TaskReadError>,
+        #[source]
+        cleanup: Box<RedfishServiceRootError>,
+    },
+}
+
+impl From<RedfishServiceRootError> for TaskReadError {
+    fn from(source: RedfishServiceRootError) -> Self {
+        Self::Preparation(Box::new(source))
+    }
+}
 
 fn classify_service_root_error(
     source: UpstreamServiceRootError,
@@ -6078,6 +6432,40 @@ mod tests {
         "PercentComplete":100,
         "StartTime":"2026-08-01T09:00:00Z",
         "EndTime":"2026-08-01T09:05:00Z"
+    }"##;
+
+    /// The running `Task` document the §13.6 monitor re-reads: every
+    /// optional monitor contract field is populated, including the
+    /// `TaskMonitor` URI and one progress message.
+    const TASK_MONITOR_RUNNING_BODY: &str = r##"{
+        "@odata.type":"#Task.v1_7_0.Task",
+        "@odata.id":"/redfish/v1/TaskService/Tasks/1",
+        "@odata.etag":"W/\"task-1\"",
+        "Id":"1",
+        "Name":"Firmware Update Task",
+        "TaskState":"Running",
+        "TaskStatus":"OK",
+        "PercentComplete":42,
+        "StartTime":"2026-08-01T09:30:00Z",
+        "TaskMonitor":"/redfish/v1/TaskService/Tasks/1/Monitor",
+        "Messages":[
+            {"MessageId":"Base.1.0.Progress","Message":"Firmware update in progress","Severity":"OK"}
+        ]
+    }"##;
+
+    /// A `Task` document whose `TaskState` is a wire value this build cannot
+    /// classify and whose `PercentComplete` is explicitly null, so the
+    /// observation surfaces the honest `unsupported_value` code and `None`
+    /// instead of inventing a state.
+    const TASK_WITH_UNKNOWN_STATE_BODY: &str = r##"{
+        "@odata.type":"#Task.v1_7_0.Task",
+        "@odata.id":"/redfish/v1/TaskService/Tasks/2",
+        "@odata.etag":"W/\"task-2\"",
+        "Id":"2",
+        "Name":"Future State Task",
+        "TaskState":"FutureState",
+        "TaskStatus":"Critical",
+        "PercentComplete":null
     }"##;
 
     /// A System member that advertises the 0.2 `PcieDevices` family as an
@@ -9824,6 +10212,263 @@ mod tests {
             &server.finish_all().await?,
             &SERVICES_RESOURCE_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    /// The request order of one Task read: the Session lifecycle around the
+    /// direct `Bmc::get` of the Task URI.
+    const TASK_READ_REQUEST_PATHS: [&str; 6] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TaskService/Tasks/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    #[tokio::test]
+    async fn reads_a_task_through_typed_navigation_with_session_token_auth()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[("200 OK", TASK_MONITOR_RUNNING_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let observation = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?,
+            )
+            .await?;
+
+        assert_eq!(
+            observation.task_uri().as_str(),
+            "/redfish/v1/TaskService/Tasks/1"
+        );
+        assert_eq!(
+            observation.task_monitor().map(ResourceODataId::as_str),
+            Some("/redfish/v1/TaskService/Tasks/1/Monitor")
+        );
+        assert_eq!(
+            observation.etag().map(ResourceEtag::as_str),
+            Some("W/\"task-1\"")
+        );
+        assert_eq!(observation.task_state(), Some("running"));
+        assert_eq!(observation.task_status(), Some("ok"));
+        assert_eq!(observation.percent_complete(), Some(42));
+        let message = observation
+            .messages()
+            .last()
+            .ok_or_else(|| io::Error::other("the Task must report its progress message"))?;
+        assert_eq!(message.message_id(), "Base.1.0.Progress");
+        assert_eq!(message.message(), Some("Firmware update in progress"));
+        assert_eq!(message.severity(), Some("OK"));
+        assert_session_requests(&server.finish_all().await?, &TASK_READ_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maps_unknown_task_states_into_the_stable_unsupported_code()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[("200 OK", TASK_WITH_UNKNOWN_STATE_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let observation = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/2")?,
+            )
+            .await?;
+
+        assert_eq!(observation.task_state(), Some("unsupported_value"));
+        assert_eq!(observation.task_status(), Some("critical"));
+        assert_eq!(observation.percent_complete(), None);
+        assert!(
+            observation.messages().is_empty(),
+            "a Task without a Messages property reports no messages"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_a_disappeared_task_as_gone_for_recovery_reverification()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[(
+                "404 Not Found",
+                "{\"error\":{\"code\":\"Base.1.0.ResourceMissing\",\"message\":\"The task was deleted\"}}",
+            )],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?,
+            )
+            .await;
+
+        match result {
+            Err(TaskReadError::TaskGone { task_uri, .. }) => {
+                assert_eq!(task_uri.as_str(), "/redfish/v1/TaskService/Tasks/1");
+            }
+            other => {
+                return Err(
+                    format!("a 404 Task read must surface as TaskGone, got {other:?}").into(),
+                );
+            }
+        }
+        // The poll stops immediately — the Task URI was still requested
+        // through the Session before the Session was deleted.
+        assert_session_requests(&server.finish_all().await?, &TASK_READ_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_an_undecodable_task_document_as_schema_incompatible()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[(
+                "200 OK",
+                "{\"@odata.id\":\"/redfish/v1/TaskService/Tasks/1\"}",
+            )],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?,
+            )
+            .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(observation) => {
+                return Err(format!("an undecodable Task must fail, got {observation:?}").into());
+            }
+        };
+        match error {
+            TaskReadError::ReadFailed { task_uri, source } => {
+                assert_eq!(task_uri.as_str(), "/redfish/v1/TaskService/Tasks/1");
+                assert!(
+                    matches!(*source, RedfishServiceRootError::SchemaIncompatible { .. }),
+                    "an undecodable Task document is a schema failure: {source}"
+                );
+            }
+            other => {
+                return Err(format!("an undecodable Task must be ReadFailed, got {other}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_a_dropped_task_read_as_an_unknown_network_result()
+    -> Result<(), Box<dyn Error>> {
+        // The empty response at the Task position encodes a dropped
+        // connection: the request is captured, no response ever arrives.
+        let mut responses = session_response_sequence(CORE_SERVICE_ROOT_BODY, &[]);
+        responses.insert(4, Vec::new());
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?,
+            )
+            .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(observation) => {
+                return Err(format!("a dropped Task read must fail, got {observation:?}").into());
+            }
+        };
+        match error {
+            TaskReadError::ReadFailed { task_uri, source } => {
+                assert_eq!(task_uri.as_str(), "/redfish/v1/TaskService/Tasks/1");
+                assert!(
+                    matches!(*source, RedfishServiceRootError::Network { .. }),
+                    "a dropped connection is an unprovable network result: {source}"
+                );
+            }
+            other => {
+                return Err(format!("a dropped Task read must be ReadFailed, got {other}").into());
+            }
+        }
+        // The Task request itself was captured before the connection dropped,
+        // proving the monitor did attempt the read.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(
+            std::str::from_utf8(&requests[4])?
+                .starts_with("GET /redfish/v1/TaskService/Tasks/1 HTTP/1.1\r\n")
+        );
+        Ok(())
+    }
+
+    /// Pins the compiled `TaskState` wire values to the stable snake-case
+    /// codes the observation carries (§7.2) — the exact code set the
+    /// `remote_tasks` persistence contract enforces. A future `nv-redfish`
+    /// CSDL update that renames a wire value or its canonical mapping fails
+    /// here instead of silently producing a code the engine cannot classify.
+    #[test]
+    fn task_state_wire_values_map_to_the_stable_recovery_codes() -> Result<(), Box<dyn Error>> {
+        use nv_redfish::core::ToSnakeCase;
+        use nv_redfish::schema::task::TaskState;
+
+        let pairs = [
+            ("New", TaskState::New, "new"),
+            ("Starting", TaskState::Starting, "starting"),
+            ("Running", TaskState::Running, "running"),
+            ("Suspended", TaskState::Suspended, "suspended"),
+            ("Interrupted", TaskState::Interrupted, "interrupted"),
+            ("Pending", TaskState::Pending, "pending"),
+            ("Stopping", TaskState::Stopping, "stopping"),
+            ("Completed", TaskState::Completed, "completed"),
+            ("Killed", TaskState::Killed, "killed"),
+            ("Exception", TaskState::Exception, "exception"),
+            ("Service", TaskState::Service, "service"),
+            ("Cancelling", TaskState::Cancelling, "cancelling"),
+            ("Cancelled", TaskState::Cancelled, "cancelled"),
+        ];
+        for (wire, state, code) in pairs {
+            let decoded: TaskState = serde_json::from_str(&format!("\"{wire}\""))?;
+            assert_eq!(decoded, state);
+            assert_eq!(decoded.to_snake_case(), code);
+        }
         Ok(())
     }
 
