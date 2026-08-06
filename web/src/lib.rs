@@ -735,15 +735,20 @@ fn project_enrollment(
             ResourceFeature::Chassis => chassis += 1,
             ResourceFeature::Managers => managers += 1,
             // The 0.2 resource families (Processors, Memory, Storage,
-            // Network, and later Accounts) intentionally stay out of the
-            // three-field enrollment counts; the typed resource-inventory
-            // route carries their full snapshots instead.
+            // Network, Accounts, Bios, BootOptions, and SecureBoot)
+            // intentionally stay out of the three-field enrollment counts;
+            // the typed resource-inventory route carries their full
+            // snapshots instead.
             ResourceFeature::ServiceRoot
             | ResourceFeature::Processors
             | ResourceFeature::Memory
             | ResourceFeature::Storages
             | ResourceFeature::NetworkAdapters
-            | ResourceFeature::EthernetInterfaces => {}
+            | ResourceFeature::EthernetInterfaces
+            | ResourceFeature::Accounts
+            | ResourceFeature::Bios
+            | ResourceFeature::BootOptions
+            | ResourceFeature::SecureBoot => {}
         }
     }
     Ok(EndpointEnrollmentResponse::new(
@@ -1135,6 +1140,10 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::EthernetInterface { .. } => {
             project_ethernet_interface_details(details)
         }
+        CoreResourceDetails::Account { .. } => project_account_details(details),
+        CoreResourceDetails::Bios { .. } => project_bios_details(details),
+        CoreResourceDetails::BootOption { .. } => project_boot_option_details(details),
+        CoreResourceDetails::SecureBoot { .. } => project_secure_boot_details(details),
     }
 }
 
@@ -1442,6 +1451,101 @@ fn project_ethernet_interface_details(
         speed_mbps: *speed_mbps,
         interface_enabled: *interface_enabled,
         status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 accounts family (a `ManagerAccount`) into the shared
+/// wire contract. The manager-account schema has no `Status` property, so
+/// the projection carries no status field.
+///
+/// The dispatcher guarantees this receives the `Account` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_account_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Account {
+        enabled,
+        role_id,
+        locked,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::Account {
+            enabled: None,
+            role_id: None,
+            locked: None,
+        };
+    };
+    CoreResourceDetailsResponse::Account {
+        enabled: *enabled,
+        role_id: role_id.clone(),
+        locked: *locked,
+    }
+}
+
+/// Projects the §2.1 bios family into the shared wire contract, retaining
+/// only the attribute-registry metadata that names the BIOS attribute set.
+///
+/// The dispatcher guarantees this receives the `Bios` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_bios_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::Bios { attribute_registry } = details else {
+        return CoreResourceDetailsResponse::Bios {
+            attribute_registry: None,
+        };
+    };
+    CoreResourceDetailsResponse::Bios {
+        attribute_registry: attribute_registry.clone(),
+    }
+}
+
+/// Projects the §2.1 boot-options family into the shared wire contract;
+/// the enabled flag stays a Boolean so clients render it without re-parsing
+/// text.
+///
+/// The dispatcher guarantees this receives the `BootOption` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_boot_option_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::BootOption {
+        display_name,
+        boot_option_enabled,
+        uefi_device_path,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::BootOption {
+            display_name: None,
+            boot_option_enabled: None,
+            uefi_device_path: None,
+        };
+    };
+    CoreResourceDetailsResponse::BootOption {
+        display_name: display_name.clone(),
+        boot_option_enabled: *boot_option_enabled,
+        uefi_device_path: uefi_device_path.clone(),
+    }
+}
+
+/// Projects the §2.1 secure-boot family into the shared wire contract,
+/// retaining the schema mode enumeration as a string so clients render it
+/// without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `SecureBoot` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_secure_boot_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::SecureBoot {
+        secure_boot_enable,
+        secure_boot_mode,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::SecureBoot {
+            secure_boot_enable: None,
+            secure_boot_mode: None,
+        };
+    };
+    CoreResourceDetailsResponse::SecureBoot {
+        secure_boot_enable: *secure_boot_enable,
+        secure_boot_mode: secure_boot_mode.clone(),
     }
 }
 
@@ -1954,6 +2058,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_accounts_bios_boot_options_and_secure_boot_typed_resources()
+    -> Result<(), Box<dyn Error>> {
+        let item = accounts_configuration_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 5);
+        // The inventory orders snapshots by `@odata.id`, so the root
+        // AccountService member sorts before the system-scoped families.
+        assert_eq!(resources[1]["resource"]["resource_type"], "account");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/AccountService/Accounts/admin"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Administrator Account");
+        assert_eq!(
+            resources[1]["source"]["odata_type"],
+            "#ManagerAccount.v1_14_1.ManagerAccount"
+        );
+        assert_eq!(resources[1]["resource"]["details"]["enabled"], true);
+        assert_eq!(
+            resources[1]["resource"]["details"]["role_id"],
+            "Administrator"
+        );
+        assert_eq!(resources[1]["resource"]["details"]["locked"], false);
+        assert_eq!(resources[2]["resource"]["resource_type"], "bios");
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Bios"
+        );
+        assert_eq!(
+            resources[2]["resource"]["details"]["attribute_registry"],
+            "BiosAttributeRegistry.v1_0_0"
+        );
+        assert_eq!(resources[3]["resource"]["resource_type"], "boot_option");
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/BootOptions/PXE-1"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["display_name"],
+            "PXE Network Boot"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["boot_option_enabled"],
+            true
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["uefi_device_path"],
+            "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)"
+        );
+        assert_eq!(resources[4]["resource"]["resource_type"], "secure_boot");
+        assert_eq!(
+            resources[4]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/SecureBoot"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["secure_boot_enable"],
+            true
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["secure_boot_mode"],
+            "DeployedMode"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn distinguishes_core_resource_route_states() -> Result<(), Box<dyn Error>> {
         let waiting = inventory_item("Waiting BMC", "https://192.0.2.20", 20, false)?;
         let endpoint_id = waiting.endpoint().id();
@@ -2203,6 +2385,77 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, storage, network_adapter, ethernet_interface],
+        )?)
+    }
+
+    fn accounts_configuration_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Accounts and configuration BMC")?,
+            EndpointAddress::parse("https://192.0.2.32")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![32])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(5)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let account = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Accounts,
+            "/redfish/v1/AccountService/Accounts/admin",
+            r#"{"Id":"admin","Name":"Administrator Account","Description":"Built-in administrator account","UserName":"admin","RoleId":"Administrator","Enabled":true,"Locked":false,"AccountTypes":["Redfish","IPMI"]}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#ManagerAccount.v1_14_1.ManagerAccount",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"account-1\"")?);
+        let bios = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::Bios,
+            "/redfish/v1/Systems/1/Bios",
+            r#"{"Id":"BIOS","Name":"BIOS Configuration","AttributeRegistry":"BiosAttributeRegistry.v1_0_0","ResetBiosToDefaultsPending":false}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#Bios.v1_2_3.Bios")?)
+        .with_etag(ResourceEtag::parse("W/\"bios-1\"")?);
+        let boot_option = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::BootOptions,
+            "/redfish/v1/Systems/1/BootOptions/PXE-1",
+            r#"{"Id":"PXE-1","Name":"Network Boot Option","Description":"PXE boot option","BootOptionReference":"Boot0001","DisplayName":"PXE Network Boot","BootOptionEnabled":true,"UefiDevicePath":"PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)","Alias":"Pxe"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#BootOption.v1_0_6.BootOption")?);
+        let secure_boot = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::SecureBoot,
+            "/redfish/v1/Systems/1/SecureBoot",
+            r#"{"Id":"SecureBoot","Name":"Secure Boot","SecureBootEnable":true,"SecureBootCurrentBoot":"Enabled","SecureBootMode":"DeployedMode"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#SecureBoot.v1_1_2.SecureBoot")?)
+        .with_etag(ResourceEtag::parse("W/\"secure-boot-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, account, bios, boot_option, secure_boot],
         )?)
     }
 
