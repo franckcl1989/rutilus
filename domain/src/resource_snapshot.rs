@@ -14,11 +14,14 @@ const MAX_TYPED_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// Every variant's `as_str()` code is the §2.1 feature name and equals the
 /// matching [`EndpointCapability`] product code, so snapshot and ledger
-/// projections never translate the same wire string twice. The one deliberate
-/// exception is [`Self::SoftwareInventory`]: it is the read surface under the
-/// §2.1 `update-service` feature, so its `software-inventory` family code is
-/// narrower than the `update-service` capability code, which also covers the
-/// update operations of the same family (see the ledger-consistency test).
+/// projections never translate the same wire string twice. The deliberate
+/// exceptions are the subsidiary read surfaces under the service features:
+/// [`Self::SoftwareInventory`] under `update-service`, [`Self::EventSubscription`]
+/// under `event-service`, [`Self::MetricDefinition`] and [`Self::MetricReport`]
+/// under `telemetry-service`, and [`Self::Task`] under `task-service`. Each
+/// subsidiary family code is narrower than its service capability code, which
+/// also covers the operations of the same family (see the ledger-consistency
+/// test).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResourceFeature {
     ServiceRoot,
@@ -104,6 +107,51 @@ pub enum ResourceFeature {
     /// surface and the update operations, so this variant addresses only the
     /// read surface and must not be mistaken for a capability code.
     SoftwareInventory,
+    /// The §2.1 `event-service` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    EventService,
+    /// One subscription under the §2.1 `event-service` read surface, added as
+    /// a typed resource family in the 0.2 snapshot. The family code is
+    /// `event-subscription` (not `event-service`, which stays the capability
+    /// code): one `event-service` capability covers both the subscription read
+    /// surface and the event operations, so this variant addresses only the
+    /// read surface and must not be mistaken for a capability code. Redfish
+    /// models subscriptions as `EventDestination` resources; nv-redfish 0.13
+    /// does not compile that type, and infra decodes the `Subscriptions` leaf
+    /// with a local minimal schema.
+    EventSubscription,
+    /// The §2.1 `telemetry-service` feature, added as a typed resource family
+    /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    TelemetryService,
+    /// One metric definition under the §2.1 `telemetry-service` read surface,
+    /// added as a typed resource family in the 0.2 snapshot. The family code
+    /// is `metric-definition` (not `telemetry-service`, which stays the
+    /// capability code): one `telemetry-service` capability covers both the
+    /// definition read surface and the telemetry operations, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code.
+    MetricDefinition,
+    /// One metric report under the §2.1 `telemetry-service` read surface,
+    /// added as a typed resource family in the 0.2 snapshot. The family code
+    /// is `metric-report` (not `telemetry-service`, which stays the
+    /// capability code): one `telemetry-service` capability covers both the
+    /// report read surface and the telemetry operations, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code.
+    MetricReport,
+    /// The §2.1 `task-service` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface.
+    TaskService,
+    /// One task under the §2.1 `task-service` read surface, added as a typed
+    /// resource family in the 0.2 snapshot. The family code is `task` (not
+    /// `task-service`, which stays the capability code): one `task-service`
+    /// capability covers both the task read surface and the task operations,
+    /// so this variant addresses only the read surface and must not be
+    /// mistaken for a capability code.
+    Task,
 }
 
 impl ResourceFeature {
@@ -134,6 +182,13 @@ impl ResourceFeature {
             Self::PcieDevices => "pcie-devices",
             Self::Assembly => "assembly",
             Self::SoftwareInventory => "software-inventory",
+            Self::EventService => "event-service",
+            Self::EventSubscription => "event-subscription",
+            Self::TelemetryService => "telemetry-service",
+            Self::MetricDefinition => "metric-definition",
+            Self::MetricReport => "metric-report",
+            Self::TaskService => "task-service",
+            Self::Task => "task",
         }
     }
 }
@@ -172,6 +227,13 @@ impl FromStr for ResourceFeature {
             "pcie-devices" => Ok(Self::PcieDevices),
             "assembly" => Ok(Self::Assembly),
             "software-inventory" => Ok(Self::SoftwareInventory),
+            "event-service" => Ok(Self::EventService),
+            "event-subscription" => Ok(Self::EventSubscription),
+            "telemetry-service" => Ok(Self::TelemetryService),
+            "metric-definition" => Ok(Self::MetricDefinition),
+            "metric-report" => Ok(Self::MetricReport),
+            "task-service" => Ok(Self::TaskService),
+            "task" => Ok(Self::Task),
             _ => Err(ResourceFeatureParseError),
         }
     }
@@ -730,6 +792,13 @@ mod tests {
             ResourceFeature::PcieDevices,
             ResourceFeature::Assembly,
             ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
         ];
 
         for feature in features {
@@ -741,6 +810,9 @@ mod tests {
         );
     }
 
+    // The exhaustive per-family assertions below exceed the pedantic
+    // line budget because every mapped pair is spelled out on the wire.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn typed_family_codes_round_trip_and_match_the_capability_ledger() {
         // The snapshot feature and the §2.1 capability ledger must speak the
@@ -800,6 +872,22 @@ mod tests {
                 EndpointCapability::PcieDevices,
             ),
             (ResourceFeature::Assembly, EndpointCapability::Assembly),
+            // The 0.2 service families reuse the §2.1 codes the ledger
+            // already persists for `event-service`, `telemetry-service`, and
+            // `task-service`, so the feature and capability inventories
+            // cannot drift on the wire.
+            (
+                ResourceFeature::EventService,
+                EndpointCapability::EventService,
+            ),
+            (
+                ResourceFeature::TelemetryService,
+                EndpointCapability::TelemetryService,
+            ),
+            (
+                ResourceFeature::TaskService,
+                EndpointCapability::TaskService,
+            ),
         ];
         for (feature, capability) in families {
             assert_eq!(feature.as_str(), capability.as_str());
@@ -837,8 +925,51 @@ mod tests {
                 .parse::<EndpointCapability>(),
             Err(EndpointCapabilityParseError)
         );
+        // The 0.2 subsidiary read surfaces under the three service features
+        // follow the `software-inventory` precedent above: each family code is
+        // narrower than its service capability code, so the mapping is
+        // asserted explicitly (and the family codes must not parse as
+        // capabilities) so the two inventories cannot silently drift into
+        // aliasing each other.
+        let subsidiary = [
+            (
+                ResourceFeature::EventSubscription,
+                EndpointCapability::EventService,
+            ),
+            (
+                ResourceFeature::MetricDefinition,
+                EndpointCapability::TelemetryService,
+            ),
+            (
+                ResourceFeature::MetricReport,
+                EndpointCapability::TelemetryService,
+            ),
+            (ResourceFeature::Task, EndpointCapability::TaskService),
+        ];
+        for (feature, capability) in subsidiary {
+            assert_ne!(feature.as_str(), capability.as_str());
+            assert_eq!(feature.as_str().parse(), Ok(feature));
+            assert_eq!(
+                feature.as_str().parse::<EndpointCapability>(),
+                Err(EndpointCapabilityParseError)
+            );
+            assert_eq!(capability.as_str().parse(), Ok(capability));
+        }
+        assert_eq!(
+            ResourceFeature::EventSubscription.as_str(),
+            "event-subscription"
+        );
+        assert_eq!(
+            ResourceFeature::MetricDefinition.as_str(),
+            "metric-definition"
+        );
+        assert_eq!(ResourceFeature::MetricReport.as_str(), "metric-report");
+        assert_eq!(ResourceFeature::Task.as_str(), "task");
     }
 
+    // The exhaustive near-miss spellings below exceed the pedantic line
+    // budget because every rejected wire string is listed explicitly.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn rejects_unknown_and_near_miss_feature_codes() {
         // Singular forms and trailing punctuation would silently address a
@@ -923,6 +1054,49 @@ mod tests {
             "SoftwareInventory",
             "software",
             "update-service",
+            "event-services",
+            "eventservice",
+            "event_service",
+            "EventService",
+            "event-service/",
+            "event",
+            "events",
+            "event-destination",
+            "event-destinations",
+            "subscription",
+            "subscriptions",
+            "event-subscriptions",
+            "eventsubscription",
+            "event_subscription",
+            "EventSubscription",
+            "event-subscription/",
+            "telemetry-services",
+            "telemetryservice",
+            "telemetry_service",
+            "TelemetryService",
+            "telemetry-service/",
+            "metric-definitions",
+            "metricdefinition",
+            "metric_definition",
+            "MetricDefinition",
+            "metric-definition/",
+            "metric",
+            "metrics",
+            "metric-reports",
+            "metricreport",
+            "metric_report",
+            "MetricReport",
+            "metric-report/",
+            "task-services",
+            "taskservice",
+            "task_service",
+            "TaskService",
+            "task-service/",
+            "tasks",
+            "task/",
+            "Task",
+            "subtask",
+            "subtasks",
         ] {
             assert_eq!(
                 code.parse::<ResourceFeature>(),
