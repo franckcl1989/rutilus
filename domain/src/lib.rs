@@ -8,6 +8,7 @@ mod capability;
 mod credential;
 mod endpoint;
 mod endpoint_address;
+mod event;
 mod ids;
 mod operation;
 mod redfish_command;
@@ -39,6 +40,10 @@ pub use endpoint::{
     TlsIdentityChanged, TlsTrust,
 };
 pub use endpoint_address::{EndpointAddress, EndpointAddressError};
+pub use event::{
+    Event, EventId, EventSeverity, EventSeverityParseError, EventTimelineError, MessageId,
+    MessageIdError,
+};
 pub use ids::{
     ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
     OperationId, ResourceId, TargetId,
