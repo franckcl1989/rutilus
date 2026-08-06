@@ -6,9 +6,12 @@ mod application_adapter;
 mod redfish_gateway;
 mod tls_probe;
 
+pub use application_adapter::{CommandDispatchError, CommandVerifyError, RedfishCommandExecutor};
 pub use redfish_gateway::{
-    CoreEndpointDiscovery, CoreResourceProjection, CoreResourceReadError, RedfishGateway,
-    RedfishServiceRootError, ServiceRootSummary, TlsIdentityStateError,
+    CommandExecutionError, CommandExecutionOutcome, CommandRejection, CommandVerificationError,
+    CommandVerificationOutcome, CoreEndpointDiscovery, CoreResourceProjection,
+    CoreResourceReadError, RedfishGateway, RedfishServiceRootError, ServiceRootSummary,
+    TlsIdentityStateError,
 };
 pub use tls_probe::{
     SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,
