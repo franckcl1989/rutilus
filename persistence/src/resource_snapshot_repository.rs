@@ -1210,6 +1210,122 @@ mod tests {
     }
 
     #[tokio::test]
+    // The seven service families must round-trip inside one committed
+    // Generation so the count and full-equality assertions prove the complete
+    // family set; splitting them would duplicate the store setup and fragment
+    // the round-trip proof. The domain crate allows the same on its long
+    // round-trip tests.
+    #[allow(clippy::too_many_lines)]
+    async fn commits_and_reads_back_event_telemetry_and_task_features() -> Result<(), Box<dyn Error>>
+    {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1/", "Root")?,
+            observation(
+                ResourceFeature::EventService,
+                "/redfish/v1/EventService",
+                "Event Service",
+            )?
+            .with_odata_type(ResourceODataType::parse(
+                "#EventService.v1_12_0.EventService",
+            )?),
+            observation(
+                ResourceFeature::EventSubscription,
+                "/redfish/v1/EventService/Subscriptions/1",
+                "Subscription One",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"subscription-1\"")?),
+            observation(
+                ResourceFeature::TelemetryService,
+                "/redfish/v1/TelemetryService",
+                "Telemetry Service",
+            )?,
+            observation(
+                ResourceFeature::MetricDefinition,
+                "/redfish/v1/TelemetryService/MetricDefinitions/1",
+                "Inlet Temperature Definition",
+            )?,
+            observation(
+                ResourceFeature::MetricReport,
+                "/redfish/v1/TelemetryService/MetricReports/1",
+                "Inlet Temperature Report",
+            )?
+            .with_etag(ResourceEtag::parse("W/\"report-1\"")?),
+            observation(
+                ResourceFeature::TaskService,
+                "/redfish/v1/TaskService",
+                "Task Service",
+            )?,
+            observation(
+                ResourceFeature::Task,
+                "/redfish/v1/TaskService/Tasks/1",
+                "Firmware Update Task",
+            )?
+            .with_odata_type(ResourceODataType::parse("#Task.v1_7_4.Task")?),
+        ];
+        let committed = store
+            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .await?;
+        assert!(
+            committed
+                .iter()
+                .all(|snapshot| snapshot.generation().get() == 1)
+        );
+        let event_service = committed
+            .iter()
+            .find(|snapshot| snapshot.feature() == ResourceFeature::EventService)
+            .ok_or("event service snapshot is missing")?;
+        assert_eq!(
+            event_service.odata_id().as_str(),
+            "/redfish/v1/EventService"
+        );
+        assert_eq!(
+            event_service.odata_type().map(ResourceODataType::as_str),
+            Some("#EventService.v1_12_0.EventService")
+        );
+        assert!(event_service.payload().as_str().contains("Event Service"));
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for (feature, expected) in [
+            (ResourceFeature::EventService, 1),
+            (ResourceFeature::EventSubscription, 1),
+            (ResourceFeature::TelemetryService, 1),
+            (ResourceFeature::MetricDefinition, 1),
+            (ResourceFeature::MetricReport, 1),
+            (ResourceFeature::TaskService, 1),
+            (ResourceFeature::Task, 1),
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                expected,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+        assert!(loaded.iter().all(|snapshot| matches!(
+            snapshot.feature(),
+            ResourceFeature::ServiceRoot
+                | ResourceFeature::EventService
+                | ResourceFeature::EventSubscription
+                | ResourceFeature::TelemetryService
+                | ResourceFeature::MetricDefinition
+                | ResourceFeature::MetricReport
+                | ResourceFeature::TaskService
+                | ResourceFeature::Task
+        )));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn feature_change_rejection_rolls_back_the_complete_generation()
     -> Result<(), Box<dyn Error>> {
         let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
