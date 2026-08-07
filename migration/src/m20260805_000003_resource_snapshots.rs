@@ -53,6 +53,13 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         "systems",
                         "chassis",
                         "managers",
+                        // The 0.5 Dell Attributes family reads the manager's
+                        // Dell `Attributes` document; the code is the narrow
+                        // surface code of `ResourceFeature::OemDell`, distinct
+                        // from the `oem-dell` / `oem-dell-attributes`
+                        // capability codes that stay with the capability
+                        // ledger.
+                        "dell-attributes",
                         "processors",
                         "memory",
                         "storages",
