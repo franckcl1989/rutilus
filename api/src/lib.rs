@@ -3580,6 +3580,734 @@ impl TagListResponse {
     }
 }
 
+/// The §16.1 role of one principal, as spoken on the wire.
+///
+/// The codes are the stable persistence contract (`role_assignments.role`
+/// CHECK constraint), so the wire form and the domain vocabulary never
+/// drift.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleResponse {
+    Administrator,
+    Operator,
+    Viewer,
+}
+
+/// The §16.1 enabled/disabled state of one principal, as spoken on the wire.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalStateResponse {
+    Enabled,
+    Disabled,
+}
+
+/// A credential-presenting sign-in attempt (§16.2).
+///
+/// The password never leaves the `SecretString` wrapper on its way to the
+/// verification boundary; serialization is required by the WASM client,
+/// while `Debug` remains permanently redacted. The optional TOTP code is
+/// presented when the principal's active authenticator requires the second
+/// factor.
+pub struct LoginRequest {
+    username: String,
+    password: SecretString,
+    totp_code: Option<String>,
+}
+
+impl LoginRequest {
+    #[must_use]
+    pub fn new(username: String, password: SecretString, totp_code: Option<String>) -> Self {
+        Self {
+            username,
+            password,
+            totp_code,
+        }
+    }
+
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    #[must_use]
+    pub fn password(&self) -> &SecretString {
+        &self.password
+    }
+
+    #[must_use]
+    pub fn totp_code(&self) -> Option<&str> {
+        self.totp_code.as_deref()
+    }
+}
+
+impl Serialize for LoginRequest {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        #[derive(Serialize)]
+        struct WireLoginRequest<'a> {
+            username: &'a str,
+            password: &'a str,
+            totp_code: Option<&'a str>,
+        }
+
+        WireLoginRequest {
+            username: &self.username,
+            password: self.password.expose_secret(),
+            totp_code: self.totp_code.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LoginRequest {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireLoginRequest {
+            username: String,
+            password: String,
+            totp_code: Option<String>,
+        }
+
+        let wire = WireLoginRequest::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.username,
+            wire.password.into(),
+            wire.totp_code,
+        ))
+    }
+}
+
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("totp_code", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The CSRF token of a fresh session (§16.2 "CSRF 防护").
+///
+/// The session cookie is set by the response itself; the body carries only
+/// the CSRF token the client must present with every mutating request. The
+/// token is a single-use-per-session secret, so the body never contains the
+/// session token itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginResponse {
+    csrf_token: String,
+}
+
+impl LoginResponse {
+    #[must_use]
+    pub const fn new(csrf_token: String) -> Self {
+        Self { csrf_token }
+    }
+
+    #[must_use]
+    pub fn csrf_token(&self) -> &str {
+        &self.csrf_token
+    }
+}
+
+/// The explicit sign-out of the presenting session (§16.2).
+///
+/// The empty body keeps the wire contract strict: unknown fields are
+/// refused, so a client cannot smuggle state into the request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogoutRequest {}
+
+/// The first-startup claim of the product (§16.2 "首次启动生成一次性
+/// Bootstrap Code").
+///
+/// The claim binds the one-time code, sets the initial password of the
+/// built-in administrator, and — when the optional TOTP pair is present —
+/// enrolls and activates a TOTP authenticator: `totp_secret` is the base32
+/// secret of the operator's authenticator app and `totp_code` proves
+/// possession of it. The two fields stand or fall together; a claim with
+/// exactly one of them is rejected at the boundary. Serialization is
+/// required by the WASM client, while `Debug` remains permanently redacted.
+pub struct BootstrapCompleteRequest {
+    code: String,
+    password: SecretString,
+    totp_secret: Option<String>,
+    totp_code: Option<String>,
+}
+
+impl BootstrapCompleteRequest {
+    #[must_use]
+    pub fn new(
+        code: String,
+        password: SecretString,
+        totp_secret: Option<String>,
+        totp_code: Option<String>,
+    ) -> Self {
+        Self {
+            code,
+            password,
+            totp_secret,
+            totp_code,
+        }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub fn password(&self) -> &SecretString {
+        &self.password
+    }
+
+    #[must_use]
+    pub fn totp_secret(&self) -> Option<&str> {
+        self.totp_secret.as_deref()
+    }
+
+    #[must_use]
+    pub fn totp_code(&self) -> Option<&str> {
+        self.totp_code.as_deref()
+    }
+
+    /// Reports whether the optional TOTP pair is complete.
+    ///
+    /// The two fields stand or fall together: a claim with exactly one of
+    /// them cannot be a coherent enrollment.
+    #[must_use]
+    pub fn has_complete_totp_pair(&self) -> bool {
+        self.totp_secret.is_some() == self.totp_code.is_some()
+    }
+}
+
+impl Serialize for BootstrapCompleteRequest {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        #[derive(Serialize)]
+        struct WireBootstrapCompleteRequest<'a> {
+            code: &'a str,
+            password: &'a str,
+            totp_secret: Option<&'a str>,
+            totp_code: Option<&'a str>,
+        }
+
+        WireBootstrapCompleteRequest {
+            code: &self.code,
+            password: self.password.expose_secret(),
+            totp_secret: self.totp_secret.as_deref(),
+            totp_code: self.totp_code.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BootstrapCompleteRequest {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireBootstrapCompleteRequest {
+            code: String,
+            password: String,
+            totp_secret: Option<String>,
+            totp_code: Option<String>,
+        }
+
+        let wire = WireBootstrapCompleteRequest::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.code,
+            wire.password.into(),
+            wire.totp_secret,
+            wire.totp_code,
+        ))
+    }
+}
+
+impl fmt::Debug for BootstrapCompleteRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapCompleteRequest")
+            .field("code", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .field("totp_secret", &"[REDACTED]")
+            .field("totp_code", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The session and CSRF tokens of a completed bootstrap claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapCompleteResponse {
+    csrf_token: String,
+}
+
+impl BootstrapCompleteResponse {
+    #[must_use]
+    pub const fn new(csrf_token: String) -> Self {
+        Self { csrf_token }
+    }
+
+    #[must_use]
+    pub fn csrf_token(&self) -> &str {
+        &self.csrf_token
+    }
+}
+
+/// A signed-in principal changing their own password (§16.2).
+///
+/// The current password authenticates the request; the new password must
+/// pass the product password policy at the boundary. Both values are
+/// `SecretString`-wrapped, serialized only for the WASM client, and never
+/// echoed by any response.
+pub struct SetPasswordRequest {
+    current_password: SecretString,
+    new_password: SecretString,
+}
+
+impl SetPasswordRequest {
+    #[must_use]
+    pub fn new(current_password: SecretString, new_password: SecretString) -> Self {
+        Self {
+            current_password,
+            new_password,
+        }
+    }
+
+    #[must_use]
+    pub fn current_password(&self) -> &SecretString {
+        &self.current_password
+    }
+
+    #[must_use]
+    pub fn new_password(&self) -> &SecretString {
+        &self.new_password
+    }
+}
+
+impl Serialize for SetPasswordRequest {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        #[derive(Serialize)]
+        struct WireSetPasswordRequest<'a> {
+            current_password: &'a str,
+            new_password: &'a str,
+        }
+
+        WireSetPasswordRequest {
+            current_password: self.current_password.expose_secret(),
+            new_password: self.new_password.expose_secret(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SetPasswordRequest {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireSetPasswordRequest {
+            current_password: String,
+            new_password: String,
+        }
+
+        let wire = WireSetPasswordRequest::deserialize(deserializer)?;
+        Ok(Self::new(
+            wire.current_password.into(),
+            wire.new_password.into(),
+        ))
+    }
+}
+
+impl fmt::Debug for SetPasswordRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SetPasswordRequest")
+            .field("current_password", &"[REDACTED]")
+            .field("new_password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The identity summary of one authenticated principal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalSummaryResponse {
+    id: String,
+    name: String,
+    state: PrincipalStateResponse,
+    role: Option<RoleResponse>,
+}
+
+impl PrincipalSummaryResponse {
+    #[must_use]
+    pub fn new(
+        id: String,
+        name: String,
+        state: PrincipalStateResponse,
+        role: Option<RoleResponse>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            state,
+            role,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> PrincipalStateResponse {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> Option<RoleResponse> {
+        self.role
+    }
+}
+
+/// The session state of the requesting client (§16.2).
+///
+/// The console decides its first screen from this response: an
+/// authenticated caller receives their principal summary, an
+/// unauthenticated one receives whether the first-startup bootstrap claim
+/// is still pending.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeResponse {
+    authenticated: bool,
+    bootstrap_pending: bool,
+    principal: Option<PrincipalSummaryResponse>,
+}
+
+impl MeResponse {
+    #[must_use]
+    pub const fn new(
+        authenticated: bool,
+        bootstrap_pending: bool,
+        principal: Option<PrincipalSummaryResponse>,
+    ) -> Self {
+        Self {
+            authenticated,
+            bootstrap_pending,
+            principal,
+        }
+    }
+
+    #[must_use]
+    pub const fn authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    #[must_use]
+    pub const fn bootstrap_pending(&self) -> bool {
+        self.bootstrap_pending
+    }
+
+    #[must_use]
+    pub fn principal(&self) -> Option<&PrincipalSummaryResponse> {
+        self.principal.as_ref()
+    }
+}
+
+/// One session row of the §16.2 session administration view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummaryResponse {
+    session_id: String,
+    principal_id: String,
+    principal_name: String,
+    created_at: OffsetDateTime,
+    last_used_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    revoked_at: Option<OffsetDateTime>,
+    current: bool,
+}
+
+impl SessionSummaryResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        session_id: String,
+        principal_id: String,
+        principal_name: String,
+        created_at: OffsetDateTime,
+        last_used_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+        revoked_at: Option<OffsetDateTime>,
+        current: bool,
+    ) -> Self {
+        Self {
+            session_id,
+            principal_id,
+            principal_name,
+            created_at,
+            last_used_at,
+            expires_at,
+            revoked_at,
+            current,
+        }
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    #[must_use]
+    pub fn principal_name(&self) -> &str {
+        &self.principal_name
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn last_used_at(&self) -> OffsetDateTime {
+        self.last_used_at
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+
+    #[must_use]
+    pub const fn revoked_at(&self) -> Option<OffsetDateTime> {
+        self.revoked_at
+    }
+
+    #[must_use]
+    pub const fn is_current(&self) -> bool {
+        self.current
+    }
+}
+
+/// The complete session administration listing (§16.2).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAdminResponse {
+    sessions: Vec<SessionSummaryResponse>,
+}
+
+impl SessionAdminResponse {
+    #[must_use]
+    pub const fn new(sessions: Vec<SessionSummaryResponse>) -> Self {
+        Self { sessions }
+    }
+
+    #[must_use]
+    pub fn sessions(&self) -> &[SessionSummaryResponse] {
+        &self.sessions
+    }
+}
+
+/// Revokes one presented session by its stable identity (§16.2).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeSessionRequest {
+    session_id: Uuid,
+}
+
+impl RevokeSessionRequest {
+    #[must_use]
+    pub const fn new(session_id: Uuid) -> Self {
+        Self { session_id }
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+}
+
+/// One principal row of the §16.1 user administration view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserSummaryResponse {
+    id: String,
+    name: String,
+    state: PrincipalStateResponse,
+    role: Option<RoleResponse>,
+    created_at: OffsetDateTime,
+}
+
+impl UserSummaryResponse {
+    #[must_use]
+    pub fn new(
+        id: String,
+        name: String,
+        state: PrincipalStateResponse,
+        role: Option<RoleResponse>,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            state,
+            role,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> PrincipalStateResponse {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> Option<RoleResponse> {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// The complete user administration listing (§16.1).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAdminResponse {
+    users: Vec<UserSummaryResponse>,
+}
+
+impl UserAdminResponse {
+    #[must_use]
+    pub const fn new(users: Vec<UserSummaryResponse>) -> Self {
+        Self { users }
+    }
+
+    #[must_use]
+    pub fn users(&self) -> &[UserSummaryResponse] {
+        &self.users
+    }
+}
+
+/// Creates one product user principal with its §16.1 role.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserRequest {
+    name: String,
+    role: RoleResponse,
+}
+
+impl CreateUserRequest {
+    #[must_use]
+    pub fn new(name: String, role: RoleResponse) -> Self {
+        Self { name, role }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> RoleResponse {
+        self.role
+    }
+}
+
+/// Transitions one principal's §16.1 enabled/disabled state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetPrincipalStateRequest {
+    state: PrincipalStateResponse,
+}
+
+impl SetPrincipalStateRequest {
+    #[must_use]
+    pub const fn new(state: PrincipalStateResponse) -> Self {
+        Self { state }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> PrincipalStateResponse {
+        self.state
+    }
+}
+
+/// Reassigns one principal's §16.1 role.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignRoleRequest {
+    role: RoleResponse,
+}
+
+impl AssignRoleRequest {
+    #[must_use]
+    pub const fn new(role: RoleResponse) -> Self {
+        Self { role }
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> RoleResponse {
+        self.role
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
@@ -8591,6 +9319,308 @@ mod tests {
                 endpoint_id,
                 "production".to_owned(),
             )])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_contract_is_secret_safe_and_strict() -> Result<(), Box<dyn Error>> {
+        // The sign-in request carries the wrapped password and the optional
+        // TOTP code; unknown fields are refused.
+        let request = LoginRequest::new(
+            "admin".to_owned(),
+            "correct horse battery staple".to_owned().into(),
+            Some("123456".to_owned()),
+        );
+        let request_json = serde_json::to_value(&request)?;
+        assert_eq!(request.username(), "admin");
+        assert_eq!(request.totp_code(), Some("123456"));
+        assert_eq!(
+            request_json,
+            json!({
+                "username": "admin",
+                "password": "correct horse battery staple",
+                "totp_code": "123456"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<LoginRequest>(request_json)?)?,
+            json!({
+                "username": "admin",
+                "password": "correct horse battery staple",
+                "totp_code": "123456"
+            })
+        );
+        assert!(!format!("{request:?}").contains("correct horse battery staple"));
+        assert!(
+            serde_json::from_value::<LoginRequest>(json!({
+                "username": "admin",
+                "password": "correct horse battery staple",
+                "totp_code": "123456",
+                "remember_me": true
+            }))
+            .is_err(),
+            "unknown login fields must be rejected"
+        );
+
+        // The login response carries only the CSRF token — never the session
+        // token, which lives in the response cookie.
+        let response = LoginResponse::new("csrf-value".to_owned());
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({ "csrf_token": "csrf-value" })
+        );
+        assert_eq!(
+            serde_json::from_value::<LoginResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert!(
+            serde_json::from_value::<LoginResponse>(json!({ "session_token": "x" })).is_err(),
+            "a session token must never appear in the body"
+        );
+
+        // The logout request is an empty, strict body.
+        assert_eq!(serde_json::to_value(&LogoutRequest {})?, json!({}));
+        assert!(serde_json::from_value::<LogoutRequest>(json!({})).is_ok());
+        assert!(
+            serde_json::from_value::<LogoutRequest>(json!({ "reason": "bye" })).is_err(),
+            "unknown logout fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_contract_keeps_the_totp_pair_optional_but_paired() -> Result<(), Box<dyn Error>> {
+        let plain = BootstrapCompleteRequest::new(
+            "ABCD2345EFGH6789JKLM".to_owned(),
+            "first product password".to_owned().into(),
+            None,
+            None,
+        );
+        assert_eq!(plain.code(), "ABCD2345EFGH6789JKLM");
+        assert!(plain.has_complete_totp_pair());
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<BootstrapCompleteRequest>(
+                serde_json::to_value(&plain)?
+            )?)?,
+            serde_json::to_value(&plain)?
+        );
+        assert!(!format!("{plain:?}").contains("ABCD2345EFGH6789JKLM"));
+
+        // The optional TOTP pair travels together.
+        let paired = BootstrapCompleteRequest::new(
+            "ABCD2345EFGH6789JKLM".to_owned(),
+            "first product password".to_owned().into(),
+            Some("JBSWY3DPEHPK3PXP".to_owned()),
+            Some("123456".to_owned()),
+        );
+        assert!(paired.has_complete_totp_pair());
+        assert_eq!(paired.totp_secret(), Some("JBSWY3DPEHPK3PXP"));
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<BootstrapCompleteRequest>(
+                serde_json::to_value(&paired)?
+            )?)?,
+            serde_json::to_value(&paired)?
+        );
+
+        // A half-present TOTP pair deserializes but reports the incomplete
+        // shape, which the claim boundary refuses before any state changes.
+        let secret_only = serde_json::from_value::<BootstrapCompleteRequest>(json!({
+            "code": "ABCD2345EFGH6789JKLM",
+            "password": "first product password",
+            "totp_secret": "JBSWY3DPEHPK3PXP"
+        }))?;
+        assert!(
+            !secret_only.has_complete_totp_pair(),
+            "a secret without its activation code is an incomplete pair"
+        );
+        let code_only = serde_json::from_value::<BootstrapCompleteRequest>(json!({
+            "code": "ABCD2345EFGH6789JKLM",
+            "password": "first product password",
+            "totp_code": "123456"
+        }))?;
+        assert!(
+            !code_only.has_complete_totp_pair(),
+            "a code without its secret is an incomplete pair"
+        );
+        assert!(
+            serde_json::from_value::<BootstrapCompleteRequest>(json!({
+                "code": "ABCD2345EFGH6789JKLM",
+                "password": "first product password",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "totp_code": "123456",
+                "remember_me": true
+            }))
+            .is_err(),
+            "unknown bootstrap fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn me_and_admin_contracts_round_trip_with_strict_shapes() -> Result<(), Box<dyn Error>> {
+        // The me response carries the authenticated flag, the bootstrap
+        // gate, and the optional principal summary.
+        let principal = PrincipalSummaryResponse::new(
+            "principal-uuid".to_owned(),
+            "admin".to_owned(),
+            PrincipalStateResponse::Enabled,
+            Some(RoleResponse::Administrator),
+        );
+        let me = MeResponse::new(true, false, Some(principal));
+        assert!(me.authenticated());
+        assert!(!me.bootstrap_pending());
+        assert_eq!(
+            me.principal().map(PrincipalSummaryResponse::role),
+            Some(Some(RoleResponse::Administrator))
+        );
+        assert_eq!(
+            serde_json::to_value(&me)?,
+            json!({
+                "authenticated": true,
+                "bootstrap_pending": false,
+                "principal": {
+                    "id": "principal-uuid",
+                    "name": "admin",
+                    "state": "enabled",
+                    "role": "administrator"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<MeResponse>(serde_json::to_value(&me)?)?,
+            me
+        );
+        assert!(
+            serde_json::from_value::<MeResponse>(json!({
+                "authenticated": true,
+                "bootstrap_pending": false,
+                "principal": null,
+                "extra": true
+            }))
+            .is_err(),
+            "unknown me fields must be rejected"
+        );
+
+        // The session administration rows carry the identity and the
+        // lifecycle times, marking the presenting session.
+        let session = SessionSummaryResponse::new(
+            "session-uuid".to_owned(),
+            "principal-uuid".to_owned(),
+            "admin".to_owned(),
+            OffsetDateTime::parse("2026-08-06T08:00:00Z", &Rfc3339)?,
+            OffsetDateTime::parse("2026-08-06T09:00:00Z", &Rfc3339)?,
+            OffsetDateTime::parse("2026-08-06T16:00:00Z", &Rfc3339)?,
+            None,
+            true,
+        );
+        let sessions = SessionAdminResponse::new(vec![session]);
+        assert_eq!(sessions.sessions().len(), 1);
+        assert!(sessions.sessions()[0].is_current());
+        assert_eq!(
+            serde_json::from_value::<SessionAdminResponse>(serde_json::to_value(&sessions)?)?,
+            sessions
+        );
+        assert!(
+            serde_json::from_value::<SessionAdminResponse>(json!({
+                "sessions": [{
+                    "session_id": "session-uuid",
+                    "principal_id": "principal-uuid",
+                    "principal_name": "admin",
+                    "created_at": "2026-08-06T08:00:00Z",
+                    "last_used_at": "2026-08-06T09:00:00Z",
+                    "expires_at": "2026-08-06T16:00:00Z",
+                    "revoked_at": null,
+                    "current": true,
+                    "device": "must not exist"
+                }]
+            }))
+            .is_err(),
+            "unknown session fields must be rejected"
+        );
+
+        // The user administration rows carry the role and state codes.
+        let user = UserSummaryResponse::new(
+            "principal-uuid".to_owned(),
+            "operator".to_owned(),
+            PrincipalStateResponse::Enabled,
+            Some(RoleResponse::Operator),
+            OffsetDateTime::parse("2026-08-06T08:00:00Z", &Rfc3339)?,
+        );
+        let users = UserAdminResponse::new(vec![user]);
+        assert_eq!(users.users().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<UserAdminResponse>(serde_json::to_value(&users)?)?,
+            users
+        );
+        assert!(
+            serde_json::from_value::<UserAdminResponse>(json!({
+                "users": [{
+                    "id": "principal-uuid",
+                    "name": "operator",
+                    "state": "enabled",
+                    "role": "operator",
+                    "created_at": "2026-08-06T08:00:00Z",
+                    "badge": "must not exist"
+                }]
+            }))
+            .is_err(),
+            "unknown user fields must be rejected"
+        );
+
+        // The administration write requests are strict and typed.
+        let create = CreateUserRequest::new("viewer".to_owned(), RoleResponse::Viewer);
+        assert_eq!(
+            serde_json::to_value(&create)?,
+            json!({ "name": "viewer", "role": "viewer" })
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateUserRequest>(serde_json::to_value(&create)?)?,
+            create
+        );
+        assert!(
+            serde_json::from_value::<CreateUserRequest>(json!({ "name": "viewer" })).is_err(),
+            "a role is required to create a user"
+        );
+        let state = SetPrincipalStateRequest::new(PrincipalStateResponse::Disabled);
+        assert_eq!(
+            serde_json::to_value(&state)?,
+            json!({ "state": "disabled" })
+        );
+        assert_eq!(
+            serde_json::from_value::<SetPrincipalStateRequest>(serde_json::to_value(&state)?)?,
+            state
+        );
+        assert!(
+            serde_json::from_value::<SetPrincipalStateRequest>(json!({ "state": "suspended" }))
+                .is_err(),
+            "an unknown principal state must be rejected"
+        );
+        let role = AssignRoleRequest::new(RoleResponse::Administrator);
+        assert_eq!(
+            serde_json::to_value(&role)?,
+            json!({ "role": "administrator" })
+        );
+        assert_eq!(
+            serde_json::from_value::<AssignRoleRequest>(serde_json::to_value(&role)?)?,
+            role
+        );
+        let revoke = RevokeSessionRequest::new(uuid::uuid!("3b3a6f2e-8c9a-4b1e-9d2f-5a6b7c8d9e0f"));
+        assert_eq!(
+            serde_json::to_value(&revoke)?,
+            json!({ "session_id": "3b3a6f2e-8c9a-4b1e-9d2f-5a6b7c8d9e0f" })
+        );
+        assert_eq!(
+            serde_json::from_value::<RevokeSessionRequest>(serde_json::to_value(&revoke)?)?,
+            revoke
+        );
+        assert!(
+            serde_json::from_value::<RevokeSessionRequest>(json!({
+                "session_id": "not-a-uuid"
+            }))
+            .is_err(),
+            "an invalid session id must be rejected"
         );
         Ok(())
     }
