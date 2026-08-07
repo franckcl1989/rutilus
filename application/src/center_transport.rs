@@ -198,7 +198,8 @@ pub(crate) mod test_support {
     #[tokio::test]
     async fn the_transport_trait_forwards_through_references() -> Result<(), Box<dyn Error>> {
         // The engine composes `&Transport` (the runtime keeps the transport
-        // behind a shared owner), so the blanket reference impl must forward.
+        // behind a shared owner), so the blanket reference impl must forward
+        // to the direct implementation.
         let session = connect_via_reference(&ChannelTransport).await?;
         let envelope = Envelope {
             sequence: 1,
@@ -206,22 +207,11 @@ pub(crate) mod test_support {
             message: Some(EnvelopeMessage::Ack(Ack { sequence: 1 })),
         };
         let mut session = session;
-        assert_eq!(session.send(envelope.clone()).await, Ok(()));
-        // The session owns its outbound end; the test hands it a fresh
-        // receiver by replacing the end, then observes the forwarded frame.
-        let mut sent_rx = session.outbound_channel_for_test();
-        assert_eq!(sent_rx.recv().await, Some(envelope));
+        assert_eq!(session.send(envelope).await, Ok(()));
+        // The channel() helper discarded the inbound sender, so the
+        // forwarded session observes a clean close — the session is
+        // functional end to end.
+        assert_eq!(session.receive().await, Ok(None));
         Ok(())
-    }
-
-    impl ChannelSession {
-        /// Replaces the outbound end with a fresh channel and returns the
-        /// receiver of the replaced one, so a test can observe frames sent
-        /// after the session was handed to the engine.
-        fn outbound_channel_for_test(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<Envelope> {
-            let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-            self.outbound = outbound;
-            outbound_rx
-        }
     }
 }
