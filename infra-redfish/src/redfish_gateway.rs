@@ -36,6 +36,21 @@ use nv_redfish::{
     // feature's own generated module (`oem::dell::schema`), not in the base
     // `schema` module where the standard types are re-exported.
     oem::dell::schema::dell_attributes::DellAttributes as DellAttributesSchema,
+    // The Lenovo OEM feature compiles its own generated module tree
+    // (`oem::lenovo::schema`) exactly like the Dell, NVIDIA, and Supermicro
+    // features. The manager's `Oem.Lenovo` segment decodes through the
+    // compiled untagged `LenovoManagerSchema` — the same dual-version serde
+    // fallback the upstream `LenovoManager` wrapper performs (v0_1_0 with the
+    // boolean `KCSEnabled` shape, v1_0_0 with the state-string shape, and the
+    // `Security` navigation on the unversioned `base` shared by both) — and
+    // the `Security` navigation is resolved into the `LenovoSecurityService`
+    // document.
+    oem::lenovo::manager::LenovoManagerSchema,
+    oem::lenovo::schema::lenovo_security_service::{
+        FwRollbackState as LenovoFwRollbackStateSchema,
+        LenovoSecurityService as LenovoSecurityServiceSchema,
+    },
+    oem::lenovo::schema::resource::Resource as LenovoResourceSchema,
     // The NVIDIA OEM feature compiles its own generated module tree
     // (`oem::nvidia::schema`) exactly like the Dell and Supermicro features.
     // The system-config-profile family navigates from the ComputerSystem's
@@ -46,7 +61,21 @@ use nv_redfish::{
     // themselves: the segment and every chain document are fetched and
     // decoded through these schemas, never a raw JSON read (§11.5 two-way
     // rule).
+    oem::nvidia::schema::nvidia_chassis::NvidiaSmaChassis as NvidiaSmaChassisSchema,
     oem::nvidia::schema::nvidia_computer_system::NvidiaComputerSystem as NvidiaComputerSystemSchema,
+    oem::nvidia::schema::nvidia_debug_token::{
+        GenerateTokenResponse as NvidiaDebugTokenGenerateTokenResponse,
+        NvidiaDebugToken as NvidiaDebugTokenSchema,
+        NvidiaDebugTokenDisableTokenAction as NvidiaDebugTokenDisableTokenActionSchema,
+        NvidiaDebugTokenGenerateTokenAction as NvidiaDebugTokenGenerateTokenActionSchema,
+        NvidiaDebugTokenInstallTokenAction as NvidiaDebugTokenInstallTokenActionSchema,
+    },
+    oem::nvidia::schema::nvidia_debug_token_management::{
+        EraseType as NvidiaEraseTypeSchema,
+        NvidiaDebugTokenManagement as NvidiaDebugTokenManagementSchema,
+        NvidiaDebugTokenManagementEraseTokenAction as NvidiaDebugTokenManagementEraseTokenActionSchema,
+        TokenType as NvidiaTokenTypeSchema,
+    },
     // The §0.5.0 NVIDIA manager chains navigate from the `Manager`'s
     // `Oem.Nvidia` segment: the versioned `NvidiaManager.v1_9_0` module
     // carries the `PowerCompliance` navigation (the decode target must be
@@ -73,6 +102,11 @@ use nv_redfish::{
         ComparisonType as NvidiaPowerPolicyComparisonType,
         NvidiaPowerPolicy as NvidiaPowerPolicySchema, UnitType as NvidiaPowerPolicyUnitType,
     },
+    oem::nvidia::schema::nvidia_power_smoothing::{
+        NvidiaPowerSmoothing as NvidiaPowerSmoothingSchema,
+        NvidiaPowerSmoothingActivatePresetProfileAction as NvidiaPowerSmoothingActivatePresetProfileActionSchema,
+        NvidiaPowerSmoothingApplyAdminOverridesAction as NvidiaPowerSmoothingApplyAdminOverridesActionSchema,
+    },
     oem::nvidia::schema::nvidia_power_state_group::NvidiaPowerStateGroup as NvidiaPowerStateGroupSchema,
     oem::nvidia::schema::nvidia_psc_state::{
         NvidiaPscState as NvidiaPscStateSchema, StatusType as NvidiaPscStateStatusType,
@@ -84,8 +118,13 @@ use nv_redfish::{
     oem::nvidia::schema::nvidia_psu_state::NvidiaPsuState as NvidiaPsuStateSchema,
     oem::nvidia::schema::nvidia_psu_state_collection::NvidiaPsuStateCollection as NvidiaPsuStateCollectionSchema,
     oem::nvidia::schema::nvidia_system_config_profile::NvidiaSystemConfigProfile as NvidiaSystemConfigProfileSchema,
+    oem::nvidia::schema::nvidia_system_config_profile::{
+        NvidiaSystemConfigProfileFactoryResetAction as NvidiaSystemConfigProfileFactoryResetActionSchema,
+        NvidiaSystemConfigProfileUpdateAction as NvidiaSystemConfigProfileUpdateActionSchema,
+    },
     oem::nvidia::schema::nvidia_system_config_profile_status::NvidiaSystemConfigProfileStatus as NvidiaSystemConfigProfileStatusSchema,
     oem::nvidia::schema::nvidia_system_profile::NvidiaSystemProfile as NvidiaSystemProfileSchema,
+    oem::nvidia::schema::nvidia_system_profile::NvidiaSystemProfileActivateAction as NvidiaSystemProfileActivateActionSchema,
     oem::nvidia::schema::nvidia_system_profile_collection::NvidiaSystemProfileCollection as NvidiaSystemProfileCollectionSchema,
     oem::nvidia::schema::nvidia_system_profile_file::NvidiaSystemProfileFile as NvidiaSystemProfileFileSchema,
     // The generated NVIDIA module tree carries its own copies of the
@@ -181,11 +220,12 @@ use rutilus_domain::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
     CertificateFingerprint, ChassisCommand, CreateSubscription, CredentialUsername,
     DeleteSubscription, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
-    EndpointId, Event, EventCommand, EventDestinationProtocol, EventId, EventSeverity, EventType,
-    ManagerCommand, MessageId, RedfishCommand, ResetKeysType, ResetType, ResourceEtag,
-    ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
+    EndpointId, EraseType, Event, EventCommand, EventDestinationProtocol, EventId, EventSeverity,
+    EventType, ManagerCommand, MessageId, NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand,
+    NvidiaSystemConfigProfileCommand, OemCommand, RedfishCommand, ResetKeysType, ResetType,
+    ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
     ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
-    SetBootSourceOverride, SystemCommand, TlsIdentityChanged, TlsTrust,
+    SetBootSourceOverride, SystemCommand, TlsIdentityChanged, TlsTrust, TokenType,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -1508,6 +1548,7 @@ async fn read_manager_resources(
         resources.extend(read_manager_dell_attributes(&manager, bmc, identity, trust).await?);
         resources.extend(read_manager_supermicro_oem(&manager, bmc, identity, trust).await?);
         resources.extend(read_manager_nvidia_oem(&manager, bmc, identity, trust).await?);
+        resources.extend(read_manager_lenovo_oem(&manager, bmc, identity, trust).await?);
     }
     Ok(resources)
 }
@@ -1770,6 +1811,69 @@ async fn read_manager_nvidia_oem(
     Ok(resources)
 }
 
+/// Reads one manager's Lenovo `SecurityService` document (§11.5).
+///
+/// The Lenovo read mirrors `nv-redfish`'s own manager OEM constructor: only a
+/// manager document that advertises `Oem.Lenovo` is probed, the embedded
+/// segment is decoded into the compiled untagged `LenovoManagerSchema` — the
+/// same dual-version serde fallback the upstream `LenovoManager` wrapper
+/// performs (`v0_1_0` with the boolean `KCSEnabled` shape, `v1_0_0` with the
+/// state-string shape, and the `Security` navigation on the unversioned
+/// `base` both variants flatten) — and the present `Security` `NavProperty`
+/// field is resolved through the same typed navigation the upstream
+/// `LenovoManager::security` / `LenovoSecurityService::new` wrappers perform:
+/// an embedded reference is fetched by its `@odata.id`, an embedded expanded
+/// object is used as-is, never a raw JSON read. Unlike the Dell Attributes
+/// surface there is no crafted URL: the `SecurityService` document is
+/// referenced by the manager's own `Oem.Lenovo` segment, so the product
+/// follows the vendor's embedded navigation instead of building one.
+///
+/// A manager without `Oem.Lenovo`, or with an `Oem.Lenovo` segment the
+/// compiled schema cannot decode, produces no snapshot and no fabricated
+/// request; a failed or undecodable document is one odd manager surface and
+/// follows the member-level skip semantics like any other member fetch.
+async fn read_manager_lenovo_oem(
+    manager: &ManagerSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(oem_value) = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Lenovo"))
+    else {
+        return Ok(Vec::new());
+    };
+    // The embedded `Oem.Lenovo` value is vendor-shaped until the compiled
+    // untagged `LenovoManagerSchema` decodes it; a segment the compiled
+    // schema rejects is one odd manager surface and leaves the whole Lenovo
+    // family absent, exactly like an undecodable member.
+    let lenovo_manager: LenovoManagerSchema = match serde_json::from_value(oem_value.clone()) {
+        Ok(segment) => segment,
+        Err(_) => return Ok(Vec::new()),
+    };
+    // The two untagged versions flatten the same unversioned `base` with the
+    // `Security` navigation, so either arm resolves the same reference: the
+    // version difference (the `KCSEnabled` boolean vs state-string shapes)
+    // never affects the read surface, exactly like the upstream `base()`
+    // accessor that serves both versions.
+    let security = match &lenovo_manager {
+        LenovoManagerSchema::V0_1(data) => data.base.security.as_ref(),
+        LenovoManagerSchema::V1_0(data) => data.base.security.as_ref(),
+    };
+    read_singleton_resources(
+        security,
+        bmc,
+        identity,
+        trust,
+        lenovo_security_service_projection,
+    )
+    .await
+}
+
 /// Decodes one `Oem.Nvidia` segment value into the chain-entry
 /// `PowerCompliance` identifier, or returns `None` when the segment is not a
 /// `Manager` segment, carries no chain navigation, or cannot be decoded.
@@ -1841,6 +1945,11 @@ struct NvidiaManagerSegmentReferenceSchema {
     odata_id: ODataId,
     #[serde(rename = "PowerCompliance", default)]
     power_compliance: Option<NavProperty<NvidiaPowerComplianceManagerSchema>>,
+    // The write-side debug-token-management chain resolves the same
+    // reference-form segment through this schema, so the navigation field
+    // lives here next to its sibling (the read side ignores it).
+    #[serde(rename = "DebugTokenManagement", default)]
+    debug_token_management: Option<NavProperty<NvidiaDebugTokenManagementSchema>>,
 }
 
 impl EntityTypeRef for NvidiaManagerSegmentReferenceSchema {
@@ -2230,6 +2339,11 @@ struct NvidiaComputerSystemSegmentSchema {
     odata_id: ODataId,
     #[serde(rename = "SystemConfigProfile", default)]
     system_config_profile: Option<NavProperty<NvidiaSystemConfigProfileSchema>>,
+    // The write-side debug-token chain resolves the same reference-form
+    // segment through this schema, so the navigation field lives here next to
+    // its sibling (the read side ignores it).
+    #[serde(rename = "CPUDebugToken", default)]
+    cpu_debug_token: Option<NavProperty<NvidiaDebugTokenSchema>>,
 }
 
 impl EntityTypeRef for NvidiaComputerSystemSegmentSchema {
@@ -3381,15 +3495,704 @@ async fn execute_authenticated_command(
         RedfishCommand::Update(_) => Err(CommandExecutionError::Rejected(
             CommandRejection::InvalidCommandPayload,
         )),
-        // The Oem family has no typed execution path through this boundary
-        // in this slice: the §11.5 vendor write surfaces are compiled by
-        // the oem-command gateway work. Reaching this arm means the caller
-        // misrouted the command; the refusal is provable (no write is ever
-        // sent) and the payload is rejected because it cannot be executed
-        // through this boundary.
-        RedfishCommand::Oem(_) => Err(CommandExecutionError::Rejected(
-            CommandRejection::InvalidCommandPayload,
-        )),
+        RedfishCommand::Oem(oem) => {
+            execute_nvidia_oem_command(bmc, root, identity, trust, oem).await
+        }
+    }
+}
+
+/// Executes one NVIDIA OEM command through the decoded CSDL actions of its
+/// chain resource (§13.3 step 7).
+///
+/// Every action is invoked through the compiled action reference the decoded
+/// resource advertises (`bmc.action`, the same typed path as the reset
+/// families), with the domain payload projected onto the compiled parameter
+/// types; responses project through [`outcome_from_modification`], so a `202`
+/// Task acceptance surfaces as [`CommandExecutionError::AsyncTaskAccepted`]
+/// for the §13.6 Task monitor. The navigation to each chain resource mirrors
+/// the §11.5 read side exactly: the endpoint's first member of the core
+/// collection, its `Oem.Nvidia` segment (embedded or the `BlueField`
+/// reference-form quirk), and the compiled navigation property — the write
+/// target URI is never guessed (§11.1).
+async fn execute_nvidia_oem_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    oem: &OemCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    match oem {
+        OemCommand::SystemConfigProfile(command) => {
+            execute_nvidia_system_config_profile_command(bmc, root, identity, trust, command).await
+        }
+        OemCommand::DebugToken(command) => {
+            execute_nvidia_debug_token_command(bmc, root, identity, trust, command).await
+        }
+        OemCommand::PowerSmoothing(command) => {
+            execute_nvidia_power_smoothing_command(bmc, root, identity, trust, command).await
+        }
+    }
+}
+
+/// Executes one `NvidiaSystemConfigProfile` command through the decoded
+/// actions of the profile service document (and, for `ActivateProfile`, the
+/// decoded first member of its `Profiles` collection).
+async fn execute_nvidia_system_config_profile_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    command: &NvidiaSystemConfigProfileCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let prepare = |source: BmcError| command_preparation_error(source, identity, trust);
+    match command {
+        NvidiaSystemConfigProfileCommand::Update(profile) => {
+            let Some(service) = nvidia_system_config_profile_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = service
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.update.as_ref())
+            else {
+                // §13.3 step 2: the decoded profile service does not advertise
+                // the Update action, so the command is provably unsupported
+                // on this endpoint.
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaSystemConfigProfileUpdateActionSchema {
+                profile_file: Some(profile.profile_file().to_owned()),
+            };
+            run_nvidia_action::<NvidiaSystemConfigProfileUpdateActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+        NvidiaSystemConfigProfileCommand::FactoryReset => {
+            let Some(service) = nvidia_system_config_profile_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = service
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.factory_reset.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaSystemConfigProfileFactoryResetActionSchema {};
+            run_nvidia_action::<NvidiaSystemConfigProfileFactoryResetActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+        NvidiaSystemConfigProfileCommand::ActivateProfile => {
+            // The `#NvidiaSystemProfile.Activate` action is bound to the
+            // profile member documents, so the write targets the first member
+            // of the service's decoded `Profiles` collection — the
+            // endpoint-scoped write rule of the reset families.
+            let Some(service) = nvidia_system_config_profile_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(profiles_nav) = service.profiles.as_ref() else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let collection = match profiles_nav.get(bmc).await {
+                Ok(collection) => collection,
+                Err(source) => {
+                    return Err(command_preparation_error(source, identity, trust));
+                }
+            };
+            let Some(member_nav) = collection.members.first() else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let member = match member_nav.get(bmc).await {
+                Ok(member) => member,
+                Err(source) => {
+                    return Err(command_preparation_error(source, identity, trust));
+                }
+            };
+            let Some(action) = member
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.activate.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaSystemProfileActivateActionSchema {};
+            run_nvidia_action::<NvidiaSystemProfileActivateActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+    }
+}
+
+/// Executes one `NvidiaDebugToken` command through the decoded actions of the
+/// device `NvidiaDebugToken` document behind the system's `CPUDebugToken`
+/// navigation, or of the manager's `DebugTokenManagement` document for
+/// `EraseToken`.
+async fn execute_nvidia_debug_token_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    command: &NvidiaDebugTokenCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let prepare = |source: BmcError| command_preparation_error(source, identity, trust);
+    match command {
+        NvidiaDebugTokenCommand::GenerateToken(token_type) => {
+            let Some(token) = nvidia_cpu_debug_token_document(root, bmc, prepare).await? else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = token
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.generate_token.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaDebugTokenGenerateTokenActionSchema {
+                token_type: Some(map_token_type(*token_type)),
+            };
+            run_nvidia_action::<
+                NvidiaDebugTokenGenerateTokenActionSchema,
+                NvidiaDebugTokenGenerateTokenResponse,
+            >(action, &params, bmc, identity, trust)
+            .await
+        }
+        NvidiaDebugTokenCommand::InstallToken(token_data) => {
+            let Some(token) = nvidia_cpu_debug_token_document(root, bmc, prepare).await? else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = token
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.install_token.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaDebugTokenInstallTokenActionSchema {
+                token_data: Some(token_data.token_data().to_owned()),
+            };
+            run_nvidia_action::<NvidiaDebugTokenInstallTokenActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+        NvidiaDebugTokenCommand::DisableToken => {
+            let Some(token) = nvidia_cpu_debug_token_document(root, bmc, prepare).await? else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = token
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.disable_token.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaDebugTokenDisableTokenActionSchema {};
+            run_nvidia_action::<NvidiaDebugTokenDisableTokenActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+        NvidiaDebugTokenCommand::EraseToken(erase) => {
+            let Some(management) =
+                nvidia_debug_token_management_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = management
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.erase_token.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaDebugTokenManagementEraseTokenActionSchema {
+                erase_type: Some(map_erase_type(erase.erase_type())),
+                token_type: Some(map_token_type(erase.token_type())),
+            };
+            run_nvidia_action::<NvidiaDebugTokenManagementEraseTokenActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+    }
+}
+
+/// Executes one `NvidiaPowerSmoothing` command through the decoded actions of
+/// the chassis's power smoothing document.
+async fn execute_nvidia_power_smoothing_command(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    command: &NvidiaPowerSmoothingCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let prepare = |source: BmcError| command_preparation_error(source, identity, trust);
+    match command {
+        NvidiaPowerSmoothingCommand::ActivatePresetProfile(profile_id) => {
+            let Some(power_smoothing) = nvidia_power_smoothing_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = power_smoothing
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.activate_preset_profile.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaPowerSmoothingActivatePresetProfileActionSchema {
+                profile_id: Some(profile_id.profile_id()),
+            };
+            run_nvidia_action::<NvidiaPowerSmoothingActivatePresetProfileActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+        NvidiaPowerSmoothingCommand::ApplyAdminOverrides => {
+            let Some(power_smoothing) = nvidia_power_smoothing_document(root, bmc, prepare).await?
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let Some(action) = power_smoothing
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.apply_admin_overrides.as_ref())
+            else {
+                return Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable,
+                ));
+            };
+            let params = NvidiaPowerSmoothingApplyAdminOverridesActionSchema {};
+            run_nvidia_action::<NvidiaPowerSmoothingApplyAdminOverridesActionSchema, _>(
+                action, &params, bmc, identity, trust,
+            )
+            .await
+        }
+    }
+}
+
+/// Runs one compiled NVIDIA action through the typed `Bmc::action` API and
+/// projects the modification response, classifying transport failures
+/// through [`classify_command_write_error`] exactly like the reset families.
+async fn run_nvidia_action<T, R>(
+    action: &nv_redfish::core::Action<T, R>,
+    params: &T,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandExecutionOutcome, CommandExecutionError>
+where
+    T: Send + Sync + Serialize,
+    R: Send + Sync + for<'de> Deserialize<'de>,
+{
+    let response = match bmc.action::<T, R>(action, params).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the first member of one core collection, returning the raw
+/// transport failure for the caller's classification.
+///
+/// The write-side counterpart of [`first_collection_member`] without an
+/// error contract: the execution path classifies through
+/// [`command_preparation_error`] and the verification path through
+/// [`command_verification_read_error`], so one navigation serves both.
+async fn first_collection_member_raw<C>(
+    nav: Option<&NavProperty<C>>,
+    bmc: &UpstreamBmc,
+) -> Result<Option<Arc<C::Member>>, BmcError>
+where
+    C: MemberCollection,
+{
+    let Some(collection_nav) = nav else {
+        return Ok(None);
+    };
+    let collection = collection_nav.get(bmc).await?;
+    let Some(member_nav) = collection.members().first() else {
+        return Ok(None);
+    };
+    let member = member_nav.get(bmc).await?;
+    Ok(Some(member))
+}
+
+/// The system-segment chain entries a write or verification resolves.
+///
+/// Both navigations hang off the same `NvidiaComputerSystem` segment, so one
+/// decode resolves both identifiers and a command needs only the one it
+/// targets.
+struct NvidiaSystemChainEntries {
+    system_config_profile: Option<ODataId>,
+    cpu_debug_token: Option<ODataId>,
+}
+
+/// Resolves the endpoint's first system's `Oem.Nvidia` chain entries for one
+/// write.
+///
+/// A missing system, missing `Oem.Nvidia` segment, or missing chain link is
+/// `None` (the family is not advertised); a failed fetch is the raw
+/// transport failure for the caller's classification. The navigation mirrors
+/// the read-side [`decode_nvidia_system_config_profile_navigation`] exactly,
+/// including the `BlueField` reference-form segment quirk.
+async fn nvidia_system_segment_entries(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+) -> Result<Option<NvidiaSystemChainEntries>, BmcError> {
+    let Some(system) = first_collection_member_raw(root.root.systems.as_ref(), bmc).await? else {
+        return Ok(None);
+    };
+    let Some(nvidia) = system
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Nvidia"))
+    else {
+        return Ok(None);
+    };
+    resolve_nvidia_system_segment(nvidia, bmc).await
+}
+
+/// Decodes one `Oem.Nvidia` system-segment value into its chain-entry
+/// identifiers, or returns `None` when the segment is not a `ComputerSystem`
+/// segment or cannot be decoded.
+async fn resolve_nvidia_system_segment(
+    nvidia: &serde_json::Value,
+    bmc: &UpstreamBmc,
+) -> Result<Option<NvidiaSystemChainEntries>, BmcError> {
+    if is_nvidia_reference_form(nvidia) {
+        let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let navigation = NavProperty::<NvidiaComputerSystemSegmentSchema>::new_reference(
+            ODataId::from(id.to_owned()),
+        );
+        let segment = navigation.get(bmc).await?;
+        return Ok(Some(nvidia_system_chain_entries(
+            segment.system_config_profile.as_ref(),
+            segment.cpu_debug_token.as_ref(),
+        )));
+    }
+    match nvidia_segment_kind(nvidia) {
+        Some(NvidiaSegmentKind::ComputerSystem) => {
+            match serde_json::from_value::<NvidiaComputerSystemSchema>(nvidia.clone()) {
+                Ok(segment) => Ok(Some(nvidia_system_chain_entries(
+                    segment.system_config_profile.as_ref(),
+                    segment.cpu_debug_token.as_ref(),
+                ))),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(NvidiaSegmentKind::Chassis | NvidiaSegmentKind::Manager) | None => Ok(None),
+    }
+}
+
+/// Collects the two chain-entry identifiers from their decoded navigation
+/// properties; `NavProperty` is not `Clone`, so the identifiers are the
+/// rehydratable form, exactly like the read-side chain decoding.
+fn nvidia_system_chain_entries(
+    system_config_profile: Option<&NavProperty<NvidiaSystemConfigProfileSchema>>,
+    cpu_debug_token: Option<&NavProperty<NvidiaDebugTokenSchema>>,
+) -> NvidiaSystemChainEntries {
+    NvidiaSystemChainEntries {
+        system_config_profile: system_config_profile.map(NavProperty::id).cloned(),
+        cpu_debug_token: cpu_debug_token.map(NavProperty::id).cloned(),
+    }
+}
+
+/// Resolves the endpoint's first manager's `Oem.Nvidia` `DebugTokenManagement`
+/// chain-entry identifier, or `None` when the endpoint does not advertise it.
+async fn nvidia_manager_debug_token_management_id(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+) -> Result<Option<ODataId>, BmcError> {
+    let Some(manager) = first_collection_member_raw(root.root.managers.as_ref(), bmc).await? else {
+        return Ok(None);
+    };
+    let Some(nvidia) = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Nvidia"))
+    else {
+        return Ok(None);
+    };
+    resolve_nvidia_manager_segment(nvidia, bmc).await
+}
+
+/// Decodes one `Oem.Nvidia` manager-segment value into its
+/// `DebugTokenManagement` chain-entry identifier, or returns `None` when the
+/// segment is not a `Manager` segment or cannot be decoded.
+async fn resolve_nvidia_manager_segment(
+    nvidia: &serde_json::Value,
+    bmc: &UpstreamBmc,
+) -> Result<Option<ODataId>, BmcError> {
+    if is_nvidia_reference_form(nvidia) {
+        let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let navigation = NavProperty::<NvidiaManagerSegmentReferenceSchema>::new_reference(
+            ODataId::from(id.to_owned()),
+        );
+        let segment = navigation.get(bmc).await?;
+        return Ok(segment
+            .debug_token_management
+            .as_ref()
+            .map(NavProperty::id)
+            .cloned());
+    }
+    match nvidia_segment_kind(nvidia) {
+        Some(NvidiaSegmentKind::Manager) => {
+            match serde_json::from_value::<NvidiaManagerSegmentSchema>(nvidia.clone()) {
+                Ok(segment) => Ok(segment
+                    .debug_token_management
+                    .as_ref()
+                    .map(NavProperty::id)
+                    .cloned()),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(NvidiaSegmentKind::ComputerSystem | NvidiaSegmentKind::Chassis) | None => Ok(None),
+    }
+}
+
+/// Resolves the endpoint's first chassis's `Oem.Nvidia` `PowerSmoothing`
+/// chain-entry identifier, or `None` when the endpoint does not advertise it.
+async fn nvidia_chassis_power_smoothing_id(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+) -> Result<Option<ODataId>, BmcError> {
+    let Some(chassis) = first_collection_member_raw(root.root.chassis.as_ref(), bmc).await? else {
+        return Ok(None);
+    };
+    let Some(nvidia) = chassis
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Nvidia"))
+    else {
+        return Ok(None);
+    };
+    resolve_nvidia_chassis_segment(nvidia, bmc).await
+}
+
+/// Decodes one `Oem.Nvidia` chassis-segment value into its `PowerSmoothing`
+/// chain-entry identifier, or returns `None` when the segment is not a
+/// `Chassis` segment or cannot be decoded.
+///
+/// The decode target is the compiled `NvidiaSmaChassis` type — the chassis
+/// shape that carries the `PowerSmoothing` navigation in `nv-redfish-schema`
+/// 0.13.0; a segment of another chassis shape simply carries no navigation.
+async fn resolve_nvidia_chassis_segment(
+    nvidia: &serde_json::Value,
+    bmc: &UpstreamBmc,
+) -> Result<Option<ODataId>, BmcError> {
+    if is_nvidia_reference_form(nvidia) {
+        let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let navigation = NavProperty::<NvidiaChassisSegmentReferenceSchema>::new_reference(
+            ODataId::from(id.to_owned()),
+        );
+        let segment = navigation.get(bmc).await?;
+        return Ok(segment
+            .power_smoothing
+            .as_ref()
+            .map(NavProperty::id)
+            .cloned());
+    }
+    match nvidia_segment_kind(nvidia) {
+        Some(NvidiaSegmentKind::Chassis) => {
+            match serde_json::from_value::<NvidiaSmaChassisSchema>(nvidia.clone()) {
+                Ok(segment) => Ok(segment
+                    .power_smoothing
+                    .as_ref()
+                    .map(NavProperty::id)
+                    .cloned()),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(NvidiaSegmentKind::ComputerSystem | NvidiaSegmentKind::Manager) | None => Ok(None),
+    }
+}
+
+/// Fetches one chain-root document through its decoded reference navigation,
+/// classifying fetch failures with the caller's error mapper.
+async fn nvidia_chain_document<T, E, F>(
+    id: ODataId,
+    bmc: &UpstreamBmc,
+    map: F,
+) -> Result<Option<Arc<T>>, E>
+where
+    T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+    F: Fn(BmcError) -> E,
+{
+    let navigation = NavProperty::<T>::new_reference(id);
+    let document = navigation.get(bmc).await.map_err(&map)?;
+    Ok(Some(document))
+}
+
+/// The `NvidiaSystemConfigProfile` chain root of the endpoint's first system,
+/// or `None` when the endpoint does not advertise the chain.
+///
+/// The navigation mirrors the §11.5 read side exactly; fetch failures are
+/// classified by the caller's mapper so the execution and verification paths
+/// keep their own error contracts.
+async fn nvidia_system_config_profile_document<E, F>(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+    map: F,
+) -> Result<Option<Arc<NvidiaSystemConfigProfileSchema>>, E>
+where
+    F: Fn(BmcError) -> E,
+{
+    let Some(entries) = nvidia_system_segment_entries(root, bmc)
+        .await
+        .map_err(&map)?
+    else {
+        return Ok(None);
+    };
+    let Some(id) = entries.system_config_profile else {
+        return Ok(None);
+    };
+    nvidia_chain_document(id, bmc, map).await
+}
+
+/// The device `NvidiaDebugToken` document behind the endpoint's first
+/// system's `CPUDebugToken` navigation, or `None` when not advertised.
+async fn nvidia_cpu_debug_token_document<E, F>(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+    map: F,
+) -> Result<Option<Arc<NvidiaDebugTokenSchema>>, E>
+where
+    F: Fn(BmcError) -> E,
+{
+    let Some(entries) = nvidia_system_segment_entries(root, bmc)
+        .await
+        .map_err(&map)?
+    else {
+        return Ok(None);
+    };
+    let Some(id) = entries.cpu_debug_token else {
+        return Ok(None);
+    };
+    nvidia_chain_document(id, bmc, map).await
+}
+
+/// The `NvidiaDebugTokenManagement` document behind the endpoint's first
+/// manager's `Oem.Nvidia` segment, or `None` when not advertised.
+async fn nvidia_debug_token_management_document<E, F>(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+    map: F,
+) -> Result<Option<Arc<NvidiaDebugTokenManagementSchema>>, E>
+where
+    F: Fn(BmcError) -> E,
+{
+    let Some(id) = nvidia_manager_debug_token_management_id(root, bmc)
+        .await
+        .map_err(&map)?
+    else {
+        return Ok(None);
+    };
+    nvidia_chain_document(id, bmc, map).await
+}
+
+/// The `NvidiaPowerSmoothing` document behind the endpoint's first chassis's
+/// `Oem.Nvidia` segment, or `None` when not advertised.
+async fn nvidia_power_smoothing_document<E, F>(
+    root: &ServiceRoot<UpstreamBmc>,
+    bmc: &UpstreamBmc,
+    map: F,
+) -> Result<Option<Arc<NvidiaPowerSmoothingSchema>>, E>
+where
+    F: Fn(BmcError) -> E,
+{
+    let Some(id) = nvidia_chassis_power_smoothing_id(root, bmc)
+        .await
+        .map_err(&map)?
+    else {
+        return Ok(None);
+    };
+    nvidia_chain_document(id, bmc, map).await
+}
+
+/// The typed fetch target of a reference-form `Oem.Nvidia` chassis segment.
+///
+/// The compiled `NvidiaSmaChassis` type models the segment but implements no
+/// `EntityTypeRef` (it is an OEM segment, not a standalone resource), so a
+/// reference-form fetch goes through this minimal local schema, the same
+/// local-schema precedent as the read side's segment schemas.
+#[derive(Deserialize)]
+struct NvidiaChassisSegmentReferenceSchema {
+    #[serde(rename = "@odata.id")]
+    odata_id: ODataId,
+    #[serde(rename = "PowerSmoothing", default)]
+    power_smoothing: Option<NavProperty<NvidiaPowerSmoothingSchema>>,
+}
+
+impl EntityTypeRef for NvidiaChassisSegmentReferenceSchema {
+    fn odata_id(&self) -> &ODataId {
+        &self.odata_id
+    }
+
+    fn etag(&self) -> Option<&nv_redfish::core::ODataETag> {
+        None
     }
 }
 
@@ -4120,12 +4923,56 @@ async fn verify_authenticated_command(
         // reset families' `CapabilityUnavailable` error — see the
         // `CommandVerifier` contract doc.
         RedfishCommand::Update(_) => verify_authenticated_update(bmc, root, identity, trust).await,
-        // The Oem family has no verification path through this boundary in
-        // this slice; the generic verifier only runs after an accepted
-        // dispatch, and the §11.5 oem-command gateway work compiles the
-        // vendor verification surface. The arm is defensive: the targeted
-        // verification surface is not available here.
-        RedfishCommand::Oem(_) => Err(CommandVerificationError::CapabilityUnavailable),
+        RedfishCommand::Oem(oem) => verify_nvidia_oem_target(bmc, root, identity, trust, oem).await,
+    }
+}
+
+/// "Accepted" verification of an NVIDIA OEM command: the chain resource the
+/// write targeted must re-read without error through the same §11.5
+/// navigation the write used.
+///
+/// The physical effect is deliberately not asserted (see
+/// [`RedfishGateway::verify_command`]): the profile-service and debug-token
+/// actions take effect asynchronously on the BMC, so claiming an effect from
+/// a successful read would fabricate a result. `EraseToken` targets the
+/// manager's `DebugTokenManagement` document and the other debug-token
+/// actions target the system's `CPUDebugToken` document, so the re-read
+/// follows the document of the executed action.
+async fn verify_nvidia_oem_target(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    oem: &OemCommand,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let map = |source: BmcError| command_verification_read_error(source, identity, trust);
+    match oem {
+        OemCommand::SystemConfigProfile(_) => {
+            match nvidia_system_config_profile_document(root, bmc, map).await {
+                Ok(Some(_)) => Ok(CommandVerificationOutcome::Confirmed),
+                Ok(None) => Err(CommandVerificationError::CapabilityUnavailable),
+                Err(source) => Err(source),
+            }
+        }
+        OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(_)) => {
+            match nvidia_debug_token_management_document(root, bmc, map).await {
+                Ok(Some(_)) => Ok(CommandVerificationOutcome::Confirmed),
+                Ok(None) => Err(CommandVerificationError::CapabilityUnavailable),
+                Err(source) => Err(source),
+            }
+        }
+        OemCommand::DebugToken(_) => match nvidia_cpu_debug_token_document(root, bmc, map).await {
+            Ok(Some(_)) => Ok(CommandVerificationOutcome::Confirmed),
+            Ok(None) => Err(CommandVerificationError::CapabilityUnavailable),
+            Err(source) => Err(source),
+        },
+        OemCommand::PowerSmoothing(_) => {
+            match nvidia_power_smoothing_document(root, bmc, map).await {
+                Ok(Some(_)) => Ok(CommandVerificationOutcome::Confirmed),
+                Ok(None) => Err(CommandVerificationError::CapabilityUnavailable),
+                Err(source) => Err(source),
+            }
+        }
     }
 }
 
@@ -4968,6 +5815,25 @@ struct SmcSysLockdownPayload {
 struct SmcKcsInterfacePayload {
     #[serde(rename = "Privilege", skip_serializing_if = "Option::is_none")]
     privilege: Option<KcsPrivilegeSchema>,
+}
+
+/// The §0.5.0 Lenovo `SecurityService` family projection.
+///
+/// The field set is exactly the `OemLenovoSecurityServicePayload` the
+/// application boundary decodes with `deny_unknown_fields`, so an extra field
+/// here would make every stored snapshot unreadable at projection time. The
+/// compiled schema models the rollback state inside the `Configurator`
+/// segment, and the upstream `LenovoSecurityService::fw_rollback` wrapper
+/// collapses that nesting onto its single typed accessor; the projection
+/// follows the wrapper surface, so the wire carries the flattened
+/// `FWRollback` enum spelling verbatim (e.g. `Enabled`, `Disabled`, or
+/// `UnsupportedValue` for a value this build cannot classify).
+#[derive(Serialize)]
+struct LenovoSecurityServicePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "FWRollback", skip_serializing_if = "Option::is_none")]
+    fw_rollback: Option<LenovoFwRollbackStateSchema>,
 }
 
 /// The one document-kind discriminator of the §0.5.0 NVIDIA
@@ -6152,6 +7018,42 @@ fn smc_kcs_interface_projection(
     )
 }
 
+/// Projects one typed Lenovo `LenovoSecurityService` document into the OEM
+/// family.
+///
+/// The `@odata.id`, `ETag`, `Id`, `Name`, and `Description` come from the
+/// typed schema base exactly like every other family; the `FWRollback` state
+/// comes from the compiled type and is serialized by its vendor-defined wire
+/// spelling (e.g. `Enabled`, `Disabled`, or `UnsupportedValue` for a value
+/// this build cannot classify), never translated, per §12.3. The compiled
+/// schema models the rollback state inside the `Configurator` segment, and
+/// the upstream `LenovoSecurityService::fw_rollback` wrapper collapses that
+/// nesting onto its single typed accessor; the projection follows the
+/// wrapper's typed surface, so an absent `Configurator` or absent
+/// `FWRollback` property projects as `None` and is skipped on the wire. The
+/// document is one manager surface, so an unrepresentable identifier or
+/// payload is skipped by the caller through the member-level
+/// `member_projection` semantics.
+fn lenovo_security_service_projection(
+    security_service: &LenovoSecurityServiceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = LenovoSecurityServicePayload {
+        resource: lenovo_common_resource(&security_service.base),
+        fw_rollback: security_service
+            .configurator
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(|configurator| configurator.fw_rollback)
+            .flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::OemLenovoSecurityService,
+        security_service.odata_id(),
+        security_service.etag(),
+        &payload,
+    )
+}
+
 /// Projects one typed NVIDIA `SystemConfigProfile` document into the OEM
 /// family.
 ///
@@ -6469,6 +7371,21 @@ fn nvidia_managed_entity_projection(
 /// `CommonResourcePayload::from_schema_base` projects instead of converting
 /// between the two nominally distinct resource types.
 fn nvidia_common_resource(base: &NvidiaResourceSchema) -> CommonResourcePayload {
+    CommonResourcePayload {
+        id: base.id.clone(),
+        name: base.name.clone(),
+        description: base.description.as_ref().and_then(Option::as_ref).cloned(),
+    }
+}
+
+/// Copies the common identity fields from one compiled Lenovo schema base.
+///
+/// The Lenovo OEM feature generates its own `resource::Resource` base type (a
+/// separate module tree from the base schema re-export, exactly like the Dell
+/// and NVIDIA features), so the common fields are copied here with the same
+/// shape `CommonResourcePayload::from_schema_base` projects instead of
+/// converting between the two nominally distinct resource types.
+fn lenovo_common_resource(base: &LenovoResourceSchema) -> CommonResourcePayload {
     CommonResourcePayload {
         id: base.id.clone(),
         name: base.name.clone(),
@@ -8605,6 +9522,48 @@ fn map_boot_override_mode(
     }
 }
 
+/// Maps the domain `TokenType` projection onto the compiled CSDL member set.
+///
+/// The domain member set is pinned to the CSDL by const tests, so this match
+/// cannot drift silently.
+fn map_token_type(value: TokenType) -> NvidiaTokenTypeSchema {
+    use NvidiaTokenTypeSchema as NvTokenType;
+    match value {
+        TokenType::Frc => NvTokenType::Frc,
+        TokenType::Crcs => NvTokenType::Crcs,
+        TokenType::Crdt => NvTokenType::Crdt,
+        TokenType::DebugFirmwareRunning => NvTokenType::DebugFirmwareRunning,
+        TokenType::DebugFirmwareUnlock => NvTokenType::DebugFirmwareUnlock,
+        TokenType::OtpDumpEnable => NvTokenType::OtpDumpEnable,
+        TokenType::JtagUnlock => NvTokenType::JtagUnlock,
+        TokenType::HardwareUnlock => NvTokenType::HardwareUnlock,
+        TokenType::RuntimeDebugUnlock => NvTokenType::RuntimeDebugUnlock,
+        TokenType::FeatureUnlock => NvTokenType::FeatureUnlock,
+        TokenType::Mtdt => NvTokenType::Mtdt,
+        TokenType::CcplexArmJtagDebugCont => NvTokenType::CcplexArmJtagDebugCont,
+        TokenType::NvJtagControl => NvTokenType::NvJtagControl,
+        TokenType::DiagnosticBoot => NvTokenType::DiagnosticBoot,
+        TokenType::BpmpFirmwareDebugFs => NvTokenType::BpmpFirmwareDebugFs,
+        TokenType::FirmwareDebugKnobs => NvTokenType::FirmwareDebugKnobs,
+        TokenType::FirewallLifting => NvTokenType::FirewallLifting,
+        TokenType::Verbosity => NvTokenType::Verbosity,
+        TokenType::SmaDebugCapability => NvTokenType::SmaDebugCapability,
+        TokenType::CpldDebugCapability => NvTokenType::CpldDebugCapability,
+    }
+}
+
+/// Maps the domain `EraseType` projection onto the compiled CSDL member set.
+fn map_erase_type(value: EraseType) -> NvidiaEraseTypeSchema {
+    use NvidiaEraseTypeSchema as NvEraseType;
+    match value {
+        EraseType::EraseAll => NvEraseType::EraseAll,
+        EraseType::EraseAllAndRatchetCounterIncreased => {
+            NvEraseType::EraseAllAndRatchetCounterIncreased
+        }
+        EraseType::TokenType => NvEraseType::TokenType,
+    }
+}
+
 /// Maps the domain `ResetKeysType` projection onto the compiled CSDL
 /// member set (including the `DeletePK` wire name).
 fn map_reset_keys_type(value: ResetKeysType) -> nv_redfish::schema::secure_boot::ResetKeysType {
@@ -8861,7 +9820,10 @@ mod tests {
         RootCertStore, ServerConfig,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
-    use rutilus_domain::{StartUpdate, TlsCertificate, TlsTrust, UpdateCommand};
+    use rutilus_domain::{
+        EraseToken, ProfileFile, ProfileId, StartUpdate, TlsCertificate, TlsTrust, TokenData,
+        UpdateCommand,
+    };
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -9199,6 +10161,70 @@ mod tests {
         "Name":"Manager One",
         "ManagerType":"BMC",
         "Oem":{"Nvidia":5}
+    }"#;
+
+    /// A Manager member whose `Oem.Lenovo` segment embeds the `Security`
+    /// navigation reference the Lenovo read follows: the segment carries the
+    /// boolean `KCSEnabled` shape (`v0_1_0`, what a real Lenovo XCC
+    /// publishes) plus the `Security` navigation carrying the `@odata.id` the
+    /// compiled untagged `LenovoManagerSchema` resolves through `NavProperty`
+    /// — the same embedded-reference shape nv-redfish's own Lenovo manager
+    /// constructor decodes (reference form, so the document is fetched by its
+    /// `@odata.id`).
+    const MANAGER_WITH_LENOVO_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Lenovo":{
+            "KCSEnabled":true,
+            "Security":{"@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"}
+        }}
+    }"#;
+
+    /// A Manager member whose `Oem.Lenovo` segment carries the state-string
+    /// `KCSEnabled` shape (`v1_0_0`): the untagged dual-version decode must
+    /// fall back to the `v1_0_0` variant (the boolean `v0_1_0` shape cannot
+    /// parse a string) and still resolve the same `Security` navigation from
+    /// the shared unversioned `base`.
+    const MANAGER_WITH_LENOVO_STRING_KCS_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Lenovo":{
+            "KCSEnabled":"Enabled",
+            "Security":{"@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"}
+        }}
+    }"#;
+
+    /// A Manager member whose `Oem.Lenovo` segment cannot be decoded by the
+    /// compiled untagged `LenovoManagerSchema`: the segment value is not an
+    /// object, so the segment is one odd manager surface and leaves the whole
+    /// Lenovo family absent without a request.
+    const MANAGER_WITH_UNDECODABLE_LENOVO_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Lenovo":5}
+    }"#;
+
+    /// The typed Lenovo `LenovoSecurityService` document served at the
+    /// embedded `@odata.id`. The compiled schema models the `Configurator`
+    /// segment with the `FWRollback` state; the fixture carries the vendor's
+    /// enum spelling verbatim and the common identity fields the base
+    /// `resource::Resource` requires.
+    const LENOVO_SECURITY_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+        "@odata.etag":"W/\"lenovo-security-1\"",
+        "Id":"SecurityService",
+        "Name":"Lenovo Security Service",
+        "Description":"Lenovo security service",
+        "Configurator":{"FWRollback":"Enabled"}
     }"#;
 
     /// The typed NVIDIA `NvidiaPowerComplianceManager` chain-root document,
@@ -11112,6 +12138,25 @@ mod tests {
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
         "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one manager that advertises `Oem.Lenovo`: the
+    /// `SecurityService` document is read right after the manager member,
+    /// fetched through the `@odata.id` embedded in the `Oem.Lenovo` segment's
+    /// `Security` navigation, exactly like the other manager-bound families.
+    const CORE_RESOURCE_WITH_LENOVO_SECURITY_SERVICE_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -14113,6 +15158,268 @@ mod tests {
             &server.finish_all().await?,
             &CORE_RESOURCE_WITH_FAILED_NVIDIA_MANAGER_CHAIN_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_lenovo_security_service_through_oem_navigation() -> Result<(), Box<dyn Error>> {
+        // The Lenovo `SecurityService` document is read right after the
+        // Manager member, through the `@odata.id` embedded in the
+        // `Oem.Lenovo` segment's `Security` navigation.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_LENOVO_OEM_BODY),
+                ("200 OK", LENOVO_SECURITY_SERVICE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        let security = &resources[4];
+        assert_eq!(
+            security.feature(),
+            ResourceFeature::OemLenovoSecurityService
+        );
+        assert_eq!(
+            security.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+        );
+        assert_eq!(
+            security.etag().map(ResourceEtag::as_str),
+            Some("W/\"lenovo-security-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(security.payload().as_str())?;
+        assert_eq!(payload["Id"], "SecurityService");
+        assert_eq!(payload["Name"], "Lenovo Security Service");
+        assert_eq!(payload["Description"], "Lenovo security service");
+        // The `Configurator` nesting of the compiled schema collapses onto
+        // the wrapper's single `fw_rollback()` surface, so the wire carries
+        // the flattened `FWRollback` enum spelling verbatim (§12.3).
+        assert_eq!(payload["FWRollback"], "Enabled");
+        assert_eq!(payload["Configurator"], serde_json::Value::Null);
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_LENOVO_SECURITY_SERVICE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_without_lenovo_oem_produces_no_lenovo_snapshot() -> Result<(), Box<dyn Error>>
+    {
+        // An `Oem` segment of another vendor must not be mistaken for Lenovo,
+        // and a manager without any `Oem` segment stays untouched; neither
+        // case issues a Lenovo probe.
+        for manager_body in [MANAGER_BODY, MANAGER_WITH_OTHER_OEM_BODY] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                CORE_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", manager_body),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemLenovoSecurityService));
+            // No Lenovo probe was issued: the request sequence is exactly the
+            // plain manager read.
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_lenovo_segment_leaves_the_family_absent() -> Result<(), Box<dyn Error>> {
+        // A manager whose `Oem.Lenovo` segment cannot be decoded by the
+        // compiled untagged `LenovoManagerSchema` is one odd manager surface:
+        // the read succeeds, the family stays absent, and no document request
+        // is fabricated.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_UNDECODABLE_LENOVO_OEM_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemLenovoSecurityService)
+        );
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_lenovo_security_service_fetch_skips_like_one_odd_member()
+    -> Result<(), Box<dyn Error>> {
+        // A `SecurityService` document that cannot be fetched (here a 404) is
+        // one odd manager surface, not an endpoint-wide condition: the read
+        // succeeds, leaves the family absent, and the failed URI stays
+        // observable as a request like every member-level skip.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_LENOVO_OEM_BODY),
+                ("404 Not Found", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemLenovoSecurityService)
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_LENOVO_SECURITY_SERVICE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn lenovo_untagged_segment_decodes_both_kcs_enabled_shapes() -> Result<(), Box<dyn Error>> {
+        // The untagged dual-version decode mirrors the upstream
+        // `LenovoManager` wrapper: the boolean `KCSEnabled` shape (`v0_1_0`)
+        // decodes as the first variant, the state-string shape (`v1_0_0`)
+        // falls back to the second, and either way the shared unversioned
+        // `base` carries the same `Security` navigation the read follows.
+        let manager: serde_json::Value = serde_json::from_str(MANAGER_WITH_LENOVO_OEM_BODY)?;
+        let boolean_segment: LenovoManagerSchema =
+            serde_json::from_value(manager["Oem"]["Lenovo"].clone())?;
+        assert!(matches!(boolean_segment, LenovoManagerSchema::V0_1(_)));
+        assert!(security_navigation(&boolean_segment).is_some());
+
+        let manager: serde_json::Value =
+            serde_json::from_str(MANAGER_WITH_LENOVO_STRING_KCS_OEM_BODY)?;
+        let string_segment: LenovoManagerSchema =
+            serde_json::from_value(manager["Oem"]["Lenovo"].clone())?;
+        // The boolean `v0_1_0` shape cannot parse a string, so the untagged
+        // decode must fall back to the `v1_0_0` variant.
+        assert!(matches!(string_segment, LenovoManagerSchema::V1_0(_)));
+        assert!(security_navigation(&string_segment).is_some());
+
+        // A segment without the `Security` navigation decodes fine but
+        // carries no navigation, so the family stays absent.
+        let bare: LenovoManagerSchema = serde_json::from_value(serde_json::json!({
+            "KCSEnabled": true
+        }))?;
+        assert!(security_navigation(&bare).is_none());
+        Ok(())
+    }
+
+    /// The `Security` navigation of one decoded untagged Lenovo segment,
+    /// resolved exactly like `read_manager_lenovo_oem` resolves it.
+    fn security_navigation(segment: &LenovoManagerSchema) -> Option<String> {
+        let nav = match segment {
+            LenovoManagerSchema::V0_1(data) => data.base.security.as_ref(),
+            LenovoManagerSchema::V1_0(data) => data.base.security.as_ref(),
+        };
+        nav.map(|nav| nav.id().to_string())
+    }
+
+    #[test]
+    fn lenovo_security_service_projection_keeps_the_typed_field_contract()
+    -> Result<(), Box<dyn Error>> {
+        // The compiled schema is the type boundary: the typed identity fields
+        // are projected verbatim and the `FWRollback` enum spelling stays the
+        // vendor's wire value (§12.3).
+        let security_service: LenovoSecurityServiceSchema =
+            serde_json::from_str(LENOVO_SECURITY_SERVICE_BODY)?;
+        let projection = lenovo_security_service_projection(&security_service)?;
+        assert_eq!(
+            projection.feature(),
+            ResourceFeature::OemLenovoSecurityService
+        );
+        // The payloads are canonicalized by the snapshot payload rule (the
+        // `serde_json` map order), so the expected strings follow the
+        // alphabetical key order, not the declaration order.
+        assert_eq!(
+            projection.payload().as_str(),
+            r#"{"Description":"Lenovo security service","FWRollback":"Enabled","Id":"SecurityService","Name":"Lenovo Security Service"}"#
+        );
+        // Without the optional `Configurator` segment the rollback state is
+        // absent and the wire key is skipped instead of coerced.
+        let bare: LenovoSecurityServiceSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService","Id":"SecurityService","Name":"Lenovo Security Service"}"#,
+        )?;
+        assert_eq!(
+            lenovo_security_service_projection(&bare)?
+                .payload()
+                .as_str(),
+            r#"{"Id":"SecurityService","Name":"Lenovo Security Service"}"#
+        );
         Ok(())
     }
 
@@ -17475,6 +18782,125 @@ mod tests {
         "Name":"System One",
         "SystemType":"Physical"
     }"#;
+    /// The System document for the NVIDIA OEM write tests: advertises the
+    /// `Oem.Nvidia` segment with the `SystemConfigProfile` and `CPUDebugToken`
+    /// navigations the write chains follow.
+    const COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem",
+            "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"},
+            "CPUDebugToken":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken"}
+        }}
+    }"##;
+
+    /// The `NvidiaSystemConfigProfile` document for write tests: advertises
+    /// the `#NvidiaSystemConfigProfile.Update` and `#NvidiaSystemConfigProfile.FactoryReset`
+    /// actions, plus the `Profiles` navigation the activate flow follows.
+    const COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "Id":"SystemConfigProfile",
+        "Name":"NVIDIA System Config Profile",
+        "Profiles":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles"},
+        "Actions":{
+            "#NvidiaSystemConfigProfile.Update":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update"},
+            "#NvidiaSystemConfigProfile.FactoryReset":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.FactoryReset"}
+        }
+    }"##;
+
+    /// A `NvidiaSystemConfigProfile` document that advertises no actions at
+    /// all, for the §13.3 step 2 capability-check pin.
+    const COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_WITHOUT_ACTIONS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "Id":"SystemConfigProfile",
+        "Name":"NVIDIA System Config Profile"
+    }"#;
+
+    /// The `Profiles` collection of the NVIDIA profile write tests.
+    const COMMAND_NVIDIA_PROFILES_COLLECTION_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+        "Id":"Profiles",
+        "Name":"System Profile Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"}]
+    }"#;
+
+    /// The profile member document for write tests: advertises the
+    /// `#NvidiaSystemProfile.Activate` action.
+    const COMMAND_NVIDIA_SYSTEM_PROFILE_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+        "Id":"1",
+        "Name":"Default Profile",
+        "Actions":{
+            "#NvidiaSystemProfile.Activate":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/Actions/NvidiaSystemProfile.Activate"}
+        }
+    }"##;
+
+    /// The `NvidiaDebugToken` document for write tests: advertises the
+    /// `#NvidiaDebugToken.GenerateToken`, `.InstallToken`, and `.DisableToken`
+    /// actions.
+    const COMMAND_NVIDIA_DEBUG_TOKEN_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken",
+        "Id":"CPUDebugToken",
+        "Name":"Debug Token",
+        "Actions":{
+            "#NvidiaDebugToken.GenerateToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.GenerateToken"},
+            "#NvidiaDebugToken.InstallToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.InstallToken"},
+            "#NvidiaDebugToken.DisableToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.DisableToken"}
+        }
+    }"##;
+
+    /// The Manager document for the NVIDIA OEM write tests: advertises the
+    /// `Oem.Nvidia` segment with the `DebugTokenManagement` navigation.
+    const COMMAND_MANAGER_WITH_NVIDIA_OEM_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaManager.v1_9_0.NvidiaManager",
+            "DebugTokenManagement":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement"}
+        }}
+    }"##;
+
+    /// The `NvidiaDebugTokenManagement` document for write tests: advertises
+    /// the `#NvidiaDebugTokenManagement.EraseToken` action.
+    const COMMAND_NVIDIA_DEBUG_TOKEN_MANAGEMENT_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement",
+        "Id":"DebugTokenManagement",
+        "Name":"Debug Token Management",
+        "Actions":{
+            "#NvidiaDebugTokenManagement.EraseToken":{"target":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement/Actions/NvidiaDebugTokenManagement.EraseToken"}
+        }
+    }"##;
+
+    /// The Chassis document for the NVIDIA OEM write tests: advertises the
+    /// `Oem.Nvidia` segment with the `PowerSmoothing` navigation.
+    const COMMAND_CHASSIS_WITH_NVIDIA_OEM_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaChassis.v1_4_0.NvidiaSmaChassis",
+            "PowerSmoothing":{"@odata.id":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing"}
+        }}
+    }"##;
+
+    /// The `NvidiaPowerSmoothing` document for write tests: advertises the
+    /// `#NvidiaPowerSmoothing.ActivatePresetProfile` and `.ApplyAdminOverrides`
+    /// actions.
+    const COMMAND_NVIDIA_POWER_SMOOTHING_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing",
+        "Id":"PowerSmoothing",
+        "Name":"Power Smoothing",
+        "Actions":{
+            "#NvidiaPowerSmoothing.ActivatePresetProfile":{"target":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ActivatePresetProfile"},
+            "#NvidiaPowerSmoothing.ApplyAdminOverrides":{"target":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ApplyAdminOverrides"}
+        }
+    }"##;
 
     /// The Chassis document for write tests: advertises the
     /// `#Chassis.Reset` action.
@@ -18765,6 +20191,659 @@ mod tests {
                 assert!(!request.contains("password"));
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_profile_update_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::Update(ProfileFile::new(
+                        r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#.to_owned(),
+                    )),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            r#"{"ProfileFile":"{\"UUID\":\"11111111-2222-3333-4444-555555555555\"}"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_profile_factory_reset_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.FactoryReset",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            "{}",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_profile_activate_through_the_member_action_api()
+    -> Result<(), Box<dyn Error>> {
+        // `#NvidiaSystemProfile.Activate` is bound to the profile member
+        // documents, so the write navigates the decoded `Profiles` collection
+        // to its first member before dispatching.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                ("200 OK", COMMAND_NVIDIA_PROFILES_COLLECTION_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_PROFILE_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::ActivateProfile,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/Actions/NvidiaSystemProfile.Activate",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            "{}",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_debug_token_generate_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        // The GenerateToken action answers with the `BinaryTokenURI` entity,
+        // so the write response is a handled `200` body, not a `204`.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_DEBUG_TOKEN_BODY),
+            ],
+            http_response(
+                "200 OK",
+                r#"{"BinaryTokenURI":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Token"}"#,
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken",
+                "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.GenerateToken",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            r#"{"TokenType":"FRC"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_debug_token_install_and_disable_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        for (command, action_path, body) in [
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::InstallToken(TokenData::new(
+                        "dG9rZW4tZGF0YQ==".to_owned(),
+                    )),
+                )),
+                "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.InstallToken",
+                r#"{"TokenData":"dG9rZW4tZGF0YQ=="}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::DisableToken,
+                )),
+                "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.DisableToken",
+                "{}",
+            ),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", FULL_SYSTEMS_BODY),
+                    ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                    ("200 OK", COMMAND_NVIDIA_DEBUG_TOKEN_BODY),
+                ],
+                http_response("204 No Content", ""),
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+            assert_command_requests(
+                &server.finish_all().await?,
+                &[
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Systems",
+                    "/redfish/v1/Systems/1",
+                    "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken",
+                    action_path,
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                "POST",
+                body,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_erase_token_through_the_manager_chain() -> Result<(), Box<dyn Error>> {
+        // `EraseToken` runs on the manager's `DebugTokenManagement` document,
+        // so the navigation goes through the managers collection instead of
+        // the systems collection.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_DEBUG_TOKEN_MANAGEMENT_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(
+                    EraseToken::new(EraseType::EraseAll, TokenType::Frc),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Managers",
+                "/redfish/v1/Managers/1",
+                "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement",
+                "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement/Actions/NvidiaDebugTokenManagement.EraseToken",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+            "POST",
+            r#"{"EraseType":"EraseAll","TokenType":"FRC"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_nvidia_power_smoothing_actions_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        for (command, action_path, body) in [
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ActivatePresetProfile(ProfileId::new(3)),
+                )),
+                "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ActivatePresetProfile",
+                r#"{"ProfileId":3}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+                )),
+                "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ApplyAdminOverrides",
+                "{}",
+            ),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", COMMAND_CHASSIS_WITH_NVIDIA_OEM_BODY),
+                    ("200 OK", COMMAND_NVIDIA_POWER_SMOOTHING_BODY),
+                ],
+                http_response("204 No Content", ""),
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+            assert_command_requests(
+                &server.finish_all().await?,
+                &[
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Chassis",
+                    "/redfish/v1/Chassis/1",
+                    "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing",
+                    action_path,
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                "POST",
+                body,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nvidia_profile_update_accepts_a_task_and_surfaces_its_location()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+            ],
+            http_response_with_headers(
+                "202 Accepted",
+                "",
+                &[("Location", "/redfish/v1/TaskService/Tasks/1")],
+            ),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::Update(ProfileFile::new("{}".to_owned())),
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CommandExecutionError::AsyncTaskAccepted { task_location })
+                if task_location.to_string() == "/redfish/v1/TaskService/Tasks/1"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_nvidia_commands_when_the_oem_chain_is_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        // A system without `Oem.Nvidia` makes every system-segment face
+        // provably unsupported, so the capability check rejects the command
+        // after the member fetch and no write response is ever served.
+        for command in [
+            RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                NvidiaSystemConfigProfileCommand::Update(ProfileFile::new("{}".to_owned())),
+            )),
+            RedfishCommand::Oem(OemCommand::DebugToken(
+                NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", FULL_SYSTEMS_BODY),
+                    ("200 OK", COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable
+                ))
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_nvidia_profile_update_when_the_action_is_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        // The decoded profile service exists but advertises no actions, so
+        // the §13.3 step 2 capability check rejects the command.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY),
+                (
+                    "200 OK",
+                    COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_WITHOUT_ACTIONS_BODY,
+                ),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_nvidia_oem_commands_by_re_reading_the_chain() -> Result<(), Box<dyn Error>> {
+        // "Accepted" verification: the chain document the write targeted must
+        // re-read without error, and no physical effect is asserted.
+        for (command, paths, member, document) in [
+            (
+                RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Systems",
+                    "/redfish/v1/Systems/1",
+                    "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+                )),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Systems",
+                    "/redfish/v1/Systems/1",
+                    "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_NVIDIA_DEBUG_TOKEN_BODY),
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(
+                    EraseToken::new(EraseType::EraseAll, TokenType::Frc),
+                ))),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Managers",
+                    "/redfish/v1/Managers/1",
+                    "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_NVIDIA_DEBUG_TOKEN_MANAGEMENT_BODY),
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+                )),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Chassis",
+                    "/redfish/v1/Chassis/1",
+                    "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_NVIDIA_POWER_SMOOTHING_BODY),
+            ),
+        ] {
+            let member_body = (
+                "200 OK",
+                match paths[4] {
+                    "/redfish/v1/Systems" => COMMAND_SYSTEM_WITH_NVIDIA_OEM_BODY,
+                    "/redfish/v1/Managers" => COMMAND_MANAGER_WITH_NVIDIA_OEM_BODY,
+                    "/redfish/v1/Chassis" => COMMAND_CHASSIS_WITH_NVIDIA_OEM_BODY,
+                    _ => unreachable!("unexpected collection path"),
+                },
+            );
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[member, member_body, document],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+            assert_verification_requests(&server.finish_all().await?, &paths)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_nvidia_oem_commands_as_an_error_when_the_chain_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // A vanished `Oem.Nvidia` chain makes the re-read inconclusive: the
+        // verifier reports the same `CapabilityUnavailable` error as the
+        // reset families instead of fabricating a verdict.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITHOUT_CAPABILITIES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            verdict,
+            Err(CommandVerificationError::CapabilityUnavailable)
+        ));
         Ok(())
     }
 
