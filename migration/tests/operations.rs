@@ -71,6 +71,7 @@ async fn verify_operation_constraints(
         state: Set(String::from("queued")),
         command: Set(command.clone()),
         batch_id: Set(None),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -108,6 +109,7 @@ async fn verify_operation_constraints(
             state: Set(String::from(state)),
             command: Set(String::from(COMMAND_JSON)),
             batch_id: Set(None),
+            failure_kind: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -123,6 +125,7 @@ async fn verify_operation_constraints(
         state: Set(String::from("queued")),
         command: Set(String::from(COMMAND_JSON)),
         batch_id: Set(None),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -137,6 +140,7 @@ async fn verify_operation_constraints(
         state: Set(String::from("pending")),
         command: Set(String::from(COMMAND_JSON)),
         batch_id: Set(None),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }

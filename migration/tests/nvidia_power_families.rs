@@ -10,10 +10,52 @@ use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// The 000003 allow-list plus the 0.5.0 NVIDIA system-config-profile code:
-/// the follow-up migration must accept every code the original migration
-/// accepted and the new family code on top.
-const FEATURE_CODES_WITH_NVIDIA: [&str; 34] = [
+/// The 000001 allow-list plus the 0.5.0 NVIDIA power-compliance and
+/// managed-entity codes: the follow-up migration must accept every code the
+/// previous migration accepted and the two new family codes on top.
+const FEATURE_CODES_WITH_POWER_FAMILIES: [&str; 36] = [
+    "service-root",
+    "systems",
+    "chassis",
+    "managers",
+    "dell-attributes",
+    "supermicro-sys-lockdown",
+    "supermicro-kcs-interface",
+    "nvidia-system-config-profile",
+    "nvidia-power-compliance",
+    "nvidia-managed-entity",
+    "processors",
+    "memory",
+    "storages",
+    "network-adapters",
+    "ethernet-interfaces",
+    "accounts",
+    "bios",
+    "boot-options",
+    "secure-boot",
+    "power",
+    "thermal",
+    "sensors",
+    "controls",
+    "log-services",
+    "manager-network-protocol",
+    "host-interfaces",
+    "pcie-devices",
+    "assembly",
+    "software-inventory",
+    "event-service",
+    "event-subscription",
+    "telemetry-service",
+    "metric-definition",
+    "metric-report",
+    "task-service",
+    "task",
+];
+
+/// The 000001 allow-list (the 000003 list plus the system-config-profile
+/// code), which `down` must restore exactly (the two new NVIDIA codes become
+/// unparseable again).
+const FEATURE_CODES_BEFORE_POWER_FAMILIES: [&str; 34] = [
     "service-root",
     "systems",
     "chassis",
@@ -50,46 +92,9 @@ const FEATURE_CODES_WITH_NVIDIA: [&str; 34] = [
     "task",
 ];
 
-/// The 000003 allow-list, which `down` must restore exactly (the NVIDIA code
-/// becomes unparseable again).
-const FEATURE_CODES_BEFORE_NVIDIA: [&str; 33] = [
-    "service-root",
-    "systems",
-    "chassis",
-    "managers",
-    "dell-attributes",
-    "supermicro-sys-lockdown",
-    "supermicro-kcs-interface",
-    "processors",
-    "memory",
-    "storages",
-    "network-adapters",
-    "ethernet-interfaces",
-    "accounts",
-    "bios",
-    "boot-options",
-    "secure-boot",
-    "power",
-    "thermal",
-    "sensors",
-    "controls",
-    "log-services",
-    "manager-network-protocol",
-    "host-interfaces",
-    "pcie-devices",
-    "assembly",
-    "software-inventory",
-    "event-service",
-    "event-subscription",
-    "telemetry-service",
-    "metric-definition",
-    "metric-report",
-    "task-service",
-    "task",
-];
-
 #[tokio::test]
-async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<(), Box<dyn Error>> {
+async fn nvidia_power_families_migration_extends_the_feature_allow_list()
+-> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database_path = directory.path().join("rutilus.db");
     let normalized_path = database_path.to_string_lossy().replace('\\', "/");
@@ -97,13 +102,15 @@ async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<()
     options.max_connections(1);
     let database = Database::connect(options).await?;
 
+    // Idempotency: the migration history replays cleanly twice, so an
+    // interrupted upgrade can resume without a half-migrated allow-list.
     Migrator::up(&database, None).await?;
     Migrator::up(&database, None).await?;
 
     let now = OffsetDateTime::now_utc();
     let endpoint_id = seed_endpoint(&database, now).await?;
 
-    // A resource and snapshot stored under the 000003 schema survive the
+    // A resource and snapshot stored under the 000001 schema survive the
     // rebuild: the rebuild copies every row, so the follow-up migration must
     // not lose observations. The odata path is deliberately distinct from
     // the allow-list loop's fixture paths below, so the seed does not collide
@@ -119,9 +126,9 @@ async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<()
     .await?;
     seed_snapshot(&database, preexisting_resource_id, now).await?;
 
-    // The follow-up migration accepts every 000003 code plus the new NVIDIA
-    // family code, and refuses anything else.
-    for code in FEATURE_CODES_WITH_NVIDIA {
+    // The follow-up migration accepts every 000001 code plus the two new
+    // NVIDIA family codes, and refuses anything else.
+    for code in FEATURE_CODES_WITH_POWER_FAMILIES {
         let odata_id = format!("/redfish/v1/fixtures/{code}");
         let resource_id = seed_resource(&database, endpoint_id, code, &odata_id, now).await?;
         assert_eq!(
@@ -150,8 +157,8 @@ async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<()
         seed_resource(
             &database,
             endpoint_id,
-            "oem-nvidia-profiles",
-            "/redfish/v1/fixtures/oem-nvidia-profiles",
+            "oem-nvidia-power-management",
+            "/redfish/v1/fixtures/oem-nvidia-power-management",
             now,
         )
         .await
@@ -166,35 +173,37 @@ async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<()
         .ok_or("the pre-existing snapshot must survive the rebuild")?;
     assert_eq!(stored_snapshot.generation, 1);
 
-    // `down` restores the 000003 allow-list: the NVIDIA code is refused
-    // again and every original code still works. The row stored under the
-    // NVIDIA code cannot be represented by the 000003 schema, so it is
-    // removed first — exactly what a real downgrade must do with rows that
-    // only the newer schema can hold (the rebuild copies every remaining row
-    // into the restored tables).
+    // `down` restores the 000001 allow-list: the two new NVIDIA codes are
+    // refused again and every original code still works. The rows stored
+    // under the new codes cannot be represented by the 000001 schema, so
+    // they are removed first — exactly what a real downgrade must do with
+    // rows that only the newer schema can hold (the rebuild copies every
+    // remaining row into the restored tables).
     resource::Entity::delete_many()
-        .filter(resource::Column::Feature.eq("nvidia-system-config-profile"))
+        .filter(
+            resource::Column::Feature.is_in(["nvidia-power-compliance", "nvidia-managed-entity"]),
+        )
         .exec(&database)
         .await?;
-    // Down the three follow-up migrations only: `down(None)` would unwind
-    // the whole history and drop the `resources` table the assertions below
-    // seed into, while this test only needs the original NVIDIA follow-up
-    // undone. The two migrations stacked after 000001 (000002 operation
-    // failure kinds and 000003 NVIDIA power families) unwind first, so the
-    // restore lands on the exact 000003 allow-list the test asserts.
-    Migrator::down(&database, Some(3)).await?;
-    assert!(
-        seed_resource(
-            &database,
-            endpoint_id,
-            "nvidia-system-config-profile",
-            "/redfish/v1/fixtures/nvidia-system-config-profile",
-            now,
-        )
-        .await
-        .is_err()
-    );
-    for code in FEATURE_CODES_BEFORE_NVIDIA {
+    // Down one migration only: `down(None)` would unwind the whole history
+    // and drop the `resources` table the assertions below seed into, while
+    // this test only needs the NVIDIA follow-up undone.
+    Migrator::down(&database, Some(1)).await?;
+    for code in ["nvidia-power-compliance", "nvidia-managed-entity"] {
+        assert!(
+            seed_resource(
+                &database,
+                endpoint_id,
+                code,
+                &format!("/redfish/v1/fixtures/downgraded/{code}"),
+                now,
+            )
+            .await
+            .is_err(),
+            "{code} must be refused after the downgrade"
+        );
+    }
+    for code in FEATURE_CODES_BEFORE_POWER_FAMILIES {
         // The pre-down rows still exist, so the downgraded seeds use their
         // own odata prefix to stay clear of the unique (endpoint_id,
         // odata_id) pairs.

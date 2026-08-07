@@ -153,6 +153,7 @@ async fn assert_batch_tables(
         state: Set(String::from("queued")),
         command: Set(String::from(COMMAND_JSON)),
         batch_id: Set(Some(Uuid::now_v7())),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -177,6 +178,7 @@ async fn insert_operation(
         state: Set(String::from("queued")),
         command: Set(String::from(COMMAND_JSON)),
         batch_id: Set(batch_id),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }

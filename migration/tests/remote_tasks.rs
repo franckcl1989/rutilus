@@ -160,6 +160,7 @@ async fn insert_operation(
         state: Set(String::from("waiting-remote")),
         command: Set(String::from(r#"{"reset":{"reset_type":"graceful"}}"#)),
         batch_id: Set(None),
+        failure_kind: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
