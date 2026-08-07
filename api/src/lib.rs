@@ -3879,10 +3879,10 @@ impl BootstrapCompleteResponse {
 
 /// A signed-in principal changing their own password (§16.2).
 ///
-/// The current password authenticates the request; the new password must
-/// pass the product password policy at the boundary. Both values are
-/// `SecretString`-wrapped, serialized only for the WASM client, and never
-/// echoed by any response.
+/// The current password authenticates the request; the new password is
+/// hashed for storage as given — the product enforces no password-strength
+/// policy. Both values are `SecretString`-wrapped, serialized only for the
+/// WASM client, and never echoed by any response.
 pub struct SetPasswordRequest {
     current_password: SecretString,
     new_password: SecretString,
