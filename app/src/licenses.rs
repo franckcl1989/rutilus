@@ -5,8 +5,10 @@
 //! (resolved versions) and the crates' published license metadata, and
 //! cross-checked against the `deny.toml` license allow list. Embedding keeps
 //! the subcommand dependency-free and the output stable across builds; the
-//! test suite re-checks every entry against the workspace `Cargo.lock` so a
-//! version bump without an inventory update fails CI.
+//! test suite re-checks every entry against the workspace `Cargo.lock` (so a
+//! version bump without an inventory update fails CI) and against the
+//! dependency tables of every workspace member manifest (so a new direct
+//! dependency without an inventory entry fails CI too).
 
 /// One third-party crate of the product.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +70,11 @@ pub const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
     },
     ThirdPartyLicense {
         name: "futures",
+        version: "0.3.33",
+        license: "MIT OR Apache-2.0",
+    },
+    ThirdPartyLicense {
+        name: "futures-util",
         version: "0.3.33",
         license: "MIT OR Apache-2.0",
     },
@@ -207,6 +214,11 @@ pub const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
         license: "MIT OR Apache-2.0",
     },
     ThirdPartyLicense {
+        name: "tokio-util",
+        version: "0.7.19",
+        license: "MIT OR Apache-2.0",
+    },
+    ThirdPartyLicense {
         name: "tower",
         version: "0.5.3",
         license: "MIT",
@@ -321,6 +333,104 @@ mod tests {
             );
         }
         assert_eq!(text.lines().count(), THIRD_PARTY_LICENSES.len());
+    }
+
+    /// Every workspace member manifest at test time, embedded so the direct
+    /// dependency inventory can be cross-checked without a TOML parser. The
+    /// workspace root `Cargo.toml` is deliberately excluded: its
+    /// `[workspace.dependencies]` table declares versions, not the direct
+    /// dependencies of any crate.
+    const WORKSPACE_MEMBER_MANIFESTS: &[&str] = &[
+        include_str!("../../api/Cargo.toml"),
+        include_str!("../../app/Cargo.toml"),
+        include_str!("../../application/Cargo.toml"),
+        include_str!("../../center-protocol/Cargo.toml"),
+        include_str!("../../domain/Cargo.toml"),
+        include_str!("../../entity/Cargo.toml"),
+        include_str!("../../infra-redfish/Cargo.toml"),
+        include_str!("../../migration/Cargo.toml"),
+        include_str!("../../operation-engine/Cargo.toml"),
+        include_str!("../../persistence/Cargo.toml"),
+        include_str!("../../platform/Cargo.toml"),
+        include_str!("../../security/Cargo.toml"),
+        include_str!("../../test-support/Cargo.toml"),
+        include_str!("../../ui/Cargo.toml"),
+        include_str!("../../web/Cargo.toml"),
+    ];
+
+    #[test]
+    fn inventory_covers_exactly_the_direct_third_party_dependencies() {
+        let inventory_names = THIRD_PARTY_LICENSES
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<std::collections::HashSet<_>>();
+        let mut direct_names = Vec::new();
+        for manifest in WORKSPACE_MEMBER_MANIFESTS {
+            for name in direct_dependency_names(manifest) {
+                if !name.starts_with("rutilus-") {
+                    direct_names.push(name);
+                }
+            }
+        }
+
+        let mut missing = direct_names
+            .iter()
+            .copied()
+            .filter(|name| !inventory_names.contains(name))
+            .collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "the licenses inventory misses direct third-party dependencies: {missing:?}"
+        );
+
+        let mut orphaned = inventory_names
+            .iter()
+            .copied()
+            .filter(|name| !direct_names.contains(name))
+            .collect::<Vec<_>>();
+        orphaned.sort_unstable();
+        assert!(
+            orphaned.is_empty(),
+            "the licenses inventory names crates that are no longer direct dependencies: {orphaned:?}"
+        );
+    }
+
+    /// The crate names declared in one manifest's dependency tables:
+    /// `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and
+    /// the target-gated `[target.'cfg(...)'.dependencies]` variants. A
+    /// single-line text scan suffices because the workspace writes every
+    /// dependency on one line; a future wrapped entry fails the completeness
+    /// test loudly, which is exactly the guard's purpose.
+    fn direct_dependency_names(manifest: &str) -> Vec<&str> {
+        let mut names = Vec::new();
+        let mut in_dependency_table = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_dependency_table = line.contains("dependencies");
+                continue;
+            }
+            if !in_dependency_table {
+                continue;
+            }
+            let Some(name) = line
+                .split_once('=')
+                .map(|(key, _)| key.trim())
+                .map(|key| key.strip_suffix(".workspace").unwrap_or(key))
+                .filter(|name| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+                })
+            else {
+                continue;
+            };
+            names.push(name);
+        }
+        names
     }
 
     /// All `version = "..."` values of one package in the lock file.
