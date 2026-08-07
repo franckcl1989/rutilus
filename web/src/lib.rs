@@ -778,6 +778,7 @@ where
         state.gateway.as_ref(),
         &state.clock,
         state.actor,
+        None,
         state.origin,
     );
     let request = OnboardEndpointRequest::new(
@@ -820,6 +821,7 @@ where
         state.gateway.as_ref(),
         &state.clock,
         state.actor,
+        None,
         state.origin,
     );
     let importer = EndpointCsvImportExecutor::new(
@@ -828,6 +830,7 @@ where
         state.services.as_ref(),
         &state.clock,
         state.actor,
+        None,
         state.origin,
     );
     match importer.execute(import).await {

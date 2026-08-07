@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use rutilus_domain::{AuditActor, DeploymentPosture, EndpointId, ResourceSnapshot};
+use rutilus_domain::{AuditActor, DeploymentPosture, EndpointId, PrincipalId, ResourceSnapshot};
 use thiserror::Error;
 
 use crate::{
@@ -65,6 +65,7 @@ pub struct EndpointEnrollment<Repository, Credentials, Gateway, Time> {
     gateway: Gateway,
     clock: Time,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 }
 
@@ -86,6 +87,7 @@ where
         gateway: Gateway,
         clock: Time,
         actor: AuditActor,
+        actor_principal_id: Option<PrincipalId>,
         origin: DeploymentPosture,
     ) -> Self {
         Self {
@@ -94,6 +96,7 @@ where
             gateway,
             clock,
             actor,
+            actor_principal_id,
             origin,
         }
     }
@@ -136,6 +139,7 @@ where
             &self.repository,
             &self.clock,
             self.actor,
+            self.actor_principal_id,
             self.origin,
         );
         let onboarded = onboarding.execute(request).await.map_err(|source| {
@@ -156,6 +160,7 @@ where
             &self.repository,
             &self.clock,
             self.actor,
+            self.actor_principal_id,
             self.origin,
         );
         let snapshots = refresh.execute(endpoint_id).await.map_err(|source| {
@@ -324,6 +329,7 @@ mod tests {
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
         assert_enroller(&service);
@@ -380,6 +386,7 @@ mod tests {
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -414,6 +421,7 @@ mod tests {
             MockGateway::fail_read(Arc::clone(&state)),
             FixedClock(now),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -472,6 +480,7 @@ mod tests {
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -519,6 +528,7 @@ mod tests {
             MockGateway::succeed(Arc::clone(&state)),
             FixedClock(now),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 

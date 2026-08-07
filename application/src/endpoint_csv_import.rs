@@ -4,7 +4,7 @@ use rutilus_domain::{
     AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
     AuditOperationContext, AuditOperationId, AuditParameterSummary, AuditProgress,
     AuditRedfishOperation, AuditSequence, AuditTarget, DeploymentPosture, EndpointAddress,
-    EndpointId, ProductPermission,
+    EndpointId, PrincipalId, ProductPermission,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -25,6 +25,7 @@ pub struct EndpointCsvImportExecutor<Probe, Enroller, Audit, Time> {
     audit: Audit,
     clock: Time,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 }
 
@@ -42,6 +43,7 @@ where
         audit: Audit,
         clock: Time,
         actor: AuditActor,
+        actor_principal_id: Option<PrincipalId>,
         origin: DeploymentPosture,
     ) -> Self {
         Self {
@@ -50,6 +52,7 @@ where
             audit,
             clock,
             actor,
+            actor_principal_id,
             origin,
         }
     }
@@ -107,7 +110,7 @@ where
                 ));
             }
         };
-        let context = match AuditOperationContext::try_new(
+        let context = match AuditOperationContext::try_new_with_actor_principal(
             AuditOperationId::generate(),
             self.actor,
             self.origin,
@@ -116,6 +119,7 @@ where
             ProductPermission::ManageEndpoints,
             AuditAction::ImportEndpoints,
             AuditRedfishOperation::None,
+            self.actor_principal_id,
         ) {
             Ok(context) => context,
             Err(source) => {
@@ -657,6 +661,7 @@ mod tests {
             MockAudit { state },
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         )
     }

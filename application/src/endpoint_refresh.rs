@@ -5,8 +5,8 @@ use rutilus_domain::{
     AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
     AuditRedfishOperation, AuditSequence, AuditTarget, CredentialId, CredentialUsername,
     DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointId,
-    ProductPermission, ResourceEtag, ResourceFeature, ResourceODataId, ResourceODataType,
-    ResourceSnapshot, ResourceSnapshotPayload, TlsTrust,
+    PrincipalId, ProductPermission, ResourceEtag, ResourceFeature, ResourceODataId,
+    ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, TlsTrust,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -329,6 +329,7 @@ pub struct AuditedEndpointRefresh<Repository, Credentials, Reader, Audit, Time> 
     audit: Audit,
     clock: Time,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 }
 
@@ -342,6 +343,7 @@ where
     Time: Clock,
 {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repository: Repository,
         credentials: Credentials,
@@ -349,6 +351,7 @@ where
         audit: Audit,
         clock: Time,
         actor: AuditActor,
+        actor_principal_id: Option<PrincipalId>,
         origin: DeploymentPosture,
     ) -> Self {
         Self {
@@ -358,6 +361,7 @@ where
             audit,
             clock,
             actor,
+            actor_principal_id,
             origin,
         }
     }
@@ -385,15 +389,18 @@ where
             Audit::Error,
         >,
     > {
-        let context =
-            refresh_audit_context(endpoint_id, self.actor, self.origin).map_err(|source| {
-                AuditedEndpointRefreshError::Audit {
-                    stage: RefreshAuditStage::Start,
-                    endpoint_id,
-                    resources_committed: false,
-                    source: AuditRecordError::Context(source),
-                }
-            })?;
+        let context = refresh_audit_context(
+            endpoint_id,
+            self.actor,
+            self.actor_principal_id,
+            self.origin,
+        )
+        .map_err(|source| AuditedEndpointRefreshError::Audit {
+            stage: RefreshAuditStage::Start,
+            endpoint_id,
+            resources_committed: false,
+            source: AuditRecordError::Context(source),
+        })?;
         let terminal_sequence =
             AuditSequence::FIRST
                 .next()
@@ -544,9 +551,10 @@ where
 fn refresh_audit_context(
     endpoint_id: EndpointId,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 ) -> Result<AuditOperationContext, AuditOperationContextError> {
-    AuditOperationContext::try_new(
+    AuditOperationContext::try_new_with_actor_principal(
         AuditOperationId::generate(),
         actor,
         origin,
@@ -555,6 +563,7 @@ fn refresh_audit_context(
         ProductPermission::RefreshEndpoints,
         AuditAction::RefreshEndpoint,
         AuditRedfishOperation::ReadCoreResources,
+        actor_principal_id,
     )
 }
 
@@ -893,6 +902,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -945,6 +955,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 1),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -977,6 +988,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -1021,6 +1033,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 2),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -1056,6 +1069,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), Arc::clone(&audit_state), 2),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -1192,6 +1206,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 
@@ -1244,6 +1259,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(OffsetDateTime::now_utc()),
             AuditActor::System,
+            None,
             DeploymentPosture::Site,
         );
 

@@ -6,7 +6,7 @@ use rutilus_domain::{
     AuditProgress, AuditRedfishOperation, AuditSequence, AuditTarget, AuditTlsTrust, CredentialId,
     CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
     EndpointCapabilityObservation, EndpointDisplayName, EndpointId, EndpointTimelineError,
-    ProductPermission, TlsTrust,
+    PrincipalId, ProductPermission, TlsTrust,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -321,6 +321,7 @@ pub struct AuditedEndpointOnboarding<Repository, Credentials, Gateway, Audit, Ti
     audit: Audit,
     clock: Time,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 }
 
@@ -334,6 +335,7 @@ where
     Time: Clock,
 {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repository: Repository,
         credentials: Credentials,
@@ -341,6 +343,7 @@ where
         audit: Audit,
         clock: Time,
         actor: AuditActor,
+        actor_principal_id: Option<PrincipalId>,
         origin: DeploymentPosture,
     ) -> Self {
         Self {
@@ -350,6 +353,7 @@ where
             audit,
             clock,
             actor,
+            actor_principal_id,
             origin,
         }
     }
@@ -376,13 +380,12 @@ where
         >,
     > {
         let context =
-            onboarding_audit_context(&request, self.actor, self.origin).map_err(|source| {
-                AuditedOnboardEndpointError::Audit {
+            onboarding_audit_context(&request, self.actor, self.actor_principal_id, self.origin)
+                .map_err(|source| AuditedOnboardEndpointError::Audit {
                     stage: OnboardingAuditStage::Start,
                     endpoint_id: None,
                     source: AuditRecordError::Context(source),
-                }
-            })?;
+                })?;
         let second =
             AuditSequence::FIRST
                 .next()
@@ -529,13 +532,14 @@ where
 fn onboarding_audit_context(
     request: &OnboardEndpointRequest,
     actor: AuditActor,
+    actor_principal_id: Option<PrincipalId>,
     origin: DeploymentPosture,
 ) -> Result<AuditOperationContext, AuditOperationContextError> {
     let trust = match request.target().trust() {
         TlsTrust::SystemCa { .. } => AuditTlsTrust::SystemCa,
         TlsTrust::PinnedCertificate { .. } => AuditTlsTrust::PinnedCertificate,
     };
-    AuditOperationContext::try_new(
+    AuditOperationContext::try_new_with_actor_principal(
         AuditOperationId::generate(),
         actor,
         origin,
@@ -547,6 +551,7 @@ fn onboarding_audit_context(
         ProductPermission::ManageEndpoints,
         AuditAction::EnrollEndpoint,
         AuditRedfishOperation::ProbeCoreCapabilities,
+        actor_principal_id,
     )
 }
 
@@ -784,6 +789,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(observed_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -837,6 +843,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 1),
             FixedClock(trusted_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -870,6 +877,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 2),
             FixedClock(trusted_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -907,6 +915,7 @@ mod tests {
             MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
             FixedClock(trusted_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -951,6 +960,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), audit_state, 2),
             FixedClock(trusted_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 
@@ -993,6 +1003,7 @@ mod tests {
             MockAudit::fail_on(Arc::clone(&lifecycle), Arc::clone(&audit_state), 3),
             FixedClock(trusted_at),
             AuditActor::LocalOperator,
+            None,
             DeploymentPosture::Standalone,
         );
 

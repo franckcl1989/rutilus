@@ -97,6 +97,7 @@ pub fn trusted_endpoint_enrollment<'a>(
         gateway,
         SystemClock,
         actor,
+        None,
         origin,
     )
 }
@@ -117,6 +118,7 @@ pub fn endpoint_csv_importer<'a>(
         store,
         SystemClock,
         actor,
+        None,
         origin,
     )
 }
