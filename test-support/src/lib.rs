@@ -32,11 +32,13 @@
 //! [`MockBmc::start`] serves the default `Rutilus` tree (Vendor "Rutilus
 //! Test", no `Oem` namespace anywhere), while [`MockBmc::start_with_profile`]
 //! swaps in a vendor tree -- the `Dell` profile serves the §11.5
-//! `DellAttributes` surface behind the manager's `Oem.Dell` segment, and a
-//! vendor that serves no OEM surface is a new profile variant that only
-//! changes the identity strings (the 0.5.0 xFusion/Inspur standard-pattern
-//! basis). Vendor-standard integration tests can therefore drive a realistic
-//! vendor identity instead of the generic fixture.
+//! `DellAttributes` surface behind the manager's `Oem.Dell` segment, and the
+//! `XFusion` and `Inspur` profiles realize the 0.5.0 standard pattern: a
+//! vendor that serves no OEM surface is a profile variant that only changes
+//! the identity strings, so every §2.1 OEM capability stays `NotAdvertised`
+//! and no other vendor's surface can mis-display. Vendor-standard integration
+//! tests can therefore drive a realistic vendor identity instead of the
+//! generic fixture.
 //!
 //! # Demo flow
 //!

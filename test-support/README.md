@@ -158,9 +158,21 @@ for them instead of classifying a guessed path.
   read decodes a real document. Every other document of the tree is shared
   with the default profile, and the Dell Attributes route 404s under any
   other profile.
-- The profile enum is the extension point for 0.5.0's xFusion/Inspur
-  standard-pattern verification: a vendor that serves no OEM surface is a new
-  profile variant that only changes the Service Root identity strings.
+- xFusion (`MockProfile::XFusion`, `--profile xfusion`): Vendor "xFusion" /
+  Product "2288H V7", no `Oem` namespace anywhere in the tree, so every
+  §2.1 OEM capability probes `NotAdvertised` and the read surface stays the
+  default 28-resource tree. This is the 0.5.0 standard-pattern verification
+  basis: a vendor that serves no OEM surface must not mis-display any other
+  vendor's features. Every document of the tree is shared with the default
+  profile except the Service Root identity strings.
+- Inspur (`MockProfile::Inspur`, `--profile inspur`): Vendor "Inspur" /
+  Product "NF5280M6", no `Oem` namespace anywhere in the tree, the second
+  0.5.0 standard-pattern verification basis. Every document of the tree is
+  shared with the default profile except the Service Root identity strings.
+- The profile enum stays the extension point for further vendors: a vendor
+  that serves no OEM surface is a new profile variant that only changes the
+  Service Root identity strings, and a vendor with an OEM surface adds its
+  namespace plus its gated routes.
 
 ## Behavior contract
 
@@ -207,8 +219,9 @@ Session lifecycle with exact wire-sequence assertions, and refresh.
 - `MockBmc::start()` / `MockBmc::bind(port)` -- bind and serve the default
   profile in the background; `MockBmc::start_with_profile(profile)` /
   `MockBmc::bind_with_profile(port, profile)` serve a vendor profile
-  (`MockProfile::Rutilus` | `MockProfile::Dell`); `stop()` shuts down and
-  releases the port.
+  (`MockProfile::Rutilus` | `MockProfile::Dell` | `MockProfile::Nvidia` |
+  `MockProfile::Lenovo` | `MockProfile::XFusion` | `MockProfile::Inspur`);
+  `stop()` shuts down and releases the port.
 - `MockBmc::endpoint_address()` / `url()` -- the endpoint to enroll.
 - `MockBmc::fingerprint()` / `fingerprint_text()` / `certificate_der()` --
   the TLS identity for trust construction and Pin assertions.

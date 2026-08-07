@@ -346,6 +346,121 @@ fn nvidia_profile_swaps_identity_and_serves_power_chain_routes_only() -> Result<
     Ok(())
 }
 
+#[test]
+fn lenovo_profile_swaps_identity_and_serves_security_service_route_only()
+-> Result<(), Box<dyn Error>> {
+    // The fixture mapping: the Lenovo profile swaps the Service Root identity
+    // strings and adds the manager `Oem.Lenovo` segment with the `Security`
+    // navigation.
+    let lenovo_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Lenovo))?;
+    assert_eq!(lenovo_root["Vendor"], "Lenovo");
+    assert_eq!(lenovo_root["Product"], "ThinkSystem SR650");
+    let lenovo_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Lenovo))?;
+    assert_eq!(lenovo_manager["Oem"]["Lenovo"]["KCSEnabled"], true);
+    assert_eq!(
+        lenovo_manager["Oem"]["Lenovo"]["Security"]["@odata.id"],
+        "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+    );
+    // The default profile's manager keeps no `Oem` namespace.
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+
+    // The §11.5 `SecurityService` route is served only under the Lenovo
+    // profile.
+    let lenovo_state = MockState::with_profile(MockProfile::Lenovo);
+    let security = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+        &[],
+        &lenovo_state,
+    );
+    assert_eq!(security.status, "200 OK");
+    let security_body: serde_json::Value = serde_json::from_str(&security.body)?;
+    assert_eq!(security_body["Id"], "SecurityService");
+    assert_eq!(security_body["Configurator"]["FWRollback"], "Enabled");
+
+    // Under the default profile the same path is a Redfish-shaped 404, so
+    // the default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    let missing = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+        &[],
+        &default_state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
+fn no_oem_profiles_swap_identity_and_gate_every_vendor_route() -> Result<(), Box<dyn Error>> {
+    // The §21 0.5.0 standard-pattern fixture mapping: an xFusion or Inspur
+    // profile swaps only the Service Root identity strings, and no document
+    // of the tree carries an `Oem` namespace.
+    for (profile, vendor, product) in [
+        (MockProfile::XFusion, "xFusion", "2288H V7"),
+        (MockProfile::Inspur, "Inspur", "NF5280M6"),
+    ] {
+        let root: serde_json::Value = serde_json::from_str(fixtures::service_root(profile))?;
+        assert_eq!(root["Vendor"], vendor, "{vendor} Service Root");
+        assert_eq!(root["Product"], product, "{vendor} Service Root");
+        assert!(root.get("Oem").is_none(), "{vendor} must serve no Oem");
+        let manager: serde_json::Value = serde_json::from_str(fixtures::manager(profile))?;
+        assert!(
+            manager.get("Oem").is_none(),
+            "{vendor} manager must be Oem-free"
+        );
+        let system: serde_json::Value = serde_json::from_str(fixtures::system(profile))?;
+        assert!(
+            system.get("Oem").is_none(),
+            "{vendor} system must be Oem-free"
+        );
+        let chassis: serde_json::Value = serde_json::from_str(fixtures::chassis(profile))?;
+        assert!(
+            chassis.get("Oem").is_none(),
+            "{vendor} chassis must be Oem-free"
+        );
+
+        // Every document outside the Service Root is byte-identical to the
+        // default tree, so the standard surface cannot drift from the
+        // default profile.
+        assert_eq!(
+            fixtures::manager(profile),
+            fixtures::manager(MockProfile::Rutilus),
+            "{vendor} must share the default manager document"
+        );
+        assert_eq!(
+            fixtures::system(profile),
+            fixtures::system(MockProfile::Rutilus),
+            "{vendor} must share the default system document"
+        );
+        assert_eq!(
+            fixtures::chassis(profile),
+            fixtures::chassis(MockProfile::Rutilus),
+            "{vendor} must share the default chassis document"
+        );
+
+        // Every vendor route of the other profiles 404s under the no-OEM
+        // profiles, so no vendor namespace can mis-display on the standard
+        // tree.
+        let state = MockState::with_profile(profile);
+        for path in [
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+            "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing",
+        ] {
+            let missing = route::dispatch(HttpMethod::Get, path, &[], &state);
+            assert_eq!(missing.status, "404 Not Found", "{path} under {vendor}");
+        }
+    }
+    Ok(())
+}
+
 // The 125-line test exceeds the pedantic line budget because the whole
 // NVIDIA demo flow (probe, read, refresh, wire sequence) is asserted in one
 // contract; the lint is scoped here exactly like the other flow tests. The
@@ -856,4 +971,68 @@ fn header_value<'a>(response: &'a super::http::HttpResponse, name: &str) -> Opti
         .iter()
         .find(|(header_name, _)| header_name == name)
         .map(|(_, value)| value.as_str())
+}
+
+#[test]
+fn nvidia_action_routes_answer_task_entity_and_empty_acceptances() -> Result<(), Box<dyn Error>> {
+    let state = MockState::with_profile(MockProfile::Nvidia);
+
+    // The profile Update action accepts asynchronously with the Task
+    // location (§13.6), exactly like a real BMC.
+    let update = route::dispatch(
+        HttpMethod::Post,
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update",
+        br#"{"ProfileFile":"{}"}"#,
+        &state,
+    );
+    assert_eq!(update.status, "202 Accepted");
+    assert_eq!(
+        header_value(&update, "Location"),
+        Some("/redfish/v1/TaskService/Tasks/1")
+    );
+    let body: serde_json::Value = serde_json::from_str(&update.body)?;
+    assert_eq!(body["Id"], "1");
+
+    // The GenerateToken action answers with the `BinaryTokenURI` entity.
+    let generate = route::dispatch(
+        HttpMethod::Post,
+        "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.GenerateToken",
+        br#"{"TokenType":"FRC"}"#,
+        &state,
+    );
+    assert_eq!(generate.status, "200 OK");
+    let body: serde_json::Value = serde_json::from_str(&generate.body)?;
+    assert_eq!(
+        body["BinaryTokenURI"],
+        "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Token"
+    );
+
+    // The remaining actions accept synchronously with no body.
+    for path in [
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.FactoryReset",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/Actions/NvidiaSystemProfile.Activate",
+        "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.InstallToken",
+        "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.DisableToken",
+        "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement/Actions/NvidiaDebugTokenManagement.EraseToken",
+        "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ActivatePresetProfile",
+        "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ApplyAdminOverrides",
+    ] {
+        let response = route::dispatch(HttpMethod::Post, path, br"{}", &state);
+        assert_eq!(response.status, "204 No Content", "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn nvidia_action_routes_are_gated_on_the_nvidia_profile() {
+    // A non-NVIDIA profile must 404 the action targets like any unserved
+    // path instead of leaking the vendor namespace.
+    let state = MockState::new();
+    let response = route::dispatch(
+        HttpMethod::Post,
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update",
+        br"{}",
+        &state,
+    );
+    assert_eq!(response.status, "404 Not Found");
 }

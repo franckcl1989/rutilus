@@ -24,20 +24,26 @@ struct Cli {
     port: u16,
 
     /// Vendor fixture profile to serve: `rutilus` (the default, no vendor
-    /// `Oem` namespace) or `dell` (Dell identity plus the §11.5
-    /// `DellAttributes` surface).
-    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell"])]
+    /// `Oem` namespace), `dell` (Dell identity plus the §11.5
+    /// `DellAttributes` surface), `nvidia` (NVIDIA identity plus the §11.5
+    /// chains), `lenovo` (Lenovo identity plus the §11.5
+    /// `SecurityService` surface), `xfusion` (xFusion identity, no OEM
+    /// surface), or `inspur` (Inspur identity, no OEM surface).
+    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell", "nvidia", "lenovo", "xfusion", "inspur"])]
     profile: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    // `clap` restricts the value to the two documented names, so any other
+    // `clap` restricts the value to the documented names, so any other
     // spelling falls back to the default profile.
     let profile = match cli.profile.as_str() {
         "dell" => MockProfile::Dell,
         "nvidia" => MockProfile::Nvidia,
+        "lenovo" => MockProfile::Lenovo,
+        "xfusion" => MockProfile::XFusion,
+        "inspur" => MockProfile::Inspur,
         _ => MockProfile::Rutilus,
     };
     let mock = MockBmc::bind_with_profile(cli.port, profile).await?;

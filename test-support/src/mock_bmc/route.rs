@@ -40,8 +40,9 @@ const DEFAULT_USER_NAME: &str = "admin";
 // with the fixture tree, and the arms must stay in one place so the served
 // surface reads as a single table; splitting the service-family routes into
 // a helper would scatter the routing logic. The infra crate allows the same
-// lint on its fixture-sequence tests.
-#[allow(clippy::too_many_lines)]
+// lint on its fixture-sequence tests, and the `204` action acceptances
+// share one body by design.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 pub(crate) fn dispatch(
     method: HttpMethod,
     target: &str,
@@ -98,6 +99,68 @@ pub(crate) fn dispatch(
         ) if state.profile() == MockProfile::Nvidia => {
             json_ok(fixtures::NVIDIA_SYSTEM_PROFILE_FILE_1)
         }
+        // The §0.5.0 OEM write slice targets the debug-token and
+        // power-smoothing chain documents through the same §11.5 navigation;
+        // like the read chains, they exist only under the NVIDIA profile.
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_DEBUG_TOKEN)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_DEBUG_TOKEN_MANAGEMENT)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_SMOOTHING)
+        }
+        // The §0.5.0 OEM write slice runs the typed actions the fixtures
+        // advertise. The Update action answers `202 Accepted` with the
+        // Task location (the async path of §13.6), the GenerateToken action
+        // answers with the `BinaryTokenURI` entity, and every other action
+        // answers `204`, exactly like the write responses the gateway's own
+        // fixture sequences serve.
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update",
+        ) if state.profile() == MockProfile::Nvidia => nvidia_update_task(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.FactoryReset",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/Actions/NvidiaSystemProfile.Activate",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.GenerateToken",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(r#"{"BinaryTokenURI":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Token"}"#)
+        }
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.InstallToken",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.DisableToken",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement/Actions/NvidiaDebugTokenManagement.EraseToken",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ActivatePresetProfile",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
+        (
+            HttpMethod::Post,
+            "/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ApplyAdminOverrides",
+        ) if state.profile() == MockProfile::Nvidia => no_content(),
         (HttpMethod::Get, "/redfish/v1/Systems/1/Bios") => json_ok(fixtures::BIOS),
         (HttpMethod::Get, "/redfish/v1/Systems/1/BootOptions") => {
             json_ok(fixtures::BOOT_OPTIONS_COLLECTION)
@@ -121,7 +184,7 @@ pub(crate) fn dispatch(
             json_ok(fixtures::PCIE_DEVICE_GPU1)
         }
         (HttpMethod::Get, "/redfish/v1/Chassis") => json_ok(fixtures::CHASSIS_COLLECTION),
-        (HttpMethod::Get, "/redfish/v1/Chassis/1") => json_ok(fixtures::CHASSIS),
+        (HttpMethod::Get, "/redfish/v1/Chassis/1") => json_ok(fixtures::chassis(state.profile())),
         (HttpMethod::Get, "/redfish/v1/Chassis/1/Power") => json_ok(fixtures::POWER),
         (HttpMethod::Get, "/redfish/v1/Chassis/1/Thermal") => json_ok(fixtures::THERMAL),
         (HttpMethod::Get, "/redfish/v1/Chassis/1/Sensors") => json_ok(fixtures::SENSORS_COLLECTION),
@@ -238,6 +301,17 @@ pub(crate) fn dispatch(
         {
             json_ok(fixtures::DELL_ATTRIBUTES)
         }
+        // The §11.5 Lenovo `SecurityService` document is a vendor fixture: it
+        // exists only under the Lenovo profile, and any other profile must
+        // 404 it like any unserved path instead of leaking a vendor
+        // namespace. The document is reached through the `Oem.Lenovo`
+        // segment's `Security` navigation, so the route mirrors the exact
+        // `@odata.id` value the fixture serves.
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService")
+            if state.profile() == MockProfile::Lenovo =>
+        {
+            json_ok(fixtures::LENOVO_SECURITY_SERVICE)
+        }
         (HttpMethod::Get, "/redfish/v1/Managers/1/LogServices") => {
             json_ok(fixtures::LOG_SERVICES_COLLECTION)
         }
@@ -287,6 +361,27 @@ pub(crate) fn dispatch(
 
 fn json_ok(body: impl Into<String>) -> HttpResponse {
     HttpResponse::json("200 OK", body.into())
+}
+
+/// The `204` answer of one synchronously accepted action.
+fn no_content() -> HttpResponse {
+    HttpResponse::json("204 No Content", String::new())
+}
+
+/// The `202` Task acceptance of the profile Update action.
+///
+/// The `Location` names the Task the `TaskService` routes serve, and the body
+/// is the Task document itself, mirroring a real BMC's async acceptance
+/// (§13.6).
+fn nvidia_update_task() -> HttpResponse {
+    HttpResponse::json_with_headers(
+        "202 Accepted",
+        vec![(
+            "Location".to_owned(),
+            "/redfish/v1/TaskService/Tasks/1".to_owned(),
+        )],
+        fixtures::TASK_1.to_owned(),
+    )
 }
 
 fn not_found() -> HttpResponse {

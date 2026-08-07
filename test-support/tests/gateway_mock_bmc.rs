@@ -6,7 +6,11 @@
 //! Root read, the complete 44-capability probe (30 standard §2.1 features and
 //! 14 OEM features), the typed core resource read, the Session create/delete
 //! lifecycle, and the 0.5.0 vendor profiles (the Dell profile's `oem-dell`
-//! probe states and its §11.5 `DellAttributes` snapshot).
+//! probe states and its §11.5 `DellAttributes` snapshot, the NVIDIA
+//! profile's `oem-nvidia*` probe states and its §11.5 chains, the Lenovo
+//! profile's `oem-lenovo` probe states and its §11.5 `SecurityService`
+//! snapshot, and the xFusion/Inspur no-OEM profiles proving every OEM
+//! capability stays `NotAdvertised` and the read tree stays OEM-free).
 //!
 //! Every test starts its own `MockBmc` on an ephemeral port, so the suite is
 //! self-contained: it needs no manual setup, no fixture files, and no
@@ -16,10 +20,15 @@ use std::{error::Error, io};
 
 use rutilus_domain::{
     CAPABILITY_LEDGER_ORDER, CapabilityState, CredentialUsername, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, OEM_CAPABILITY_LEDGER_ORDER,
-    ResourceFeature, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, EraseToken, EraseType,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OEM_CAPABILITY_LEDGER_ORDER, OemCommand, ProfileFile, ProfileId, RedfishCommand,
+    ResourceFeature, TlsTrust, TokenData, TokenType,
 };
-use rutilus_infra_redfish::{CoreResourceProjection, RedfishGateway, SystemCaStatus};
+use rutilus_infra_redfish::{
+    CommandExecutionError, CommandExecutionOutcome, CommandVerificationOutcome,
+    CoreResourceProjection, RedfishGateway, SystemCaStatus,
+};
 use rutilus_test_support::{MockBmc, MockProfile, RequestRecord};
 use secrecy::SecretString;
 use time::OffsetDateTime;
@@ -641,6 +650,37 @@ const NVIDIA_PROBE_REQUEST_COUNT: u64 = 34;
 /// singleton).
 const NVIDIA_RESOURCE_READ_REQUEST_COUNT: u64 = 71;
 
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the Lenovo profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides `oem-lenovo` from the
+/// already-decoded manager member and never probes a vendor URL.
+const LENOVO_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the Lenovo profile: the 51 requests of the default profile plus the
+/// single §11.5 `SecurityService` fetch.
+const LENOVO_RESOURCE_READ_REQUEST_COUNT: u64 = 52;
+
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with a no-OEM profile (xFusion / Inspur): exactly the 34 requests
+/// of the default profile, because the §11.3 namespace probe decides the OEM
+/// capabilities from already-decoded documents and never probes a vendor
+/// URL.
+const NO_OEM_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with a no-OEM profile (xFusion / Inspur): exactly the 51 requests of the
+/// default profile, because the tree serves no OEM chain to fetch.
+const NO_OEM_RESOURCE_READ_REQUEST_COUNT: u64 = 51;
+
+/// The no-OEM vendor profiles and their Service Root identities, the §21
+/// 0.5.0 standard-pattern verification basis: the identity strings swap and
+/// no vendor `Oem` namespace is served anywhere.
+const NO_OEM_PROFILES: [(MockProfile, &str, &str); 2] = [
+    (MockProfile::XFusion, "xFusion", "2288H V7"),
+    (MockProfile::Inspur, "Inspur", "NF5280M6"),
+];
+
 #[tokio::test]
 async fn dell_profile_probes_oem_dell_supported_with_standard_surface_unchanged()
 -> Result<(), Box<dyn Error>> {
@@ -1171,5 +1211,496 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
         0,
         "the resource read must delete its transient Session before returning"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_executes_oem_actions_through_the_typed_mock_actions()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    // The synchronous profile-service and device-token actions are accepted
+    // through the decoded action targets.
+    for command in [
+        RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+            NvidiaSystemConfigProfileCommand::FactoryReset,
+        )),
+        RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+            NvidiaSystemConfigProfileCommand::ActivateProfile,
+        )),
+        RedfishCommand::Oem(OemCommand::DebugToken(
+            NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+        )),
+        RedfishCommand::Oem(OemCommand::DebugToken(
+            NvidiaDebugTokenCommand::InstallToken(TokenData::new("dG9rZW4tZGF0YQ==".to_owned())),
+        )),
+        RedfishCommand::Oem(OemCommand::DebugToken(
+            NvidiaDebugTokenCommand::DisableToken,
+        )),
+    ] {
+        let outcome = gateway
+            .execute_command(&address, &trust, &username, &password, &command)
+            .await?;
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+    }
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "every command must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_update_accepts_a_task_and_surfaces_its_location()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    // The mock answers the Update action with `202 Accepted` and the Task
+    // location, so the gateway surfaces the §13.6 acceptance for the Task
+    // monitor instead of a synchronous outcome.
+    let result = gateway
+        .execute_command(
+            &address,
+            &trust,
+            &username,
+            &password,
+            &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                NvidiaSystemConfigProfileCommand::Update(ProfileFile::new("{}".to_owned())),
+            )),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(CommandExecutionError::AsyncTaskAccepted { task_location })
+            if task_location.to_string() == "/redfish/v1/TaskService/Tasks/1"
+    ));
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "a Task acceptance must still delete its transient Session"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_executes_erase_token_through_the_manager_chain()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let outcome = gateway
+        .execute_command(
+            &address,
+            &trust,
+            &username,
+            &password,
+            &RedfishCommand::Oem(OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(
+                EraseToken::new(EraseType::EraseAll, TokenType::Frc),
+            ))),
+        )
+        .await?;
+
+    assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_executes_power_smoothing_actions_through_the_chassis_chain()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    for command in [
+        RedfishCommand::Oem(OemCommand::PowerSmoothing(
+            NvidiaPowerSmoothingCommand::ActivatePresetProfile(ProfileId::new(3)),
+        )),
+        RedfishCommand::Oem(OemCommand::PowerSmoothing(
+            NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+        )),
+    ] {
+        let outcome = gateway
+            .execute_command(&address, &trust, &username, &password, &command)
+            .await?;
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_verifies_oem_commands_by_re_reading_the_chain() -> Result<(), Box<dyn Error>>
+{
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    for command in [
+        RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+            NvidiaSystemConfigProfileCommand::FactoryReset,
+        )),
+        RedfishCommand::Oem(OemCommand::DebugToken(
+            NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+        )),
+    ] {
+        let verdict = gateway
+            .verify_command(&address, &trust, &username, &password, &command)
+            .await?;
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+    }
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "every verification must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lenovo_profile_probes_oem_lenovo_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Lenovo).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile: a vendor profile only swaps the identity
+    // strings and the OEM surface, never the standard tree.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The Lenovo profile advertises exactly the Lenovo namespace: the decoded
+    // manager member carries `Oem.Lenovo`, so `oem-lenovo` probes
+    // `Supported`; no other vendor namespace is served, so every remaining
+    // OEM capability stays `NotAdvertised` (§11.3 advertised layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemLenovo => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("Lenovo"),
+        "the probe must carry the Lenovo Service Root identity"
+    );
+    assert_eq!(
+        discovery.service_root().product(),
+        Some("ThinkSystem SR650"),
+        "the probe must carry the Lenovo Service Root product"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        LENOVO_PROBE_REQUEST_COUNT,
+        "the Lenovo namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete Lenovo read surface is asserted in one test so the request
+// position and the 29-resource order stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint
+// on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn lenovo_profile_reads_lenovo_security_service_snapshot() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Lenovo).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The Lenovo read surface adds exactly the §11.5 `SecurityService`
+    // snapshot to the default 28-resource tree, in the documented read order:
+    // it is one manager surface, projected right after the manager's
+    // `HostInterfaces` member and before the root-level `Accounts` family.
+    assert_eq!(resources.len(), 29);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::OemLenovoSecurityService,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The `SecurityService` snapshot carries the manager's `Oem.Lenovo`
+    // surface: the embedded navigation identity, its upstream ETag, and the
+    // `FWRollback` state exactly as published (the `Configurator` nesting of
+    // the compiled schema collapses onto the wrapper's flattened accessor).
+    let security = &resources[19];
+    assert_eq!(
+        security.feature(),
+        ResourceFeature::OemLenovoSecurityService
+    );
+    assert_eq!(
+        security.odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+    );
+    assert!(
+        security.etag().is_some(),
+        "{} must carry its upstream ETag",
+        security.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(security.payload().as_str())?;
+    assert_eq!(payload["Id"], "SecurityService");
+    assert_eq!(payload["Name"], "Lenovo Security Service");
+    assert_eq!(payload["Description"], "Lenovo security service");
+    assert_eq!(payload["FWRollback"], "Enabled");
+
+    // The gateway fetches the `SecurityService` document exactly once, as one
+    // manager surface right after the `HostInterfaces/1` member, and through
+    // the Session token transport like every other read.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        LENOVO_RESOURCE_READ_REQUEST_COUNT,
+        "the Lenovo read must issue exactly one request beyond the default flow"
+    );
+    let host_interface_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/HostInterfaces/1")
+        .ok_or_else(|| io::Error::other("HostInterfaces/1 is missing from the request log"))?;
+    let security_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService")
+        .ok_or_else(|| {
+            io::Error::other("the SecurityService fetch is missing from the request log")
+        })?;
+    assert_eq!(
+        security_index,
+        host_interface_index + 1,
+        "the SecurityService fetch must follow the manager's HostInterfaces member"
+    );
+    assert_eq!(
+        requests[security_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the SecurityService fetch must authenticate with the Session token"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_oem_profiles_probe_every_oem_capability_not_advertised() -> Result<(), Box<dyn Error>> {
+    for (profile, vendor, product) in NO_OEM_PROFILES {
+        let mock = MockBmc::start_with_profile(profile).await?;
+        let gateway = RedfishGateway::from_system_roots().await?;
+        let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+        let (username, password) = credentials()?;
+
+        let discovery = gateway
+            .probe_core_capabilities(&address, &trust, &username, &password)
+            .await?;
+
+        // Same §2.1 inventory, same order, and the same served standard
+        // surface as the default profile: a no-OEM profile swaps only the
+        // identity strings, never the standard tree.
+        assert_eq!(
+            discovery.capabilities().len(),
+            CAPABILITY_LEDGER_ORDER.len()
+        );
+        for (index, observation) in discovery.capabilities().iter().enumerate() {
+            assert_eq!(
+                observation.capability(),
+                CAPABILITY_LEDGER_ORDER[index],
+                "capability {index} must follow the §2.1 inventory order"
+            );
+        }
+        for capability in CORE_CAPABILITIES_SUPPORTED {
+            assert_capability_state(
+                discovery.capabilities(),
+                capability,
+                CapabilityState::Supported,
+            )?;
+        }
+        // The §21 0.5.0 standard-pattern verification: a vendor that serves
+        // no `Oem` namespace must never mis-advertise another vendor's
+        // surface, so every one of the 14 §2.1 OEM capabilities probes
+        // `NotAdvertised` exactly like the default tree.
+        for capability in OEM_CAPABILITY_LEDGER_ORDER {
+            assert_capability_state(
+                discovery.capabilities(),
+                capability,
+                CapabilityState::NotAdvertised,
+            )?;
+        }
+        assert_eq!(
+            discovery.service_root().vendor(),
+            Some(vendor),
+            "the probe must carry the {vendor} Service Root identity"
+        );
+        assert_eq!(
+            discovery.service_root().product(),
+            Some(product),
+            "the probe must carry the {vendor} Service Root product"
+        );
+        assert_eq!(
+            mock.requests_served(),
+            NO_OEM_PROBE_REQUEST_COUNT,
+            "a no-OEM namespace probe must fetch no document beyond the default flow"
+        );
+    }
+    Ok(())
+}
+
+// The complete no-OEM read surface is asserted in one test so the
+// 28-resource order stays one contract with the default profile; splitting
+// it would duplicate the pin/credentials flow for both profiles. The infra
+// crate allows the same lint on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn no_oem_profiles_read_the_default_core_tree_without_oem_snapshots()
+-> Result<(), Box<dyn Error>> {
+    for (profile, vendor, _) in NO_OEM_PROFILES {
+        let mock = MockBmc::start_with_profile(profile).await?;
+        let gateway = RedfishGateway::from_system_roots().await?;
+        let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+        let (username, password) = credentials()?;
+
+        let resources = gateway
+            .read_core_resources(&address, &trust, &username, &password)
+            .await?;
+
+        // The read surface is the default 28-resource tree with zero OEM
+        // snapshots: the exact feature order of the default profile, so any
+        // leaked vendor snapshot would break this list instead of drifting.
+        assert_eq!(
+            resources.len(),
+            28,
+            "a no-OEM profile must add no snapshot to the default tree"
+        );
+        let features: Vec<ResourceFeature> = resources
+            .iter()
+            .map(CoreResourceProjection::feature)
+            .collect();
+        assert_eq!(
+            features,
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Bios,
+                ResourceFeature::BootOptions,
+                ResourceFeature::SecureBoot,
+                ResourceFeature::Processors,
+                ResourceFeature::Processors,
+                ResourceFeature::Memory,
+                ResourceFeature::PcieDevices,
+                ResourceFeature::Chassis,
+                ResourceFeature::Power,
+                ResourceFeature::Thermal,
+                ResourceFeature::Sensors,
+                ResourceFeature::Controls,
+                ResourceFeature::Assembly,
+                ResourceFeature::Managers,
+                ResourceFeature::LogServices,
+                ResourceFeature::ManagerNetworkProtocol,
+                ResourceFeature::HostInterfaces,
+                ResourceFeature::Accounts,
+                ResourceFeature::SoftwareInventory,
+                ResourceFeature::EventService,
+                ResourceFeature::EventSubscription,
+                ResourceFeature::TelemetryService,
+                ResourceFeature::MetricDefinition,
+                ResourceFeature::MetricReport,
+                ResourceFeature::TaskService,
+                ResourceFeature::Task,
+            ]
+        );
+        assert_resource_identifiers(&resources);
+
+        // The gateway fetches no document beyond the default flow, through
+        // the Session token transport like every other read, and deletes its
+        // transient Session before returning.
+        assert_eq!(
+            mock.requests_served(),
+            NO_OEM_RESOURCE_READ_REQUEST_COUNT,
+            "a no-OEM read must issue exactly the default request count"
+        );
+        let requests = mock.requests();
+        let system_index = requests
+            .iter()
+            .position(|request| request.path() == "/redfish/v1/Systems/1")
+            .ok_or_else(|| io::Error::other("Systems/1 is missing from the request log"))?;
+        assert_eq!(
+            requests[system_index].header("x-auth-token"),
+            Some("test-session-token"),
+            "the {vendor} read must authenticate with the Session token"
+        );
+        assert_eq!(
+            mock.active_sessions(),
+            0,
+            "the resource read must delete its transient Session before returning"
+        );
+    }
     Ok(())
 }

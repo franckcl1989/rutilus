@@ -30,7 +30,15 @@
 //! [`NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS`], [`NVIDIA_PROFILES_COLLECTION`],
 //! [`NVIDIA_SYSTEM_PROFILE_1`], and [`NVIDIA_SYSTEM_PROFILE_FILE_1`]) plus
 //! the manager-scoped power-compliance and managed-entity chains
-//! ([`NVIDIA_POWER_COMPLIANCE`] and its sub-documents); everything else is
+//! ([`NVIDIA_POWER_COMPLIANCE`] and its sub-documents); the Lenovo profile
+//! swaps the Service Root identity strings ([`SERVICE_ROOT_LENOVO`]), adds
+//! the `Oem.Lenovo` segment to the manager document ([`MANAGER_LENOVO`]),
+//! and serves the §11.5 `SecurityService` document
+//! ([`LENOVO_SECURITY_SERVICE`]); the xFusion and Inspur profiles swap only
+//! the Service Root identity strings ([`SERVICE_ROOT_XFUSION`],
+//! [`SERVICE_ROOT_INSPUR`]) and serve no `Oem` fixtures at all (the
+//! §21 0.5.0 no-OEM standard-pattern basis), so every document outside the
+//! Service Root stays shared with the default tree; everything else is
 //! shared. [`service_root`], [`manager`], and [`system`] select the
 //! profile-specific documents, and the route table gates the vendor routes
 //! on the profile, so no vendor surface can leak into another profile.
@@ -277,7 +285,8 @@ pub(crate) const SYSTEM_NVIDIA: &str = r##"{
     ],
     "Oem":{"Nvidia":{
         "@odata.type":"#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem",
-        "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"}
+        "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"},
+        "CPUDebugToken":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken"}
     }}
 }"##;
 
@@ -289,7 +298,9 @@ pub(crate) const SYSTEM_NVIDIA: &str = r##"{
 /// links whose documents the product never fetches, and the `Status` /
 /// `Profiles` navigations), so the gateway's typed navigation into the
 /// compiled `NvidiaSystemConfigProfile` schema succeeds against the mock.
-pub(crate) const NVIDIA_SYSTEM_CONFIG_PROFILE: &str = r#"{
+/// The `Actions` section advertises the two typed profile-service actions
+/// the §0.5.0 write slice executes; the read slice ignores it.
+pub(crate) const NVIDIA_SYSTEM_CONFIG_PROFILE: &str = r##"{
     "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
     "@odata.etag":"W/\"nvidia-scp-1\"",
     "Id":"SystemConfigProfile",
@@ -300,8 +311,12 @@ pub(crate) const NVIDIA_SYSTEM_CONFIG_PROFILE: &str = r#"{
         "OemCertificates":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Truststore/OemCertificates"}
     },
     "Status":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"},
-    "Profiles":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles"}
-}"#;
+    "Profiles":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles"},
+    "Actions":{
+        "#NvidiaSystemConfigProfile.Update":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.Update"},
+        "#NvidiaSystemConfigProfile.FactoryReset":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Actions/NvidiaSystemConfigProfile.FactoryReset"}
+    }
+}"##;
 
 /// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status` -- the
 /// profile service status singleton of the NVIDIA vendor profile.
@@ -330,7 +345,7 @@ pub(crate) const NVIDIA_PROFILES_COLLECTION: &str = r##"{
 
 /// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1` --
 /// the default profile member of the NVIDIA vendor profile.
-pub(crate) const NVIDIA_SYSTEM_PROFILE_1: &str = r#"{
+pub(crate) const NVIDIA_SYSTEM_PROFILE_1: &str = r##"{
     "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
     "@odata.etag":"W/\"nvidia-profile-1\"",
     "Id":"1",
@@ -341,8 +356,54 @@ pub(crate) const NVIDIA_SYSTEM_PROFILE_1: &str = r#"{
     "UUID":"11111111-2222-3333-4444-555555555555",
     "Version":1,
     "ProfileName":"default-profile",
-    "ProfileFile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"}
-}"#;
+    "ProfileFile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"},
+    "Actions":{
+        "#NvidiaSystemProfile.Activate":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/Actions/NvidiaSystemProfile.Activate"}
+    }
+}"##;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken` -- the device debug
+/// token document of the NVIDIA vendor profile.
+///
+/// The document is reached through the `CPUDebugToken` navigation of the
+/// system's `Oem.Nvidia` segment and advertises the three device debug-token
+/// actions the §0.5.0 write slice executes (`GenerateToken` answers with the
+/// `BinaryTokenURI` entity, the other two with no body).
+pub(crate) const NVIDIA_DEBUG_TOKEN: &str = r##"{
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken",
+    "@odata.etag":"W/\"nvidia-debug-token-1\"",
+    "Id":"CPUDebugToken",
+    "Name":"Debug Token",
+    "Description":"Device debug token",
+    "TokenType":"None",
+    "Status":"NoTokenApplied",
+    "TimeLeftSeconds":0,
+    "DeviceID":"GPU-1",
+    "TokenSubTypes":[],
+    "Actions":{
+        "#NvidiaDebugToken.GenerateToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.GenerateToken"},
+        "#NvidiaDebugToken.InstallToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.InstallToken"},
+        "#NvidiaDebugToken.DisableToken":{"target":"/redfish/v1/Systems/1/Oem/Nvidia/CPUDebugToken/Actions/NvidiaDebugToken.DisableToken"}
+    }
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement` -- the debug
+/// token management document of the NVIDIA vendor profile.
+///
+/// The document is reached through the `DebugTokenManagement` navigation of
+/// the manager's `Oem.Nvidia` segment and advertises the
+/// `#NvidiaDebugTokenManagement.EraseToken` action the §0.5.0 write slice
+/// executes.
+pub(crate) const NVIDIA_DEBUG_TOKEN_MANAGEMENT: &str = r##"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement",
+    "@odata.etag":"W/\"nvidia-dtm-1\"",
+    "Id":"DebugTokenManagement",
+    "Name":"Debug Token Management",
+    "Description":"Debug token settings",
+    "Actions":{
+        "#NvidiaDebugTokenManagement.EraseToken":{"target":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement/Actions/NvidiaDebugTokenManagement.EraseToken"}
+    }
+}"##;
 
 /// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile`
 /// -- the profile file document of the NVIDIA vendor profile, carrying the
@@ -707,9 +768,111 @@ pub(crate) const MANAGER_NVIDIA: &str = r##"{
     "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
     "Oem":{"Nvidia":{
         "@odata.type":"#NvidiaManager.v1_9_0.NvidiaManager",
-        "PowerCompliance":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"}
+        "PowerCompliance":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"},
+        "DebugTokenManagement":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/DebugTokenManagement"}
     }}
 }"##;
+
+/// `GET /redfish/v1/Chassis/1` -- the chassis of the NVIDIA vendor profile.
+///
+/// Exactly the default chassis surface plus the `Oem.Nvidia` segment that
+/// advertises the `NvidiaSmaChassis` shape with the `PowerSmoothing`
+/// navigation the §0.5.0 write slice follows.
+pub(crate) const CHASSIS_NVIDIA: &str = r##"{
+    "@odata.id":"/redfish/v1/Chassis/1",
+    "@odata.etag":"W/\"chassis-1\"",
+    "Id":"1",
+    "Name":"Chassis One",
+    "ChassisType":"RackMount",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model C",
+    "PartNumber":"CHA-PART-1",
+    "SerialNumber":"CHA-1",
+    "SKU":"CHA-SKU-1",
+    "AssetTag":"RACK-01",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+    "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+    "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+    "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"},
+    "Oem":{"Nvidia":{
+        "@odata.type":"#NvidiaChassis.v1_4_0.NvidiaSmaChassis",
+        "PowerSmoothing":{"@odata.id":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing"}
+    }}
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing` -- the power
+/// smoothing document of the NVIDIA vendor profile.
+///
+/// The document is reached through the chassis's `Oem.Nvidia` segment and
+/// advertises the two power-smoothing actions the §0.5.0 write slice
+/// executes.
+pub(crate) const NVIDIA_POWER_SMOOTHING: &str = r##"{
+    "@odata.id":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing",
+    "@odata.etag":"W/\"nvidia-power-smoothing-1\"",
+    "Id":"PowerSmoothing",
+    "Name":"Power Smoothing",
+    "Description":"Power smoothing settings",
+    "Enabled":true,
+    "Actions":{
+        "#NvidiaPowerSmoothing.ActivatePresetProfile":{"target":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ActivatePresetProfile"},
+        "#NvidiaPowerSmoothing.ApplyAdminOverrides":{"target":"/redfish/v1/Chassis/1/Oem/Nvidia/PowerSmoothing/Actions/NvidiaPowerSmoothing.ApplyAdminOverrides"}
+    }
+}"##;
+
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the Lenovo vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the `Oem.Lenovo` segment that
+/// advertises the Lenovo OEM namespace and embeds the `Security` navigation:
+/// the segment carries the boolean `KCSEnabled` shape (`v0_1_0`, what a real
+/// Lenovo XCC publishes) plus the `Security` reference the §11.5 read follows,
+/// so this one addition switches both the capability probe and the read
+/// layer on for the manager surface. The document mirrors the
+/// `MANAGER_WITH_LENOVO_OEM_BODY` fixture `rutilus-infra-redfish` decodes in
+/// its own Lenovo tests.
+pub(crate) const MANAGER_LENOVO: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{"Lenovo":{
+        "KCSEnabled":true,
+        "Security":{"@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"}
+    }}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Lenovo/SecurityService` -- the §11.5
+/// Lenovo `SecurityService` document of the Lenovo vendor profile.
+///
+/// The document mirrors the `LENOVO_SECURITY_SERVICE_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own Lenovo tests (the typed base
+/// fields `Id`, `Name`, and `Description` plus the `Configurator` segment
+/// with the `FWRollback` enum spelling), so the gateway's typed navigation
+/// into the compiled `LenovoSecurityService` schema succeeds against the
+/// mock.
+pub(crate) const LENOVO_SECURITY_SERVICE: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+    "@odata.etag":"W/\"lenovo-security-1\"",
+    "Id":"SecurityService",
+    "Name":"Lenovo Security Service",
+    "Description":"Lenovo security service",
+    "Configurator":{"FWRollback":"Enabled"}
+}"#;
 
 /// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance` -- the §11.5
 /// NVIDIA `NvidiaPowerComplianceManager` chain root of the NVIDIA vendor
@@ -1306,8 +1469,40 @@ pub(crate) fn service_root(profile: MockProfile) -> &'static str {
         MockProfile::Rutilus => SERVICE_ROOT,
         MockProfile::Dell => SERVICE_ROOT_DELL,
         MockProfile::Nvidia => SERVICE_ROOT_NVIDIA,
+        MockProfile::Lenovo => SERVICE_ROOT_LENOVO,
+        MockProfile::XFusion => SERVICE_ROOT_XFUSION,
+        MockProfile::Inspur => SERVICE_ROOT_INSPUR,
     }
 }
+
+/// `GET /redfish/v1` -- the Service Root of the Lenovo vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real Lenovo
+/// XCC identifies itself as Vendor "Lenovo" with the `ThinkSystem` model as
+/// the product. The navigation surface is byte-identical to [`SERVICE_ROOT`],
+/// and no `Oem` segment is served here because the Lenovo namespace lives on
+/// the manager document, exactly where the gateway's probe and read look for
+/// it.
+pub(crate) const SERVICE_ROOT_LENOVO: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"Lenovo",
+    "Product":"ThinkSystem SR650",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
 
 /// `GET /redfish/v1` -- the Service Root of the NVIDIA vendor profile.
 ///
@@ -1337,6 +1532,64 @@ pub(crate) const SERVICE_ROOT_NVIDIA: &str = r##"{
     "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
 }"##;
 
+/// `GET /redfish/v1` -- the Service Root of the xFusion vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real xFusion
+/// BMC identifies itself as Vendor "xFusion" and carries the server model as
+/// the product. The navigation surface is byte-identical to [`SERVICE_ROOT`],
+/// and no `Oem` segment is served anywhere: the §21 0.5.0 standard-pattern
+/// basis is a tree with no OEM surface at all, so every §2.1 OEM capability
+/// stays `NotAdvertised` exactly like the default tree.
+pub(crate) const SERVICE_ROOT_XFUSION: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"xFusion",
+    "Product":"2288H V7",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1` -- the Service Root of the Inspur vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real Inspur
+/// BMC identifies itself as Vendor "Inspur" and carries the server model as
+/// the product. The navigation surface is byte-identical to [`SERVICE_ROOT`],
+/// and no `Oem` segment is served anywhere: the second §21 0.5.0
+/// standard-pattern verification basis, exercising the same no-OEM tree
+/// against a different vendor identity.
+pub(crate) const SERVICE_ROOT_INSPUR: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"Inspur",
+    "Product":"NF5280M6",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
 /// The `Managers/1` document of one vendor profile.
 ///
 /// The default profile keeps the byte-identical [`MANAGER`]; the Dell
@@ -1346,12 +1599,19 @@ pub(crate) const SERVICE_ROOT_NVIDIA: &str = r##"{
 /// chains.
 pub(crate) fn manager(profile: MockProfile) -> &'static str {
     match profile {
-        MockProfile::Rutilus => MANAGER,
+        // The default and the xFusion/Inspur no-OEM profiles keep the shared
+        // default manager document; the vendor surfaces live on the manager
+        // member only for the profiles that carry an `Oem` namespace.
+        MockProfile::Rutilus | MockProfile::XFusion | MockProfile::Inspur => MANAGER,
         MockProfile::Dell => MANAGER_DELL,
         // The NVIDIA profile carries the `Oem.Nvidia` segment on both the
         // System member (the system-config-profile chain) and the Manager
         // member (the power-compliance and managed-entity chains).
         MockProfile::Nvidia => MANAGER_NVIDIA,
+        // The Lenovo profile carries the `Oem.Lenovo` segment on the Manager
+        // member (the `SecurityService` surface); the System member stays
+        // the shared default document.
+        MockProfile::Lenovo => MANAGER_LENOVO,
     }
 }
 
@@ -1362,9 +1622,32 @@ pub(crate) fn manager(profile: MockProfile) -> &'static str {
 /// and navigates the system-config-profile chain.
 pub(crate) fn system(profile: MockProfile) -> &'static str {
     match profile {
-        // The Dell profile shares the default system document: the Dell
-        // OEM surface lives on the manager member, not the system.
-        MockProfile::Rutilus | MockProfile::Dell => SYSTEM,
+        // The Dell and Lenovo profiles share the default system document:
+        // their OEM surfaces live on the manager member, not the system,
+        // and the xFusion and Inspur profiles serve no OEM surface at all.
+        MockProfile::Rutilus
+        | MockProfile::Dell
+        | MockProfile::Lenovo
+        | MockProfile::XFusion
+        | MockProfile::Inspur => SYSTEM,
         MockProfile::Nvidia => SYSTEM_NVIDIA,
+    }
+}
+
+/// The `Chassis/1` document of one vendor profile.
+///
+/// The NVIDIA profile adds the `Oem.Nvidia` segment that advertises its OEM
+/// namespace and navigates the power-smoothing document; every other profile
+/// keeps the shared default document.
+pub(crate) fn chassis(profile: MockProfile) -> &'static str {
+    match profile {
+        MockProfile::Nvidia => CHASSIS_NVIDIA,
+        // The xFusion and Inspur profiles serve no OEM surface, so the
+        // chassis stays the shared default document.
+        MockProfile::Rutilus
+        | MockProfile::Dell
+        | MockProfile::Lenovo
+        | MockProfile::XFusion
+        | MockProfile::Inspur => CHASSIS,
     }
 }
