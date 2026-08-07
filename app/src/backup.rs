@@ -280,12 +280,11 @@ pub async fn restore_backup(
     // schema before the restore is reported complete. The staged read-only
     // inspection applies no migrations; pending migrations still apply at
     // the next real open.
-    let restored_database = fs::read(paths.database_path()).map_err(|source| {
-        BackupError::ReadRestored {
+    let restored_database =
+        fs::read(paths.database_path()).map_err(|source| BackupError::ReadRestored {
             path: paths.database_path().to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     if restored_database != snapshot.database() {
         return Err(BackupError::RestoredDatabaseDiffers);
     }
@@ -665,7 +664,9 @@ pub enum BackupError {
         #[source]
         source: io::Error,
     },
-    #[error("restore verification failed: the restored database differs from the verified backup snapshot")]
+    #[error(
+        "restore verification failed: the restored database differs from the verified backup snapshot"
+    )]
     RestoredDatabaseDiffers,
     #[error(
         "the backup package could not be authenticated with this instance's master key: the \
