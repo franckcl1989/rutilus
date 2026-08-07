@@ -20,13 +20,22 @@ use rutilus_api::{
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
     EventDestinationProtocol, EventListResponse, EventResponse, EventType, GroupResponse,
     ManagerCommand, MetricValueResponse, OperationResponse, OperationSourceResponse,
-    OperationStateResponse, RedfishCommand, ResetKeysType, ResetType, ResourceStatusResponse,
-    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
-    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
+    OperationStateResponse, RedfishCommand, ResetKeysType, ResetType, ResourceDiagnosticsResponse,
+    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+    TagListResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
     TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+// Production wasm builds reach `serde_json` through the leptos re-export:
+// leptos is the wasm-only UI dependency that already carries the crate, so
+// the manifest stays untouched. Host test builds use the dev-dependency.
+#[cfg(target_arch = "wasm32")]
+use leptos::serde_json as json;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use serde_json as json;
 
 #[cfg(any(target_arch = "wasm32", test))]
 const PRODUCT_ID: &str = "rutilus";
@@ -220,18 +229,23 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
                 generation,
                 observed_at,
                 resources,
-            } => (
-                format!(
-                    "Generation {} · observed {}",
-                    generation.get(),
-                    format_observed_at(observed_at)
-                ),
-                Some(count_core_resources(resources)),
-                resources
-                    .iter()
-                    .map(CoreResourceCardProjection::from)
-                    .collect(),
-            ),
+            } => {
+                let endpoint_id_text = identity.endpoint_id().to_string();
+                (
+                    format!(
+                        "Generation {} · observed {}",
+                        generation.get(),
+                        format_observed_at(observed_at)
+                    ),
+                    Some(count_core_resources(resources)),
+                    resources
+                        .iter()
+                        .map(|resource| {
+                            CoreResourceCardProjection::from_resource(&endpoint_id_text, resource)
+                        })
+                        .collect(),
+                )
+            }
         };
         let (vendor, health_level, health_label) = match endpoint.snapshot() {
             EndpointResourceSnapshotResponse::AwaitingFirstRefresh => {
@@ -337,11 +351,22 @@ struct CoreResourceCardProjection {
     description: Option<String>,
     source: String,
     facts: Vec<ResourceFactProjection>,
+    /// The owning endpoint's id; the §12.4 diagnostics drill-down routes on
+    /// it, so the card carries it into the panel entry.
+    endpoint_id: String,
+    /// The stable resource id the backend assigned to this observation; the
+    /// §12.4 diagnostics route addresses one resource by this id.
+    resource_id: String,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-impl From<&CoreResourceResponse> for CoreResourceCardProjection {
-    fn from(resource: &CoreResourceResponse) -> Self {
+impl CoreResourceCardProjection {
+    /// Projects one typed resource into its card, binding the owning
+    /// endpoint id so the card can open the resource's §12.4 diagnostics
+    /// panel. The endpoint is not part of the resource response, so it is
+    /// threaded in from the surrounding inventory projection instead of a
+    /// `From` impl.
+    fn from_resource(endpoint_id: &str, resource: &CoreResourceResponse) -> Self {
         let mut facts = vec![ResourceFactProjection {
             label: "Redfish ID",
             value: resource.common().id().to_owned(),
@@ -354,6 +379,8 @@ impl From<&CoreResourceResponse> for CoreResourceCardProjection {
             description: resource.common().description().map(str::to_owned),
             source: resource.source().odata_id().to_owned(),
             facts,
+            endpoint_id: endpoint_id.to_owned(),
+            resource_id: resource.source().resource_id().to_string(),
         }
     }
 }
@@ -1391,11 +1418,12 @@ enum ConsoleView {
     Events,
     Artifacts,
     Telemetry,
+    Diagnostics,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 11] = [
+    const ALL: [ConsoleView; 12] = [
         Self::Overview,
         Self::Groups,
         Self::Credentials,
@@ -1407,6 +1435,7 @@ impl ConsoleView {
         Self::Events,
         Self::Artifacts,
         Self::Telemetry,
+        Self::Diagnostics,
     ];
 
     const fn label(self) -> &'static str {
@@ -1422,6 +1451,7 @@ impl ConsoleView {
             Self::Events => "Events",
             Self::Artifacts => "Artifacts",
             Self::Telemetry => "Telemetry",
+            Self::Diagnostics => "Diagnostics",
         }
     }
 }
@@ -1526,6 +1556,174 @@ struct CapabilityTargetProjection {
     display_name: String,
     address: String,
 }
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The resource whose §12.4 diagnostics panel is shown. Captured at entry
+/// time so the panel keeps its identity even if the inventory refreshes;
+/// the endpoint and resource ids are the two route parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiagnosticsTargetProjection {
+    endpoint_id: String,
+    resource_id: String,
+    name: String,
+    source: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&CoreResourceCardProjection> for DiagnosticsTargetProjection {
+    /// The card-to-panel entry: every resource card opens exactly its own
+    /// resource's panel, never a neighboring resource.
+    fn from(card: &CoreResourceCardProjection) -> Self {
+        Self {
+            endpoint_id: card.endpoint_id.clone(),
+            resource_id: card.resource_id.clone(),
+            name: card.name.clone(),
+            source: card.source.clone(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Why the §12.4 diagnostics snapshot of one resource could not be loaded.
+///
+/// The three variants map the route contract (404, transport/other status,
+/// unparseable body) to static copy. A 400 cannot originate from this UI
+/// because endpoint and resource ids always come from the local inventory,
+/// so it folds into `Unavailable` like 503.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticsLoadFailure {
+    /// The route answered 404: the endpoint or its resource no longer
+    /// exists in the product.
+    ResourceNotFound,
+    /// The request failed on the network or the route answered 4xx/5xx.
+    Unavailable,
+    /// The route answered 200 with a body that violates the strict shared
+    /// diagnostics contract.
+    Malformed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl DiagnosticsLoadFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::ResourceNotFound => "This resource no longer exists in the product.",
+            Self::Unavailable => "The diagnostics snapshot is temporarily unavailable.",
+            Self::Malformed => "The server response could not be parsed.",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The lazy-loading state of one resource's §12.4 diagnostics panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DiagnosticsState {
+    Idle,
+    Loading,
+    Ready(DiagnosticsProjection),
+    Failed(DiagnosticsLoadFailure),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl DiagnosticsState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed(failure) => failure.message(),
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+
+    fn projection(&self) -> Option<DiagnosticsProjection> {
+        match self {
+            Self::Ready(projection) => Some(projection.clone()),
+            Self::Idle | Self::Loading | Self::Failed(_) => None,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The read-only §12.4 diagnostics snapshot of one resource, projected for
+/// the panel: every field the route exposes, plus the canonical rendering of
+/// the decoded typed payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiagnosticsProjection {
+    endpoint_id: String,
+    odata_uri: String,
+    odata_type: Option<String>,
+    etag: Option<String>,
+    feature: String,
+    generation: String,
+    /// The decoded typed payload rendered as pretty-printed JSON. The wire
+    /// payload is a typed value, not raw bytes, so there is no original text
+    /// to reproduce verbatim; the deterministic 2-space rendering preserves
+    /// every field while staying readable and diffable.
+    typed_payload_json: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&ResourceDiagnosticsResponse> for DiagnosticsProjection {
+    fn from(diagnostics: &ResourceDiagnosticsResponse) -> Self {
+        Self {
+            endpoint_id: diagnostics.endpoint_id().to_string(),
+            odata_uri: diagnostics.odata_uri().to_owned(),
+            odata_type: diagnostics.odata_type().map(str::to_owned),
+            etag: diagnostics.etag().map(str::to_owned),
+            feature: diagnostics.feature().to_owned(),
+            generation: diagnostics.generation().get().to_string(),
+            typed_payload_json: format_typed_payload_json(diagnostics.typed_payload()),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders the decoded typed payload as deterministic pretty-printed JSON.
+///
+/// `serde_json::Value` objects sort keys, so the output is canonical for a
+/// given payload; `to_string_pretty` cannot fail on an already-valid value,
+/// so the error case folds into an empty string that the panel shows as an
+/// explicit empty payload rather than a crash.
+fn format_typed_payload_json(payload: &json::Value) -> String {
+    json::to_string_pretty(payload).unwrap_or_default()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The muted placeholder shown when a BMC did not publish an optional
+/// diagnostics field. Absence is information (§12.4 exposes what the BMC
+/// published and did not publish), so the row stays visible instead of
+/// hiding what is missing. Pinned like the capability `NOT_OBSERVED` label
+/// so the rendering decision cannot drift.
+const DIAGNOSTICS_ABSENT_FIELD_LABEL: &str = "Not published";
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders one optional diagnostics field for the panel: the published
+/// value, or the pinned absent-field placeholder. Kept as a pure function
+/// (mirroring the capability label helpers) so the placeholder is
+/// unit-testable instead of living inline in the wasm component.
+fn diagnostics_optional_text(value: Option<&str>) -> String {
+    match value {
+        Some(value) => value.to_owned(),
+        None => DIAGNOSTICS_ABSENT_FIELD_LABEL.to_owned(),
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Honest boundary of the §12.4 diagnostics surface, shown as the panel
+/// footnote. The wording mirrors the backend contract (api §12.4 view): the
+/// payload is the persisted decoded snapshot of the latest complete refresh,
+/// and decode-error paths left no record, so no diagnostics can exist for
+/// resources that never entered the snapshot store.
+const DIAGNOSTICS_FOOTER_NOTE: &str = "Diagnostics show the decoded snapshot of the latest complete refresh; decode-error paths are not persisted and have no diagnostics.";
 
 #[cfg(any(target_arch = "wasm32", test))]
 /// Static label for a capability that has never been observed on this
@@ -5667,8 +5865,8 @@ mod browser {
         EndpointResourceInventoryResponse, EndpointTrustChallengeResponse,
         EndpointTrustExpectationRequest, EnrollEndpointRequest, EventListResponse,
         GroupListResponse, GroupResponse, OperationListResponse, OperationResponse,
-        TagListResponse, TelemetrySampleListResponse, TelemetrySeriesListResponse,
-        TelemetrySeriesResponse, TrustedEndpointResponse,
+        ResourceDiagnosticsResponse, TagListResponse, TelemetrySampleListResponse,
+        TelemetrySeriesListResponse, TelemetrySeriesResponse, TrustedEndpointResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -5681,22 +5879,24 @@ mod browser {
         CapabilityTargetProjection, CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState,
         ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
-        EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
-        EventActionView, EventCardProjection, EventProtocolView, EventTypeView, EventsListState,
-        GroupCardProjection, GroupCreateState, GroupDetailProjection, GroupDetailState, GroupDraft,
-        GroupMemberActionState, GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure,
-        ImportState, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
-        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
-        OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
-        OverviewFilterSelections, ResetKeysTypeView, ResetTypeView, SecureBootActionView,
-        TagApplyState, TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
-        TelemetryCardProjection, TelemetryListState, TrustChallengeProjection,
-        UpdateArtifactChoice, apply_overview_filters, artifact_chunk_range_at,
-        artifact_upload_status_text, base64_encode, build_command, command_summary,
-        endpoint_address_draft_error, format_artifact_size, group_member_choices,
-        group_name_draft_error, health_badge_class, health_choices, health_level_label,
-        operation_endpoint_choices, percent_encode_path_segment, sha256_hex, tag_draft_error,
-        toggle_set_membership, trust_mode_label, update_artifact_choices, vendor_choices,
+        DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
+        DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
+        EnrollmentDraft, EnrollmentDraftError, EventActionView, EventCardProjection,
+        EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
+        GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
+        GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState,
+        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
+        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
+        OperationSubmitState, OperationsListState, OverviewFilterSelections, ResetKeysTypeView,
+        ResetTypeView, SecureBootActionView, TagApplyState, TagCardProjection, TagDraft,
+        TagDraftError, TagInventoryView, TagsListState, TelemetryCardProjection,
+        TelemetryListState, TrustChallengeProjection, UpdateArtifactChoice, apply_overview_filters,
+        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
+        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
+        format_artifact_size, group_member_choices, group_name_draft_error, health_badge_class,
+        health_choices, health_level_label, operation_endpoint_choices,
+        percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
+        trust_mode_label, update_artifact_choices, vendor_choices,
     };
 
     #[wasm_bindgen(start)]
@@ -5719,6 +5919,14 @@ mod browser {
         let (capability_state, set_capability_state) = signal(CapabilityMatrixState::Idle);
         let (capability_triggered, set_capability_triggered) = signal(false);
 
+        // The §12.4 diagnostics drill-down mirrors the capability pattern:
+        // target and state live at the shell level so the resource-card
+        // entry can reset them, and the view itself only reads and refreshes.
+        let (diagnostics_target, set_diagnostics_target) =
+            signal(None::<DiagnosticsTargetProjection>);
+        let (diagnostics_state, set_diagnostics_state) = signal(DiagnosticsState::Idle);
+        let (diagnostics_triggered, set_diagnostics_triggered) = signal(false);
+
         let on_view_capabilities = Callback::new(move |target: CapabilityTargetProjection| {
             set_capability_target.set(Some(target));
             set_capability_state.set(CapabilityMatrixState::Idle);
@@ -5726,10 +5934,22 @@ mod browser {
             set_view.set(ConsoleView::Capabilities);
         });
 
+        let on_open_diagnostics = Callback::new(move |target: DiagnosticsTargetProjection| {
+            set_diagnostics_target.set(Some(target));
+            set_diagnostics_state.set(DiagnosticsState::Idle);
+            set_diagnostics_triggered.set(false);
+            set_view.set(ConsoleView::Diagnostics);
+        });
+
         let on_back_to_overview = Callback::new(move |()| {
             set_capability_target.set(None);
             set_capability_state.set(CapabilityMatrixState::Idle);
             set_capability_triggered.set(false);
+            // Leaving either drill-down clears both targets so the hidden
+            // navigation entries re-hide once the overview is active again.
+            set_diagnostics_target.set(None);
+            set_diagnostics_state.set(DiagnosticsState::Idle);
+            set_diagnostics_triggered.set(false);
             set_view.set(ConsoleView::Overview);
         });
 
@@ -5868,12 +6088,15 @@ mod browser {
                                     "view-nav-item"
                                 }
                             };
-                            // The capability drill-down needs an endpoint
-                            // chosen from a card first, so its navigation
-                            // entry stays hidden until a target is selected.
+                            // The capability and diagnostics drill-downs need
+                            // an endpoint (and, for diagnostics, a resource)
+                            // chosen from a card first, so their navigation
+                            // entries stay hidden until a target is selected.
                             let hidden = move || {
-                                candidate == ConsoleView::Capabilities
-                                    && capability_target.get().is_none()
+                                (candidate == ConsoleView::Capabilities
+                                    && capability_target.get().is_none())
+                                    || (candidate == ConsoleView::Diagnostics
+                                        && diagnostics_target.get().is_none())
                             };
                             view! {
                                 <button
@@ -6047,6 +6270,7 @@ mod browser {
                                         <EndpointCard
                                             card=card
                                             on_view_capabilities=on_view_capabilities
+                                            on_open_diagnostics=on_open_diagnostics
                                         />
                                     }
                                 })
@@ -6073,6 +6297,15 @@ mod browser {
                 <TelemetryView view=view />
                 <ArtifactsView view=view />
                 <GroupsView view=view load_state=state />
+                <DiagnosticsView
+                    view=view
+                    target=diagnostics_target
+                    state=diagnostics_state
+                    set_state=set_diagnostics_state
+                    triggered=diagnostics_triggered
+                    set_triggered=set_diagnostics_triggered
+                    on_back=on_back_to_overview
+                />
             </main>
         }
     }
@@ -6081,6 +6314,7 @@ mod browser {
     fn EndpointCard(
         card: EndpointCardProjection,
         on_view_capabilities: Callback<CapabilityTargetProjection>,
+        on_open_diagnostics: Callback<DiagnosticsTargetProjection>,
     ) -> impl IntoView {
         let systems = card.resource_counts.map_or(0, |counts| counts.systems);
         let chassis = card.resource_counts.map_or(0, |counts| counts.chassis);
@@ -6158,7 +6392,14 @@ mod browser {
                     <div class="core-resource-grid">
                         {resources
                             .into_iter()
-                            .map(|resource| view! { <CoreResourceCard resource=resource /> })
+                            .map(|resource| {
+                                view! {
+                                    <CoreResourceCard
+                                        resource=resource
+                                        on_open_diagnostics=on_open_diagnostics
+                                    />
+                                }
+                            })
                             .collect_view()}
                     </div>
                 </section>
@@ -6167,17 +6408,30 @@ mod browser {
     }
 
     #[component]
-    fn CoreResourceCard(resource: CoreResourceCardProjection) -> impl IntoView {
+    fn CoreResourceCard(
+        resource: CoreResourceCardProjection,
+        on_open_diagnostics: Callback<DiagnosticsTargetProjection>,
+    ) -> impl IntoView {
         let CoreResourceCardProjection {
             type_label,
             name,
             description,
             source,
             facts,
+            endpoint_id,
+            resource_id,
         } = resource;
         let has_description = description.is_some();
         let description = description.unwrap_or_default();
         let source_title = source.clone();
+        // The §12.4 entry opens exactly this card's resource: the ids are the
+        // two route parameters, captured from the projection at render time.
+        let diagnostics_target = DiagnosticsTargetProjection {
+            endpoint_id,
+            resource_id,
+            name: name.clone(),
+            source: source.clone(),
+        };
 
         view! {
             <article class="core-resource-card">
@@ -6205,6 +6459,15 @@ mod browser {
                     <span>"Source"</span>
                     <code>{source}</code>
                 </p>
+                <div class="core-resource-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_open_diagnostics.run(diagnostics_target.clone())
+                    >
+                        "Diagnostics"
+                    </button>
+                </div>
             </article>
         }
     }
@@ -8810,6 +9073,196 @@ mod browser {
                     {entry.observed_at_text}
                 </p>
             </article>
+        }
+    }
+
+    #[component]
+    fn DiagnosticsView(
+        view: ReadSignal<ConsoleView>,
+        target: ReadSignal<Option<DiagnosticsTargetProjection>>,
+        state: ReadSignal<DiagnosticsState>,
+        set_state: WriteSignal<DiagnosticsState>,
+        triggered: ReadSignal<bool>,
+        set_triggered: WriteSignal<bool>,
+        on_back: Callback<()>,
+    ) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Diagnostics;
+
+        // Fetches exactly once per target: the card entry resets the
+        // triggered flag, and the nav re-entry keeps the cached snapshot.
+        Effect::new(move |_| {
+            if !active() {
+                return;
+            }
+            let Some(target) = target.get() else {
+                return;
+            };
+            if triggered.get() {
+                return;
+            }
+            set_triggered.set(true);
+            set_state.set(DiagnosticsState::Loading);
+            let endpoint_id = target.endpoint_id;
+            let resource_id = target.resource_id;
+            spawn_local(async move {
+                set_state.set(fetch_diagnostics(&endpoint_id, &resource_id).await);
+            });
+        });
+
+        let on_refresh = move |_| {
+            set_state.set(DiagnosticsState::Loading);
+            let Some(target) = target.get() else {
+                return;
+            };
+            let endpoint_id = target.endpoint_id;
+            let resource_id = target.resource_id;
+            spawn_local(async move {
+                set_state.set(fetch_diagnostics(&endpoint_id, &resource_id).await);
+            });
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Diagnostics"</p>
+                        <h2>
+                            {move || {
+                                target
+                                    .get()
+                                    .map_or_else(String::new, |target| target.name)
+                            }}
+                        </h2>
+                    </div>
+                    <p class="endpoint-address">
+                        {move || {
+                            target
+                                .get()
+                                .map_or_else(String::new, |target| target.source)
+                        }}
+                    </p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        on:click=move |_| on_back.run(())
+                    >
+                        "Back to overview"
+                    </button>
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || state.get().is_loading()
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !state.get().is_loading()>
+                    "Loading diagnostics..."
+                </p>
+                <p class="form-error" hidden=move || !state.get().is_failed()>
+                    {move || state.get().failure_message()}
+                </p>
+                <div class="diagnostics-panel" hidden=move || !state.get().is_ready()>
+                    {move || {
+                        state
+                            .get()
+                            .projection()
+                            .into_iter()
+                            .map(|projection| {
+                                view! { <DiagnosticsReady projection=projection /> }
+                            })
+                            .collect_view()
+                    }}
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn DiagnosticsReady(projection: DiagnosticsProjection) -> impl IntoView {
+        let DiagnosticsProjection {
+            endpoint_id,
+            odata_uri,
+            odata_type,
+            etag,
+            feature,
+            generation,
+            typed_payload_json,
+        } = projection;
+        // An absent optional field is information: the BMC did not publish
+        // it. The muted placeholder keeps the row visible instead of hiding
+        // what is missing; the pinned rendering helper keeps the decision
+        // testable outside the wasm component.
+        let odata_type_text = diagnostics_optional_text(odata_type.as_deref());
+        let etag_text = diagnostics_optional_text(etag.as_deref());
+
+        view! {
+            <dl class="diagnostics-facts">
+                <div>
+                    <dt>"Endpoint"</dt>
+                    <dd><code>{endpoint_id}</code></dd>
+                </div>
+                <div>
+                    <dt>"OData URI"</dt>
+                    <dd><code>{odata_uri}</code></dd>
+                </div>
+                <div>
+                    <dt>"OData Type"</dt>
+                    <dd><code>{odata_type_text}</code></dd>
+                </div>
+                <div>
+                    <dt>"ETag"</dt>
+                    <dd><code>{etag_text}</code></dd>
+                </div>
+                <div>
+                    <dt>"nv-redfish feature"</dt>
+                    <dd><code>{feature}</code></dd>
+                </div>
+                <div>
+                    <dt>"Generation"</dt>
+                    <dd>{generation}</dd>
+                </div>
+            </dl>
+            // The decoded payload is read-only (§12.4 forbids submitting
+            // arbitrary JSON): a native collapsible keeps the raw JSON one
+            // click away without any edit surface, and the pre scrolls
+            // within its bound instead of stretching the page.
+            <details class="diagnostics-json" open>
+                <summary>"Decoded typed payload"</summary>
+                <pre class="diagnostics-json-body"><code>{typed_payload_json}</code></pre>
+            </details>
+            <p class="diagnostics-note">{DIAGNOSTICS_FOOTER_NOTE}</p>
+        }
+    }
+
+    /// Loads the §12.4 diagnostics snapshot of one resource.
+    ///
+    /// A 404 means the endpoint or its resource no longer exists. Any other
+    /// non-200 status — including 503 and the 400 that cannot originate from
+    /// this UI, whose ids always come from the local inventory — maps to the
+    /// generic unavailable message; a 200 body that violates the strict
+    /// shared contract maps to the malformed message.
+    async fn fetch_diagnostics(endpoint_id: &str, resource_id: &str) -> DiagnosticsState {
+        let path = format!("/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics");
+        let Ok(response) = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return DiagnosticsState::Failed(DiagnosticsLoadFailure::Unavailable);
+        };
+        if response.status() == 404 {
+            return DiagnosticsState::Failed(DiagnosticsLoadFailure::ResourceNotFound);
+        }
+        if !response.ok() {
+            return DiagnosticsState::Failed(DiagnosticsLoadFailure::Unavailable);
+        }
+        match response.json::<ResourceDiagnosticsResponse>().await {
+            Ok(diagnostics) => DiagnosticsState::Ready(DiagnosticsProjection::from(&diagnostics)),
+            Err(_) => DiagnosticsState::Failed(DiagnosticsLoadFailure::Malformed),
         }
     }
 
@@ -13383,6 +13836,7 @@ mod tests {
                 ConsoleView::Events,
                 ConsoleView::Artifacts,
                 ConsoleView::Telemetry,
+                ConsoleView::Diagnostics,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -13396,6 +13850,7 @@ mod tests {
         assert_eq!(ConsoleView::Events.label(), "Events");
         assert_eq!(ConsoleView::Artifacts.label(), "Artifacts");
         assert_eq!(ConsoleView::Telemetry.label(), "Telemetry");
+        assert_eq!(ConsoleView::Diagnostics.label(), "Diagnostics");
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(
@@ -13986,6 +14441,191 @@ mod tests {
         assert_eq!(target.endpoint_id, "01989abc-def0-7abc-8def-0123456789ac");
         assert_eq!(target.display_name, "Rack B BMC");
         assert_eq!(target.address, "https://192.0.2.11/");
+    }
+
+    #[test]
+    fn diagnostics_fixture_projects_every_field_and_pins_pretty_json() -> Result<(), Box<dyn Error>>
+    {
+        let diagnostics: ResourceDiagnosticsResponse = serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ac",
+            "odata_uri": "/redfish/v1/Systems/1",
+            "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+            "etag": "W/\"system-7\"",
+            "feature": "std-redfish",
+            "generation": 7,
+            "typed_payload": {
+                "@odata.id": "/redfish/v1/Systems/1",
+                "@odata.type": "#ComputerSystem.v1_20_0.ComputerSystem",
+                "Id": "1",
+                "Name": "Web Front End",
+                "SystemType": "Physical",
+                "Status": { "State": "Enabled", "Health": "OK" },
+                "Boot": {
+                    "BootSourceOverrideEnabled": "Once",
+                    "BootSourceOverrideTarget": "Pxe"
+                }
+            }
+        }))?;
+
+        let projection = DiagnosticsProjection::from(&diagnostics);
+        assert_eq!(
+            projection.endpoint_id,
+            "01989abc-def0-7abc-8def-0123456789ac"
+        );
+        assert_eq!(projection.odata_uri, "/redfish/v1/Systems/1");
+        assert_eq!(
+            projection.odata_type.as_deref(),
+            Some("#ComputerSystem.v1_20_0.ComputerSystem")
+        );
+        assert_eq!(projection.etag.as_deref(), Some("W/\"system-7\""));
+        assert_eq!(projection.feature, "std-redfish");
+        assert_eq!(projection.generation, "7");
+        // The rendering decision is pinned: canonical 2-space pretty JSON.
+        // `serde_json::Value` objects sort keys, so the output is
+        // deterministic for a given payload (no original text survives the
+        // typed decode anyway).
+        assert_eq!(
+            projection.typed_payload_json,
+            concat!(
+                "{\n",
+                "  \"@odata.id\": \"/redfish/v1/Systems/1\",\n",
+                "  \"@odata.type\": \"#ComputerSystem.v1_20_0.ComputerSystem\",\n",
+                "  \"Boot\": {\n",
+                "    \"BootSourceOverrideEnabled\": \"Once\",\n",
+                "    \"BootSourceOverrideTarget\": \"Pxe\"\n",
+                "  },\n",
+                "  \"Id\": \"1\",\n",
+                "  \"Name\": \"Web Front End\",\n",
+                "  \"Status\": {\n",
+                "    \"Health\": \"OK\",\n",
+                "    \"State\": \"Enabled\"\n",
+                "  },\n",
+                "  \"SystemType\": \"Physical\"\n",
+                "}"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_projection_preserves_absent_optional_fields() -> Result<(), Box<dyn Error>> {
+        let diagnostics: ResourceDiagnosticsResponse = serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+            "odata_uri": "/redfish/v1/Chassis/1/Thermal",
+            "odata_type": null,
+            "etag": null,
+            "feature": "oem-dell",
+            "generation": 3,
+            "typed_payload": { "Temperature": [] }
+        }))?;
+
+        let projection = DiagnosticsProjection::from(&diagnostics);
+        assert_eq!(projection.odata_type, None);
+        assert_eq!(projection.etag, None);
+        assert_eq!(projection.feature, "oem-dell");
+        assert_eq!(projection.generation, "3");
+        assert_eq!(projection.typed_payload_json, "{\n  \"Temperature\": []\n}");
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_absent_optional_fields_render_the_not_published_placeholder() {
+        // Pins the rendering decision like the capability
+        // `NOT_OBSERVED_STATE_LABEL` precedent: absence keeps the row
+        // visible with a stable placeholder instead of hiding what the BMC
+        // did not publish.
+        assert_eq!(DIAGNOSTICS_ABSENT_FIELD_LABEL, "Not published");
+        assert_eq!(diagnostics_optional_text(None), "Not published".to_owned());
+        assert_eq!(
+            diagnostics_optional_text(Some("#ComputerSystem.v1_20_0.ComputerSystem")),
+            "#ComputerSystem.v1_20_0.ComputerSystem".to_owned()
+        );
+    }
+
+    #[test]
+    fn diagnostics_states_cover_loading_ready_and_typed_failures() {
+        assert_eq!(
+            DiagnosticsLoadFailure::ResourceNotFound.message(),
+            "This resource no longer exists in the product."
+        );
+        assert_eq!(
+            DiagnosticsLoadFailure::Unavailable.message(),
+            "The diagnostics snapshot is temporarily unavailable."
+        );
+        assert_eq!(
+            DiagnosticsLoadFailure::Malformed.message(),
+            "The server response could not be parsed."
+        );
+        assert_eq!(DiagnosticsState::Idle.failure_message(), "");
+        assert!(DiagnosticsState::Loading.is_loading());
+        assert!(DiagnosticsState::Failed(DiagnosticsLoadFailure::ResourceNotFound).is_failed());
+        assert_eq!(
+            DiagnosticsState::Failed(DiagnosticsLoadFailure::ResourceNotFound).failure_message(),
+            "This resource no longer exists in the product."
+        );
+        assert_eq!(
+            DiagnosticsState::Failed(DiagnosticsLoadFailure::Malformed).failure_message(),
+            "The server response could not be parsed."
+        );
+
+        let projection = DiagnosticsProjection {
+            endpoint_id: "01989abc-def0-7abc-8def-0123456789ac".to_owned(),
+            odata_uri: "/redfish/v1/Systems/1".to_owned(),
+            odata_type: Some("#ComputerSystem.v1_20_0.ComputerSystem".to_owned()),
+            etag: Some("W/\"system-7\"".to_owned()),
+            feature: "std-redfish".to_owned(),
+            generation: "7".to_owned(),
+            typed_payload_json: "{}".to_owned(),
+        };
+        let ready = DiagnosticsState::Ready(projection.clone());
+        assert!(ready.is_ready());
+        assert_eq!(ready.projection(), Some(projection));
+        assert_eq!(ready.failure_message(), "");
+        assert_eq!(DiagnosticsState::Idle.projection(), None);
+        assert_eq!(DiagnosticsState::Loading.projection(), None);
+        assert_eq!(
+            DiagnosticsState::Failed(DiagnosticsLoadFailure::Unavailable).projection(),
+            None
+        );
+    }
+
+    #[test]
+    fn core_resource_card_entry_opens_its_own_diagnostics_target() -> Result<(), Box<dyn Error>> {
+        let inventories = resource_inventories()?;
+        let cards = inventories
+            .iter()
+            .map(EndpointCardProjection::from)
+            .collect::<Vec<_>>();
+        let rack_b = cards
+            .iter()
+            .find(|card| card.endpoint_id == "01989abc-def0-7abc-8def-0123456789ac")
+            .ok_or("rack B card must exist")?;
+        let system = rack_b
+            .resources
+            .iter()
+            .find(|card| card.type_label == "System")
+            .ok_or("system card must exist")?;
+
+        // The entry must open exactly this card's resource: the target
+        // carries the endpoint id, the resource id, and the display identity
+        // the panel header renders.
+        let target = DiagnosticsTargetProjection::from(system);
+        assert_eq!(target.endpoint_id, rack_b.endpoint_id);
+        assert_eq!(target.resource_id, "01989abc-def0-7abc-8def-0123456789d1");
+        assert_eq!(target.name, "Compute One");
+        assert_eq!(target.source, "/redfish/v1/Systems/1");
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_footer_note_discloses_decoded_snapshot_and_unpersisted_decode_errors() {
+        // The footnote is the honest boundary of §12.4 (mirroring the api
+        // contract): the panel shows the decoded snapshot of the latest
+        // complete refresh, and decode-error paths are not persisted, so the
+        // panel must never imply it covers failed decodes.
+        assert!(DIAGNOSTICS_FOOTER_NOTE.contains("decoded snapshot"));
+        assert!(DIAGNOSTICS_FOOTER_NOTE.contains("latest complete refresh"));
+        assert!(DIAGNOSTICS_FOOTER_NOTE.contains("not persisted"));
     }
 
     #[test]

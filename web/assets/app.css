@@ -1239,3 +1239,89 @@ dd {
   font-size: 0.76rem;
   overflow-wrap: anywhere;
 }
+
+/* ----- §12.4 Advanced Diagnostics panel ----- */
+.core-resource-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0.85rem 0 0;
+  padding-top: 0.7rem;
+  border-top: 1px solid rgb(143 171 207 / 10%);
+}
+
+.diagnostics-panel {
+  margin-top: 1.1rem;
+  padding: 1.1rem;
+  border: 1px solid rgb(143 171 207 / 16%);
+  border-radius: 0.9rem;
+  background: rgb(123 155 194 / 5%);
+}
+
+.diagnostics-facts {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.diagnostics-facts div { min-width: 0; }
+
+.diagnostics-facts dt {
+  font-size: 0.64rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.diagnostics-facts dd {
+  margin-top: 0.18rem;
+  overflow-wrap: anywhere;
+  color: #d7e0eb;
+  font-size: 0.78rem;
+}
+
+.diagnostics-facts code { color: #bcd2ea; }
+
+.diagnostics-json {
+  margin: 1.1rem 0 0;
+  border: 1px solid rgb(143 171 207 / 14%);
+  border-radius: 0.7rem;
+  background: rgb(8 13 21 / 72%);
+}
+
+.diagnostics-json summary {
+  padding: 0.7rem 0.9rem;
+  cursor: pointer;
+  color: #83bff3;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
+.diagnostics-json summary:hover { color: #9fd0f7; }
+
+.diagnostics-json-body {
+  max-height: 22rem;
+  margin: 0;
+  padding: 0.9rem;
+  overflow: auto;
+  border-top: 1px solid rgb(143 171 207 / 12%);
+  color: #bcd2ea;
+  font-size: 0.72rem;
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.diagnostics-json-body code {
+  color: inherit;
+  font: inherit;
+}
+
+/* The honest §12.4 boundary: a decoded snapshot, not a live request
+   surface. The muted footnote keeps the caveat visible under the payload. */
+.diagnostics-note {
+  margin: 1rem 0 0;
+  color: #8495ad;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
