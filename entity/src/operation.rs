@@ -32,6 +32,15 @@ pub struct Model {
     /// domain `Operation` aggregate does not carry it. Deleting the batch
     /// cascades the child away (migration 000011).
     pub batch_id: Option<Uuid>,
+    /// The §13.7 failure classification of a `failed` operation, when the
+    /// product can prove why it failed in product vocabulary. The value is a
+    /// stable `FailureKind` code (migration 000012 CHECKs the allow-list); the
+    /// repository rehydrates it through the domain type and refuses unknown
+    /// codes as a corrupt record, mirroring the state and source codes. It
+    /// lives only here — the domain `Operation` aggregate does not carry it —
+    /// because reporting is the only reader: batch outcome summaries bucket a
+    /// classified failure as `unsupported` instead of `failed`.
+    pub failure_kind: Option<String>,
     /// When the operation was accepted, before any Redfish interaction.
     pub created_at: TimeDateTimeWithTimeZone,
     /// When the state last changed; `created_at` until the first transition.
