@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 mod application_adapter;
 mod artifact_repository;
 mod audit_repository;
+mod backup_snapshot;
 mod bootstrap_repository;
 mod center_binding_repository;
 mod center_inbox_repository;
@@ -41,6 +42,10 @@ mod totp_repository;
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
 pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
+pub use backup_snapshot::{
+    DatabaseSnapshot, RestoreCheckError, RestoreCompatibility, RestoreError, SnapshotError,
+    restore_compatibility, restore_database_files,
+};
 pub use bootstrap_repository::{BootstrapRepositoryError, StoredBootstrapCodeError};
 pub use center_binding_repository::{
     CenterBindingRepositoryError, RevokeOutcome, StoredCenterBindingError,
@@ -255,7 +260,7 @@ pub enum OpenStoreError {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SqliteSettings {
+pub(crate) struct SqliteSettings {
     busy_timeout: Duration,
     max_connections: u32,
 }
@@ -334,7 +339,10 @@ async fn migrations_are_pending(database_path: &Path) -> Result<bool, OpenStoreE
     Ok(!pending.is_empty())
 }
 
-fn sqlite_connect_options(database_path: &Path, settings: SqliteSettings) -> ConnectOptions {
+pub(crate) fn sqlite_connect_options(
+    database_path: &Path,
+    settings: SqliteSettings,
+) -> ConnectOptions {
     let configured_path = database_path.to_path_buf();
     let mut options = ConnectOptions::new("sqlite://rutilus.db?mode=rwc");
     options
@@ -355,7 +363,7 @@ fn sqlite_connect_options(database_path: &Path, settings: SqliteSettings) -> Con
     options
 }
 
-fn sqlite_read_only_connect_options(database_path: &Path) -> ConnectOptions {
+pub(crate) fn sqlite_read_only_connect_options(database_path: &Path) -> ConnectOptions {
     let configured_path = database_path.to_path_buf();
     let mut options = ConnectOptions::new("sqlite://rutilus.db?mode=ro");
     options
