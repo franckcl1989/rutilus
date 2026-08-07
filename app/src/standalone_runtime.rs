@@ -31,8 +31,8 @@ use rutilus_infra_redfish::{
     NV_REDFISH_DEVELOPMENT_BASELINE, RedfishCommandExecutor, RedfishGateway, TlsProbeInitError,
 };
 use rutilus_operation_engine::{
-    BoundaryFuture as OperationBoundaryFuture, OperationEngine, OperationStore, RemoteTask,
-    RemoteTaskState, RemoteTaskStore,
+    BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationEngine,
+    OperationStore, RemoteTask, RemoteTaskState, RemoteTaskStore,
 };
 use rutilus_persistence::{
     ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
@@ -336,6 +336,14 @@ impl OperationStore for StandaloneState {
         )
     }
 
+    fn record_failure_kind(
+        &self,
+        operation_id: OperationId,
+        kind: rutilus_domain::FailureKind,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        <SqliteStore as OperationStore>::record_failure_kind(&self.store, operation_id, kind)
+    }
+
     fn list_operations(
         &self,
         state: Option<OperationState>,
@@ -368,7 +376,7 @@ impl OperationStore for StandaloneState {
     fn list_batch_children(
         &self,
         batch_id: rutilus_domain::BatchOperationId,
-    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+    ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         <SqliteStore as OperationStore>::list_batch_children(&self.store, batch_id)
     }
 }
