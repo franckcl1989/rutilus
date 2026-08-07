@@ -1252,7 +1252,7 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
 /// `Systems` capability (the stable 0.1 product code of the
 /// `computer-systems` feature) and `SecureBoot` respectively; event
 /// subscription writes require the event service.
-fn required_capability(command: &RedfishCommand) -> EndpointCapability {
+pub(crate) fn required_capability(command: &RedfishCommand) -> EndpointCapability {
     match command {
         // Boot configuration lives on the `ComputerSystem` resource, so a
         // boot command needs the same `Systems` capability as a system reset.
@@ -1282,7 +1282,7 @@ fn required_capability(command: &RedfishCommand) -> EndpointCapability {
 ///
 /// `None` means the capability has no observation yet (it is not the
 /// `NotAdvertised` final state, which requires an explicit probe result).
-fn required_capability_state(
+pub(crate) fn required_capability_state(
     required: EndpointCapability,
     entries: &[CapabilityLedgerEntry],
 ) -> Option<CapabilityState> {

@@ -41,7 +41,9 @@ pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
 };
-pub use center_sync::{CenterOutbox, CenterSync, CenterSyncError, CenterSyncOptions};
+pub use center_sync::{
+    CenterInbox, CenterOutbox, CenterSync, CenterSyncError, CenterSyncOptions, InboxInsertOutcome,
+};
 pub use center_transport::{CenterSession, CenterTransport};
 pub use command_executor::{
     CommandExecutor, CommandOutcome, CommandVerifier, DispatchVerdict, DispatchVerdictClassifier,

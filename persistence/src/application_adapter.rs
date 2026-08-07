@@ -1,14 +1,15 @@
 use rutilus_application::{
-    AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, CapabilitySnapshotRepository,
-    CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryItemError, EndpointInventoryRepository, EndpointRefreshRepository,
-    ResourceObservation, StoredCapability,
+    ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
+    CapabilitySnapshotRepository, CredentialInventoryRepository, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
+    EndpointRefreshRepository, InboxInsertOutcome, ResourceObservation, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
+use rutilus_domain::{ArtifactId, ArtifactState};
 use rutilus_domain::{
     AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
-    EndpointCapabilityObservation, EndpointId, FailureKind, InstanceId, Operation, OperationId,
-    OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot,
+    EndpointCapabilityObservation, EndpointId, FailureKind, InboxEntry, InboxEvent, InstanceId,
+    Operation, OperationId, OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot,
 };
 use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore, RemoteTask,
@@ -18,7 +19,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    AuditRepositoryError, CenterOutboxRepositoryError, CredentialRepositoryError,
+    ArtifactRepositoryError, AuditRepositoryError, CenterInboxRepositoryError,
+    CenterOutboxRepositoryError, CreateInboxOutcome, CredentialRepositoryError,
     EndpointCapabilityRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
     OperationRepositoryError, RemoteTaskRepositoryError, ResourceSnapshotRepositoryError,
     SqliteStore,
@@ -257,6 +259,92 @@ impl EndpointInventoryRepository for SqliteStore {
                 );
             }
             Ok(inventory)
+        })
+    }
+}
+
+impl ArtifactRepository for SqliteStore {
+    type Error = ArtifactRepositoryError;
+
+    fn create_artifact<'a>(
+        &'a self,
+        artifact: &'a rutilus_domain::Artifact,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::create_artifact(self, artifact).await })
+    }
+
+    fn find_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> BoundaryFuture<'_, Result<Option<rutilus_domain::Artifact>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_artifact(self, artifact_id).await })
+    }
+
+    fn list_artifacts_by_state(
+        &self,
+        state: ArtifactState,
+    ) -> BoundaryFuture<'_, Result<Vec<rutilus_domain::Artifact>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_artifacts_by_state(self, state).await })
+    }
+
+    fn update_artifact(
+        &self,
+        artifact_id: ArtifactId,
+        uploaded_bytes: u64,
+        state: ArtifactState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::update_artifact(self, artifact_id, uploaded_bytes, state, occurred_at)
+                .await
+        })
+    }
+
+    fn artifact_file_path(&self, artifact_id: ArtifactId) -> std::path::PathBuf {
+        SqliteStore::artifact_file_path(self, artifact_id)
+    }
+}
+
+impl rutilus_application::CenterInbox for SqliteStore {
+    type Error = CenterInboxRepositoryError;
+
+    fn insert<'a>(
+        &'a self,
+        entry: &'a InboxEntry,
+    ) -> BoundaryFuture<'a, Result<InboxInsertOutcome, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::create_inbox_entry(self, entry)
+                .await
+                .map(|outcome| match outcome {
+                    CreateInboxOutcome::Created => InboxInsertOutcome::Created,
+                    CreateInboxOutcome::DuplicateInProgress => {
+                        InboxInsertOutcome::DuplicateInProgress
+                    }
+                    CreateInboxOutcome::DuplicateResolved(state) => {
+                        InboxInsertOutcome::DuplicateResolved(state)
+                    }
+                })
+        })
+    }
+
+    fn find_by_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<InboxEntry>, Self::Error>> {
+        Box::pin(
+            async move { SqliteStore::find_inbox_entry_by_operation(self, operation_id).await },
+        )
+    }
+
+    fn advance(
+        &self,
+        operation_id: OperationId,
+        event: InboxEvent,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::advance_inbox_entry(self, operation_id, event)
+                .await
+                .map(|_| ())
         })
     }
 }

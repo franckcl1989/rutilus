@@ -177,6 +177,8 @@ async fn the_engine_flushes_the_real_outbox_and_resumes_from_the_last_ack()
     let engine = CenterSync::new(
         transport,
         &store,
+        &store,
+        &store,
         FixedClock(now),
         instance_id,
         engine_options(),
@@ -253,6 +255,8 @@ async fn the_engine_keeps_running_locally_while_the_center_is_gone() -> Result<(
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let engine = CenterSync::new(
         transport,
+        &store,
+        &store,
         &store,
         FixedClock(now),
         instance_id,
