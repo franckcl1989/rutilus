@@ -59,7 +59,7 @@ mod remote_task;
 mod remote_task_store;
 
 pub use operation_engine::{EngineError, MAX_BATCH_TARGETS, OperationEngine, RECOVERABLE_STATES};
-pub use operation_store::{BoundaryFuture, OperationStore};
+pub use operation_store::{BoundaryFuture, ClassifiedBatchChild, OperationStore};
 pub use remote_task::{
     RemoteTask, RemoteTaskError, RemoteTaskState, RemoteTaskStateParseError, TaskUri, TaskUriError,
 };

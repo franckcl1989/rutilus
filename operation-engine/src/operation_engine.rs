@@ -334,7 +334,9 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use super::*;
-    use crate::{BoundaryFuture, RemoteTask, RemoteTaskState, RemoteTaskStore, TaskUri};
+    use crate::{
+        BoundaryFuture, ClassifiedBatchChild, RemoteTask, RemoteTaskState, RemoteTaskStore, TaskUri,
+    };
 
     /// One recorded store call, in order.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +344,7 @@ mod tests {
         Create(OperationId),
         Find(OperationId),
         ApplyTransition(OperationId, OperationState),
+        RecordFailureKind(OperationId),
         List(Option<OperationState>),
         SaveRemoteTask(OperationId),
         FindRemoteTask(OperationId),
@@ -630,16 +633,36 @@ mod tests {
             })
         }
 
+        fn record_failure_kind(
+            &self,
+            operation_id: OperationId,
+            _kind: rutilus_domain::FailureKind,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::RecordFailureKind(operation_id));
+                Ok(())
+            })
+        }
+
         fn list_batch_children(
             &self,
             batch_id: BatchOperationId,
-        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .map_err(|_| FakeStoreError::Failure)?
                     .push(Call::ListBatchChildren(batch_id));
-                self.list_batch_children_owned(batch_id)
+                // The engine never writes failure kinds, so every child reads
+                // back unclassified.
+                Ok(self
+                    .list_batch_children_owned(batch_id)?
+                    .into_iter()
+                    .map(|child| (child, None))
+                    .collect())
             })
         }
     }
@@ -1296,17 +1319,28 @@ mod tests {
 
         // Children restore in target order, pairing every endpoint with its
         // child (§13.7), regardless of the order the targets were submitted
-        // in.
+        // in; the engine never writes failure kinds, so every child reads
+        // back unclassified.
         let mut expected_children = later_children;
         expected_children
             .sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        let mut expected_pairs = expected_children
+            .iter()
+            .cloned()
+            .map(|child| (child, None))
+            .collect::<Vec<_>>();
         assert_eq!(
             store.list_batch_children(later_batch.id()).await?,
-            expected_children
+            expected_pairs
         );
+        expected_pairs = earlier_children
+            .iter()
+            .cloned()
+            .map(|child| (child, None))
+            .collect();
         assert_eq!(
             store.list_batch_children(earlier_batch.id()).await?,
-            earlier_children
+            expected_pairs
         );
         // An unknown batch id reads an empty child list; the parent
         // existence is a separate read.

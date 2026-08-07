@@ -1,10 +1,19 @@
 use std::{error::Error, future::Future, pin::Pin};
 
-use rutilus_domain::{BatchOperation, BatchOperationId, Operation, OperationId, OperationState};
+use rutilus_domain::{
+    BatchOperation, BatchOperationId, FailureKind, Operation, OperationId, OperationState,
+};
 use time::OffsetDateTime;
 
 /// A boxed future returned by boundary traits so implementers stay `dyn`-safe.
 pub type BoundaryFuture<'a, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'a>>;
+
+/// One batch child paired with its persisted failure classification (§13.7).
+///
+/// The kind is `None` for every child that is not a classified failure;
+/// reporting reads the pair to bucket a `Failed` child as `unsupported`
+/// instead of an ordinary failure.
+pub type ClassifiedBatchChild = (Operation, Option<FailureKind>);
 
 /// The persistence boundary for the Operation lifecycle.
 ///
@@ -73,6 +82,27 @@ pub trait OperationStore: Send + Sync {
         occurred_at: OffsetDateTime,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
 
+    /// Persists the failure classification of one operation (design section
+    /// 13.7 batch reporting).
+    ///
+    /// The kind is a fact of a provable failure's *reason*, written by the
+    /// refusal path BEFORE the `Failed` transition, so a crash between the
+    /// two writes leaves either an unclassified failure (the ordinary case)
+    /// or an orphaned kind on a non-terminal row — both harmless, because
+    /// reporting reads the kind only to bucket a `Failed` child, and the
+    /// domain state machine never treats the column as a state. The write
+    /// does not touch `updated_at` (the timeline records state transitions).
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict-style error for an unknown operation id, exactly
+    /// like [`Self::apply_transition`].
+    fn record_failure_kind(
+        &self,
+        operation_id: OperationId,
+        kind: FailureKind,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
+
     /// Lists operations, optionally filtered by exact state.
     ///
     /// A `None` filter returns every operation; a `Some` filter returns only
@@ -118,17 +148,21 @@ pub trait OperationStore: Send + Sync {
     /// deterministic order as the operation listing.
     fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>>;
 
-    /// Lists one batch's child operations in target order.
+    /// Lists one batch's child operations in target order, paired with each
+    /// child's persisted failure classification (design section 13.7).
     ///
     /// Each child carries exactly one target, so target order is a total
     /// order over the batch; reporting (design section 13.7) reads the
     /// children in this deterministic order to pair each endpoint with its
-    /// child outcome. An unknown batch id returns an empty list (the parent
+    /// child outcome and to bucket classified failures. The kind is `None`
+    /// for every child that is not a classified failure — the kind is only
+    /// ever written for the capability pre-flight refusal path, so most rows
+    /// carry `None`. An unknown batch id returns an empty list (the parent
     /// existence is a separate [`Self::find_batch`] read).
     fn list_batch_children(
         &self,
         batch_id: BatchOperationId,
-    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>>;
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>>;
 }
 
 impl<Store> OperationStore for &Store
@@ -160,6 +194,14 @@ where
         Store::apply_transition(*self, operation_id, new_state, occurred_at)
     }
 
+    fn record_failure_kind(
+        &self,
+        operation_id: OperationId,
+        kind: FailureKind,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Store::record_failure_kind(*self, operation_id, kind)
+    }
+
     fn list_operations(
         &self,
         state: Option<OperationState>,
@@ -189,7 +231,7 @@ where
     fn list_batch_children(
         &self,
         batch_id: BatchOperationId,
-    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         Store::list_batch_children(*self, batch_id)
     }
 }
