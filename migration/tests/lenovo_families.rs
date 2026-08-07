@@ -184,13 +184,13 @@ async fn lenovo_family_migration_extends_the_feature_allow_list() -> Result<(), 
         .filter(resource::Column::Feature.eq("lenovo-security-service"))
         .exec(&database)
         .await?;
-    // Down two migrations only: `down(None)` would unwind the whole history
-    // and drop the `resources` table the assertions below seed into, while
-    // this test only needs the Lenovo follow-up undone. The audit
-    // execute-operation migration registered above it (000008) unwinds
-    // first, so the restore lands on the exact 000003-with-000001
-    // allow-list the test asserts.
-    Migrator::down(&database, Some(2)).await?;
+    // Down three migrations only: `down(None)` would unwind the whole
+    // history and drop the `resources` table the assertions below seed into,
+    // while this test only needs the Lenovo follow-up undone. The audit
+    // execute-operation migration (000008) and the center tables migration
+    // (000009) registered above it unwind first, so the restore lands on the
+    // exact 000003-with-000001 allow-list the test asserts.
+    Migrator::down(&database, Some(3)).await?;
     assert!(
         seed_resource(
             &database,

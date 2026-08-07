@@ -176,15 +176,15 @@ async fn nvidia_families_migration_extends_the_feature_allow_list() -> Result<()
         .filter(resource::Column::Feature.eq("nvidia-system-config-profile"))
         .exec(&database)
         .await?;
-    // Down the seven follow-up migrations only: `down(None)` would unwind
+    // Down the eight follow-up migrations only: `down(None)` would unwind
     // the whole history and drop the `resources` table the assertions below
     // seed into, while this test only needs the original NVIDIA follow-up
-    // undone. The six migrations stacked after 000001 (000002 operation
+    // undone. The seven migrations stacked after 000001 (000002 operation
     // failure kinds, 000003 NVIDIA power families, 000005 product users,
-    // 000007 audit action shapes, 000006 Lenovo families, and 000008 audit
-    // execute-operation) unwind first, so the restore lands on the exact
-    // pre-000001 allow-list the test asserts.
-    Migrator::down(&database, Some(7)).await?;
+    // 000007 audit action shapes, 000006 Lenovo families, 000008 audit
+    // execute-operation, and 000009 center tables) unwind first, so the
+    // restore lands on the exact pre-000001 allow-list the test asserts.
+    Migrator::down(&database, Some(8)).await?;
     assert!(
         seed_resource(
             &database,

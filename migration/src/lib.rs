@@ -20,6 +20,7 @@ mod m20260807_000005_product_users;
 mod m20260807_000006_lenovo_families;
 mod m20260807_000007_audit_action_shapes;
 mod m20260807_000008_audit_execute_operation;
+mod m20260807_000009_center_tables;
 
 pub struct Migrator;
 
@@ -45,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000007_audit_action_shapes::Migration),
             Box::new(m20260807_000006_lenovo_families::Migration),
             Box::new(m20260807_000008_audit_execute_operation::Migration),
+            Box::new(m20260807_000009_center_tables::Migration),
         ]
     }
 }
