@@ -10,6 +10,7 @@ use rutilus_domain::{CredentialId, CredentialVersionId};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+mod backup_package;
 mod binding_code;
 mod bootstrap_code;
 mod master_key;
@@ -17,6 +18,11 @@ mod password_hash;
 mod session_token;
 mod totp;
 
+pub use backup_package::{
+    BACKUP_PACKAGE_FORMAT_VERSION, BACKUP_PACKAGE_MAGIC, BackupEntry, BackupEntryKind,
+    BackupPackageError, DecryptedBackup, DecryptedEntry, MAX_ENTRIES, MAX_ENTRY_NAME_LENGTH,
+    MAX_MANIFEST_LENGTH, create_backup_package, open_backup_package,
+};
 pub use binding_code::{BindingCodeError, generate_binding_code};
 pub use bootstrap_code::{
     BOOTSTRAP_CODE_CHARACTERS, BootstrapCodeError, generate_bootstrap_code, hash_bootstrap_code,
