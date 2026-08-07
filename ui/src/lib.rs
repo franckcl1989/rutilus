@@ -211,6 +211,11 @@ struct EndpointCardProjection {
     /// original value beside the unified value), absent when no resource
     /// published a health yet.
     health_label: Option<String>,
+    /// The §12.2 OEM surface of the endpoint (§11.5): either the honest
+    /// `UnsupportedByNvRedfishBaseline` notice or the upstream-typed OEM
+    /// resource cards of the latest complete snapshot. Absent until a
+    /// complete refresh observed resources, exactly like `resource_counts`.
+    oem_section: OemSectionProjection,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -221,10 +226,13 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
             TlsTrustModeResponse::SystemCa => "System CA",
             TlsTrustModeResponse::PinnedCertificate => "Pinned certificate",
         };
-        let (snapshot_label, resource_counts, resources) = match endpoint.snapshot() {
-            EndpointResourceSnapshotResponse::AwaitingFirstRefresh => {
-                ("Awaiting first refresh".to_owned(), None, Vec::new())
-            }
+        let (snapshot_label, resource_counts, resources, oem_section) = match endpoint.snapshot() {
+            EndpointResourceSnapshotResponse::AwaitingFirstRefresh => (
+                "Awaiting first refresh".to_owned(),
+                None,
+                Vec::new(),
+                OemSectionProjection::UnsupportedByNvRedfishBaseline,
+            ),
             EndpointResourceSnapshotResponse::Current {
                 generation,
                 observed_at,
@@ -244,6 +252,7 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
                             CoreResourceCardProjection::from_resource(&endpoint_id_text, resource)
                         })
                         .collect(),
+                    OemSectionProjection::of_snapshot(&endpoint_id_text, resources),
                 )
             }
         };
@@ -271,6 +280,7 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
             vendor,
             health_level,
             health_label,
+            oem_section,
         }
     }
 }
@@ -302,6 +312,7 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // TelemetryService/MetricDefinition/MetricReport/TaskService/Task
             // service families follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
+            | CoreResourceDetailsResponse::OemDell { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -385,6 +396,150 @@ impl CoreResourceCardProjection {
     }
 }
 
+/// The §12.2 OEM surface of one endpoint snapshot, in the two legal §11.5
+/// forms.
+///
+/// The section is `Available` exactly when the latest complete snapshot
+/// carries upstream-typed OEM resources, which are projected as resource
+/// cards through the same [`CoreResourceCardProjection`] surface as every
+/// standard family. Otherwise the section shows the honest
+/// `UnsupportedByNvRedfishBaseline` notice: the nv-redfish baseline has no
+/// strong-typed OEM surface for this endpoint's vendor, and §11.5 forbids
+/// inventing one (no raw-JSON writes, vendor URLs, web screens, or private
+/// plugins). The placeholder is a real state, not a loading fallback, so it
+/// stays visible as long as the boundary holds.
+///
+/// Switch condition between the two forms: [`Self::of_snapshot`] derives it
+/// from the presence of typed OEM resources ([`Self::from_cards`] is the
+/// single decision point), and [`oem_resource_card`] is the single extension
+/// point that maps each landed OEM family. The api contract has landed the
+/// Dell OEM family (`OemDell`, the §0.5.0 `oem-dell-attributes` surface), so
+/// Dell endpoints derive the card form while every other vendor keeps the
+/// honest §11.5 placeholder; the closed match refuses to compile until each
+/// newly landed vendor family gains its arm.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OemSectionProjection {
+    /// The nv-redfish baseline compiles no strong-typed OEM surface for the
+    /// endpoint's vendor (§11.5 second branch): the section renders the
+    /// pinned [`OEM_UNSUPPORTED_NOTICE`] instead of fabricating a surface.
+    UnsupportedByNvRedfishBaseline,
+    /// Upstream-typed OEM resources of the latest complete snapshot,
+    /// projected as resource cards (§11.5 first branch).
+    Available {
+        cards: Vec<CoreResourceCardProjection>,
+    },
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OemSectionProjection {
+    /// Projects the §12.2 OEM section from one complete resource snapshot.
+    ///
+    /// The section form follows the snapshot: OEM resources projected by
+    /// [`oem_resource_card`] render as cards, and their absence (a non-Dell
+    /// endpoint, or a Dell endpoint whose manager published no
+    /// `DellAttributes` document) derives the §11.5 placeholder form.
+    fn of_snapshot(endpoint_id: &str, resources: &[CoreResourceResponse]) -> Self {
+        let cards = resources
+            .iter()
+            .filter_map(|resource| oem_resource_card(endpoint_id, resource))
+            .collect::<Vec<_>>();
+        Self::from_cards(cards)
+    }
+
+    /// Constructs the section from its typed OEM cards; the single switch
+    /// condition between the two §11.5 forms. Kept separate from
+    /// [`Self::of_snapshot`] so the condition is pinned by tests and the
+    /// wasm build cannot drift into a third state.
+    fn from_cards(cards: Vec<CoreResourceCardProjection>) -> Self {
+        if cards.is_empty() {
+            Self::UnsupportedByNvRedfishBaseline
+        } else {
+            Self::Available { cards }
+        }
+    }
+
+    /// Reports whether the section renders the data-card form.
+    #[must_use]
+    const fn is_supported(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+
+    /// Returns the typed OEM resource cards of the section; the placeholder
+    /// form carries none, which the component renders as the notice.
+    fn cards(&self) -> Vec<CoreResourceCardProjection> {
+        match self {
+            Self::UnsupportedByNvRedfishBaseline => Vec::new(),
+            Self::Available { cards } => cards.clone(),
+        }
+    }
+}
+
+/// The §11.5 honest notice shown when the nv-redfish baseline has no
+/// strong-typed OEM surface for the endpoint's vendor. Pinned so the
+/// `UnsupportedByNvRedfishBaseline` rendering cannot drift from the §11.5
+/// contract wording.
+#[cfg(any(target_arch = "wasm32", test))]
+const OEM_UNSUPPORTED_NOTICE: &str =
+    "OEM data is not available in the nv-redfish baseline for this vendor";
+
+/// Projects one resource as an OEM section card, or `None` when it belongs
+/// to a standard family.
+///
+/// The closed match over `CoreResourceDetailsResponse` is the single
+/// extension point of the §12.2 OEM section: every OEM family the api
+/// contract projects gains an arm here — the exhaustive match refuses to
+/// compile otherwise — projecting the card through the existing
+/// [`CoreResourceCardProjection::from_resource`] path so the family renders
+/// with the same card surface as every standard family, and
+/// [`OemSectionProjection::of_snapshot`] then derives the card form
+/// automatically. The `OemDell` family (the §0.5.0 `oem-dell-attributes`
+/// surface) has landed; later vendor families (HPE, Lenovo, NVIDIA, ...)
+/// extend this match the same way. Standard families and vendors the
+/// baseline has not typed stay out, so their endpoints keep the honest
+/// §11.5 placeholder.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_resource_card(
+    endpoint_id: &str,
+    resource: &CoreResourceResponse,
+) -> Option<CoreResourceCardProjection> {
+    match resource.resource() {
+        CoreResourceDetailsResponse::OemDell { .. } => Some(
+            CoreResourceCardProjection::from_resource(endpoint_id, resource),
+        ),
+        CoreResourceDetailsResponse::ServiceRoot { .. }
+        | CoreResourceDetailsResponse::Processor { .. }
+        | CoreResourceDetailsResponse::Memory { .. }
+        | CoreResourceDetailsResponse::Storage { .. }
+        | CoreResourceDetailsResponse::NetworkAdapter { .. }
+        | CoreResourceDetailsResponse::EthernetInterface { .. }
+        | CoreResourceDetailsResponse::Account { .. }
+        | CoreResourceDetailsResponse::Bios { .. }
+        | CoreResourceDetailsResponse::BootOption { .. }
+        | CoreResourceDetailsResponse::SecureBoot { .. }
+        | CoreResourceDetailsResponse::Power { .. }
+        | CoreResourceDetailsResponse::Thermal { .. }
+        | CoreResourceDetailsResponse::Sensor { .. }
+        | CoreResourceDetailsResponse::Control { .. }
+        | CoreResourceDetailsResponse::LogService { .. }
+        | CoreResourceDetailsResponse::ManagerNetworkProtocol { .. }
+        | CoreResourceDetailsResponse::HostInterface { .. }
+        | CoreResourceDetailsResponse::PcieDevice { .. }
+        | CoreResourceDetailsResponse::Assembly { .. }
+        | CoreResourceDetailsResponse::SoftwareInventory { .. }
+        | CoreResourceDetailsResponse::EventService { .. }
+        | CoreResourceDetailsResponse::EventSubscription { .. }
+        | CoreResourceDetailsResponse::TelemetryService { .. }
+        | CoreResourceDetailsResponse::MetricDefinition { .. }
+        | CoreResourceDetailsResponse::MetricReport { .. }
+        | CoreResourceDetailsResponse::TaskService { .. }
+        | CoreResourceDetailsResponse::Task { .. }
+        | CoreResourceDetailsResponse::System { .. }
+        | CoreResourceDetailsResponse::Chassis { .. }
+        | CoreResourceDetailsResponse::Manager { .. } => None,
+    }
+}
+
 /// Projects one resource into its card identity and family facts; the From
 /// implementation stays a thin assembly so the per-family projections remain
 /// readable and individually testable.
@@ -397,6 +552,7 @@ fn card_facts(
         CoreResourceDetailsResponse::System { .. } => system_card_facts(resource),
         CoreResourceDetailsResponse::Chassis { .. } => chassis_card_facts(resource),
         CoreResourceDetailsResponse::Manager { .. } => manager_card_facts(resource),
+        CoreResourceDetailsResponse::OemDell { .. } => oem_dell_card_facts(resource),
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
         CoreResourceDetailsResponse::Storage { .. } => storage_card_facts(resource),
@@ -1338,6 +1494,45 @@ fn task_card_facts(
     ("Task", facts)
 }
 
+/// Facts for the Dell OEM card under the §0.5.0 `oem-dell-attributes`
+/// family.
+///
+/// The manager `DellAttributes` document is the only Dell OEM surface
+/// nv-redfish 0.13 compiles, and the five projected fields are the iDRAC
+/// identity attributes the api contract pins on it. Every optional value
+/// renders only when the document published the attribute key, and the
+/// vendor's original text is kept verbatim per §12.3.
+///
+/// The dispatcher guarantees this receives the `OemDell` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_dell_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemDell {
+        server_model,
+        server_service_tag,
+        server_generation,
+        server_bmc_mac_address,
+        server_name,
+    } = resource
+    else {
+        return ("Dell OEM", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Model", server_model.as_deref());
+    push_fact(&mut facts, "Service tag", server_service_tag.as_deref());
+    push_fact(&mut facts, "Generation", server_generation.as_deref());
+    push_fact(
+        &mut facts,
+        "BMC MAC address",
+        server_bmc_mac_address.as_deref(),
+    );
+    push_fact(&mut facts, "Server name", server_name.as_deref());
+    ("Dell OEM", facts)
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn push_hardware_facts(
     facts: &mut Vec<ResourceFactProjection>,
@@ -1839,6 +2034,12 @@ struct CapabilityGroupProjection {
 /// The complete §2.1 capability matrix of one endpoint, grouped by §12.2
 /// page in ledger appearance order. The response arrives in ledger order;
 /// grouping preserves that stable order instead of re-sorting by page name.
+///
+/// OEM ledger entries arrive with `ui_location = oem` and group under the
+/// §12.2 OEM page exactly like every other entry: the wire contract decides
+/// membership, so the page stays honest when the baseline has no OEM
+/// capability (the §12.2 rule against blank fake pages) and gains the 14
+/// OEM entries the moment the ledger projects them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CapabilityMatrixProjection {
     groups: Vec<CapabilityGroupProjection>,
@@ -5885,18 +6086,19 @@ mod browser {
         EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
         GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
         GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState,
-        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
-        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
-        OperationSubmitState, OperationsListState, OverviewFilterSelections, ResetKeysTypeView,
-        ResetTypeView, SecureBootActionView, TagApplyState, TagCardProjection, TagDraft,
-        TagDraftError, TagInventoryView, TagsListState, TelemetryCardProjection,
-        TelemetryListState, TrustChallengeProjection, UpdateArtifactChoice, apply_overview_filters,
-        artifact_chunk_range_at, artifact_upload_status_text, base64_encode, build_command,
-        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
-        format_artifact_size, group_member_choices, group_name_draft_error, health_badge_class,
-        health_choices, health_level_label, operation_endpoint_choices,
-        percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
-        trust_mode_label, update_artifact_choices, vendor_choices,
+        OEM_UNSUPPORTED_NOTICE, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
+        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
+        OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
+        OverviewFilterSelections, ResetKeysTypeView, ResetTypeView, SecureBootActionView,
+        TagApplyState, TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
+        TelemetryCardProjection, TelemetryListState, TrustChallengeProjection,
+        UpdateArtifactChoice, apply_overview_filters, artifact_chunk_range_at,
+        artifact_upload_status_text, base64_encode, build_command, command_summary,
+        diagnostics_optional_text, endpoint_address_draft_error, format_artifact_size,
+        group_member_choices, group_name_draft_error, health_badge_class, health_choices,
+        health_level_label, operation_endpoint_choices, percent_encode_path_segment, sha256_hex,
+        tag_draft_error, toggle_set_membership, trust_mode_label, update_artifact_choices,
+        vendor_choices,
     };
 
     #[wasm_bindgen(start)]
@@ -6332,6 +6534,12 @@ mod browser {
         let health_badge_hidden = card.health_label.is_none();
         let health_badge_text = card.health_label.clone();
         let resources = card.resources;
+        // The §12.2 OEM section renders either the honest §11.5
+        // UnsupportedByNvRedfishBaseline notice or the typed OEM resource
+        // cards; the projection pins the switch condition, the component
+        // only mirrors it into the two visibility flags.
+        let oem_supported = card.oem_section.is_supported();
+        let oem_cards = card.oem_section.cards();
         let capability_target = CapabilityTargetProjection {
             endpoint_id: card.endpoint_id.clone(),
             display_name: card.display_name.clone(),
@@ -6391,6 +6599,27 @@ mod browser {
                     </div>
                     <div class="core-resource-grid">
                         {resources
+                            .into_iter()
+                            .map(|resource| {
+                                view! {
+                                    <CoreResourceCard
+                                        resource=resource
+                                        on_open_diagnostics=on_open_diagnostics
+                                    />
+                                }
+                            })
+                            .collect_view()}
+                    </div>
+                </section>
+                <section class="oem-section" hidden=awaiting_refresh>
+                    <div class="core-resources-heading">
+                        <h4>"OEM"</h4>
+                    </div>
+                    <p class="oem-unsupported" hidden=oem_supported>
+                        {OEM_UNSUPPORTED_NOTICE}
+                    </p>
+                    <div class="core-resource-grid" hidden=!oem_supported>
+                        {oem_cards
                             .into_iter()
                             .map(|resource| {
                                 view! {
@@ -11591,6 +11820,84 @@ mod tests {
             .collect()
     }
 
+    /// The 14 OEM capability entries the nv-redfish baseline compiles
+    /// (infra-redfish `COMPILED_OEM_FEATURES`), as (product code, upstream
+    /// feature) pairs in feature order. The ledger lands them under the
+    /// §12.2 OEM page (`ui_location = "oem"`), so the capability page must
+    /// render exactly this set under the OEM group.
+    const OEM_LEDGER_FIXTURE: [(&str, &str); 14] = [
+        ("oem-ami", "oem-ami"),
+        ("oem-dell", "oem-dell"),
+        ("oem-dell-attributes", "oem-dell-attributes"),
+        ("oem-delta", "oem-delta"),
+        ("oem-hpe", "oem-hpe"),
+        ("oem-lenovo", "oem-lenovo"),
+        ("oem-liteon", "oem-liteon"),
+        ("oem-nvidia", "oem-nvidia"),
+        ("oem-nvidia-cper", "oem-nvidia-cper"),
+        ("oem-nvidia-fabrics", "oem-nvidia-fabrics"),
+        ("oem-nvidia-power-management", "oem-nvidia-power-management"),
+        ("oem-nvidia-profiles", "oem-nvidia-profiles"),
+        ("oem-nvidia-security", "oem-nvidia-security"),
+        ("oem-supermicro", "oem-supermicro"),
+    ];
+
+    fn oem_ledger_entries(states: &[Option<&str>]) -> Vec<serde_json::Value> {
+        OEM_LEDGER_FIXTURE
+            .iter()
+            .enumerate()
+            .map(|(index, &(capability, feature))| {
+                let state = states.get(index).copied().flatten();
+                json!({
+                    "capability": capability,
+                    "upstream_feature": feature,
+                    "classification": "user_facing",
+                    "ui_location": "oem",
+                    "state": state,
+                    "observed_at": state.map(|_| "2026-08-05T09:12:13Z")
+                })
+            })
+            .collect()
+    }
+
+    fn oem_dell_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789d8",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+                "odata_type": "#DellAttributes.v1_0_0.DellAttributes",
+                "etag": "W/\"dell-attributes-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Dell Attributes",
+                "description": "Dell iDRAC attributes"
+            },
+            "resource": {
+                "resource_type": "oem_dell",
+                "details": {
+                    "server_model": "PowerEdge R750",
+                    "server_service_tag": "ABC1234",
+                    "server_generation": "16G",
+                    "server_bmc_mac_address": "14:18:77:aa:bb:cc",
+                    "server_name": "rack-1-server-2"
+                }
+            }
+        })
+    }
+
+    fn capability_inventory_with_oem(
+        standard_states: &[Option<&str>],
+        oem_states: &[Option<&str>],
+    ) -> Result<EndpointCapabilityInventoryResponse, serde_json::Error> {
+        let mut entries = ledger_entries(standard_states);
+        entries.extend(oem_ledger_entries(oem_states));
+        serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789e1",
+            "entries": entries,
+        }))
+    }
+
     fn power_resource() -> serde_json::Value {
         json!({
             "source": {
@@ -14431,6 +14738,263 @@ mod tests {
     }
 
     #[test]
+    fn capability_matrix_groups_oem_entries_under_the_oem_page() -> Result<(), Box<dyn Error>> {
+        let standard_states: [Option<&str>; 30] = [None; 30];
+        let oem_states: [Option<&str>; 14] = [None; 14];
+        let matrix = CapabilityMatrixProjection::from(&capability_inventory_with_oem(
+            &standard_states,
+            &oem_states,
+        )?);
+
+        // The 30 standard entries still group into the same 22 pages; the 14
+        // OEM entries add exactly one page — the §12.2 OEM page — because
+        // they arrive with `ui_location = "oem"`.
+        assert_eq!(matrix.groups.len(), 23);
+        let oem_group = matrix
+            .groups
+            .iter()
+            .find(|group| group.page_title == "OEM")
+            .ok_or("an OEM capability page must exist")?;
+        assert_eq!(oem_group.entries.len(), 14);
+        assert_eq!(
+            oem_group
+                .entries
+                .iter()
+                .map(|entry| entry.product_code.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "oem-ami",
+                "oem-dell",
+                "oem-dell-attributes",
+                "oem-delta",
+                "oem-hpe",
+                "oem-lenovo",
+                "oem-liteon",
+                "oem-nvidia",
+                "oem-nvidia-cper",
+                "oem-nvidia-fabrics",
+                "oem-nvidia-power-management",
+                "oem-nvidia-profiles",
+                "oem-nvidia-security",
+                "oem-supermicro",
+            ]
+        );
+        // Every entry keeps its upstream feature and its honest unobserved
+        // state (missing data is never disguised as a probe result).
+        for (index, entry) in oem_group.entries.iter().enumerate() {
+            assert_eq!(entry.upstream_feature, OEM_LEDGER_FIXTURE[index].1);
+            assert_eq!(entry.state_label, NOT_OBSERVED_STATE_LABEL);
+            assert_eq!(entry.state_class, "capability-state capability-none");
+            assert_eq!(entry.observed_at_text, None);
+        }
+        assert_eq!(
+            CapabilityMatrixState::Ready(matrix).summary_text(),
+            "44 capabilities across 23 pages"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_capability_entries_render_honest_state_semantics() -> Result<(), Box<dyn Error>> {
+        // OEM probing may reach only the compiled layer for a vendor; the
+        // state semantics stay identical to standard entries, so a compiled
+        // but unprobed OEM feature renders "Not compiled" instead of being
+        // disguised as supported.
+        let standard_states: [Option<&str>; 30] = [None; 30];
+        let oem_states: [Option<&str>; 14] = [
+            Some("supported"),
+            Some("read_only"),
+            Some("unauthorized"),
+            Some("temporarily_unavailable"),
+            Some("schema_incompatible"),
+            Some("not_advertised"),
+            Some("not_compiled"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let matrix = CapabilityMatrixProjection::from(&capability_inventory_with_oem(
+            &standard_states,
+            &oem_states,
+        )?);
+        let oem_group = matrix
+            .groups
+            .iter()
+            .find(|group| group.page_title == "OEM")
+            .ok_or("an OEM capability page must exist")?;
+        let labels = oem_group
+            .entries
+            .iter()
+            .map(|entry| (entry.state_label, entry.state_class))
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0], ("Supported", "capability-state capability-ok"));
+        assert_eq!(labels[1], ("Read only", "capability-state capability-ok"));
+        assert_eq!(
+            labels[2],
+            ("Unauthorized", "capability-state capability-warn")
+        );
+        assert_eq!(
+            labels[3],
+            (
+                "Temporarily unavailable",
+                "capability-state capability-warn"
+            )
+        );
+        assert_eq!(
+            labels[4],
+            ("Schema incompatible", "capability-state capability-warn")
+        );
+        assert_eq!(
+            labels[5],
+            ("Not advertised", "capability-state capability-off")
+        );
+        assert_eq!(
+            labels[6],
+            ("Not compiled", "capability-state capability-off")
+        );
+        assert_eq!(
+            labels[7],
+            ("Not yet observed", "capability-state capability-none")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_section_derives_the_placeholder_form_without_oem_resources() -> Result<(), Box<dyn Error>>
+    {
+        let state =
+            ConsoleLoadState::accepted(about(PRODUCT_ID), inventory()?, resource_inventories()?);
+        let cards = state.endpoint_cards();
+        let waiting = cards.first().ok_or("waiting endpoint must exist")?;
+        let current = cards.get(1).ok_or("current endpoint must exist")?;
+
+        // The awaiting endpoint has no snapshot yet, and the current
+        // endpoint's complete snapshot carries the standard families but no
+        // OEM resource: a non-Dell endpoint derives the §11.5 placeholder
+        // form, exactly like §11.5's second branch requires.
+        assert_eq!(
+            waiting.oem_section,
+            OemSectionProjection::UnsupportedByNvRedfishBaseline
+        );
+        assert_eq!(
+            current.oem_section,
+            OemSectionProjection::UnsupportedByNvRedfishBaseline
+        );
+        assert!(!current.oem_section.is_supported());
+        assert!(current.oem_section.cards().is_empty());
+
+        // The switch condition is pinned: an empty card list derives the
+        // placeholder form, a non-empty list the card form.
+        assert_eq!(
+            OemSectionProjection::from_cards(Vec::new()),
+            OemSectionProjection::UnsupportedByNvRedfishBaseline
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_dell_resources() -> Result<(), Box<dyn Error>>
+    {
+        // The api contract has landed the Dell OEM family
+        // (`oem-dell-attributes`), so a Dell snapshot (a manager publishing
+        // a DellAttributes document) derives the data-card form through the
+        // wire projection, not by direct construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ac",
+                "display_name": "Rack B BMC",
+                "address": "https://192.0.2.11/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [oem_dell_resource()]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("a Dell snapshot must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 1);
+        let dell = cards.first().ok_or("the Dell card must exist")?;
+        assert_eq!(dell.type_label, "Dell OEM");
+        assert_eq!(dell.name, "Dell Attributes");
+        assert_eq!(
+            dell.source,
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"
+        );
+        // The iDRAC identity attributes render with the vendor's original
+        // values verbatim (§12.3).
+        assert!(dell.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PowerEdge R750".to_owned(),
+        }));
+        assert!(dell.facts.contains(&ResourceFactProjection {
+            label: "Service tag",
+            value: "ABC1234".to_owned(),
+        }));
+        assert!(dell.facts.contains(&ResourceFactProjection {
+            label: "Generation",
+            value: "16G".to_owned(),
+        }));
+        assert!(dell.facts.contains(&ResourceFactProjection {
+            label: "BMC MAC address",
+            value: "14:18:77:aa:bb:cc".to_owned(),
+        }));
+        assert!(dell.facts.contains(&ResourceFactProjection {
+            label: "Server name",
+            value: "rack-1-server-2".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn oem_section_card_form_keeps_the_resource_card_surface() -> Result<(), Box<dyn Error>> {
+        // Direct construction pins the switch condition and the card surface
+        // the §12.2 OEM page renders through the standard card path (the
+        // wire-driven Dell form is covered separately).
+        let resource: CoreResourceResponse = serde_json::from_value(system_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "System");
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Redfish ID",
+            value: "1".to_owned(),
+        }));
+
+        let section = OemSectionProjection::from_cards(vec![card.clone()]);
+        assert!(section.is_supported());
+        assert_eq!(
+            section,
+            OemSectionProjection::Available { cards: vec![card] }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_unsupported_notice_pins_the_11_5_wording() {
+        // The placeholder is the §11.5 `UnsupportedByNvRedfishBaseline`
+        // rendering: the exact copy is pinned so the honest boundary cannot
+        // drift into claiming OEM support.
+        assert_eq!(
+            OEM_UNSUPPORTED_NOTICE,
+            "OEM data is not available in the nv-redfish baseline for this vendor"
+        );
+    }
+
+    #[test]
     fn capability_target_projection_carries_the_drill_down_identity() {
         let target = CapabilityTargetProjection {
             endpoint_id: "01989abc-def0-7abc-8def-0123456789ac".to_owned(),
@@ -15580,6 +16144,7 @@ mod tests {
             vendor: vendor.map(str::to_owned),
             health_level,
             health_label: None,
+            oem_section: OemSectionProjection::UnsupportedByNvRedfishBaseline,
         }
     }
 

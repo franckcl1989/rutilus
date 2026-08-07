@@ -1325,3 +1325,24 @@ dd {
   font-size: 0.7rem;
   line-height: 1.5;
 }
+
+/* §12.2 OEM surface of the endpoint card, the two-form §11.5 contract: the
+   section renders either the honest UnsupportedByNvRedfishBaseline notice
+   or the typed OEM resource cards (once the api projects an OEM resource
+   family). The dashed muted notice keeps absence readable as information,
+   not as a failure state. */
+.oem-section {
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid rgb(143 171 207 / 14%);
+}
+
+.oem-unsupported {
+  margin: 0.15rem 0 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px dashed rgb(143 171 207 / 22%);
+  border-radius: 0.8rem;
+  color: #8495ad;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
