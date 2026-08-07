@@ -762,6 +762,40 @@ impl ResourceStatusResponse {
     }
 }
 
+/// The §0.5.0 NVIDIA `Truststore` metadata of the `SystemConfigProfile`
+/// chain-root document: the presence of each certificate-store link
+/// (`NvidiaCertificates` / `OemCertificates`), never the certificate
+/// payloads behind them (the sensitive surface is deferred to a later
+/// slice).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OemNvidiaSystemConfigProfileTruststoreResponse {
+    nvidia_certificates: Option<bool>,
+    oem_certificates: Option<bool>,
+}
+
+impl OemNvidiaSystemConfigProfileTruststoreResponse {
+    #[must_use]
+    pub const fn new(nvidia_certificates: Option<bool>, oem_certificates: Option<bool>) -> Self {
+        Self {
+            nvidia_certificates,
+            oem_certificates,
+        }
+    }
+
+    /// Whether the `NvidiaCertificates` link was present.
+    #[must_use]
+    pub const fn nvidia_certificates(&self) -> Option<bool> {
+        self.nvidia_certificates
+    }
+
+    /// Whether the `OemCertificates` link was present.
+    #[must_use]
+    pub const fn oem_certificates(&self) -> Option<bool> {
+        self.oem_certificates
+    }
+}
+
 /// Feature-specific, explicitly tagged core Redfish resource fields.
 ///
 /// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
@@ -856,6 +890,70 @@ pub enum CoreResourceDetailsResponse {
     /// common identity is the resource's own `@odata.id` final segment (the
     /// Redfish `Id` per DSP0266), never a product-invented label.
     OemSmcKcsInterface { privilege: Option<String> },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `SystemConfigProfile` schema (`NvidiaSystemConfigProfile`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-profiles` feature).
+    ///
+    /// The chain-root document of the `ComputerSystem`'s `Oem.Nvidia` segment
+    /// is the first member of the NVIDIA system-config-profile chain; the
+    /// whole chain shares the single family code
+    /// `nvidia-system-config-profile` because the chain root decides whether
+    /// the chain exists at all (§11.5: an OEM surface is projected only when
+    /// upstream strongly types it). The details are the `Truststore`
+    /// metadata: the presence of each certificate-store link, never the
+    /// certificate payloads behind them (the sensitive surface is deferred).
+    OemNvidiaSystemConfigProfile {
+        truststore: Option<OemNvidiaSystemConfigProfileTruststoreResponse>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `SystemConfigProfileStatus` schema (`NvidiaSystemConfigProfileStatus`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-profiles` feature).
+    ///
+    /// The status singleton of the system-config-profile chain; the details
+    /// are the compiled status fields — the `PendingList.Activation` text,
+    /// the numeric `ActiveProfileIndex` / `BmcProfileVersion` /
+    /// `DefaultProfileIndex` indices, and the `FactoryResetStatus` text —
+    /// each `None` when the endpoint did not publish the property.
+    OemNvidiaSystemConfigProfileStatus {
+        pending_list_activation: Option<String>,
+        active_profile_index: Option<i64>,
+        bmc_profile_version: Option<i64>,
+        factory_reset_status: Option<String>,
+        default_profile_index: Option<i64>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `SystemProfile` schema (`NvidiaSystemProfile`, nv-redfish-schema 0.13,
+    /// `oem-nvidia-profiles` feature).
+    ///
+    /// One member of the system-config-profile collection; the details are
+    /// the compiled metadata fields (`Default`, `Owner`, `UUID`, the numeric
+    /// `Version`, and `ProfileName`). The profile file behind the member's
+    /// `ProfileFile` navigation is its own chain document and its own
+    /// variant.
+    OemNvidiaSystemProfile {
+        default: Option<bool>,
+        owner: Option<String>,
+        uuid: Option<String>,
+        version: Option<i64>,
+        profile_name: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `SystemProfileFile` schema (`NvidiaSystemProfileFile`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-profiles` feature).
+    ///
+    /// The profile file document behind one profile member's `ProfileFile`
+    /// navigation; the details are the compiled `Metadata` fields (`Activate`,
+    /// `Delete`, `OriginProfileUUID`, `More_Profiles`, `ProjectName`,
+    /// `UUID`) and the base64 `Profile` content, kept verbatim (§12.3).
+    OemNvidiaSystemProfileFile {
+        metadata_activate: Option<bool>,
+        metadata_delete: Option<bool>,
+        metadata_origin_profile_uuid: Option<String>,
+        metadata_more_profiles: Option<bool>,
+        metadata_project_name: Option<String>,
+        metadata_uuid: Option<String>,
+        profile: Option<String>,
+    },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
@@ -2530,6 +2628,83 @@ impl OperationResponse {
     }
 }
 
+/// The acknowledgement of one multi-target batch submission (§13.7).
+///
+/// A batch is one parent record plus one ordinary single-target child
+/// operation per submitted endpoint. `targets` echoes the submitted endpoint
+/// UUIDs in submission order and `child_operation_ids` carries one
+/// `OperationId` per target in the same order, so the console can pair every
+/// endpoint with the operation record that will execute and report its write;
+/// the children are ordinary persisted operations with their own lifecycle,
+/// listed and executed exactly like single submissions. `command` echoes the
+/// typed write every child will dispatch (§13.3 step 7).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchOperationResponse {
+    batch_id: Uuid,
+    source: OperationSourceResponse,
+    command: RedfishCommand,
+    targets: Vec<Uuid>,
+    child_operation_ids: Vec<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl BatchOperationResponse {
+    #[must_use]
+    pub const fn new(
+        batch_id: Uuid,
+        source: OperationSourceResponse,
+        command: RedfishCommand,
+        targets: Vec<Uuid>,
+        child_operation_ids: Vec<Uuid>,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            batch_id,
+            source,
+            command,
+            targets,
+            child_operation_ids,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn batch_id(&self) -> Uuid {
+        self.batch_id
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> OperationSourceResponse {
+        self.source
+    }
+
+    /// Returns the typed write command every child operation dispatches.
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    /// Returns the submitted endpoint UUIDs in submission order.
+    #[must_use]
+    pub fn targets(&self) -> &[Uuid] {
+        &self.targets
+    }
+
+    /// Returns one child `OperationId` per target, in the same order as
+    /// [`Self::targets`].
+    #[must_use]
+    pub fn child_operation_ids(&self) -> &[Uuid] {
+        &self.child_operation_ids
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
 /// Stable envelope for one operation listing, optionally filtered by state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -3925,6 +4100,273 @@ mod tests {
             ),
             CoreResourceDetailsResponse::OemSmcKcsInterface {
                 privilege: Some("Administrator".to_owned()),
+            },
+        )
+    }
+
+    // The four NVIDIA chain documents are asserted in one test so the wire
+    // shapes stay one contract; the four golden assertions exceed the
+    // pedantic line budget, so the lint is scoped here exactly like the
+    // other OEM contract tests.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn core_resource_contract_carries_oem_nvidia_wire_values() -> Result<(), Box<dyn Error>> {
+        let chain_root = oem_nvidia_system_config_profile_resource();
+        let status = oem_nvidia_system_config_profile_status_resource();
+        let profile = oem_nvidia_system_profile_resource();
+        let profile_file = oem_nvidia_system_profile_file_resource();
+
+        // The chain root carries the `Truststore` link-presence metadata;
+        // the certificate payloads behind the links stay out.
+        assert_eq!(
+            serde_json::to_value(&chain_root)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b4",
+                    "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                    "odata_type": "#NvidiaSystemConfigProfile.NvidiaSystemConfigProfile",
+                    "etag": "W/\"nvidia-scp-1\""
+                },
+                "common": {
+                    "id": "SystemConfigProfile",
+                    "name": "NVIDIA System Config Profile",
+                    "description": "Profile service"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_system_config_profile",
+                    "details": {
+                        "truststore": {
+                            "nvidia_certificates": true,
+                            "oem_certificates": false
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&chain_root)?)?,
+            chain_root
+        );
+        // The status singleton carries the compiled status fields.
+        assert_eq!(
+            serde_json::to_value(&status)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b5",
+                    "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+                    "odata_type": "#NvidiaSystemConfigProfileStatus.NvidiaSystemConfigProfileStatus",
+                    "etag": "W/\"nvidia-scp-status-1\""
+                },
+                "common": {
+                    "id": "Status",
+                    "name": "System Config Profile Status",
+                    "description": "Profile service status"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_system_config_profile_status",
+                    "details": {
+                        "pending_list_activation": "profile-1",
+                        "active_profile_index": 1,
+                        "bmc_profile_version": 2,
+                        "factory_reset_status": "Idle",
+                        "default_profile_index": 1
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&status)?)?,
+            status
+        );
+        // A profile member carries the compiled metadata fields.
+        assert_eq!(
+            serde_json::to_value(&profile)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b6",
+                    "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+                    "odata_type": "#NvidiaSystemProfile.NvidiaSystemProfile",
+                    "etag": "W/\"nvidia-profile-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Default Profile",
+                    "description": "Factory default profile"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_system_profile",
+                    "details": {
+                        "default": true,
+                        "owner": "Nvidia",
+                        "uuid": "11111111-2222-3333-4444-555555555555",
+                        "version": 1,
+                        "profile_name": "default-profile"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&profile)?)?,
+            profile
+        );
+        // The profile file carries the metadata and the base64 content
+        // verbatim.
+        assert_eq!(
+            serde_json::to_value(&profile_file)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b7",
+                    "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+                    "odata_type": "#NvidiaSystemProfileFile.NvidiaSystemProfileFile",
+                    "etag": "W/\"nvidia-profile-file-1\""
+                },
+                "common": {
+                    "id": "ProfileFile",
+                    "name": "Profile File",
+                    "description": "Signed profile file"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_system_profile_file",
+                    "details": {
+                        "metadata_activate": true,
+                        "metadata_delete": false,
+                        "metadata_origin_profile_uuid": "11111111-2222-3333-4444-555555555555",
+                        "metadata_more_profiles": false,
+                        "metadata_project_name": "BlueField",
+                        "metadata_uuid": "11111111-2222-3333-4444-555555555555",
+                        "profile": "eyJwcm9maWxlIjogInRlc3QifQ=="
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&profile_file)?)?,
+            profile_file
+        );
+        // An unknown key is refused under every NVIDIA variant, keeping the
+        // strict `deny_unknown_fields` contract.
+        for (resource_type, details) in [
+            (
+                "oem_nvidia_system_config_profile",
+                json!({"truststore": {"nvidia_certificates": true}, "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_system_config_profile_status",
+                json!({"active_profile_index": 1, "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_system_profile",
+                json!({"profile_name": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_system_profile_file",
+                json!({"profile": "x", "arbitrary": true}),
+            ),
+        ] {
+            assert!(
+                serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                    "resource_type": resource_type,
+                    "details": details
+                }))
+                .is_err(),
+                "{resource_type} must refuse unknown detail fields"
+            );
+        }
+        Ok(())
+    }
+
+    fn oem_nvidia_system_config_profile_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b4"),
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile".to_owned(),
+                Some("#NvidiaSystemConfigProfile.NvidiaSystemConfigProfile".to_owned()),
+                Some("W/\"nvidia-scp-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "SystemConfigProfile".to_owned(),
+                "NVIDIA System Config Profile".to_owned(),
+                Some("Profile service".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile {
+                truststore: Some(OemNvidiaSystemConfigProfileTruststoreResponse::new(
+                    Some(true),
+                    Some(false),
+                )),
+            },
+        )
+    }
+
+    fn oem_nvidia_system_config_profile_status_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b5"),
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status".to_owned(),
+                Some("#NvidiaSystemConfigProfileStatus.NvidiaSystemConfigProfileStatus".to_owned()),
+                Some("W/\"nvidia-scp-status-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "Status".to_owned(),
+                "System Config Profile Status".to_owned(),
+                Some("Profile service status".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus {
+                pending_list_activation: Some("profile-1".to_owned()),
+                active_profile_index: Some(1),
+                bmc_profile_version: Some(2),
+                factory_reset_status: Some("Idle".to_owned()),
+                default_profile_index: Some(1),
+            },
+        )
+    }
+
+    fn oem_nvidia_system_profile_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b6"),
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1".to_owned(),
+                Some("#NvidiaSystemProfile.NvidiaSystemProfile".to_owned()),
+                Some("W/\"nvidia-profile-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Default Profile".to_owned(),
+                Some("Factory default profile".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaSystemProfile {
+                default: Some(true),
+                owner: Some("Nvidia".to_owned()),
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+                version: Some(1),
+                profile_name: Some("default-profile".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_system_profile_file_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b7"),
+                "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+                    .to_owned(),
+                Some("#NvidiaSystemProfileFile.NvidiaSystemProfileFile".to_owned()),
+                Some("W/\"nvidia-profile-file-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "ProfileFile".to_owned(),
+                "Profile File".to_owned(),
+                Some("Signed profile file".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaSystemProfileFile {
+                metadata_activate: Some(true),
+                metadata_delete: Some(false),
+                metadata_origin_profile_uuid: Some(
+                    "11111111-2222-3333-4444-555555555555".to_owned(),
+                ),
+                metadata_more_profiles: Some(false),
+                metadata_project_name: Some("BlueField".to_owned()),
+                metadata_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+                profile: Some("eyJwcm9maWxlIjogInRlc3QifQ==".to_owned()),
             },
         )
     }
@@ -6371,6 +6813,66 @@ mod tests {
             serde_json::from_value::<OperationListResponse>(json!({
                 "operations": [],
                 "total": 0
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_operation_contract_pins_the_submission_acknowledgement() -> Result<(), Box<dyn Error>>
+    {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let batch_id = uuid!("01989abc-def0-7abc-8def-0123456789e1");
+        let first_endpoint = uuid!("01989abc-def0-7abc-8def-0123456789ab");
+        let second_endpoint = uuid!("01989abc-def0-7abc-8def-0123456789ac");
+        let first_child = uuid!("01989abc-def0-7abc-8def-0123456789e2");
+        let second_child = uuid!("01989abc-def0-7abc-8def-0123456789e3");
+        let response = BatchOperationResponse::new(
+            batch_id,
+            OperationSourceResponse::Site,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            vec![first_endpoint, second_endpoint],
+            vec![first_child, second_child],
+            observed_at,
+        );
+
+        assert_eq!(response.batch_id(), batch_id);
+        assert_eq!(response.source(), OperationSourceResponse::Site);
+        assert_eq!(
+            response.command(),
+            &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle))
+        );
+        assert_eq!(response.targets(), &[first_endpoint, second_endpoint]);
+        assert_eq!(response.child_operation_ids(), &[first_child, second_child]);
+        assert_eq!(response.created_at(), observed_at);
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "batch_id": batch_id,
+                "source": "site",
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "targets": [first_endpoint, second_endpoint],
+                "child_operation_ids": [first_child, second_child],
+                "created_at": "2026-08-05T10:11:12Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BatchOperationResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        // Unknown fields are rejected: the acknowledgement is a strict
+        // projection, and the target/child pairing is the only link between
+        // the endpoints and their operation records.
+        assert!(
+            serde_json::from_value::<BatchOperationResponse>(json!({
+                "batch_id": batch_id,
+                "source": "site",
+                "command": { "System": { "Reset": "On" } },
+                "targets": [first_endpoint],
+                "child_operation_ids": [first_child],
+                "created_at": "2026-08-05T10:11:12Z",
+                "summary": { "total": 1 }
             }))
             .is_err()
         );
