@@ -170,6 +170,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn store_round_trips_os_protected_bytes() -> Result<(), Box<dyn Error>> {
         let store = SystemSecretStore::new();
