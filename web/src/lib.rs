@@ -32,9 +32,10 @@ use rutilus_api::{
     ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
     HealthResponse, MetricValueResponse, OperationListResponse, OperationResponse,
     OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    ResourceStatusResponse, TagListResponse, TagResponse, TelemetrySampleListResponse,
-    TelemetrySampleResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
-    TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
+    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
+    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
+    TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
+    UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -52,7 +53,8 @@ use rutilus_application::{
     EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
     EnrolledEndpoint, EventRepository, GroupManagement, GroupManagementError, GroupRepository,
     NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, OperationStore,
-    OperationSubmission, RedfishDiscovery, ResourceStatusSummary, SubmissionError, TagManagement,
+    OperationSubmission, RedfishDiscovery, ResourceDiagnostics, ResourceDiagnosticsQuery,
+    ResourceDiagnosticsQueryError, ResourceStatusSummary, SubmissionError, TagManagement,
     TagManagementError, TagRepository, TelemetryRepository, TlsIdentityProbe, TrustedEndpoint,
     parse_endpoint_csv,
 };
@@ -61,8 +63,8 @@ use rutilus_domain::{
     CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
     CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
     EndpointId, Event, Group, GroupId, GroupName, Operation, OperationId, OperationSource,
-    OperationState, OperationTarget, ResourceFeature, ResourceSnapshot, Tag, TagName, TargetId,
-    TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
+    OperationState, OperationTarget, ResourceFeature, ResourceId, ResourceSnapshot, Tag, TagName,
+    TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -275,6 +277,10 @@ where
             get(endpoint_resources::<Services, Gateway, Time>),
         )
         .route(
+            "/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics",
+            get(resource_diagnostics::<Services, Gateway, Time>),
+        )
+        .route(
             "/api/v1/endpoints/{endpoint_id}/capabilities",
             get(endpoint_capabilities::<Services, Gateway, Time>),
         )
@@ -477,6 +483,53 @@ where
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
     };
     let Ok(response) = project_endpoint_resources(&inventory) else {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let mut response = Json(response).into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Serves the §12.4 Advanced Diagnostics view of one stored resource snapshot.
+///
+/// The resource is addressed by its stable local `ResourceId` (the same UUID
+/// identity the resource-inventory API exposes), not by the vendor-controlled
+/// `@odata.id` URI: the URI contains path and fragment characters that would
+/// need URL encoding and is not a product identity, while the response body
+/// carries the URI verbatim for display.
+///
+/// The view is read-only by construction — §12.4 forbids changing Method,
+/// submitting arbitrary JSON, and bypassing the permission and task model —
+/// so this path only ever reads the current Generation and never triggers a
+/// refresh or a write.
+async fn resource_diagnostics<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath((endpoint_id, resource_id)): AxumPath<(String, String)>,
+) -> Response
+where
+    Services: EndpointInventoryRepository,
+{
+    let (Ok(endpoint_id), Ok(resource_id)) = (
+        endpoint_id.parse::<EndpointId>(),
+        resource_id.parse::<ResourceId>(),
+    ) else {
+        return uncached_status(StatusCode::BAD_REQUEST);
+    };
+    let diagnostics =
+        match ResourceDiagnosticsQuery::new(state.services.as_ref(), endpoint_id, resource_id)
+            .execute()
+            .await
+        {
+            Ok(Some(diagnostics)) => diagnostics,
+            Ok(None) => return uncached_status(StatusCode::NOT_FOUND),
+            Err(ResourceDiagnosticsQueryError::Inventory(
+                EndpointInventoryQueryError::Repository(_),
+            )) => return uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+            Err(ResourceDiagnosticsQueryError::Inventory(
+                EndpointInventoryQueryError::DuplicateEndpoint { .. },
+            )) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+    let Ok(response) = project_resource_diagnostics(&diagnostics) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = Json(response).into_response();
@@ -2224,6 +2277,25 @@ fn project_endpoint_resources(
     ))
 }
 
+fn project_resource_diagnostics(
+    diagnostics: &ResourceDiagnostics,
+) -> Result<ResourceDiagnosticsResponse, EndpointInventoryProjectionError> {
+    Ok(ResourceDiagnosticsResponse::new(
+        diagnostics.endpoint_id().into_uuid(),
+        diagnostics.odata_id().to_string(),
+        diagnostics.odata_type().map(ToString::to_string),
+        diagnostics.etag().map(ToString::to_string),
+        diagnostics.feature().as_str().to_owned(),
+        NonZeroU64::new(diagnostics.generation().get())
+            .ok_or(EndpointInventoryProjectionError::ZeroGeneration)?,
+        // The persisted payload is guaranteed JSON by snapshot construction,
+        // so this parse only fails on a corrupted store; the honest mapping
+        // is an internal fault rather than a fabricated diagnostics view.
+        serde_json::from_str(diagnostics.typed_payload())
+            .map_err(|_| EndpointInventoryProjectionError::InvalidTypedPayload)?,
+    ))
+}
+
 fn project_endpoint_identity(endpoint: &Endpoint) -> EndpointIdentityResponse {
     let trust = match endpoint.trust() {
         TlsTrust::SystemCa { .. } => TlsTrustModeResponse::SystemCa,
@@ -3228,6 +3300,7 @@ enum EndpointInventoryProjectionError {
     MissingRefreshTime,
     ResourceCountOverflow,
     IncoherentResourceSnapshot,
+    InvalidTypedPayload,
 }
 
 fn uncached_status(status: StatusCode) -> Response {
@@ -3288,15 +3361,15 @@ mod tests {
     use http_body_util::BodyExt as _;
     use rutilus_application::{
         BoundaryFuture, CapabilitySnapshotRepository, EndpointDiscovery,
-        ProtectedCredentialCreation, ResolvedCredential, ResourceObservation, StoredCapability,
-        TlsIdentityObservation,
+        ProtectedCredentialCreation, ResolvedCredential, ResourceDiagnostics, ResourceObservation,
+        StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
         CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
         EndpointCapabilityObservation, EndpointDisplayName, EndpointId, RefreshGeneration,
-        ResourceEtag, ResourceId, ResourceODataId, ResourceODataType, ResourceSnapshot,
-        ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
-        TlsCertificate, TlsTrust,
+        ResourceEtag, ResourceFeature, ResourceId, ResourceODataId, ResourceODataType,
+        ResourceSnapshot, ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries,
+        TelemetrySeriesId, TlsCertificate, TlsTrust,
     };
     use secrecy::SecretString;
     use serde_json::{Value, json};
@@ -5222,5 +5295,48 @@ mod tests {
         ) -> BoundaryFuture<'a, Result<Vec<Tag>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
+    }
+
+    #[test]
+    fn diagnostics_projection_maps_a_corrupt_stored_payload_to_an_internal_fault()
+    -> Result<(), Box<dyn Error>> {
+        let valid = ResourceDiagnostics::new(
+            EndpointId::generate(),
+            ResourceId::generate(),
+            ResourceODataId::parse("/redfish/v1/Systems/1")?,
+            Some(ResourceODataType::parse(
+                "#ComputerSystem.v1_20_0.ComputerSystem",
+            )?),
+            Some(ResourceEtag::parse("W/\"system-1\"")?),
+            ResourceFeature::Systems,
+            r#"{"Id":"1","Name":"System One"}"#.to_owned(),
+            RefreshGeneration::new(7)?,
+        );
+        let projected = project_resource_diagnostics(&valid)
+            .map_err(|_| "valid diagnostics projection must succeed")?;
+        assert_eq!(projected.odata_uri(), "/redfish/v1/Systems/1");
+        assert_eq!(projected.feature(), "systems");
+        assert_eq!(projected.generation().get(), 7);
+
+        // `ResourceDiagnostics::new` is the only constructor that can carry a
+        // payload which does not re-parse (the query path always copies a
+        // domain-validated snapshot payload), so the corrupt-store branch of
+        // the projection is exercised here directly instead of through the
+        // route, which cannot produce it.
+        let corrupt = ResourceDiagnostics::new(
+            EndpointId::generate(),
+            ResourceId::generate(),
+            ResourceODataId::parse("/redfish/v1/Systems/1")?,
+            None,
+            None,
+            ResourceFeature::Systems,
+            "not json".to_owned(),
+            RefreshGeneration::new(7)?,
+        );
+        assert_eq!(
+            project_resource_diagnostics(&corrupt),
+            Err(EndpointInventoryProjectionError::InvalidTypedPayload)
+        );
+        Ok(())
     }
 }

@@ -11,6 +11,7 @@ rust-embed.workspace = true
 rutilus-application.workspace = true
 rutilus-api.workspace = true
 rutilus-domain.workspace = true
+serde_json.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
