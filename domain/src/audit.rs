@@ -1009,6 +1009,9 @@ mod tests {
             AuditRedfishOperation::CreateEventSubscription,
             AuditRedfishOperation::DeleteEventSubscription,
             AuditRedfishOperation::UpdateFirmware,
+            AuditRedfishOperation::OemSystemConfigProfile,
+            AuditRedfishOperation::OemDebugToken,
+            AuditRedfishOperation::OemPowerSmoothing,
             AuditRedfishOperation::PollRemoteTask,
         ]);
         assert_codes(&[AuditProgress::EndpointCreated, AuditProgress::RowValidated]);
