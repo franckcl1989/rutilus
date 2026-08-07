@@ -582,6 +582,14 @@ where
                         }
                         Some(EnvelopeMessage::OperationOffer(offer)) => {
                             self.handle_offer(offer, &envelope).await?;
+                            // The reply is durable before the flush, so one
+                            // burst carries it: a handled offer must reach
+                            // the center without waiting for an
+                            // acknowledgement that may never come (§15.6 —
+                            // the center waits for the reply to its offer,
+                            // and an idle site has nothing to acknowledge).
+                            self.flush_outbox(&mut session, &mut sent, peer_acked)
+                                .await?;
                         }
                         _ => self.dispatch_inbound(envelope),
                     }
@@ -613,21 +621,46 @@ where
             .await
             .map_err(CenterSyncError::Outbox)?;
         for entry in pending {
+            // An entry already delivered on this connection is not sent
+            // again: the acknowledgement retires it, and a dropped
+            // connection re-sends it from the pending scan (§15.4
+            // at-least-once). The skip keeps a mid-burst flush — the
+            // offer-reply flush of the inbound loop — from duplicating an
+            // unacknowledged burst on the wire.
+            if sent.iter().any(|(sent_id, _)| *sent_id == entry.id()) {
+                continue;
+            }
             // The payload is the §9.4 typed serialization of the envelope;
             // the row's sequence column is authoritative, and the stored
             // acknowledgement watermark is the enqueue-time value, so the
             // frame is rebuilt with both patched to the send-time truth.
-            let mut envelope: Envelope =
-                serde_json::from_str(entry.payload_json()).map_err(|source| {
-                    CenterSyncError::InvalidOutboxPayload {
-                        entry_id: entry.id(),
-                        source,
-                    }
-                })?;
-            envelope.sequence =
-                u64::try_from(entry.sequence()).map_err(|_| CenterSyncError::SequenceOverflow {
-                    sequence: entry.sequence(),
-                })?;
+            let mut envelope: Envelope = match serde_json::from_str(entry.payload_json()) {
+                Ok(envelope) => envelope,
+                Err(source) => {
+                    // One corrupt row must not wedge the whole flush: log
+                    // it, skip it, and deliver the rest of the queue. The
+                    // row has no durable failure state, so it stays pending
+                    // and every flush re-logs it until an operator repairs
+                    // or clears it (a future migration could add a failed
+                    // state).
+                    eprintln!(
+                        "site {}: skipping outbox entry {} with a corrupt payload: {source}",
+                        self.instance_id,
+                        entry.id()
+                    );
+                    continue;
+                }
+            };
+            let Ok(wire_sequence) = u64::try_from(entry.sequence()) else {
+                eprintln!(
+                    "site {}: skipping outbox entry {} with an unwireable sequence {}",
+                    self.instance_id,
+                    entry.id(),
+                    entry.sequence()
+                );
+                continue;
+            };
+            envelope.sequence = wire_sequence;
             envelope.acked_sequence = peer_acked;
             session
                 .send(envelope)
@@ -1525,14 +1558,17 @@ pub enum CenterSyncError<
     #[error("the center closed the connection")]
     Closed,
     /// A stored outbox payload is not the §9.4 typed serialization of an
-    /// envelope; the row is corrupt.
+    /// envelope; the row is corrupt. The flush isolates such rows (log and
+    /// skip) instead of failing the connection, so this variant documents
+    /// the corruption shape the engine detects rather than a return path.
     #[error("stored outbox entry {entry_id} is not a valid envelope payload: {source}")]
     InvalidOutboxPayload {
         entry_id: OutboxEntryId,
         #[source]
         source: serde_json::Error,
     },
-    /// A stored sequence cannot be represented on the wire.
+    /// A stored sequence cannot be represented on the wire; the flush
+    /// isolates such rows (log and skip) like corrupt payloads.
     #[error("outbox sequence {sequence} cannot be represented on the wire")]
     SequenceOverflow { sequence: i64 },
     /// An artifact's bytes could not be read for the center distribution.
@@ -3596,6 +3632,97 @@ mod tests {
                 message: Some(EnvelopeMessage::Ack(Ack { sequence: 5 })),
             })
             .map_err(|_| std::io::Error::other("the center feed closed"))?;
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        assert!(
+            stopped.is_ok(),
+            "the engine must stop cleanly, got {stopped:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_offer_reply_is_flushed_without_waiting_for_an_acknowledgement()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        // The `?` operator cannot widen the mock helper's
+        // `Box<dyn Error + Send + Sync>` into the test's `Box<dyn Error>`,
+        // so the two `Send + Sync`-typed sites convert explicitly.
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let instance_id = InstanceId::generate();
+        let endpoint_id = endpoint.id();
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            let outbox = MockOutbox::new(instance_id);
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                &store,
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
+        let mut wire = next_wire(&mut wires).await?;
+        // The connect reports the prepared projection first: one snapshot and
+        // two upserts (§21 0.7.0 incremental sync).
+        for sequence in [1, 2, 3] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+
+        // The center sends one operation offer and never acknowledges
+        // anything. The §15.6 reply must still reach it: the engine flushes
+        // immediately after handling the offer, and the flush never re-sends
+        // the already-delivered burst.
+        let (offer, received) = offer_for(instance_id, endpoint_id, now.unix_timestamp() + 3600)
+            .map_err(std::io::Error::other)?;
+        wire.inbound
+            .send(received.clone())
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = next_outbox_frame(&mut wire).await?;
+        assert_eq!(
+            envelope.sequence, 4,
+            "the reply must be the next frame, not a re-send of the burst"
+        );
+        let Some(EnvelopeMessage::OperationAccepted(accepted)) = envelope.message else {
+            return Err(std::io::Error::other("the reply was not an OperationAccepted").into());
+        };
+        assert_eq!(accepted.operation_id, offer.operation_id);
+
+        // A re-delivered offer is answered from the recorded state, and that
+        // reply is flushed the same way.
+        wire.inbound
+            .send(received)
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = next_outbox_frame(&mut wire).await?;
+        assert_eq!(envelope.sequence, 5);
+        let Some(EnvelopeMessage::OperationProgress(progress)) = envelope.message else {
+            return Err(
+                std::io::Error::other("the duplicate reply was not an OperationProgress").into(),
+            );
+        };
+        assert_eq!(progress.operation_id, offer.operation_id);
+        assert_eq!(progress.state, OperationState::Queued.as_str());
 
         stop_tx
             .send(())
