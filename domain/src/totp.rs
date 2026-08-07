@@ -130,15 +130,13 @@ impl TotpAuthenticator {
 
     /// Rehydrates a persisted authenticator record.
     ///
-    /// The stored secret is currently the 20-byte plaintext secret this
-    /// slice writes, so its length is validated here; the shape rules — an
-    /// activated authenticator always has `activated_at`, a provisioning one
-    /// has neither `activated_at` nor a used step — keep a tampered row from
-    /// producing a half-understood aggregate.
-    ///
-    /// TODO(S2): when persistence starts storing the Master-Key-encrypted
-    /// ciphertext, this entry point must be reached only after decryption;
-    /// the exactly-20-bytes rule can never accept ciphertext.
+    /// Persistence stores the secret as Master-Key XChaCha20-Poly1305
+    /// ciphertext and decrypts it before this entry point runs, so the
+    /// recovered 20-byte plaintext is what the length rule validates; this
+    /// type only carries domain values and never touches persistence. The
+    /// shape rules — an activated authenticator always has `activated_at`,
+    /// a provisioning one has neither `activated_at` nor a used step — keep
+    /// a tampered row from producing a half-understood aggregate.
     ///
     /// # Errors
     ///

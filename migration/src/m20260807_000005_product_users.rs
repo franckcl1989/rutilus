@@ -19,17 +19,16 @@ use sea_orm_migration::prelude::*;
 ///   that the CHECK pins to `argon2id-1`, so a persisted row's columns can
 ///   never silently change meaning. The row cascades away with its principal.
 /// - `totp_authenticators` — the optional TOTP second factor (§16.2). The
-///   secret column currently stores the 20-byte plaintext secret: Master-Key
-///   encryption is S2 wiring, and this slice's table has no production data,
-///   so the plaintext format is a self-consistent staging contract.
-///   TODO(S2): the write path must switch the column to XChaCha20-Poly1305
-///   ciphertext (via `security::encrypt_credential`) before any production
-///   authenticator lands — which also changes the length the domain
-///   rehydration validates. The state CHECK pins `provisioning`/`active`,
-///   and the algorithm, digits, and period columns are pinned to the
-///   product's single RFC 6238 shape (`sha1`, 6, 30) so a row always carries
-///   its full verification contract. The per-principal index keeps the
-///   sign-in lookup from scanning the whole table.
+///   secret column stores the Master-Key-encrypted XChaCha20-Poly1305
+///   ciphertext blob (the 24-byte nonce followed by the ciphertext, written
+///   through `security::encrypt_credential`): the plaintext secret never
+///   reaches the database, and the persistence read path decrypts the blob
+///   back to the 20-byte plaintext before the domain rehydration validates
+///   it. The state CHECK pins `provisioning`/`active`, and the algorithm,
+///   digits, and period columns are pinned to the product's single RFC 6238
+///   shape (`sha1`, 6, 30) so a row always carries its full verification
+///   contract. The per-principal index keeps the sign-in lookup from
+///   scanning the whole table.
 /// - `sessions` — one row per sign-in (§16.2). Only the SHA-256 hashes of
 ///   the bearer token and the CSRF token are stored (unique token hash: the
 ///   lookup key at every authenticated request), with the lifecycle times.
