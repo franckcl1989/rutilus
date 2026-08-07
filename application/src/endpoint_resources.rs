@@ -135,6 +135,21 @@ pub enum CoreResourceDetails {
         power_state: Option<String>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §0.5.0 OEM family member: the manager's Dell `DellAttributes`
+    /// document, read through the nv-redfish `oem-dell-attributes` typed
+    /// surface (§11.5 — an OEM surface is projected only when upstream
+    /// compiles it). The identity fields are the five Dell iDRAC attributes
+    /// the product pins; every other entry of the vendor-specific dynamic
+    /// attribute bag stays out exactly like the `Bios` family keeps its
+    /// `Attributes` bag out, and each value is the typed string of the
+    /// compiled `Edm.String` type — never raw JSON.
+    OemDell {
+        server_model: Option<String>,
+        server_service_tag: Option<String>,
+        server_generation: Option<String>,
+        server_bmc_mac_address: Option<String>,
+        server_name: Option<String>,
+    },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -558,6 +573,7 @@ where
         ResourceFeature::Systems => project_system(snapshot, payload)?,
         ResourceFeature::Chassis => project_chassis(snapshot, payload)?,
         ResourceFeature::Managers => project_manager(snapshot, payload)?,
+        ResourceFeature::OemDell => project_oem_dell(snapshot, payload)?,
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
@@ -689,6 +705,27 @@ where
             version: parsed.version,
             power_state: parsed.power_state,
             status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_oem_dell<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemDellPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemDell {
+            server_model: parsed.server_model,
+            server_service_tag: parsed.server_service_tag,
+            server_generation: parsed.server_generation,
+            server_bmc_mac_address: parsed.server_bmc_mac_address,
+            server_name: parsed.server_name,
         }
     })
 }
@@ -1390,6 +1427,43 @@ struct ManagerPayload {
 }
 
 impl CommonPayload for ManagerPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §0.5.0 Dell OEM `DellAttributes` snapshot payload, decoded exactly as
+/// the infra projection wrote it: the five pinned Dell iDRAC identity
+/// attributes, each `None` when the endpoint did not publish the key.
+/// `deny_unknown_fields` keeps the snapshot contract strict, so a future
+/// extra wire field would make stored snapshots unreadable exactly like an
+/// extra top-level key would.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemDellPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ServerModel")]
+    server_model: Option<String>,
+    #[serde(rename = "ServerServiceTag")]
+    server_service_tag: Option<String>,
+    #[serde(rename = "ServerGeneration")]
+    server_generation: Option<String>,
+    #[serde(rename = "ServerBmcMacAddress")]
+    server_bmc_mac_address: Option<String>,
+    #[serde(rename = "ServerName")]
+    server_name: Option<String>,
+}
+
+impl CommonPayload for OemDellPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),
@@ -2475,6 +2549,63 @@ mod tests {
                 locked: Some(false),
             } if role_id == "Administrator"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_oem_dell_family_without_losing_source_values() -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(13)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemDell,
+                    "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+                    r#"{"Id":"1","Name":"Dell Attributes","Description":"Dell iDRAC attributes","ServerModel":"PowerEdge R750","ServerServiceTag":"ABC1234","ServerGeneration":"16G","ServerBmcMacAddress":"14:18:77:aa:bb:cc","ServerName":"rack-1-server-2"}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 2);
+        let oem_dell = &result.resources()[1];
+        assert_eq!(oem_dell.feature(), ResourceFeature::OemDell);
+        assert_eq!(
+            oem_dell.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"
+        );
+        assert_eq!(oem_dell.common().id(), "1");
+        assert_eq!(oem_dell.common().name(), "Dell Attributes");
+        assert_eq!(
+            oem_dell.common().description(),
+            Some("Dell iDRAC attributes")
+        );
+        assert_eq!(
+            oem_dell.details(),
+            &CoreResourceDetails::OemDell {
+                server_model: Some("PowerEdge R750".to_owned()),
+                server_service_tag: Some("ABC1234".to_owned()),
+                server_generation: Some("16G".to_owned()),
+                server_bmc_mac_address: Some("14:18:77:aa:bb:cc".to_owned()),
+                server_name: Some("rack-1-server-2".to_owned()),
+            }
+        );
         Ok(())
     }
 
