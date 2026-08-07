@@ -160,6 +160,37 @@ impl OperationStore for MockServices {
     ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    fn create_batch<'a>(
+        &'a self,
+        _batch: &'a rutilus_domain::BatchOperation,
+        _children: &'a [Operation],
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        // The suites in this file never create batches; the operation
+        // submission path owns that boundary, so this stub is unreachable
+        // here.
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn find_batch(
+        &self,
+        _batch_id: rutilus_domain::BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_batches(
+        &self,
+    ) -> BoundaryFuture<'_, Result<Vec<rutilus_domain::BatchOperation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_batch_children(
+        &self,
+        _batch_id: rutilus_domain::BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
 }
 
 impl EndpointRefreshRepository for MockServices {

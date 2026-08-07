@@ -29,12 +29,12 @@ use rutilus_application::{
     TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
-    CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event, Operation, OperationId,
-    OperationSource, OperationState, OperationTarget, RedfishCommand, ResetType, ResourceSnapshot,
-    SeriesKey, SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
-    TlsCertificate, TlsTrust,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
+    Credential, CredentialId, CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint,
+    EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event,
+    Operation, OperationId, OperationSource, OperationState, OperationTarget, RedfishCommand,
+    ResetType, ResourceSnapshot, SeriesKey, SystemCommand, TargetId, TelemetrySample,
+    TelemetrySeries, TelemetrySeriesId, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{AuditEventQuery, WebProductInfo, router};
 use secrecy::SecretString;
@@ -46,6 +46,8 @@ use tower::ServiceExt as _;
 struct MockState {
     endpoints: Vec<Endpoint>,
     operations: HashMap<OperationId, Operation>,
+    batches: HashMap<BatchOperationId, BatchOperation>,
+    batch_children: HashMap<BatchOperationId, Vec<Operation>>,
 }
 
 /// Implements every application boundary behind the injected services bundle,
@@ -240,6 +242,80 @@ impl OperationStore for MockServices {
                 .filter(|operation| state_filter.is_none_or(|state| operation.state() == state))
                 .cloned()
                 .collect())
+        })
+    }
+
+    fn create_batch<'a>(
+        &'a self,
+        batch: &'a BatchOperation,
+        children: &'a [Operation],
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().map_err(|_| MockError::Lock)?;
+            // At-least-once delivery (§15.4): a re-delivered batch id is a
+            // no-op that never re-inserts the children.
+            if state.batches.contains_key(&batch.id()) {
+                return Ok(());
+            }
+            state.batches.insert(batch.id(), batch.clone());
+            for child in children {
+                state
+                    .operations
+                    .entry(child.id())
+                    .or_insert_with(|| child.clone());
+            }
+            state.batch_children.insert(batch.id(), children.to_vec());
+            Ok(())
+        })
+    }
+
+    fn find_batch(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .batches
+                .get(&batch_id)
+                .cloned())
+        })
+    }
+
+    fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
+        Box::pin(async move {
+            let mut batches = self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .batches
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            batches.sort_by_key(|batch| (batch.created_at(), batch.id()));
+            Ok(batches)
+        })
+    }
+
+    fn list_batch_children(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move {
+            let mut children = self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .batch_children
+                .get(&batch_id)
+                .cloned()
+                .unwrap_or_default();
+            // Target order (§13.7): each child carries exactly one target, so
+            // ordering by that target's identity is a total order.
+            children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+            Ok(children)
         })
     }
 }
@@ -652,6 +728,136 @@ async fn submits_an_operation_and_echoes_the_queued_projection() -> Result<(), B
             "the persisted target must bind the submitted endpoint"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn submits_a_batch_and_echoes_one_child_per_target() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let first = managed_endpoint()?;
+    let second = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(first.clone());
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(second.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+
+    let response = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "source": "site",
+            "targets": [first.id().to_string(), second.id().to_string()],
+            "command": { "System": { "Reset": "PowerCycle" } }
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    assert_eq!(
+        response.headers().get("cache-control"),
+        Some(&axum::http::HeaderValue::from_static(
+            "no-store, must-revalidate"
+        ))
+    );
+    let body = json_body(response).await?;
+    let batch_id = body["batch_id"]
+        .as_str()
+        .ok_or("batch submission must return a batch_id")?;
+    assert_eq!(body["source"], "site");
+    assert_eq!(
+        body["command"],
+        json!({ "System": { "Reset": "PowerCycle" } })
+    );
+    assert_eq!(body["created_at"], "1970-01-01T00:00:00Z");
+
+    // The acknowledgement pairs every submitted endpoint with one child
+    // operation id in the same order (§13.7), so the console can track each
+    // write through an ordinary operation record.
+    let targets = body["targets"]
+        .as_array()
+        .ok_or("batch submission must return targets")?;
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0], first.id().to_string());
+    assert_eq!(targets[1], second.id().to_string());
+    let children = body["child_operation_ids"]
+        .as_array()
+        .ok_or("batch submission must return child operation ids")?;
+    assert_eq!(children.len(), 2);
+
+    let state = state.lock().map_err(|_| MockError::Lock)?;
+    let stored_batch = state
+        .batches
+        .get(&batch_id.parse::<BatchOperationId>()?)
+        .ok_or("the submitted batch must be persisted")?;
+    assert_eq!(stored_batch.source(), OperationSource::Site);
+    // Every child is an ordinary single-target queued operation bound to its
+    // own endpoint — never one multi-target operation wearing both.
+    for (child_id, endpoint) in children.iter().zip([&first, &second]) {
+        let child_id = child_id
+            .as_str()
+            .ok_or("child operation id must be a string")?
+            .parse::<OperationId>()?;
+        let child = state
+            .operations
+            .get(&child_id)
+            .ok_or("the batch child must be persisted as an ordinary operation")?;
+        assert_eq!(child.state(), OperationState::Queued);
+        assert_eq!(child.targets().len(), 1);
+        assert_eq!(child.targets()[0].endpoint_id(), endpoint.id());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_over_limit_batch_without_persisting() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+    let targets = (0..=128)
+        .map(|_| {
+            // Managed endpoints are not required to reach the limit check: it
+            // fires before any endpoint lookup, exactly like the empty and
+            // duplicate checks.
+            EndpointId::generate().to_string()
+        })
+        .collect::<Vec<_>>();
+
+    let response = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": targets,
+            "command": { "System": { "Reset": "PowerCycle" } }
+        }),
+    )
+    .await?;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "an over-limit batch must be rejected"
+    );
+    let body = json_body(response).await?;
+    assert_eq!(
+        body["message"],
+        json!("a batch may target at most 128 endpoints")
+    );
+    assert_eq!(
+        state.lock().map_err(|_| MockError::Lock)?.operations.len(),
+        0,
+        "every rejected submission must leave the store untouched"
+    );
+    assert_eq!(
+        state.lock().map_err(|_| MockError::Lock)?.batches.len(),
+        0,
+        "every rejected submission must leave the store untouched"
+    );
     Ok(())
 }
 

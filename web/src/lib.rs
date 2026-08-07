@@ -18,11 +18,11 @@ use rutilus_api::{
     AboutResponse, AppendArtifactChunkRequest, ArtifactFinalizeFailureResponse,
     ArtifactListResponse, ArtifactProgressResponse, ArtifactResponse, ArtifactStateResponse,
     AssignTagRequest, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
-    AuditTargetResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
-    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
-    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
-    CoreResourceResponse, CoreResourceSourceResponse, CreateArtifactRequest,
-    CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
+    AuditTargetResponse, BatchOperationResponse, BeginEndpointTrustRequest,
+    CapabilityClassificationResponse, CapabilityEntryResponse, CapabilityStateResponse,
+    ConfirmEndpointTrustRequest, CoreResourceCommonResponse, CoreResourceCountsResponse,
+    CoreResourceDetailsResponse, CoreResourceResponse, CoreResourceSourceResponse,
+    CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
     CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
     EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
     EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
@@ -30,10 +30,10 @@ use rutilus_api::{
     EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
     ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
-    HealthResponse, MetricValueResponse, OperationListResponse, OperationResponse,
-    OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
-    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
+    HealthResponse, MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse,
+    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    OperationTargetResponse, ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse,
+    TagResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
     TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
     UiLocationResponse,
 };
@@ -59,12 +59,13 @@ use rutilus_application::{
     parse_endpoint_csv,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityClassification,
-    CapabilityState, CertificateFingerprintParseError, Credential, CredentialId, CredentialName,
-    CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName,
-    EndpointId, Event, Group, GroupId, GroupName, Operation, OperationId, OperationSource,
-    OperationState, OperationTarget, ResourceFeature, ResourceId, ResourceSnapshot, Tag, TagName,
-    TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation,
+    CapabilityClassification, CapabilityState, CertificateFingerprintParseError, Credential,
+    CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointDisplayName, EndpointId, Event, Group, GroupId, GroupName, Operation, OperationId,
+    OperationSource, OperationState, OperationTarget, ResourceFeature, ResourceId,
+    ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+    TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -963,13 +964,17 @@ where
     response
 }
 
-/// Converts one typed Redfish write into a persisted operation (§13.1) and
-/// returns its `Queued` projection.
+/// Converts one typed Redfish write into a persisted operation (§13.1) or
+/// batch (§13.7) and returns its acknowledgement.
 ///
 /// The request names target endpoints only; the application submission use
 /// case binds a fresh target identity to each endpoint, verifies that every
-/// endpoint is managed, and persists the operation with the submitted source
-/// (defaulting to `standalone`).
+/// endpoint is managed, and persists the write with the submitted source
+/// (defaulting to `standalone`). One target acknowledges an ordinary
+/// `OperationResponse`; several targets are a batch — one batch parent plus
+/// one ordinary single-target child operation per endpoint, all persisted
+/// atomically — and acknowledge a `BatchOperationResponse` carrying the
+/// batch id and the children's operation ids in the submitted order.
 async fn create_operation<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     Json(request): Json<CreateOperationRequest>,
@@ -999,30 +1004,63 @@ where
         .collect();
     let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
     let now = state.clock.now();
-    match submission
-        .submit(source, targets, request.command().clone(), now)
-        .await
-    {
-        Ok(operation) => json_created(Json(project_operation(&operation))),
-        Err(SubmissionError::EmptyTargets) => json_error(
+    if request.targets().len() > 1 {
+        match submission
+            .submit_batch(source, targets, request.command().clone(), now)
+            .await
+        {
+            Ok((batch, children)) => json_created(Json(project_batch(&batch, &children))),
+            Err(error) => submission_error_response(&error),
+        }
+    } else {
+        match submission
+            .submit(source, targets, request.command().clone(), now)
+            .await
+        {
+            Ok(operation) => json_created(Json(project_operation(&operation))),
+            Err(error) => submission_error_response(&error),
+        }
+    }
+}
+
+/// Maps one submission failure onto the HTTP contract shared by the
+/// single-operation and batch submission paths.
+fn submission_error_response<StoreError, LookupError>(
+    error: &SubmissionError<StoreError, LookupError>,
+) -> Response
+where
+    StoreError: Error + 'static,
+    LookupError: Error + 'static,
+{
+    match error {
+        SubmissionError::EmptyTargets => json_error(
             StatusCode::BAD_REQUEST,
             "an operation must target at least one endpoint".to_owned(),
         ),
-        Err(SubmissionError::DuplicateEndpoint { endpoint_id }) => json_error(
+        SubmissionError::TooManyTargets { limit } => json_error(
+            StatusCode::BAD_REQUEST,
+            format!("a batch may target at most {limit} endpoints"),
+        ),
+        SubmissionError::MultipleTargets => json_error(
+            StatusCode::BAD_REQUEST,
+            "an operation must target exactly one endpoint; submit multiple endpoints as a batch"
+                .to_owned(),
+        ),
+        SubmissionError::DuplicateEndpoint { endpoint_id } => json_error(
             StatusCode::BAD_REQUEST,
             format!("operation targets endpoint {endpoint_id} more than once"),
         ),
         // A body-referenced endpoint that does not exist is unprocessable,
         // exactly like the enrollment path's missing-credential verdict.
-        Err(SubmissionError::UnknownEndpoint { endpoint_id }) => json_error(
+        SubmissionError::UnknownEndpoint { endpoint_id } => json_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("target endpoint {endpoint_id} is not a managed endpoint"),
         ),
-        Err(SubmissionError::Inventory(_)) => json_error(
+        SubmissionError::Inventory(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the target endpoints could not be checked".to_owned(),
         ),
-        Err(SubmissionError::Store(_)) => json_error(
+        SubmissionError::Store(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "operation persistence failed".to_owned(),
         ),
@@ -1053,6 +1091,8 @@ where
         }
         Err(
             SubmissionError::EmptyTargets
+            | SubmissionError::TooManyTargets { .. }
+            | SubmissionError::MultipleTargets
             | SubmissionError::DuplicateEndpoint { .. }
             | SubmissionError::UnknownEndpoint { .. },
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1085,6 +1125,8 @@ where
         // the store boundary is reachable here.
         Err(
             SubmissionError::EmptyTargets
+            | SubmissionError::TooManyTargets { .. }
+            | SubmissionError::MultipleTargets
             | SubmissionError::DuplicateEndpoint { .. }
             | SubmissionError::UnknownEndpoint { .. }
             | SubmissionError::Inventory(_),
@@ -1372,6 +1414,33 @@ fn project_operation(operation: &Operation) -> OperationResponse {
     )
 }
 
+/// Projects one batch parent with its children onto the wire
+/// acknowledgement (§13.7).
+///
+/// The engine constructs the children in submission order (the same order
+/// the submitted endpoints were bound to their targets), so the submitted
+/// endpoint ids and the child operation ids align positionally:
+/// `targets[i]` is the endpoint `child_operation_ids[i]` was created for.
+/// (The store boundary's own `list_batch_children` read orders by target
+/// identity instead; this projection is the immediate submission
+/// acknowledgement, which must echo submission order.)
+fn project_batch(batch: &BatchOperation, children: &[Operation]) -> BatchOperationResponse {
+    BatchOperationResponse::new(
+        batch.id().into_uuid(),
+        project_operation_source(batch.source()),
+        batch.command(),
+        children
+            .iter()
+            .map(|child| child.targets()[0].endpoint_id().into_uuid())
+            .collect(),
+        children
+            .iter()
+            .map(|child| child.id().into_uuid())
+            .collect(),
+        batch.created_at(),
+    )
+}
+
 fn project_operation_target(target: &OperationTarget) -> OperationTargetResponse {
     OperationTargetResponse::new(
         target.target_id().into_uuid(),
@@ -1512,9 +1581,9 @@ fn project_enrollment(
             // Network, Accounts, Bios, BootOptions, SecureBoot, the
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, the OemDell / OemSmcSysLockdown / OemSmcKcsInterface
-            // §11.5 OEM families, the PcieDevices/Assembly/SoftwareInventory
-            // read families, and the
+            // surface, the OemDell / OemSmcSysLockdown / OemSmcKcsInterface /
+            // OemNvidiaSystemConfigProfile §11.5 OEM families, the
+            // PcieDevices/Assembly/SoftwareInventory read families, and the
             // EventService/EventSubscription/TelemetryService/
             // MetricDefinition/MetricReport/TaskService/Task service
             // families) intentionally stay out of the three-field enrollment
@@ -1540,6 +1609,7 @@ fn project_enrollment(
             | ResourceFeature::OemDell
             | ResourceFeature::OemSmcSysLockdown
             | ResourceFeature::OemSmcKcsInterface
+            | ResourceFeature::OemNvidiaSystemConfigProfile
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
@@ -2346,6 +2416,18 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::OemSmcKcsInterface { .. } => {
             project_oem_smc_kcs_interface_details(details)
         }
+        CoreResourceDetails::OemNvidiaSystemConfigProfile { .. } => {
+            project_oem_nvidia_system_config_profile_details(details)
+        }
+        CoreResourceDetails::OemNvidiaSystemConfigProfileStatus { .. } => {
+            project_oem_nvidia_system_config_profile_status_details(details)
+        }
+        CoreResourceDetails::OemNvidiaSystemProfile { .. } => {
+            project_oem_nvidia_system_profile_details(details)
+        }
+        CoreResourceDetails::OemNvidiaSystemProfileFile { .. } => {
+            project_oem_nvidia_system_profile_file_details(details)
+        }
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
@@ -2607,6 +2689,136 @@ fn project_oem_smc_kcs_interface_details(
     };
     CoreResourceDetailsResponse::OemSmcKcsInterface {
         privilege: privilege.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA system-config-profile chain root into the
+/// shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaSystemConfigProfile`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_system_config_profile_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaSystemConfigProfile { truststore } = details else {
+        return CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { truststore: None };
+    };
+    CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile {
+        truststore: truststore.as_ref().map(|truststore| {
+            OemNvidiaSystemConfigProfileTruststoreResponse::new(
+                truststore.nvidia_certificates(),
+                truststore.oem_certificates(),
+            )
+        }),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `SystemConfigProfileStatus` chain document into
+/// the shared wire contract.
+///
+/// The dispatcher guarantees this receives the
+/// `OemNvidiaSystemConfigProfileStatus` variant; the fallback keeps a stable
+/// empty projection instead of panicking if that contract is ever violated.
+fn project_oem_nvidia_system_config_profile_status_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaSystemConfigProfileStatus {
+        pending_list_activation,
+        active_profile_index,
+        bmc_profile_version,
+        factory_reset_status,
+        default_profile_index,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus {
+            pending_list_activation: None,
+            active_profile_index: None,
+            bmc_profile_version: None,
+            factory_reset_status: None,
+            default_profile_index: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus {
+        pending_list_activation: pending_list_activation.clone(),
+        active_profile_index: *active_profile_index,
+        bmc_profile_version: *bmc_profile_version,
+        factory_reset_status: factory_reset_status.clone(),
+        default_profile_index: *default_profile_index,
+    }
+}
+
+/// Projects the §11.5 NVIDIA `SystemProfile` chain member into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaSystemProfile`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_system_profile_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaSystemProfile {
+        default,
+        owner,
+        uuid,
+        version,
+        profile_name,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaSystemProfile {
+            default: None,
+            owner: None,
+            uuid: None,
+            version: None,
+            profile_name: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaSystemProfile {
+        default: *default,
+        owner: owner.clone(),
+        uuid: uuid.clone(),
+        version: *version,
+        profile_name: profile_name.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `SystemProfileFile` chain document into the
+/// shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaSystemProfileFile`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_system_profile_file_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaSystemProfileFile {
+        metadata_activate,
+        metadata_delete,
+        metadata_origin_profile_uuid,
+        metadata_more_profiles,
+        metadata_project_name,
+        metadata_uuid,
+        profile,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaSystemProfileFile {
+            metadata_activate: None,
+            metadata_delete: None,
+            metadata_origin_profile_uuid: None,
+            metadata_more_profiles: None,
+            metadata_project_name: None,
+            metadata_uuid: None,
+            profile: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaSystemProfileFile {
+        metadata_activate: *metadata_activate,
+        metadata_delete: *metadata_delete,
+        metadata_origin_profile_uuid: metadata_origin_profile_uuid.clone(),
+        metadata_more_profiles: *metadata_more_profiles,
+        metadata_project_name: metadata_project_name.clone(),
+        metadata_uuid: metadata_uuid.clone(),
+        profile: profile.clone(),
     }
 }
 
@@ -3834,6 +4046,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_oem_nvidia_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = oem_nvidia_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 5);
+        // The inventory orders snapshots by `@odata.id`, so the service root
+        // sorts before the chain documents, and within the chain the profile
+        // collection members sort before the status singleton (`Profiles` <
+        // `Status`).
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        assert_eq!(
+            resources[1]["resource"]["resource_type"],
+            "oem_nvidia_system_config_profile"
+        );
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        );
+        assert_eq!(
+            resources[1]["common"]["name"],
+            "NVIDIA System Config Profile"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["truststore"]["nvidia_certificates"],
+            true
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["truststore"]["oem_certificates"],
+            false
+        );
+        assert_eq!(
+            resources[2]["resource"]["resource_type"],
+            "oem_nvidia_system_profile"
+        );
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+        );
+        assert_eq!(resources[2]["resource"]["details"]["owner"], "Nvidia");
+        assert_eq!(resources[2]["resource"]["details"]["version"], 1);
+        assert_eq!(
+            resources[3]["resource"]["resource_type"],
+            "oem_nvidia_system_profile_file"
+        );
+        assert_eq!(
+            resources[3]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["metadata_origin_profile_uuid"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(
+            resources[3]["resource"]["details"]["profile"],
+            "eyJwcm9maWxlIjogInRlc3QifQ=="
+        );
+        assert_eq!(
+            resources[4]["resource"]["resource_type"],
+            "oem_nvidia_system_config_profile_status"
+        );
+        assert_eq!(
+            resources[4]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["pending_list_activation"],
+            "profile-1"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["active_profile_index"],
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_storage_network_and_ethernet_typed_resources() -> Result<(), Box<dyn Error>> {
         let item = storage_network_inventory_item()?;
         let endpoint_id = item.endpoint().id();
@@ -4676,6 +4975,88 @@ mod tests {
         )?)
     }
 
+    fn oem_nvidia_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("NVIDIA OEM BMC")?,
+            EndpointAddress::parse("https://192.0.2.40")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![40])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        // The whole NVIDIA system-config-profile chain shares the one family
+        // code; each snapshot payload carries its `DocumentType`
+        // discriminator so the application boundary routes the snapshot to
+        // the right details shape.
+        let chain_root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+            r#"{"Id":"SystemConfigProfile","Name":"NVIDIA System Config Profile","Description":"Profile service","DocumentType":"system_config_profile","Truststore":{"NvidiaCertificates":true,"OemCertificates":false}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaSystemConfigProfile.NvidiaSystemConfigProfile",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-scp-1\"")?);
+        let status = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+            r#"{"Id":"Status","Name":"System Config Profile Status","Description":"Profile service status","DocumentType":"system_config_profile_status","PendingList":{"Activation":"profile-1"},"ActiveProfileIndex":1,"BmcProfileVersion":2,"FactoryResetStatus":"Idle","DefaultProfileIndex":1}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaSystemConfigProfileStatus.NvidiaSystemConfigProfileStatus",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-scp-status-1\"")?);
+        let profile = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+            r#"{"Id":"1","Name":"Default Profile","Description":"Factory default profile","DocumentType":"system_profile","Default":true,"Owner":"Nvidia","UUID":"11111111-2222-3333-4444-555555555555","Version":1,"ProfileName":"default-profile"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaSystemProfile.NvidiaSystemProfile",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-profile-1\"")?);
+        let profile_file = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+            r#"{"Id":"ProfileFile","Name":"Profile File","Description":"Signed profile file","DocumentType":"system_profile_file","ProfileFile":{"Metadata":{"Activate":true,"Delete":false,"OriginProfileUUID":"11111111-2222-3333-4444-555555555555","More_Profiles":false,"ProjectName":"BlueField","UUID":"11111111-2222-3333-4444-555555555555"},"Profile":"eyJwcm9maWxlIjogInRlc3QifQ=="}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaSystemProfileFile.NvidiaSystemProfileFile",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-profile-file-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, chain_root, profile, profile_file, status],
+        )?)
+    }
+
     fn storage_network_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
         let created_at = OffsetDateTime::UNIX_EPOCH;
         let observed_at = created_at + Duration::SECOND;
@@ -5392,6 +5773,32 @@ mod tests {
         fn list_operations(
             &self,
             _state: Option<OperationState>,
+        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn create_batch<'a>(
+            &'a self,
+            _batch: &'a BatchOperation,
+            _children: &'a [Operation],
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn find_batch(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
+        ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
+        fn list_batch_children(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
         ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
         }
