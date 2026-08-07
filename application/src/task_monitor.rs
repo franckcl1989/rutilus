@@ -884,7 +884,9 @@ mod tests {
         EndpointId, OperationId, OperationSource, OperationState, OperationTarget, RedfishCommand,
         ResetType, SystemCommand, TargetId,
     };
-    use rutilus_operation_engine::BoundaryFuture as OperationBoundaryFuture;
+    use rutilus_operation_engine::{
+        BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild,
+    };
     use time::{Duration, OffsetDateTime};
 
     use crate::BoundaryFuture;
@@ -1151,10 +1153,20 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
+        fn record_failure_kind(
+            &self,
+            _operation_id: OperationId,
+            _kind: rutilus_domain::FailureKind,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            // The monitor never classifies failures; the executor's refusal
+            // path owns that write, so this stub is unreachable here.
+            Box::pin(async move { Ok(()) })
+        }
+
         fn list_batch_children(
             &self,
             _batch_id: rutilus_domain::BatchOperationId,
-        ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
             // The monitor never lists batch children; batch reporting owns
             // that projection, so this stub is unreachable here.
             Box::pin(async move { Ok(Vec::new()) })

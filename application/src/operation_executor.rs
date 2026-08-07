@@ -39,8 +39,9 @@ use rutilus_domain::{
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOperationId,
     AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
     CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
-    EventCommand, ManagerCommand, Operation, OperationEvent, OperationId, OperationState,
-    ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand, UpdateCommand,
+    EventCommand, FailureKind, ManagerCommand, Operation, OperationEvent, OperationId,
+    OperationState, ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand,
+    UpdateCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
@@ -75,6 +76,28 @@ type ExecutorErrorOf<Store, Gateway, Audit> = ExecutorError<
     <Gateway as CommandVerifier>::Error,
     <Audit as AuditEventWriter>::Error,
 >;
+
+/// The §13.3 step-2 capability pre-flight verdict (§13.7).
+///
+/// The verdict splits the refusal by provability: a provably unsupported
+/// capability is classified `capability-unsupported` before the `Failed`
+/// transition (so batch reporting buckets it as `unsupported` instead of an
+/// ordinary failure), while an unconfirmed capability is a plain provable
+/// refusal with no classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilityPreflight {
+    /// The required capability is observed `Supported`: the write may
+    /// dispatch.
+    Usable,
+    /// The required capability is provably unsupported — not compiled, not
+    /// advertised, schema-incompatible, or read-only (§13.3 step 2). The
+    /// refusal is classified `capability-unsupported` before it is recorded.
+    Unsupported,
+    /// The required capability cannot be confirmed but is not provably
+    /// unsupported — unauthorized, temporarily unavailable, or never
+    /// observed. The refusal is recorded without a classification.
+    Unconfirmed,
+}
 
 /// Drives one persisted operation through the execution flow.
 ///
@@ -193,6 +216,9 @@ where
     /// Note that a failed dispatch or verification still persists the
     /// operation's honest terminal state before the error is returned, so a
     /// caller that sees an error can re-read the operation for its outcome.
+    // The flow spans the full §13.3 pre-flight and dispatch sequence, so the
+    // line count is the coverage, not a signal.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_operation(
         &self,
         operation_id: OperationId,
@@ -239,15 +265,44 @@ where
                 )
                 .await;
         }
-        if !self.capability_usable(&command, endpoint_id).await? {
-            return self
-                .refuse(
-                    &engine,
-                    operation_id,
-                    &started,
-                    AuditFailure::RedfishDiscoveryFailed,
-                )
-                .await;
+        match self.capability_preflight(&command, endpoint_id).await? {
+            // The required capability is observed `Supported`: the write may
+            // dispatch.
+            CapabilityPreflight::Usable => {}
+            // The capability is provably unsupported (§13.7): the refusal is
+            // classified before the `Failed` transition, so batch reporting
+            // can bucket it as `unsupported` instead of an ordinary failure.
+            // The kind write and the transition are two store writes; a crash
+            // between them leaves an orphaned kind on a non-terminal row,
+            // which reporting never reads (the kind buckets only `Failed`
+            // children) and which the next transition overwrites or leaves
+            // inert — the window is harmless by design.
+            CapabilityPreflight::Unsupported => {
+                self.store
+                    .record_failure_kind(operation_id, FailureKind::CapabilityUnsupported)
+                    .await
+                    .map_err(ExecutorError::Store)?;
+                return self
+                    .refuse(
+                        &engine,
+                        operation_id,
+                        &started,
+                        AuditFailure::RedfishDiscoveryFailed,
+                    )
+                    .await;
+            }
+            // The capability cannot be confirmed but is not provably
+            // unsupported: a plain provable refusal, never classified.
+            CapabilityPreflight::Unconfirmed => {
+                return self
+                    .refuse(
+                        &engine,
+                        operation_id,
+                        &started,
+                        AuditFailure::RedfishDiscoveryFailed,
+                    )
+                    .await;
+            }
         }
 
         // §13.3 step 4 (first cut, Update only): the referenced artifact must
@@ -588,32 +643,44 @@ where
     /// The ledger merge is delegated to [`EndpointCapabilityQuery`] — the
     /// existing, already-tested capability projection — and this module adds
     /// only the command-to-capability mapping and the write-usable decision.
-    /// Only [`CapabilityState::Supported`] passes: `ReadOnly` advertises a
-    /// read-only surface (a write would be refused by the BMC), and every
-    /// other state — unauthorized, temporarily unavailable,
-    /// schema-incompatible, not advertised, not compiled, or not yet observed
-    /// — means the product cannot confirm the capability, so dispatching
-    /// would be unaccountable. A pre-flight refusal is provable — nothing
-    /// has been dispatched — and is therefore recorded `Failed`, never
-    /// `Unknown` (design section 13.5).
+    /// Only [`CapabilityState::Supported`] passes. The refusal verdicts split
+    /// by provability (§13.7): `NotCompiled`, `NotAdvertised`,
+    /// `SchemaIncompatible`, and `ReadOnly` prove the capability itself
+    /// cannot serve the write — the endpoint-side limitation is the reason,
+    /// classified `capability-unsupported`; `Unauthorized`,
+    /// `TemporarilyUnavailable`, and a never-observed capability do not
+    /// prove the capability unusable (the endpoint may simply not have been
+    /// probed or authorized yet), so those refusals stay unclassified
+    /// ordinary failures. Either way the pre-flight refusal is provable —
+    /// nothing has been dispatched — and is therefore recorded `Failed`,
+    /// never `Unknown` (design section 13.5).
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::CapabilityPreflight`] when the ledger query
     /// fails.
-    async fn capability_usable(
+    async fn capability_preflight(
         &self,
         command: &RedfishCommand,
         endpoint_id: EndpointId,
-    ) -> Result<bool, ExecutorErrorOf<Store, Gateway, Audit>> {
+    ) -> Result<CapabilityPreflight, ExecutorErrorOf<Store, Gateway, Audit>> {
         let required = required_capability(command);
         let entries = EndpointCapabilityQuery::new(&self.store, endpoint_id)
             .execute()
             .await
             .map_err(ExecutorError::CapabilityPreflight)?;
-        Ok(entries
-            .and_then(|entries| required_capability_state(required, &entries))
-            .is_some_and(|state| state == CapabilityState::Supported))
+        let state = entries.and_then(|entries| required_capability_state(required, &entries));
+        Ok(match state {
+            Some(CapabilityState::Supported) => CapabilityPreflight::Usable,
+            Some(
+                CapabilityState::NotCompiled
+                | CapabilityState::NotAdvertised
+                | CapabilityState::SchemaIncompatible
+                | CapabilityState::ReadOnly,
+            ) => CapabilityPreflight::Unsupported,
+            Some(CapabilityState::Unauthorized | CapabilityState::TemporarilyUnavailable)
+            | None => CapabilityPreflight::Unconfirmed,
+        })
     }
 
     /// Records a provable pre-flight refusal: one `Failed` transition and the
@@ -1469,7 +1536,7 @@ pub enum ExecutorError<
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         error::Error,
         fmt,
         sync::{Arc, Mutex},
@@ -1486,7 +1553,7 @@ mod tests {
         TlsTrust, UpdateCommand,
     };
     use rutilus_operation_engine::{
-        BoundaryFuture as OperationBoundaryFuture, RemoteTaskState, TaskUri,
+        BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
     };
     use time::Duration;
 
@@ -1647,6 +1714,7 @@ mod tests {
         Create(OperationId),
         Find(OperationId),
         ApplyTransition(OperationId, OperationState),
+        RecordFailureKind(OperationId),
         FindEndpoint(EndpointId),
         FindCapabilities(EndpointId),
         FindArtifact(ArtifactId),
@@ -1655,7 +1723,7 @@ mod tests {
 
     /// The single failure mode armed for the next matching store call.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum FailureKind {
+    enum MockStoreFailure {
         Read,
         Write,
         EndpointLookup,
@@ -1684,7 +1752,10 @@ mod tests {
         endpoint: Option<Endpoint>,
         capabilities: Vec<StoredCapability>,
         calls: Mutex<Vec<Call>>,
-        fail_once: Mutex<Option<FailureKind>>,
+        // The kind value itself is a zero-sized type (the vocabulary has one
+        // variant), so the record is the set of classified operations.
+        classified: Mutex<HashSet<OperationId>>,
+        fail_once: Mutex<Option<MockStoreFailure>>,
         find_calls: Mutex<usize>,
         find_race: Mutex<Option<(usize, OperationState)>>,
     }
@@ -1700,6 +1771,7 @@ mod tests {
                 endpoint,
                 capabilities,
                 calls: Mutex::new(Vec::new()),
+                classified: Mutex::new(HashSet::new()),
                 fail_once: Mutex::new(None),
                 find_calls: Mutex::new(0),
                 find_race: Mutex::new(None),
@@ -1759,9 +1831,17 @@ mod tests {
         }
 
         /// Arms exactly one failure for the next call of `kind`.
-        fn arm_failure(&self, kind: FailureKind) -> Result<(), MockError> {
+        fn arm_failure(&self, kind: MockStoreFailure) -> Result<(), MockError> {
             *self.fail_once.lock().map_err(|_| MockError::Events)? = Some(kind);
             Ok(())
+        }
+
+        /// The operations that received a failure classification.
+        fn recorded_failure_kinds(&self) -> Result<HashSet<OperationId>, MockError> {
+            self.classified
+                .lock()
+                .map(|classified| classified.clone())
+                .map_err(|_| MockError::Events)
         }
 
         /// Arms a transition race: the `n`-th `find_operation` read
@@ -1814,7 +1894,7 @@ mod tests {
         }
 
         /// Consumes the armed failure when it matches `kind`.
-        fn consume_failure(&self, kind: FailureKind) -> Result<bool, MockError> {
+        fn consume_failure(&self, kind: MockStoreFailure) -> Result<bool, MockError> {
             let mut slot = self.fail_once.lock().map_err(|_| MockError::Events)?;
             if *slot == Some(kind) {
                 *slot = None;
@@ -1850,7 +1930,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::Find(operation_id));
-                if self.consume_failure(FailureKind::Read)? {
+                if self.consume_failure(MockStoreFailure::Read)? {
                     return Err(MockError::Store);
                 }
                 let mut find_count = self.find_calls.lock().map_err(|_| MockError::Events)?;
@@ -1899,7 +1979,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::ApplyTransition(operation_id, new_state));
-                if self.consume_failure(FailureKind::Write)? {
+                if self.consume_failure(MockStoreFailure::Write)? {
                     return Err(MockError::Store);
                 }
                 let mut rows = self.rows.lock().map_err(|_| MockError::Events)?;
@@ -1918,6 +1998,31 @@ mod tests {
                     occurred_at,
                 )
                 .map_err(|_| MockError::Store)?;
+                Ok(())
+            })
+        }
+
+        fn record_failure_kind(
+            &self,
+            operation_id: OperationId,
+            kind: rutilus_domain::FailureKind,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(Call::RecordFailureKind(operation_id));
+                if self.consume_failure(MockStoreFailure::Write)? {
+                    return Err(MockError::Store);
+                }
+                // The vocabulary has one variant, so the record is the set of
+                // classified operations; `kind` stays in the signature to pin
+                // the boundary contract.
+                let _ = kind;
+                self.classified
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .insert(operation_id);
                 Ok(())
             })
         }
@@ -1961,7 +2066,7 @@ mod tests {
         fn list_batch_children(
             &self,
             _batch_id: rutilus_domain::BatchOperationId,
-        ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
             // The executor never lists batch children; batch reporting owns
             // that projection, so this stub is unreachable here.
             Box::pin(async move { Ok(Vec::new()) })
@@ -1980,7 +2085,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::FindEndpoint(endpoint_id));
-                if self.consume_failure(FailureKind::EndpointLookup)? {
+                if self.consume_failure(MockStoreFailure::EndpointLookup)? {
                     return Err(MockError::Repository);
                 }
                 Ok(self.endpoint.clone())
@@ -2012,7 +2117,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::FindCapabilities(endpoint_id));
-                if self.consume_failure(FailureKind::CapabilityLookup)? {
+                if self.consume_failure(MockStoreFailure::CapabilityLookup)? {
                     return Err(MockError::Capability);
                 }
                 if self.endpoint.is_none() {
@@ -2044,7 +2149,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::FindArtifact(artifact_id));
-                if self.consume_failure(FailureKind::ArtifactLookup)? {
+                if self.consume_failure(MockStoreFailure::ArtifactLookup)? {
                     return Err(MockError::Artifact);
                 }
                 self.artifacts
@@ -2095,7 +2200,7 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(Call::SaveRemoteTask(task.operation_id()));
-                if self.consume_failure(FailureKind::RemoteTaskWrite)? {
+                if self.consume_failure(MockStoreFailure::RemoteTaskWrite)? {
                     return Err(MockError::RemoteTaskStore);
                 }
                 self.remote_tasks
@@ -2669,7 +2774,7 @@ mod tests {
             Some(endpoint(endpoint_id)?),
             supported_update_service_capability(),
         );
-        store.arm_failure(FailureKind::ArtifactLookup)?;
+        store.arm_failure(MockStoreFailure::ArtifactLookup)?;
         let operation = queued_update_operation(endpoint_id, ArtifactId::generate(), None);
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(
@@ -2961,7 +3066,8 @@ mod tests {
     async fn read_only_capability_refuses_before_any_dispatch() -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         // ReadOnly advertises a read-only surface: a write must not be
-        // dispatched against it, and the refusal is provable.
+        // dispatched against it, the refusal is provable, and the capability
+        // itself is provably unsupported, so the failure is classified.
         let store = FakeStore::new(
             Some(endpoint(endpoint_id)?),
             vec![StoredCapability::new(
@@ -2988,6 +3094,26 @@ mod tests {
             applied_states(&store.recorded_calls()?),
             [OperationState::Failed]
         );
+        // The classification is written before the Failed transition, so a
+        // crash between the two writes can only orphan a kind on a
+        // non-terminal row — never lose a recorded refusal.
+        let calls = store.recorded_calls()?;
+        let kind_call = calls
+            .iter()
+            .position(|call| *call == Call::RecordFailureKind(operation.id()))
+            .ok_or("the capability refusal must record its failure kind")?;
+        let failed_call = calls
+            .iter()
+            .position(|call| *call == Call::ApplyTransition(operation.id(), OperationState::Failed))
+            .ok_or("the capability refusal must persist the Failed transition")?;
+        assert!(
+            kind_call < failed_call,
+            "the failure kind must be written before the Failed transition"
+        );
+        assert_eq!(
+            store.recorded_failure_kinds()?,
+            HashSet::from([operation.id()])
+        );
         assert_eq!(gateway.recorded_calls()?.len(), 0);
         let events = audit.recorded_events()?;
         assert_eq!(events.len(), 2);
@@ -2999,6 +3125,177 @@ mod tests {
             events[1].outcome().verification(),
             Some(AuditVerification::Rejected)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provably_unsupported_capabilities_are_classified_before_the_refusal()
+    -> Result<(), Box<dyn Error>> {
+        // Every capability state that proves the capability itself cannot
+        // serve the write is classified `capability-unsupported` (§13.7).
+        for state in [
+            CapabilityState::NotCompiled,
+            CapabilityState::NotAdvertised,
+            CapabilityState::SchemaIncompatible,
+        ] {
+            let endpoint_id = EndpointId::generate();
+            let store = FakeStore::new(
+                Some(endpoint(endpoint_id)?),
+                vec![StoredCapability::new(
+                    EndpointCapabilityObservation::new(EndpointCapability::Systems, state),
+                    created_at(),
+                )],
+            );
+            let operation = queued_operation(endpoint_id);
+            store.insert(operation.clone())?;
+            let gateway = FakeGateway::new(
+                Ok(CommandOutcome::Accepted),
+                Ok(VerificationVerdict::Confirmed),
+            );
+            let audit = MockAudit::succeed();
+            let executor = executor(&store, &gateway, &audit);
+
+            let finished = executor.execute_operation(operation.id()).await?;
+
+            assert_eq!(
+                finished.state(),
+                OperationState::Failed,
+                "a {state} capability must refuse the write"
+            );
+            assert_eq!(
+                store.recorded_failure_kinds()?,
+                HashSet::from([operation.id()]),
+                "a {state} capability must classify the refusal as unsupported"
+            );
+            assert_eq!(
+                applied_states(&store.recorded_calls()?),
+                [OperationState::Failed]
+            );
+            assert_eq!(gateway.recorded_calls()?.len(), 0);
+            assert_eq!(
+                audit.recorded_events()?[1].outcome().verification(),
+                Some(AuditVerification::Rejected)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_capabilities_refuse_without_a_classification() -> Result<(), Box<dyn Error>>
+    {
+        // An unauthorized, temporarily unavailable, or never-observed
+        // capability does not prove the capability unusable — the endpoint
+        // may simply not have been probed or authorized yet — so the refusal
+        // is an ordinary failure with no kind (§13.7).
+        let unobserved_endpoint_id = EndpointId::generate();
+        let unobserved = FakeStore::new(Some(endpoint(unobserved_endpoint_id)?), Vec::new());
+        let unobserved_operation = queued_operation(unobserved_endpoint_id);
+        unobserved.insert(unobserved_operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let unobserved_executor = executor(&unobserved, &gateway, &audit);
+        let finished = unobserved_executor
+            .execute_operation(unobserved_operation.id())
+            .await?;
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert!(
+            unobserved.recorded_failure_kinds()?.is_empty(),
+            "an unobserved capability must never be classified"
+        );
+        assert_eq!(gateway.recorded_calls()?.len(), 0);
+
+        for state in [
+            CapabilityState::Unauthorized,
+            CapabilityState::TemporarilyUnavailable,
+        ] {
+            let endpoint_id = EndpointId::generate();
+            let store = FakeStore::new(
+                Some(endpoint(endpoint_id)?),
+                vec![StoredCapability::new(
+                    EndpointCapabilityObservation::new(EndpointCapability::Systems, state),
+                    created_at(),
+                )],
+            );
+            let operation = queued_operation(endpoint_id);
+            store.insert(operation.clone())?;
+            let gateway = FakeGateway::new(
+                Ok(CommandOutcome::Accepted),
+                Ok(VerificationVerdict::Confirmed),
+            );
+            let audit = MockAudit::succeed();
+            let executor = executor(&store, &gateway, &audit);
+
+            let finished = executor.execute_operation(operation.id()).await?;
+
+            assert_eq!(
+                finished.state(),
+                OperationState::Failed,
+                "a {state} capability must refuse the write"
+            );
+            assert!(
+                store.recorded_failure_kinds()?.is_empty(),
+                "a {state} capability must never be classified"
+            );
+            assert_eq!(
+                applied_states(&store.recorded_calls()?),
+                [OperationState::Failed]
+            );
+            assert_eq!(gateway.recorded_calls()?.len(), 0);
+            assert_eq!(
+                audit.recorded_events()?[1].outcome().verification(),
+                Some(AuditVerification::Rejected)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_write_failure_propagates_without_persisting_the_refusal()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            vec![StoredCapability::new(
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::Systems,
+                    CapabilityState::ReadOnly,
+                ),
+                created_at(),
+            )],
+        );
+        // The armed write failure hits the record_failure_kind call, not the
+        // transition: the classification is written first, and a failure
+        // there must abort the refusal cleanly — the operation stays queued
+        // and unclassified rather than half-refused.
+        store.arm_failure(MockStoreFailure::Write)?;
+        let operation = queued_operation(endpoint_id);
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.execute_operation(operation.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::Store(MockError::Store))
+        ));
+        assert_eq!(
+            applied_states(&store.recorded_calls()?).len(),
+            0,
+            "a failed classification write must not persist the refusal"
+        );
+        assert!(
+            store.recorded_failure_kinds()?.is_empty(),
+            "a failed classification write must not record a kind"
+        );
+        assert_eq!(gateway.recorded_calls()?.len(), 0);
         Ok(())
     }
 
@@ -3037,7 +3334,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
-        store.arm_failure(FailureKind::EndpointLookup)?;
+        store.arm_failure(MockStoreFailure::EndpointLookup)?;
         let operation = queued_operation(endpoint_id);
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(
@@ -3070,7 +3367,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
-        store.arm_failure(FailureKind::CapabilityLookup)?;
+        store.arm_failure(MockStoreFailure::CapabilityLookup)?;
         let operation = queued_operation(endpoint_id);
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(
@@ -3111,7 +3408,7 @@ mod tests {
     async fn store_read_failure_propagates_with_source_chain() -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
-        store.arm_failure(FailureKind::Read)?;
+        store.arm_failure(MockStoreFailure::Read)?;
         let operation = queued_operation(endpoint_id);
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(
@@ -4225,7 +4522,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
-        store.arm_failure(FailureKind::RemoteTaskWrite)?;
+        store.arm_failure(MockStoreFailure::RemoteTaskWrite)?;
         let operation = queued_operation(endpoint_id);
         store.insert(operation.clone())?;
         let gateway = FakeGateway::new(

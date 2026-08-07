@@ -259,6 +259,116 @@ pub enum CoreResourceDetails {
         metadata_uuid: Option<String>,
         profile: Option<String>,
     },
+    /// One §0.5.0 NVIDIA power-compliance chain member: the chain-root
+    /// `NvidiaPowerComplianceManager` document of the `Manager`'s
+    /// `Oem.Nvidia` segment, read through the compiled
+    /// `oem-nvidia-power-management` surface (§11.5). The whole chain — this
+    /// document, its `PowerDomains` collection members, the `ACLossPolicy` /
+    /// `PSUCompliancePolicy` singletons, the `ManagedEntityGroups` collection
+    /// members, the `PowerStateGroup` document with its
+    /// `PowerShelfControllers` / `PowerSupplies` collection members, and the
+    /// `PSURedundancy` singleton — shares the single family code
+    /// `nvidia-power-compliance`, because the chain root decides whether the
+    /// chain exists at all. The details are the compiled `ManagerType` enum
+    /// spelling (e.g. `PowerManager`), verbatim per §12.3.
+    OemNvidiaPowerCompliance { manager_type: Option<String> },
+    /// One §0.5.0 NVIDIA power-compliance chain member: one `NvidiaPowerDomain`
+    /// member of the compliance manager's `PowerDomains` collection. The
+    /// details are the compiled scalar fields: the numeric `Value`, the
+    /// `Type` / `Unit` enumerations, and the `SensorReadingType` /
+    /// `SensorImpl` sensor enumerations, each verbatim per §12.3.
+    OemNvidiaPowerDomain {
+        value: Option<i64>,
+        r#type: Option<String>,
+        unit: Option<String>,
+        sensor_reading_type: Option<String>,
+        sensor_impl: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: the `ACLossPolicy`
+    /// or `PSUCompliancePolicy` singleton (one variant for both, they share
+    /// the compiled `NvidiaPowerPolicy` schema). The details are the compiled
+    /// scalar fields: the `AutoDeassertPowerBrake` boolean, the numeric
+    /// `Min` / `Max` thresholds, the `Type` / `Unit` enumerations, and the
+    /// `PolicyActions` enumeration, each verbatim per §12.3. The `DwellTime`
+    /// duration stays out of the strictly projectable field set.
+    OemNvidiaPowerPolicy {
+        auto_deassert_power_brake: Option<bool>,
+        min: Option<i64>,
+        max: Option<i64>,
+        r#type: Option<String>,
+        unit: Option<String>,
+        policy_actions: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: one
+    /// `NvidiaManagedEntityGroup` member of the compliance manager's
+    /// `ManagedEntityGroups` collection. The details are the compiled
+    /// `CurrentManagedEntityId` text; the group's `ManagedEntities`
+    /// navigation belongs to the managed-entity family.
+    OemNvidiaManagedEntityGroup {
+        current_managed_entity_id: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: the
+    /// `NvidiaPowerStateGroup` document. The details are the compiled scalar
+    /// fields: the `PscId` text and the numeric `GeneratedWatts` /
+    /// `NumberOfPscs` / `NumberOfLocalPsus`; the `PowerShelfControllers` /
+    /// `PowerSupplies` collection members are their own chain documents and
+    /// their own variants.
+    OemNvidiaPowerStateGroup {
+        psc_id: Option<String>,
+        generated_watts: Option<i64>,
+        number_of_pscs: Option<i64>,
+        number_of_local_psus: Option<i64>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: one `NvidiaPscState`
+    /// member of the power state group's `PowerShelfControllers` collection.
+    /// The details are the compiled scalar fields: the `PscId` text, the
+    /// numeric `NumOfOperationalPsus` / `MillisecondsSinceLastHeartbeat`,
+    /// the `PowerBrakeAssert` boolean, and the `Status` enumeration, each
+    /// verbatim per §12.3.
+    OemNvidiaPscState {
+        psc_id: Option<String>,
+        num_of_operational_psus: Option<i64>,
+        power_brake_assert: Option<bool>,
+        milliseconds_since_last_heartbeat: Option<i64>,
+        status: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: one `NvidiaPsuState`
+    /// member of the power state group's `PowerSupplies` collection. The
+    /// details are the compiled scalar fields: the `PsuId` text and the
+    /// `Presence` / `Input1Active` / `Input2Active` booleans, each verbatim
+    /// per §12.3.
+    OemNvidiaPsuState {
+        psu_id: Option<String>,
+        presence: Option<bool>,
+        input1active: Option<bool>,
+        input2active: Option<bool>,
+    },
+    /// One §0.5.0 NVIDIA power-compliance chain member: the
+    /// `NvidiaPsuRedundancy` document. The details are the compiled scalar
+    /// fields: the `MaxNumSupported` / `MinNumNeeded` texts and the
+    /// `RedundancySetting` enumeration, each verbatim per §12.3.
+    OemNvidiaPsuRedundancy {
+        max_num_supported: Option<String>,
+        min_num_needed: Option<String>,
+        redundancy_setting: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA managed-entity chain member: one
+    /// `NvidiaManagedEntity` member of a group member's `ManagedEntities`
+    /// collection, read through the compiled `oem-nvidia-power-management`
+    /// surface (§11.5). The chain — the `ManagedEntityGroups` collection
+    /// behind the compliance manager's `ManagedEntityGroups` navigation (the
+    /// chain's entry, whose presence decides whether the chain exists at
+    /// all) and each entity member — shares the single family code
+    /// `nvidia-managed-entity`. The details are the compiled scalar fields:
+    /// the `TransportProtocol` enumeration, the `IPv4Address` /
+    /// `IPv6Address` address texts, and the numeric `Port`, each verbatim
+    /// per §12.3.
+    OemNvidiaManagedEntity {
+        transport_protocol: Option<String>,
+        ipv4_address: Option<String>,
+        ipv6_address: Option<String>,
+        port: Option<i64>,
+    },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -688,6 +798,12 @@ where
         ResourceFeature::OemNvidiaSystemConfigProfile => {
             project_oem_nvidia_system_config_profile(snapshot, payload)?
         }
+        ResourceFeature::OemNvidiaPowerCompliance => {
+            project_oem_nvidia_power_compliance(snapshot, payload)?
+        }
+        ResourceFeature::OemNvidiaManagedEntity => {
+            project_oem_nvidia_managed_entity(snapshot, payload)?
+        }
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
@@ -1005,6 +1121,167 @@ where
                     metadata_project_name: project_name,
                     metadata_uuid: uuid,
                     profile,
+                },
+            ))
+        }
+    }
+}
+
+// The router projects the eight chain document kinds of the one
+// power-compliance family code in one place; the eight arms exceed the
+// pedantic line budget, so the lint is scoped to this router exactly like
+// the system-config-profile router.
+#[allow(clippy::too_many_lines)]
+fn project_oem_nvidia_power_compliance<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    let envelope = deserialize_payload::<OemNvidiaPowerComplianceEnvelope, RepositoryError>(
+        snapshot, payload,
+    )?;
+    match envelope.document_type {
+        OemNvidiaPowerComplianceDocument::PowerComplianceManager => {
+            let parsed = deserialize_payload::<OemNvidiaPowerCompliancePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPowerCompliance {
+                    manager_type: parsed.manager_type,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PowerDomain => {
+            let parsed = deserialize_payload::<OemNvidiaPowerDomainPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPowerDomain {
+                    value: parsed.value,
+                    r#type: parsed.r#type,
+                    unit: parsed.unit,
+                    sensor_reading_type: parsed.sensor_reading_type,
+                    sensor_impl: parsed.sensor_impl,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PowerPolicy => {
+            let parsed = deserialize_payload::<OemNvidiaPowerPolicyPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPowerPolicy {
+                    auto_deassert_power_brake: parsed.auto_deassert_power_brake,
+                    min: parsed.min,
+                    max: parsed.max,
+                    r#type: parsed.r#type,
+                    unit: parsed.unit,
+                    policy_actions: parsed.policy_actions,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::ManagedEntityGroup => {
+            let parsed = deserialize_payload::<OemNvidiaManagedEntityGroupPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaManagedEntityGroup {
+                    current_managed_entity_id: parsed.current_managed_entity_id,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PowerStateGroup => {
+            let parsed = deserialize_payload::<OemNvidiaPowerStateGroupPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPowerStateGroup {
+                    psc_id: parsed.psc_id,
+                    generated_watts: parsed.generated_watts,
+                    number_of_pscs: parsed.number_of_pscs,
+                    number_of_local_psus: parsed.number_of_local_psus,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PscState => {
+            let parsed = deserialize_payload::<OemNvidiaPscStatePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPscState {
+                    psc_id: parsed.psc_id,
+                    num_of_operational_psus: parsed.num_of_operational_psus,
+                    power_brake_assert: parsed.power_brake_assert,
+                    milliseconds_since_last_heartbeat: parsed.milliseconds_since_last_heartbeat,
+                    status: parsed.status,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PsuState => {
+            let parsed = deserialize_payload::<OemNvidiaPsuStatePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPsuState {
+                    psu_id: parsed.psu_id,
+                    presence: parsed.presence,
+                    input1active: parsed.input1active,
+                    input2active: parsed.input2active,
+                },
+            ))
+        }
+        OemNvidiaPowerComplianceDocument::PsuRedundancy => {
+            let parsed = deserialize_payload::<OemNvidiaPsuRedundancyPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaPsuRedundancy {
+                    max_num_supported: parsed.max_num_supported,
+                    min_num_needed: parsed.min_num_needed,
+                    redundancy_setting: parsed.redundancy_setting,
+                },
+            ))
+        }
+    }
+}
+
+fn project_oem_nvidia_managed_entity<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    let envelope =
+        deserialize_payload::<OemNvidiaManagedEntityEnvelope, RepositoryError>(snapshot, payload)?;
+    match envelope.document_type {
+        OemNvidiaManagedEntityDocument::ManagedEntity => {
+            let parsed = deserialize_payload::<OemNvidiaManagedEntityPayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaManagedEntity {
+                    transport_protocol: parsed.transport_protocol,
+                    ipv4_address: parsed.ipv4_address,
+                    ipv6_address: parsed.ipv6_address,
+                    port: parsed.port,
                 },
             ))
         }
@@ -2080,6 +2357,397 @@ struct OemNvidiaSystemProfileFileMetadataPayload {
     project_name: Option<String>,
     #[serde(rename = "UUID")]
     uuid: Option<String>,
+}
+
+/// The chain document kinds of the §0.5.0 NVIDIA power-compliance family,
+/// written into every chain snapshot payload by the infra projection (which
+/// knows the compiled decode target) and consumed here to route the one
+/// family code to the right details shape. The wire spellings are the
+/// `snake_case` type names, matching the infra's serialization.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[allow(clippy::enum_variant_names)]
+#[serde(rename_all = "snake_case")]
+enum OemNvidiaPowerComplianceDocument {
+    PowerComplianceManager,
+    PowerDomain,
+    PowerPolicy,
+    ManagedEntityGroup,
+    PowerStateGroup,
+    PscState,
+    PsuState,
+    PsuRedundancy,
+}
+
+/// The chain document kinds of the §0.5.0 NVIDIA managed-entity family:
+/// exactly one compiled decode target carries the chain, so the discriminator
+/// has a single arm (kept as an enum so the routing envelope stays uniform).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OemNvidiaManagedEntityDocument {
+    ManagedEntity,
+}
+
+/// The routing envelope of one power-compliance chain snapshot: only the
+/// `DocumentType` discriminator, deliberately lenient (no
+/// `deny_unknown_fields`) because the kind-specific payload fields follow in
+/// the same document and each kind payload is decoded strictly afterwards.
+#[derive(Deserialize)]
+struct OemNvidiaPowerComplianceEnvelope {
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+}
+
+/// The routing envelope of one managed-entity chain snapshot.
+#[derive(Deserialize)]
+struct OemNvidiaManagedEntityEnvelope {
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaManagedEntityDocument,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerComplianceManager` chain-root snapshot
+/// payload, decoded exactly as the infra projection wrote it: the common
+/// identity fields plus the `ManagerType` enumeration spelling.
+/// `deny_unknown_fields` keeps the snapshot contract strict, so a future
+/// extra wire field would make stored snapshots unreadable exactly like an
+/// extra top-level key would. The common fields are optional with an
+/// `@odata.id`-derived fallback, so an odd snapshot without them stays
+/// projectable.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPowerCompliancePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "ManagerType")]
+    manager_type: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPowerCompliancePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerDomain` snapshot payload, decoded exactly
+/// as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPowerDomainPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "Value")]
+    value: Option<i64>,
+    #[serde(rename = "Type")]
+    r#type: Option<String>,
+    #[serde(rename = "Unit")]
+    unit: Option<String>,
+    #[serde(rename = "SensorReadingType")]
+    sensor_reading_type: Option<String>,
+    #[serde(rename = "SensorImpl")]
+    sensor_impl: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPowerDomainPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerPolicy` snapshot payload, decoded exactly
+/// as the infra projection wrote it (shared by the `ACLossPolicy` and
+/// `PSUCompliancePolicy` singletons).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPowerPolicyPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "AutoDeassertPowerBrake")]
+    auto_deassert_power_brake: Option<bool>,
+    #[serde(rename = "Min")]
+    min: Option<i64>,
+    #[serde(rename = "Max")]
+    max: Option<i64>,
+    #[serde(rename = "Type")]
+    r#type: Option<String>,
+    #[serde(rename = "Unit")]
+    unit: Option<String>,
+    #[serde(rename = "PolicyActions")]
+    policy_actions: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPowerPolicyPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaManagedEntityGroup` snapshot payload, decoded
+/// exactly as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaManagedEntityGroupPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "CurrentManagedEntityId")]
+    current_managed_entity_id: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaManagedEntityGroupPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerStateGroup` snapshot payload, decoded
+/// exactly as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPowerStateGroupPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "PscId")]
+    psc_id: Option<String>,
+    #[serde(rename = "GeneratedWatts")]
+    generated_watts: Option<i64>,
+    #[serde(rename = "NumberOfPscs")]
+    number_of_pscs: Option<i64>,
+    #[serde(rename = "NumberOfLocalPsus")]
+    number_of_local_psus: Option<i64>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPowerStateGroupPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPscState` snapshot payload, decoded exactly as
+/// the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPscStatePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "PscId")]
+    psc_id: Option<String>,
+    #[serde(rename = "NumOfOperationalPsus")]
+    num_of_operational_psus: Option<i64>,
+    #[serde(rename = "PowerBrakeAssert")]
+    power_brake_assert: Option<bool>,
+    #[serde(rename = "MillisecondsSinceLastHeartbeat")]
+    milliseconds_since_last_heartbeat: Option<i64>,
+    #[serde(rename = "Status")]
+    status: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPscStatePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPsuState` snapshot payload, decoded exactly as
+/// the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPsuStatePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "PsuId")]
+    psu_id: Option<String>,
+    #[serde(rename = "Presence")]
+    presence: Option<bool>,
+    #[serde(rename = "Input1Active")]
+    input1active: Option<bool>,
+    #[serde(rename = "Input2Active")]
+    input2active: Option<bool>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPsuStatePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPsuRedundancy` snapshot payload, decoded exactly
+/// as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaPsuRedundancyPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaPowerComplianceDocument,
+    #[serde(rename = "MaxNumSupported")]
+    max_num_supported: Option<String>,
+    #[serde(rename = "MinNumNeeded")]
+    min_num_needed: Option<String>,
+    #[serde(rename = "RedundancySetting")]
+    redundancy_setting: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaPsuRedundancyPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `NvidiaManagedEntity` snapshot payload, decoded exactly
+/// as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaManagedEntityPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaManagedEntityDocument,
+    #[serde(rename = "TransportProtocol")]
+    transport_protocol: Option<String>,
+    #[serde(rename = "IPv4Address")]
+    ipv4_address: Option<String>,
+    #[serde(rename = "IPv6Address")]
+    ipv6_address: Option<String>,
+    #[serde(rename = "Port")]
+    port: Option<i64>,
+}
+
+impl NvidiaCommonFields for OemNvidiaManagedEntityPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 }
 
 #[derive(Deserialize)]

@@ -281,7 +281,7 @@ mod tests {
         EndpointDisplayName, OperationState, OperationTarget, ResourceSnapshot, TargetId,
         TlsCertificate, TlsTrust,
     };
-    use rutilus_operation_engine::{BoundaryFuture, MAX_BATCH_TARGETS};
+    use rutilus_operation_engine::{BoundaryFuture, ClassifiedBatchChild, MAX_BATCH_TARGETS};
     use thiserror::Error as ThisError;
     use time::{Duration, OffsetDateTime};
 
@@ -407,6 +407,16 @@ mod tests {
             })
         }
 
+        fn record_failure_kind(
+            &self,
+            _operation_id: OperationId,
+            _kind: rutilus_domain::FailureKind,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            // The submission paths never classify failures; the executor's
+            // refusal path owns that write, so this stub is unreachable here.
+            Box::pin(async move { Ok(()) })
+        }
+
         fn list_operations(
             &self,
             state: Option<OperationState>,
@@ -475,8 +485,16 @@ mod tests {
         fn list_batch_children(
             &self,
             batch_id: BatchOperationId,
-        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
-            Box::pin(async move { self.list_batch_children_owned(batch_id) })
+        ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+            // The submission paths never classify failures, so every child
+            // reads back unclassified.
+            Box::pin(async move {
+                Ok(self
+                    .list_batch_children_owned(batch_id)?
+                    .into_iter()
+                    .map(|child| (child, None))
+                    .collect())
+            })
         }
     }
 

@@ -2,6 +2,7 @@
 
 mod artifact_store;
 mod audit_log;
+mod batch_query;
 mod capability_query;
 mod command_executor;
 mod credential_management;
@@ -28,6 +29,7 @@ pub use artifact_store::{
     ArtifactStoreError,
 };
 pub use audit_log::{AuditEventWriter, AuditRecordError};
+pub use batch_query::{BatchDetail, BatchQuery, BatchQueryError, BatchSummary};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
@@ -103,4 +105,4 @@ pub use update_executor::{UpdateArtifactPayload, UpdateExecutor};
 /// engine so the Web crate can aggregate it into its product-services bundle
 /// without a direct engine dependency; the application use cases compose the
 /// same trait behind this facade.
-pub use rutilus_operation_engine::OperationStore;
+pub use rutilus_operation_engine::{ClassifiedBatchChild, OperationStore};
