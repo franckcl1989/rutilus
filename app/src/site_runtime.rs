@@ -4,14 +4,13 @@
 //! The Site reuses the Standalone runtime's instance and drain structure and
 //! differs only in its listener: an explicitly requested address, HTTPS with
 //! a rustls configuration narrowed to TLS 1.3, and no plaintext HTTP
-//! fallback. The 0.6.0 acceptance "非 HTTPS 不允许远程登录" is enforced at
-//! startup: a non-loopback listen address without TLS material is a hard
-//! configuration error, never a degraded plaintext service.
-//!
-//! When no certificate is supplied, the Site generates a self-signed
-//! certificate whose SAN covers the requested listen host, persists the pair
-//! below `tls/` (private key mode 0600), and prints the certificate
-//! fingerprint at startup.
+//! fallback off loopback. The 0.6.0 acceptance "非 HTTPS 不允许远程登录" is
+//! enforced at startup: every non-loopback listen serves HTTPS — with the
+//! CLI-provided pair, the pair persisted below `tls/`, or, when neither
+//! exists, a freshly generated self-signed certificate whose SAN covers the
+//! requested listen host (private key persisted mode 0600). The certificate
+//! fingerprint is printed at startup for out-of-band verification, and only
+//! a loopback listen without any TLS material is served plaintext.
 
 use std::{
     fmt,
@@ -555,6 +554,45 @@ fn fingerprint(cert: &CertificateDer<'_>) -> String {
         .join(":")
 }
 
+/// Acquires the Site TLS material in three tiers: the CLI-provided pair,
+/// the pair persisted below `tls/` (reused so the service keeps its identity
+/// across restarts), or a fresh self-signed pair covering the listen host.
+/// Generation is reserved for a non-loopback listen; a loopback listen
+/// without any material is served plaintext (`None`).
+///
+/// # Errors
+///
+/// Returns [`SiteTlsError`] when any tier fails: unreadable or invalid PEM
+/// material, a certificate/key mismatch, generation failure, or persistence
+/// failure.
+fn acquire_tls(
+    paths: &RuntimePaths,
+    listen: &ListenAddress,
+    address: SocketAddr,
+    provided: Option<(&Path, &Path)>,
+) -> Result<Option<SiteTls>, SiteTlsError> {
+    if provided.is_some() || !address.ip().is_loopback() || persisted_pair_exists(paths) {
+        // Explicit material, or a non-loopback listen (which must be HTTPS),
+        // or an already persisted pair: HTTPS material is expected, and a
+        // missing pair is generated and persisted.
+        SiteTls::load_or_generate(paths, listen, provided).map(Some)
+    } else {
+        // A loopback listen without any TLS material: the loopback
+        // plaintext posture.
+        Ok(None)
+    }
+}
+
+/// Whether both halves of a previously generated pair exist below `tls/`.
+///
+/// Both files must be present: a half-written or broken pair must not count
+/// as a full pair (which would otherwise trigger generation for a loopback
+/// listen).
+fn persisted_pair_exists(paths: &RuntimePaths) -> bool {
+    paths.tls_directory().join("cert.pem").is_file()
+        && paths.tls_directory().join("key.pem").is_file()
+}
+
 /// The Site listener: the requested address served over TLS (or loopback
 /// plaintext, which `bind` refuses off loopback).
 #[derive(Debug)]
@@ -567,12 +605,21 @@ pub struct SiteBinding {
 impl SiteBinding {
     /// Binds the Site listener and enforces the HTTPS policy.
     ///
+    /// The TLS material is acquired before the policy decision: the
+    /// CLI-provided pair, the pair persisted below `tls/`, or — for a
+    /// non-loopback listen — a freshly generated self-signed pair. Every
+    /// non-loopback listen therefore serves HTTPS (the 0.6.0 acceptance
+    /// "非 HTTPS 不允许远程登录"), with the certificate fingerprint printed
+    /// at startup for out-of-band verification; only a loopback listen
+    /// without any TLS material serves plaintext.
+    ///
     /// # Errors
     ///
-    /// Returns [`SiteRunError::Config`] for a non-loopback address without
-    /// TLS material (the 0.6.0 hard error), [`SiteRunError::Bind`] or
-    /// [`SiteRunError::LocalAddress`] for socket failures, and
-    /// [`SiteRunError::Tls`] when the TLS material cannot be prepared.
+    /// Returns [`SiteRunError::Config`] when a non-loopback listen ends up
+    /// without TLS material (the fail-closed fallback),
+    /// [`SiteRunError::Bind`] or [`SiteRunError::LocalAddress`] for socket
+    /// failures, and [`SiteRunError::Tls`] when the TLS material cannot be
+    /// prepared.
     pub async fn bind(
         paths: &RuntimePaths,
         options: &SiteRunOptions,
@@ -581,17 +628,21 @@ impl SiteBinding {
             .await
             .map_err(SiteRunError::Bind)?;
         let address = listener.local_addr().map_err(SiteRunError::LocalAddress)?;
-        let tls = match listener_policy(address, options.cert.is_some())? {
-            ListenerPolicy::Https => Some(
-                SiteTls::load_or_generate(
-                    paths,
-                    &options.listen,
-                    options.cert.as_deref().zip(options.key.as_deref()),
-                )
-                .map_err(SiteRunError::Tls)?,
-            ),
-            ListenerPolicy::LoopbackPlaintext => None,
-        };
+        let tls = acquire_tls(
+            paths,
+            &options.listen,
+            address,
+            options.cert.as_deref().zip(options.key.as_deref()),
+        )
+        .map_err(SiteRunError::Tls)?;
+        // The policy is decided on the acquired material rather than on
+        // whether the CLI supplied a certificate, so a non-loopback listen
+        // always ends up HTTPS (self-signed material is generated when
+        // absent). Reaching the error arm means a non-loopback listen ended
+        // up without TLS material — the fail-closed fallback.
+        match listener_policy(address, tls.is_some())? {
+            ListenerPolicy::Https | ListenerPolicy::LoopbackPlaintext => {}
+        }
         Ok(Self {
             listener,
             tls,
@@ -1028,6 +1079,111 @@ mod tests {
         // A second boot reuses the persisted identity.
         let second = SiteTls::load_or_generate(&paths, &listen, None)?;
         assert_eq!(first.fingerprint(), second.fingerprint());
+        Ok(())
+    }
+
+    /// Probes one free port on the given host and returns it.
+    async fn free_port(host: Ipv4Addr) -> io::Result<u16> {
+        let listener = TcpListener::bind((host, 0)).await?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        Ok(port)
+    }
+
+    /// The production-reachable end-to-end path: a non-loopback listen
+    /// without CLI material generates and persists a self-signed pair and
+    /// serves HTTPS, and a later boot reuses the persisted identity.
+    #[tokio::test]
+    async fn non_loopback_bind_generates_persists_and_reuses_self_signed(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let first_port = free_port(Ipv4Addr::UNSPECIFIED).await?;
+        let first_listen = parse_listen(&format!("0.0.0.0:{first_port}"))?;
+        let first =
+            SiteBinding::bind(&paths, &SiteRunOptions::new(first_listen, None, None)?).await?;
+        assert_eq!(first.url(), format!("https://0.0.0.0:{first_port}/"));
+        let first_tls = first
+            .tls
+            .ok_or_else(|| io::Error::other("the non-loopback bind generated a self-signed pair"))?;
+        assert_eq!(first_tls.fingerprint().split(':').count(), 32);
+        assert!(paths.tls_directory().join("cert.pem").is_file());
+        assert!(paths.tls_directory().join("key.pem").is_file());
+
+        // A second boot on a fresh port reuses the persisted identity.
+        let second_port = free_port(Ipv4Addr::UNSPECIFIED).await?;
+        let second_listen = parse_listen(&format!("0.0.0.0:{second_port}"))?;
+        let second =
+            SiteBinding::bind(&paths, &SiteRunOptions::new(second_listen, None, None)?).await?;
+        let second_tls = second
+            .tls
+            .ok_or_else(|| io::Error::other("the second boot reused the persisted pair"))?;
+        assert_eq!(first_tls.fingerprint(), second_tls.fingerprint());
+        Ok(())
+    }
+
+    /// A loopback listen without any TLS material is the plaintext posture,
+    /// and no certificate pair is generated for it.
+    #[tokio::test]
+    async fn loopback_bind_without_material_is_plaintext_and_generates_nothing(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let port = free_port(Ipv4Addr::LOCALHOST).await?;
+        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
+        let binding = SiteBinding::bind(&paths, &SiteRunOptions::new(listen, None, None)?).await?;
+        assert!(binding.tls.is_none());
+        assert_eq!(binding.url(), format!("http://127.0.0.1:{port}/"));
+        assert!(!paths.tls_directory().join("cert.pem").is_file());
+        assert!(!paths.tls_directory().join("key.pem").is_file());
+        Ok(())
+    }
+
+    /// A loopback listen still reuses a pair persisted below `tls/` (the
+    /// persisted tier precedes the loopback plaintext posture).
+    #[tokio::test]
+    async fn loopback_bind_reuses_a_persisted_pair() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let seed_listen = parse_listen("127.0.0.1:8443")?;
+        let seeded = SiteTls::load_or_generate(&paths, &seed_listen, None)?;
+
+        let port = free_port(Ipv4Addr::LOCALHOST).await?;
+        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
+        let binding = SiteBinding::bind(&paths, &SiteRunOptions::new(listen, None, None)?).await?;
+        assert_eq!(binding.url(), format!("https://127.0.0.1:{port}/"));
+        let tls = binding
+            .tls
+            .ok_or_else(|| io::Error::other("the persisted pair is reused on loopback"))?;
+        assert_eq!(tls.fingerprint(), seeded.fingerprint());
+        Ok(())
+    }
+
+    /// An explicitly provided pair is served over HTTPS even on loopback.
+    #[tokio::test]
+    async fn explicitly_provided_pair_serves_https_even_on_loopback() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        // Seed a pair, then copy it to explicit CLI-style paths.
+        let seed_listen = parse_listen("127.0.0.1:8443")?;
+        let seeded = SiteTls::load_or_generate(&paths, &seed_listen, None)?;
+        let cert_path = directory.path().join("explicit-cert.pem");
+        let key_path = directory.path().join("explicit-key.pem");
+        std::fs::copy(paths.tls_directory().join("cert.pem"), &cert_path)?;
+        std::fs::copy(paths.tls_directory().join("key.pem"), &key_path)?;
+
+        let port = free_port(Ipv4Addr::LOCALHOST).await?;
+        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
+        let binding = SiteBinding::bind(
+            &paths,
+            &SiteRunOptions::new(listen, Some(cert_path), Some(key_path))?,
+        )
+        .await?;
+        assert_eq!(binding.url(), format!("https://127.0.0.1:{port}/"));
+        let tls = binding
+            .tls
+            .ok_or_else(|| io::Error::other("the provided pair is served"))?;
+        assert_eq!(tls.fingerprint(), seeded.fingerprint());
         Ok(())
     }
 
