@@ -47,12 +47,55 @@ use nv_redfish::{
     // decoded through these schemas, never a raw JSON read (§11.5 two-way
     // rule).
     oem::nvidia::schema::nvidia_computer_system::NvidiaComputerSystem as NvidiaComputerSystemSchema,
+    // The §0.5.0 NVIDIA manager chains navigate from the `Manager`'s
+    // `Oem.Nvidia` segment: the versioned `NvidiaManager.v1_9_0` module
+    // carries the `PowerCompliance` navigation (the decode target must be
+    // this navigation-carrying versioned struct — decoding into an
+    // unversioned shape would silently drop the navigation), into the
+    // `NvidiaPowerComplianceManager` document, and from there into the
+    // power-compliance and managed-entity sub-chains.
+    oem::nvidia::schema::nvidia_managed_entity::NvidiaManagedEntity as NvidiaManagedEntitySchema,
+    oem::nvidia::schema::nvidia_managed_entity_collection::NvidiaManagedEntityCollection as NvidiaManagedEntityCollectionSchema,
+    oem::nvidia::schema::nvidia_managed_entity_group::NvidiaManagedEntityGroup as NvidiaManagedEntityGroupSchema,
+    oem::nvidia::schema::nvidia_managed_entity_group_collection::NvidiaManagedEntityGroupCollection as NvidiaManagedEntityGroupCollectionSchema,
+    oem::nvidia::schema::nvidia_manager::v1_9_0::NvidiaManager as NvidiaManagerSegmentSchema,
+    oem::nvidia::schema::nvidia_power_compliance_manager::{
+        NvidiaManagerType as NvidiaPowerComplianceManagerType,
+        NvidiaPowerComplianceManager as NvidiaPowerComplianceManagerSchema,
+    },
+    oem::nvidia::schema::nvidia_power_domain::{
+        ComparisonType as NvidiaPowerDomainComparisonType,
+        NvidiaPowerDomain as NvidiaPowerDomainSchema, UnitType as NvidiaPowerDomainUnitType,
+    },
+    oem::nvidia::schema::nvidia_power_domain_collection::NvidiaPowerDomainCollection as NvidiaPowerDomainCollectionSchema,
+    oem::nvidia::schema::nvidia_power_policy::{
+        ActionType as NvidiaPowerPolicyActionType,
+        ComparisonType as NvidiaPowerPolicyComparisonType,
+        NvidiaPowerPolicy as NvidiaPowerPolicySchema, UnitType as NvidiaPowerPolicyUnitType,
+    },
+    oem::nvidia::schema::nvidia_power_state_group::NvidiaPowerStateGroup as NvidiaPowerStateGroupSchema,
+    oem::nvidia::schema::nvidia_psc_state::{
+        NvidiaPscState as NvidiaPscStateSchema, StatusType as NvidiaPscStateStatusType,
+    },
+    oem::nvidia::schema::nvidia_psc_state_collection::NvidiaPscStateCollection as NvidiaPscStateCollectionSchema,
+    oem::nvidia::schema::nvidia_psu_redundancy::{
+        NvidiaPsuRedundancy as NvidiaPsuRedundancySchema, RedundancyType as NvidiaPsuRedundancyType,
+    },
+    oem::nvidia::schema::nvidia_psu_state::NvidiaPsuState as NvidiaPsuStateSchema,
+    oem::nvidia::schema::nvidia_psu_state_collection::NvidiaPsuStateCollection as NvidiaPsuStateCollectionSchema,
     oem::nvidia::schema::nvidia_system_config_profile::NvidiaSystemConfigProfile as NvidiaSystemConfigProfileSchema,
     oem::nvidia::schema::nvidia_system_config_profile_status::NvidiaSystemConfigProfileStatus as NvidiaSystemConfigProfileStatusSchema,
     oem::nvidia::schema::nvidia_system_profile::NvidiaSystemProfile as NvidiaSystemProfileSchema,
     oem::nvidia::schema::nvidia_system_profile_collection::NvidiaSystemProfileCollection as NvidiaSystemProfileCollectionSchema,
     oem::nvidia::schema::nvidia_system_profile_file::NvidiaSystemProfileFile as NvidiaSystemProfileFileSchema,
+    // The generated NVIDIA module tree carries its own copies of the
+    // `protocol` and `sensor` modules (exactly like the base schema's
+    // re-export), so the enum types the NVIDIA documents reference come from
+    // this tree, never from the base `schema` module.
+    oem::nvidia::schema::protocol::Protocol as NvidiaProtocolSchema,
     oem::nvidia::schema::resource::Resource as NvidiaResourceSchema,
+    oem::nvidia::schema::sensor::ImplementationType as NvidiaSensorImplementationType,
+    oem::nvidia::schema::sensor::ReadingType as NvidiaSensorReadingType,
     // The Supermicro OEM feature compiles its own generated module tree
     // (`oem::supermicro::schema`) exactly like the Dell feature: the
     // `smc_manager_extensions` schema models the manager's embedded
@@ -1464,6 +1507,7 @@ async fn read_manager_resources(
         );
         resources.extend(read_manager_dell_attributes(&manager, bmc, identity, trust).await?);
         resources.extend(read_manager_supermicro_oem(&manager, bmc, identity, trust).await?);
+        resources.extend(read_manager_nvidia_oem(&manager, bmc, identity, trust).await?);
     }
     Ok(resources)
 }
@@ -1585,6 +1629,437 @@ async fn read_manager_supermicro_oem(
         )
         .await?,
     );
+    Ok(resources)
+}
+
+/// Reads one manager's NVIDIA power-compliance and managed-entity chains
+/// (§11.5).
+///
+/// Both families enter through the manager's `Oem.Nvidia` segment and share
+/// the physical path to the `NvidiaPowerComplianceManager` document: the
+/// segment's `PowerCompliance` navigation is decoded once and the compliance
+/// document is fetched once, then the two families diverge at the compliance
+/// document's sub-navigations. The power-compliance family (one family = one
+/// entry navigation chain, the `power_compliance` navigation) covers the
+/// compliance document itself plus the `PowerDomains` collection members,
+/// the `ACLossPolicy` / `PSUCompliancePolicy` singletons, the
+/// `ManagedEntityGroups` collection members, the `PowerStateGroup` document
+/// with its `PowerShelfControllers` and `PowerSupplies` collection members,
+/// and the `PSURedundancy` singleton. The managed-entity family (its entry
+/// navigation is the `managed_entity_groups` chain, whose presence decides
+/// whether the family exists) reuses the fetched group documents and follows
+/// each group member's `ManagedEntities` navigation into the
+/// `NvidiaManagedEntity` members.
+///
+/// # The segment decode
+///
+/// The segment value is vendor-shaped until the discrimination decodes it.
+/// A `Manager` segment decodes into the compiled
+/// `nvidia_manager::v1_9_0::NvidiaManager` type — the versioned module that
+/// carries the `PowerCompliance` navigation. The decode target must be this
+/// navigation-carrying versioned struct: serde tolerates unknown keys, so
+/// decoding into an unversioned shape would silently drop the navigation.
+///
+/// A `BlueField` may inline only a partially expanded stub of the segment —
+/// the value then has the `{"@odata.id": ...}` reference shape — so the
+/// segment is fetched through that reference before decoding, exactly like
+/// the system-config-profile chain. The reference is not a compiled
+/// navigation property, so the fetch goes through a local typed decode
+/// target (the compiled `NvidiaManager` type implements no `EntityTypeRef`),
+/// never a raw JSON read (§11.5 two-way rule).
+///
+/// # Absence and failure semantics
+///
+/// A manager without `Oem.Nvidia`, or with a segment that cannot be
+/// discriminated or decoded, produces no snapshot and no fabricated request,
+/// and leaves `read_manager_resources`'s other families untouched (zero
+/// behavior change). Every chain fetch failure — the compliance document,
+/// each sub-collection document, and each member — follows the member-level
+/// skip semantics (`skip_member_failure`), because the chain root decides
+/// whether the chain exists and one odd chain surface must not erase the
+/// readable remainder; a failed projection skips the member through
+/// `member_projection`.
+async fn read_manager_nvidia_oem(
+    manager: &ManagerSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nvidia) = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Nvidia"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(power_compliance) =
+        decode_nvidia_manager_navigation(nvidia, bmc, identity, trust).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let power_compliance =
+        NavProperty::<NvidiaPowerComplianceManagerSchema>::new_reference(power_compliance);
+    let Some(compliance) = fetch_member(&power_compliance, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    // The power-compliance family: the chain-root document first, then its
+    // sub-chains in the compiled navigation order.
+    if let Some(projection) =
+        member_projection(nvidia_power_compliance_manager_projection(&compliance))?
+    {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_nvidia_power_domain_collection(
+            compliance.power_domains.as_ref(),
+            bmc,
+            identity,
+            trust,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_singleton_resources(
+            compliance.ac_loss_policy.as_ref(),
+            bmc,
+            identity,
+            trust,
+            nvidia_power_policy_projection,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_singleton_resources(
+            compliance.psu_compliance_policy.as_ref(),
+            bmc,
+            identity,
+            trust,
+            nvidia_power_policy_projection,
+        )
+        .await?,
+    );
+    // The managed entity groups chain is shared between the two families:
+    // the group documents land in the power-compliance family and their
+    // `ManagedEntities` members in the managed-entity family.
+    resources.extend(
+        read_nvidia_managed_entity_groups(
+            compliance.managed_entity_groups.as_ref(),
+            bmc,
+            identity,
+            trust,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_nvidia_power_state_group(compliance.power_state_group.as_ref(), bmc, identity, trust)
+            .await?,
+    );
+    resources.extend(
+        read_singleton_resources(
+            compliance.psu_redundancy.as_ref(),
+            bmc,
+            identity,
+            trust,
+            nvidia_psu_redundancy_projection,
+        )
+        .await?,
+    );
+    Ok(resources)
+}
+
+/// Decodes one `Oem.Nvidia` segment value into the chain-entry
+/// `PowerCompliance` identifier, or returns `None` when the segment is not a
+/// `Manager` segment, carries no chain navigation, or cannot be decoded.
+///
+/// The chain entry is carried as its `@odata.id`: `NavProperty` is not
+/// `Clone`, and the caller rebuilds the reference-form navigation from the
+/// identifier exactly like the upstream `downcast` conversion, so an
+/// embedded expanded segment entry is fetched by its own `@odata.id` (the
+/// authoritative resource representation).
+///
+/// The reference form (`{"@odata.id": ...}`, the `BlueField` partial-stub
+/// quirk) is fetched through a typed decode target first, with the
+/// member-level skip semantics on a failed fetch; the fetched document is
+/// decoded through the local segment schema (the compiled
+/// `NvidiaManager.v1_9_0` type cannot be a fetch target: it implements no
+/// `EntityTypeRef`). An undecodable segment leaves both families absent
+/// without a fabricated request, exactly like the undecodable Supermicro
+/// segment.
+async fn decode_nvidia_manager_navigation(
+    nvidia: &serde_json::Value,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<ODataId>, CoreResourceReadError> {
+    if is_nvidia_reference_form(nvidia) {
+        let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let navigation = NavProperty::<NvidiaManagerSegmentReferenceSchema>::new_reference(
+            ODataId::from(id.to_owned()),
+        );
+        let Some(segment) = fetch_member(&navigation, bmc, identity, trust).await? else {
+            return Ok(None);
+        };
+        return Ok(segment
+            .power_compliance
+            .as_ref()
+            .map(NavProperty::id)
+            .cloned());
+    }
+    match nvidia_segment_kind(nvidia) {
+        Some(NvidiaSegmentKind::Manager) => {
+            match serde_json::from_value::<NvidiaManagerSegmentSchema>(nvidia.clone()) {
+                Ok(segment) => Ok(segment
+                    .power_compliance
+                    .as_ref()
+                    .map(NavProperty::id)
+                    .cloned()),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(NvidiaSegmentKind::ComputerSystem | NvidiaSegmentKind::Chassis) | None => Ok(None),
+    }
+}
+
+/// The typed fetch target of a reference-form `Oem.Nvidia` manager segment.
+///
+/// The compiled `NvidiaManager.v1_9_0` type models the segment but does not
+/// implement `EntityTypeRef` (it is an OEM segment, not a standalone
+/// resource), so a reference-form fetch cannot go through
+/// `bmc.get::<NvidiaManagerSegmentSchema>`. The fetched document decodes
+/// through this minimal local schema instead — the same local-schema
+/// precedent as the `EventSubscription` family and the reference-form
+/// `NvidiaComputerSystem` segment — mirroring exactly the navigation fields
+/// the chains follow, with the `@odata.id` the fetch proves.
+#[derive(Deserialize)]
+struct NvidiaManagerSegmentReferenceSchema {
+    #[serde(rename = "@odata.id")]
+    odata_id: ODataId,
+    #[serde(rename = "PowerCompliance", default)]
+    power_compliance: Option<NavProperty<NvidiaPowerComplianceManagerSchema>>,
+}
+
+impl EntityTypeRef for NvidiaManagerSegmentReferenceSchema {
+    fn odata_id(&self) -> &ODataId {
+        &self.odata_id
+    }
+
+    fn etag(&self) -> Option<&nv_redfish::core::ODataETag> {
+        None
+    }
+}
+
+/// Reads the `NvidiaPowerDomainCollection` behind the compliance manager and
+/// projects every decoded member.
+///
+/// Unlike a standard collection, a failed collection document follows the
+/// member-level skip semantics instead of aborting the read: the chain's
+/// failure rule treats every sub-document as one odd chain surface, so a
+/// failed power-domain collection leaves the already-read compliance manager
+/// snapshot in place.
+async fn read_nvidia_power_domain_collection(
+    nav: Option<&NavProperty<NvidiaPowerDomainCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_nvidia_member_documents(
+        &collection.members,
+        bmc,
+        identity,
+        trust,
+        nvidia_power_domain_projection,
+    )
+    .await
+}
+
+/// Reads the `NvidiaManagedEntityGroupCollection` behind the compliance
+/// manager and, for every decoded group member, its `ManagedEntities`
+/// collection members, so the managed-entity sub-chain follows its parent
+/// through the same typed navigation.
+///
+/// The group documents belong to the power-compliance family (the
+/// compliance manager's `ManagedEntityGroups` sub-chain) and the entity
+/// members to the managed-entity family (the `managed_entity_groups` entry
+/// navigation), so one shared traversal feeds both families from one set of
+/// requests. A failed collection document skips the whole shared sub-chain
+/// with the member-level semantics, exactly like the profile-collection
+/// precedent; individual members keep the usual member-level semantics.
+async fn read_nvidia_managed_entity_groups(
+    nav: Option<&NavProperty<NvidiaManagedEntityGroupCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    for group_nav in &collection.members {
+        let Some(group) = fetch_member(group_nav, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(nvidia_managed_entity_group_projection(&group))?
+        {
+            resources.push(projection);
+        }
+        resources.extend(
+            read_nvidia_managed_entity_collection(
+                Some(&group.managed_entities),
+                bmc,
+                identity,
+                trust,
+            )
+            .await?,
+        );
+    }
+    Ok(resources)
+}
+
+/// Reads the `NvidiaManagedEntityCollection` behind one group member and
+/// projects every decoded entity member into the managed-entity family.
+async fn read_nvidia_managed_entity_collection(
+    nav: Option<&NavProperty<NvidiaManagedEntityCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_nvidia_member_documents(
+        &collection.members,
+        bmc,
+        identity,
+        trust,
+        nvidia_managed_entity_projection,
+    )
+    .await
+}
+
+/// Reads the `NvidiaPowerStateGroup` document and its
+/// `PowerShelfControllers` / `PowerSupplies` collection members, so the
+/// power-state sub-chain follows its parent through the same typed
+/// navigation. A failed power-state document skips the whole sub-chain with
+/// the member-level semantics.
+async fn read_nvidia_power_state_group(
+    nav: Option<&NavProperty<NvidiaPowerStateGroupSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(group) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) = member_projection(nvidia_power_state_group_projection(&group))? {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_nvidia_psc_state_collection(
+            Some(&group.power_shelf_controllers),
+            bmc,
+            identity,
+            trust,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_nvidia_psu_state_collection(Some(&group.power_supplies), bmc, identity, trust).await?,
+    );
+    Ok(resources)
+}
+
+/// Reads the `NvidiaPscStateCollection` and projects every decoded member.
+async fn read_nvidia_psc_state_collection(
+    nav: Option<&NavProperty<NvidiaPscStateCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_nvidia_member_documents(
+        &collection.members,
+        bmc,
+        identity,
+        trust,
+        nvidia_psc_state_projection,
+    )
+    .await
+}
+
+/// Reads the `NvidiaPsuStateCollection` and projects every decoded member.
+async fn read_nvidia_psu_state_collection(
+    nav: Option<&NavProperty<NvidiaPsuStateCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_nvidia_member_documents(
+        &collection.members,
+        bmc,
+        identity,
+        trust,
+        nvidia_psu_state_projection,
+    )
+    .await
+}
+
+/// Projects every decoded member of one decoded NVIDIA collection document.
+///
+/// The member loop is the shared tail of the NVIDIA collection readers; the
+/// collection document itself is fetched by the caller with the chain's
+/// member-level skip semantics (unlike a standard collection, whose failed
+/// document aborts the read).
+async fn read_nvidia_member_documents<M>(
+    members: &[NavProperty<M>],
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    project: impl Fn(&M) -> Result<CoreResourceProjection, CoreResourceReadError>,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
+where
+    M: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    let mut resources = Vec::new();
+    for member in members {
+        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(project(&member))? {
+            resources.push(projection);
+        }
+    }
     Ok(resources)
 }
 
@@ -1732,7 +2207,10 @@ async fn decode_nvidia_system_config_profile_navigation(
                 Err(_) => Ok(None),
             }
         }
-        Some(NvidiaSegmentKind::Chassis) | None => Ok(None),
+        // A Manager segment carries no system-config-profile chain; the
+        // power-compliance and managed-entity families decode it through
+        // their own navigation reader instead.
+        Some(NvidiaSegmentKind::Chassis | NvidiaSegmentKind::Manager) | None => Ok(None),
     }
 }
 
@@ -1781,6 +2259,11 @@ enum NvidiaSegmentKind {
     /// system-config-profile chain; the arm keeps the discrimination
     /// mechanism explicit so a later chassis family lands on it.
     Chassis,
+    /// A `Manager` `Oem.Nvidia` segment: the `NvidiaManager` namespace type
+    /// (versioned, the latest compiled `NvidiaManager.v1_9_0` module carries
+    /// the `PowerCompliance` navigation), whose versioned module carries the
+    /// navigation the power-compliance and managed-entity families follow.
+    Manager,
 }
 
 /// Discriminates one `Oem.Nvidia` segment value by its own `@odata.type`.
@@ -1801,6 +2284,11 @@ fn nvidia_segment_kind(segment: &serde_json::Value) -> Option<NvidiaSegmentKind>
             "NvidiaChassis" | "NvidiaRoTchassis" | "NvidiaSmaChassis" | "NvidiaCBCChassis",
         )
         | (Some("NvidiaRoTChassis"), "NvidiaRoTChassis") => Some(NvidiaSegmentKind::Chassis),
+        // The manager segment is versioned (`NvidiaManager.v1_9_0.NvidiaManager`),
+        // so the top namespace and the type name match both the versioned and
+        // the hypothetical unversioned spelling; the decode target is the
+        // versioned `v1_9_0::NvidiaManager` struct either way.
+        (Some("NvidiaManager"), "NvidiaManager") => Some(NvidiaSegmentKind::Manager),
         _ => None,
     }
 }
@@ -4625,6 +5113,252 @@ struct NvidiaSystemProfileFileMetadataPayload {
     uuid: Option<String>,
 }
 
+/// The one document-kind discriminator of the §0.5.0 NVIDIA power-compliance
+/// family.
+///
+/// The whole chain shares the single family code `nvidia-power-compliance`
+/// (one family = one entry navigation chain), so the snapshot payload must
+/// carry the chain document's kind for the application boundary to route the
+/// snapshot to the right details shape. The value is written by the infra
+/// projection — which knows the compiled decode target it just projected —
+/// and consumed by the application projection; it is a product discriminator,
+/// not a Redfish field, and never reaches the wire response (the application
+/// consumes it).
+#[derive(Clone, Copy, Debug, Serialize)]
+#[allow(clippy::enum_variant_names)]
+#[serde(rename_all = "snake_case")]
+enum NvidiaPowerComplianceDocument {
+    PowerComplianceManager,
+    PowerDomain,
+    PowerPolicy,
+    ManagedEntityGroup,
+    PowerStateGroup,
+    PscState,
+    PsuState,
+    PsuRedundancy,
+}
+
+/// The one document-kind discriminator of the §0.5.0 NVIDIA managed-entity
+/// family: exactly one compiled decode target carries the chain, so the
+/// discriminator has a single arm (kept as an enum so the application
+/// boundary routes through the same envelope shape as the other chains).
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NvidiaManagedEntityDocument {
+    ManagedEntity,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerComplianceManager` chain-root projection.
+///
+/// The field set is exactly the application payload decoded with
+/// `deny_unknown_fields`, so an extra field here would make every stored
+/// snapshot unreadable at projection time. Only the compiled `ManagerType`
+/// enumeration is projectable; the `Actions` section and every navigation
+/// stay out of the strictly projectable field set.
+#[derive(Serialize)]
+struct NvidiaPowerComplianceManagerPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "ManagerType", skip_serializing_if = "Option::is_none")]
+    manager_type: Option<NvidiaPowerComplianceManagerType>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerDomain` member projection.
+///
+/// The field set is exactly the compiled `NvidiaPowerDomain` schema's
+/// scalar fields: the numeric `Value`, the `Type` / `Unit` enumerations, and
+/// the `SensorReadingType` / `SensorImpl` sensor enumerations. The
+/// `PowerPolicies` navigation stays out of the strictly projectable field
+/// set.
+#[derive(Serialize)]
+struct NvidiaPowerDomainPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "Value", skip_serializing_if = "Option::is_none")]
+    value: Option<i64>,
+    #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
+    r#type: Option<NvidiaPowerDomainComparisonType>,
+    #[serde(rename = "Unit", skip_serializing_if = "Option::is_none")]
+    unit: Option<NvidiaPowerDomainUnitType>,
+    #[serde(rename = "SensorReadingType", skip_serializing_if = "Option::is_none")]
+    sensor_reading_type: Option<NvidiaSensorReadingType>,
+    #[serde(rename = "SensorImpl", skip_serializing_if = "Option::is_none")]
+    sensor_impl: Option<NvidiaSensorImplementationType>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerPolicy` projection, shared by the
+/// `ACLossPolicy` and `PSUCompliancePolicy` singletons.
+///
+/// The field set is exactly the compiled `NvidiaPowerPolicy` schema's scalar
+/// fields: the `AutoDeassertPowerBrake` boolean, the numeric `Min` / `Max`
+/// thresholds, the `Type` / `Unit` enumerations, and the `PolicyActions`
+/// enumeration. The `DwellTime` duration stays out of the strictly
+/// projectable field set: the threshold duration carries no cross-vendor
+/// identity and the strict field set keeps the policy's actionable scalars.
+#[derive(Serialize)]
+struct NvidiaPowerPolicyPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(
+        rename = "AutoDeassertPowerBrake",
+        skip_serializing_if = "Option::is_none"
+    )]
+    auto_deassert_power_brake: Option<bool>,
+    #[serde(rename = "Min", skip_serializing_if = "Option::is_none")]
+    min: Option<i64>,
+    #[serde(rename = "Max", skip_serializing_if = "Option::is_none")]
+    max: Option<i64>,
+    #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
+    r#type: Option<NvidiaPowerPolicyComparisonType>,
+    #[serde(rename = "Unit", skip_serializing_if = "Option::is_none")]
+    unit: Option<NvidiaPowerPolicyUnitType>,
+    #[serde(rename = "PolicyActions", skip_serializing_if = "Option::is_none")]
+    policy_actions: Option<NvidiaPowerPolicyActionType>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaManagedEntityGroup` member projection of the
+/// power-compliance family.
+///
+/// The field set is exactly the compiled `NvidiaManagedEntityGroup` schema's
+/// scalar field: the `CurrentManagedEntityId` text. The `ManagedEntities`
+/// navigation belongs to the managed-entity family and stays out of this
+/// payload.
+#[derive(Serialize)]
+struct NvidiaManagedEntityGroupPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(
+        rename = "CurrentManagedEntityId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    current_managed_entity_id: Option<String>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPowerStateGroup` projection.
+///
+/// The field set is exactly the compiled `NvidiaPowerStateGroup` schema's
+/// scalar fields: the `PscId` text, the numeric `GeneratedWatts` /
+/// `NumberOfPscs` / `NumberOfLocalPsus`. The `PowerShelfControllers` /
+/// `PowerSupplies` navigations are their own chain documents and stay out of
+/// this payload.
+#[derive(Serialize)]
+struct NvidiaPowerStateGroupPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "PscId", skip_serializing_if = "Option::is_none")]
+    psc_id: Option<String>,
+    #[serde(rename = "GeneratedWatts", skip_serializing_if = "Option::is_none")]
+    generated_watts: Option<i64>,
+    #[serde(rename = "NumberOfPscs", skip_serializing_if = "Option::is_none")]
+    number_of_pscs: Option<i64>,
+    #[serde(rename = "NumberOfLocalPsus", skip_serializing_if = "Option::is_none")]
+    number_of_local_psus: Option<i64>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPscState` member projection.
+///
+/// The field set is exactly the compiled `NvidiaPscState` schema's scalar
+/// fields: the `PscId` text, the numeric `NumOfOperationalPsus` /
+/// `MillisecondsSinceLastHeartbeat`, the `PowerBrakeAssert` boolean, and the
+/// `Status` enumeration.
+#[derive(Serialize)]
+struct NvidiaPscStatePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "PscId", skip_serializing_if = "Option::is_none")]
+    psc_id: Option<String>,
+    #[serde(
+        rename = "NumOfOperationalPsus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    num_of_operational_psus: Option<i64>,
+    #[serde(rename = "PowerBrakeAssert", skip_serializing_if = "Option::is_none")]
+    power_brake_assert: Option<bool>,
+    #[serde(
+        rename = "MillisecondsSinceLastHeartbeat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    milliseconds_since_last_heartbeat: Option<i64>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<NvidiaPscStateStatusType>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPsuState` member projection.
+///
+/// The field set is exactly the compiled `NvidiaPsuState` schema's scalar
+/// fields: the `PsuId` text and the `Presence` / `Input1Active` /
+/// `Input2Active` booleans.
+#[derive(Serialize)]
+struct NvidiaPsuStatePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "PsuId", skip_serializing_if = "Option::is_none")]
+    psu_id: Option<String>,
+    #[serde(rename = "Presence", skip_serializing_if = "Option::is_none")]
+    presence: Option<bool>,
+    #[serde(rename = "Input1Active", skip_serializing_if = "Option::is_none")]
+    input1active: Option<bool>,
+    #[serde(rename = "Input2Active", skip_serializing_if = "Option::is_none")]
+    input2active: Option<bool>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaPsuRedundancy` projection.
+///
+/// The field set is exactly the compiled `NvidiaPsuRedundancy` schema's
+/// scalar fields: the `MaxNumSupported` / `MinNumNeeded` texts and the
+/// `RedundancySetting` enumeration.
+#[derive(Serialize)]
+struct NvidiaPsuRedundancyPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaPowerComplianceDocument,
+    #[serde(rename = "MaxNumSupported", skip_serializing_if = "Option::is_none")]
+    max_num_supported: Option<String>,
+    #[serde(rename = "MinNumNeeded", skip_serializing_if = "Option::is_none")]
+    min_num_needed: Option<String>,
+    #[serde(rename = "RedundancySetting", skip_serializing_if = "Option::is_none")]
+    redundancy_setting: Option<NvidiaPsuRedundancyType>,
+}
+
+/// The §0.5.0 NVIDIA `NvidiaManagedEntity` member projection of the
+/// managed-entity family.
+///
+/// The field set is exactly the compiled `NvidiaManagedEntity` schema's
+/// scalar fields: the `TransportProtocol` enumeration, the `IPv4Address` /
+/// `IPv6Address` address texts (the compiled `Ipv4address` / `Ipv6address`
+/// structs are not serializable, so the strictly projectable field set keeps
+/// the address text itself, verbatim), and the numeric `Port`.
+#[derive(Serialize)]
+struct NvidiaManagedEntityPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaManagedEntityDocument,
+    #[serde(rename = "TransportProtocol", skip_serializing_if = "Option::is_none")]
+    transport_protocol: Option<NvidiaProtocolSchema>,
+    #[serde(rename = "IPv4Address", skip_serializing_if = "Option::is_none")]
+    ipv4_address: Option<String>,
+    #[serde(rename = "IPv6Address", skip_serializing_if = "Option::is_none")]
+    ipv6_address: Option<String>,
+    #[serde(rename = "Port", skip_serializing_if = "Option::is_none")]
+    port: Option<i64>,
+}
+
 /// The §0.2.0 `processors` family projection.
 ///
 /// The field set is exactly the `ProcessorPayload` the application boundary
@@ -5514,6 +6248,200 @@ fn nvidia_system_profile_file_projection(
         ResourceFeature::OemNvidiaSystemConfigProfile,
         profile_file.odata_id(),
         profile_file.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPowerComplianceManager` chain-root
+/// document into the power-compliance family.
+fn nvidia_power_compliance_manager_projection(
+    compliance: &NvidiaPowerComplianceManagerSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPowerComplianceManagerPayload {
+        resource: nvidia_common_resource(&compliance.base),
+        document_type: NvidiaPowerComplianceDocument::PowerComplianceManager,
+        manager_type: compliance.manager_type.as_ref().copied(),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        compliance.odata_id(),
+        compliance.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPowerDomain` member into the
+/// power-compliance family.
+fn nvidia_power_domain_projection(
+    domain: &NvidiaPowerDomainSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPowerDomainPayload {
+        resource: nvidia_common_resource(&domain.base),
+        document_type: NvidiaPowerComplianceDocument::PowerDomain,
+        value: Some(domain.value),
+        r#type: Some(domain.r#type),
+        unit: Some(domain.unit),
+        sensor_reading_type: Some(domain.sensor_reading_type),
+        sensor_impl: Some(domain.sensor_impl),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        domain.odata_id(),
+        domain.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPowerPolicy` document (the `ACLossPolicy`
+/// or `PSUCompliancePolicy` singleton) into the power-compliance family.
+fn nvidia_power_policy_projection(
+    policy: &NvidiaPowerPolicySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPowerPolicyPayload {
+        resource: nvidia_common_resource(&policy.base),
+        document_type: NvidiaPowerComplianceDocument::PowerPolicy,
+        auto_deassert_power_brake: Some(policy.auto_deassert_power_brake),
+        min: Some(policy.min),
+        max: Some(policy.max),
+        r#type: policy.r#type,
+        unit: Some(policy.unit),
+        policy_actions: policy.policy_actions,
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        policy.odata_id(),
+        policy.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaManagedEntityGroup` member into the
+/// power-compliance family.
+fn nvidia_managed_entity_group_projection(
+    group: &NvidiaManagedEntityGroupSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaManagedEntityGroupPayload {
+        resource: nvidia_common_resource(&group.base),
+        document_type: NvidiaPowerComplianceDocument::ManagedEntityGroup,
+        current_managed_entity_id: Some(group.current_managed_entity_id.clone()),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        group.odata_id(),
+        group.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPowerStateGroup` document into the
+/// power-compliance family.
+fn nvidia_power_state_group_projection(
+    group: &NvidiaPowerStateGroupSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPowerStateGroupPayload {
+        resource: nvidia_common_resource(&group.base),
+        document_type: NvidiaPowerComplianceDocument::PowerStateGroup,
+        psc_id: Some(group.psc_id.clone()),
+        generated_watts: Some(group.generated_watts),
+        number_of_pscs: group.number_of_pscs,
+        number_of_local_psus: Some(group.number_of_local_psus),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        group.odata_id(),
+        group.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPscState` member into the
+/// power-compliance family.
+fn nvidia_psc_state_projection(
+    state: &NvidiaPscStateSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPscStatePayload {
+        resource: nvidia_common_resource(&state.base),
+        document_type: NvidiaPowerComplianceDocument::PscState,
+        psc_id: Some(state.psc_id.clone()),
+        num_of_operational_psus: state.num_of_operational_psus,
+        power_brake_assert: state.power_brake_assert,
+        milliseconds_since_last_heartbeat: state.milliseconds_since_last_heartbeat,
+        status: state.status,
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        state.odata_id(),
+        state.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPsuState` member into the
+/// power-compliance family.
+fn nvidia_psu_state_projection(
+    state: &NvidiaPsuStateSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPsuStatePayload {
+        resource: nvidia_common_resource(&state.base),
+        document_type: NvidiaPowerComplianceDocument::PsuState,
+        psu_id: Some(state.psu_id.clone()),
+        presence: Some(state.presence),
+        input1active: Some(state.input1active),
+        input2active: Some(state.input2active),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        state.odata_id(),
+        state.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaPsuRedundancy` document into the
+/// power-compliance family.
+fn nvidia_psu_redundancy_projection(
+    redundancy: &NvidiaPsuRedundancySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaPsuRedundancyPayload {
+        resource: nvidia_common_resource(&redundancy.base),
+        document_type: NvidiaPowerComplianceDocument::PsuRedundancy,
+        max_num_supported: redundancy.max_num_supported.clone(),
+        min_num_needed: redundancy.min_num_needed.clone(),
+        redundancy_setting: redundancy.redundancy_setting,
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaPowerCompliance,
+        redundancy.odata_id(),
+        redundancy.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `NvidiaManagedEntity` member into the
+/// managed-entity family.
+fn nvidia_managed_entity_projection(
+    entity: &NvidiaManagedEntitySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaManagedEntityPayload {
+        resource: nvidia_common_resource(&entity.base),
+        document_type: NvidiaManagedEntityDocument::ManagedEntity,
+        transport_protocol: entity.transport_protocol.as_ref().copied(),
+        ipv4_address: entity
+            .ipv4address
+            .as_ref()
+            .and_then(|address| address.address.as_ref().and_then(Option::as_deref))
+            .map(str::to_owned),
+        ipv6_address: entity
+            .ipv6address
+            .as_ref()
+            .and_then(|address| address.address.as_ref().and_then(Option::as_deref))
+            .map(str::to_owned),
+        port: entity.port,
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaManagedEntity,
+        entity.odata_id(),
+        entity.etag(),
         &payload,
     )
 }
@@ -8207,6 +9135,264 @@ mod tests {
         "Privilege":"Administrator"
     }"#;
 
+    /// A Manager member whose `Oem.Nvidia` segment embeds the inline
+    /// versioned `NvidiaManager` object: the segment carries its own
+    /// `@odata.type` (the discrimination the gateway performs, matching the
+    /// `NvidiaManager.v1_9_0` namespace) and the `PowerCompliance`
+    /// navigation both the power-compliance and the managed-entity families
+    /// follow.
+    const MANAGER_WITH_NVIDIA_POWER_COMPLIANCE_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaManager.v1_9_0.NvidiaManager",
+            "PowerCompliance":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"}
+        }}
+    }"##;
+
+    /// A Manager member whose `Oem.Nvidia` segment has the reference shape
+    /// (`{"@odata.id": ...}`), the `BlueField` partial-stub quirk: the
+    /// segment body at the reference is fetched and decoded before the chain
+    /// navigation can be followed.
+    const MANAGER_WITH_NVIDIA_REFERENCE_FORM_SEGMENT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Nvidia":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia"}}
+    }"#;
+
+    /// The `NvidiaManager` document served at the reference-form segment's
+    /// `@odata.id`, carrying the `PowerCompliance` navigation.
+    const NVIDIA_MANAGER_SEGMENT_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia",
+        "@odata.type":"#NvidiaManager.v1_9_0.NvidiaManager",
+        "PowerCompliance":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"}
+    }"##;
+
+    /// A Manager member whose `Oem.Nvidia` segment cannot be discriminated or
+    /// decoded (a non-object value): one odd manager surface, both NVIDIA
+    /// power families stay absent and no chain request is fabricated.
+    const MANAGER_WITH_UNDECODABLE_NVIDIA_SEGMENT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Nvidia":5}
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPowerComplianceManager` chain-root document,
+    /// served at the segment's `PowerCompliance` navigation. Every
+    /// sub-navigation of the power-compliance family is present, so the full
+    /// chain is exercised in one fixture sequence.
+    const NVIDIA_POWER_COMPLIANCE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        "@odata.etag":"W/\"nvidia-pc-1\"",
+        "Id":"PowerCompliance",
+        "Name":"NVIDIA Power Compliance",
+        "Description":"Power compliance manager",
+        "ManagerType":"PowerManager",
+        "PowerDomains":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains"},
+        "ACLossPolicy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy"},
+        "PSUCompliancePolicy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy"},
+        "ManagedEntityGroups":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups"},
+        "PowerStateGroup":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup"},
+        "PSURedundancy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy"}
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPowerDomainCollection` with the single
+    /// power-domain member.
+    const NVIDIA_POWER_DOMAINS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaPowerDomainCollection.NvidiaPowerDomainCollection",
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+        "Id":"PowerDomains",
+        "Name":"Power Domain Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1"}]
+    }"##;
+
+    /// The typed NVIDIA `NvidiaPowerDomain` member with every compiled scalar
+    /// field populated (the `PowerPolicies` navigation is required by the
+    /// schema and stays in the fixture even though the strictly projectable
+    /// field set never follows it).
+    const NVIDIA_POWER_DOMAIN_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+        "@odata.etag":"W/\"nvidia-domain-1\"",
+        "Id":"1",
+        "Name":"Power Domain One",
+        "Description":"Power comparison domain",
+        "Value":800,
+        "Type":"Above",
+        "Unit":"Watts",
+        "SensorReadingType":"Power",
+        "SensorImpl":"PhysicalSensor",
+        "PowerPolicies":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1/PowerPolicies"}
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPowerPolicy` document served at the
+    /// `ACLossPolicy` navigation, with every compiled scalar field
+    /// populated.
+    const NVIDIA_POWER_AC_LOSS_POLICY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+        "@odata.etag":"W/\"nvidia-acloss-1\"",
+        "Id":"ACLossPolicy",
+        "Name":"AC Loss Policy",
+        "Description":"AC loss power policy",
+        "AutoDeassertPowerBrake":true,
+        "Min":200,
+        "Max":600,
+        "Type":"Inclusive",
+        "Unit":"Watts",
+        "DwellTime":"PT1S",
+        "PolicyActions":"AssertPowerBrake"
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPowerPolicy` document served at the
+    /// `PSUCompliancePolicy` navigation.
+    const NVIDIA_POWER_PSU_COMPLIANCE_POLICY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        "@odata.etag":"W/\"nvidia-psupolicy-1\"",
+        "Id":"PSUCompliancePolicy",
+        "Name":"PSU Compliance Policy",
+        "Description":"PSU compliance power policy",
+        "AutoDeassertPowerBrake":false,
+        "Min":100,
+        "Max":500,
+        "Type":"Below",
+        "Unit":"Watts",
+        "DwellTime":"PT2S",
+        "PolicyActions":"DoNothing"
+    }"#;
+
+    /// The typed NVIDIA `NvidiaManagedEntityGroupCollection` with the single
+    /// group member.
+    const NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaManagedEntityGroupCollection.NvidiaManagedEntityGroupCollection",
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+        "Id":"ManagedEntityGroups",
+        "Name":"Managed Entity Group Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1"}]
+    }"##;
+
+    /// The typed NVIDIA `NvidiaManagedEntityGroup` member with its
+    /// `ManagedEntities` navigation into the managed-entity family.
+    const NVIDIA_MANAGED_ENTITY_GROUP_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+        "@odata.etag":"W/\"nvidia-group-1\"",
+        "Id":"1",
+        "Name":"Managed Entity Group One",
+        "Description":"BlueField group",
+        "CurrentManagedEntityId":"BF1",
+        "ManagedEntities":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities"}
+    }"#;
+
+    /// The typed NVIDIA `NvidiaManagedEntityCollection` with the single
+    /// entity member.
+    const NVIDIA_MANAGED_ENTITIES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaManagedEntityCollection.NvidiaManagedEntityCollection",
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+        "Id":"ManagedEntities",
+        "Name":"Managed Entity Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"}]
+    }"##;
+
+    /// The typed NVIDIA `NvidiaManagedEntity` member with every compiled
+    /// scalar field populated.
+    const NVIDIA_MANAGED_ENTITY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        "@odata.etag":"W/\"nvidia-entity-1\"",
+        "Id":"1",
+        "Name":"Managed Entity One",
+        "Description":"BlueField managed entity",
+        "TransportProtocol":"HTTPS",
+        "IPv4Address":{"Address":"192.0.2.10","SubnetMask":"255.255.255.0","Gateway":"192.0.2.1"},
+        "IPv6Address":{"Address":"2001:db8::10","PrefixLength":64},
+        "Port":443
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPowerStateGroup` document with every compiled
+    /// scalar field populated and the two required state-collection
+    /// navigations.
+    const NVIDIA_POWER_STATE_GROUP_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+        "@odata.etag":"W/\"nvidia-state-group-1\"",
+        "Id":"PowerStateGroup",
+        "Name":"Power State Group",
+        "Description":"Power shelf state",
+        "PscId":"PSC1",
+        "GeneratedWatts":2400,
+        "NumberOfPscs":1,
+        "NumberOfLocalPsus":2,
+        "PowerShelfControllers":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers"},
+        "PowerSupplies":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies"}
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPscStateCollection` with the single PSC
+    /// member.
+    const NVIDIA_PSC_STATES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaPscStateCollection.NvidiaPscStateCollection",
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+        "Id":"PowerShelfControllers",
+        "Name":"Power Shelf Controller Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1"}]
+    }"##;
+
+    /// The typed NVIDIA `NvidiaPscState` member with every compiled scalar
+    /// field populated.
+    const NVIDIA_PSC_STATE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+        "@odata.etag":"W/\"nvidia-psc-1\"",
+        "Id":"1",
+        "Name":"Power Shelf Controller One",
+        "Description":"PSC state",
+        "PscId":"PSC1",
+        "NumOfOperationalPsus":4,
+        "PowerBrakeAssert":false,
+        "MillisecondsSinceLastHeartbeat":12,
+        "Status":"Operational"
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPsuStateCollection` with the single PSU
+    /// member.
+    const NVIDIA_PSU_STATES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaPsuStateCollection.NvidiaPsuStateCollection",
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+        "Id":"PowerSupplies",
+        "Name":"Power Supply Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1"}]
+    }"##;
+
+    /// The typed NVIDIA `NvidiaPsuState` member with every compiled scalar
+    /// field populated.
+    const NVIDIA_PSU_STATE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+        "@odata.etag":"W/\"nvidia-psu-1\"",
+        "Id":"1",
+        "Name":"Power Supply One",
+        "Description":"PSU state",
+        "PsuId":"PSU1",
+        "Presence":true,
+        "Input1Active":true,
+        "Input2Active":false
+    }"#;
+
+    /// The typed NVIDIA `NvidiaPsuRedundancy` document with every compiled
+    /// scalar field populated.
+    const NVIDIA_PSU_REDUNDANCY_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+        "@odata.etag":"W/\"nvidia-redundancy-1\"",
+        "Id":"PSURedundancy",
+        "Name":"PSU Redundancy",
+        "Description":"PSU redundancy settings",
+        "MaxNumSupported":"4",
+        "MinNumNeeded":"2",
+        "RedundancySetting":"NPlusOne"
+    }"#;
+
     /// A System member whose `Oem.Nvidia` segment embeds the inline
     /// `NvidiaComputerSystem` object: the segment carries its own
     /// `@odata.type` (the discrimination the gateway performs) and the
@@ -9956,6 +11142,111 @@ mod tests {
         "/redfish/v1/Chassis/1",
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one Manager member that advertises `Oem.Nvidia`
+    /// with an inline `NvidiaManager` segment: the power-compliance and
+    /// managed-entity chains are read right after the manager member — the
+    /// compliance document, its `PowerDomains` collection with its member,
+    /// the `ACLossPolicy` and `PSUCompliancePolicy` singletons, the
+    /// `ManagedEntityGroups` collection with its member and the member's
+    /// `ManagedEntities` collection with its entity member, the
+    /// `PowerStateGroup` document with its `PowerShelfControllers` and
+    /// `PowerSupplies` collections with their members, and the
+    /// `PSURedundancy` singleton — exactly like the other manager-bound
+    /// families.
+    const CORE_RESOURCE_WITH_NVIDIA_POWER_COMPLIANCE_REQUEST_PATHS: [&str; 26] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one Manager member whose `Oem.Nvidia` segment
+    /// has the reference form: the segment body is fetched first, then the
+    /// chains follow exactly like the inline form.
+    const CORE_RESOURCE_WITH_NVIDIA_MANAGER_REFERENCE_SEGMENT_REQUEST_PATHS: [&str; 27] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when a manager chain document fails (here the
+    /// `PowerDomains` collection): the failed URI is still requested (that is
+    /// how the skip is observed), the chain root and the remaining sub-chains
+    /// stay in place, and the read completes.
+    const CORE_RESOURCE_WITH_FAILED_NVIDIA_MANAGER_CHAIN_REQUEST_PATHS: [&str; 25] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -12321,6 +13612,23 @@ mod tests {
                 "{odata_type} must discriminate as a chassis segment"
             );
         }
+        // The manager segment is versioned: the top namespace and the type
+        // name decide the kind for both the versioned and the hypothetical
+        // unversioned spellings, and the decode target is the versioned
+        // `v1_9_0` struct either way.
+        for odata_type in [
+            "#NvidiaManager.v1_9_0.NvidiaManager",
+            "#NvidiaManager.NvidiaManager",
+        ] {
+            let segment = serde_json::json!({ "@odata.type": odata_type });
+            assert!(
+                matches!(
+                    nvidia_segment_kind(&segment),
+                    Some(NvidiaSegmentKind::Manager)
+                ),
+                "{odata_type} must discriminate as a manager segment"
+            );
+        }
         // A segment without a parseable `@odata.type`, or with a type from
         // outside the compiled NVIDIA surface, is not discriminable.
         for segment in [
@@ -12423,6 +13731,468 @@ mod tests {
                 .payload()
                 .as_str(),
             r#"{"DocumentType":"system_profile_file","Id":"ProfileFile","Name":"Profile File"}"#
+        );
+        Ok(())
+    }
+
+    // The complete power chain surface is asserted in one test so the
+    // snapshot order and the request sequence stay one contract; the fixture
+    // sequence exceeds the pedantic line budget, so the lint is scoped here
+    // exactly like the other fixture-sequence tests.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reads_nvidia_power_compliance_and_managed_entity_chains_through_oem_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_NVIDIA_POWER_COMPLIANCE_BODY),
+                // The chains are read right after the Manager member and
+                // before the Session delete, so the bodies follow that order.
+                ("200 OK", NVIDIA_POWER_COMPLIANCE_BODY),
+                ("200 OK", NVIDIA_POWER_DOMAINS_COLLECTION_BODY),
+                ("200 OK", NVIDIA_POWER_DOMAIN_BODY),
+                ("200 OK", NVIDIA_POWER_AC_LOSS_POLICY_BODY),
+                ("200 OK", NVIDIA_POWER_PSU_COMPLIANCE_POLICY_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUP_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITIES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_BODY),
+                ("200 OK", NVIDIA_POWER_STATE_GROUP_BODY),
+                ("200 OK", NVIDIA_PSC_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSC_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSU_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_REDUNDANCY_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 14);
+        // The power-compliance family: the chain-root document, its
+        // `PowerDomains` member, the two policy singletons, the
+        // `ManagedEntityGroups` member, the `PowerStateGroup` document with
+        // its PSC and PSU state members, and the `PSURedundancy` singleton.
+        let compliance = &resources[4];
+        assert_eq!(
+            compliance.feature(),
+            ResourceFeature::OemNvidiaPowerCompliance
+        );
+        assert_eq!(
+            compliance.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
+        );
+        assert_eq!(
+            compliance.etag().map(ResourceEtag::as_str),
+            Some("W/\"nvidia-pc-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(compliance.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "power_compliance_manager");
+        assert_eq!(payload["ManagerType"], "PowerManager");
+        assert!(payload.get("PowerDomains").is_none());
+        let domain = &resources[5];
+        let payload: serde_json::Value = serde_json::from_str(domain.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "power_domain");
+        assert_eq!(payload["Value"], 800);
+        assert_eq!(payload["Type"], "Above");
+        assert_eq!(payload["Unit"], "Watts");
+        assert_eq!(payload["SensorReadingType"], "Power");
+        assert_eq!(payload["SensorImpl"], "PhysicalSensor");
+        assert!(payload.get("PowerPolicies").is_none());
+        let ac_loss = &resources[6];
+        let payload: serde_json::Value = serde_json::from_str(ac_loss.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "power_policy");
+        assert_eq!(payload["AutoDeassertPowerBrake"], true);
+        assert_eq!(payload["Min"], 200);
+        assert_eq!(payload["Max"], 600);
+        assert_eq!(payload["Type"], "Inclusive");
+        assert_eq!(payload["Unit"], "Watts");
+        assert_eq!(payload["PolicyActions"], "AssertPowerBrake");
+        assert!(payload.get("DwellTime").is_none());
+        let psu_policy = &resources[7];
+        let payload: serde_json::Value = serde_json::from_str(psu_policy.payload().as_str())?;
+        assert_eq!(payload["PolicyActions"], "DoNothing");
+        assert_eq!(payload["Type"], "Below");
+        let group = &resources[8];
+        assert_eq!(group.feature(), ResourceFeature::OemNvidiaPowerCompliance);
+        let payload: serde_json::Value = serde_json::from_str(group.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "managed_entity_group");
+        assert_eq!(payload["CurrentManagedEntityId"], "BF1");
+        assert!(payload.get("ManagedEntities").is_none());
+        // The managed-entity family: the entity member behind the group's
+        // `ManagedEntities` navigation.
+        let entity = &resources[9];
+        assert_eq!(entity.feature(), ResourceFeature::OemNvidiaManagedEntity);
+        assert_eq!(
+            entity.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"
+        );
+        let payload: serde_json::Value = serde_json::from_str(entity.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "managed_entity");
+        assert_eq!(payload["TransportProtocol"], "HTTPS");
+        assert_eq!(payload["IPv4Address"], "192.0.2.10");
+        assert_eq!(payload["IPv6Address"], "2001:db8::10");
+        assert_eq!(payload["Port"], 443);
+        let state_group = &resources[10];
+        let payload: serde_json::Value = serde_json::from_str(state_group.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "power_state_group");
+        assert_eq!(payload["PscId"], "PSC1");
+        assert_eq!(payload["GeneratedWatts"], 2400);
+        assert_eq!(payload["NumberOfPscs"], 1);
+        assert_eq!(payload["NumberOfLocalPsus"], 2);
+        let psc = &resources[11];
+        let payload: serde_json::Value = serde_json::from_str(psc.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "psc_state");
+        assert_eq!(payload["PscId"], "PSC1");
+        assert_eq!(payload["NumOfOperationalPsus"], 4);
+        assert_eq!(payload["PowerBrakeAssert"], false);
+        assert_eq!(payload["MillisecondsSinceLastHeartbeat"], 12);
+        assert_eq!(payload["Status"], "Operational");
+        let psu = &resources[12];
+        let payload: serde_json::Value = serde_json::from_str(psu.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "psu_state");
+        assert_eq!(payload["PsuId"], "PSU1");
+        assert_eq!(payload["Presence"], true);
+        assert_eq!(payload["Input1Active"], true);
+        assert_eq!(payload["Input2Active"], false);
+        // The `PSURedundancy` singleton follows the PSU states.
+        let redundancy = resources
+            .iter()
+            .find(|resource| {
+                resource.odata_id().as_str()
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy"
+            })
+            .ok_or("the redundancy snapshot must exist")?;
+        let payload: serde_json::Value = serde_json::from_str(redundancy.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "psu_redundancy");
+        assert_eq!(payload["MaxNumSupported"], "4");
+        assert_eq!(payload["MinNumNeeded"], "2");
+        assert_eq!(payload["RedundancySetting"], "NPlusOne");
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_NVIDIA_POWER_COMPLIANCE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_without_nvidia_oem_produces_no_nvidia_snapshot() -> Result<(), Box<dyn Error>>
+    {
+        // A manager without any `Oem` segment stays untouched, exactly like
+        // the other vendor families: no NVIDIA snapshot and no fabricated
+        // chain request, and the standard manager surface is byte-identical.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources.iter().all(|resource| {
+            resource.feature() != ResourceFeature::OemNvidiaPowerCompliance
+                && resource.feature() != ResourceFeature::OemNvidiaManagedEntity
+        }));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_nvidia_manager_segment_leaves_both_families_absent()
+    -> Result<(), Box<dyn Error>> {
+        // An `Oem.Nvidia` segment that cannot be discriminated or decoded
+        // (here: a non-object value) is one odd manager surface: the read
+        // succeeds, both power families stay absent, and no chain request is
+        // ever fabricated.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_UNDECODABLE_NVIDIA_SEGMENT_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources.iter().all(|resource| {
+            resource.feature() != ResourceFeature::OemNvidiaPowerCompliance
+                && resource.feature() != ResourceFeature::OemNvidiaManagedEntity
+        }));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nvidia_manager_reference_form_segment_is_fetched_before_decoding()
+    -> Result<(), Box<dyn Error>> {
+        // A BlueField-style reference-form segment (`{"@odata.id": ...}`) is
+        // fetched through the local typed decode target first; the fetched
+        // document then navigates the chains exactly like the inline form.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_NVIDIA_REFERENCE_FORM_SEGMENT_BODY),
+                // The reference-form segment body is fetched first, then the
+                // chains follow right after the Manager member.
+                ("200 OK", NVIDIA_MANAGER_SEGMENT_BODY),
+                ("200 OK", NVIDIA_POWER_COMPLIANCE_BODY),
+                ("200 OK", NVIDIA_POWER_DOMAINS_COLLECTION_BODY),
+                ("200 OK", NVIDIA_POWER_DOMAIN_BODY),
+                ("200 OK", NVIDIA_POWER_AC_LOSS_POLICY_BODY),
+                ("200 OK", NVIDIA_POWER_PSU_COMPLIANCE_POLICY_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUP_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITIES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_BODY),
+                ("200 OK", NVIDIA_POWER_STATE_GROUP_BODY),
+                ("200 OK", NVIDIA_PSC_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSC_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSU_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_REDUNDANCY_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 14);
+        assert!(resources.iter().any(|resource| {
+            resource.feature() == ResourceFeature::OemNvidiaPowerCompliance
+                && resource.odata_id().as_str()
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
+        }));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_NVIDIA_MANAGER_REFERENCE_SEGMENT_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_nvidia_manager_chain_documents_are_skipped_like_one_odd_surface()
+    -> Result<(), Box<dyn Error>> {
+        // A failed chain sub-document (here the `PowerDomains` collection)
+        // follows the member-level skip semantics: the read succeeds, the
+        // chain root and every other sub-chain stay in place, and the failed
+        // sub-chain alone is absent — the readable remainder is never erased.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_NVIDIA_POWER_COMPLIANCE_BODY),
+                ("200 OK", NVIDIA_POWER_COMPLIANCE_BODY),
+                ("404 Not Found", "{}"),
+                ("200 OK", NVIDIA_POWER_AC_LOSS_POLICY_BODY),
+                ("200 OK", NVIDIA_POWER_PSU_COMPLIANCE_POLICY_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_GROUP_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITIES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_MANAGED_ENTITY_BODY),
+                ("200 OK", NVIDIA_POWER_STATE_GROUP_BODY),
+                ("200 OK", NVIDIA_PSC_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSC_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_STATES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_PSU_STATE_BODY),
+                ("200 OK", NVIDIA_PSU_REDUNDANCY_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 13);
+        let compliance = resources
+            .iter()
+            .filter(|resource| resource.feature() == ResourceFeature::OemNvidiaPowerCompliance)
+            .collect::<Vec<_>>();
+        // The chain root and every other sub-chain stay: the compliance
+        // manager, both policies, the managed entity group, the power state
+        // group, the PSC and PSU states, and the PSU redundancy.
+        assert_eq!(compliance.len(), 8);
+        assert!(
+            resources
+                .iter()
+                .any(|resource| { resource.feature() == ResourceFeature::OemNvidiaManagedEntity })
+        );
+        assert!(!resources.iter().any(|resource| {
+            resource.odata_id().as_str()
+                == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1"
+        }));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_FAILED_NVIDIA_MANAGER_CHAIN_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_power_document_projections_keep_the_typed_field_contract()
+    -> Result<(), Box<dyn Error>> {
+        // The compiled schemas are the type boundary: the typed metadata
+        // fields are projected verbatim, the `DocumentType` discriminator is
+        // written by the projection, and absent fields are skipped on the
+        // wire instead of coerced.
+        let compliance: NvidiaPowerComplianceManagerSchema =
+            serde_json::from_str(NVIDIA_POWER_COMPLIANCE_BODY)?;
+        assert_eq!(
+            nvidia_power_compliance_manager_projection(&compliance)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"Power compliance manager","DocumentType":"power_compliance_manager","Id":"PowerCompliance","ManagerType":"PowerManager","Name":"NVIDIA Power Compliance"}"#
+        );
+        let bare_compliance: NvidiaPowerComplianceManagerSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance","Id":"PowerCompliance","Name":"NVIDIA Power Compliance"}"#,
+        )?;
+        assert_eq!(
+            nvidia_power_compliance_manager_projection(&bare_compliance)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"power_compliance_manager","Id":"PowerCompliance","Name":"NVIDIA Power Compliance"}"#
+        );
+
+        let domain: NvidiaPowerDomainSchema = serde_json::from_str(NVIDIA_POWER_DOMAIN_BODY)?;
+        assert_eq!(
+            nvidia_power_domain_projection(&domain)?.payload().as_str(),
+            r#"{"Description":"Power comparison domain","DocumentType":"power_domain","Id":"1","Name":"Power Domain One","SensorImpl":"PhysicalSensor","SensorReadingType":"Power","Type":"Above","Unit":"Watts","Value":800}"#
+        );
+
+        let policy: NvidiaPowerPolicySchema =
+            serde_json::from_str(NVIDIA_POWER_AC_LOSS_POLICY_BODY)?;
+        assert_eq!(
+            nvidia_power_policy_projection(&policy)?.payload().as_str(),
+            r#"{"AutoDeassertPowerBrake":true,"Description":"AC loss power policy","DocumentType":"power_policy","Id":"ACLossPolicy","Max":600,"Min":200,"Name":"AC Loss Policy","PolicyActions":"AssertPowerBrake","Type":"Inclusive","Unit":"Watts"}"#
+        );
+
+        let group: NvidiaManagedEntityGroupSchema =
+            serde_json::from_str(NVIDIA_MANAGED_ENTITY_GROUP_BODY)?;
+        assert_eq!(
+            nvidia_managed_entity_group_projection(&group)?
+                .payload()
+                .as_str(),
+            r#"{"CurrentManagedEntityId":"BF1","Description":"BlueField group","DocumentType":"managed_entity_group","Id":"1","Name":"Managed Entity Group One"}"#
+        );
+
+        let state_group: NvidiaPowerStateGroupSchema =
+            serde_json::from_str(NVIDIA_POWER_STATE_GROUP_BODY)?;
+        assert_eq!(
+            nvidia_power_state_group_projection(&state_group)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"Power shelf state","DocumentType":"power_state_group","GeneratedWatts":2400,"Id":"PowerStateGroup","Name":"Power State Group","NumberOfLocalPsus":2,"NumberOfPscs":1,"PscId":"PSC1"}"#
+        );
+
+        let psc: NvidiaPscStateSchema = serde_json::from_str(NVIDIA_PSC_STATE_BODY)?;
+        assert_eq!(
+            nvidia_psc_state_projection(&psc)?.payload().as_str(),
+            r#"{"Description":"PSC state","DocumentType":"psc_state","Id":"1","MillisecondsSinceLastHeartbeat":12,"Name":"Power Shelf Controller One","NumOfOperationalPsus":4,"PowerBrakeAssert":false,"PscId":"PSC1","Status":"Operational"}"#
+        );
+
+        let psu: NvidiaPsuStateSchema = serde_json::from_str(NVIDIA_PSU_STATE_BODY)?;
+        assert_eq!(
+            nvidia_psu_state_projection(&psu)?.payload().as_str(),
+            r#"{"Description":"PSU state","DocumentType":"psu_state","Id":"1","Input1Active":true,"Input2Active":false,"Name":"Power Supply One","Presence":true,"PsuId":"PSU1"}"#
+        );
+
+        let redundancy: NvidiaPsuRedundancySchema =
+            serde_json::from_str(NVIDIA_PSU_REDUNDANCY_BODY)?;
+        assert_eq!(
+            nvidia_psu_redundancy_projection(&redundancy)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"PSU redundancy settings","DocumentType":"psu_redundancy","Id":"PSURedundancy","MaxNumSupported":"4","MinNumNeeded":"2","Name":"PSU Redundancy","RedundancySetting":"NPlusOne"}"#
+        );
+
+        let entity: NvidiaManagedEntitySchema = serde_json::from_str(NVIDIA_MANAGED_ENTITY_BODY)?;
+        assert_eq!(
+            nvidia_managed_entity_projection(&entity)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"BlueField managed entity","DocumentType":"managed_entity","IPv4Address":"192.0.2.10","IPv6Address":"2001:db8::10","Id":"1","Name":"Managed Entity One","Port":443,"TransportProtocol":"HTTPS"}"#
+        );
+        let sparse_entity: NvidiaManagedEntitySchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1","Id":"1","Name":"Managed Entity One"}"#,
+        )?;
+        assert_eq!(
+            nvidia_managed_entity_projection(&sparse_entity)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"managed_entity","Id":"1","Name":"Managed Entity One"}"#
         );
         Ok(())
     }
