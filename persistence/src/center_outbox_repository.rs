@@ -1,3 +1,4 @@
+use rutilus_center_protocol::{Envelope, EnvelopeMessage};
 use rutilus_domain::{
     InstanceId, OutboxEntry, OutboxEntryError, OutboxEntryId, OutboxEntryState,
     OutboxEntryStateParseError,
@@ -14,6 +15,78 @@ use time::OffsetDateTime;
 use crate::SqliteStore;
 
 impl SqliteStore {
+    /// Allocates the next per-instance sequence and persists one envelope
+    /// as one atomic write (design §17, D4; §15.4).
+    ///
+    /// The envelope's payload column holds the §9.4 typed payload: the serde
+    /// JSON serialization of the center-protocol `Envelope`, built here from
+    /// `message` with the allocated sequence and `acked_sequence: 0`, so the
+    /// stored payload always agrees with the row's sequence column and can
+    /// only ever be JSON produced by a successfully serialized wire type.
+    /// The allocation and the insert run under one write-gate acquisition,
+    /// so two concurrent enqueues can never observe the same maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterOutboxRepositoryError::SequenceOverflow`] when the
+    /// next sequence exceeds the signed `SQLite` range, and
+    /// [`CenterOutboxRepositoryError`] variants for coordination,
+    /// serialization, or database failures.
+    pub async fn enqueue_outbox_entry(
+        &self,
+        instance_id: InstanceId,
+        message: &EnvelopeMessage,
+        created_at: OffsetDateTime,
+    ) -> Result<OutboxEntry, CenterOutboxRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(CenterOutboxRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        let maximum = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .select_only()
+            .column_as(Expr::col(center_outbox::Column::Sequence).max(), "max")
+            .into_tuple::<(Option<i64>,)>()
+            .one(&transaction)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?
+            .and_then(|(maximum,)| maximum)
+            .unwrap_or(0);
+        let sequence = maximum
+            .checked_add(1)
+            .ok_or(CenterOutboxRepositoryError::SequenceOverflow { sequence: maximum })?;
+        // The wire sequence is an unsigned field; the allocation is bounded
+        // by the signed SQLite range above, so the conversion is exact.
+        let wire_sequence = u64::try_from(sequence)
+            .map_err(|_| CenterOutboxRepositoryError::SequenceOverflow { sequence })?;
+        let envelope = Envelope {
+            sequence: wire_sequence,
+            acked_sequence: 0,
+            message: Some(message.clone()),
+        };
+        let payload_json =
+            serde_json::to_string(&envelope).map_err(CenterOutboxRepositoryError::Payload)?;
+        let entry = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            instance_id,
+            sequence,
+            payload_json,
+            created_at,
+        );
+        insert_outbox_entry(&transaction, &entry).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        Ok(entry)
+    }
+
     /// Queues one outbound envelope for delivery (design §17, D4).
     ///
     /// The per-instance sequence is pinned by the unique
@@ -250,6 +323,10 @@ pub enum AckOutcome {
 pub enum CenterOutboxRepositoryError {
     #[error("outbox write coordination is unavailable")]
     Coordinate(#[source] tokio::sync::AcquireError),
+    #[error("the outbox sequence cannot advance past {sequence}")]
+    SequenceOverflow { sequence: i64 },
+    #[error("the envelope could not be serialized into the outbox payload: {0}")]
+    Payload(#[source] serde_json::Error),
     #[error("outbox entry {entry_id} was not found")]
     NotFound { entry_id: OutboxEntryId },
     #[error("stored outbox entry {entry_id} is invalid: {source}")]

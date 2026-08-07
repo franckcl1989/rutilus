@@ -37,12 +37,12 @@ pub use batch_refresh::{
     BatchEndpointRefresh, BatchEndpointRefreshError, EndpointRefreshFailureKind,
     EndpointRefreshOutcome, MAX_CONCURRENT_REFRESHES, MAX_REFRESH_TARGETS,
 };
-pub use center_sync::{CenterSync, CenterSyncError, CenterSyncOptions};
-pub use center_transport::{CenterSession, CenterTransport};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
 };
+pub use center_sync::{CenterOutbox, CenterSync, CenterSyncError, CenterSyncOptions};
+pub use center_transport::{CenterSession, CenterTransport};
 pub use command_executor::{
     CommandExecutor, CommandOutcome, CommandVerifier, DispatchVerdict, DispatchVerdictClassifier,
     VerificationVerdict,

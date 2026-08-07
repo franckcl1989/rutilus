@@ -4,10 +4,11 @@ use rutilus_application::{
     EndpointInventoryItemError, EndpointInventoryRepository, EndpointRefreshRepository,
     ResourceObservation, StoredCapability,
 };
+use rutilus_center_protocol::EnvelopeMessage;
 use rutilus_domain::{
     AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
-    EndpointCapabilityObservation, EndpointId, FailureKind, Operation, OperationId, OperationState,
-    ResourceSnapshot,
+    EndpointCapabilityObservation, EndpointId, FailureKind, InstanceId, Operation, OperationId,
+    OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot,
 };
 use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore, RemoteTask,
@@ -17,9 +18,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    AuditRepositoryError, CredentialRepositoryError, EndpointCapabilityRepositoryError,
-    EndpointRepositoryError, NewResourceSnapshot, OperationRepositoryError,
-    RemoteTaskRepositoryError, ResourceSnapshotRepositoryError, SqliteStore,
+    AuditRepositoryError, CenterOutboxRepositoryError, CredentialRepositoryError,
+    EndpointCapabilityRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
+    OperationRepositoryError, RemoteTaskRepositoryError, ResourceSnapshotRepositoryError,
+    SqliteStore,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -255,6 +257,41 @@ impl EndpointInventoryRepository for SqliteStore {
                 );
             }
             Ok(inventory)
+        })
+    }
+}
+
+impl rutilus_application::CenterOutbox for SqliteStore {
+    type Error = CenterOutboxRepositoryError;
+
+    fn enqueue<'a>(
+        &'a self,
+        instance_id: InstanceId,
+        message: &'a EnvelopeMessage,
+        created_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<OutboxEntry, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::enqueue_outbox_entry(self, instance_id, message, created_at).await
+        })
+    }
+
+    fn list_pending(
+        &self,
+        instance_id: InstanceId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_pending_outbox(self, instance_id, limit).await })
+    }
+
+    fn acknowledge(
+        &self,
+        entry_id: OutboxEntryId,
+        acked_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::ack_outbox_entry(self, entry_id, acked_at)
+                .await
+                .map(|_| ())
         })
     }
 }

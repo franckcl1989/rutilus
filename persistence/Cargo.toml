@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 rutilus-application.workspace = true
+rutilus-center-protocol.workspace = true
 rutilus-domain.workspace = true
 rutilus-entity.workspace = true
 rutilus-migration.workspace = true
