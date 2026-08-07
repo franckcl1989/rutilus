@@ -1,8 +1,8 @@
 use std::error::Error;
 
 use rutilus_domain::{
-    InvalidTransition, Operation, OperationEvent, OperationId, OperationSource, OperationState,
-    OperationTarget, RedfishCommand,
+    BatchOperation, BatchOperationId, InvalidTransition, Operation, OperationEvent, OperationId,
+    OperationSource, OperationState, OperationTarget, RedfishCommand,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -44,6 +44,18 @@ pub const RECOVERABLE_STATES: [OperationState; 4] = [
     OperationState::WaitingRemote,
     OperationState::Verifying,
 ];
+
+/// The supported upper bound of one batch's target count (design §13.7).
+///
+/// # Why 128
+///
+/// A batch commits one parent and all its children in a single transaction
+/// and one batch report pairs every child with its outcome, so the bound
+/// keeps one batch's transaction and projection bounded while staying far
+/// above any realistic managed-endpoint sweep. It is a product limit, not a
+/// storage limit: the database imposes none, and callers surface the limit
+/// as a clean rejection instead of an unbounded write.
+pub const MAX_BATCH_TARGETS: usize = 128;
 
 /// Drives the persisted Operation lifecycle (design section 13).
 ///
@@ -188,6 +200,69 @@ where
             .map_err(EngineError::Store)
     }
 
+    /// Constructs one batch parent and its single-target child operations,
+    /// persists them atomically, and returns the parent with its children.
+    ///
+    /// # Why every child is an ordinary operation
+    ///
+    /// Design section 13.7 turns a multi-endpoint submission into one batch
+    /// parent plus one ordinary single-target `Operation` per submitted
+    /// endpoint — the same §13.2 state machine, the same scheduler, the same
+    /// recovery. The executor, scheduler, Task monitor, recovery, and audit
+    /// paths never see the batch; only the parent record links the children.
+    ///
+    /// `targets` must contain at least one target (a batch is a list of
+    /// targets, not an empty one, exactly like [`Self::create`]) and at most
+    /// [`MAX_BATCH_TARGETS`] targets. The batch id and every child's
+    /// `OperationId` are generated fresh here, so two calls never produce the
+    /// same records; [`OperationStore::create_batch`] is still idempotent on
+    /// the batch id (design §15.4) as the guard for re-delivery, which must
+    /// never re-insert the children.
+    ///
+    /// `now` is the caller-supplied creation time with the same monotonic
+    /// contract as [`Self::create`]: the domain trusts it without re-checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::EmptyTargets`] when `targets` is empty,
+    /// [`EngineError::TooManyTargets`] when it exceeds [`MAX_BATCH_TARGETS`],
+    /// and [`EngineError::Store`] when the persistence boundary rejects the
+    /// write.
+    pub async fn create_batch(
+        &self,
+        source: OperationSource,
+        targets: Vec<OperationTarget>,
+        command: RedfishCommand,
+        now: OffsetDateTime,
+    ) -> Result<(BatchOperation, Vec<Operation>), EngineError<Store::Error>> {
+        if targets.is_empty() {
+            return Err(EngineError::EmptyTargets);
+        }
+        if targets.len() > MAX_BATCH_TARGETS {
+            return Err(EngineError::TooManyTargets {
+                limit: MAX_BATCH_TARGETS,
+            });
+        }
+        let batch = BatchOperation::new(BatchOperationId::generate(), source, command, now);
+        let children = targets
+            .into_iter()
+            .map(|target| {
+                Operation::new(
+                    OperationId::generate(),
+                    source,
+                    vec![target],
+                    batch.command(),
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .create_batch(&batch, &children)
+            .await
+            .map_err(EngineError::Store)?;
+        Ok((batch, children))
+    }
+
     /// Lists operations in [`RECOVERABLE_STATES`] after a restart.
     ///
     /// This first version only reports the candidates; the upper layer (the
@@ -228,6 +303,13 @@ where
     /// The operation would have no target and could never execute.
     #[error("operation must target at least one object")]
     EmptyTargets,
+    /// The batch would exceed the supported target limit (§13.7).
+    ///
+    /// A batch commits its parent and every child in one transaction and one
+    /// report pairs each child with its outcome, so the supported bound keeps
+    /// one batch bounded; the caller should split the submission.
+    #[error("a batch may target at most {limit} endpoints")]
+    TooManyTargets { limit: usize },
     /// The domain state machine rejected the event for the current state.
     #[error("operation {operation_id} rejected transition: {source}")]
     InvalidTransition {
@@ -245,8 +327,8 @@ mod tests {
     use std::{collections::HashMap, io, sync::Mutex};
 
     use rutilus_domain::{
-        EndpointId, OperationId, OperationState, OperationTarget, ResetType, SystemCommand,
-        TargetId,
+        BatchOperation, BatchOperationId, EndpointId, OperationId, OperationState, OperationTarget,
+        ResetType, SystemCommand, TargetId,
     };
     use thiserror::Error;
     use time::{Duration, OffsetDateTime};
@@ -264,6 +346,10 @@ mod tests {
         SaveRemoteTask(OperationId),
         FindRemoteTask(OperationId),
         ListRemoteTasks(RemoteTaskState),
+        CreateBatch(BatchOperationId),
+        FindBatch(BatchOperationId),
+        ListBatches,
+        ListBatchChildren(BatchOperationId),
     }
 
     /// A recorded state step, with the exact timestamp the engine supplied.
@@ -295,6 +381,8 @@ mod tests {
     struct FakeStore {
         rows: Mutex<HashMap<OperationId, Operation>>,
         remote_rows: Mutex<HashMap<OperationId, RemoteTask>>,
+        batch_rows: Mutex<HashMap<BatchOperationId, BatchOperation>>,
+        batch_children: Mutex<HashMap<BatchOperationId, Vec<Operation>>>,
         calls: Mutex<Vec<Call>>,
         steps: Mutex<Vec<TransitionStep>>,
         fail_next_write: Mutex<bool>,
@@ -305,10 +393,41 @@ mod tests {
             Self {
                 rows: Mutex::new(HashMap::new()),
                 remote_rows: Mutex::new(HashMap::new()),
+                batch_rows: Mutex::new(HashMap::new()),
+                batch_children: Mutex::new(HashMap::new()),
                 calls: Mutex::new(Vec::new()),
                 steps: Mutex::new(Vec::new()),
                 fail_next_write: Mutex::new(false),
             }
+        }
+
+        fn find_batch_owned(
+            &self,
+            batch_id: BatchOperationId,
+        ) -> Result<Option<BatchOperation>, FakeStoreError> {
+            self.batch_rows
+                .lock()
+                .map_err(|_| FakeStoreError::Failure)
+                .map(|rows| rows.get(&batch_id).cloned())
+        }
+
+        fn list_batch_children_owned(
+            &self,
+            batch_id: BatchOperationId,
+        ) -> Result<Vec<Operation>, FakeStoreError> {
+            let mut children = self
+                .batch_children
+                .lock()
+                .map_err(|_| FakeStoreError::Failure)?
+                .get(&batch_id)
+                .cloned()
+                .unwrap_or_default();
+            // Target order (§13.7): each child carries exactly one target, so
+            // ordering by that target's identity is a total order; a corrupt
+            // zero-target row (impossible through the engine) sorts first by
+            // `None` instead of panicking.
+            children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+            Ok(children)
         }
 
         fn arm_write_failure(&self) -> Result<(), FakeStoreError> {
@@ -446,6 +565,81 @@ mod tests {
                     .filter(|operation| state.is_none_or(|state| operation.state() == state))
                     .cloned()
                     .collect())
+            })
+        }
+
+        fn create_batch<'a>(
+            &'a self,
+            batch: &'a BatchOperation,
+            children: &'a [Operation],
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::CreateBatch(batch.id()));
+                // At-least-once delivery (§15.4): a re-delivered batch id is
+                // a no-op that never re-inserts the children, mirroring the
+                // production repository's "already exists -> return" rule.
+                let mut batch_rows = self
+                    .batch_rows
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?;
+                if batch_rows.contains_key(&batch.id()) {
+                    return Ok(());
+                }
+                batch_rows.insert(batch.id(), batch.clone());
+                self.batch_children
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .insert(batch.id(), children.to_vec());
+                Ok(())
+            })
+        }
+
+        fn find_batch(
+            &self,
+            batch_id: BatchOperationId,
+        ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::FindBatch(batch_id));
+                self.find_batch_owned(batch_id)
+            })
+        }
+
+        fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::ListBatches);
+                let mut batches = self
+                    .batch_rows
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // Acceptance order: creation time, then identity, mirroring
+                // the production listing.
+                batches.sort_by_key(|batch| (batch.created_at(), batch.id()));
+                Ok(batches)
+            })
+        }
+
+        fn list_batch_children(
+            &self,
+            batch_id: BatchOperationId,
+        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::ListBatchChildren(batch_id));
+                self.list_batch_children_owned(batch_id)
             })
         }
     }
@@ -935,6 +1129,194 @@ mod tests {
                 Call::ApplyTransition(created.id(), OperationState::Succeeded),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_batch_persists_one_parent_and_single_target_children_in_one_call()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let targets = [one_target(), one_target(), one_target()];
+
+        let (batch, children) = engine
+            .create_batch(OperationSource::Site, targets.to_vec(), one_command(), now)
+            .await?;
+
+        assert_eq!(batch.source(), OperationSource::Site);
+        assert_eq!(batch.command(), one_command());
+        assert_eq!(batch.created_at(), now);
+        assert_eq!(children.len(), 3);
+        // Every child is an ordinary single-target queued operation.
+        for (child, target) in children.iter().zip(targets) {
+            assert_eq!(child.state(), OperationState::Queued);
+            assert_eq!(child.targets(), &[target]);
+            assert_eq!(child.command(), one_command());
+            assert_eq!(child.created_at(), now);
+            assert_eq!(child.source(), OperationSource::Site);
+        }
+        // The children are distinct ordinary operations, exactly like any
+        // other submitted operation, and the parent + all children landed in
+        // one atomic store call (§13.7).
+        let stored = store
+            .find_batch_owned(batch.id())?
+            .ok_or_else(|| io::Error::other("created batch must be stored"))?;
+        assert_eq!(stored, batch);
+        assert_eq!(store.list_batch_children_owned(batch.id())?, children);
+        assert_eq!(store.calls()?, vec![Call::CreateBatch(batch.id())]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_batch_rejects_empty_targets_without_touching_the_store()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+
+        let error = engine
+            .create_batch(
+                OperationSource::Standalone,
+                Vec::new(),
+                one_command(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("empty-target batch must fail"))?;
+        assert_eq!(
+            error.to_string(),
+            "operation must target at least one object"
+        );
+        assert!(matches!(error, EngineError::EmptyTargets));
+        // The store is never contacted for a batch that cannot execute.
+        assert_eq!(store.calls()?, Vec::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_batch_rejects_more_than_128_targets_without_touching_the_store()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let targets = (0..=MAX_BATCH_TARGETS)
+            .map(|_| one_target())
+            .collect::<Vec<_>>();
+
+        let error = engine
+            .create_batch(
+                OperationSource::Standalone,
+                targets,
+                one_command(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("over-limit batch must fail"))?;
+        assert_eq!(
+            error.to_string(),
+            format!("a batch may target at most {MAX_BATCH_TARGETS} endpoints")
+        );
+        assert!(matches!(
+            error,
+            EngineError::TooManyTargets {
+                limit: MAX_BATCH_TARGETS
+            }
+        ));
+        // The store is never contacted for an over-limit batch.
+        assert_eq!(store.calls()?, Vec::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_batch_redelivery_is_a_no_op_that_never_duplicates_children()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let (batch, children) = engine
+            .create_batch(
+                OperationSource::Center,
+                vec![one_target(), one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+
+        // At-least-once delivery (§15.4): the same batch id delivered again
+        // must be a no-op — the stored batch and its children are
+        // authoritative and must never be re-inserted.
+        store.create_batch(&batch, &children).await?;
+        store.create_batch(&batch, &children).await?;
+
+        let stored_batch = store.find_batch_owned(batch.id())?;
+        assert_eq!(
+            stored_batch.as_ref(),
+            Some(&batch),
+            "re-delivery must not rewrite the stored batch"
+        );
+        assert_eq!(
+            store.list_batch_children_owned(batch.id())?,
+            children,
+            "re-delivery must never re-insert the children"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_batches_restores_acceptance_order_and_children_restore_target_order()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let base = OffsetDateTime::now_utc();
+
+        let (later_batch, later_children) = engine
+            .create_batch(
+                OperationSource::Site,
+                vec![one_target(), one_target(), one_target()],
+                one_command(),
+                base + Duration::SECOND,
+            )
+            .await?;
+        let (earlier_batch, earlier_children) = engine
+            .create_batch(
+                OperationSource::Center,
+                vec![one_target()],
+                one_command(),
+                base,
+            )
+            .await?;
+
+        // The listing restores acceptance order (creation time, then
+        // identity), matching the operation listing's deterministic order.
+        let batches = store.list_batches().await?;
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].id(), earlier_batch.id());
+        assert_eq!(batches[1].id(), later_batch.id());
+
+        // Children restore in target order, pairing every endpoint with its
+        // child (§13.7), regardless of the order the targets were submitted
+        // in.
+        let mut expected_children = later_children;
+        expected_children
+            .sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        assert_eq!(
+            store.list_batch_children(later_batch.id()).await?,
+            expected_children
+        );
+        assert_eq!(
+            store.list_batch_children(earlier_batch.id()).await?,
+            earlier_children
+        );
+        // An unknown batch id reads an empty child list; the parent
+        // existence is a separate read.
+        assert!(
+            store
+                .list_batch_children(BatchOperationId::generate())
+                .await?
+                .is_empty()
+        );
+        assert_eq!(store.find_batch(BatchOperationId::generate()).await?, None);
         Ok(())
     }
 

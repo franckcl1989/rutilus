@@ -10,10 +10,15 @@
 //!
 //! - [`OperationStore`] is the persistence boundary: it is implemented by
 //!   `rutilus-persistence` in production and by an in-memory fake in tests.
-//!   The engine never sees `SQLite` or `SeaORM` (design section 7.3).
+//!   The engine never sees `SQLite` or `SeaORM` (design section 7.3). The
+//!   boundary also carries the §13.7 batch surface — `create_batch` commits
+//!   one batch parent and its ordinary single-target child operations
+//!   atomically and idempotently, plus the batch read queries — because a
+//!   batch is persisted through the same store as every other operation.
 //! - [`OperationEngine`] is the generic coordinator: it constructs and
-//!   persists new operations, applies domain events, lists operations, and
-//!   reports the operations left in a recoverable state after a restart.
+//!   persists new operations, applies domain events, lists operations,
+//!   constructs batch parents with their child operations, and reports the
+//!   operations left in a recoverable state after a restart.
 //! - [`EngineError`] wraps the store's own error type so every persistence
 //!   failure keeps its context while the engine adds its own verdicts.
 //! - [`RemoteTask`], [`RemoteTaskState`], and [`TaskUri`] are the §13.6
@@ -53,7 +58,7 @@ mod operation_store;
 mod remote_task;
 mod remote_task_store;
 
-pub use operation_engine::{EngineError, OperationEngine, RECOVERABLE_STATES};
+pub use operation_engine::{EngineError, MAX_BATCH_TARGETS, OperationEngine, RECOVERABLE_STATES};
 pub use operation_store::{BoundaryFuture, OperationStore};
 pub use remote_task::{
     RemoteTask, RemoteTaskError, RemoteTaskState, RemoteTaskStateParseError, TaskUri, TaskUriError,

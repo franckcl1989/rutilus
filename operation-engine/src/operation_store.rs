@@ -1,6 +1,6 @@
 use std::{error::Error, future::Future, pin::Pin};
 
-use rutilus_domain::{Operation, OperationId, OperationState};
+use rutilus_domain::{BatchOperation, BatchOperationId, Operation, OperationId, OperationState};
 use time::OffsetDateTime;
 
 /// A boxed future returned by boundary traits so implementers stay `dyn`-safe.
@@ -83,6 +83,52 @@ pub trait OperationStore: Send + Sync {
         &self,
         state: Option<OperationState>,
     ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>>;
+
+    /// Atomically persists one batch parent and every child operation
+    /// (design section 13.7).
+    ///
+    /// A batch is one `batch_operations` parent plus one ordinary
+    /// single-target child operation per submitted endpoint; the parent and
+    /// all children commit in one transaction, so a child can never be
+    /// persisted without its batch (or half a batch without the rest).
+    ///
+    /// # Idempotency (design section 15.4)
+    ///
+    /// Delivery is at-least-once, exactly like [`Self::create_operation`]: a
+    /// second call with the same `BatchOperationId` MUST return `Ok(())`
+    /// without touching any stored row — the persisted batch is authoritative
+    /// and a re-delivered batch must never re-insert its children (single
+    /// business effect per batch). The persisted rows are always
+    /// authoritative; callers that need them re-read through
+    /// [`Self::find_batch`] and [`Self::list_batch_children`].
+    fn create_batch<'a>(
+        &'a self,
+        batch: &'a BatchOperation,
+        children: &'a [Operation],
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>>;
+
+    /// Reads one batch parent by id; `None` when the id is unknown.
+    fn find_batch(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>>;
+
+    /// Lists every batch parent in acceptance order (creation time, then
+    /// identity), so batch reporting (design section 13.7) replays the same
+    /// deterministic order as the operation listing.
+    fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>>;
+
+    /// Lists one batch's child operations in target order.
+    ///
+    /// Each child carries exactly one target, so target order is a total
+    /// order over the batch; reporting (design section 13.7) reads the
+    /// children in this deterministic order to pair each endpoint with its
+    /// child outcome. An unknown batch id returns an empty list (the parent
+    /// existence is a separate [`Self::find_batch`] read).
+    fn list_batch_children(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>>;
 }
 
 impl<Store> OperationStore for &Store
@@ -119,5 +165,31 @@ where
         state: Option<OperationState>,
     ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         Store::list_operations(*self, state)
+    }
+
+    fn create_batch<'a>(
+        &'a self,
+        batch: &'a BatchOperation,
+        children: &'a [Operation],
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Store::create_batch(*self, batch, children)
+    }
+
+    fn find_batch(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+        Store::find_batch(*self, batch_id)
+    }
+
+    fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
+        Store::list_batches(*self)
+    }
+
+    fn list_batch_children(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Store::list_batch_children(*self, batch_id)
     }
 }
