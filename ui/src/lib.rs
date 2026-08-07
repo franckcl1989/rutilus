@@ -10,19 +10,20 @@ use std::{collections::BTreeSet, fmt};
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
     AboutResponse, ArtifactResponse, ArtifactStateResponse, AuditEventResponse, AuditQueryResponse,
-    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode,
-    CapabilityEntryResponse, CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse,
-    CoreResourceResponse, CreateSubscription, CredentialInventoryResponse,
-    CredentialSummaryResponse, DeleteSubscription, EndpointCapabilityInventoryResponse,
-    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
-    EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EventCommand,
-    EventDestinationProtocol, EventListResponse, EventResponse, EventType, GroupResponse,
-    ManagerCommand, MetricValueResponse, OperationResponse, OperationSourceResponse,
-    OperationStateResponse, RedfishCommand, ResetKeysType, ResetType, ResourceDiagnosticsResponse,
-    ResourceStatusResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
-    TagListResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
+    BatchOperationResponse, BootCommand, BootSource, BootSourceOverrideEnabled,
+    BootSourceOverrideMode, CapabilityEntryResponse, CapabilityStateResponse, ChassisCommand,
+    CoreResourceDetailsResponse, CoreResourceResponse, CreateSubscription,
+    CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
+    EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse, EndpointSummaryResponse,
+    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
+    EndpointTrustExpectationRequest, EventCommand, EventDestinationProtocol, EventListResponse,
+    EventResponse, EventType, GroupResponse, ManagerCommand, MetricValueResponse,
+    OperationResponse, OperationSourceResponse, OperationStateResponse, RedfishCommand,
+    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
+    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
     TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
@@ -307,14 +308,20 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // three-line counts summary keeps its 0.1 wire shape. The
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, the PcieDevice/Assembly/SoftwareInventory read
-            // families, and the EventService/EventSubscription/
+            // surface, the OemDell / OemSmcSysLockdown / OemSmcKcsInterface /
+            // OemNvidia* §11.5 OEM families, the
+            // PcieDevice/Assembly/SoftwareInventory read families, and the
+            // EventService/EventSubscription/
             // TelemetryService/MetricDefinition/MetricReport/TaskService/Task
             // service families follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::OemDell { .. }
             | CoreResourceDetailsResponse::OemSmcSysLockdown { .. }
             | CoreResourceDetailsResponse::OemSmcKcsInterface { .. }
+            | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { .. }
+            | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus { .. }
+            | CoreResourceDetailsResponse::OemNvidiaSystemProfile { .. }
+            | CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -508,7 +515,11 @@ fn oem_resource_card(
     match resource.resource() {
         CoreResourceDetailsResponse::OemDell { .. }
         | CoreResourceDetailsResponse::OemSmcSysLockdown { .. }
-        | CoreResourceDetailsResponse::OemSmcKcsInterface { .. } => Some(
+        | CoreResourceDetailsResponse::OemSmcKcsInterface { .. }
+        | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { .. }
+        | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus { .. }
+        | CoreResourceDetailsResponse::OemNvidiaSystemProfile { .. }
+        | CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. } => Some(
             CoreResourceCardProjection::from_resource(endpoint_id, resource),
         ),
         CoreResourceDetailsResponse::ServiceRoot { .. }
@@ -562,6 +573,18 @@ fn card_facts(
         }
         CoreResourceDetailsResponse::OemSmcKcsInterface { .. } => {
             oem_smc_kcs_interface_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { .. } => {
+            oem_nvidia_system_config_profile_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus { .. } => {
+            oem_nvidia_system_config_profile_status_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaSystemProfile { .. } => {
+            oem_nvidia_system_profile_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. } => {
+            oem_nvidia_system_profile_file_card_facts(resource)
         }
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
@@ -1597,6 +1620,157 @@ fn oem_smc_kcs_interface_card_facts(
     ("Supermicro KCS Interface", facts)
 }
 
+/// Facts for the NVIDIA `SystemConfigProfile` chain-root card under the
+/// §0.5.0 `oem-nvidia-profiles` family.
+///
+/// The `Truststore` metadata renders the presence of each certificate-store
+/// link in its canonical wire spelling (`true` / `false`) per §12.3; the
+/// certificate payloads behind the links stay out of the product entirely
+/// (the sensitive surface is deferred).
+///
+/// The dispatcher guarantees this receives the
+/// `OemNvidiaSystemConfigProfile` variant; the fallback keeps a stable empty
+/// facts list instead of panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_system_config_profile_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { truststore } = resource else {
+        return ("NVIDIA System Config Profile", Vec::new());
+    };
+    let mut facts = Vec::new();
+    if let Some(truststore) = truststore {
+        push_boolean_fact(
+            &mut facts,
+            "NVIDIA certificates",
+            truststore.nvidia_certificates(),
+        );
+        push_boolean_fact(
+            &mut facts,
+            "OEM certificates",
+            truststore.oem_certificates(),
+        );
+    }
+    ("NVIDIA System Config Profile", facts)
+}
+
+/// Facts for the NVIDIA `SystemConfigProfileStatus` card under the §0.5.0
+/// `oem-nvidia-profiles` family.
+///
+/// The compiled status fields render verbatim per §12.3: the
+/// `PendingList.Activation` text, the numeric profile indices, and the
+/// `FactoryResetStatus` text. Each optional value renders only when the
+/// document published the property.
+///
+/// The dispatcher guarantees this receives the
+/// `OemNvidiaSystemConfigProfileStatus` variant; the fallback keeps a stable
+/// empty facts list instead of panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_system_config_profile_status_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus {
+        pending_list_activation,
+        active_profile_index,
+        bmc_profile_version,
+        factory_reset_status,
+        default_profile_index,
+    } = resource
+    else {
+        return ("NVIDIA Profile Status", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Pending activation",
+        pending_list_activation.as_deref(),
+    );
+    push_i64_fact(&mut facts, "Active profile index", *active_profile_index);
+    push_i64_fact(&mut facts, "BMC profile version", *bmc_profile_version);
+    push_fact(
+        &mut facts,
+        "Factory reset status",
+        factory_reset_status.as_deref(),
+    );
+    push_i64_fact(&mut facts, "Default profile index", *default_profile_index);
+    ("NVIDIA Profile Status", facts)
+}
+
+/// Facts for the NVIDIA `SystemProfile` card under the §0.5.0
+/// `oem-nvidia-profiles` family.
+///
+/// The compiled metadata fields render verbatim per §12.3: the `Default`
+/// boolean in its canonical wire spelling, the `Owner` / `UUID` /
+/// `ProfileName` texts, and the numeric `Version`. Each optional value
+/// renders only when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaSystemProfile`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_system_profile_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaSystemProfile {
+        default,
+        owner,
+        uuid,
+        version,
+        profile_name,
+    } = resource
+    else {
+        return ("NVIDIA System Profile", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_boolean_fact(&mut facts, "Default", *default);
+    push_fact(&mut facts, "Owner", owner.as_deref());
+    push_fact(&mut facts, "UUID", uuid.as_deref());
+    push_i64_fact(&mut facts, "Version", *version);
+    push_fact(&mut facts, "Profile name", profile_name.as_deref());
+    ("NVIDIA System Profile", facts)
+}
+
+/// Facts for the NVIDIA `SystemProfileFile` card under the §0.5.0
+/// `oem-nvidia-profiles` family.
+///
+/// The compiled file fields render verbatim per §12.3: the `Metadata`
+/// flags and texts plus the base64 `Profile` content, never re-interpreted
+/// by the product.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaSystemProfileFile`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_system_profile_file_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaSystemProfileFile {
+        metadata_activate,
+        metadata_delete,
+        metadata_origin_profile_uuid,
+        metadata_more_profiles,
+        metadata_project_name,
+        metadata_uuid,
+        profile,
+    } = resource
+    else {
+        return ("NVIDIA Profile File", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_boolean_fact(&mut facts, "Activate", *metadata_activate);
+    push_boolean_fact(&mut facts, "Delete", *metadata_delete);
+    push_fact(
+        &mut facts,
+        "Origin profile UUID",
+        metadata_origin_profile_uuid.as_deref(),
+    );
+    push_boolean_fact(&mut facts, "More profiles", *metadata_more_profiles);
+    push_fact(&mut facts, "Project name", metadata_project_name.as_deref());
+    push_fact(&mut facts, "UUID", metadata_uuid.as_deref());
+    push_fact(&mut facts, "Profile", profile.as_deref());
+    ("NVIDIA Profile File", facts)
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn push_hardware_facts(
     facts: &mut Vec<ResourceFactProjection>,
@@ -1631,6 +1805,36 @@ fn push_u64_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, v
         facts.push(ResourceFactProjection {
             label,
             value: value.to_string(),
+        });
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders one signed numeric resource fact (the NVIDIA profile indices)
+/// only when a value exists, keeping the facts list free of placeholder text
+/// for absent observations.
+fn push_i64_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value: Option<i64>) {
+    if let Some(value) = value {
+        facts.push(ResourceFactProjection {
+            label,
+            value: value.to_string(),
+        });
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Renders one boolean resource fact in its canonical wire spelling
+/// (`true` / `false`) only when a value exists, keeping the facts list free
+/// of placeholder text for absent observations.
+fn push_boolean_fact(
+    facts: &mut Vec<ResourceFactProjection>,
+    label: &'static str,
+    value: Option<bool>,
+) {
+    if let Some(value) = value {
+        facts.push(ResourceFactProjection {
+            label,
+            value: if value { "true" } else { "false" }.to_owned(),
         });
     }
 }
@@ -6109,6 +6313,28 @@ enum TagApplyState {
     Failed(String),
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+/// Parses the submission acknowledgement for the selected target count
+/// (§13.1, §13.7).
+///
+/// One target acknowledges an ordinary operation; several targets acknowledge
+/// the batch parent whose children pair with the submitted endpoints. A body
+/// that cannot be parsed as the selected contract is a malformed
+/// acknowledgement and maps to the single static failure message, exactly
+/// like every other refused submission. The batch per-endpoint report view
+/// is a later slice; this cut only needs the submission to succeed.
+fn acknowledge_submission(target_count: usize, body: &str) -> Result<(), &'static str> {
+    if target_count > 1 {
+        json::from_str::<BatchOperationResponse>(body)
+            .map(|_| ())
+            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)
+    } else {
+        json::from_str::<OperationResponse>(body)
+            .map(|_| ())
+            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use std::collections::BTreeSet;
@@ -9807,16 +10033,24 @@ mod browser {
         }
     }
 
-    /// Submits one operation draft (§13.1).
+    /// Submits one operation draft (§13.1, §13.7).
     ///
     /// The draft must already be validated (the form only calls this after
     /// `try_build` succeeds); a refused submission maps to the single static
     /// failure message because the route's rejection reasons are not part of
     /// the current console contract.
+    ///
+    /// The acknowledgement is parsed by the selected-target count: one target
+    /// acknowledges an ordinary `OperationResponse`; several targets
+    /// acknowledge the batch parent (`BatchOperationResponse`), whose
+    /// children carry the same typed command and are executed and reported as
+    /// ordinary operations. The per-endpoint batch report view is a later
+    /// slice; this cut only needs the submission to succeed.
     async fn submit_operation(
         draft: &OperationFormDraft,
         command: &OperationCommandDraft,
     ) -> Result<(), &'static str> {
+        let target_count = draft.selected_endpoint_ids.len();
         let targets: Result<Vec<_>, _> = draft
             .selected_endpoint_ids
             .iter()
@@ -9838,11 +10072,11 @@ mod browser {
         if !response.ok() {
             return Err(OperationSubmitState::FAILURE_MESSAGE);
         }
-        response
-            .json::<OperationResponse>()
+        let body = response
+            .text()
             .await
             .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
-        Ok(())
+        super::acknowledge_submission(target_count, &body)
     }
 
     /// Loads the §9.3 artifact inventory.
@@ -11989,6 +12223,111 @@ mod tests {
                 "resource_type": "oem_smc_kcs_interface",
                 "details": {
                     "privilege": "Operator"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_system_config_profile_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e4",
+                "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                "odata_type": "#NvidiaSystemConfigProfile.NvidiaSystemConfigProfile",
+                "etag": "W/\"nvidia-scp-1\""
+            },
+            "common": {
+                "id": "SystemConfigProfile",
+                "name": "NVIDIA System Config Profile",
+                "description": "Profile service"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_system_config_profile",
+                "details": {
+                    "truststore": {
+                        "nvidia_certificates": true,
+                        "oem_certificates": false
+                    }
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_system_config_profile_status_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e5",
+                "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+                "odata_type": "#NvidiaSystemConfigProfileStatus.NvidiaSystemConfigProfileStatus",
+                "etag": "W/\"nvidia-scp-status-1\""
+            },
+            "common": {
+                "id": "Status",
+                "name": "System Config Profile Status",
+                "description": "Profile service status"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_system_config_profile_status",
+                "details": {
+                    "pending_list_activation": "profile-1",
+                    "active_profile_index": 1,
+                    "bmc_profile_version": 2,
+                    "factory_reset_status": "Idle",
+                    "default_profile_index": 1
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_system_profile_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e6",
+                "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+                "odata_type": "#NvidiaSystemProfile.NvidiaSystemProfile",
+                "etag": "W/\"nvidia-profile-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Default Profile",
+                "description": "Factory default profile"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_system_profile",
+                "details": {
+                    "default": true,
+                    "owner": "Nvidia",
+                    "uuid": "11111111-2222-3333-4444-555555555555",
+                    "version": 1,
+                    "profile_name": "default-profile"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_system_profile_file_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e7",
+                "odata_id": "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+                "odata_type": "#NvidiaSystemProfileFile.NvidiaSystemProfileFile",
+                "etag": "W/\"nvidia-profile-file-1\""
+            },
+            "common": {
+                "id": "ProfileFile",
+                "name": "Profile File",
+                "description": "Signed profile file"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_system_profile_file",
+                "details": {
+                    "metadata_activate": true,
+                    "metadata_delete": false,
+                    "metadata_origin_profile_uuid": "11111111-2222-3333-4444-555555555555",
+                    "metadata_more_profiles": false,
+                    "metadata_project_name": "BlueField",
+                    "metadata_uuid": "11111111-2222-3333-4444-555555555555",
+                    "profile": "eyJwcm9maWxlIjogInRlc3QifQ=="
                 }
             }
         })
@@ -15127,6 +15466,154 @@ mod tests {
         Ok(())
     }
 
+    // The four NVIDIA chain documents are asserted in one test so the card
+    // order and the full fact surface stay one contract; the four card
+    // projections exceed the pedantic line budget, so the lint is scoped
+    // here exactly like the other OEM card-form tests.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_nvidia_resources() -> Result<(), Box<dyn Error>>
+    {
+        // The api contract has landed the NVIDIA system-config-profile family
+        // (`oem-nvidia-profiles`), so an NVIDIA snapshot (a system publishing
+        // the `Oem.Nvidia` profile chain) derives the data-card form through
+        // the wire projection, not by direct construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ae",
+                "display_name": "Rack D BMC",
+                "address": "https://192.0.2.13/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [
+                        oem_nvidia_system_config_profile_resource(),
+                        oem_nvidia_system_config_profile_status_resource(),
+                        oem_nvidia_system_profile_resource(),
+                        oem_nvidia_system_profile_file_resource()
+                    ]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("an NVIDIA snapshot must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 4);
+        let chain_root = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile")
+            .ok_or("the SystemConfigProfile card must exist")?;
+        assert_eq!(chain_root.type_label, "NVIDIA System Config Profile");
+        assert_eq!(chain_root.name, "NVIDIA System Config Profile");
+        // The Truststore link-presence metadata renders in its canonical
+        // wire spelling verbatim (§12.3); the certificate payloads behind
+        // the links never reach the card.
+        assert!(chain_root.facts.contains(&ResourceFactProjection {
+            label: "NVIDIA certificates",
+            value: "true".to_owned(),
+        }));
+        assert!(chain_root.facts.contains(&ResourceFactProjection {
+            label: "OEM certificates",
+            value: "false".to_owned(),
+        }));
+        let status = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+            })
+            .ok_or("the status card must exist")?;
+        assert_eq!(status.type_label, "NVIDIA Profile Status");
+        assert!(status.facts.contains(&ResourceFactProjection {
+            label: "Pending activation",
+            value: "profile-1".to_owned(),
+        }));
+        assert!(status.facts.contains(&ResourceFactProjection {
+            label: "Active profile index",
+            value: "1".to_owned(),
+        }));
+        assert!(status.facts.contains(&ResourceFactProjection {
+            label: "BMC profile version",
+            value: "2".to_owned(),
+        }));
+        assert!(status.facts.contains(&ResourceFactProjection {
+            label: "Factory reset status",
+            value: "Idle".to_owned(),
+        }));
+        assert!(status.facts.contains(&ResourceFactProjection {
+            label: "Default profile index",
+            value: "1".to_owned(),
+        }));
+        let profile = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+            })
+            .ok_or("the profile card must exist")?;
+        assert_eq!(profile.type_label, "NVIDIA System Profile");
+        // The compiled metadata fields render verbatim per §12.3.
+        assert!(profile.facts.contains(&ResourceFactProjection {
+            label: "Default",
+            value: "true".to_owned(),
+        }));
+        assert!(profile.facts.contains(&ResourceFactProjection {
+            label: "Owner",
+            value: "Nvidia".to_owned(),
+        }));
+        assert!(profile.facts.contains(&ResourceFactProjection {
+            label: "UUID",
+            value: "11111111-2222-3333-4444-555555555555".to_owned(),
+        }));
+        assert!(profile.facts.contains(&ResourceFactProjection {
+            label: "Version",
+            value: "1".to_owned(),
+        }));
+        assert!(profile.facts.contains(&ResourceFactProjection {
+            label: "Profile name",
+            value: "default-profile".to_owned(),
+        }));
+        let profile_file = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+            })
+            .ok_or("the profile file card must exist")?;
+        assert_eq!(profile_file.type_label, "NVIDIA Profile File");
+        // The metadata fields and the base64 content render verbatim (§12.3).
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "Activate",
+            value: "true".to_owned(),
+        }));
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "Delete",
+            value: "false".to_owned(),
+        }));
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "Origin profile UUID",
+            value: "11111111-2222-3333-4444-555555555555".to_owned(),
+        }));
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "More profiles",
+            value: "false".to_owned(),
+        }));
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "Project name",
+            value: "BlueField".to_owned(),
+        }));
+        assert!(profile_file.facts.contains(&ResourceFactProjection {
+            label: "Profile",
+            value: "eyJwcm9maWxlIjogInRlc3QifQ==".to_owned(),
+        }));
+        Ok(())
+    }
+
     #[test]
     fn oem_section_card_form_keeps_the_resource_card_surface() -> Result<(), Box<dyn Error>> {
         // Direct construction pins the switch condition and the card surface
@@ -16088,6 +16575,52 @@ mod tests {
             "created_at": "2026-08-06T09:10:11Z",
             "updated_at": "2026-08-06T09:12:13Z"
         }))
+    }
+
+    #[test]
+    fn submission_acknowledgement_branches_on_the_selected_target_count()
+    -> Result<(), Box<dyn Error>> {
+        // One selected target acknowledges an ordinary operation response.
+        let operation_body = serde_json::to_string(&operation_response_fixture("queued")?)?;
+        assert_eq!(acknowledge_submission(1, &operation_body), Ok(()));
+
+        // Several selected targets acknowledge the batch parent (§13.7): the
+        // response carries the batch id and one child operation id per
+        // target, and the submission succeeds even though the per-endpoint
+        // batch report view is a later slice.
+        let batch_body = serde_json::to_string(&rutilus_api::BatchOperationResponse::new(
+            "01989abc-def0-7abc-8def-0123456789b1".parse()?,
+            rutilus_api::OperationSourceResponse::Site,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            vec![
+                "01989abc-def0-7abc-8def-0123456789ab".parse()?,
+                "01989abc-def0-7abc-8def-0123456789ac".parse()?,
+            ],
+            vec![
+                "01989abc-def0-7abc-8def-0123456789b2".parse()?,
+                "01989abc-def0-7abc-8def-0123456789b3".parse()?,
+            ],
+            time::OffsetDateTime::UNIX_EPOCH,
+        ))?;
+        assert_eq!(acknowledge_submission(2, &batch_body), Ok(()));
+
+        // The two contracts do not interchange: the operation acknowledgement
+        // is malformed for a batch selection and the batch acknowledgement
+        // for a single selection, and both map to the static failure message
+        // like any other rejected or unparseable submission.
+        assert_eq!(
+            acknowledge_submission(2, &operation_body),
+            Err(OperationSubmitState::FAILURE_MESSAGE)
+        );
+        assert_eq!(
+            acknowledge_submission(1, &batch_body),
+            Err(OperationSubmitState::FAILURE_MESSAGE)
+        );
+        assert_eq!(
+            acknowledge_submission(3, "not json"),
+            Err(OperationSubmitState::FAILURE_MESSAGE)
+        );
+        Ok(())
     }
 
     #[test]
