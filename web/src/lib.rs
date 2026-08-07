@@ -5,7 +5,7 @@ use std::{error::Error, num::NonZeroU64, path::Path, sync::Arc};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Extension, Path as AxumPath, State},
     http::{
         HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
@@ -70,6 +70,13 @@ use rutilus_domain::{
     TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
+
+mod auth;
+
+pub use auth::{
+    AuthContext, AuthGate, AuthPolicy, AuthServices, BOOTSTRAP_PRINCIPAL_NAME, IssuedSessionTokens,
+    SESSION_COOKIE_NAME,
+};
 
 /// The HTTP body limit of one chunk request: the 4 MiB base64 protocol limit
 /// plus JSON framing headroom, so the handler's own
@@ -220,13 +227,14 @@ impl<T> ProductServices for T where
 {
 }
 
-struct WebState<Services, Gateway, Time> {
-    product: WebProductInfo,
-    actor: AuditActor,
-    origin: DeploymentPosture,
-    services: Arc<Services>,
-    gateway: Arc<Gateway>,
-    clock: Time,
+pub(crate) struct WebState<Services, Gateway, Time> {
+    pub(crate) product: WebProductInfo,
+    pub(crate) actor: AuditActor,
+    pub(crate) origin: DeploymentPosture,
+    pub(crate) auth: auth::AuthState,
+    pub(crate) services: Arc<Services>,
+    pub(crate) gateway: Arc<Gateway>,
+    pub(crate) clock: Time,
 }
 
 impl<Services, Gateway, Time> Clone for WebState<Services, Gateway, Time>
@@ -238,6 +246,7 @@ where
             product: self.product,
             actor: self.actor,
             origin: self.origin,
+            auth: self.auth.clone(),
             services: Arc::clone(&self.services),
             gateway: Arc::clone(&self.gateway),
             clock: self.clock.clone(),
@@ -252,6 +261,11 @@ where
 /// paths are composed from the injected application boundaries at request
 /// time, keeping the Web crate free of persistence and security internals.
 ///
+/// The session policy is [`AuthPolicy::Open`]: every request is served
+/// without a session, exactly like the pre-0.6 console. The Standalone
+/// runtime and a future Site listener use [`router_with_auth`] to enforce
+/// the §16.2 session model.
+///
 /// The function is a declarative route table; the line count grows with the
 /// product surface, so the lint is not a signal here.
 #[allow(clippy::too_many_lines)]
@@ -264,10 +278,56 @@ pub fn router<Services, Gateway, Time>(
     clock: Time,
 ) -> Router
 where
-    Services: ProductServices + 'static,
+    Services: ProductServices + AuthServices + 'static,
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
+    router_with_auth(
+        product,
+        actor,
+        origin,
+        AuthPolicy::Open,
+        services,
+        gateway,
+        clock,
+    )
+}
+
+/// Builds the local Web application under one §16.2 session policy.
+///
+/// The session middleware runs on every route: in `Open` mode it only
+/// resolves the unauthenticated actor, while `Guarded` (and an armed
+/// `PendingBootstrap` gate) require a session and the route's role mask on
+/// everything except the public sign-in surface. The authentication
+/// boundaries are composed from the same injected services bundle as the
+/// product boundaries.
+///
+/// The function is a declarative route table; the line count grows with the
+/// product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
+pub fn router_with_auth<Services, Gateway, Time>(
+    product: WebProductInfo,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+    policy: AuthPolicy,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
+) -> Router
+where
+    Services: ProductServices + AuthServices + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
+{
+    let state = WebState {
+        product,
+        actor,
+        origin,
+        auth: auth::AuthState::new(policy),
+        services,
+        gateway,
+        clock,
+    };
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/about", get(about::<Services, Gateway, Time>))
@@ -398,15 +458,53 @@ where
             "/api/v1/endpoints/{endpoint_id}/tags/{tag_name}",
             delete(remove_tag::<Services, Gateway, Time>),
         )
+        .route(
+            "/api/v1/auth/login",
+            post(auth::login::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/logout",
+            post(auth::logout::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/bootstrap",
+            post(auth::bootstrap_complete::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/password",
+            post(auth::change_password::<Services, Gateway, Time>),
+        )
+        .route("/api/v1/auth/me", get(auth::me::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/admin/sessions",
+            get(auth::list_sessions::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/sessions",
+            post(auth::revoke_session::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users",
+            get(auth::list_users::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users",
+            post(auth::create_user::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users/{principal_id}/state",
+            post(auth::set_user_state::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users/{principal_id}/role",
+            post(auth::assign_user_role::<Services, Gateway, Time>),
+        )
         .fallback(static_asset)
-        .with_state(WebState {
-            product,
-            actor,
-            origin,
-            services,
-            gateway,
-            clock,
-        })
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            auth::auth_middleware::<Services, Gateway, Time>,
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(CSP),
@@ -736,6 +834,7 @@ where
 /// refreshes one endpoint under mandatory audit.
 async fn enroll_endpoint<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
     Json(request): Json<EnrollEndpointRequest>,
 ) -> Response
 where
@@ -777,8 +876,8 @@ where
         state.services.as_ref(),
         state.gateway.as_ref(),
         &state.clock,
-        state.actor,
-        None,
+        context.actor(),
+        context.actor_principal_id(),
         state.origin,
     );
     let request = OnboardEndpointRequest::new(
@@ -802,6 +901,7 @@ where
 /// result under one mandatory batch audit.
 async fn import_endpoints_csv<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
     Json(request): Json<EndpointCsvImportRequest>,
 ) -> Response
 where
@@ -820,8 +920,8 @@ where
         state.services.as_ref(),
         state.gateway.as_ref(),
         &state.clock,
-        state.actor,
-        None,
+        context.actor(),
+        context.actor_principal_id(),
         state.origin,
     );
     let importer = EndpointCsvImportExecutor::new(
@@ -829,8 +929,8 @@ where
         &enrollment,
         state.services.as_ref(),
         &state.clock,
-        state.actor,
-        None,
+        context.actor(),
+        context.actor_principal_id(),
         state.origin,
     );
     match importer.execute(import).await {
@@ -2379,7 +2479,7 @@ fn no_content() -> Response {
     response
 }
 
-fn json_ok<Body: IntoResponse>(body: Body) -> Response {
+pub(crate) fn json_ok<Body: IntoResponse>(body: Body) -> Response {
     let mut response = body.into_response();
     no_store(&mut response);
     response
@@ -2392,18 +2492,21 @@ fn json_created<Body: IntoResponse>(body: Body) -> Response {
     response
 }
 
-fn json_error(status: StatusCode, message: String) -> Response {
+pub(crate) fn json_error(status: StatusCode, message: String) -> Response {
     json_error_with_status(status, Json(ErrorResponse::new(message)))
 }
 
-fn json_error_with_status<Body: IntoResponse>(status: StatusCode, body: Body) -> Response {
+pub(crate) fn json_error_with_status<Body: IntoResponse>(
+    status: StatusCode,
+    body: Body,
+) -> Response {
     let mut response = body.into_response();
     *response.status_mut() = status;
     no_store(&mut response);
     response
 }
 
-fn no_store(response: &mut Response) {
+pub(crate) fn no_store(response: &mut Response) {
     response.headers_mut().insert(
         CACHE_CONTROL,
         HeaderValue::from_static("no-store, must-revalidate"),
@@ -3999,7 +4102,7 @@ enum EndpointInventoryProjectionError {
     InvalidTypedPayload,
 }
 
-fn uncached_status(status: StatusCode) -> Response {
+pub(crate) fn uncached_status(status: StatusCode) -> Response {
     let mut response = status.into_response();
     response.headers_mut().insert(
         CACHE_CONTROL,
@@ -4053,7 +4156,10 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use std::{collections::HashMap, error::Error, fmt, sync::Mutex};
 
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{Request, header::SET_COOKIE},
+    };
     use http_body_util::BodyExt as _;
     use rutilus_application::{
         BoundaryFuture, CapabilitySnapshotRepository, ClassifiedBatchChild, EndpointDiscovery,
@@ -4061,15 +4167,17 @@ mod tests {
         StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
-        BatchOperation, BatchOperationId, CredentialId, CredentialUsername, CredentialVersionId,
-        Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
+        Argon2IdHash, BatchOperation, BatchOperationId, BootstrapCode, BootstrapCodeId,
+        CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
+        EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
         FailureKind, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-        RedfishCommand, RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId,
-        ResourceODataId, ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, SeriesKey,
-        SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
-        TlsCertificate, TlsTrust,
+        PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState, RedfishCommand,
+        RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId,
+        ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, Role, RoleAssignment,
+        SeriesKey, Session, SessionId, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
+        TelemetrySeriesId, TlsCertificate, TlsTrust, TotpAuthenticator, TotpAuthenticatorError,
     };
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretBox, SecretString};
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime};
     use tower::ServiceExt as _;
@@ -4088,8 +4196,11 @@ mod tests {
             Arc::new(UnavailableWriteServices {
                 inventory,
                 batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: false,
+                auth_state: AuthTestState::default(),
             }),
-            Arc::new(UnavailableGateway),
+            Arc::new(UnavailableGateway { working: false }),
             FixedClock,
         )
     }
@@ -4104,8 +4215,11 @@ mod tests {
             Arc::new(UnavailableWriteServices {
                 inventory: Ok(Vec::new()),
                 batch_store,
+                managed_endpoints: None,
+                refresh_working: false,
+                auth_state: AuthTestState::default(),
             }),
-            Arc::new(UnavailableGateway),
+            Arc::new(UnavailableGateway { working: false }),
             FixedClock,
         )
     }
@@ -6378,6 +6492,22 @@ mod tests {
         /// default bundle unavailable (every existing test's expectation),
         /// while the batch-route tests arm a working in-memory store.
         batch_store: BatchTestStore,
+        /// The managed endpoints behind the refresh pre-check: `None` keeps
+        /// the refresh surface unavailable (every existing test's
+        /// expectation), an empty list makes every referenced endpoint
+        /// unknown (the 422 verdict), and a populated list backs the working
+        /// refresh tests.
+        managed_endpoints: Option<Vec<Endpoint>>,
+        /// Whether the refresh execution boundaries (credential resolution,
+        /// Generation commit, capability snapshot replace, and audit append)
+        /// answer like a working slice: `false` keeps them unavailable (the
+        /// default), `true` arms the refresh route's 200-report test.
+        refresh_working: bool,
+        /// The in-memory authentication state behind the §16.2 auth tests:
+        /// the Open test routers never touch it (the auth boundary answers
+        /// "nothing found"), while the guarded tests populate it through
+        /// `AuthTestState`.
+        auth_state: AuthTestState,
     }
 
     /// In-memory batch store for the §13.7 route tests.
@@ -6461,9 +6591,12 @@ mod tests {
     }
 
     /// Every gateway boundary reports a controlled failure so the read-path
-    /// tests never touch the network.
+    /// tests never touch the network; `working` arms the typed Redfish read
+    /// and the capability re-probe for the refresh route's 200-report test.
     #[derive(Clone, Copy)]
-    struct UnavailableGateway;
+    struct UnavailableGateway {
+        working: bool,
+    }
 
     #[derive(Clone, Copy)]
     struct UnavailableProtected;
@@ -6597,6 +6730,417 @@ mod tests {
             _event: &'a AuditEvent,
         ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
             Box::pin(async { Err(MockWriteError) })
+        }
+    }
+
+    /// The in-memory §16.2 authentication state behind the guarded-route
+    /// tests.
+    ///
+    /// The state mirrors the persistence shapes (principal, role, password,
+    /// session, bootstrap rows) without a database, and the crypto surface
+    /// is a deterministic fold of the input — good enough to prove the
+    /// middleware gates, not to stand in for real cryptography.
+    #[derive(Clone, Default)]
+    struct AuthTestState {
+        inner: Arc<Mutex<AuthTestInner>>,
+    }
+
+    #[derive(Default)]
+    struct AuthTestInner {
+        principals: Vec<Principal>,
+        roles: HashMap<PrincipalId, Role>,
+        passwords: HashMap<PrincipalId, PasswordCredential>,
+        sessions: Vec<Session>,
+        bootstrap_code: Option<BootstrapCode>,
+        next_token: u64,
+    }
+
+    impl AuthTestState {
+        fn seed_principal(&self, name: &str, password: &str, role: Role) {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            let now = OffsetDateTime::now_utc();
+            let Ok(name) = PrincipalName::parse(name) else {
+                return;
+            };
+            let principal = Principal::new(PrincipalId::generate(), name, now);
+            inner.roles.insert(principal.id(), role);
+            inner
+                .passwords
+                .insert(principal.id(), deterministic_credential(password, now));
+            inner.principals.push(principal);
+        }
+
+        fn seed_bootstrap_code(&self, code: &str) {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.bootstrap_code = Some(BootstrapCode::new(
+                BootstrapCodeId::generate(),
+                fold_hash(code),
+                OffsetDateTime::now_utc(),
+            ));
+        }
+    }
+
+    /// The deterministic "crypto" of the auth test state: a fixed salt and a
+    /// byte fold of the password, so hash and verify agree without real
+    /// Argon2id work.
+    fn deterministic_credential(password: &str, changed_at: OffsetDateTime) -> PasswordCredential {
+        // The fixed part sizes are valid by construction; the error arms are
+        // totality guards of the domain value objects.
+        let Ok(hash) = Argon2IdHash::from_parts(&[0x11; 16], &fold_hash(password)) else {
+            unreachable!("the fixed salt and hash lengths are valid");
+        };
+        let Ok(credential) =
+            PasswordCredential::try_from_parts(PrincipalId::generate(), hash, changed_at)
+        else {
+            unreachable!("the credential parts are valid");
+        };
+        credential
+    }
+
+    /// The deterministic byte fold standing in for SHA-256 in tests.
+    fn fold_hash(value: &str) -> [u8; 32] {
+        let mut hash = [0_u8; 32];
+        for (index, byte) in value.bytes().enumerate() {
+            hash[index % 32] ^= byte.rotate_left(u32::try_from(index % 8).unwrap_or(0));
+        }
+        hash
+    }
+
+    /// The auth boundaries of the test bundle: the Open test routers never
+    /// touch a session (the state is empty and answers "nothing found"),
+    /// while the guarded tests seed the state and drive the full §16.2
+    /// lifecycle through it.
+    impl AuthServices for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn find_session_by_token_hash<'a>(
+            &'a self,
+            token_hash: &'a [u8; 32],
+        ) -> BoundaryFuture<'a, Result<Option<Session>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .sessions
+                    .iter()
+                    .find(|session| session.token_hash() == token_hash)
+                    .cloned())
+            })
+        }
+        fn create_session<'a>(
+            &'a self,
+            session: &'a Session,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let session = session.clone();
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                inner.sessions.push(session);
+                Ok(())
+            })
+        }
+        fn touch_session(
+            &self,
+            session_id: SessionId,
+            at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                let session = inner
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id() == session_id)
+                    .ok_or(MockWriteError)?;
+                session.touch(at).map_err(|_| MockWriteError)
+            })
+        }
+        fn revoke_session(
+            &self,
+            session_id: SessionId,
+            at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                let session = inner
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id() == session_id)
+                    .ok_or(MockWriteError)?;
+                session.revoke(at).map_err(|_| MockWriteError)
+            })
+        }
+        fn revoke_sessions_for_principal(
+            &self,
+            principal_id: PrincipalId,
+            at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<u64, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                let mut revoked = 0;
+                for session in &mut inner.sessions {
+                    if session.principal_id() == principal_id
+                        && session.revoked_at().is_none()
+                        && session.revoke(at).is_ok()
+                    {
+                        revoked += 1;
+                    }
+                }
+                Ok(revoked)
+            })
+        }
+        fn list_sessions(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Vec<Session>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .sessions
+                    .iter()
+                    .filter(|session| session.principal_id() == principal_id)
+                    .cloned()
+                    .collect())
+            })
+        }
+        fn find_principal(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .principals
+                    .iter()
+                    .find(|principal| principal.id() == principal_id)
+                    .cloned())
+            })
+        }
+        fn find_principal_by_name<'a>(
+            &'a self,
+            name: &'a PrincipalName,
+        ) -> BoundaryFuture<'a, Result<Option<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let name = name.clone();
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .principals
+                    .iter()
+                    .find(|principal| principal.name() == &name)
+                    .cloned())
+            })
+        }
+        fn list_principals(&self) -> BoundaryFuture<'_, Result<Vec<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner.principals.clone())
+            })
+        }
+        fn create_principal<'a>(
+            &'a self,
+            principal: &'a Principal,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let principal = principal.clone();
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                inner.principals.push(principal);
+                Ok(())
+            })
+        }
+        fn set_principal_state(
+            &self,
+            principal_id: PrincipalId,
+            state: PrincipalState,
+            at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                let principal = inner
+                    .principals
+                    .iter_mut()
+                    .find(|principal| principal.id() == principal_id)
+                    .ok_or(MockWriteError)?;
+                principal.set_state(state, at);
+                Ok(())
+            })
+        }
+        fn assign_role<'a>(
+            &'a self,
+            assignment: &'a RoleAssignment,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let assignment = assignment.clone();
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                inner
+                    .roles
+                    .insert(assignment.principal_id(), assignment.role());
+                Ok(())
+            })
+        }
+        fn find_role_assignment(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<RoleAssignment>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner.roles.get(&principal_id).copied().map(|role| {
+                    RoleAssignment::new(principal_id, role, None, OffsetDateTime::now_utc())
+                }))
+            })
+        }
+        fn list_role_assignments(
+            &self,
+        ) -> BoundaryFuture<'_, Result<Vec<RoleAssignment>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .roles
+                    .iter()
+                    .map(|(principal_id, role)| {
+                        RoleAssignment::new(*principal_id, *role, None, OffsetDateTime::now_utc())
+                    })
+                    .collect())
+            })
+        }
+        fn find_password_credential(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<PasswordCredential>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner.passwords.get(&principal_id).cloned())
+            })
+        }
+        fn save_password_credential<'a>(
+            &'a self,
+            credential: &'a PasswordCredential,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let credential = credential.clone();
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                inner
+                    .passwords
+                    .insert(credential.principal_id(), credential);
+                Ok(())
+            })
+        }
+        fn list_totp_authenticators(
+            &self,
+            _principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Vec<TotpAuthenticator>, Self::Error>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+        fn record_totp_step(
+            &self,
+            _authenticator_id: rutilus_domain::TotpAuthenticatorId,
+            _step: u64,
+        ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+            Box::pin(async move { Ok(false) })
+        }
+        fn find_bootstrap_code_by_hash<'a>(
+            &'a self,
+            code_hash: &'a [u8; 32],
+        ) -> BoundaryFuture<'a, Result<Option<BootstrapCode>, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .bootstrap_code
+                    .clone()
+                    .filter(|code| code.code_hash() == code_hash))
+            })
+        }
+        fn has_unconsumed_bootstrap_code(&self) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            Box::pin(async move {
+                let inner = inner.lock().map_err(|_| MockWriteError)?;
+                Ok(inner
+                    .bootstrap_code
+                    .as_ref()
+                    .is_some_and(|code| code.used_at().is_none()))
+            })
+        }
+        fn consume_bootstrap_code<'a>(
+            &'a self,
+            code_id: BootstrapCodeId,
+            used_by: PrincipalId,
+            password: &'a PasswordCredential,
+            authenticator: Option<&'a TotpAuthenticator>,
+            session: &'a Session,
+            consumed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.auth_state.inner);
+            let (password, session) = (password.clone(), session.clone());
+            let authenticator = authenticator.cloned();
+            Box::pin(async move {
+                let mut inner = inner.lock().map_err(|_| MockWriteError)?;
+                let Some(code) = inner.bootstrap_code.as_mut() else {
+                    return Err(MockWriteError);
+                };
+                if code.id() != code_id || code.used_at().is_some() {
+                    return Err(MockWriteError);
+                }
+                code.consume(used_by, consumed_at)
+                    .map_err(|_| MockWriteError)?;
+                inner.passwords.insert(used_by, password);
+                if authenticator.is_some() {
+                    inner.roles.insert(used_by, Role::Administrator);
+                }
+                inner.sessions.push(session);
+                Ok(())
+            })
+        }
+        fn verify_password(&self, hash: &Argon2IdHash, password: &SecretString) -> bool {
+            hash == deterministic_credential(password.expose_secret(), OffsetDateTime::now_utc())
+                .hash()
+        }
+        fn verify_totp(
+            &self,
+            _secret: &SecretBox<[u8; 20]>,
+            _code: &str,
+            _now: OffsetDateTime,
+            _last_used_step: Option<u64>,
+        ) -> Result<u64, TotpAuthenticatorError> {
+            Err(TotpAuthenticatorError::InvalidCode)
+        }
+        fn hash_password(&self, password: &SecretString) -> Result<Argon2IdHash, Self::Error> {
+            Argon2IdHash::from_parts(&[0x11; 16], &fold_hash(password.expose_secret()))
+                .map_err(|_| MockWriteError)
+        }
+        fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
+            fold_hash(code)
+        }
+        fn issue_tokens(&self) -> Result<IssuedSessionTokens, Self::Error> {
+            let mut inner = self.auth_state.inner.lock().map_err(|_| MockWriteError)?;
+            inner.next_token += 1;
+            let session_wire = format!("session-token-{}", inner.next_token);
+            let csrf_wire = format!("csrf-token-{}", inner.next_token);
+            Ok(IssuedSessionTokens::new(
+                session_wire.clone(),
+                fold_hash(&session_wire),
+                csrf_wire.clone(),
+                fold_hash(&csrf_wire),
+            ))
+        }
+        fn token_hash(&self, wire: &str) -> [u8; 32] {
+            fold_hash(wire)
         }
     }
 
@@ -6861,6 +7405,30 @@ mod tests {
         }
     }
 
+    /// A clock the tests can move forward, to prove time-driven behavior —
+    /// the session expires on its absolute deadline regardless of activity.
+    #[derive(Clone, Debug)]
+    struct StepClock(Arc<Mutex<OffsetDateTime>>);
+
+    impl StepClock {
+        fn at(now: OffsetDateTime) -> Self {
+            Self(Arc::new(Mutex::new(now)))
+        }
+
+        fn advance(&self, by: Duration) {
+            let Ok(mut now) = self.0.lock() else {
+                return;
+            };
+            *now += by;
+        }
+    }
+
+    impl Clock for StepClock {
+        fn now(&self) -> OffsetDateTime {
+            self.0.lock().map_or(OffsetDateTime::UNIX_EPOCH, |now| *now)
+        }
+    }
+
     impl GroupRepository for UnavailableWriteServices {
         type Error = MockWriteError;
 
@@ -6973,6 +7541,477 @@ mod tests {
             project_resource_diagnostics(&corrupt),
             Err(EndpointInventoryProjectionError::InvalidTypedPayload)
         );
+        Ok(())
+    }
+
+    /// Builds the router under one §16.2 session policy over the auth test
+    /// state.
+    fn test_router_with_policy(auth_state: AuthTestState, policy: AuthPolicy) -> Router {
+        test_router_with_clock(auth_state, policy, FixedClock)
+    }
+
+    /// Builds the router under one §16.2 session policy and one explicit
+    /// clock, for the tests that move time.
+    fn test_router_with_clock<Time>(
+        auth_state: AuthTestState,
+        policy: AuthPolicy,
+        clock: Time,
+    ) -> Router
+    where
+        Time: Clock + Clone + 'static,
+    {
+        router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            policy,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: false,
+                auth_state,
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            clock,
+        )
+    }
+
+    fn seeded_auth_state() -> AuthTestState {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        state
+    }
+
+    /// Signs in through the route and returns the session cookie and the
+    /// CSRF token of the response.
+    async fn sign_in(
+        router: &Router,
+        username: &str,
+        password: &str,
+    ) -> Result<(String, String), Box<dyn Error>> {
+        let login_body = format!(r#"{{"username": "{username}", "password": "{password}"}}"#);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(login_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the sign-in response must set the session cookie")?
+            .to_str()?
+            .split(';')
+            .next()
+            .ok_or("the session cookie is malformed")?
+            .to_owned();
+        let body = json_body(response).await?;
+        let csrf = body
+            .get("csrf_token")
+            .and_then(Value::as_str)
+            .ok_or("the login response must carry the CSRF token")?
+            .to_owned();
+        Ok((cookie, csrf))
+    }
+
+    #[tokio::test]
+    async fn guarded_router_requires_a_session_for_product_routes() -> Result<(), Box<dyn Error>> {
+        let router = test_router_with_policy(AuthTestState::default(), AuthPolicy::Guarded);
+
+        // The product surface is closed...
+        let endpoints = router
+            .clone()
+            .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(endpoints.status(), StatusCode::UNAUTHORIZED);
+        // ...while the public sign-in surface stays open.
+        let health = router
+            .clone()
+            .oneshot(Request::get("/api/v1/health").body(Body::empty())?)
+            .await?;
+        assert_eq!(health.status(), StatusCode::OK);
+        let about = router
+            .clone()
+            .oneshot(Request::get("/api/v1/about").body(Body::empty())?)
+            .await?;
+        assert_eq!(about.status(), StatusCode::OK);
+        let me = router
+            .clone()
+            .oneshot(Request::get("/api/v1/auth/me").body(Body::empty())?)
+            .await?;
+        assert_eq!(me.status(), StatusCode::OK);
+        let body = json_body(me).await?;
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["bootstrap_pending"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sign_in_opens_the_product_surface_and_sets_a_safe_cookie() -> Result<(), Box<dyn Error>>
+    {
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, _csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        assert!(cookie.starts_with("rutilus_session="), "{cookie}");
+
+        // The session cookie opens the product surface.
+        let endpoints = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/endpoints")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(endpoints.status(), StatusCode::OK);
+
+        // The sign-in response cookie carries the §16.2 flags.
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        let set_cookie = login
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the sign-in response must set the session cookie")?
+            .to_str()?
+            .to_owned();
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+        assert!(
+            !set_cookie.contains("Secure"),
+            "loopback HTTP must not set Secure"
+        );
+
+        // A wrong password is refused, and the attempt is rate limited by
+        // username: the fifth refusal still answers, the sixth is refused
+        // before any verification.
+        for _ in 0..5 {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"username": "admin", "password": "wrong password"}"#,
+                        ))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutating_routes_require_the_csrf_token() -> Result<(), Box<dyn Error>> {
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        // A mutating request without the CSRF token is refused...
+        let no_csrf = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/credentials")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"name": "bmc", "username": "root", "password": "secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(no_csrf.status(), StatusCode::UNAUTHORIZED);
+
+        // ...and with the CSRF token the request reaches the handler (the
+        // credential boundaries are unavailable in the mock, so the route
+        // answers 500 — proving the CSRF gate passed).
+        let with_csrf = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/credentials")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"name": "bmc", "username": "root", "password": "secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(with_csrf.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A wrong CSRF token is refused in constant time.
+        let wrong_csrf = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/credentials")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", "csrf-token-999")
+                    .body(Body::from(
+                        r#"{"name": "bmc", "username": "root", "password": "secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(wrong_csrf.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_masks_are_enforced_on_guarded_routes() -> Result<(), Box<dyn Error>> {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "admin secret phrase", Role::Administrator);
+        state.seed_principal("viewer", "viewer secret phrase", Role::Viewer);
+        let router = test_router_with_policy(state, AuthPolicy::Guarded);
+
+        // A viewer reads the product surface but cannot reach the
+        // Administrator surfaces or submit operations.
+        let (cookie, csrf) = sign_in(&router, "viewer", "viewer secret phrase").await?;
+        let endpoints = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/endpoints")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(endpoints.status(), StatusCode::OK);
+        let users = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/admin/users")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(users.status(), StatusCode::FORBIDDEN);
+        let submit = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/operations")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"source": null, "targets": [], "command": {"kind": "system_reset", "reset_type": "graceful"}}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(submit.status(), StatusCode::FORBIDDEN);
+
+        // The administrator reaches both surfaces.
+        let (admin_cookie, _admin_csrf) = sign_in(&router, "admin", "admin secret phrase").await?;
+        let users = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/admin/users")
+                    .header("cookie", &admin_cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(users.status(), StatusCode::OK);
+        let body = json_body(users).await?;
+        assert_eq!(body["users"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_arms_the_pending_gate() -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        state.seed_bootstrap_code("ABCD2345EFGH6789JKLM");
+        let gate = AuthGate::open();
+        let router = test_router_with_policy(state, AuthPolicy::PendingBootstrap(gate.clone()));
+
+        // Before the claim the console is open...
+        let endpoints = router
+            .clone()
+            .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(endpoints.status(), StatusCode::OK);
+        assert!(!gate.is_guarded());
+
+        // ...the claim binds the code, sets the password, opens a session,
+        // and arms the gate in-process.
+        let claim = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "ABCD2345EFGH6789JKLM", "password": "first product password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(claim.status(), StatusCode::OK);
+        assert!(gate.is_guarded(), "the claim must arm the gate");
+        let cookie = claim
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the claim must set the session cookie")?
+            .to_str()?
+            .split(';')
+            .next()
+            .ok_or("the session cookie is malformed")?
+            .to_owned();
+
+        // The console is guarded from this request on: the claim's own
+        // session works, a sessionless request is refused.
+        let closed = router
+            .clone()
+            .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(closed.status(), StatusCode::UNAUTHORIZED);
+        let open = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/endpoints")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(open.status(), StatusCode::OK);
+
+        // The claim's password signs in afterwards; the consumed code is
+        // refused.
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "first product password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+        let again = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "ABCD2345EFGH6789JKLM", "password": "second password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_presenting_session() -> Result<(), Box<dyn Error>> {
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let logout = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/logout")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(logout.status(), StatusCode::OK);
+        let cleared = logout
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the logout response must clear the cookie")?
+            .to_str()?;
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+
+        // The revoked session token is refused afterwards.
+        let closed = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/endpoints")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(closed.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Fetches the product surface with one session cookie.
+    async fn fetch_endpoints(router: &Router, cookie: &str) -> Result<StatusCode, Box<dyn Error>> {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/endpoints")
+                    .header("cookie", cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response.status())
+    }
+
+    #[tokio::test]
+    async fn an_active_session_is_rejected_eight_hours_after_sign_in() -> Result<(), Box<dyn Error>>
+    {
+        // The session lifetime is absolute: `expires_at` is fixed at
+        // sign-in plus eight hours, and activity only advances
+        // `last_used_at` — so a session that is used continuously is
+        // still refused once the deadline passes.
+        let started_at = OffsetDateTime::UNIX_EPOCH + Duration::days(1);
+        let clock = StepClock::at(started_at);
+        let state = seeded_auth_state();
+        let router = test_router_with_clock(state.clone(), AuthPolicy::Guarded, clock.clone());
+        let (cookie, _csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        // Freshly signed in, the session serves the product surface.
+        assert_eq!(fetch_endpoints(&router, &cookie).await?, StatusCode::OK);
+
+        // Heavy use — a request every hour — keeps the session alive
+        // inside its absolute lifetime, and each touch advances the
+        // persisted last-use time.
+        for _ in 0..7 {
+            clock.advance(Duration::hours(1));
+            assert_eq!(fetch_endpoints(&router, &cookie).await?, StatusCode::OK);
+        }
+        clock.advance(Duration::minutes(59));
+        assert_eq!(fetch_endpoints(&router, &cookie).await?, StatusCode::OK);
+
+        // The deadline does not move with the activity: one minute later
+        // the same actively used session is refused.
+        clock.advance(Duration::minutes(1));
+        assert_eq!(
+            fetch_endpoints(&router, &cookie).await?,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The stored row confirms the semantics: the touch advanced
+        // `last_used_at`, while `expires_at` stayed at sign-in plus eight
+        // hours.
+        let Ok(inner) = state.inner.lock() else {
+            return Ok(());
+        };
+        let session = inner
+            .sessions
+            .last()
+            .ok_or("the sign-in must have created a session")?;
+        assert_eq!(session.expires_at(), started_at + Duration::hours(8));
+        assert!(session.last_used_at() > started_at);
         Ok(())
     }
 }

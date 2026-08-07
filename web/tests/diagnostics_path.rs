@@ -814,3 +814,204 @@ async fn reports_duplicate_endpoint_inventory_as_internal_error() -> Result<(), 
     );
     Ok(())
 }
+
+/// The auth boundaries of the test bundle: every store read answers
+/// "nothing found" and every write fails, so the Open test routers never
+/// touch a session.
+impl rutilus_web::AuthServices for MockServices {
+    type Error = MockError;
+
+    fn find_session_by_token_hash<'a>(
+        &'a self,
+        _token_hash: &'a [u8; 32],
+    ) -> rutilus_application::BoundaryFuture<'a, Result<Option<rutilus_domain::Session>, Self::Error>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+    fn create_session<'a>(
+        &'a self,
+        _session: &'a rutilus_domain::Session,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn touch_session(
+        &self,
+        _session_id: rutilus_domain::SessionId,
+        _at: time::OffsetDateTime,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn revoke_session(
+        &self,
+        _session_id: rutilus_domain::SessionId,
+        _at: time::OffsetDateTime,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn revoke_sessions_for_principal(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+        _at: time::OffsetDateTime,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<u64, Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn list_sessions(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<Vec<rutilus_domain::Session>, Self::Error>>
+    {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+    fn find_principal(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+    ) -> rutilus_application::BoundaryFuture<
+        '_,
+        Result<Option<rutilus_domain::Principal>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+    fn find_principal_by_name<'a>(
+        &'a self,
+        _name: &'a rutilus_domain::PrincipalName,
+    ) -> rutilus_application::BoundaryFuture<
+        'a,
+        Result<Option<rutilus_domain::Principal>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+    fn list_principals(
+        &self,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<Vec<rutilus_domain::Principal>, Self::Error>>
+    {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+    fn create_principal<'a>(
+        &'a self,
+        _principal: &'a rutilus_domain::Principal,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn set_principal_state(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+        _state: rutilus_domain::PrincipalState,
+        _at: time::OffsetDateTime,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn assign_role<'a>(
+        &'a self,
+        _assignment: &'a rutilus_domain::RoleAssignment,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn find_role_assignment(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+    ) -> rutilus_application::BoundaryFuture<
+        '_,
+        Result<Option<rutilus_domain::RoleAssignment>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+    fn list_role_assignments(
+        &self,
+    ) -> rutilus_application::BoundaryFuture<
+        '_,
+        Result<Vec<rutilus_domain::RoleAssignment>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+    fn find_password_credential(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+    ) -> rutilus_application::BoundaryFuture<
+        '_,
+        Result<Option<rutilus_domain::PasswordCredential>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+    fn save_password_credential<'a>(
+        &'a self,
+        _credential: &'a rutilus_domain::PasswordCredential,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn list_totp_authenticators(
+        &self,
+        _principal_id: rutilus_domain::PrincipalId,
+    ) -> rutilus_application::BoundaryFuture<
+        '_,
+        Result<Vec<rutilus_domain::TotpAuthenticator>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+    fn record_totp_step(
+        &self,
+        _authenticator_id: rutilus_domain::TotpAuthenticatorId,
+        _step: u64,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<bool, Self::Error>> {
+        Box::pin(async move { Ok(false) })
+    }
+    fn find_bootstrap_code_by_hash<'a>(
+        &'a self,
+        _code_hash: &'a [u8; 32],
+    ) -> rutilus_application::BoundaryFuture<
+        'a,
+        Result<Option<rutilus_domain::BootstrapCode>, Self::Error>,
+    > {
+        Box::pin(async move { Ok(None) })
+    }
+    fn has_unconsumed_bootstrap_code(
+        &self,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<bool, Self::Error>> {
+        Box::pin(async move { Ok(false) })
+    }
+    fn consume_bootstrap_code<'a>(
+        &'a self,
+        _code_id: rutilus_domain::BootstrapCodeId,
+        _used_by: rutilus_domain::PrincipalId,
+        _password: &'a rutilus_domain::PasswordCredential,
+        _authenticator: Option<&'a rutilus_domain::TotpAuthenticator>,
+        _session: &'a rutilus_domain::Session,
+        _consumed_at: time::OffsetDateTime,
+    ) -> rutilus_application::BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { Err(MockError::Persistence) })
+    }
+    fn verify_password(
+        &self,
+        _hash: &rutilus_domain::Argon2IdHash,
+        _password: &secrecy::SecretString,
+    ) -> bool {
+        false
+    }
+    fn verify_totp(
+        &self,
+        _secret: &secrecy::SecretBox<[u8; rutilus_domain::TOTP_SECRET_LENGTH]>,
+        _code: &str,
+        _now: time::OffsetDateTime,
+        _last_used_step: Option<u64>,
+    ) -> Result<u64, rutilus_domain::TotpAuthenticatorError> {
+        Err(rutilus_domain::TotpAuthenticatorError::InvalidCode)
+    }
+    fn hash_password(
+        &self,
+        _password: &secrecy::SecretString,
+    ) -> Result<rutilus_domain::Argon2IdHash, Self::Error> {
+        Err(MockError::Persistence)
+    }
+    fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
+        let mut hash = [0_u8; 32];
+        hash[..code.len().min(32)].copy_from_slice(code.as_bytes());
+        hash
+    }
+    fn issue_tokens(&self) -> Result<rutilus_web::IssuedSessionTokens, Self::Error> {
+        Err(MockError::Persistence)
+    }
+    fn token_hash(&self, wire: &str) -> [u8; 32] {
+        let mut hash = [0_u8; 32];
+        hash[..wire.len().min(32)].copy_from_slice(wire.as_bytes());
+        hash
+    }
+}

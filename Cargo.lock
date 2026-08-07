@@ -3626,6 +3626,7 @@ name = "rutilus-web"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base32",
  "http-body-util",
  "rust-embed",
  "rutilus-api",

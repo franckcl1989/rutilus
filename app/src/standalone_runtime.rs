@@ -21,10 +21,12 @@ use rutilus_application::{
     TaskMonitor, TelemetryRepository, TelemetrySampler, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
-    CredentialVersionId, DeploymentPosture, Endpoint, EndpointCapabilityObservation, EndpointId,
-    Event, Group, GroupId, Operation, OperationId, OperationState, ResourceSnapshot, SeriesKey,
-    Tag, TagName, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+    Argon2IdHash, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BootstrapCode,
+    BootstrapCodeId, Credential, CredentialId, CredentialVersionId, DeploymentPosture, Endpoint,
+    EndpointCapabilityObservation, EndpointId, Event, Group, GroupId, Operation, OperationId,
+    OperationState, PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState,
+    ResourceSnapshot, RoleAssignment, SeriesKey, Session, SessionId, Tag, TagName, TelemetrySample,
+    TelemetrySeries, TelemetrySeriesId, TotpAuthenticator, TotpAuthenticatorError,
 };
 use rutilus_infra_redfish::{
     EventStream as GatewayEventStream, EventStreamError, EventStreamOpenError,
@@ -35,22 +37,27 @@ use rutilus_operation_engine::{
     OperationStore, RemoteTask, RemoteTaskState, RemoteTaskStore,
 };
 use rutilus_persistence::{
-    ArtifactRepositoryError, AuditRepositoryError, CloseStoreError, CredentialRepositoryError,
-    EndpointInventoryPersistenceError, EndpointRefreshPersistenceError, EndpointRepositoryError,
-    EventRepositoryError, GroupRepositoryError, NewCredential, OpenStoreError,
-    OperationRepositoryError, RemoteTaskRepositoryError, SqliteStore, TagRepositoryError,
-    TelemetryRepositoryError,
+    ArtifactRepositoryError, AuditRepositoryError, BootstrapRepositoryError, CloseStoreError,
+    CredentialRepositoryError, EndpointInventoryPersistenceError, EndpointRefreshPersistenceError,
+    EndpointRepositoryError, EventRepositoryError, GroupRepositoryError, NewCredential,
+    OpenStoreError, OperationRepositoryError, PasswordRepositoryError, PrincipalRepositoryError,
+    RemoteTaskRepositoryError, SessionRepositoryError, SqliteStore, TagRepositoryError,
+    TelemetryRepositoryError, TotpRepositoryError,
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
     MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
 };
 use rutilus_security::{
-    CredentialProtectionError, MasterKey, MasterKeyProtectionError, ProtectedCredentialVersion,
-    decrypt_credential, encrypt_credential, recover_master_key,
+    CredentialProtectionError, CsrfToken, MasterKey, MasterKeyProtectionError, PasswordHashError,
+    ProtectedCredentialVersion, SessionToken, SessionTokenError, decrypt_credential,
+    encrypt_credential, hash_bootstrap_code, hash_password, recover_master_key, verify_code,
+    verify_password,
 };
-use rutilus_web::{AuditEventQuery, ProductServices, WebProductInfo, router};
-use secrecy::SecretString;
+use rutilus_web::{
+    AuthServices, AuditEventQuery, IssuedSessionTokens, ProductServices, WebProductInfo, router,
+};
+use secrecy::{SecretBox, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -284,6 +291,311 @@ impl AuditEventQuery for StandaloneState {
             Ok(tail.iter().rev().take(take).cloned().collect())
         })
     }
+}
+
+/// The §16.2 authentication boundaries of the Standalone runtime: every
+/// store method forwards to `SqliteStore` (the TOTP secret flows through the
+/// instance master key on the way in and out), and every crypto operation
+/// delegates to the security crate, so the Web crate never touches
+/// persistence or security internals.
+impl AuthServices for StandaloneState {
+    type Error = StandaloneAuthError;
+
+    fn find_session_by_token_hash<'a>(
+        &'a self,
+        token_hash: &'a [u8; 32],
+    ) -> BoundaryFuture<'a, Result<Option<Session>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_session_by_token_hash(token_hash)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn create_session<'a>(
+        &'a self,
+        session: &'a Session,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .create_session(session)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn touch_session(
+        &self,
+        session_id: SessionId,
+        at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .touch_session(session_id, at)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn revoke_session(
+        &self,
+        session_id: SessionId,
+        at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .revoke_session(session_id, at)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn revoke_sessions_for_principal(
+        &self,
+        principal_id: PrincipalId,
+        at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<u64, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .revoke_sessions_for_principal(principal_id, at)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn list_sessions(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Vec<Session>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .list_sessions(principal_id)
+                .await
+                .map_err(StandaloneAuthError::Session)
+        })
+    }
+    fn find_principal(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Option<Principal>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_principal(principal_id)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn find_principal_by_name<'a>(
+        &'a self,
+        name: &'a PrincipalName,
+    ) -> BoundaryFuture<'a, Result<Option<Principal>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_principal_by_name(name)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn list_principals(&self) -> BoundaryFuture<'_, Result<Vec<Principal>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .list_principals()
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn create_principal<'a>(
+        &'a self,
+        principal: &'a Principal,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .create_principal(principal)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn set_principal_state(
+        &self,
+        principal_id: PrincipalId,
+        state: PrincipalState,
+        at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .set_principal_state(principal_id, state, at)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn assign_role<'a>(
+        &'a self,
+        assignment: &'a RoleAssignment,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .assign_role(assignment)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn find_role_assignment(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Option<RoleAssignment>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_role_assignment(principal_id)
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn list_role_assignments(
+        &self,
+    ) -> BoundaryFuture<'_, Result<Vec<RoleAssignment>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .list_role_assignments()
+                .await
+                .map_err(StandaloneAuthError::Principal)
+        })
+    }
+    fn find_password_credential(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Option<PasswordCredential>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_password_credential(principal_id)
+                .await
+                .map_err(StandaloneAuthError::Password)
+        })
+    }
+    fn save_password_credential<'a>(
+        &'a self,
+        credential: &'a PasswordCredential,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .save_password_credential(credential)
+                .await
+                .map_err(StandaloneAuthError::Password)
+        })
+    }
+    fn list_totp_authenticators(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Vec<TotpAuthenticator>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .list_totp_authenticators(&self.master_key, principal_id)
+                .await
+                .map_err(StandaloneAuthError::Totp)
+        })
+    }
+    fn record_totp_step(
+        &self,
+        authenticator_id: rutilus_domain::TotpAuthenticatorId,
+        step: u64,
+    ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .record_totp_step(authenticator_id, step)
+                .await
+                .map_err(StandaloneAuthError::Totp)
+        })
+    }
+    fn find_bootstrap_code_by_hash<'a>(
+        &'a self,
+        code_hash: &'a [u8; 32],
+    ) -> BoundaryFuture<'a, Result<Option<BootstrapCode>, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .find_bootstrap_code_by_hash(code_hash)
+                .await
+                .map_err(StandaloneAuthError::Bootstrap)
+        })
+    }
+    fn has_unconsumed_bootstrap_code(&self) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .has_unconsumed_bootstrap_code()
+                .await
+                .map_err(StandaloneAuthError::Bootstrap)
+        })
+    }
+    fn consume_bootstrap_code<'a>(
+        &'a self,
+        code_id: BootstrapCodeId,
+        used_by: PrincipalId,
+        password: &'a PasswordCredential,
+        authenticator: Option<&'a TotpAuthenticator>,
+        session: &'a Session,
+        consumed_at: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.store
+                .consume_bootstrap_code(
+                    &self.master_key,
+                    code_id,
+                    used_by,
+                    password,
+                    authenticator,
+                    session,
+                    consumed_at,
+                )
+                .await
+                .map_err(StandaloneAuthError::Bootstrap)
+        })
+    }
+    fn verify_password(&self, hash: &Argon2IdHash, password: &SecretString) -> bool {
+        verify_password(hash, password)
+    }
+    fn verify_totp(
+        &self,
+        secret: &SecretBox<[u8; rutilus_domain::TOTP_SECRET_LENGTH]>,
+        code: &str,
+        now: OffsetDateTime,
+        last_used_step: Option<u64>,
+    ) -> Result<u64, TotpAuthenticatorError> {
+        verify_code(secret, code, now, last_used_step)
+    }
+    fn hash_password(&self, password: &SecretString) -> Result<Argon2IdHash, Self::Error> {
+        hash_password(password).map_err(StandaloneAuthError::Hash)
+    }
+    fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
+        hash_bootstrap_code(code)
+    }
+    fn issue_tokens(&self) -> Result<IssuedSessionTokens, Self::Error> {
+        let session_token = SessionToken::generate().map_err(StandaloneAuthError::Tokens)?;
+        let csrf_token = CsrfToken::generate().map_err(StandaloneAuthError::Tokens)?;
+        Ok(IssuedSessionTokens::new(
+            session_token.as_base64url(),
+            session_token.hash(),
+            csrf_token.as_base64url(),
+            csrf_token.hash(),
+        ))
+    }
+    fn token_hash(&self, wire: &str) -> [u8; 32] {
+        // An unparseable presentation hashes to a value no stored session
+        // row carries, so the lookup refuses it without a dedicated error.
+        SessionToken::from_base64url(wire).map_or([0_u8; 32], |token| token.hash())
+    }
+}
+
+/// A controlled failure of the §16.2 authentication boundaries.
+#[derive(Debug, Error)]
+pub enum StandaloneAuthError {
+    #[error("session store operation failed: {0}")]
+    Session(#[source] SessionRepositoryError),
+    #[error("principal store operation failed: {0}")]
+    Principal(#[source] PrincipalRepositoryError),
+    #[error("password store operation failed: {0}")]
+    Password(#[source] PasswordRepositoryError),
+    #[error("TOTP store operation failed: {0}")]
+    Totp(#[source] TotpRepositoryError),
+    #[error("bootstrap store operation failed: {0}")]
+    Bootstrap(#[source] BootstrapRepositoryError),
+    #[error("password derivation failed: {0}")]
+    Hash(#[source] PasswordHashError),
+    #[error("session token issuance failed: {0}")]
+    Tokens(#[source] SessionTokenError),
 }
 
 impl CapabilityQueryRepository for StandaloneState {
@@ -1022,7 +1334,7 @@ impl StandaloneBinding {
         shutdown: Shutdown,
     ) -> io::Result<()>
     where
-        Services: ProductServices + 'static,
+        Services: ProductServices + AuthServices + 'static,
         Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
         Time: Clock + Clone + 'static,
         Shutdown: Future<Output = ()> + Send + 'static,
@@ -1063,7 +1375,7 @@ pub async fn run_standalone<Services, Gateway, Time>(
     clock: Time,
 ) -> Result<(), StandaloneRunError>
 where
-    Services: ProductServices + 'static,
+    Services: ProductServices + AuthServices + 'static,
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
