@@ -954,6 +954,139 @@ pub enum CoreResourceDetailsResponse {
         metadata_uuid: Option<String>,
         profile: Option<String>,
     },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPowerComplianceManager` schema (`NvidiaPowerComplianceManager`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// The chain-root document of the `Manager`'s `Oem.Nvidia` segment is the
+    /// first member of the NVIDIA power-compliance chain; the whole chain
+    /// shares the single family code `nvidia-power-compliance` because the
+    /// chain root decides whether the chain exists at all (§11.5: an OEM
+    /// surface is projected only when upstream strongly types it). The
+    /// details are the compiled `ManagerType` enumeration spelling (e.g.
+    /// `PowerManager`), verbatim per §12.3.
+    OemNvidiaPowerCompliance { manager_type: Option<String> },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPowerDomain` schema (`NvidiaPowerDomain`, nv-redfish-schema
+    /// 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// One member of the compliance manager's `PowerDomains` collection; the
+    /// details are the compiled scalar fields — the numeric `Value`, the
+    /// `Type` / `Unit` enumerations, and the `SensorReadingType` /
+    /// `SensorImpl` sensor enumerations — each verbatim per §12.3.
+    OemNvidiaPowerDomain {
+        value: Option<i64>,
+        r#type: Option<String>,
+        unit: Option<String>,
+        sensor_reading_type: Option<String>,
+        sensor_impl: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPowerPolicy` schema (`NvidiaPowerPolicy`, nv-redfish-schema
+    /// 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// The `ACLossPolicy` / `PSUCompliancePolicy` singleton of the
+    /// power-compliance chain (one variant for both, they share the compiled
+    /// schema); the details are the compiled scalar fields — the
+    /// `AutoDeassertPowerBrake` boolean, the numeric `Min` / `Max`
+    /// thresholds, the `Type` / `Unit` enumerations, and the `PolicyActions`
+    /// enumeration — each verbatim per §12.3. The `DwellTime` duration stays
+    /// out of the strictly projectable field set.
+    OemNvidiaPowerPolicy {
+        auto_deassert_power_brake: Option<bool>,
+        min: Option<i64>,
+        max: Option<i64>,
+        r#type: Option<String>,
+        unit: Option<String>,
+        policy_actions: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaManagedEntityGroup` schema (`NvidiaManagedEntityGroup`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// One member of the compliance manager's `ManagedEntityGroups`
+    /// collection; the details are the compiled `CurrentManagedEntityId`
+    /// text. The group's `ManagedEntities` navigation belongs to the
+    /// managed-entity family.
+    OemNvidiaManagedEntityGroup {
+        current_managed_entity_id: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPowerStateGroup` schema (`NvidiaPowerStateGroup`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// The `PowerStateGroup` document of the power-compliance chain; the
+    /// details are the compiled scalar fields — the `PscId` text and the
+    /// numeric `GeneratedWatts` / `NumberOfPscs` / `NumberOfLocalPsus`. The
+    /// `PowerShelfControllers` / `PowerSupplies` collection members are their
+    /// own chain documents and their own variants.
+    OemNvidiaPowerStateGroup {
+        psc_id: Option<String>,
+        generated_watts: Option<i64>,
+        number_of_pscs: Option<i64>,
+        number_of_local_psus: Option<i64>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPscState` schema (`NvidiaPscState`, nv-redfish-schema 0.13,
+    /// `oem-nvidia-power-management` feature).
+    ///
+    /// One member of the power state group's `PowerShelfControllers`
+    /// collection; the details are the compiled scalar fields — the `PscId`
+    /// text, the numeric `NumOfOperationalPsus` /
+    /// `MillisecondsSinceLastHeartbeat`, the `PowerBrakeAssert` boolean, and
+    /// the `Status` enumeration — each verbatim per §12.3.
+    OemNvidiaPscState {
+        psc_id: Option<String>,
+        num_of_operational_psus: Option<i64>,
+        power_brake_assert: Option<bool>,
+        milliseconds_since_last_heartbeat: Option<i64>,
+        status: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPsuState` schema (`NvidiaPsuState`, nv-redfish-schema 0.13,
+    /// `oem-nvidia-power-management` feature).
+    ///
+    /// One member of the power state group's `PowerSupplies` collection; the
+    /// details are the compiled scalar fields — the `PsuId` text and the
+    /// `Presence` / `Input1Active` / `Input2Active` booleans — each verbatim
+    /// per §12.3.
+    OemNvidiaPsuState {
+        psu_id: Option<String>,
+        presence: Option<bool>,
+        input1active: Option<bool>,
+        input2active: Option<bool>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaPsuRedundancy` schema (`NvidiaPsuRedundancy`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// The `PSURedundancy` singleton of the power-compliance chain; the
+    /// details are the compiled scalar fields — the `MaxNumSupported` /
+    /// `MinNumNeeded` texts and the `RedundancySetting` enumeration — each
+    /// verbatim per §12.3.
+    OemNvidiaPsuRedundancy {
+        max_num_supported: Option<String>,
+        min_num_needed: Option<String>,
+        redundancy_setting: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Redfish NVIDIA
+    /// `NvidiaManagedEntity` schema (`NvidiaManagedEntity`,
+    /// nv-redfish-schema 0.13, `oem-nvidia-power-management` feature).
+    ///
+    /// One member of a group member's `ManagedEntities` collection, the
+    /// chain of the managed-entity family under the single family code
+    /// `nvidia-managed-entity` (the chain's entry navigation is the
+    /// compliance manager's `ManagedEntityGroups` chain, whose presence
+    /// decides whether the chain exists at all). The details are the
+    /// compiled scalar fields — the `TransportProtocol` enumeration, the
+    /// `IPv4Address` / `IPv6Address` address texts, and the numeric `Port` —
+    /// each verbatim per §12.3.
+    OemNvidiaManagedEntity {
+        transport_protocol: Option<String>,
+        ipv4_address: Option<String>,
+        ipv6_address: Option<String>,
+        port: Option<i64>,
+    },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
@@ -2724,6 +2857,268 @@ impl OperationListResponse {
     }
 }
 
+/// The derived §13.7 lifecycle phase of one batch, as console vocabulary.
+///
+/// The six wire values mirror the domain batch-state codes exactly, so the
+/// console renders the verdict the server derived from the children — a batch
+/// state is never computed client-side.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchOperationStateResponse {
+    /// Every child operation is still `Queued`; nothing has started.
+    Queued,
+    /// At least one child is still in flight; children may already have
+    /// finished.
+    Running,
+    /// Every child operation succeeded.
+    Succeeded,
+    /// At least one child failed provably (a partial failure never becomes an
+    /// overall success).
+    Failed,
+    /// At least one child ended `Unknown` and no child failed.
+    Unknown,
+    /// Every child operation was cancelled.
+    Cancelled,
+}
+
+/// The §13.7 outcome buckets of one batch's completed children.
+///
+/// `total` counts every child, including the ones still in flight, which are
+/// counted in no bucket; `unsupported` counts the classified
+/// capability-unsupported failures, separated from ordinary `failed` by the
+/// server-side failure classification.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchOutcomeCountsResponse {
+    succeeded: usize,
+    failed: usize,
+    unknown: usize,
+    unsupported: usize,
+    cancelled: usize,
+    total: usize,
+}
+
+impl BatchOutcomeCountsResponse {
+    #[must_use]
+    pub const fn new(
+        succeeded: usize,
+        failed: usize,
+        unknown: usize,
+        unsupported: usize,
+        cancelled: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            succeeded,
+            failed,
+            unknown,
+            unsupported,
+            cancelled,
+            total,
+        }
+    }
+
+    #[must_use]
+    pub const fn succeeded(self) -> usize {
+        self.succeeded
+    }
+
+    #[must_use]
+    pub const fn failed(self) -> usize {
+        self.failed
+    }
+
+    #[must_use]
+    pub const fn unknown(self) -> usize {
+        self.unknown
+    }
+
+    #[must_use]
+    pub const fn unsupported(self) -> usize {
+        self.unsupported
+    }
+
+    #[must_use]
+    pub const fn cancelled(self) -> usize {
+        self.cancelled
+    }
+
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.total
+    }
+}
+
+/// One batch's derived summary projection for the console (§13.7).
+///
+/// The state and the outcome buckets are server-derived facts: the console
+/// renders them as-is and never infers a batch verdict from the children.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSummaryResponse {
+    batch_id: Uuid,
+    source: OperationSourceResponse,
+    command: RedfishCommand,
+    state: BatchOperationStateResponse,
+    outcomes: BatchOutcomeCountsResponse,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl BatchSummaryResponse {
+    #[must_use]
+    pub const fn new(
+        batch_id: Uuid,
+        source: OperationSourceResponse,
+        command: RedfishCommand,
+        state: BatchOperationStateResponse,
+        outcomes: BatchOutcomeCountsResponse,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            batch_id,
+            source,
+            command,
+            state,
+            outcomes,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn batch_id(&self) -> Uuid {
+        self.batch_id
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> OperationSourceResponse {
+        self.source
+    }
+
+    /// Returns the typed write command every child operation dispatches.
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    /// Returns the derived batch verdict.
+    #[must_use]
+    pub const fn state(&self) -> BatchOperationStateResponse {
+        self.state
+    }
+
+    /// Returns the outcome buckets of the batch's children.
+    #[must_use]
+    pub const fn outcomes(&self) -> BatchOutcomeCountsResponse {
+        self.outcomes
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// Stable envelope for one batch listing in acceptance order (§13.7).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchListResponse {
+    batches: Vec<BatchSummaryResponse>,
+}
+
+impl BatchListResponse {
+    #[must_use]
+    pub const fn new(batches: Vec<BatchSummaryResponse>) -> Self {
+        Self { batches }
+    }
+
+    #[must_use]
+    pub fn batches(&self) -> &[BatchSummaryResponse] {
+        &self.batches
+    }
+}
+
+/// One batch's full report: the derived summary plus every child operation
+/// (§13.7).
+///
+/// The children are ordinary operation projections in target order, so the
+/// console can pair every endpoint with the operation record that executed
+/// its write; the batch verdict and the outcome buckets stay server-derived.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchDetailResponse {
+    batch_id: Uuid,
+    source: OperationSourceResponse,
+    command: RedfishCommand,
+    state: BatchOperationStateResponse,
+    outcomes: BatchOutcomeCountsResponse,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    children: Vec<OperationResponse>,
+}
+
+impl BatchDetailResponse {
+    #[must_use]
+    pub const fn new(
+        batch_id: Uuid,
+        source: OperationSourceResponse,
+        command: RedfishCommand,
+        state: BatchOperationStateResponse,
+        outcomes: BatchOutcomeCountsResponse,
+        created_at: OffsetDateTime,
+        children: Vec<OperationResponse>,
+    ) -> Self {
+        Self {
+            batch_id,
+            source,
+            command,
+            state,
+            outcomes,
+            created_at,
+            children,
+        }
+    }
+
+    #[must_use]
+    pub const fn batch_id(&self) -> Uuid {
+        self.batch_id
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> OperationSourceResponse {
+        self.source
+    }
+
+    /// Returns the typed write command every child operation dispatches.
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    /// Returns the derived batch verdict.
+    #[must_use]
+    pub const fn state(&self) -> BatchOperationStateResponse {
+        self.state
+    }
+
+    /// Returns the outcome buckets of the batch's children.
+    #[must_use]
+    pub const fn outcomes(&self) -> BatchOutcomeCountsResponse {
+        self.outcomes
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    /// Returns the batch's children in target order.
+    #[must_use]
+    pub fn children(&self) -> &[OperationResponse] {
+        &self.children
+    }
+}
+
 /// The §14.3 lifecycle state of one firmware upload artifact.
 ///
 /// The three wire values mirror the domain state codes exactly, so the
@@ -4367,6 +4762,547 @@ mod tests {
                 metadata_project_name: Some("BlueField".to_owned()),
                 metadata_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
                 profile: Some("eyJwcm9maWxlIjogInRlc3QifQ==".to_owned()),
+            },
+        )
+    }
+
+    // The nine power-family wire contracts are asserted in one test so the
+    // golden JSON and the strict-field contract stay one surface; the nine
+    // document projections exceed the pedantic line budget, so the lint is
+    // scoped here exactly like the system-config-profile contract test.
+    // The `psc_state` / `psu_state` bindings are two letters apart, so the
+    // pedantic similar-names lint is scoped off like the line budget.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[test]
+    fn core_resource_contract_carries_oem_nvidia_power_wire_values() -> Result<(), Box<dyn Error>> {
+        let compliance = oem_nvidia_power_compliance_resource();
+        let domain = oem_nvidia_power_domain_resource();
+        let policy = oem_nvidia_power_policy_resource();
+        let group = oem_nvidia_managed_entity_group_resource();
+        let state_group = oem_nvidia_power_state_group_resource();
+        let psc_state = oem_nvidia_psc_state_resource();
+        let psu_state = oem_nvidia_psu_state_resource();
+        let redundancy = oem_nvidia_psu_redundancy_resource();
+        let entity = oem_nvidia_managed_entity_resource();
+
+        // The chain root carries the compiled `ManagerType` enumeration
+        // spelling verbatim.
+        assert_eq!(
+            serde_json::to_value(&compliance)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c0",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+                    "odata_type": "#NvidiaPowerComplianceManager.v1_0_0.NvidiaPowerComplianceManager",
+                    "etag": "W/\"nvidia-pc-1\""
+                },
+                "common": {
+                    "id": "PowerCompliance",
+                    "name": "NVIDIA Power Compliance",
+                    "description": "Power compliance manager"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_power_compliance",
+                    "details": {
+                        "manager_type": "PowerManager"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&compliance)?)?,
+            compliance
+        );
+        // A power domain member carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&domain)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c1",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+                    "odata_type": "#NvidiaPowerDomain.v1_0_0.NvidiaPowerDomain",
+                    "etag": "W/\"nvidia-domain-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Power Domain One",
+                    "description": "Power comparison domain"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_power_domain",
+                    "details": {
+                        "value": 800,
+                        "type": "Above",
+                        "unit": "Watts",
+                        "sensor_reading_type": "Power",
+                        "sensor_impl": "PhysicalSensor"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&domain)?)?,
+            domain
+        );
+        // A power policy carries the compiled scalar fields (the enum
+        // spellings verbatim).
+        assert_eq!(
+            serde_json::to_value(&policy)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c2",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+                    "odata_type": "#NvidiaPowerPolicy.v1_0_0.NvidiaPowerPolicy",
+                    "etag": "W/\"nvidia-acloss-1\""
+                },
+                "common": {
+                    "id": "ACLossPolicy",
+                    "name": "AC Loss Policy",
+                    "description": "AC loss power policy"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_power_policy",
+                    "details": {
+                        "auto_deassert_power_brake": true,
+                        "min": 200,
+                        "max": 600,
+                        "type": "Inclusive",
+                        "unit": "Watts",
+                        "policy_actions": "AssertPowerBrake"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&policy)?)?,
+            policy
+        );
+        // A managed entity group member carries the compiled id text.
+        assert_eq!(
+            serde_json::to_value(&group)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c3",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+                    "odata_type": "#NvidiaManagedEntityGroup.v1_0_0.NvidiaManagedEntityGroup",
+                    "etag": "W/\"nvidia-group-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Managed Entity Group One",
+                    "description": "BlueField group"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_managed_entity_group",
+                    "details": {
+                        "current_managed_entity_id": "BF1"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&group)?)?,
+            group
+        );
+        // The power state group carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&state_group)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c4",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+                    "odata_type": "#NvidiaPowerStateGroup.v1_0_0.NvidiaPowerStateGroup",
+                    "etag": "W/\"nvidia-state-group-1\""
+                },
+                "common": {
+                    "id": "PowerStateGroup",
+                    "name": "Power State Group",
+                    "description": "Power shelf state"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_power_state_group",
+                    "details": {
+                        "psc_id": "PSC1",
+                        "generated_watts": 2400,
+                        "number_of_pscs": 1,
+                        "number_of_local_psus": 2
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&state_group)?)?,
+            state_group
+        );
+        // A PSC state member carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&psc_state)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c5",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+                    "odata_type": "#NvidiaPscState.v1_0_0.NvidiaPscState",
+                    "etag": "W/\"nvidia-psc-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Power Shelf Controller One",
+                    "description": "PSC state"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_psc_state",
+                    "details": {
+                        "psc_id": "PSC1",
+                        "num_of_operational_psus": 4,
+                        "power_brake_assert": false,
+                        "milliseconds_since_last_heartbeat": 12,
+                        "status": "Operational"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&psc_state)?)?,
+            psc_state
+        );
+        // A PSU state member carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&psu_state)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c6",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+                    "odata_type": "#NvidiaPsuState.v1_0_0.NvidiaPsuState",
+                    "etag": "W/\"nvidia-psu-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Power Supply One",
+                    "description": "PSU state"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_psu_state",
+                    "details": {
+                        "psu_id": "PSU1",
+                        "presence": true,
+                        "input1active": true,
+                        "input2active": false
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&psu_state)?)?,
+            psu_state
+        );
+        // The PSU redundancy singleton carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&redundancy)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c7",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+                    "odata_type": "#NvidiaPsuRedundancy.v1_0_0.NvidiaPsuRedundancy",
+                    "etag": "W/\"nvidia-redundancy-1\""
+                },
+                "common": {
+                    "id": "PSURedundancy",
+                    "name": "PSU Redundancy",
+                    "description": "PSU redundancy settings"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_psu_redundancy",
+                    "details": {
+                        "max_num_supported": "4",
+                        "min_num_needed": "2",
+                        "redundancy_setting": "NPlusOne"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&redundancy)?)?,
+            redundancy
+        );
+        // A managed entity member carries the compiled scalar fields.
+        assert_eq!(
+            serde_json::to_value(&entity)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789c8",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+                    "odata_type": "#NvidiaManagedEntity.v1_0_0.NvidiaManagedEntity",
+                    "etag": "W/\"nvidia-entity-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Managed Entity One",
+                    "description": "BlueField managed entity"
+                },
+                "resource": {
+                    "resource_type": "oem_nvidia_managed_entity",
+                    "details": {
+                        "transport_protocol": "HTTPS",
+                        "ipv4_address": "192.0.2.10",
+                        "ipv6_address": "2001:db8::10",
+                        "port": 443
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&entity)?)?,
+            entity
+        );
+        // An unknown key is refused under every power-family variant, keeping
+        // the strict `deny_unknown_fields` contract.
+        for (resource_type, details) in [
+            (
+                "oem_nvidia_power_compliance",
+                json!({"manager_type": "PowerManager", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_power_domain",
+                json!({"value": 1, "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_power_policy",
+                json!({"min": 1, "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_managed_entity_group",
+                json!({"current_managed_entity_id": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_power_state_group",
+                json!({"psc_id": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_psc_state",
+                json!({"psc_id": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_psu_state",
+                json!({"psu_id": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_psu_redundancy",
+                json!({"max_num_supported": "x", "arbitrary": true}),
+            ),
+            (
+                "oem_nvidia_managed_entity",
+                json!({"port": 1, "arbitrary": true}),
+            ),
+        ] {
+            assert!(
+                serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                    "resource_type": resource_type,
+                    "details": details
+                }))
+                .is_err(),
+                "{resource_type} must refuse unknown detail fields"
+            );
+        }
+        Ok(())
+    }
+
+    fn oem_nvidia_power_compliance_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c0"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance".to_owned(),
+                Some(
+                    "#NvidiaPowerComplianceManager.v1_0_0.NvidiaPowerComplianceManager".to_owned(),
+                ),
+                Some("W/\"nvidia-pc-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "PowerCompliance".to_owned(),
+                "NVIDIA Power Compliance".to_owned(),
+                Some("Power compliance manager".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPowerCompliance {
+                manager_type: Some("PowerManager".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_power_domain_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c1"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1".to_owned(),
+                Some("#NvidiaPowerDomain.v1_0_0.NvidiaPowerDomain".to_owned()),
+                Some("W/\"nvidia-domain-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Power Domain One".to_owned(),
+                Some("Power comparison domain".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPowerDomain {
+                value: Some(800),
+                r#type: Some("Above".to_owned()),
+                unit: Some("Watts".to_owned()),
+                sensor_reading_type: Some("Power".to_owned()),
+                sensor_impl: Some("PhysicalSensor".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_power_policy_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c2"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy".to_owned(),
+                Some("#NvidiaPowerPolicy.v1_0_0.NvidiaPowerPolicy".to_owned()),
+                Some("W/\"nvidia-acloss-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "ACLossPolicy".to_owned(),
+                "AC Loss Policy".to_owned(),
+                Some("AC loss power policy".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPowerPolicy {
+                auto_deassert_power_brake: Some(true),
+                min: Some(200),
+                max: Some(600),
+                r#type: Some("Inclusive".to_owned()),
+                unit: Some("Watts".to_owned()),
+                policy_actions: Some("AssertPowerBrake".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_managed_entity_group_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c3"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1"
+                    .to_owned(),
+                Some("#NvidiaManagedEntityGroup.v1_0_0.NvidiaManagedEntityGroup".to_owned()),
+                Some("W/\"nvidia-group-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Managed Entity Group One".to_owned(),
+                Some("BlueField group".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup {
+                current_managed_entity_id: Some("BF1".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_power_state_group_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c4"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup".to_owned(),
+                Some("#NvidiaPowerStateGroup.v1_0_0.NvidiaPowerStateGroup".to_owned()),
+                Some("W/\"nvidia-state-group-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "PowerStateGroup".to_owned(),
+                "Power State Group".to_owned(),
+                Some("Power shelf state".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPowerStateGroup {
+                psc_id: Some("PSC1".to_owned()),
+                generated_watts: Some(2400),
+                number_of_pscs: Some(1),
+                number_of_local_psus: Some(2),
+            },
+        )
+    }
+
+    fn oem_nvidia_psc_state_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c5"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1"
+                    .to_owned(),
+                Some("#NvidiaPscState.v1_0_0.NvidiaPscState".to_owned()),
+                Some("W/\"nvidia-psc-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Power Shelf Controller One".to_owned(),
+                Some("PSC state".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPscState {
+                psc_id: Some("PSC1".to_owned()),
+                num_of_operational_psus: Some(4),
+                power_brake_assert: Some(false),
+                milliseconds_since_last_heartbeat: Some(12),
+                status: Some("Operational".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_psu_state_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c6"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1"
+                    .to_owned(),
+                Some("#NvidiaPsuState.v1_0_0.NvidiaPsuState".to_owned()),
+                Some("W/\"nvidia-psu-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Power Supply One".to_owned(),
+                Some("PSU state".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPsuState {
+                psu_id: Some("PSU1".to_owned()),
+                presence: Some(true),
+                input1active: Some(true),
+                input2active: Some(false),
+            },
+        )
+    }
+
+    fn oem_nvidia_psu_redundancy_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c7"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy".to_owned(),
+                Some("#NvidiaPsuRedundancy.v1_0_0.NvidiaPsuRedundancy".to_owned()),
+                Some("W/\"nvidia-redundancy-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "PSURedundancy".to_owned(),
+                "PSU Redundancy".to_owned(),
+                Some("PSU redundancy settings".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaPsuRedundancy {
+                max_num_supported: Some("4".to_owned()),
+                min_num_needed: Some("2".to_owned()),
+                redundancy_setting: Some("NPlusOne".to_owned()),
+            },
+        )
+    }
+
+    fn oem_nvidia_managed_entity_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789c8"),
+                "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"
+                    .to_owned(),
+                Some("#NvidiaManagedEntity.v1_0_0.NvidiaManagedEntity".to_owned()),
+                Some("W/\"nvidia-entity-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Managed Entity One".to_owned(),
+                Some("BlueField managed entity".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemNvidiaManagedEntity {
+                transport_protocol: Some("HTTPS".to_owned()),
+                ipv4_address: Some("192.0.2.10".to_owned()),
+                ipv6_address: Some("2001:db8::10".to_owned()),
+                port: Some(443),
             },
         )
     }
@@ -6873,6 +7809,217 @@ mod tests {
                 "child_operation_ids": [first_child],
                 "created_at": "2026-08-05T10:11:12Z",
                 "summary": { "total": 1 }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_summary_contract_pins_the_derived_verdict_and_buckets() -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let batch_id = uuid!("01989abc-def0-7abc-8def-0123456789e4");
+        let summary = BatchSummaryResponse::new(
+            batch_id,
+            OperationSourceResponse::Site,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            BatchOperationStateResponse::Failed,
+            BatchOutcomeCountsResponse::new(2, 1, 0, 1, 0, 4),
+            observed_at,
+        );
+
+        assert_eq!(summary.batch_id(), batch_id);
+        assert_eq!(summary.source(), OperationSourceResponse::Site);
+        assert_eq!(
+            summary.command(),
+            &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle))
+        );
+        assert_eq!(summary.state(), BatchOperationStateResponse::Failed);
+        assert_eq!(summary.outcomes().succeeded(), 2);
+        assert_eq!(summary.outcomes().failed(), 1);
+        assert_eq!(summary.outcomes().unsupported(), 1);
+        assert_eq!(summary.outcomes().total(), 4);
+        assert_eq!(summary.created_at(), observed_at);
+        // The state and the buckets serialize with their stable wire shapes:
+        // snake_case state codes and the six bucket keys.
+        assert_eq!(
+            serde_json::to_value(&summary)?,
+            json!({
+                "batch_id": batch_id,
+                "source": "site",
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "failed",
+                "outcomes": {
+                    "succeeded": 2,
+                    "failed": 1,
+                    "unknown": 0,
+                    "unsupported": 1,
+                    "cancelled": 0,
+                    "total": 4
+                },
+                "created_at": "2026-08-05T10:11:12Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BatchSummaryResponse>(serde_json::to_value(&summary)?)?,
+            summary
+        );
+        // Unknown fields are rejected, and an unknown batch state code is
+        // refused at the wire: the console can never render a verdict this
+        // build does not know.
+        assert!(
+            serde_json::from_value::<BatchSummaryResponse>(json!({
+                "batch_id": batch_id,
+                "source": "site",
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "failed",
+                "outcomes": {
+                    "succeeded": 2,
+                    "failed": 1,
+                    "unknown": 0,
+                    "unsupported": 1,
+                    "cancelled": 0,
+                    "total": 4
+                },
+                "created_at": "2026-08-05T10:11:12Z",
+                "extra": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<BatchSummaryResponse>(json!({
+                "batch_id": batch_id,
+                "source": "site",
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "finished",
+                "outcomes": {
+                    "succeeded": 2,
+                    "failed": 1,
+                    "unknown": 0,
+                    "unsupported": 1,
+                    "cancelled": 0,
+                    "total": 4
+                },
+                "created_at": "2026-08-05T10:11:12Z"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    // The contract walk pins every summary field, both envelope shapes, and
+    // two strict-deserialization refusals, so the line count is the coverage.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn batch_list_and_detail_contracts_round_trip() -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let batch_id = uuid!("01989abc-def0-7abc-8def-0123456789e5");
+        let summary = BatchSummaryResponse::new(
+            batch_id,
+            OperationSourceResponse::Standalone,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            BatchOperationStateResponse::Running,
+            BatchOutcomeCountsResponse::new(1, 0, 0, 0, 0, 2),
+            observed_at,
+        );
+        let list = BatchListResponse::new(vec![summary.clone()]);
+        assert_eq!(list.batches(), std::slice::from_ref(&summary));
+        assert_eq!(
+            serde_json::to_value(&list)?,
+            json!({
+                "batches": [{
+                    "batch_id": batch_id,
+                    "source": "standalone",
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "state": "running",
+                    "outcomes": {
+                        "succeeded": 1,
+                        "failed": 0,
+                        "unknown": 0,
+                        "unsupported": 0,
+                        "cancelled": 0,
+                        "total": 2
+                    },
+                    "created_at": "2026-08-05T10:11:12Z"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BatchListResponse>(serde_json::to_value(&list)?)?,
+            list
+        );
+        assert!(
+            serde_json::from_value::<BatchListResponse>(json!({
+                "batches": [],
+                "count": 0
+            }))
+            .is_err()
+        );
+
+        let detail = BatchDetailResponse::new(
+            batch_id,
+            OperationSourceResponse::Standalone,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            BatchOperationStateResponse::Running,
+            BatchOutcomeCountsResponse::new(1, 0, 0, 0, 0, 2),
+            observed_at,
+            vec![
+                OperationResponse::new(
+                    uuid!("01989abc-def0-7abc-8def-0123456789e6"),
+                    OperationSourceResponse::Standalone,
+                    vec![OperationTargetResponse::new(
+                        uuid!("01989abc-def0-7abc-8def-0123456789e7"),
+                        uuid!("01989abc-def0-7abc-8def-0123456789e8"),
+                    )],
+                    RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                    OperationStateResponse::Succeeded,
+                    observed_at,
+                    observed_at,
+                ),
+                OperationResponse::new(
+                    uuid!("01989abc-def0-7abc-8def-0123456789e9"),
+                    OperationSourceResponse::Standalone,
+                    vec![OperationTargetResponse::new(
+                        uuid!("01989abc-def0-7abc-8def-0123456789ea"),
+                        uuid!("01989abc-def0-7abc-8def-0123456789eb"),
+                    )],
+                    RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                    OperationStateResponse::Queued,
+                    observed_at,
+                    observed_at,
+                ),
+            ],
+        );
+        assert_eq!(detail.batch_id(), batch_id);
+        assert_eq!(detail.children().len(), 2);
+        assert_eq!(
+            detail.children()[0].operation_id(),
+            uuid!("01989abc-def0-7abc-8def-0123456789e6")
+        );
+        assert_eq!(detail.children()[1].state(), OperationStateResponse::Queued);
+        // The detail is a strict projection of the summary fields plus the
+        // children; an unknown field anywhere in the document is rejected.
+        assert_eq!(
+            serde_json::from_value::<BatchDetailResponse>(serde_json::to_value(&detail)?)?,
+            detail
+        );
+        assert!(
+            serde_json::from_value::<BatchDetailResponse>(json!({
+                "batch_id": batch_id,
+                "source": "standalone",
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "running",
+                "outcomes": {
+                    "succeeded": 1,
+                    "failed": 0,
+                    "unknown": 0,
+                    "unsupported": 0,
+                    "cancelled": 0,
+                    "total": 2
+                },
+                "created_at": "2026-08-05T10:11:12Z",
+                "children": [],
+                "summary": {}
             }))
             .is_err()
         );
