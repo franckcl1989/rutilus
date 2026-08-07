@@ -112,6 +112,22 @@ pub enum ResourceFeature {
     /// must not be mistaken for a capability code (see the
     /// ledger-consistency test).
     OemNvidiaManagedEntity,
+    /// The §2.1 `oem-lenovo` read surface, added as a typed resource family
+    /// in the 0.5 slice. The family reads the manager-scoped Lenovo
+    /// `SecurityService` document through the `Lenovo` OEM namespace of the
+    /// `Manager` document: the `Oem.Lenovo` segment decodes through the
+    /// untagged dual-version `LenovoManagerProperties` schema (`v0_1_0` with
+    /// the boolean `KCSEnabled` / `v1_0_0` with the state-string
+    /// `KCSEnabled`, the
+    /// same serde fallback the upstream `LenovoManager` wrapper performs), and
+    /// the `Security` navigation is resolved through the same typed
+    /// `NavProperty` fetch the upstream `security()` wrapper performs. The
+    /// family code is `lenovo-security-service` (not `oem-lenovo`, which stays
+    /// the namespace capability code): the one `oem-lenovo` capability covers
+    /// the namespace advertisement that precedes the read, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code (see the ledger-consistency test).
+    OemLenovoSecurityService,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -253,6 +269,7 @@ impl ResourceFeature {
             Self::OemNvidiaSystemConfigProfile => "nvidia-system-config-profile",
             Self::OemNvidiaPowerCompliance => "nvidia-power-compliance",
             Self::OemNvidiaManagedEntity => "nvidia-managed-entity",
+            Self::OemLenovoSecurityService => "lenovo-security-service",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
@@ -304,6 +321,7 @@ impl FromStr for ResourceFeature {
             "nvidia-system-config-profile" => Ok(Self::OemNvidiaSystemConfigProfile),
             "nvidia-power-compliance" => Ok(Self::OemNvidiaPowerCompliance),
             "nvidia-managed-entity" => Ok(Self::OemNvidiaManagedEntity),
+            "lenovo-security-service" => Ok(Self::OemLenovoSecurityService),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
@@ -875,6 +893,7 @@ mod tests {
             ResourceFeature::OemNvidiaSystemConfigProfile,
             ResourceFeature::OemNvidiaPowerCompliance,
             ResourceFeature::OemNvidiaManagedEntity,
+            ResourceFeature::OemLenovoSecurityService,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
@@ -1101,6 +1120,17 @@ mod tests {
                 ResourceFeature::OemNvidiaManagedEntity,
                 EndpointCapability::OemNvidiaPowerManagement,
             ),
+            // The 0.5 Lenovo SecurityService family follows the same
+            // precedent: the family reads the manager's Lenovo
+            // `SecurityService` document inside the `Lenovo` namespace, so it
+            // maps to the `oem-lenovo` namespace capability (the feature that
+            // advertises that namespace) under the narrower family code
+            // `lenovo-security-service` — never the `oem-lenovo` capability
+            // code, which stays with the ledger.
+            (
+                ResourceFeature::OemLenovoSecurityService,
+                EndpointCapability::OemLenovo,
+            ),
         ];
         for (feature, capability) in subsidiary {
             assert_ne!(feature.as_str(), capability.as_str());
@@ -1260,6 +1290,31 @@ mod tests {
         );
         assert_eq!(
             "oem-nvidia-power-management".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        // The 0.5 Lenovo SecurityService family keeps its narrow
+        // `lenovo-security-service` code; the `oem-lenovo` namespace
+        // capability stays with the ledger, so the snapshot and capability
+        // inventories cannot silently drift into aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemLenovoSecurityService.as_str(),
+            "lenovo-security-service"
+        );
+        assert_eq!(EndpointCapability::OemLenovo.as_str(), "oem-lenovo");
+        assert_eq!(
+            "lenovo-security-service".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemLenovoSecurityService)
+        );
+        assert_eq!(
+            "lenovo-security-service".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-lenovo".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemLenovo)
+        );
+        assert_eq!(
+            "oem-lenovo".parse::<ResourceFeature>(),
             Err(ResourceFeatureParseError)
         );
     }
@@ -1423,6 +1478,25 @@ mod tests {
             "nvidia-managed-entities",
             "nvidia-managed-entity-group",
             "oem-nvidia-managed-entity",
+            // The 0.5 Lenovo SecurityService family: singular, snake_case, and
+            // CamelCase forms would address a different surface, the
+            // vendor-less names would collide with the product's
+            // vendor-prefixed family space, and the `oem-lenovo` capability
+            // code (plus its hypothetical per-surface extensions) must stay
+            // unparseable as families so the ledger and the snapshot
+            // inventory never alias.
+            "lenovo-security-service/",
+            "lenovo_security_service",
+            "lenovosecurityservice",
+            "LenovoSecurityService",
+            "security-service",
+            "security_service",
+            "SecurityService",
+            "lenovo-security-services",
+            "lenovo-security",
+            "lenovo-sec",
+            "oem-lenovo",
+            "oem-lenovo-security-service",
             "host-interface",
             "host-interfaces/",
             "hostinterface",

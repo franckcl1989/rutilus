@@ -778,6 +778,11 @@ where
         #[source]
         source: serde_json::Error,
     },
+    #[error("resource {resource_id} has an {feature} snapshot that is not yet projectable in this layer")]
+    NotYetProjectable {
+        resource_id: ResourceId,
+        feature: ResourceFeature,
+    },
 }
 
 fn project_snapshot<RepositoryError>(
@@ -803,6 +808,17 @@ where
         }
         ResourceFeature::OemNvidiaManagedEntity => {
             project_oem_nvidia_managed_entity(snapshot, payload)?
+        }
+        ResourceFeature::OemLenovoSecurityService => {
+            // The typed projection of the Lenovo `SecurityService` document
+            // lands with the §11.5 resource-details slice; this arm keeps
+            // the compiled family's snapshot countable and storable, and
+            // reports the missing projection as a controlled error instead
+            // of panicking.
+            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
+                resource_id: snapshot.resource_id(),
+                feature: snapshot.feature(),
+            });
         }
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,

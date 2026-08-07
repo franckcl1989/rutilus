@@ -596,6 +596,9 @@ where
             )
             | EndpointResourceInventoryQueryError::Projection { .. },
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(EndpointResourceInventoryQueryError::NotYetProjectable { .. }) => {
+            return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
     let Ok(response) = project_endpoint_resources(&inventory) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1960,6 +1963,7 @@ fn project_enrollment(
             | ResourceFeature::OemNvidiaSystemConfigProfile
             | ResourceFeature::OemNvidiaPowerCompliance
             | ResourceFeature::OemNvidiaManagedEntity
+            | ResourceFeature::OemLenovoSecurityService
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
