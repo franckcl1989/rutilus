@@ -17,11 +17,15 @@ mod application_adapter;
 mod artifact_repository;
 mod audit_repository;
 mod bootstrap_repository;
+mod center_binding_repository;
+mod center_inbox_repository;
+mod center_outbox_repository;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
 mod event_repository;
 mod group_repository;
+mod instance_repository;
 mod migration_backup;
 mod operation_repository;
 mod password_repository;
@@ -29,6 +33,7 @@ mod principal_repository;
 mod remote_task_repository;
 mod resource_snapshot_repository;
 mod session_repository;
+mod sync_cursor_repository;
 mod tag_repository;
 mod telemetry_repository;
 mod totp_repository;
@@ -37,6 +42,15 @@ pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefresh
 pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
 pub use bootstrap_repository::{BootstrapRepositoryError, StoredBootstrapCodeError};
+pub use center_binding_repository::{
+    CenterBindingRepositoryError, RevokeOutcome, StoredCenterBindingError,
+};
+pub use center_inbox_repository::{
+    CenterInboxRepositoryError, CreateInboxOutcome, InboxAdvanceOutcome, StoredCenterInboxError,
+};
+pub use center_outbox_repository::{
+    AckOutcome, CenterOutboxRepositoryError, StoredCenterOutboxError,
+};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };
@@ -46,6 +60,7 @@ pub use endpoint_capability_repository::{
 pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
 pub use event_repository::{EventRepositoryError, StoredEventError};
 pub use group_repository::{GroupRepositoryError, StoredGroupError};
+pub use instance_repository::{InstanceRepositoryError, StoredInstanceError};
 pub use migration_backup::{MigrationBackup, MigrationBackupError};
 pub use operation_repository::{OperationRepositoryError, StoredBatchError, StoredOperationError};
 pub use password_repository::{PasswordRepositoryError, StoredPasswordError};
@@ -55,6 +70,7 @@ pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
 };
 pub use session_repository::{SessionRepositoryError, StoredSessionError};
+pub use sync_cursor_repository::{StoredSyncCursorError, SyncCursorRepositoryError};
 pub use tag_repository::{StoredTagError, TagRepositoryError};
 pub use telemetry_repository::{
     StoredTelemetryError, TelemetryPruneSummary, TelemetryRepositoryError,
