@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     error::Error as StdError,
     fmt,
     future::Future,
@@ -14,19 +14,27 @@ use std::{
 use futures_util::TryStreamExt as _;
 use futures_util::io::Cursor;
 use nv_redfish::{
-    Bmc as _, Resource as NvResource, ServiceRoot,
+    Bmc as _,
+    Resource as NvResource,
+    ServiceRoot,
     bmc_http::{
         BmcCredentials, CacheSettings, HttpBmc,
         reqwest::{BmcError, Client as NvHttpClient},
     },
-    chassis::{Chassis, ChassisCollection, NetworkAdapter},
+    chassis::{Chassis, ChassisCollection, Manufacturer as ChassisManufacturer, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
     core::{
-        BoxTryStream, DataStream, EntityTypeRef, HttpPushUriUpdateRequest, ModificationResponse,
-        MultipartUpdateRequest, NavProperty, ODataId, ReferenceLeaf, ToSnakeCase, UploadStream,
+        BoxTryStream, DataStream, EdmPrimitiveType, EntityTypeRef, HttpPushUriUpdateRequest,
+        ModificationResponse, MultipartUpdateRequest, NavProperty, ODataId, ReferenceLeaf,
+        ToSnakeCase, UploadStream,
     },
     event_service::EventStreamPayload,
     manager::{Manager, ManagerCollection},
+    // The Dell Attributes read surface is the one Dell OEM schema the
+    // `oem-dell-attributes` feature compiles; it lives in the Dell OEM
+    // feature's own generated module (`oem::dell::schema`), not in the base
+    // `schema` module where the standard types are re-exported.
+    oem::dell::schema::dell_attributes::DellAttributes as DellAttributesSchema,
     schema::{
         assembly::Assembly as AssemblySchema,
         assembly::AssemblyData as AssemblyDataSchema,
@@ -187,9 +195,9 @@ impl RedfishGateway {
         }
     }
 
-    /// Reads the Service Root and probes the complete §2.1 standard feature
-    /// surface (30 capabilities) through public, typed `nv-redfish`
-    /// navigation methods.
+    /// Reads the Service Root and probes the complete §2.1 capability surface
+    /// (30 standard and 14 OEM capabilities) through public, typed
+    /// `nv-redfish` navigation methods.
     ///
     /// When `SessionService` is usable, the gateway creates an operation-scoped
     /// Session, authenticates subsequent reads with its in-memory token, and
@@ -206,6 +214,11 @@ impl RedfishGateway {
     /// cannot change. When no member can be inspected (empty collection or
     /// member fetch failure), member-scoped features inherit the collection's
     /// observation gap instead of guessing at links that were never decoded.
+    ///
+    /// OEM capabilities are probed as a pure presence read over the resources
+    /// this flow already decoded (Service Root plus collection members): the
+    /// vendor namespace keys in their `Oem` segments decide the §11.3
+    /// advertised layer without a single extra request.
     ///
     /// Capability reads are sequential. A TLS identity or validation failure
     /// stops the probe immediately, while endpoint-local authorization,
@@ -258,6 +271,7 @@ impl RedfishGateway {
                 systems_features: probe_system_features(&systems, &identity, trust).await?,
                 chassis_features: probe_chassis_features(&chassis, &identity, trust).await?,
                 manager_features: probe_manager_features(&managers, &identity, trust).await?,
+                oem: probe_oem_namespaces(&authenticated.root, &systems, &chassis, &managers),
             };
             Ok(CoreEndpointDiscovery {
                 service_root,
@@ -1419,8 +1433,61 @@ async fn read_manager_resources(
             )
             .await?,
         );
+        resources.extend(read_manager_dell_attributes(&manager, bmc, identity, trust).await?);
     }
     Ok(resources)
+}
+
+/// Reads one manager's Dell OEM `DellAttributes` document (§11.5).
+///
+/// The only Dell OEM surface nv-redfish 0.13 compiles is the manager
+/// `DellAttributes` leaf behind `oem-dell-attributes`, so the Dell OEM family
+/// is exactly this document. The read mirrors `nv-redfish`'s own
+/// manager-attributes constructor: only a manager document that advertises
+/// `Oem.Dell` is probed, the probe URL is crafted from the manager's own
+/// `@odata.id` (the same `{manager}/Oem/Dell/DellAttributes/{id}` the
+/// upstream wrapper builds), and the document is fetched through the same
+/// typed navigation into the compiled `DellAttributes` schema — never a raw
+/// JSON read, per §11.5's two-way rule.
+///
+/// A manager without `Oem.Dell` produces no snapshot and no fabricated
+/// request; a failed or undecodable Dell Attributes document is one odd
+/// manager surface and follows the member-level skip semantics like any
+/// other member fetch.
+async fn read_manager_dell_attributes(
+    manager: &ManagerSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let advertises_dell = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .is_some_and(|oem| oem.additional_properties.get("Dell").is_some());
+    if !advertises_dell {
+        return Ok(Vec::new());
+    }
+    let odata_id = ODataId::from(format!(
+        "{}/Oem/Dell/DellAttributes/{}",
+        manager.odata_id(),
+        manager.base.id
+    ));
+    let attributes = match NavProperty::<DellAttributesSchema>::new_reference(odata_id)
+        .get(bmc)
+        .await
+    {
+        Ok(attributes) => attributes,
+        Err(source) => {
+            skip_member_failure(source, identity, trust)?;
+            return Ok(Vec::new());
+        }
+    };
+    let Some(projection) = member_projection(dell_attributes_projection(&attributes))? else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![projection])
 }
 
 /// Reads the `Accounts` family through the root-level `AccountService` link,
@@ -3966,6 +4033,36 @@ struct ManagerPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.5.0 Dell OEM `DellAttributes` family projection.
+///
+/// The field set is exactly the `OemDellPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. Only the five
+/// identity attributes Dell iDRAC documents on its `DellAttributes` resource
+/// are projected, each read through the typed `Edm.PrimitiveType` map of the
+/// compiled schema (the same typed lookup the upstream `DellAttributes`
+/// wrapper performs); every other entry of the vendor-specific dynamic
+/// attribute bag stays out exactly like `Bios`'s `Attributes` bag does,
+/// because the bag is unbounded and untyped by key.
+#[derive(Serialize)]
+struct DellAttributesPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ServerModel", skip_serializing_if = "Option::is_none")]
+    server_model: Option<String>,
+    #[serde(rename = "ServerServiceTag", skip_serializing_if = "Option::is_none")]
+    server_service_tag: Option<String>,
+    #[serde(rename = "ServerGeneration", skip_serializing_if = "Option::is_none")]
+    server_generation: Option<String>,
+    #[serde(
+        rename = "ServerBmcMacAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    server_bmc_mac_address: Option<String>,
+    #[serde(rename = "ServerName", skip_serializing_if = "Option::is_none")]
+    server_name: Option<String>,
+}
+
 /// The §0.2.0 `processors` family projection.
 ///
 /// The field set is exactly the `ProcessorPayload` the application boundary
@@ -4658,6 +4755,65 @@ fn manager_projection(
         manager.etag(),
         &payload,
     )
+}
+
+/// Projects one typed Dell `DellAttributes` document into the OEM family.
+///
+/// The `@odata.id`, `ETag`, `Id`, `Name`, and `Description` come from the
+/// typed schema base exactly like every other family; the identity attributes
+/// come from the typed primitive map. The document is one manager surface,
+/// so an unrepresentable identifier or payload is skipped by the caller
+/// through the member-level `member_projection` semantics.
+fn dell_attributes_projection(
+    attributes: &DellAttributesSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = DellAttributesPayload {
+        // The Dell OEM feature generates its own `resource::Resource` base
+        // type (a separate module tree from the base schema re-export), so
+        // the common fields are copied here with the same shape
+        // `from_schema_base` projects instead of converting between the two
+        // nominally distinct resource types.
+        resource: CommonResourcePayload {
+            id: attributes.base.id.clone(),
+            name: attributes.base.name.clone(),
+            description: attributes
+                .base
+                .description
+                .as_ref()
+                .and_then(Option::as_ref)
+                .cloned(),
+        },
+        server_model: dell_attribute_string(attributes, "ServerModel"),
+        server_service_tag: dell_attribute_string(attributes, "ServerServiceTag"),
+        server_generation: dell_attribute_string(attributes, "ServerGeneration"),
+        server_bmc_mac_address: dell_attribute_string(attributes, "ServerBmcMacAddress"),
+        server_name: dell_attribute_string(attributes, "ServerName"),
+    };
+    build_core_projection(
+        ResourceFeature::OemDell,
+        attributes.odata_id(),
+        attributes.etag(),
+        &payload,
+    )
+}
+
+/// Reads one Dell Attributes entry as its typed string value.
+///
+/// Mirrors the upstream `DellAttributeRef::str_value` semantics: an absent
+/// entry, an explicitly null entry, or an entry of another `Edm.PrimitiveType`
+/// (boolean, integer, decimal) projects as `None` instead of failing the
+/// projection — the typed surface decides what a key is worth, the product
+/// never re-interprets a vendor string.
+fn dell_attribute_string(attributes: &DellAttributesSchema, name: &str) -> Option<String> {
+    attributes
+        .attributes
+        .as_ref()
+        .and_then(|bag| bag.dynamic_properties.get(name))
+        .and_then(Option::as_ref)
+        .and_then(|value| match value {
+            EdmPrimitiveType::String(text) => Some(text.clone()),
+            _ => None,
+        })
 }
 
 fn processor_projection(
@@ -6095,8 +6251,45 @@ struct ManagerFeatureProbe {
     log_services: CapabilityState,
 }
 
+/// The observed states of the §2.1 OEM capabilities, one field per variant
+/// in [`rutilus_domain::OEM_CAPABILITY_LEDGER_ORDER`] order.
+///
+/// The states are decided at the vendor-namespace granularity (§11.3
+/// advertised layer): a capability is `Supported` when the already-decoded
+/// resources expose its vendor namespace, and `NotAdvertised` otherwise.
+/// Sub-features that compile inside a parent namespace (`oem-dell-attributes`,
+/// `oem-nvidia-*`) inherit the namespace state, because their sub-surfaces
+/// (the `Attributes` resource, CPER records, fabric data, and so on) are only
+/// distinguishable when the read slice actually reads the OEM resource.
+struct OemNamespaceProbe {
+    ami: CapabilityState,
+    dell: CapabilityState,
+    dell_attributes: CapabilityState,
+    delta: CapabilityState,
+    hpe: CapabilityState,
+    lenovo: CapabilityState,
+    liteon: CapabilityState,
+    nvidia: CapabilityState,
+    nvidia_cper: CapabilityState,
+    nvidia_fabrics: CapabilityState,
+    nvidia_power_management: CapabilityState,
+    nvidia_profiles: CapabilityState,
+    nvidia_security: CapabilityState,
+    supermicro: CapabilityState,
+}
+
+/// The chassis `Manufacturer` hardware-id value that advertises `LiteOn` OEM
+/// extensions.
+///
+/// `LiteOn` is the one compiled vendor whose surface `nv-redfish` 0.13 keys
+/// by manufacturer instead of an `Oem` namespace
+/// (`oem/liteon/power_supply.rs` gates on exactly this value), so the probe
+/// mirrors that exact gate instead of inventing a namespace key the vendor
+/// does not use.
+const LITEON_CHASSIS_MANUFACTURER: &str = "LITE-ON TECHNOLOGY CORP.";
+
 /// Every probed state grouped by origin, so the §2.1 observation vector can
-/// be assembled exhaustively without a 30-field hand-written tuple.
+/// be assembled exhaustively without a 44-field hand-written tuple.
 struct CapabilityObservations {
     session: CapabilityState,
     systems: CapabilityState,
@@ -6106,6 +6299,105 @@ struct CapabilityObservations {
     systems_features: SystemFeatureProbe,
     chassis_features: ChassisFeatureProbe,
     manager_features: ManagerFeatureProbe,
+    oem: OemNamespaceProbe,
+}
+
+/// Returns the vendor namespace keys present in one decoded resource's `Oem`
+/// segment.
+///
+/// The `Oem` segment always preserves its keys as additional properties (the
+/// vendor schemas are decoded separately), so this is a pure presence read
+/// over data the capability probe already fetched: it never issues a request
+/// and cannot fail, which is why the §11.3 advertised layer is decided
+/// without error classification.
+fn oem_namespace_keys(resource: &ResourceSchema) -> Vec<&str> {
+    resource
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.as_object())
+        .map(|namespaces| namespaces.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Collects the `Oem` namespace keys of every decoded member of one
+/// collection into the probe set.
+///
+/// Members that could not be fetched are absent from the set; they neither
+/// advertise nor deny a namespace, because their documents were never
+/// decoded. The root resource always contributes its own `Oem` segment, so
+/// the probe basis is never empty.
+fn collect_member_oem_namespaces<'a, M>(
+    namespaces: &mut BTreeSet<&'a str>,
+    collection: &'a ProbedCollection<M>,
+) where
+    M: NvResource,
+{
+    if let Some(members) = &collection.members {
+        for member in members {
+            namespaces.extend(oem_namespace_keys(NvResource::resource_ref(member)));
+        }
+    }
+}
+
+/// Probes the §2.1 OEM capabilities through the vendor namespaces already
+/// decoded by the capability probe.
+///
+/// Advertisement is an endpoint-level property, so one decoded resource that
+/// carries the vendor namespace decides the capability. The vendor namespace
+/// keys mirror the exact keys `nv-redfish` 0.13 reads (`Ami`, `Dell`,
+/// `deltaenergysystems`, `Hpe`, `Lenovo`, `Nvidia`, `Supermicro`); `LiteOn`
+/// is decided by the chassis `Manufacturer` value instead (see
+/// [`LITEON_CHASSIS_MANUFACTURER`]). Sub-features inherit their parent
+/// namespace state because their surfaces cannot be told apart at the
+/// namespace granularity — the read slice verifies them by reading the OEM
+/// resource itself.
+fn probe_oem_namespaces(
+    root: &ServiceRoot<UpstreamBmc>,
+    systems: &ProbedCollection<ComputerSystem<UpstreamBmc>>,
+    chassis: &ProbedCollection<Chassis<UpstreamBmc>>,
+    managers: &ProbedCollection<Manager<UpstreamBmc>>,
+) -> OemNamespaceProbe {
+    let mut namespaces = BTreeSet::new();
+    namespaces.extend(oem_namespace_keys(NvResource::resource_ref(root)));
+    collect_member_oem_namespaces(&mut namespaces, systems);
+    collect_member_oem_namespaces(&mut namespaces, chassis);
+    collect_member_oem_namespaces(&mut namespaces, managers);
+    let liteon_advertised = chassis.members.as_deref().is_some_and(|members| {
+        members.iter().any(|member| {
+            member.hardware_id().manufacturer
+                == Some(ChassisManufacturer::new(LITEON_CHASSIS_MANUFACTURER))
+        })
+    });
+    let namespace_state = |key: &str| {
+        if namespaces.contains(key) {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::NotAdvertised
+        }
+    };
+    OemNamespaceProbe {
+        ami: namespace_state("Ami"),
+        dell: namespace_state("Dell"),
+        dell_attributes: namespace_state("Dell"),
+        delta: namespace_state("deltaenergysystems"),
+        hpe: namespace_state("Hpe"),
+        lenovo: namespace_state("Lenovo"),
+        liteon: {
+            if liteon_advertised {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::NotAdvertised
+            }
+        },
+        nvidia: namespace_state("Nvidia"),
+        nvidia_cper: namespace_state("Nvidia"),
+        nvidia_fabrics: namespace_state("Nvidia"),
+        nvidia_power_management: namespace_state("Nvidia"),
+        nvidia_profiles: namespace_state("Nvidia"),
+        nvidia_security: namespace_state("Nvidia"),
+        supermicro: namespace_state("Supermicro"),
+    }
 }
 
 async fn probe_root_services(
@@ -6224,7 +6516,9 @@ async fn probe_manager_features(
     })
 }
 
-/// Assembles the §2.1 inventory in design-document order.
+/// Assembles the §2.1 inventory in design-document order: the 30 standard
+/// capabilities first, then the 14 OEM capabilities in
+/// `COMPILED_OEM_FEATURES` order.
 ///
 /// Every field of [`CapabilityObservations`] maps to exactly one entry, so a
 /// future capability cannot silently drop out of discovery.
@@ -6238,8 +6532,9 @@ fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityO
         systems_features,
         chassis_features,
         manager_features,
+        oem,
     } = states;
-    vec![
+    let mut observations = vec![
         EndpointCapabilityObservation::new(EndpointCapability::Accounts, root.accounts),
         EndpointCapabilityObservation::new(EndpointCapability::Assembly, chassis_features.assembly),
         EndpointCapabilityObservation::new(EndpointCapability::Bios, systems_features.bios),
@@ -6312,6 +6607,49 @@ fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityO
         ),
         EndpointCapabilityObservation::new(EndpointCapability::Thermal, chassis_features.thermal),
         EndpointCapabilityObservation::new(EndpointCapability::UpdateService, root.update_service),
+    ];
+    observations.extend(oem_observations(&oem));
+    observations
+}
+
+/// Assembles the 14 OEM observations in [`rutilus_domain::OEM_CAPABILITY_LEDGER_ORDER`]
+/// order, mirroring the `COMPILED_OEM_FEATURES` feature order.
+///
+/// Kept separate from [`build_observations`] so the standard section stays
+/// readable at its full 30-entry length; every field of
+/// [`OemNamespaceProbe`] maps to exactly one entry, so a future OEM
+/// capability cannot silently drop out of discovery.
+fn oem_observations(oem: &OemNamespaceProbe) -> Vec<EndpointCapabilityObservation> {
+    vec![
+        EndpointCapabilityObservation::new(EndpointCapability::OemAmi, oem.ami),
+        EndpointCapabilityObservation::new(EndpointCapability::OemDell, oem.dell),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::OemDellAttributes,
+            oem.dell_attributes,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::OemDelta, oem.delta),
+        EndpointCapabilityObservation::new(EndpointCapability::OemHpe, oem.hpe),
+        EndpointCapabilityObservation::new(EndpointCapability::OemLenovo, oem.lenovo),
+        EndpointCapabilityObservation::new(EndpointCapability::OemLiteOn, oem.liteon),
+        EndpointCapabilityObservation::new(EndpointCapability::OemNvidia, oem.nvidia),
+        EndpointCapabilityObservation::new(EndpointCapability::OemNvidiaCper, oem.nvidia_cper),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::OemNvidiaFabrics,
+            oem.nvidia_fabrics,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::OemNvidiaPowerManagement,
+            oem.nvidia_power_management,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::OemNvidiaProfiles,
+            oem.nvidia_profiles,
+        ),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::OemNvidiaSecurity,
+            oem.nvidia_security,
+        ),
+        EndpointCapabilityObservation::new(EndpointCapability::OemSupermicro, oem.supermicro),
     ]
 }
 
@@ -7036,6 +7374,51 @@ mod tests {
         "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
     }"#;
 
+    /// A Manager member whose `Oem.Dell` segment advertises the Dell
+    /// Attributes surface, so the OEM read probes the crafted Dell Attributes
+    /// URL (the field shape follows what nv-redfish's own manager-attributes
+    /// constructor checks: the `Dell` key under `Oem`).
+    const MANAGER_WITH_DELL_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Dell":{}}
+    }"#;
+
+    /// A Manager member whose `Oem` segment belongs to another vendor: the
+    /// upstream constructor keys on the literal `Dell` name, so a Contoso
+    /// segment must not trigger a Dell probe.
+    const MANAGER_WITH_OTHER_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Contoso":{"Anything":true}}
+    }"#;
+
+    /// The typed Dell `DellAttributes` document served at the crafted
+    /// `{manager}/Oem/Dell/DellAttributes/{id}` URL. The `Attributes` bag
+    /// carries the identity keys the product pins plus one unprojected key,
+    /// so the strict payload contract is exercised both ways.
+    const DELL_ATTRIBUTES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        "@odata.etag":"W/\"dell-attributes-1\"",
+        "Id":"1",
+        "Name":"Dell Attributes",
+        "Description":"Dell iDRAC attributes",
+        "Attributes":{
+            "ServerModel":"PowerEdge R750",
+            "ServerServiceTag":"ABC1234",
+            "ServerGeneration":"16G",
+            "ServerBmcMacAddress":"14:18:77:aa:bb:cc",
+            "ServerName":"rack-1-server-2",
+            "BiosVersion":"2.14.2"
+        }
+    }"#;
+
     const FULL_SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -7101,6 +7484,49 @@ mod tests {
         "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
         "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
         "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"}
+    }"#;
+
+    /// A Service Root that advertises the HPE OEM namespace in its own `Oem`
+    /// segment, so the OEM probe can observe a namespace that lives on the
+    /// root resource instead of a collection member.
+    const OEM_SERVICE_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "Oem":{"Hpe":{"@odata.id":"/redfish/v1/Managers/1/Oem/Hpe"}}
+    }"#;
+
+    /// A System member that advertises the NVIDIA OEM namespace in its `Oem`
+    /// segment, so the OEM probe can observe a namespace carried by a
+    /// collection member.
+    const SYSTEM_WITH_NVIDIA_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia"}}
+    }"#;
+
+    /// A Chassis member that advertises the Dell OEM namespace in its `Oem`
+    /// segment and the `LiteOn` chassis manufacturer value, so one fixture
+    /// exercises both OEM advertisement signals at once (the `Dell` key and
+    /// the `LITE-ON TECHNOLOGY CORP.` hardware-id that `nv-redfish` 0.13
+    /// itself gates `LiteOn` support on).
+    const CHASSIS_WITH_DELL_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Manufacturer":"LITE-ON TECHNOLOGY CORP.",
+        "Oem":{"Dell":{"Attributes":{"@odata.id":"/redfish/v1/Chassis/1/Oem/Dell/Attributes"}}}
     }"#;
 
     const ACCOUNT_SERVICE_BODY: &str = r#"{
@@ -8535,6 +8961,24 @@ mod tests {
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
+    /// The request order for one manager that advertises `Oem.Dell`: the
+    /// Dell Attributes document is read right after the manager member,
+    /// exactly like the other manager-bound families.
+    const CORE_RESOURCE_WITH_DELL_ATTRIBUTES_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
     /// The request order for one System member that carries populated
     /// Processors and Memory collections: the families are read right after
     /// their parent, before the sibling collections.
@@ -9204,10 +9648,11 @@ mod tests {
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
-    /// The §2.1 standard-feature inventory in design-document order, mirrored
-    /// from `rutilus_domain` so discovery can prove it covers every capability
-    /// exactly once.
-    const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 30] = [
+    /// The complete §2.1 capability inventory in ledger order (30 standard
+    /// features in design-document order followed by the 14 OEM features in
+    /// the compiled feature order), mirrored from `rutilus_domain` so
+    /// discovery can prove it covers every capability exactly once.
+    const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 44] = [
         EndpointCapability::Accounts,
         EndpointCapability::Assembly,
         EndpointCapability::Bios,
@@ -9238,6 +9683,20 @@ mod tests {
         EndpointCapability::TelemetryService,
         EndpointCapability::Thermal,
         EndpointCapability::UpdateService,
+        EndpointCapability::OemAmi,
+        EndpointCapability::OemDell,
+        EndpointCapability::OemDellAttributes,
+        EndpointCapability::OemDelta,
+        EndpointCapability::OemHpe,
+        EndpointCapability::OemLenovo,
+        EndpointCapability::OemLiteOn,
+        EndpointCapability::OemNvidia,
+        EndpointCapability::OemNvidiaCper,
+        EndpointCapability::OemNvidiaFabrics,
+        EndpointCapability::OemNvidiaPowerManagement,
+        EndpointCapability::OemNvidiaProfiles,
+        EndpointCapability::OemNvidiaSecurity,
+        EndpointCapability::OemSupermicro,
     ];
 
     /// Builds the exact discovery vector a probe must return for one fixture
@@ -9253,6 +9712,7 @@ mod tests {
             systems_features,
             chassis_features,
             manager_features,
+            oem,
         } = states;
         let expected = [
             (EndpointCapability::Accounts, root.accounts),
@@ -9315,6 +9775,23 @@ mod tests {
             (EndpointCapability::TelemetryService, root.telemetry_service),
             (EndpointCapability::Thermal, chassis_features.thermal),
             (EndpointCapability::UpdateService, root.update_service),
+            (EndpointCapability::OemAmi, oem.ami),
+            (EndpointCapability::OemDell, oem.dell),
+            (EndpointCapability::OemDellAttributes, oem.dell_attributes),
+            (EndpointCapability::OemDelta, oem.delta),
+            (EndpointCapability::OemHpe, oem.hpe),
+            (EndpointCapability::OemLenovo, oem.lenovo),
+            (EndpointCapability::OemLiteOn, oem.liteon),
+            (EndpointCapability::OemNvidia, oem.nvidia),
+            (EndpointCapability::OemNvidiaCper, oem.nvidia_cper),
+            (EndpointCapability::OemNvidiaFabrics, oem.nvidia_fabrics),
+            (
+                EndpointCapability::OemNvidiaPowerManagement,
+                oem.nvidia_power_management,
+            ),
+            (EndpointCapability::OemNvidiaProfiles, oem.nvidia_profiles),
+            (EndpointCapability::OemNvidiaSecurity, oem.nvidia_security),
+            (EndpointCapability::OemSupermicro, oem.supermicro),
         ];
         assert_eq!(expected.len(), CAPABILITY_INVENTORY_ORDER.len());
         for (observation, expected_capability) in expected.iter().zip(CAPABILITY_INVENTORY_ORDER) {
@@ -9333,6 +9810,7 @@ mod tests {
         core: CapabilityState,
         root_services: CapabilityState,
         nested: CapabilityState,
+        oem: CapabilityState,
     ) -> CapabilityObservations {
         CapabilityObservations {
             session,
@@ -9373,6 +9851,28 @@ mod tests {
                 manager_network_protocol: nested,
                 log_services: nested,
             },
+            oem: uniform_oem(oem),
+        }
+    }
+
+    /// Assigns one uniform state to every OEM capability, for fixtures whose
+    /// decoded resources either all carry a vendor namespace or carry none.
+    fn uniform_oem(state: CapabilityState) -> OemNamespaceProbe {
+        OemNamespaceProbe {
+            ami: state,
+            dell: state,
+            dell_attributes: state,
+            delta: state,
+            hpe: state,
+            lenovo: state,
+            liteon: state,
+            nvidia: state,
+            nvidia_cper: state,
+            nvidia_fabrics: state,
+            nvidia_power_management: state,
+            nvidia_profiles: state,
+            nvidia_security: state,
+            supermicro: state,
         }
     }
 
@@ -9468,9 +9968,90 @@ mod tests {
                 CapabilityState::Supported,
                 CapabilityState::Supported,
                 CapabilityState::Supported,
+                // The full fixture carries no `Oem` segments, so no vendor
+                // namespace is advertised and every OEM capability is
+                // `NotAdvertised` without a single extra request.
+                CapabilityState::NotAdvertised,
             ))
         );
         assert_session_requests(&server.finish_all().await?, &FULL_PROBE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detects_oem_namespaces_from_decoded_resources_without_extra_requests()
+    -> Result<(), Box<dyn Error>> {
+        // The fixture spreads the vendor namespaces across the resources the
+        // capability probe already reads: `Hpe` on the Service Root, `Nvidia`
+        // on the System member, and `Dell` plus the LiteOn chassis
+        // manufacturer on the Chassis member. The Manager member carries no
+        // `Oem` segment at all. The request sequence therefore contains only
+        // the standard probe traffic: the OEM probe must not add a single
+        // request and must not fail on any resource class.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            OEM_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_NVIDIA_OEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_DELL_OEM_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let discovery = gateway
+            .probe_core_capabilities(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        let mut expected = uniform_group(
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+        );
+        expected.oem = OemNamespaceProbe {
+            ami: CapabilityState::NotAdvertised,
+            dell: CapabilityState::Supported,
+            dell_attributes: CapabilityState::Supported,
+            delta: CapabilityState::NotAdvertised,
+            hpe: CapabilityState::Supported,
+            lenovo: CapabilityState::NotAdvertised,
+            liteon: CapabilityState::Supported,
+            nvidia: CapabilityState::Supported,
+            nvidia_cper: CapabilityState::Supported,
+            nvidia_fabrics: CapabilityState::Supported,
+            nvidia_power_management: CapabilityState::Supported,
+            nvidia_profiles: CapabilityState::Supported,
+            nvidia_security: CapabilityState::Supported,
+            supermicro: CapabilityState::NotAdvertised,
+        };
+        assert_eq!(discovery.capabilities(), expected_capabilities(expected));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &[
+                "/redfish/v1",
+                "/redfish/v1/SessionService",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/SessionService/Sessions",
+                "/redfish/v1/Systems",
+                "/redfish/v1/Systems/1",
+                "/redfish/v1/Chassis",
+                "/redfish/v1/Chassis/1",
+                "/redfish/v1/Managers",
+                "/redfish/v1/Managers/1",
+                "/redfish/v1/SessionService/Sessions/1",
+            ],
+        )?;
         Ok(())
     }
 
@@ -9496,6 +10077,8 @@ mod tests {
                 CapabilityState::NotAdvertised,
                 CapabilityState::NotAdvertised,
                 CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+                // The root-only fixture carries no `Oem` segment.
                 CapabilityState::NotAdvertised,
             ))
         );
@@ -9567,6 +10150,8 @@ mod tests {
                     manager_network_protocol: CapabilityState::NotAdvertised,
                     log_services: CapabilityState::NotAdvertised,
                 },
+                // The fixture bodies carry no `Oem` segments.
+                oem: uniform_oem(CapabilityState::NotAdvertised),
             })
         );
         assert_authenticated_requests(&server.finish_all().await?, &BASIC_FALLBACK_REQUEST_PATHS)?;
@@ -9604,6 +10189,8 @@ mod tests {
                 CapabilityState::TemporarilyUnavailable,
                 CapabilityState::Supported,
                 CapabilityState::NotAdvertised,
+                CapabilityState::NotAdvertised,
+                // The fixture bodies carry no `Oem` segments.
                 CapabilityState::NotAdvertised,
             ))
         );
@@ -9694,6 +10281,8 @@ mod tests {
                 CapabilityState::Supported,
                 CapabilityState::NotAdvertised,
                 CapabilityState::NotAdvertised,
+                // The fixture bodies carry no `Oem` segments.
+                CapabilityState::NotAdvertised,
             ))
         );
         assert_invalid_session_token_fallback_requests(
@@ -9769,6 +10358,8 @@ mod tests {
                     manager_network_protocol: CapabilityState::NotAdvertised,
                     log_services: CapabilityState::NotAdvertised,
                 },
+                // The fixture bodies carry no `Oem` segments.
+                oem: uniform_oem(CapabilityState::NotAdvertised),
             })
         );
         assert_session_requests(
@@ -9964,6 +10555,186 @@ mod tests {
         assert_eq!(system_payload["Status"]["Health"], "OK");
         assert_eq!(system_payload["BiosVersion"], "2.3.4");
         assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_dell_oem_attributes_through_typed_navigation() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_DELL_OEM_BODY),
+                ("200 OK", DELL_ATTRIBUTES_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        let dell = &resources[4];
+        assert_eq!(dell.feature(), ResourceFeature::OemDell);
+        assert_eq!(
+            dell.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"
+        );
+        assert_eq!(
+            dell.etag().map(ResourceEtag::as_str),
+            Some("W/\"dell-attributes-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(dell.payload().as_str())?;
+        assert_eq!(payload["Id"], "1");
+        assert_eq!(payload["Name"], "Dell Attributes");
+        assert_eq!(payload["Description"], "Dell iDRAC attributes");
+        assert_eq!(payload["ServerModel"], "PowerEdge R750");
+        assert_eq!(payload["ServerServiceTag"], "ABC1234");
+        assert_eq!(payload["ServerGeneration"], "16G");
+        assert_eq!(payload["ServerBmcMacAddress"], "14:18:77:aa:bb:cc");
+        assert_eq!(payload["ServerName"], "rack-1-server-2");
+        // The unpinned `BiosVersion` entry of the dynamic bag stays out of the
+        // strictly projectable field set, exactly like `Bios`'s attribute bag.
+        assert!(payload.get("BiosVersion").is_none());
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_DELL_ATTRIBUTES_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_without_dell_oem_produces_no_oem_snapshot() -> Result<(), Box<dyn Error>> {
+        // An `Oem` segment of another vendor must not be mistaken for Dell,
+        // and a manager without any `Oem` segment stays untouched; neither
+        // case issues a Dell probe.
+        for manager_body in [MANAGER_BODY, MANAGER_WITH_OTHER_OEM_BODY] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                CORE_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", manager_body),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(
+                resources
+                    .iter()
+                    .all(|resource| resource.feature() != ResourceFeature::OemDell)
+            );
+            // No Dell probe was issued: the request sequence is exactly the
+            // plain manager read.
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_dell_attributes_are_skipped_like_one_odd_member()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_DELL_OEM_BODY),
+                // A Dell Attributes document that cannot be decoded into the
+                // compiled `DellAttributes` schema (missing the required `Id`
+                // and `Name`) is one odd manager surface, not an endpoint-wide
+                // condition: the read succeeds and leaves the family absent.
+                (
+                    "200 OK",
+                    r#"{"@odata.id":"/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"}"#,
+                ),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemDell)
+        );
+        // The failed Dell probe is still observable as a request, like every
+        // member-level skip.
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_DELL_ATTRIBUTES_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn dell_attribute_lookup_keeps_the_typed_primitive_contract() -> Result<(), Box<dyn Error>> {
+        // The compiled `DellAttributes` schema is the type boundary: an entry
+        // of a non-string `Edm.PrimitiveType`, an explicit null, and an
+        // absent key all project as `None` instead of being coerced.
+        let attributes: DellAttributesSchema = serde_json::from_str(
+            r#"{
+            "@odata.id":"/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+            "Id":"1",
+            "Name":"Dell Attributes",
+            "Attributes":{
+                "ServerModel":"PowerEdge R750",
+                "ServerName":null,
+                "ServerGeneration":16
+            }
+        }"#,
+        )?;
+
+        assert_eq!(
+            dell_attribute_string(&attributes, "ServerModel"),
+            Some("PowerEdge R750".to_owned())
+        );
+        assert_eq!(dell_attribute_string(&attributes, "ServerName"), None);
+        // `ServerGeneration` is an integer on this fixture: the typed lookup
+        // refuses to reinterpret it as text.
+        assert_eq!(dell_attribute_string(&attributes, "ServerGeneration"), None);
+        assert_eq!(dell_attribute_string(&attributes, "ServerServiceTag"), None);
         Ok(())
     }
 

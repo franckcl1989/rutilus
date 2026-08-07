@@ -23,9 +23,20 @@ pub use tls_probe::{
 
 /// The exact upstream version currently evaluated during product development.
 ///
-/// This remains movable until the 0.8.0 capability freeze.
+/// This remains movable until the 0.8.0 capability freeze (§2.3), when the
+/// release baseline pins the crate version, the lockfile, and the complete
+/// capability inventory as a frozen ledger Hash.
 pub const NV_REDFISH_DEVELOPMENT_BASELINE: &str = "0.13.0";
 
+/// The OEM features linked into the single Rutilus binary.
+///
+/// This list is the compiled-feature contract the domain OEM ledger
+/// [`rutilus_domain::OEM_CAPABILITY_LEDGER_ORDER`] mirrors: the alignment
+/// test below proves the two inventories name exactly the same features in
+/// exactly the same order, so the domain ledger cannot drift from the binary.
+/// It is also the rehearsal for the 0.8.0 capability-ledger Hash (§2.3): once
+/// the version, the feature list, and the schema surface freeze, this
+/// constant's contents become the machine-readable record that 0.8.0 hashes.
 const COMPILED_OEM_FEATURES: &[&str] = &[
     "oem-ami",
     "oem-dell",
@@ -72,6 +83,14 @@ impl NvRedfishBaseline {
 }
 
 /// The development capability surface linked into the single Rutilus binary.
+///
+/// This is the compiled layer of the §11.3 three-state model: the version,
+/// the `std-redfish` group, and the OEM feature list that this binary can
+/// possibly serve. The 0.2 ledger projects this surface through the domain
+/// capability inventory, so every §2.1 feature is enumerated even before a
+/// probe observes it. Like the domain ledger, this baseline stays movable
+/// during development and becomes the frozen `NvRedfishReleaseBaseline`
+/// (including its ledger Hash) at 0.8.0 (§2.3).
 pub const COMPILED_NV_REDFISH_BASELINE: NvRedfishBaseline = NvRedfishBaseline {
     version: NV_REDFISH_DEVELOPMENT_BASELINE,
     standard_redfish: true,
@@ -104,6 +123,8 @@ impl CompiledCapabilityBoundary {
 
 #[cfg(test)]
 mod tests {
+    use rutilus_domain::{EndpointCapability, OEM_CAPABILITY_LEDGER_ORDER};
+
     use super::*;
 
     #[test]
@@ -114,5 +135,18 @@ mod tests {
         assert!(baseline.includes_standard_redfish());
         assert_eq!(baseline.oem_features(), COMPILED_OEM_FEATURES);
         assert_eq!(baseline.oem_features().len(), 14);
+    }
+
+    #[test]
+    fn compiled_oem_features_match_the_domain_oem_capabilities_exactly() {
+        // The linked feature list and the domain OEM ledger must name the
+        // same features in the same order: the ledger is the projection of
+        // the binary's compiled surface (§2.4), so a feature compiled but
+        // missing from the ledger would be invisible to the capability page,
+        // and a ledger entry without a compiled feature would render a
+        // capability the binary cannot serve. The order is part of the
+        // contract because the probe emits observations in ledger order.
+        let domain_codes = OEM_CAPABILITY_LEDGER_ORDER.map(EndpointCapability::as_str);
+        assert_eq!(COMPILED_OEM_FEATURES, &domain_codes);
     }
 }
