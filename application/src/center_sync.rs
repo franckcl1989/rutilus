@@ -277,6 +277,12 @@ pub trait CenterEventTail: Send + Sync {
         after: EventId,
         limit: u64,
     ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>>;
+
+    /// Reports whether one event id is still stored — the §17 resume-anchor
+    /// validity check. The bounded history can evict the anchor (§14.4) and
+    /// a manual DB change can remove it; the engine resets such a stream to
+    /// the bounded tail instead of failing the connection on every attempt.
+    fn contains(&self, event_id: EventId) -> BoundaryFuture<'_, Result<bool, Self::Error>>;
 }
 
 impl<EventTail> CenterEventTail for &EventTail
@@ -295,6 +301,10 @@ where
         limit: u64,
     ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
         EventTail::list_after(*self, after, limit)
+    }
+
+    fn contains(&self, event_id: EventId) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+        EventTail::contains(*self, event_id)
     }
 }
 
@@ -1142,12 +1152,21 @@ where
             .await
             .map_err(CenterSyncError::Cursor)?;
         let mut watermark = match cursor.as_ref() {
-            Some(cursor) => parse_endpoint_cursor(cursor.cursor_value()).map_err(|source| {
-                CenterSyncError::InvalidCursor {
-                    stream: SyncStream::Endpoint,
-                    source,
+            Some(cursor) => match parse_endpoint_cursor(cursor.cursor_value()) {
+                Ok(watermark) => watermark,
+                Err(source) => {
+                    // A stored cursor a manual DB change or a partial
+                    // restore left unparseable must not wedge the sync loop:
+                    // log it and re-report the current projections. The
+                    // report's cursor write at the end heals the row.
+                    eprintln!(
+                        "site {}: resetting the {} stream cursor: {source}",
+                        self.instance_id,
+                        SyncStream::Endpoint
+                    );
+                    BTreeMap::new()
                 }
-            })?,
+            },
             None => BTreeMap::new(),
         };
         let items = EndpointInventoryQuery::new(&self.store)
@@ -1275,20 +1294,53 @@ where
             .get(self.instance_id, SyncStream::Event)
             .await
             .map_err(CenterSyncError::Cursor)?;
-        let (events, newest_id) = if let Some(cursor) = cursor.as_ref() {
-            let anchor = cursor.cursor_value().parse::<EventId>().map_err(|_| {
-                CenterSyncError::InvalidCursor {
-                    stream: SyncStream::Event,
-                    source: StoredCursorError::InvalidId,
-                }
-            })?;
-            let events = self
+        let cursor_anchor = if let Some(cursor) = cursor.as_ref() {
+            if let Ok(anchor) = cursor.cursor_value().parse::<EventId>() {
+                Some(anchor)
+            } else {
+                // A stored cursor a manual DB change or a partial restore
+                // left unparseable must not wedge the sync loop: log it and
+                // re-report the bounded tail. The report's cursor write at
+                // the end heals the row.
+                eprintln!(
+                    "site {}: resetting the event stream cursor: the stored value is not an event id",
+                    self.instance_id
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let (events, newest_id) = if let Some(anchor) = cursor_anchor {
+            if self
                 .events
-                .list_after(anchor, self.options.event_batch_limit)
+                .contains(anchor)
                 .await
-                .map_err(CenterSyncError::Events)?;
-            let newest_id = events.last().map(Event::id);
-            (events, newest_id)
+                .map_err(CenterSyncError::Events)?
+            {
+                let events = self
+                    .events
+                    .list_after(anchor, self.options.event_batch_limit)
+                    .await
+                    .map_err(CenterSyncError::Events)?;
+                let newest_id = events.last().map(Event::id);
+                (events, newest_id)
+            } else {
+                // The bounded history evicted the anchor (§14.4) or a manual
+                // DB change removed it: reset the stream to the bounded tail
+                // instead of failing the connection on every attempt.
+                eprintln!(
+                    "site {}: resetting the event stream cursor: the anchor {} is no longer stored",
+                    self.instance_id, anchor
+                );
+                let events = self
+                    .events
+                    .list_recent(self.options.event_batch_limit)
+                    .await
+                    .map_err(CenterSyncError::Events)?;
+                let newest_id = events.first().map(Event::id);
+                (events, newest_id)
+            }
         } else {
             let events = self
                 .events
@@ -1349,29 +1401,43 @@ where
             .get(self.instance_id, SyncStream::Artifact)
             .await
             .map_err(CenterSyncError::Cursor)?;
-        let anchor = match cursor.as_ref() {
-            Some(cursor) => Some(cursor.cursor_value().parse::<ArtifactId>().map_err(|_| {
-                CenterSyncError::InvalidCursor {
-                    stream: SyncStream::Artifact,
-                    source: StoredCursorError::InvalidId,
-                }
-            })?),
-            None => None,
-        };
-        let anchor_created_at = match anchor {
-            Some(anchor_id) => {
-                let artifact = self
-                    .store
-                    .find_artifact(anchor_id)
-                    .await
-                    .map_err(CenterSyncError::Artifact)?
-                    .ok_or(CenterSyncError::InvalidCursor {
-                        stream: SyncStream::Artifact,
-                        source: StoredCursorError::InvalidId,
-                    })?;
-                Some(artifact.created_at())
+        let anchor = if let Some(cursor) = cursor.as_ref() {
+            if let Ok(anchor) = cursor.cursor_value().parse::<ArtifactId>() {
+                Some(anchor)
+            } else {
+                // A stored cursor a manual DB change or a partial restore
+                // left unparseable must not wedge the sync loop: log it and
+                // re-distribute the ready set. The report's cursor write at
+                // the end heals the row.
+                eprintln!(
+                    "site {}: resetting the artifact stream cursor: the stored value is not an artifact id",
+                    self.instance_id
+                );
+                None
             }
-            None => None,
+        } else {
+            None
+        };
+        let anchor_created_at = if let Some(anchor_id) = anchor {
+            if let Some(artifact) = self
+                .store
+                .find_artifact(anchor_id)
+                .await
+                .map_err(CenterSyncError::Artifact)?
+            {
+                Some(artifact.created_at())
+            } else {
+                // The anchor artifact is gone (a manual DB change or a
+                // partial restore): reset the stream and re-distribute the
+                // ready set; the report's cursor write heals the row.
+                eprintln!(
+                    "site {}: resetting the artifact stream cursor: the anchor artifact is no longer stored",
+                    self.instance_id
+                );
+                None
+            }
+        } else {
+            None
         };
         let ready = self
             .store
@@ -2324,6 +2390,20 @@ mod tests {
                 Ok(after_anchor)
             })
         }
+
+        fn contains(
+            &self,
+            event_id: EventId,
+        ) -> crate::BoundaryFuture<'_, Result<bool, Self::Error>> {
+            Box::pin(async move {
+                Ok(self
+                    .events
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .any(|event| event.id() == event_id))
+            })
+        }
     }
 
     /// A fixed clock for the engine tests.
@@ -2403,6 +2483,28 @@ mod tests {
                 };
                 let _ = sequence;
             }
+            Ok(())
+        }
+
+        /// Enqueues one entry whose payload is not the §9.4 typed
+        /// serialization of an envelope — the corrupt-row shape a manual DB
+        /// change can produce.
+        fn enqueue_corrupt_payload(
+            &self,
+            now: OffsetDateTime,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| std::io::Error::other("the mock outbox lock was poisoned"))?;
+            let next = entries.iter().map(OutboxEntry::sequence).max().unwrap_or(0) + 1;
+            entries.push(OutboxEntry::new(
+                OutboxEntryId::generate(),
+                self.instance_id,
+                next,
+                String::from("{not a serialized envelope"),
+                now,
+            ));
             Ok(())
         }
 
@@ -3723,6 +3825,269 @@ mod tests {
         };
         assert_eq!(progress.operation_id, offer.operation_id);
         assert_eq!(progress.state, OperationState::Queued.as_str());
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        assert!(
+            stopped.is_ok(),
+            "the engine must stop cleanly, got {stopped:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_endpoint_cursor_resets_and_re_reports()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        // The stored cursor a manual DB change left unparseable.
+        cursor
+            .set(&SyncCursor::new(
+                SyncCursorId::generate(),
+                instance_id,
+                SyncStream::Endpoint,
+                String::from("not-an-endpoint-cursor"),
+                now,
+            ))
+            .await?;
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        // The reset re-reports the whole current projection instead of
+        // failing the connection...
+        engine.report_endpoint_projection().await?;
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages.first(),
+            Some(EnvelopeMessage::EndpointSnapshot(_))
+        ));
+        // ... and the report healed the cursor row.
+        let value = cursor
+            .cursor_value(instance_id, SyncStream::Endpoint)?
+            .ok_or_else(|| std::io::Error::other("the endpoint cursor is missing"))?;
+        assert_eq!(value, format!("{}:1", endpoint.id()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_event_cursor_resets_to_the_bounded_tail()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let first = Event::new(
+            EventId::generate(),
+            EndpointId::generate(),
+            MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+            EventSeverity::Warning,
+            Some(String::from("rebooted")),
+            now,
+            now,
+        )?;
+        let second = Event::new(
+            EventId::generate(),
+            EndpointId::generate(),
+            MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+            EventSeverity::Critical,
+            Some(String::from("thermal trip")),
+            now + time::Duration::MINUTE,
+            now + time::Duration::MINUTE,
+        )?;
+        let events = MockEventTail::new(vec![first, second.clone()]);
+        cursor
+            .set(&SyncCursor::new(
+                SyncCursorId::generate(),
+                instance_id,
+                SyncStream::Event,
+                String::from("not-an-event-id"),
+                now,
+            ))
+            .await?;
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        engine.report_event_batch().await?;
+        let messages = outbox.pending_messages()?;
+        let Some(EnvelopeMessage::EventBatch(batch)) = messages.first() else {
+            return Err(std::io::Error::other("the report was not an EventBatch").into());
+        };
+        assert_eq!(
+            batch.events.len(),
+            2,
+            "the bounded tail must be re-reported"
+        );
+        let healed = cursor
+            .cursor_value(instance_id, SyncStream::Event)?
+            .ok_or_else(|| std::io::Error::other("the event cursor is missing"))?;
+        assert_eq!(healed, second.id().to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_evicted_event_anchor_resets_to_the_bounded_tail()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let event = Event::new(
+            EventId::generate(),
+            EndpointId::generate(),
+            MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+            EventSeverity::Warning,
+            Some(String::from("rebooted")),
+            now,
+            now,
+        )?;
+        let events = MockEventTail::new(vec![event.clone()]);
+        // The cursor points at an event the bounded history already evicted
+        // (§14.4): a valid-format id that is no longer stored.
+        cursor
+            .set(&SyncCursor::new(
+                SyncCursorId::generate(),
+                instance_id,
+                SyncStream::Event,
+                EventId::generate().to_string(),
+                now,
+            ))
+            .await?;
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        engine.report_event_batch().await?;
+        let messages = outbox.pending_messages()?;
+        let Some(EnvelopeMessage::EventBatch(batch)) = messages.first() else {
+            return Err(std::io::Error::other("the report was not an EventBatch").into());
+        };
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "the bounded tail must be re-reported"
+        );
+        let healed = cursor
+            .cursor_value(instance_id, SyncStream::Event)?
+            .ok_or_else(|| std::io::Error::other("the event cursor is missing"))?;
+        assert_eq!(healed, event.id().to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_artifact_cursor_resets_and_redistributes()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let mut artifact = rutilus_domain::Artifact::new(
+            rutilus_domain::ArtifactId::generate(),
+            rutilus_domain::ArtifactName::parse("backup")?,
+            3,
+            rutilus_domain::Sha256Hex::parse(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
+            now,
+        );
+        artifact.record_bytes_received(3)?;
+        artifact.mark_ready()?;
+        store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        cursor
+            .set(&SyncCursor::new(
+                SyncCursorId::generate(),
+                instance_id,
+                SyncStream::Artifact,
+                String::from("not-an-artifact-id"),
+                now,
+            ))
+            .await?;
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        engine.report_artifacts().await?;
+        // The default chunk size carries the three bytes in one chunk: the
+        // manifest plus the chunk are re-distributed after the reset.
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages.first(),
+            Some(EnvelopeMessage::ArtifactManifest(_))
+        ));
+        let healed = cursor
+            .cursor_value(instance_id, SyncStream::Artifact)?
+            .ok_or_else(|| std::io::Error::other("the artifact cursor is missing"))?;
+        assert_eq!(healed, artifact.id().to_string());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_outbox_row_is_skipped_and_the_rest_still_flushes()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (transport, state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            let store = MockEngineStore::new();
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let instance_id = InstanceId::generate();
+            let outbox = MockOutbox::new(instance_id);
+            // The queue holds one corrupt row between two valid rows: the
+            // flush must skip it, deliver the rest, and stay connected.
+            outbox.enqueue_heartbeats(1, now)?;
+            outbox.enqueue_corrupt_payload(now)?;
+            outbox.enqueue_heartbeats(1, now)?;
+            let engine = CenterSync::new(
+                transport,
+                &store,
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
+        let mut wire = next_wire(&mut wires).await?;
+        for sequence in [1, 3] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        // The connection survived the corrupt row: the engine never
+        // reconnected (a wedge would have restarted after the backoff).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(state.attempts(), 1);
+
+        // The loop is still responsive: the center can acknowledge the
+        // delivered frames, and the engine keeps answering the stop signal.
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 3 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
 
         stop_tx
             .send(())

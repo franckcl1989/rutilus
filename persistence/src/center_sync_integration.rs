@@ -15,7 +15,10 @@ use rutilus_application::{
     BoundaryFuture, CenterSession, CenterSync, CenterSyncOptions, CenterTransport,
 };
 use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage, Heartbeat};
-use rutilus_domain::{InstanceId, InstanceKind, OutboxEntry, SiteInstance};
+use rutilus_domain::{
+    EndpointId, Event, EventId, EventSeverity, InstanceId, InstanceKind, MessageId, OutboxEntry,
+    SiteInstance, SyncCursor, SyncCursorId, SyncStream,
+};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
@@ -288,6 +291,96 @@ async fn the_engine_keeps_running_locally_while_the_center_is_gone() -> Result<(
     }
     let pending = store.list_pending_outbox(instance_id, 10).await?;
     assert_eq!(pending.len(), 2, "the offline queue must keep the entries");
+
+    stop_tx
+        .send(())
+        .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut engine_run)
+        .await
+        .map_err(|_| std::io::Error::other("the engine did not stop in time"))?;
+    assert!(
+        stopped.is_ok(),
+        "the engine must stop cleanly, got {stopped:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_evicted_event_anchor_resets_the_real_stream_to_the_bounded_tail()
+-> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let directory = tempfile::tempdir()?;
+    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let instance_id = InstanceId::generate();
+    let site = SiteInstance::new(
+        instance_id,
+        String::from("Site One"),
+        InstanceKind::Site,
+        now,
+    );
+    store.create_instance(&site).await?;
+
+    // One stored event: the bounded tail the reset must re-report.
+    let event = Event::new(
+        EventId::generate(),
+        EndpointId::generate(),
+        MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+        EventSeverity::Warning,
+        Some(String::from("rebooted")),
+        now,
+        now,
+    )?;
+    store.append_event(&event).await?;
+
+    // The event cursor points at an event the bounded history evicted or a
+    // manual DB change removed: a valid-format id that is no longer stored.
+    // The engine must reset the stream and re-report the bounded tail
+    // instead of failing the connection on every attempt.
+    store
+        .set_sync_cursor(&SyncCursor::new(
+            SyncCursorId::generate(),
+            instance_id,
+            SyncStream::Event,
+            EventId::generate().to_string(),
+            now,
+        ))
+        .await?;
+
+    let (transport, mut wires) = MockTransport::new();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let engine = CenterSync::new(
+        transport,
+        &store,
+        &store,
+        &store,
+        &store,
+        &store,
+        FixedClock(now),
+        instance_id,
+        engine_options(),
+    );
+    let mut engine_run = Box::pin(engine.run(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let mut wire = next_wire(&mut engine_run, &mut wires).await?;
+    let envelope = await_engine_or_frame(&mut engine_run, &mut wire).await?;
+    let Some(EnvelopeMessage::EventBatch(batch)) = envelope.message else {
+        return Err(std::io::Error::other("the report was not an EventBatch").into());
+    };
+    assert_eq!(
+        batch.events.len(),
+        1,
+        "the bounded tail must be re-reported"
+    );
+    assert_eq!(batch.events[0].event_id, event.id().to_string());
+
+    // The report healed the cursor row in the real store.
+    let healed = store
+        .get_sync_cursor(instance_id, SyncStream::Event)
+        .await?
+        .ok_or_else(|| std::io::Error::other("the event cursor is missing"))?;
+    assert_eq!(healed.cursor_value(), event.id().to_string());
 
     stop_tx
         .send(())

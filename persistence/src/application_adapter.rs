@@ -390,6 +390,10 @@ impl rutilus_application::CenterEventTail for SqliteStore {
             .await
         })
     }
+
+    fn contains(&self, event_id: EventId) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+        Box::pin(async move { Ok(SqliteStore::find_event(self, event_id).await?.is_some()) })
+    }
 }
 
 impl rutilus_application::CenterOutbox for SqliteStore {
