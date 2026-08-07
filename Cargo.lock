@@ -3625,6 +3625,7 @@ dependencies = [
  "base64",
  "csv",
  "futures",
+ "rutilus-center-protocol",
  "rutilus-domain",
  "rutilus-operation-engine",
  "secrecy",
@@ -3726,6 +3727,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "rutilus-application",
+ "rutilus-center-protocol",
  "rutilus-domain",
  "rutilus-entity",
  "rutilus-migration",

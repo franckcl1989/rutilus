@@ -9,6 +9,7 @@ publish.workspace = true
 base64.workspace = true
 csv.workspace = true
 futures.workspace = true
+rutilus-center-protocol.workspace = true
 rutilus-domain.workspace = true
 rutilus-operation-engine.workspace = true
 secrecy.workspace = true

@@ -5,6 +5,8 @@ mod audit_log;
 mod batch_query;
 mod batch_refresh;
 mod capability_query;
+mod center_sync;
+mod center_transport;
 mod command_executor;
 mod credential_management;
 mod endpoint_csv;
@@ -35,6 +37,8 @@ pub use batch_refresh::{
     BatchEndpointRefresh, BatchEndpointRefreshError, EndpointRefreshFailureKind,
     EndpointRefreshOutcome, MAX_CONCURRENT_REFRESHES, MAX_REFRESH_TARGETS,
 };
+pub use center_sync::{CenterSync, CenterSyncError, CenterSyncOptions};
+pub use center_transport::{CenterSession, CenterTransport};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
