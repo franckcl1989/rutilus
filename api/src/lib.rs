@@ -1335,6 +1335,91 @@ impl EndpointResourceInventoryResponse {
     }
 }
 
+/// The §12.4 Advanced Diagnostics view of one stored resource snapshot.
+///
+/// The view is read-only by construction: every field comes from the latest
+/// complete refresh Generation, and §12.4 forbids changing Method, submitting
+/// arbitrary JSON, and bypassing the normal permission and task model, so this
+/// contract carries no request surface. `typed_payload` carries the persisted
+/// `TypedPayloadJson` verbatim — the honest representation of the decoded
+/// read-only response (§9.4), including any OEM Namespace sections and Task
+/// URI the decoded payload itself retains.
+///
+/// Decode-error paths and `ExtendedInfo` are deliberately absent: a member
+/// whose typed decoding failed was skipped at refresh time without leaving a
+/// record, so no diagnostics can be fabricated for resources that never
+/// entered the snapshot store.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDiagnosticsResponse {
+    endpoint_id: Uuid,
+    odata_uri: String,
+    odata_type: Option<String>,
+    etag: Option<String>,
+    feature: String,
+    generation: NonZeroU64,
+    typed_payload: serde_json::Value,
+}
+
+impl ResourceDiagnosticsResponse {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        endpoint_id: Uuid,
+        odata_uri: String,
+        odata_type: Option<String>,
+        etag: Option<String>,
+        feature: String,
+        generation: NonZeroU64,
+        typed_payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            odata_uri,
+            odata_type,
+            etag,
+            feature,
+            generation,
+            typed_payload,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn odata_uri(&self) -> &str {
+        &self.odata_uri
+    }
+
+    #[must_use]
+    pub fn odata_type(&self) -> Option<&str> {
+        self.odata_type.as_deref()
+    }
+
+    #[must_use]
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    #[must_use]
+    pub fn feature(&self) -> &str {
+        &self.feature
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn typed_payload(&self) -> &serde_json::Value {
+        &self.typed_payload
+    }
+}
+
 /// The final capability state exposed by the same-origin product API.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3272,6 +3357,89 @@ mod tests {
         assert!(
             serde_json::from_value::<EndpointSnapshotSummaryResponse>(extended_details).is_err()
         );
+    }
+
+    #[test]
+    fn resource_diagnostics_contract_preserves_the_typed_payload_verbatim()
+    -> Result<(), Box<dyn Error>> {
+        let response = ResourceDiagnosticsResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789ab"),
+            "/redfish/v1/Systems/1".to_owned(),
+            Some("#ComputerSystem.v1_20_0.ComputerSystem".to_owned()),
+            Some("W/\"system-1\"".to_owned()),
+            "systems".to_owned(),
+            NonZeroU64::new(7).ok_or("test generation must be non-zero")?,
+            json!({
+                "Id": "1",
+                "Name": "System One",
+                "Oem": { "Vendor": { "OemFlag": true } }
+            }),
+        );
+        let encoded = serde_json::to_value(&response)?;
+        let decoded: ResourceDiagnosticsResponse = serde_json::from_value(encoded.clone())?;
+
+        assert_eq!(decoded, response);
+        assert_eq!(
+            decoded.endpoint_id(),
+            uuid!("01989abc-def0-7abc-8def-0123456789ab")
+        );
+        assert_eq!(decoded.odata_uri(), "/redfish/v1/Systems/1");
+        assert_eq!(
+            decoded.odata_type(),
+            Some("#ComputerSystem.v1_20_0.ComputerSystem")
+        );
+        assert_eq!(decoded.etag(), Some("W/\"system-1\""));
+        assert_eq!(decoded.feature(), "systems");
+        assert_eq!(
+            decoded.generation(),
+            NonZeroU64::new(7).ok_or("test generation must be non-zero")?
+        );
+        assert_eq!(
+            decoded.typed_payload(),
+            &json!({ "Id": "1", "Name": "System One", "Oem": { "Vendor": { "OemFlag": true } } })
+        );
+        assert_eq!(
+            encoded,
+            json!({
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+                "odata_uri": "/redfish/v1/Systems/1",
+                "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+                "etag": "W/\"system-1\"",
+                "feature": "systems",
+                "generation": 7,
+                "typed_payload": {
+                    "Id": "1",
+                    "Name": "System One",
+                    "Oem": { "Vendor": { "OemFlag": true } }
+                }
+            })
+        );
+        assert!(
+            serde_json::from_value::<ResourceDiagnosticsResponse>(json!({
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+                "odata_uri": "/redfish/v1/Systems/1",
+                "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+                "etag": "W/\"system-1\"",
+                "feature": "systems",
+                "generation": 7,
+                "typed_payload": { "Id": "1" },
+                "extended_info": []
+            }))
+            .is_err(),
+            "unknown diagnostics fields must be rejected"
+        );
+        assert!(
+            serde_json::from_value::<ResourceDiagnosticsResponse>(json!({
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+                "odata_uri": "/redfish/v1/Systems/1",
+                "feature": "systems",
+                "generation": 0,
+                "typed_payload": { "Id": "1" }
+            }))
+            .is_err(),
+            "a zero generation must be rejected like every other refresh snapshot"
+        );
+        Ok(())
     }
 
     #[test]
