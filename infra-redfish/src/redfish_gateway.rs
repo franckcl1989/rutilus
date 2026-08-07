@@ -23,6 +23,7 @@ use nv_redfish::{
     },
     chassis::{Chassis, ChassisCollection, Manufacturer as ChassisManufacturer, NetworkAdapter},
     computer_system::{ComputerSystem, SystemCollection},
+    core::odata::ODataType,
     core::{
         BoxTryStream, DataStream, EdmPrimitiveType, EntityTypeRef, HttpPushUriUpdateRequest,
         ModificationResponse, MultipartUpdateRequest, NavProperty, ODataId, ReferenceLeaf,
@@ -35,6 +36,23 @@ use nv_redfish::{
     // feature's own generated module (`oem::dell::schema`), not in the base
     // `schema` module where the standard types are re-exported.
     oem::dell::schema::dell_attributes::DellAttributes as DellAttributesSchema,
+    // The NVIDIA OEM feature compiles its own generated module tree
+    // (`oem::nvidia::schema`) exactly like the Dell and Supermicro features.
+    // The system-config-profile family navigates from the ComputerSystem's
+    // `Oem.Nvidia` segment (the unversioned `nvidia_computer_system` module
+    // carries the `SystemConfigProfile` navigation) into the profile
+    // service, its status singleton, the profile collection, and each
+    // member's profile file. The decode targets are the compiled types
+    // themselves: the segment and every chain document are fetched and
+    // decoded through these schemas, never a raw JSON read (§11.5 two-way
+    // rule).
+    oem::nvidia::schema::nvidia_computer_system::NvidiaComputerSystem as NvidiaComputerSystemSchema,
+    oem::nvidia::schema::nvidia_system_config_profile::NvidiaSystemConfigProfile as NvidiaSystemConfigProfileSchema,
+    oem::nvidia::schema::nvidia_system_config_profile_status::NvidiaSystemConfigProfileStatus as NvidiaSystemConfigProfileStatusSchema,
+    oem::nvidia::schema::nvidia_system_profile::NvidiaSystemProfile as NvidiaSystemProfileSchema,
+    oem::nvidia::schema::nvidia_system_profile_collection::NvidiaSystemProfileCollection as NvidiaSystemProfileCollectionSchema,
+    oem::nvidia::schema::nvidia_system_profile_file::NvidiaSystemProfileFile as NvidiaSystemProfileFileSchema,
+    oem::nvidia::schema::resource::Resource as NvidiaResourceSchema,
     // The Supermicro OEM feature compiles its own generated module tree
     // (`oem::supermicro::schema`) exactly like the Dell feature: the
     // `smc_manager_extensions` schema models the manager's embedded
@@ -1212,6 +1230,7 @@ async fn read_systems_resources(
             continue;
         };
         resources.push(system_projection);
+        resources.extend(read_system_nvidia_oem(&system, bmc, identity, trust).await?);
         resources.extend(
             read_singleton_resources(system.bios.as_ref(), bmc, identity, trust, bios_projection)
                 .await?,
@@ -1566,6 +1585,276 @@ async fn read_manager_supermicro_oem(
         )
         .await?,
     );
+    Ok(resources)
+}
+
+/// Reads one system's NVIDIA `SystemConfigProfile` chain (§11.5).
+///
+/// This is the first family that navigates through a vendor `Oem` segment of
+/// a standard resource: NVIDIA resources are not standard `NavProperty` fields
+/// (the base `redfish.rs` schema carries no NVIDIA reference), so every
+/// NVIDIA surface enters through the parent's `Oem.Nvidia` segment.
+///
+/// # The segment decode
+///
+/// The segment value is vendor-shaped until the discrimination decodes it.
+/// The segment kind is decided by the segment's own `@odata.type` — the top
+/// namespace and the type name — exactly like nv-redfish's own
+/// `NvidiaCbcChassis::new` constructor discriminates its segment
+/// (`cbc_chassis.rs`). A `ComputerSystem` segment decodes into the compiled
+/// `nvidia_computer_system::NvidiaComputerSystem` type, the unversioned
+/// module that carries the `SystemConfigProfile` navigation; the Chassis
+/// segments (the four `NvidiaChassis`-namespace shapes) carry no
+/// system-config-profile chain, so the family stays absent for them and a
+/// later chassis family can decode them through the same discrimination.
+/// The decode target must be the versioned struct that carries the
+/// navigation: serde tolerates unknown keys, so decoding into a shape
+/// without the navigation would silently drop it.
+///
+/// A `BlueField` DPU may inline only a partially expanded stub of the segment
+/// — the value then has the `{"@odata.id": ...}` reference shape — so the
+/// segment is fetched through that reference before decoding, exactly like
+/// nv-redfish's own `NvidiaComputerSystem::new` quirk handling
+/// (`computer_system.rs`). The reference is not a compiled navigation
+/// property, so the fetch goes through the typed decode target
+/// (`bmc.get::<NvidiaComputerSystemSchema>`), never a raw JSON read (§11.5
+/// two-way rule).
+///
+/// # Absence and failure semantics
+///
+/// A system without `Oem.Nvidia`, or with a segment that cannot be
+/// discriminated or decoded, produces no snapshot and no fabricated request
+/// (the supermicro precedent: `read_manager_supermicro_oem`). Every chain
+/// fetch failure — the profile service document, its status singleton, the
+/// profile collection document, and each profile member — follows the
+/// member-level skip semantics (`skip_member_failure`), because the chain
+/// root decides whether the chain exists and one odd chain surface must not
+/// erase the readable remainder; a failed projection skips the member
+/// through `member_projection`.
+async fn read_system_nvidia_oem(
+    system: &ComputerSystemSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nvidia) = system
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Nvidia"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(system_config_profile) =
+        decode_nvidia_system_config_profile_navigation(nvidia, bmc, identity, trust).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let system_config_profile =
+        NavProperty::<NvidiaSystemConfigProfileSchema>::new_reference(system_config_profile);
+    let Some(config_profile) = fetch_member(&system_config_profile, bmc, identity, trust).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) =
+        member_projection(nvidia_system_config_profile_projection(&config_profile))?
+    {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_singleton_resources(
+            config_profile.status.as_ref(),
+            bmc,
+            identity,
+            trust,
+            nvidia_system_config_profile_status_projection,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_nvidia_profile_collection(config_profile.profiles.as_ref(), bmc, identity, trust)
+            .await?,
+    );
+    Ok(resources)
+}
+
+/// Decodes one `Oem.Nvidia` segment value into the chain-entry
+/// `SystemConfigProfile` identifier, or returns `None` when the segment is
+/// not a `ComputerSystem` segment, carries no chain navigation, or cannot be
+/// decoded.
+///
+/// The chain entry is carried as its `@odata.id`: `NavProperty` is not
+/// `Clone`, and the caller rebuilds the reference-form navigation from the
+/// identifier exactly like the upstream `downcast` conversion, so an
+/// embedded expanded segment entry is fetched by its own `@odata.id` (the
+/// authoritative resource representation).
+///
+/// The reference form (`{"@odata.id": ...}`, the `BlueField` DPU partial-stub
+/// quirk) is fetched through a typed decode target first, with the
+/// member-level skip semantics on a failed fetch; the fetched document is
+/// decoded through the local segment schema (the compiled
+/// `NvidiaComputerSystem` type cannot be a fetch target: it implements no
+/// `EntityTypeRef`, exactly like the `EventSubscription` family's local
+/// schemas). An undecodable segment leaves the family absent without a
+/// fabricated request, exactly like the undecodable Supermicro segment.
+async fn decode_nvidia_system_config_profile_navigation(
+    nvidia: &serde_json::Value,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<ODataId>, CoreResourceReadError> {
+    if is_nvidia_reference_form(nvidia) {
+        let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let navigation = NavProperty::<NvidiaComputerSystemSegmentSchema>::new_reference(
+            ODataId::from(id.to_owned()),
+        );
+        let Some(segment) = fetch_member(&navigation, bmc, identity, trust).await? else {
+            return Ok(None);
+        };
+        return Ok(segment
+            .system_config_profile
+            .as_ref()
+            .map(NavProperty::id)
+            .cloned());
+    }
+    match nvidia_segment_kind(nvidia) {
+        Some(NvidiaSegmentKind::ComputerSystem) => {
+            match serde_json::from_value::<NvidiaComputerSystemSchema>(nvidia.clone()) {
+                Ok(segment) => Ok(segment
+                    .system_config_profile
+                    .as_ref()
+                    .map(NavProperty::id)
+                    .cloned()),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(NvidiaSegmentKind::Chassis) | None => Ok(None),
+    }
+}
+
+/// The typed fetch target of a reference-form `Oem.Nvidia` segment.
+///
+/// The compiled `NvidiaComputerSystem` type models the segment but does not
+/// implement `EntityTypeRef` (it is an OEM segment, not a standalone
+/// resource), so a reference-form fetch cannot go through
+/// `bmc.get::<NvidiaComputerSystemSchema>`. The fetched document decodes
+/// through this minimal local schema instead — the same local-schema
+/// precedent as the `EventSubscription` family — mirroring exactly the
+/// navigation fields the chain follows, with the `@odata.id` the fetch
+/// proves.
+#[derive(Deserialize)]
+struct NvidiaComputerSystemSegmentSchema {
+    #[serde(rename = "@odata.id")]
+    odata_id: ODataId,
+    #[serde(rename = "SystemConfigProfile", default)]
+    system_config_profile: Option<NavProperty<NvidiaSystemConfigProfileSchema>>,
+}
+
+impl EntityTypeRef for NvidiaComputerSystemSegmentSchema {
+    fn odata_id(&self) -> &ODataId {
+        &self.odata_id
+    }
+
+    fn etag(&self) -> Option<&nv_redfish::core::ODataETag> {
+        None
+    }
+}
+
+/// The kinds of one `Oem.Nvidia` segment value, discriminated by the
+/// segment's own `@odata.type` (the top namespace and the type name), the
+/// same discrimination nv-redfish's `NvidiaCbcChassis::new` constructor
+/// performs (`cbc_chassis.rs`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NvidiaSegmentKind {
+    /// A `ComputerSystem` `Oem.Nvidia` segment: the `NvidiaComputerSystem`
+    /// type, whose unversioned module carries the `SystemConfigProfile`
+    /// navigation the system-config-profile family follows.
+    ComputerSystem,
+    /// A Chassis `Oem.Nvidia` segment: the `NvidiaChassis` namespace shapes
+    /// (`NvidiaChassis`, `NvidiaRoTchassis`, `NvidiaSmaChassis`,
+    /// `NvidiaCBCChassis`) and the standalone `NvidiaRoTChassis` namespace.
+    /// None of the compiled chassis segments carries the
+    /// system-config-profile chain; the arm keeps the discrimination
+    /// mechanism explicit so a later chassis family lands on it.
+    Chassis,
+}
+
+/// Discriminates one `Oem.Nvidia` segment value by its own `@odata.type`.
+///
+/// The top namespace and the type name decide the kind, never a product
+/// guess over the segment shape. A segment without a parseable `@odata.type`
+/// is not discriminable and yields `None` — the segment is treated as one
+/// odd vendor surface and the family stays absent.
+fn nvidia_segment_kind(segment: &serde_json::Value) -> Option<NvidiaSegmentKind> {
+    let odata_type = ODataType::parse_from(segment)?;
+    let namespace = odata_type.namespace.first().copied();
+    match (namespace, odata_type.type_name) {
+        (Some("NvidiaComputerSystem"), "NvidiaComputerSystem") => {
+            Some(NvidiaSegmentKind::ComputerSystem)
+        }
+        (
+            Some("NvidiaChassis"),
+            "NvidiaChassis" | "NvidiaRoTchassis" | "NvidiaSmaChassis" | "NvidiaCBCChassis",
+        )
+        | (Some("NvidiaRoTChassis"), "NvidiaRoTChassis") => Some(NvidiaSegmentKind::Chassis),
+        _ => None,
+    }
+}
+
+/// Whether a segment value has the reference shape (an object whose only key
+/// is `@odata.id`), mirroring the `NavProperty` deserializer's own reference
+/// rule.
+fn is_nvidia_reference_form(segment: &serde_json::Value) -> bool {
+    segment
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.contains_key("@odata.id"))
+}
+
+/// Reads the `NvidiaSystemProfileCollection` and, for every decoded member,
+/// its `ProfileFile` document, so the profile sub-chain follows its parent
+/// through the same typed navigation.
+///
+/// Unlike a standard collection, a failed collection document follows the
+/// member-level skip semantics instead of aborting the read: the chain's
+/// failure rule treats every sub-document as one odd chain surface, so a
+/// failed profile collection leaves the already-read profile service and
+/// status snapshots in place. Individual members and their `ProfileFile`
+/// singletons keep the usual member-level semantics.
+async fn read_nvidia_profile_collection(
+    nav: Option<&NavProperty<NvidiaSystemProfileCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(nav) = nav else {
+        return Ok(Vec::new());
+    };
+    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    for member in &collection.members {
+        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(nvidia_system_profile_projection(&member))? {
+            resources.push(projection);
+        }
+        resources.extend(
+            read_singleton_resources(
+                member.profile_file.as_ref(),
+                bmc,
+                identity,
+                trust,
+                nvidia_system_profile_file_projection,
+            )
+            .await?,
+        );
+    }
     Ok(resources)
 }
 
@@ -4178,6 +4467,164 @@ struct SmcKcsInterfacePayload {
     privilege: Option<KcsPrivilegeSchema>,
 }
 
+/// The one document-kind discriminator of the §0.5.0 NVIDIA
+/// system-config-profile family.
+///
+/// The whole chain shares the single family code
+/// `nvidia-system-config-profile` (one family = one entry navigation chain),
+/// so the snapshot payload must carry the chain document's kind for the
+/// application boundary to route the snapshot to the right details shape.
+/// The value is written by the infra projection — which knows the compiled
+/// decode target it just projected — and consumed by the application
+/// projection; it is a product discriminator, not a Redfish field, and never
+/// reaches the wire response (the application consumes it).
+#[derive(Clone, Copy, Debug, Serialize)]
+#[allow(clippy::enum_variant_names)]
+#[serde(rename_all = "snake_case")]
+enum NvidiaSystemConfigProfileDocument {
+    SystemConfigProfile,
+    SystemConfigProfileStatus,
+    SystemProfile,
+    SystemProfileFile,
+}
+
+/// The §0.5.0 NVIDIA `SystemConfigProfile` chain-root projection.
+///
+/// The field set is exactly the application payload decoded with
+/// `deny_unknown_fields`, so an extra field here would make every stored
+/// snapshot unreadable at projection time. The `Truststore` section carries
+/// only link-presence metadata: the certificate documents behind the
+/// `NvidiaCertificates` / `OemCertificates` links are never fetched, and
+/// their certificate payloads (the base64 certificate bodies) never enter
+/// the snapshot — the sensitive surface is deferred to a later slice.
+#[derive(Serialize)]
+struct NvidiaSystemConfigProfilePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaSystemConfigProfileDocument,
+    #[serde(rename = "Truststore", skip_serializing_if = "Option::is_none")]
+    truststore: Option<NvidiaSystemConfigProfileTruststorePayload>,
+}
+
+/// The compiled `Truststore` metadata of the profile service document: the
+/// presence of each certificate-store link, never the certificates
+/// themselves.
+#[derive(Serialize)]
+struct NvidiaSystemConfigProfileTruststorePayload {
+    #[serde(rename = "NvidiaCertificates", skip_serializing_if = "Option::is_none")]
+    nvidia_certificates: Option<bool>,
+    #[serde(rename = "OemCertificates", skip_serializing_if = "Option::is_none")]
+    oem_certificates: Option<bool>,
+}
+
+/// The §0.5.0 NVIDIA `SystemConfigProfileStatus` projection.
+///
+/// The field set is exactly the compiled `NvidiaSystemConfigProfileStatus`
+/// schema: the `PendingList.Activation` text, the numeric
+/// `ActiveProfileIndex` / `BmcProfileVersion` / `DefaultProfileIndex`
+/// indices, and the `FactoryResetStatus` text. An absent property projects
+/// as `None` and is skipped on the wire, exactly like every other family.
+#[derive(Serialize)]
+struct NvidiaSystemConfigProfileStatusPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaSystemConfigProfileDocument,
+    #[serde(rename = "PendingList", skip_serializing_if = "Option::is_none")]
+    pending_list: Option<NvidiaSystemConfigProfilePendingListPayload>,
+    #[serde(rename = "ActiveProfileIndex", skip_serializing_if = "Option::is_none")]
+    active_profile_index: Option<i64>,
+    #[serde(rename = "BmcProfileVersion", skip_serializing_if = "Option::is_none")]
+    bmc_profile_version: Option<i64>,
+    #[serde(rename = "FactoryResetStatus", skip_serializing_if = "Option::is_none")]
+    factory_reset_status: Option<String>,
+    #[serde(
+        rename = "DefaultProfileIndex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    default_profile_index: Option<i64>,
+}
+
+/// The `PendingList` member of the profile status document.
+#[derive(Serialize)]
+struct NvidiaSystemConfigProfilePendingListPayload {
+    #[serde(rename = "Activation", skip_serializing_if = "Option::is_none")]
+    activation: Option<String>,
+}
+
+/// The §0.5.0 NVIDIA `SystemProfile` member projection.
+///
+/// The field set is exactly the compiled `NvidiaSystemProfile` schema's
+/// metadata fields: the `Default` boolean, the `Owner` / `UUID` /
+/// `ProfileName` texts, and the numeric `Version` (an `Edm.Int64` in the
+/// compiled schema, so it stays numeric). The `Status` action-state and the
+/// `Actions` / `ProfileFile` navigation stay out of the strictly projectable
+/// field set.
+#[derive(Serialize)]
+struct NvidiaSystemProfilePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaSystemConfigProfileDocument,
+    #[serde(rename = "Default", skip_serializing_if = "Option::is_none")]
+    default: Option<bool>,
+    #[serde(rename = "Owner", skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(rename = "UUID", skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(rename = "Version", skip_serializing_if = "Option::is_none")]
+    version: Option<i64>,
+    #[serde(rename = "ProfileName", skip_serializing_if = "Option::is_none")]
+    profile_name: Option<String>,
+}
+
+/// The §0.5.0 NVIDIA `SystemProfileFile` projection.
+///
+/// The field set is exactly the compiled `NvidiaSystemProfileFile` schema:
+/// the `ProfileFile` document with its `Metadata` (the activation/delete
+/// flags, the origin-profile UUID, the `More_Profiles` continuation flag,
+/// the project name, and the profile UUID) and the base64 `Profile` content.
+/// The signed profile payload is the file's own content and is projected
+/// verbatim (§12.3), bounded by the snapshot payload limit.
+#[derive(Serialize)]
+struct NvidiaSystemProfileFilePayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "DocumentType")]
+    document_type: NvidiaSystemConfigProfileDocument,
+    #[serde(rename = "ProfileFile", skip_serializing_if = "Option::is_none")]
+    profile_file: Option<NvidiaSystemProfileFileContentPayload>,
+}
+
+/// The `ProfileFile` member of the profile file document.
+#[derive(Serialize)]
+struct NvidiaSystemProfileFileContentPayload {
+    #[serde(rename = "Metadata", skip_serializing_if = "Option::is_none")]
+    metadata: Option<NvidiaSystemProfileFileMetadataPayload>,
+    #[serde(rename = "Profile", skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+}
+
+/// The `Metadata` member of the profile file, exactly the compiled
+/// `nvidia_system_profile_file::Metadata` fields (including the vendor's
+/// `More_Profiles` underscore spelling, kept verbatim).
+#[derive(Serialize)]
+struct NvidiaSystemProfileFileMetadataPayload {
+    #[serde(rename = "Activate", skip_serializing_if = "Option::is_none")]
+    activate: Option<bool>,
+    #[serde(rename = "Delete", skip_serializing_if = "Option::is_none")]
+    delete: Option<bool>,
+    #[serde(rename = "OriginProfileUUID", skip_serializing_if = "Option::is_none")]
+    origin_profile_uuid: Option<String>,
+    #[serde(rename = "More_Profiles", skip_serializing_if = "Option::is_none")]
+    more_profiles: Option<bool>,
+    #[serde(rename = "ProjectName", skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(rename = "UUID", skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+}
+
 /// The §0.2.0 `processors` family projection.
 ///
 /// The field set is exactly the `ProcessorPayload` the application boundary
@@ -4954,6 +5401,136 @@ fn smc_kcs_interface_projection(
         kcs_interface.etag(),
         &payload,
     )
+}
+
+/// Projects one typed NVIDIA `SystemConfigProfile` document into the OEM
+/// family.
+///
+/// The `@odata.id`, `ETag`, `Id`, `Name`, and `Description` come from the
+/// typed schema base exactly like every other family; the `Truststore`
+/// metadata and the chain navigations come from the compiled type. The
+/// document is one chain surface, so an unrepresentable identifier or
+/// payload is skipped by the caller through the member-level
+/// `member_projection` semantics.
+fn nvidia_system_config_profile_projection(
+    config_profile: &NvidiaSystemConfigProfileSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaSystemConfigProfilePayload {
+        resource: nvidia_common_resource(&config_profile.base),
+        document_type: NvidiaSystemConfigProfileDocument::SystemConfigProfile,
+        truststore: config_profile.truststore.as_ref().map(|truststore| {
+            NvidiaSystemConfigProfileTruststorePayload {
+                nvidia_certificates: truststore.nvidia_certificates.as_ref().map(|_| true),
+                oem_certificates: truststore.oem_certificates.as_ref().map(|_| true),
+            }
+        }),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaSystemConfigProfile,
+        config_profile.odata_id(),
+        config_profile.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `SystemConfigProfileStatus` document into the
+/// OEM family, carrying the compiled status fields verbatim.
+fn nvidia_system_config_profile_status_projection(
+    status: &NvidiaSystemConfigProfileStatusSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaSystemConfigProfileStatusPayload {
+        resource: nvidia_common_resource(&status.base),
+        document_type: NvidiaSystemConfigProfileDocument::SystemConfigProfileStatus,
+        pending_list: status.pending_list.as_ref().map(|pending_list| {
+            NvidiaSystemConfigProfilePendingListPayload {
+                activation: pending_list
+                    .activation
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .cloned(),
+            }
+        }),
+        active_profile_index: status.active_profile_index,
+        bmc_profile_version: status.bmc_profile_version,
+        factory_reset_status: status.factory_reset_status.clone(),
+        default_profile_index: status.default_profile_index,
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaSystemConfigProfile,
+        status.odata_id(),
+        status.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `SystemProfile` member into the OEM family,
+/// carrying the compiled metadata fields verbatim.
+fn nvidia_system_profile_projection(
+    profile: &NvidiaSystemProfileSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaSystemProfilePayload {
+        resource: nvidia_common_resource(&profile.base),
+        document_type: NvidiaSystemConfigProfileDocument::SystemProfile,
+        default: profile.default,
+        owner: profile.owner.clone(),
+        uuid: profile.uuid.clone(),
+        version: profile.version,
+        profile_name: profile.profile_name.clone(),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaSystemConfigProfile,
+        profile.odata_id(),
+        profile.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed NVIDIA `SystemProfileFile` document into the OEM
+/// family, carrying the compiled file fields (metadata and the base64
+/// profile content) verbatim.
+fn nvidia_system_profile_file_projection(
+    profile_file: &NvidiaSystemProfileFileSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NvidiaSystemProfileFilePayload {
+        resource: nvidia_common_resource(&profile_file.base),
+        document_type: NvidiaSystemConfigProfileDocument::SystemProfileFile,
+        profile_file: profile_file.profile_file.as_ref().map(|content| {
+            NvidiaSystemProfileFileContentPayload {
+                metadata: content.metadata.as_ref().map(|metadata| {
+                    NvidiaSystemProfileFileMetadataPayload {
+                        activate: metadata.activate,
+                        delete: metadata.delete,
+                        origin_profile_uuid: metadata.origin_profile_uuid.clone(),
+                        more_profiles: metadata.more_profiles,
+                        project_name: metadata.project_name.clone(),
+                        uuid: metadata.uuid.clone(),
+                    }
+                }),
+                profile: content.profile.clone(),
+            }
+        }),
+    };
+    build_core_projection(
+        ResourceFeature::OemNvidiaSystemConfigProfile,
+        profile_file.odata_id(),
+        profile_file.etag(),
+        &payload,
+    )
+}
+
+/// Copies the common identity fields from one compiled NVIDIA schema base.
+///
+/// The NVIDIA OEM feature generates its own `resource::Resource` base type (a
+/// separate module tree from the base schema re-export, exactly like the Dell
+/// feature), so the common fields are copied here with the same shape
+/// `CommonResourcePayload::from_schema_base` projects instead of converting
+/// between the two nominally distinct resource types.
+fn nvidia_common_resource(base: &NvidiaResourceSchema) -> CommonResourcePayload {
+    CommonResourcePayload {
+        id: base.id.clone(),
+        name: base.name.clone(),
+        description: base.description.as_ref().and_then(Option::as_ref).cloned(),
+    }
 }
 
 /// Reads one Dell Attributes entry as its typed string value.
@@ -7630,6 +8207,153 @@ mod tests {
         "Privilege":"Administrator"
     }"#;
 
+    /// A System member whose `Oem.Nvidia` segment embeds the inline
+    /// `NvidiaComputerSystem` object: the segment carries its own
+    /// `@odata.type` (the discrimination the gateway performs) and the
+    /// `SystemConfigProfile` navigation the system-config-profile family
+    /// follows.
+    const SYSTEM_WITH_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem",
+            "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"}
+        }}
+    }"##;
+
+    /// A System member whose `Oem.Nvidia` segment has the reference shape
+    /// (`{"@odata.id": ...}`), the `BlueField` DPU partial-stub quirk: the
+    /// segment body at the reference is fetched and decoded before the chain
+    /// navigation can be followed.
+    const SYSTEM_WITH_NVIDIA_REFERENCE_FORM_SEGMENT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia"}}
+    }"#;
+
+    /// The `NvidiaComputerSystem` document served at the reference-form
+    /// segment's `@odata.id`, carrying the `SystemConfigProfile` navigation.
+    const NVIDIA_COMPUTER_SYSTEM_SEGMENT_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia",
+        "@odata.type":"#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem",
+        "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"}
+    }"##;
+
+    /// A System member whose `Oem.Nvidia` segment is a Chassis-kind segment
+    /// (here the plain `NvidiaChassis` shape): the discrimination must leave
+    /// the whole system-config-profile family absent instead of decoding the
+    /// segment into the `ComputerSystem` type (which would silently drop the
+    /// chassis navigation, and there is no chain to follow anyway).
+    const SYSTEM_WITH_CHASSIS_KIND_NVIDIA_SEGMENT_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":{
+            "@odata.type":"#NvidiaChassis.v1_14_0.NvidiaChassis"
+        }}
+    }"##;
+
+    /// A System member whose `Oem.Nvidia` segment cannot be discriminated or
+    /// decoded (a non-object value): one odd system surface, the family stays
+    /// absent and no chain request is fabricated.
+    const SYSTEM_WITH_UNDECODABLE_NVIDIA_SEGMENT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Oem":{"Nvidia":5}
+    }"#;
+
+    /// The typed NVIDIA `SystemConfigProfile` chain-root document, served at
+    /// the segment's `SystemConfigProfile` navigation. The `Truststore`
+    /// section carries the two certificate-store links (whose documents the
+    /// product never fetches) and the `Status` / `Profiles` navigations lead
+    /// into the rest of the chain.
+    const NVIDIA_SYSTEM_CONFIG_PROFILE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "@odata.etag":"W/\"nvidia-scp-1\"",
+        "Id":"SystemConfigProfile",
+        "Name":"NVIDIA System Config Profile",
+        "Description":"Profile service",
+        "Truststore":{
+            "NvidiaCertificates":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Truststore/NvidiaCertificates"},
+            "OemCertificates":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Truststore/OemCertificates"}
+        },
+        "Status":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"},
+        "Profiles":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles"}
+    }"#;
+
+    /// The typed NVIDIA `SystemConfigProfileStatus` document with every
+    /// compiled status field populated.
+    const NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+        "@odata.etag":"W/\"nvidia-scp-status-1\"",
+        "Id":"Status",
+        "Name":"System Config Profile Status",
+        "Description":"Profile service status",
+        "PendingList":{"Activation":"profile-1"},
+        "ActiveProfileIndex":1,
+        "BmcProfileVersion":2,
+        "FactoryResetStatus":"Idle",
+        "DefaultProfileIndex":1
+    }"#;
+
+    /// The typed NVIDIA profile collection with the single profile member.
+    const NVIDIA_PROFILES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#NvidiaSystemProfileCollection.NvidiaSystemProfileCollection",
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+        "Id":"Profiles",
+        "Name":"System Profile Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"}]
+    }"##;
+
+    /// The typed NVIDIA `SystemProfile` member with every compiled metadata
+    /// field populated and the `ProfileFile` navigation.
+    const NVIDIA_SYSTEM_PROFILE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+        "@odata.etag":"W/\"nvidia-profile-1\"",
+        "Id":"1",
+        "Name":"Default Profile",
+        "Description":"Factory default profile",
+        "Default":true,
+        "Owner":"Nvidia",
+        "UUID":"11111111-2222-3333-4444-555555555555",
+        "Version":1,
+        "ProfileName":"default-profile",
+        "ProfileFile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"}
+    }"#;
+
+    /// The typed NVIDIA `SystemProfileFile` document with every compiled
+    /// field populated: the `Metadata` section and the base64 `Profile`
+    /// content.
+    const NVIDIA_SYSTEM_PROFILE_FILE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+        "@odata.etag":"W/\"nvidia-profile-file-1\"",
+        "Id":"ProfileFile",
+        "Name":"Profile File",
+        "Description":"Signed profile file",
+        "ProfileFile":{
+            "Metadata":{
+                "Activate":true,
+                "Delete":false,
+                "OriginProfileUUID":"11111111-2222-3333-4444-555555555555",
+                "More_Profiles":false,
+                "ProjectName":"BlueField",
+                "UUID":"11111111-2222-3333-4444-555555555555"
+            },
+            "Profile":"eyJwcm9maWxlIjogInRlc3QifQ=="
+        }
+    }"#;
+
     const FULL_SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -9208,6 +9932,74 @@ mod tests {
         "/redfish/v1/Managers/1",
         "/redfish/v1/Managers/1/SysLockdown",
         "/redfish/v1/Managers/1/KCSInterface",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one System member that advertises `Oem.Nvidia`
+    /// with an inline `NvidiaComputerSystem` segment: the chain is read right
+    /// after the system member — the profile service document, its status
+    /// singleton, the profile collection, the profile member, and its
+    /// profile file — exactly like the other system-bound families.
+    const CORE_RESOURCE_WITH_NVIDIA_SYSTEM_CONFIG_PROFILE_REQUEST_PATHS: [&str; 16] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one System member whose `Oem.Nvidia` segment
+    /// has the reference form: the segment body is fetched first, then the
+    /// chain follows exactly like the inline form.
+    const CORE_RESOURCE_WITH_NVIDIA_REFERENCE_SEGMENT_REQUEST_PATHS: [&str; 17] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Oem/Nvidia",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order when a chain document fails (here the profile
+    /// collection): the failed URI is still requested (that is how the skip
+    /// is observed), the chain root and status snapshots stay in place, and
+    /// the read completes.
+    const CORE_RESOURCE_WITH_FAILED_NVIDIA_CHAIN_REQUEST_PATHS: [&str; 14] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -11163,6 +11955,475 @@ mod tests {
             &server.finish_all().await?,
             &CORE_RESOURCE_WITH_SUPERMICRO_OEM_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    // The complete chain surface is asserted in one test so the snapshot
+    // order and the request sequence stay one contract; the fixture
+    // sequence exceeds the pedantic line budget, so the lint is scoped here
+    // exactly like the other fixture-sequence tests.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reads_nvidia_system_config_profile_chain_through_oem_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                // The chain is read right after the System member and before
+                // the sibling collections, so the bodies follow that order.
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS_BODY),
+                ("200 OK", NVIDIA_PROFILES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_SYSTEM_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_PROFILE_FILE_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 8);
+        let chain_root = &resources[2];
+        assert_eq!(
+            chain_root.feature(),
+            ResourceFeature::OemNvidiaSystemConfigProfile
+        );
+        assert_eq!(
+            chain_root.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        );
+        assert_eq!(
+            chain_root.etag().map(ResourceEtag::as_str),
+            Some("W/\"nvidia-scp-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(chain_root.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "system_config_profile");
+        assert_eq!(payload["Truststore"]["NvidiaCertificates"], true);
+        assert_eq!(payload["Truststore"]["OemCertificates"], true);
+        assert!(payload.get("Profiles").is_none());
+        assert!(payload.get("Status").is_none());
+        let status = &resources[3];
+        assert_eq!(
+            status.feature(),
+            ResourceFeature::OemNvidiaSystemConfigProfile
+        );
+        assert_eq!(
+            status.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+        );
+        let payload: serde_json::Value = serde_json::from_str(status.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "system_config_profile_status");
+        assert_eq!(payload["PendingList"]["Activation"], "profile-1");
+        assert_eq!(payload["ActiveProfileIndex"], 1);
+        assert_eq!(payload["BmcProfileVersion"], 2);
+        assert_eq!(payload["FactoryResetStatus"], "Idle");
+        assert_eq!(payload["DefaultProfileIndex"], 1);
+        let profile = &resources[4];
+        assert_eq!(
+            profile.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+        );
+        let payload: serde_json::Value = serde_json::from_str(profile.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "system_profile");
+        assert_eq!(payload["Default"], true);
+        assert_eq!(payload["Owner"], "Nvidia");
+        assert_eq!(payload["UUID"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(payload["Version"], 1);
+        assert_eq!(payload["ProfileName"], "default-profile");
+        let profile_file = &resources[5];
+        assert_eq!(
+            profile_file.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+        );
+        let payload: serde_json::Value = serde_json::from_str(profile_file.payload().as_str())?;
+        assert_eq!(payload["DocumentType"], "system_profile_file");
+        assert_eq!(payload["ProfileFile"]["Metadata"]["Activate"], true);
+        assert_eq!(payload["ProfileFile"]["Metadata"]["Delete"], false);
+        assert_eq!(
+            payload["ProfileFile"]["Metadata"]["OriginProfileUUID"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(payload["ProfileFile"]["Metadata"]["More_Profiles"], false);
+        assert_eq!(
+            payload["ProfileFile"]["Metadata"]["ProjectName"],
+            "BlueField"
+        );
+        assert_eq!(
+            payload["ProfileFile"]["Profile"],
+            "eyJwcm9maWxlIjogInRlc3QifQ=="
+        );
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_NVIDIA_SYSTEM_CONFIG_PROFILE_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn system_without_nvidia_oem_produces_no_nvidia_snapshot() -> Result<(), Box<dyn Error>> {
+        // A system without any `Oem` segment stays untouched, exactly like
+        // the other vendor families: no NVIDIA snapshot and no fabricated
+        // chain request.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources
+            .iter()
+            .all(|resource| resource.feature() != ResourceFeature::OemNvidiaSystemConfigProfile));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_nvidia_segment_leaves_the_family_absent() -> Result<(), Box<dyn Error>> {
+        // An `Oem.Nvidia` segment that cannot be discriminated or decoded
+        // (here: a non-object value) is one odd system surface: the read
+        // succeeds and leaves the whole system-config-profile family absent,
+        // and no chain request is ever fabricated.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_UNDECODABLE_NVIDIA_SEGMENT_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources
+            .iter()
+            .all(|resource| resource.feature() != ResourceFeature::OemNvidiaSystemConfigProfile));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chassis_kind_nvidia_segment_leaves_the_family_absent() -> Result<(), Box<dyn Error>> {
+        // A Chassis-kind `Oem.Nvidia` segment (here the `NvidiaChassis`
+        // shape) carries no system-config-profile chain: the discrimination
+        // keeps the family absent and no chain request is fabricated. The
+        // arm exists so a later chassis family decodes these segments.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_CHASSIS_KIND_NVIDIA_SEGMENT_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources
+            .iter()
+            .all(|resource| resource.feature() != ResourceFeature::OemNvidiaSystemConfigProfile));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nvidia_reference_form_segment_is_fetched_before_decoding() -> Result<(), Box<dyn Error>>
+    {
+        // A BlueField-style reference-form segment (`{"@odata.id": ...}`) is
+        // fetched through the compiled decode target first; the fetched
+        // document then navigates the chain exactly like the inline form.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_NVIDIA_REFERENCE_FORM_SEGMENT_BODY),
+                // The reference-form segment body is fetched first, then the
+                // chain follows right after the System member.
+                ("200 OK", NVIDIA_COMPUTER_SYSTEM_SEGMENT_BODY),
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS_BODY),
+                ("200 OK", NVIDIA_PROFILES_COLLECTION_BODY),
+                ("200 OK", NVIDIA_SYSTEM_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_PROFILE_FILE_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 8);
+        assert!(resources.iter().any(|resource| {
+            resource.feature() == ResourceFeature::OemNvidiaSystemConfigProfile
+                && resource.odata_id().as_str()
+                    == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        }));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_NVIDIA_REFERENCE_SEGMENT_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_nvidia_chain_documents_are_skipped_like_one_odd_surface()
+    -> Result<(), Box<dyn Error>> {
+        // A failed chain sub-document (here the profile collection) follows
+        // the member-level skip semantics: the read succeeds, the chain root
+        // and status snapshots stay in place, and the profile sub-chain is
+        // absent — the readable remainder is never erased.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_WITH_NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_BODY),
+                ("200 OK", NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS_BODY),
+                ("404 Not Found", "{}"),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        let nvidia = resources
+            .iter()
+            .filter(|resource| resource.feature() == ResourceFeature::OemNvidiaSystemConfigProfile)
+            .collect::<Vec<_>>();
+        assert_eq!(nvidia.len(), 2);
+        assert!(nvidia.iter().any(|resource| {
+            resource.odata_id().as_str() == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        }));
+        assert!(nvidia.iter().any(|resource| {
+            resource.odata_id().as_str()
+                == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+        }));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_FAILED_NVIDIA_CHAIN_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_segment_kind_discriminates_the_segment_shapes() {
+        // The discrimination mirrors nv-redfish's own `NvidiaCbcChassis::new`
+        // constructor: the top namespace and the type name decide the kind.
+        let computer_system = serde_json::json!({
+            "@odata.type": "#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem"
+        });
+        assert!(matches!(
+            nvidia_segment_kind(&computer_system),
+            Some(NvidiaSegmentKind::ComputerSystem)
+        ));
+        // The four chassis shapes of the `NvidiaChassis` namespace plus the
+        // standalone `NvidiaRoTChassis` namespace are all Chassis kinds.
+        for odata_type in [
+            "#NvidiaChassis.v1_14_0.NvidiaChassis",
+            "#NvidiaChassis.v1_14_0.NvidiaRoTchassis",
+            "#NvidiaChassis.v1_14_0.NvidiaSmaChassis",
+            "#NvidiaChassis.v1_14_0.NvidiaCBCChassis",
+            "#NvidiaRoTChassis.v1_0_0.NvidiaRoTChassis",
+        ] {
+            let segment = serde_json::json!({ "@odata.type": odata_type });
+            assert!(
+                matches!(
+                    nvidia_segment_kind(&segment),
+                    Some(NvidiaSegmentKind::Chassis)
+                ),
+                "{odata_type} must discriminate as a chassis segment"
+            );
+        }
+        // A segment without a parseable `@odata.type`, or with a type from
+        // outside the compiled NVIDIA surface, is not discriminable.
+        for segment in [
+            serde_json::json!({}),
+            serde_json::json!({ "@odata.type": "#Chassis.v1_22_0.Chassis" }),
+            serde_json::json!({ "@odata.type": "no-type-marker" }),
+            serde_json::json!(5),
+        ] {
+            assert_eq!(nvidia_segment_kind(&segment), None);
+        }
+        // The reference form is recognized before discrimination, so the
+        // `BlueField` partial-stub quirk never falls through as undecodable.
+        let reference = serde_json::json!({ "@odata.id": "/redfish/v1/Systems/1/Oem/Nvidia" });
+        assert!(is_nvidia_reference_form(&reference));
+        assert!(!is_nvidia_reference_form(&computer_system));
+    }
+
+    #[test]
+    fn nvidia_document_projections_keep_the_typed_field_contract() -> Result<(), Box<dyn Error>> {
+        // The compiled schemas are the type boundary: the typed metadata
+        // fields are projected verbatim, the `DocumentType` discriminator is
+        // written by the projection, and absent fields are skipped on the
+        // wire instead of coerced.
+        let chain_root: NvidiaSystemConfigProfileSchema =
+            serde_json::from_str(NVIDIA_SYSTEM_CONFIG_PROFILE_BODY)?;
+        let projection = nvidia_system_config_profile_projection(&chain_root)?;
+        assert_eq!(
+            projection.feature(),
+            ResourceFeature::OemNvidiaSystemConfigProfile
+        );
+        // The payloads are canonicalized by the snapshot payload rule (the
+        // `serde_json` map order), so the expected strings follow the
+        // alphabetical key order, not the declaration order.
+        assert_eq!(
+            projection.payload().as_str(),
+            r#"{"Description":"Profile service","DocumentType":"system_config_profile","Id":"SystemConfigProfile","Name":"NVIDIA System Config Profile","Truststore":{"NvidiaCertificates":true,"OemCertificates":true}}"#
+        );
+        // Without `Id` / `Name` the compiled decode fails, so the family
+        // cannot produce a bare chain-root snapshot; the closest legal
+        // document is one without the optional `Truststore`, which projects
+        // without the key.
+        let no_truststore: NvidiaSystemConfigProfileSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile","Id":"SystemConfigProfile","Name":"NVIDIA System Config Profile"}"#,
+        )?;
+        assert_eq!(
+            nvidia_system_config_profile_projection(&no_truststore)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"system_config_profile","Id":"SystemConfigProfile","Name":"NVIDIA System Config Profile"}"#
+        );
+
+        let status: NvidiaSystemConfigProfileStatusSchema =
+            serde_json::from_str(NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS_BODY)?;
+        assert_eq!(
+            nvidia_system_config_profile_status_projection(&status)?
+                .payload()
+                .as_str(),
+            r#"{"ActiveProfileIndex":1,"BmcProfileVersion":2,"DefaultProfileIndex":1,"Description":"Profile service status","DocumentType":"system_config_profile_status","FactoryResetStatus":"Idle","Id":"Status","Name":"System Config Profile Status","PendingList":{"Activation":"profile-1"}}"#
+        );
+        let sparse_status: NvidiaSystemConfigProfileStatusSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status","Id":"Status","Name":"Status"}"#,
+        )?;
+        assert_eq!(
+            nvidia_system_config_profile_status_projection(&sparse_status)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"system_config_profile_status","Id":"Status","Name":"Status"}"#
+        );
+
+        let profile: NvidiaSystemProfileSchema = serde_json::from_str(NVIDIA_SYSTEM_PROFILE_BODY)?;
+        assert_eq!(
+            nvidia_system_profile_projection(&profile)?
+                .payload()
+                .as_str(),
+            r#"{"Default":true,"Description":"Factory default profile","DocumentType":"system_profile","Id":"1","Name":"Default Profile","Owner":"Nvidia","ProfileName":"default-profile","UUID":"11111111-2222-3333-4444-555555555555","Version":1}"#
+        );
+        let sparse_profile: NvidiaSystemProfileSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1","Id":"1","Name":"Default Profile"}"#,
+        )?;
+        assert_eq!(
+            nvidia_system_profile_projection(&sparse_profile)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"system_profile","Id":"1","Name":"Default Profile"}"#
+        );
+
+        let profile_file: NvidiaSystemProfileFileSchema =
+            serde_json::from_str(NVIDIA_SYSTEM_PROFILE_FILE_BODY)?;
+        assert_eq!(
+            nvidia_system_profile_file_projection(&profile_file)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"Signed profile file","DocumentType":"system_profile_file","Id":"ProfileFile","Name":"Profile File","ProfileFile":{"Metadata":{"Activate":true,"Delete":false,"More_Profiles":false,"OriginProfileUUID":"11111111-2222-3333-4444-555555555555","ProjectName":"BlueField","UUID":"11111111-2222-3333-4444-555555555555"},"Profile":"eyJwcm9maWxlIjogInRlc3QifQ=="}}"#
+        );
+        let sparse_file: NvidiaSystemProfileFileSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile","Id":"ProfileFile","Name":"Profile File"}"#,
+        )?;
+        assert_eq!(
+            nvidia_system_profile_file_projection(&sparse_file)?
+                .payload()
+                .as_str(),
+            r#"{"DocumentType":"system_profile_file","Id":"ProfileFile","Name":"Profile File"}"#
+        );
         Ok(())
     }
 
