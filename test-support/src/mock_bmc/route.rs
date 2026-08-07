@@ -65,7 +65,39 @@ pub(crate) fn dispatch(
             json_ok(fixtures::ACCOUNT_ADMIN)
         }
         (HttpMethod::Get, "/redfish/v1/Systems") => json_ok(fixtures::SYSTEMS_COLLECTION),
-        (HttpMethod::Get, "/redfish/v1/Systems/1") => json_ok(fixtures::SYSTEM),
+        (HttpMethod::Get, "/redfish/v1/Systems/1") => json_ok(fixtures::system(state.profile())),
+        // The §11.5 NVIDIA system-config-profile chain is a vendor fixture:
+        // it exists only under the NVIDIA profile, and any other profile
+        // must 404 it like any unserved path instead of leaking a vendor
+        // namespace. The chain root is reached through the `Oem.Nvidia`
+        // segment's `SystemConfigProfile` navigation, so the routes mirror
+        // the exact `@odata.id` values the fixture serves.
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_SYSTEM_CONFIG_PROFILE)
+        }
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS)
+        }
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_PROFILES_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_SYSTEM_PROFILE_1)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_SYSTEM_PROFILE_FILE_1)
+        }
         (HttpMethod::Get, "/redfish/v1/Systems/1/Bios") => json_ok(fixtures::BIOS),
         (HttpMethod::Get, "/redfish/v1/Systems/1/BootOptions") => {
             json_ok(fixtures::BOOT_OPTIONS_COLLECTION)

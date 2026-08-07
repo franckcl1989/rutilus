@@ -22,10 +22,16 @@
 //! const set below, while the Dell profile swaps the Service Root identity
 //! strings ([`SERVICE_ROOT_DELL`]), adds the `Oem.Dell` segment to the
 //! manager document ([`MANAGER_DELL`]), and serves the §11.5
-//! `DellAttributes` document ([`DELL_ATTRIBUTES`]); everything else is
-//! shared. [`service_root`] and [`manager`] select the profile-specific
-//! documents, and the route table gates the Dell Attributes route on the
-//! profile, so no vendor surface can leak into another profile.
+//! `DellAttributes` document ([`DELL_ATTRIBUTES`]); the NVIDIA profile swaps
+//! the Service Root identity strings ([`SERVICE_ROOT_NVIDIA`]), adds the
+//! `Oem.Nvidia` segment to the System document ([`SYSTEM_NVIDIA`]), and
+//! serves the §11.5 system-config-profile chain
+//! ([`NVIDIA_SYSTEM_CONFIG_PROFILE`], [`NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS`],
+//! [`NVIDIA_PROFILES_COLLECTION`], [`NVIDIA_SYSTEM_PROFILE_1`], and
+//! [`NVIDIA_SYSTEM_PROFILE_FILE_1`]); everything else is shared.
+//! [`service_root`], [`manager`], and [`system`] select the
+//! profile-specific documents, and the route table gates the vendor routes
+//! on the profile, so no vendor surface can leak into another profile.
 
 use super::profile::MockProfile;
 
@@ -231,6 +237,131 @@ pub(crate) const SYSTEM: &str = r#"{
     "PCIeDevices":[
         {"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1"}
     ]
+}"#;
+
+/// `GET /redfish/v1/Systems/1` -- the compute system of the NVIDIA vendor
+/// profile.
+///
+/// Exactly the default system surface plus the `Oem.Nvidia` segment that
+/// advertises the NVIDIA OEM namespace and carries the inline
+/// `NvidiaComputerSystem` object with the `SystemConfigProfile` navigation:
+/// the capability probe decides the `oem-nvidia*` capabilities from the
+/// decoded `Oem` keys (§11.3 advertised layer) and the gateway's §11.5
+/// system-config-profile read gates on the discriminated `NvidiaComputerSystem`
+/// segment, so this one addition switches both layers on.
+pub(crate) const SYSTEM_NVIDIA: &str = r##"{
+    "@odata.id":"/redfish/v1/Systems/1",
+    "@odata.etag":"W/\"system-1\"",
+    "Id":"1",
+    "Name":"System One",
+    "Description":"Primary compute system",
+    "SystemType":"Physical",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model S",
+    "PartNumber":"SYS-PART-1",
+    "SerialNumber":"SYS-1",
+    "SKU":"SYS-SKU-1",
+    "HostName":"compute-1",
+    "BiosVersion":"2.3.4",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Bios":{"@odata.id":"/redfish/v1/Systems/1/Bios"},
+    "Boot":{"BootOptions":{"@odata.id":"/redfish/v1/Systems/1/BootOptions"}},
+    "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
+    "Processors":{"@odata.id":"/redfish/v1/Systems/1/Processors"},
+    "Memory":{"@odata.id":"/redfish/v1/Systems/1/Memory"},
+    "PCIeDevices":[
+        {"@odata.id":"/redfish/v1/Systems/1/PCIeDevices/GPU1"}
+    ],
+    "Oem":{"Nvidia":{
+        "@odata.type":"#NvidiaComputerSystem.v1_0_0.NvidiaComputerSystem",
+        "SystemConfigProfile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"}
+    }}
+}"##;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile` -- the §11.5
+/// NVIDIA system-config-profile chain root of the NVIDIA vendor profile.
+///
+/// The document mirrors the fixture `rutilus-infra-redfish` decodes in its
+/// own NVIDIA tests (the typed base fields, the `Truststore` certificate-store
+/// links whose documents the product never fetches, and the `Status` /
+/// `Profiles` navigations), so the gateway's typed navigation into the
+/// compiled `NvidiaSystemConfigProfile` schema succeeds against the mock.
+pub(crate) const NVIDIA_SYSTEM_CONFIG_PROFILE: &str = r#"{
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+    "@odata.etag":"W/\"nvidia-scp-1\"",
+    "Id":"SystemConfigProfile",
+    "Name":"NVIDIA System Config Profile",
+    "Description":"Profile service",
+    "Truststore":{
+        "NvidiaCertificates":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Truststore/NvidiaCertificates"},
+        "OemCertificates":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Truststore/OemCertificates"}
+    },
+    "Status":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"},
+    "Profiles":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles"}
+}"#;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status` -- the
+/// profile service status singleton of the NVIDIA vendor profile.
+pub(crate) const NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS: &str = r#"{
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+    "@odata.etag":"W/\"nvidia-scp-status-1\"",
+    "Id":"Status",
+    "Name":"System Config Profile Status",
+    "Description":"Profile service status",
+    "PendingList":{"Activation":"profile-1"},
+    "ActiveProfileIndex":1,
+    "BmcProfileVersion":2,
+    "FactoryResetStatus":"Idle",
+    "DefaultProfileIndex":1
+}"#;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles` -- the
+/// profile collection of the NVIDIA vendor profile with the single member.
+pub(crate) const NVIDIA_PROFILES_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaSystemProfileCollection.NvidiaSystemProfileCollection",
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+    "Id":"Profiles",
+    "Name":"System Profile Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"}]
+}"##;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1` --
+/// the default profile member of the NVIDIA vendor profile.
+pub(crate) const NVIDIA_SYSTEM_PROFILE_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+    "@odata.etag":"W/\"nvidia-profile-1\"",
+    "Id":"1",
+    "Name":"Default Profile",
+    "Description":"Factory default profile",
+    "Default":true,
+    "Owner":"Nvidia",
+    "UUID":"11111111-2222-3333-4444-555555555555",
+    "Version":1,
+    "ProfileName":"default-profile",
+    "ProfileFile":{"@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"}
+}"#;
+
+/// `GET /redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile`
+/// -- the profile file document of the NVIDIA vendor profile, carrying the
+/// `Metadata` section and the base64 `Profile` content.
+pub(crate) const NVIDIA_SYSTEM_PROFILE_FILE_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+    "@odata.etag":"W/\"nvidia-profile-file-1\"",
+    "Id":"ProfileFile",
+    "Name":"Profile File",
+    "Description":"Signed profile file",
+    "ProfileFile":{
+        "Metadata":{
+            "Activate":true,
+            "Delete":false,
+            "OriginProfileUUID":"11111111-2222-3333-4444-555555555555",
+            "More_Profiles":false,
+            "ProjectName":"BlueField",
+            "UUID":"11111111-2222-3333-4444-555555555555"
+        },
+        "Profile":"eyJwcm9maWxlIjogInRlc3QifQ=="
+    }
 }"#;
 
 /// `GET /redfish/v1/Systems/1/Processors` -- the processor collection.
@@ -930,8 +1061,37 @@ pub(crate) fn service_root(profile: MockProfile) -> &'static str {
     match profile {
         MockProfile::Rutilus => SERVICE_ROOT,
         MockProfile::Dell => SERVICE_ROOT_DELL,
+        MockProfile::Nvidia => SERVICE_ROOT_NVIDIA,
     }
 }
+
+/// `GET /redfish/v1` -- the Service Root of the NVIDIA vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real NVIDIA
+/// `BlueField` identifies itself as Vendor "NVIDIA" with the `BlueField` product
+/// name. The navigation surface is byte-identical to [`SERVICE_ROOT`], and
+/// no `Oem` segment is served here because the NVIDIA namespace lives on the
+/// System document, exactly where the gateway's probe and read look for it.
+pub(crate) const SERVICE_ROOT_NVIDIA: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"NVIDIA",
+    "Product":"BlueField-3",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
 
 /// The `Managers/1` document of one vendor profile.
 ///
@@ -939,7 +1099,23 @@ pub(crate) fn service_root(profile: MockProfile) -> &'static str {
 /// profile adds the `Oem.Dell` segment that advertises its OEM namespace.
 pub(crate) fn manager(profile: MockProfile) -> &'static str {
     match profile {
-        MockProfile::Rutilus => MANAGER,
+        // The NVIDIA profile shares the default manager document: the
+        // NVIDIA OEM surface lives on the System member, not the manager.
+        MockProfile::Rutilus | MockProfile::Nvidia => MANAGER,
         MockProfile::Dell => MANAGER_DELL,
+    }
+}
+
+/// The `Systems/1` document of one vendor profile.
+///
+/// The default profile keeps the byte-identical [`SYSTEM`]; the NVIDIA
+/// profile adds the `Oem.Nvidia` segment that advertises its OEM namespace
+/// and navigates the system-config-profile chain.
+pub(crate) fn system(profile: MockProfile) -> &'static str {
+    match profile {
+        // The Dell profile shares the default system document: the Dell
+        // OEM surface lives on the manager member, not the system.
+        MockProfile::Rutilus | MockProfile::Dell => SYSTEM,
+        MockProfile::Nvidia => SYSTEM_NVIDIA,
     }
 }

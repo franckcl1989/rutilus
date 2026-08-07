@@ -17,7 +17,11 @@
 //! 0.5.0 xFusion/Inspur standard-pattern verification basis -- is simply a
 //! variant that changes the identity strings and carries no `Oem` fixtures at
 //! all, so the capability probe keeps reporting every §2.1 OEM capability
-//! `NotAdvertised` exactly like the default tree.
+//! `NotAdvertised` exactly like the default tree. The NVIDIA profile is the
+//! first vendor surface carried by a System member (`Oem.Nvidia` on
+//! `Systems/1`, the 0.5.0 NVIDIA OEM surface), where the Dell profile carries
+//! its surface on the manager; the per-profile routing gates the chain
+//! documents exactly like the Dell Attributes routes.
 //!
 //! A vendor profile's identity replacement is deliberately scoped to the
 //! Service Root strings (and the `Oem` namespaces), never to the
@@ -50,16 +54,25 @@ pub enum MockProfile {
     /// `{manager}/Oem/Dell/DellAttributes/{id}`. Every other document of the
     /// tree is shared with the default profile.
     Dell,
+    /// The NVIDIA `BlueField` fixture tree: Vendor "NVIDIA" / Product
+    /// `BlueField-3`, `Systems/1` advertises `Oem.Nvidia` (which flips the
+    /// `oem-nvidia*` capability probe to `Supported`), and the §11.5
+    /// system-config-profile chain is served — the profile service document,
+    /// its status singleton, the profile collection, one profile member, and
+    /// its profile file. Every other document of the tree is shared with the
+    /// default profile.
+    Nvidia,
 }
 
 impl MockProfile {
     /// The lowercase profile name, matching the `mock-bmc` `--profile`
-    /// values (`rutilus` | `dell`).
+    /// values (`rutilus` | `dell` | `nvidia`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Rutilus => "rutilus",
             Self::Dell => "dell",
+            Self::Nvidia => "nvidia",
         }
     }
 }

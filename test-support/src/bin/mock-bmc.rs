@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // spelling falls back to the default profile.
     let profile = match cli.profile.as_str() {
         "dell" => MockProfile::Dell,
+        "nvidia" => MockProfile::Nvidia,
         _ => MockProfile::Rutilus,
     };
     let mock = MockBmc::bind_with_profile(cli.port, profile).await?;

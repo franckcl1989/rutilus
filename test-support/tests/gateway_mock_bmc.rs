@@ -620,6 +620,20 @@ const DELL_PROBE_REQUEST_COUNT: u64 = 34;
 /// single §11.5 `DellAttributes` fetch.
 const DELL_RESOURCE_READ_REQUEST_COUNT: u64 = 52;
 
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the NVIDIA profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides the `oem-nvidia*`
+/// capabilities from the already-decoded system member and never probes a
+/// vendor URL.
+const NVIDIA_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the NVIDIA profile: the 51 requests of the default profile plus the
+/// five §11.5 system-config-profile chain fetches (the profile service
+/// document, its status singleton, the profile collection, the profile
+/// member, and its profile file).
+const NVIDIA_RESOURCE_READ_REQUEST_COUNT: u64 = 56;
+
 #[tokio::test]
 async fn dell_profile_probes_oem_dell_supported_with_standard_surface_unchanged()
 -> Result<(), Box<dyn Error>> {
@@ -798,6 +812,241 @@ async fn dell_profile_reads_oem_dell_attributes_snapshot() -> Result<(), Box<dyn
         requests[dell_index].header("x-auth-token"),
         Some("test-session-token"),
         "the Dell Attributes fetch must authenticate with the Session token"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvidia_profile_probes_oem_nvidia_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The NVIDIA profile advertises exactly the NVIDIA namespace: the decoded
+    // system member carries `Oem.Nvidia`, so `oem-nvidia` and all five
+    // `oem-nvidia-*` sub-features probe `Supported` (§11.3 advertised layer);
+    // no other vendor namespace is served, so every remaining OEM capability
+    // stays `NotAdvertised`.
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemNvidia
+            | EndpointCapability::OemNvidiaCper
+            | EndpointCapability::OemNvidiaFabrics
+            | EndpointCapability::OemNvidiaPowerManagement
+            | EndpointCapability::OemNvidiaProfiles
+            | EndpointCapability::OemNvidiaSecurity => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("NVIDIA"),
+        "the probe must carry the NVIDIA Service Root identity"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        NVIDIA_PROBE_REQUEST_COUNT,
+        "the NVIDIA namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete NVIDIA read surface is asserted in one test so the request
+// position and the 32-resource order stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint
+// on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<(), Box<dyn Error>>
+{
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The NVIDIA read surface adds exactly the four §11.5
+    // system-config-profile snapshots to the default 28-resource tree (the
+    // chain root, its status singleton, the profile member, and its profile
+    // file), in the documented read order: they follow the System member and
+    // precede the system's `Bios` singleton.
+    assert_eq!(resources.len(), 32);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The chain root snapshot carries the `Truststore` link-presence
+    // metadata; the certificate documents behind the links stay unfetched.
+    let chain_root = &resources[2];
+    assert_eq!(
+        chain_root.odata_id().as_str(),
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+    );
+    assert!(chain_root.etag().is_some());
+    let payload: serde_json::Value = serde_json::from_str(chain_root.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "system_config_profile");
+    assert_eq!(payload["Truststore"]["NvidiaCertificates"], true);
+    assert_eq!(payload["Truststore"]["OemCertificates"], true);
+
+    let status = &resources[3];
+    assert_eq!(
+        status.odata_id().as_str(),
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+    );
+    let payload: serde_json::Value = serde_json::from_str(status.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "system_config_profile_status");
+    assert_eq!(payload["PendingList"]["Activation"], "profile-1");
+    assert_eq!(payload["ActiveProfileIndex"], 1);
+    assert_eq!(payload["BmcProfileVersion"], 2);
+    assert_eq!(payload["FactoryResetStatus"], "Idle");
+    assert_eq!(payload["DefaultProfileIndex"], 1);
+
+    let profile = &resources[4];
+    assert_eq!(
+        profile.odata_id().as_str(),
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+    );
+    let payload: serde_json::Value = serde_json::from_str(profile.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "system_profile");
+    assert_eq!(payload["Default"], true);
+    assert_eq!(payload["Owner"], "Nvidia");
+    assert_eq!(payload["UUID"], "11111111-2222-3333-4444-555555555555");
+    assert_eq!(payload["Version"], 1);
+    assert_eq!(payload["ProfileName"], "default-profile");
+
+    let profile_file = &resources[5];
+    assert_eq!(
+        profile_file.odata_id().as_str(),
+        "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+    );
+    let payload: serde_json::Value = serde_json::from_str(profile_file.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "system_profile_file");
+    assert_eq!(payload["ProfileFile"]["Metadata"]["Activate"], true);
+    assert_eq!(payload["ProfileFile"]["Metadata"]["Delete"], false);
+    assert_eq!(
+        payload["ProfileFile"]["Metadata"]["OriginProfileUUID"],
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(payload["ProfileFile"]["Metadata"]["More_Profiles"], false);
+    assert_eq!(
+        payload["ProfileFile"]["Metadata"]["ProjectName"],
+        "BlueField"
+    );
+    assert_eq!(
+        payload["ProfileFile"]["Profile"],
+        "eyJwcm9maWxlIjogInRlc3QifQ=="
+    );
+
+    // The gateway fetches the chain documents exactly once each, right after
+    // the System member and before the `Bios` singleton, and through the
+    // Session token transport like every other read.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        NVIDIA_RESOURCE_READ_REQUEST_COUNT,
+        "the NVIDIA read must issue exactly five requests beyond the default flow"
+    );
+    let system_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Systems/1")
+        .ok_or_else(|| io::Error::other("Systems/1 is missing from the request log"))?;
+    let chain_root_index = requests
+        .iter()
+        .position(|request| {
+            request.path() == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        })
+        .ok_or_else(|| {
+            io::Error::other("the SystemConfigProfile fetch is missing from the request log")
+        })?;
+    assert_eq!(
+        chain_root_index,
+        system_index + 1,
+        "the chain must be read right after the System member"
+    );
+    let profile_file_index = requests
+        .iter()
+        .position(|request| {
+            request.path()
+                == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+        })
+        .ok_or_else(|| io::Error::other("the ProfileFile fetch is missing from the request log"))?;
+    assert_eq!(
+        requests[profile_file_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the chain fetches must authenticate with the Session token"
     );
     assert_eq!(
         mock.active_sessions(),
