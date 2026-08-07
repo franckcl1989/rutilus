@@ -17,6 +17,7 @@ mod m20260807_000001_nvidia_families;
 mod m20260807_000002_operation_failure_kinds;
 mod m20260807_000003_nvidia_families;
 mod m20260807_000005_product_users;
+mod m20260807_000006_lenovo_families;
 mod m20260807_000007_audit_action_shapes;
 
 pub struct Migrator;
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000003_nvidia_families::Migration),
             Box::new(m20260807_000005_product_users::Migration),
             Box::new(m20260807_000007_audit_action_shapes::Migration),
+            Box::new(m20260807_000006_lenovo_families::Migration),
         ]
     }
 }
