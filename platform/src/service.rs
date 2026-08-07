@@ -20,13 +20,9 @@
 //! unit-tested on each of them; the platform-specific registration lives in
 //! the `windows` module and the cfg-gated functions at the bottom.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-
-// The registration errors carry the unit file paths on macOS and Linux only.
-#[cfg(not(windows))]
-use std::path::PathBuf;
 
 /// The registered service's SCM name, unit name, and display identity.
 // The name is consumed by the Windows SCM module and by the unit file
@@ -270,6 +266,33 @@ pub fn systemd_unit_content(
     )
 }
 
+/// The launchd agent plist path below one home directory.
+///
+/// Shared by install, uninstall, and status so every branch answers the
+/// same "is the durable registration artifact a regular file?" question;
+/// the existence semantics are unit-tested on every platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn launchd_plist_path(home: impl AsRef<Path>) -> PathBuf {
+    home.as_ref()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"))
+}
+
+/// The systemd user unit path below one home directory.
+///
+/// Shared by install, uninstall, and status so every branch answers the
+/// same "is the durable registration artifact a regular file?" question;
+/// the existence semantics are unit-tested on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn systemd_unit_path(home: impl AsRef<Path>) -> PathBuf {
+    home.as_ref()
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(SYSTEMD_UNIT_NAME)
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(value: &str) -> String {
     value
@@ -376,12 +399,12 @@ fn platform_install(
     data_directory: &Path,
 ) -> Result<(), ServiceInstallError> {
     let home = std::env::var_os("HOME").ok_or(ServiceInstallError::HomeUnavailable)?;
-    let agents = PathBuf::from(home).join("Library").join("LaunchAgents");
+    let agents = PathBuf::from(&home).join("Library").join("LaunchAgents");
     std::fs::create_dir_all(&agents).map_err(|source| ServiceInstallError::AgentDirectory {
         path: agents.clone(),
         source,
     })?;
-    let plist = agents.join(format!("{LAUNCHD_LABEL}.plist"));
+    let plist = launchd_plist_path(&home);
     let content = launchd_plist_content(arguments, executable, data_directory);
     std::fs::write(&plist, content).map_err(|source| ServiceInstallError::Plist {
         path: plist.clone(),
@@ -405,10 +428,7 @@ fn platform_install(
 #[cfg(target_os = "macos")]
 fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     let home = std::env::var_os("HOME").ok_or(ServiceUninstallError::HomeUnavailable)?;
-    let plist = PathBuf::from(home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
+    let plist = launchd_plist_path(&home);
     if !plist.is_file() {
         return Err(ServiceUninstallError::NotInstalled { path: plist });
     }
@@ -433,10 +453,7 @@ fn platform_uninstall() -> Result<(), ServiceUninstallError> {
 #[cfg(target_os = "macos")]
 fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
     let home = std::env::var_os("HOME").ok_or(ServiceStatusError::HomeUnavailable)?;
-    let plist = PathBuf::from(home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
+    let plist = launchd_plist_path(&home);
     Ok(if plist.is_file() {
         ServiceStatus::Installed
     } else {
@@ -467,7 +484,7 @@ fn platform_install(
     data_directory: &Path,
 ) -> Result<(), ServiceInstallError> {
     let home = std::env::var_os("HOME").ok_or(ServiceInstallError::HomeUnavailable)?;
-    let unit_directory = PathBuf::from(home)
+    let unit_directory = PathBuf::from(&home)
         .join(".config")
         .join("systemd")
         .join("user");
@@ -477,7 +494,7 @@ fn platform_install(
             source,
         }
     })?;
-    let unit = unit_directory.join(SYSTEMD_UNIT_NAME);
+    let unit = systemd_unit_path(&home);
     let content = systemd_unit_content(arguments, executable, data_directory);
     std::fs::write(&unit, content).map_err(|source| ServiceInstallError::Unit {
         path: unit.clone(),
@@ -506,11 +523,7 @@ fn platform_install(
 #[cfg(target_os = "linux")]
 fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     let home = std::env::var_os("HOME").ok_or(ServiceUninstallError::HomeUnavailable)?;
-    let unit = PathBuf::from(home)
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join(SYSTEMD_UNIT_NAME);
+    let unit = systemd_unit_path(&home);
     if !unit.is_file() {
         return Err(ServiceUninstallError::NotInstalled { path: unit });
     }
@@ -535,11 +548,7 @@ fn platform_uninstall() -> Result<(), ServiceUninstallError> {
 #[cfg(target_os = "linux")]
 fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
     let home = std::env::var_os("HOME").ok_or(ServiceStatusError::HomeUnavailable)?;
-    let unit = PathBuf::from(home)
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join(SYSTEMD_UNIT_NAME);
+    let unit = systemd_unit_path(&home);
     Ok(if unit.is_file() {
         ServiceStatus::Installed
     } else {
@@ -856,5 +865,47 @@ mod tests {
     fn systemd_quote_leaves_plain_tokens_alone() {
         assert_eq!(systemd_quote("plain"), "plain");
         assert_eq!(systemd_quote("has space"), "\"has space\"");
+    }
+
+    #[test]
+    fn registration_paths_name_the_expected_artifacts() {
+        let home = PathBuf::from("/home/rutilus");
+        assert_eq!(
+            launchd_plist_path(&home),
+            PathBuf::from("/home/rutilus/Library/LaunchAgents/com.rutilus.site.plist")
+        );
+        assert_eq!(
+            systemd_unit_path(&home),
+            PathBuf::from("/home/rutilus/.config/systemd/user/rutilus.service")
+        );
+    }
+
+    #[test]
+    fn registration_existence_checks_require_a_regular_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let plist = launchd_plist_path(directory.path());
+        let unit = systemd_unit_path(directory.path());
+
+        // The status and uninstall branches use `is_file`, not `exists`: a
+        // missing path and a directory with the registration name are both
+        // "not installed".
+        assert!(!plist.is_file(), "a missing path is not installed");
+        assert!(!unit.is_file(), "a missing path is not installed");
+        let unit_parent = unit
+            .parent()
+            .ok_or_else(|| std::io::Error::other("systemd unit path has no parent"))?;
+        std::fs::create_dir_all(unit_parent)?;
+        std::fs::create_dir(&unit)?;
+        assert!(!unit.is_file(), "a directory is not an installed unit");
+
+        // A regular file at the registration path is "installed".
+        let parent = plist
+            .parent()
+            .ok_or_else(|| std::io::Error::other("launchd plist path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(&plist, "<plist/>")?;
+        assert!(plist.is_file(), "a regular file is installed");
+        Ok(())
     }
 }
