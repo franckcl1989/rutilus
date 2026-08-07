@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 mod application_adapter;
 mod artifact_repository;
 mod audit_repository;
+mod bootstrap_repository;
 mod credential_repository;
 mod endpoint_capability_repository;
 mod endpoint_repository;
@@ -23,14 +24,19 @@ mod event_repository;
 mod group_repository;
 mod migration_backup;
 mod operation_repository;
+mod password_repository;
+mod principal_repository;
 mod remote_task_repository;
 mod resource_snapshot_repository;
+mod session_repository;
 mod tag_repository;
 mod telemetry_repository;
+mod totp_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
 pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
+pub use bootstrap_repository::{BootstrapRepositoryError, StoredBootstrapCodeError};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };
@@ -42,14 +48,18 @@ pub use event_repository::{EventRepositoryError, StoredEventError};
 pub use group_repository::{GroupRepositoryError, StoredGroupError};
 pub use migration_backup::{MigrationBackup, MigrationBackupError};
 pub use operation_repository::{OperationRepositoryError, StoredBatchError, StoredOperationError};
+pub use password_repository::{PasswordRepositoryError, StoredPasswordError};
+pub use principal_repository::{PrincipalRepositoryError, StoredPrincipalError};
 pub use remote_task_repository::{RemoteTaskRepositoryError, StoredRemoteTaskError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
 };
+pub use session_repository::{SessionRepositoryError, StoredSessionError};
 pub use tag_repository::{StoredTagError, TagRepositoryError};
 pub use telemetry_repository::{
     StoredTelemetryError, TelemetryPruneSummary, TelemetryRepositoryError,
 };
+pub use totp_repository::{StoredTotpError, TotpRepositoryError};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_CONNECTIONS: u32 = 4;

@@ -3547,6 +3547,7 @@ dependencies = [
 name = "rutilus-persistence"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rutilus-application",
  "rutilus-domain",
  "rutilus-entity",
