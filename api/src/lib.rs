@@ -833,6 +833,29 @@ pub enum CoreResourceDetailsResponse {
         server_bmc_mac_address: Option<String>,
         server_name: Option<String>,
     },
+    /// One §0.5.0 OEM family member projected from the typed Redfish
+    /// Supermicro `SysLockdown` schema (`SysLockdown_v1`, nv-redfish-schema
+    /// 0.13, `oem-supermicro` feature).
+    ///
+    /// The manager's `SysLockdown` document is one of the two Supermicro OEM
+    /// surfaces nv-redfish 0.13 compiles (§11.5: an OEM surface is projected
+    /// only when upstream strongly types it), and the details are the
+    /// document's only substantive typed field. The compiled schema models no
+    /// `Id` / `Name` / `Description`, so the common identity is the resource's
+    /// own `@odata.id` final segment (the Redfish `Id` per DSP0266), never a
+    /// product-invented label.
+    OemSmcSysLockdown { sys_lockdown_enabled: Option<bool> },
+    /// One §0.5.0 OEM family member projected from the typed Redfish
+    /// Supermicro `KcsInterface` schema (`KCSInterface_v1`, nv-redfish-schema
+    /// 0.13, `oem-supermicro` feature).
+    ///
+    /// The manager's `KCSInterface` document is the second Supermicro OEM
+    /// surface nv-redfish 0.13 compiles (§11.5), and `privilege` is the
+    /// vendor's enum spelling verbatim (e.g. `Administrator`, `DisableKCS`).
+    /// The compiled schema models no `Id` / `Name` / `Description`, so the
+    /// common identity is the resource's own `@odata.id` final segment (the
+    /// Redfish `Id` per DSP0266), never a product-invented label.
+    OemSmcKcsInterface { privilege: Option<String> },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
@@ -3784,6 +3807,124 @@ mod tests {
                 server_generation: Some("16G".to_owned()),
                 server_bmc_mac_address: Some("14:18:77:aa:bb:cc".to_owned()),
                 server_name: Some("rack-1-server-2".to_owned()),
+            },
+        )
+    }
+
+    #[test]
+    fn core_resource_contract_carries_oem_smc_wire_values() -> Result<(), Box<dyn Error>> {
+        let sys_lockdown = oem_smc_sys_lockdown_resource();
+        let kcs_interface = oem_smc_kcs_interface_resource();
+
+        assert_eq!(
+            serde_json::to_value(&sys_lockdown)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b2",
+                    "odata_id": "/redfish/v1/Managers/1/SysLockdown",
+                    "odata_type": "#SysLockdown.v1_0_0.SysLockdown",
+                    "etag": "W/\"sys-lockdown-1\""
+                },
+                "common": {
+                    "id": "SysLockdown",
+                    "name": "SysLockdown",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "oem_smc_sys_lockdown",
+                    "details": {
+                        "sys_lockdown_enabled": true
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&sys_lockdown)?)?,
+            sys_lockdown
+        );
+        assert_eq!(
+            serde_json::to_value(&kcs_interface)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b3",
+                    "odata_id": "/redfish/v1/Managers/1/KCSInterface",
+                    "odata_type": "#KCSInterface.v1_0_0.KCSInterface",
+                    "etag": "W/\"kcs-interface-1\""
+                },
+                "common": {
+                    "id": "KCSInterface",
+                    "name": "KCSInterface",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "oem_smc_kcs_interface",
+                    "details": {
+                        "privilege": "Administrator"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&kcs_interface)?)?,
+            kcs_interface
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "oem_smc_sys_lockdown",
+                "details": {
+                    "sys_lockdown_enabled": false,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "oem_smc_kcs_interface",
+                "details": {
+                    "privilege": "User",
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn oem_smc_sys_lockdown_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b2"),
+                "/redfish/v1/Managers/1/SysLockdown".to_owned(),
+                Some("#SysLockdown.v1_0_0.SysLockdown".to_owned()),
+                Some("W/\"sys-lockdown-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "SysLockdown".to_owned(),
+                "SysLockdown".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::OemSmcSysLockdown {
+                sys_lockdown_enabled: Some(true),
+            },
+        )
+    }
+
+    fn oem_smc_kcs_interface_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b3"),
+                "/redfish/v1/Managers/1/KCSInterface".to_owned(),
+                Some("#KCSInterface.v1_0_0.KCSInterface".to_owned()),
+                Some("W/\"kcs-interface-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "KCSInterface".to_owned(),
+                "KCSInterface".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::OemSmcKcsInterface {
+                privilege: Some("Administrator".to_owned()),
             },
         )
     }
