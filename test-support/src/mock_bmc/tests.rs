@@ -3,14 +3,15 @@
 //!
 //! The gateway-level test is the crate's acceptance proof: it runs the exact
 //! product request sequence (TLS observation, pinned trust, Session
-//! lifecycle, 30-capability probe, typed core resource read, refresh)
+//! lifecycle, 44-capability probe, typed core resource read, refresh)
 //! against a live Mock BMC and asserts shapes, counts, and cleanup.
 
 use std::{error::Error, io};
 
 use rutilus_domain::{
     CAPABILITY_LEDGER_ORDER, CapabilityState, CertificateFingerprint, CredentialUsername,
-    EndpointCapability, EndpointCapabilityObservation, ResourceFeature, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, OEM_CAPABILITY_LEDGER_ORDER,
+    ResourceFeature, TlsTrust,
 };
 use rutilus_infra_redfish::{CoreResourceProjection, RedfishGateway, SystemCaStatus};
 use secrecy::SecretString;
@@ -231,8 +232,11 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
     let username = CredentialUsername::parse(MOCK_USERNAME)?;
     let password = SecretString::from(MOCK_PASSWORD);
 
-    // The 30-capability probe: exactly the 2.1 inventory in order, with the
-    // served surface `Supported` and the unserved surface `NotAdvertised`.
+    // The 44-capability probe: exactly the §2.1 inventory in order (30
+    // standard features followed by the 14 OEM features), with the served
+    // surface `Supported`, the unserved standard surface `NotAdvertised`, and
+    // every OEM capability `NotAdvertised` (the mock serves no vendor
+    // namespace).
     let discovery = gateway
         .probe_core_capabilities(&address, &trust, &username, &password)
         .await?;
@@ -255,6 +259,17 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
         )?;
     }
     for capability in CAPABILITIES_NOT_ADVERTISED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::NotAdvertised,
+        )?;
+    }
+    // The mock serves no vendor `Oem` namespace and no LiteOn chassis, so the
+    // probe must report every compiled OEM capability `NotAdvertised`: the
+    // §11.3 advertised layer is decided by the decoded documents, never
+    // guessed from the vendor name.
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
         assert_capability_state(
             discovery.capabilities(),
             capability,

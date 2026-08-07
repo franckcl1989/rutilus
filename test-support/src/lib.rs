@@ -1,7 +1,7 @@
 //! Deterministic test support for the Rutilus product (design section 8
 //! `test-support`: Mock, Fixture, and fault injection): a runnable HTTPS Mock Redfish
 //! BMC on loopback, serving a fixed resource tree that the product's
-//! trust-first onboarding, 30-capability probe, and typed core resource read
+//! trust-first onboarding, 44-capability probe, and typed core resource read
 //! can exercise without a real BMC.
 //!
 //! # Why this crate exists
@@ -10,7 +10,7 @@
 //! so a fixture that cannot run as a real TLS server cannot demo the
 //! onboarding flow. The [`MockBmc`] here is a genuine loopback HTTPS server:
 //! the product observes its self-signed leaf, pins its SHA-256 fingerprint,
-//! logs in through `SessionService`, probes the 30 2.1 capabilities, reads
+//! logs in through `SessionService`, probes the 44 §2.1 capabilities, reads
 //! the ServiceRoot/Systems/Chassis/Managers/Processors/Memory tree, and
 //! cleans up its Session -- exactly the flow a user sees with a real BMC.
 //!

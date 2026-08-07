@@ -3,8 +3,9 @@
 //! Integration tests driving the product `RedfishGateway` against the shared
 //! Mock BMC, proving the §19.1 Mock-BMC test layer through public APIs only:
 //! trust-first onboarding of the mock's self-signed identity, the Service
-//! Root read, the complete 30-capability probe, the typed core resource read,
-//! and the Session create/delete lifecycle.
+//! Root read, the complete 44-capability probe (30 standard §2.1 features and
+//! 14 OEM features), the typed core resource read, and the Session
+//! create/delete lifecycle.
 //!
 //! Every test starts its own `MockBmc` on an ephemeral port, so the suite is
 //! self-contained: it needs no manual setup, no fixture files, and no
@@ -14,7 +15,8 @@ use std::{error::Error, io};
 
 use rutilus_domain::{
     CAPABILITY_LEDGER_ORDER, CapabilityState, CredentialUsername, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, ResourceFeature, TlsTrust,
+    EndpointCapability, EndpointCapabilityObservation, OEM_CAPABILITY_LEDGER_ORDER,
+    ResourceFeature, TlsTrust,
 };
 use rutilus_infra_redfish::{CoreResourceProjection, RedfishGateway, SystemCaStatus};
 use rutilus_test_support::{MockBmc, RequestRecord};
@@ -137,8 +139,8 @@ async fn service_root_read_establishes_pinned_trust_and_reads_summary() -> Resul
 }
 
 #[tokio::test]
-async fn probes_all_thirty_capabilities_with_core_surface_supported() -> Result<(), Box<dyn Error>>
-{
+async fn probes_all_forty_four_capabilities_with_core_surface_supported()
+-> Result<(), Box<dyn Error>> {
     let mock = MockBmc::start().await?;
     let gateway = RedfishGateway::from_system_roots().await?;
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
@@ -167,6 +169,17 @@ async fn probes_all_thirty_capabilities_with_core_surface_supported() -> Result<
             discovery.capabilities(),
             capability,
             CapabilityState::Supported,
+        )?;
+    }
+    // The mock serves no vendor `Oem` namespace and no LiteOn chassis, so the
+    // probe must report every compiled OEM capability `NotAdvertised`: the
+    // §11.3 advertised layer is decided by the decoded documents, never
+    // guessed from the vendor name.
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::NotAdvertised,
         )?;
     }
     assert_eq!(

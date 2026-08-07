@@ -3,7 +3,7 @@
 Deterministic test support for the Rutilus product (design section 8
 `test-support`: Mock、Fixture、故障注入): a runnable **HTTPS Mock Redfish
 BMC** on loopback, serving a fixed resource tree that the product's
-trust-first onboarding, 30-capability probe, and typed core resource read
+trust-first onboarding, 44-capability probe, and typed core resource read
 can exercise without a real BMC.
 
 The crate is split into:
@@ -67,8 +67,8 @@ cargo run -p rutilus -- run          # unlocks and opens the Web console
    inventory under the UpdateService; the EventService with its webhook
    subscription, the TelemetryService with its power-consumption metric
    definition and power report, and the TaskService with its running
-   firmware-update task); the capability page shows the 30-capability probe
-   result:
+   firmware-update task); the capability page shows the 44-capability probe
+   result (30 standard §2.1 features followed by the 14 OEM features):
    SessionService/Systems/Chassis/Managers/Processors/Memory/Accounts/Bios/
    BootOptions/SecureBoot/Power/Thermal/Sensors/Controls/HostInterfaces/
    LogServices/ManagerNetworkProtocol/PcieDevices/Assembly/UpdateService/
@@ -177,7 +177,7 @@ let summary = gateway
 ```
 
 See `tests/gateway_mock_bmc.rs` and `src/mock_bmc/tests.rs` for the complete
-flow: Service Root read, 30-capability probe, typed core resource read,
+flow: Service Root read, 44-capability probe, typed core resource read,
 Session lifecycle with exact wire-sequence assertions, and refresh.
 
 ### Public API
