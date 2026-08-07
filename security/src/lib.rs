@@ -20,8 +20,11 @@ pub use bootstrap_code::{
     BOOTSTRAP_CODE_CHARACTERS, BootstrapCodeError, generate_bootstrap_code, hash_bootstrap_code,
 };
 pub use master_key::{
-    MASTER_KEY_ENVELOPE_LENGTH, MasterKey, MasterKeyProtectionError, ProtectedMasterKey,
-    protect_master_key, recover_master_key,
+    MASTER_KEY_ENVELOPE_LENGTH, MAX_SYSTEM_KEY_PAYLOAD_LENGTH, MasterKey, MasterKeyProtectionError,
+    ProtectedMasterKey, RewrapError, RewrappedMasterKey, SYSTEM_KEY_ENVELOPE_MAGIC,
+    SystemKeyProtector, SystemMasterKeyEnvelopeError, SystemMasterKeyError,
+    SystemProtectedMasterKey, UnlockSource, protect_master_key, protect_master_key_system,
+    recover_master_key, recover_master_key_system, rewrap_master_key,
 };
 pub use password_hash::{PasswordHashError, hash_password, verify_password};
 pub use session_token::{CsrfToken, SessionToken, SessionTokenError, TOKEN_LENGTH};

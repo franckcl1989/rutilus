@@ -20,6 +20,55 @@ const CIPHERTEXT_OFFSET: usize = NONCE_OFFSET + NONCE_LENGTH;
 /// Exact byte length of the version-one passphrase-protected master-key envelope.
 pub const MASTER_KEY_ENVELOPE_LENGTH: usize = CIPHERTEXT_OFFSET + ENCRYPTED_MASTER_KEY_LENGTH;
 
+/// Version marker of the system-protected master-key envelope.
+pub const SYSTEM_KEY_ENVELOPE_MAGIC: [u8; 9] = *b"RUTOSK001";
+/// Defensive upper bound for one OS-protected payload: DPAPI blobs are small,
+/// and every read of the persisted envelope must stay bounded.
+pub const MAX_SYSTEM_KEY_PAYLOAD_LENGTH: usize = 64 * 1024;
+const SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH: usize = SYSTEM_KEY_ENVELOPE_MAGIC.len();
+
+/// Where the master key's protection secret comes from.
+///
+/// [`Passphrase`](Self::Passphrase) protects the key with a key derived from
+/// an operator-entered local unlock passphrase; [`System`](Self::System)
+/// delegates protection to the operating system's secret store (DPAPI,
+/// Keychain, or a private key file).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnlockSource {
+    Passphrase,
+    System,
+}
+
+/// The operating-system secret-store seam the master-key envelope needs.
+///
+/// Implemented by the platform crate (`SystemSecretStore`); the security
+/// crate only consumes the protected byte payloads, so the seam stays
+/// platform-free and the OS store can change without touching the envelope.
+///
+/// The trait is deliberately generic (`P: SystemKeyProtector`) rather than
+/// trait-object based, so the auto-trait bounds of the returned futures are
+/// inferred from the concrete protector at each call site.
+#[allow(async_fn_in_trait)]
+pub trait SystemKeyProtector {
+    /// A secret-safe failure of the operating system's store.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Protects `plaintext` inside the operating system's store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the store cannot protect the bytes.
+    async fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, Self::Error>;
+
+    /// Recovers the original bytes of a protected payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the store cannot recover the payload; no
+    /// plaintext is released on failure.
+    async fn unprotect(&self, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
+}
+
 /// A process-local master key used to protect persisted credentials.
 pub struct MasterKey(SecretBox<[u8; MASTER_KEY_LENGTH]>);
 
@@ -180,6 +229,169 @@ pub fn recover_master_key(
     Ok(MasterKey::from_boxed_bytes(master_key))
 }
 
+/// A validated envelope that is safe to persist outside the database.
+///
+/// The version-one system envelope is the `RUTOSK001` marker followed by the
+/// operating-system-protected payload. The payload's protection belongs to the
+/// platform's [`SystemKeyProtector`]; the envelope itself only frames and
+/// version-marks the persisted bytes.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SystemProtectedMasterKey(Vec<u8>);
+
+impl SystemProtectedMasterKey {
+    /// Validates and copies a persisted envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SystemMasterKeyEnvelopeError::EnvelopeTooShort`] for a
+    /// truncated value, [`SystemMasterKeyEnvelopeError::UnsupportedEnvelope`]
+    /// for an unknown format or version, and
+    /// [`SystemMasterKeyEnvelopeError::EnvelopeTooLong`] for an oversized
+    /// payload.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SystemMasterKeyEnvelopeError> {
+        if bytes.len() < SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH {
+            return Err(SystemMasterKeyEnvelopeError::EnvelopeTooShort);
+        }
+        if !bytes.starts_with(&SYSTEM_KEY_ENVELOPE_MAGIC) {
+            return Err(SystemMasterKeyEnvelopeError::UnsupportedEnvelope);
+        }
+        let payload_length = bytes.len() - SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH;
+        if payload_length > MAX_SYSTEM_KEY_PAYLOAD_LENGTH {
+            return Err(SystemMasterKeyEnvelopeError::EnvelopeTooLong);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the complete envelope for durable storage.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes this value into its persisted bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl fmt::Debug for SystemProtectedMasterKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemProtectedMasterKey([REDACTED])")
+    }
+}
+
+/// Protects a generated master key inside the operating system's secret store.
+///
+/// The OS-protected payload is framed with the `RUTOSK001` marker; the framed
+/// envelope is what the operator persists. The plaintext key never leaves this
+/// function's stack.
+///
+/// # Errors
+///
+/// Returns [`SystemMasterKeyError::Protect`] when the OS store rejects the
+/// plaintext, or [`SystemMasterKeyError::Envelope`] when framing fails.
+pub async fn protect_master_key_system<P: SystemKeyProtector>(
+    master_key: &MasterKey,
+    protector: &P,
+) -> Result<SystemProtectedMasterKey, SystemMasterKeyError<P::Error>> {
+    let payload = protector
+        .protect(master_key.expose())
+        .await
+        .map_err(SystemMasterKeyError::Protect)?;
+    let mut envelope = Vec::with_capacity(SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH + payload.len());
+    envelope.extend_from_slice(&SYSTEM_KEY_ENVELOPE_MAGIC);
+    envelope.extend_from_slice(&payload);
+    SystemProtectedMasterKey::from_bytes(envelope).map_err(SystemMasterKeyError::Envelope)
+}
+
+/// Authenticates and recovers a process-local master key from a
+/// system-protected envelope.
+///
+/// # Errors
+///
+/// Returns [`SystemMasterKeyError::Unprotect`] when the OS store rejects the
+/// payload, [`SystemMasterKeyError::Envelope`] for an invalid envelope, or
+/// [`SystemMasterKeyError::InvalidKeyLength`] when the recovered bytes are not
+/// a master key. No key bytes are released on failure.
+pub async fn recover_master_key_system<P: SystemKeyProtector>(
+    protected: &SystemProtectedMasterKey,
+    protector: &P,
+) -> Result<MasterKey, SystemMasterKeyError<P::Error>> {
+    let payload = Zeroizing::new(
+        protector
+            .unprotect(&protected.0[SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH..])
+            .await
+            .map_err(SystemMasterKeyError::Unprotect)?,
+    );
+    if payload.len() != MASTER_KEY_LENGTH {
+        return Err(SystemMasterKeyError::InvalidKeyLength);
+    }
+    let mut master_key = Box::new([0_u8; MASTER_KEY_LENGTH]);
+    master_key.copy_from_slice(&payload);
+    Ok(MasterKey::from_boxed_bytes(master_key))
+}
+
+/// The outcome of re-protecting one recovered master key.
+#[derive(Clone, Eq, PartialEq)]
+pub enum RewrappedMasterKey {
+    /// The key is protected by a derived passphrase key.
+    Passphrase(ProtectedMasterKey),
+    /// The key is protected inside the operating system's secret store.
+    System(SystemProtectedMasterKey),
+}
+
+impl fmt::Debug for RewrappedMasterKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Passphrase(_) => {
+                formatter.write_str("RewrappedMasterKey::Passphrase([REDACTED])")
+            }
+            Self::System(_) => formatter.write_str("RewrappedMasterKey::System([REDACTED])"),
+        }
+    }
+}
+
+/// Recovers a passphrase-protected master key and re-protects it under
+/// [`UnlockSource`] `target`.
+///
+/// The source is always the passphrase envelope — the one protection that an
+/// operator can recover interactively. The target's credentials are
+/// validated: [`UnlockSource::Passphrase`] requires `target_passphrase` and
+/// [`UnlockSource::System`] requires `target_protector`; an extra credential
+/// for the other target is ignored.
+///
+/// # Errors
+///
+/// Returns [`RewrapError`] when the source passphrase is wrong, a target
+/// credential is missing, or either protection step fails. No key bytes are
+/// released on failure.
+pub async fn rewrap_master_key<P: SystemKeyProtector>(
+    protected: &ProtectedMasterKey,
+    passphrase: &SecretString,
+    target: UnlockSource,
+    target_passphrase: Option<&SecretString>,
+    target_protector: Option<&P>,
+) -> Result<RewrappedMasterKey, RewrapError<P::Error>> {
+    let master_key = recover_master_key(protected, passphrase).map_err(RewrapError::Recover)?;
+    match target {
+        UnlockSource::Passphrase => {
+            let target_passphrase =
+                target_passphrase.ok_or(RewrapError::MissingTargetPassphrase)?;
+            let protected =
+                protect_master_key(&master_key, target_passphrase).map_err(RewrapError::Protect)?;
+            Ok(RewrappedMasterKey::Passphrase(protected))
+        }
+        UnlockSource::System => {
+            let target_protector = target_protector.ok_or(RewrapError::MissingTargetProtector)?;
+            let protected = protect_master_key_system(&master_key, target_protector)
+                .await
+                .map_err(RewrapError::SystemProtect)?;
+            Ok(RewrappedMasterKey::System(protected))
+        }
+    }
+}
+
 fn ensure_passphrase(passphrase: &SecretString) -> Result<(), MasterKeyProtectionError> {
     if passphrase.expose_secret().is_empty() {
         return Err(MasterKeyProtectionError::EmptyPassphrase);
@@ -275,6 +487,115 @@ impl Error for MasterKeyProtectionError {
     }
 }
 
+/// A validated-envelope failure of the system-protected master-key format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemMasterKeyEnvelopeError {
+    EnvelopeTooShort,
+    UnsupportedEnvelope,
+    EnvelopeTooLong,
+}
+
+impl fmt::Display for SystemMasterKeyEnvelopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EnvelopeTooShort => {
+                formatter.write_str("system-protected master-key envelope is too short")
+            }
+            Self::UnsupportedEnvelope => formatter
+                .write_str("system-protected master-key envelope format or version is unsupported"),
+            Self::EnvelopeTooLong => formatter
+                .write_str("system-protected master-key envelope payload exceeds the bound"),
+        }
+    }
+}
+
+impl Error for SystemMasterKeyEnvelopeError {}
+
+/// A controlled failure while protecting or recovering a master key through
+/// the operating system's secret store.
+#[derive(Debug)]
+pub enum SystemMasterKeyError<E: Error + Send + Sync + 'static> {
+    Protect(E),
+    Unprotect(E),
+    InvalidKeyLength,
+    Envelope(SystemMasterKeyEnvelopeError),
+}
+
+impl<E: Error + Send + Sync + 'static> fmt::Display for SystemMasterKeyError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protect(_) => {
+                formatter.write_str("operating system rejected the master-key protection")
+            }
+            Self::Unprotect(_) => {
+                formatter.write_str("operating system rejected the master-key recovery")
+            }
+            Self::InvalidKeyLength => {
+                formatter.write_str("operating system recovered an invalid master-key length")
+            }
+            Self::Envelope(error) => {
+                write!(
+                    formatter,
+                    "invalid system-protected master-key envelope: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl<E: Error + Send + Sync + 'static> Error for SystemMasterKeyError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Protect(source) | Self::Unprotect(source) => Some(source),
+            Self::Envelope(source) => Some(source),
+            Self::InvalidKeyLength => None,
+        }
+    }
+}
+
+/// A controlled failure while re-protecting one master key under a new
+/// unlock source.
+#[derive(Debug)]
+pub enum RewrapError<E: Error + Send + Sync + 'static> {
+    Recover(MasterKeyProtectionError),
+    Protect(MasterKeyProtectionError),
+    SystemProtect(SystemMasterKeyError<E>),
+    MissingTargetPassphrase,
+    MissingTargetProtector,
+}
+
+impl<E: Error + Send + Sync + 'static> fmt::Display for RewrapError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recover(_) => {
+                formatter.write_str("failed to authenticate the master key during re-wrapping")
+            }
+            Self::Protect(_) => {
+                formatter.write_str("failed to protect the master key under the new unlock source")
+            }
+            Self::SystemProtect(_) => {
+                formatter.write_str("operating system rejected the master key during re-wrapping")
+            }
+            Self::MissingTargetPassphrase => {
+                formatter.write_str("re-wrapping to the Passphrase source requires a passphrase")
+            }
+            Self::MissingTargetProtector => formatter.write_str(
+                "re-wrapping to the System source requires an operating-system protector",
+            ),
+        }
+    }
+}
+
+impl<E: Error + Send + Sync + 'static> Error for RewrapError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Recover(source) | Self::Protect(source) => Some(source),
+            Self::SystemProtect(source) => Some(source),
+            Self::MissingTargetPassphrase | Self::MissingTargetProtector => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rutilus_domain::{CredentialId, CredentialVersionId};
@@ -358,5 +679,218 @@ mod tests {
             ProtectedMasterKey::from_bytes(&[0_u8; MASTER_KEY_ENVELOPE_LENGTH]),
             Err(MasterKeyProtectionError::UnsupportedEnvelope)
         );
+    }
+
+    /// A deterministic in-memory stand-in for the platform's OS store: the
+    /// payload is complemented bitwise, so protect and unprotect are both
+    /// invertible and neither fails.
+    #[derive(Clone, Copy, Debug)]
+    struct ComplementProtector;
+
+    impl SystemKeyProtector for ComplementProtector {
+        type Error = std::convert::Infallible;
+
+        async fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Ok(plaintext.iter().map(|byte| !byte).collect())
+        }
+
+        async fn unprotect(&self, payload: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Ok(payload.iter().map(|byte| !byte).collect())
+        }
+    }
+
+    /// A protector that always refuses, exercising the store-failure paths.
+    #[derive(Clone, Copy, Debug)]
+    struct RefusingProtector;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RefusingError;
+
+    impl fmt::Display for RefusingError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("test protector refused the operation")
+        }
+    }
+
+    impl Error for RefusingError {}
+
+    impl SystemKeyProtector for RefusingProtector {
+        type Error = RefusingError;
+
+        async fn protect(&self, _plaintext: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Err(RefusingError)
+        }
+
+        async fn unprotect(&self, _payload: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Err(RefusingError)
+        }
+    }
+
+    #[tokio::test]
+    async fn system_envelope_round_trips_with_the_os_store() -> Result<(), Box<dyn Error>> {
+        let master_key = MasterKey::from_boxed_bytes(Box::new([0x76; MASTER_KEY_LENGTH]));
+        let protector = ComplementProtector;
+
+        let protected = protect_master_key_system(&master_key, &protector).await?;
+        let persisted = protected.clone().into_bytes();
+        assert!(persisted.starts_with(&SYSTEM_KEY_ENVELOPE_MAGIC));
+        assert!(
+            !persisted
+                .windows(MASTER_KEY_LENGTH)
+                .any(|window| window == [0x76; MASTER_KEY_LENGTH])
+        );
+        let parsed = SystemProtectedMasterKey::from_bytes(persisted)?;
+        let recovered = recover_master_key_system(&parsed, &protector).await?;
+        let credential_id = CredentialId::generate();
+        let version_id = CredentialVersionId::generate();
+        let secret: SecretString = String::from("system-protected secret").into();
+        let encrypted = encrypt_credential(&recovered, credential_id, version_id, &secret)?;
+        let decrypted = decrypt_credential(&master_key, &encrypted)?;
+
+        assert_eq!(decrypted.expose_secret(), secret.expose_secret());
+        assert_eq!(
+            format!("{protected:?}"),
+            "SystemProtectedMasterKey([REDACTED])"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn system_envelope_validation_bounds_framing_and_payload() {
+        assert_eq!(
+            SystemProtectedMasterKey::from_bytes(b"short".to_vec()),
+            Err(SystemMasterKeyEnvelopeError::EnvelopeTooShort)
+        );
+        let wrong_magic = {
+            let mut bytes = vec![0_u8; SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH + 32];
+            bytes[0] = b'X';
+            bytes
+        };
+        assert_eq!(
+            SystemProtectedMasterKey::from_bytes(wrong_magic),
+            Err(SystemMasterKeyEnvelopeError::UnsupportedEnvelope)
+        );
+        let oversized = {
+            let mut bytes =
+                vec![0_u8; SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH + MAX_SYSTEM_KEY_PAYLOAD_LENGTH + 1];
+            bytes[..SYSTEM_KEY_ENVELOPE_MAGIC_LENGTH].copy_from_slice(&SYSTEM_KEY_ENVELOPE_MAGIC);
+            bytes
+        };
+        assert_eq!(
+            SystemProtectedMasterKey::from_bytes(oversized),
+            Err(SystemMasterKeyEnvelopeError::EnvelopeTooLong)
+        );
+    }
+
+    #[tokio::test]
+    async fn system_store_failures_release_no_master_key() -> Result<(), Box<dyn Error>> {
+        let master_key = MasterKey::from_boxed_bytes(Box::new([0x77; MASTER_KEY_LENGTH]));
+
+        assert!(matches!(
+            protect_master_key_system(&master_key, &RefusingProtector).await,
+            Err(SystemMasterKeyError::Protect(RefusingError))
+        ));
+        let protected = protect_master_key_system(&master_key, &ComplementProtector).await?;
+        assert!(matches!(
+            recover_master_key_system(&protected, &RefusingProtector).await,
+            Err(SystemMasterKeyError::Unprotect(RefusingError))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrap_moves_a_passphrase_key_to_either_source() -> Result<(), Box<dyn Error>> {
+        let master_key = MasterKey::from_boxed_bytes(Box::new([0x78; MASTER_KEY_LENGTH]));
+        let passphrase: SecretString = String::from("original local unlock phrase").into();
+        let protected = protect_master_key(&master_key, &passphrase)?;
+
+        // Passphrase -> System.
+        let rewrapped = rewrap_master_key(
+            &protected,
+            &passphrase,
+            UnlockSource::System,
+            None,
+            Some(&ComplementProtector),
+        )
+        .await?;
+        let RewrappedMasterKey::System(system) = rewrapped else {
+            return Err("expected a system-protected master key".into());
+        };
+        let recovered = recover_master_key_system(&system, &ComplementProtector).await?;
+        let credential_id = CredentialId::generate();
+        let version_id = CredentialVersionId::generate();
+        let secret: SecretString = String::from("rewrapped secret").into();
+        let encrypted = encrypt_credential(&recovered, credential_id, version_id, &secret)?;
+        assert_eq!(
+            decrypt_credential(&master_key, &encrypted)?.expose_secret(),
+            secret.expose_secret()
+        );
+
+        // Passphrase -> Passphrase with a fresh passphrase.
+        let new_passphrase: SecretString = String::from("replacement local unlock phrase").into();
+        let rewrapped = rewrap_master_key(
+            &protected,
+            &passphrase,
+            UnlockSource::Passphrase,
+            Some(&new_passphrase),
+            Some(&ComplementProtector),
+        )
+        .await?;
+        let RewrappedMasterKey::Passphrase(new_envelope) = rewrapped else {
+            return Err("expected a passphrase-protected master key".into());
+        };
+        let recovered = recover_master_key(&new_envelope, &new_passphrase)?;
+        let encrypted = encrypt_credential(&recovered, credential_id, version_id, &secret)?;
+        assert_eq!(
+            decrypt_credential(&master_key, &encrypted)?.expose_secret(),
+            secret.expose_secret()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rewrap_validates_target_credentials_and_source_passphrase()
+    -> Result<(), Box<dyn Error>> {
+        let master_key = MasterKey::from_boxed_bytes(Box::new([0x79; MASTER_KEY_LENGTH]));
+        let passphrase: SecretString = String::from("correct rewrap unlock phrase").into();
+        let wrong: SecretString = String::from("incorrect rewrap unlock phrase").into();
+        let protected = protect_master_key(&master_key, &passphrase)?;
+
+        assert!(matches!(
+            rewrap_master_key::<ComplementProtector>(
+                &protected,
+                &passphrase,
+                UnlockSource::System,
+                None,
+                None,
+            )
+            .await,
+            Err(RewrapError::MissingTargetProtector)
+        ));
+        assert!(matches!(
+            rewrap_master_key::<ComplementProtector>(
+                &protected,
+                &passphrase,
+                UnlockSource::Passphrase,
+                None,
+                None,
+            )
+            .await,
+            Err(RewrapError::MissingTargetPassphrase)
+        ));
+        assert!(matches!(
+            rewrap_master_key(
+                &protected,
+                &wrong,
+                UnlockSource::System,
+                None,
+                Some(&ComplementProtector),
+            )
+            .await,
+            Err(RewrapError::Recover(
+                MasterKeyProtectionError::AuthenticationFailed
+            ))
+        ));
+        Ok(())
     }
 }
