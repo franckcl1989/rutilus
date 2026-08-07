@@ -1568,10 +1568,11 @@ mod tests {
         BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
         ChassisCommand, CreateSubscription, CredentialId, DeleteSubscription, Endpoint,
         EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        EventCommand, EventDestinationProtocol, EventType, ManagerCommand, OperationSource,
-        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, SecureBootCommand,
-        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
-        TlsTrust, UpdateCommand,
+        EventCommand, EventDestinationProtocol, EventType, ManagerCommand,
+        NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+        OperationSource, OperationTarget, ResetKeysType, ResetType, ResourceSnapshot,
+        SecureBootCommand, SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId,
+        TlsCertificate, TlsTrust, UpdateCommand,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
@@ -4241,13 +4242,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_audit_operations_pin_the_ten_write_families() -> Result<(), Box<dyn Error>> {
+    async fn command_audit_operations_pin_the_thirteen_write_families()
+    -> Result<(), Box<dyn Error>> {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
-        // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another) fails
-        // here instead of reaching the audit log.
-        let pairs: [(&RedfishCommand, AuditRedfishOperation); 10] = [
+        // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another, one OEM
+        // face ↔ another) fails here instead of reaching the audit log. The
+        // three OEM faces are pinned separately because their accountability
+        // differs (§11.5).
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 13] = [
             (
                 &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
                 AuditRedfishOperation::ResetSystem,
@@ -4307,6 +4311,24 @@ mod tests {
                 ))),
                 AuditRedfishOperation::UpdateFirmware,
             ),
+            (
+                &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+                AuditRedfishOperation::OemSystemConfigProfile,
+            ),
+            (
+                &RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::DisableToken,
+                )),
+                AuditRedfishOperation::OemDebugToken,
+            ),
+            (
+                &RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+                )),
+                AuditRedfishOperation::OemPowerSmoothing,
+            ),
         ];
         for (command, expected) in pairs {
             assert_eq!(
@@ -4328,6 +4350,90 @@ mod tests {
             required_capability(&command),
             EndpointCapability::UpdateService
         );
+    }
+
+    #[test]
+    fn oem_commands_require_their_own_capability() {
+        // Each OEM face requires the §2.1 sub-capability of its chain: the
+        // profile service, the debug-token surfaces, and the power-smoothing
+        // resource each probe `Supported` whenever the endpoint advertises
+        // the `Nvidia` namespace (§11.3 advertised layer).
+        for (command, expected) in [
+            (
+                RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+                EndpointCapability::OemNvidiaProfiles,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::DisableToken,
+                )),
+                EndpointCapability::OemNvidiaSecurity,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+                )),
+                EndpointCapability::OemNvidiaPowerManagement,
+            ),
+        ] {
+            assert_eq!(
+                required_capability(&command),
+                expected,
+                "each OEM face must require its own capability"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_token_requires_the_oem_nvidia_security_capability()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        // The endpoint's ledger observes only the profile-service
+        // sub-capability: the `OemNvidiaSecurity` capability the debug-token
+        // write requires has no observation, so it cannot confirm the write
+        // and the execution is refused before any dispatch.
+        let store = FakeStore::new(
+            Some(endpoint(endpoint_id)?),
+            vec![StoredCapability::new(
+                EndpointCapabilityObservation::new(
+                    EndpointCapability::OemNvidiaProfiles,
+                    CapabilityState::Supported,
+                ),
+                created_at(),
+            )],
+        );
+        let operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::Oem(OemCommand::DebugToken(
+                NvidiaDebugTokenCommand::DisableToken,
+            )),
+            created_at(),
+        );
+        store.insert(operation.clone())?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let finished = executor.execute_operation(operation.id()).await?;
+
+        assert_eq!(finished.state(), OperationState::Failed);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Failed]
+        );
+        assert_eq!(gateway.recorded_calls()?.len(), 0);
+        assert_eq!(
+            audit.recorded_events()?[1].outcome().verification(),
+            Some(AuditVerification::Rejected)
+        );
+        Ok(())
     }
 
     #[tokio::test]
