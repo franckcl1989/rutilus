@@ -423,9 +423,8 @@ mod tests {
         );
         assert!(
             result
-                .unwrap_err()
-                .to_string()
-                .contains("delete the seeded rows"),
+                .err()
+                .is_some_and(|error| error.to_string().contains("delete the seeded rows")),
             "the error must point at the manual repair"
         );
         store.close().await?;
