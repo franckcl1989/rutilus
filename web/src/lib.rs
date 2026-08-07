@@ -19,38 +19,40 @@ use rutilus_api::{
     ArtifactListResponse, ArtifactProgressResponse, ArtifactResponse, ArtifactStateResponse,
     AssignTagRequest, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
     AuditTargetResponse, BatchDetailResponse, BatchListResponse, BatchOperationResponse,
-    BatchOperationStateResponse, BatchOutcomeCountsResponse, BatchSummaryResponse,
-    BeginEndpointTrustRequest, CapabilityClassificationResponse, CapabilityEntryResponse,
-    CapabilityStateResponse, ConfirmEndpointTrustRequest, CoreResourceCommonResponse,
-    CoreResourceCountsResponse, CoreResourceDetailsResponse, CoreResourceResponse,
-    CoreResourceSourceResponse, CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest,
-    CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
-    EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
-    EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse,
-    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
-    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, EventListResponse,
-    EventResponse, GroupListResponse, GroupResponse, HealthResponse, MetricValueResponse,
-    OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse, OperationResponse,
-    OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
-    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
-    TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
-    UiLocationResponse,
+    BatchOperationStateResponse, BatchOutcomeCountsResponse, BatchRefreshResponse,
+    BatchSummaryResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
+    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
+    CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
+    CoreResourceResponse, CoreResourceSourceResponse, CreateArtifactRequest,
+    CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
+    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
+    EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
+    EndpointInventoryResponse, EndpointRefreshResultResponse, EndpointRefreshStatusResponse,
+    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
+    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
+    ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
+    HealthResponse, MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse,
+    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    OperationTargetResponse, RefreshEndpointsRequest, ResourceDiagnosticsResponse,
+    ResourceStatusResponse, TagListResponse, TagResponse, TelemetrySampleListResponse,
+    TelemetrySampleResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
+    TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
-    ArtifactStoreError, AuditEventWriter, AuditedOnboardEndpointError, BatchDetail, BatchQuery,
-    BatchSummary, BoundaryFuture, CapabilityLedgerEntry, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, Clock, CoreResourceDetails, CoreResourceReader,
-    CoreResourceSummary, CredentialCreation, CredentialCreationError, CredentialCreationRepository,
-    CredentialInventoryQuery, CredentialInventoryQueryError, CredentialInventoryRepository,
-    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
-    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointCsvImportExecutor,
-    EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment,
-    EndpointEnrollmentError, EndpointInventoryItem, EndpointInventoryQuery,
-    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointRefreshRepository,
+    ArtifactStoreError, AuditEventWriter, AuditedOnboardEndpointError, BatchDetail,
+    BatchEndpointRefresh, BatchEndpointRefreshError, BatchQuery, BatchSummary, BoundaryFuture,
+    CapabilityLedgerEntry, CapabilityQueryRepository, CapabilitySnapshotRepository, Clock,
+    CoreResourceDetails, CoreResourceReader, CoreResourceSummary, CredentialCreation,
+    CredentialCreationError, CredentialCreationRepository, CredentialInventoryQuery,
+    CredentialInventoryQueryError, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointCapabilityQuery,
+    EndpointCapabilityQueryError, EndpointCsvImportExecutor, EndpointCsvImportReport,
+    EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError,
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
+    EndpointInventoryRepository, EndpointRefreshOutcome, EndpointRefreshRepository,
     EndpointResourceInventory, EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
     EndpointTrustExpectationError, EnrolledEndpoint, EventRepository, GroupManagement,
@@ -370,6 +372,10 @@ where
         .route(
             "/api/v1/endpoints/import",
             post(import_endpoints_csv::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/endpoints/refresh",
+            post(refresh_endpoints::<Services, Gateway, Time>),
         )
         .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
         .route(
@@ -941,6 +947,140 @@ where
             no_store(&mut response);
             response
         }
+    }
+}
+
+/// Refreshes several managed endpoints in one bounded, concurrently executed
+/// batch, retaining every independent per-endpoint result.
+///
+/// The batch never flows through the §13 operation state machine: a refresh
+/// is a read, and every endpoint commits one new resource Generation under
+/// its own start/terminal audit (the same audit lifecycle a single refresh
+/// records). Per-endpoint failures are part of the 200 report, exactly like
+/// the CSV import row outcomes — the endpoint list errors (empty, duplicate,
+/// oversized, unknown endpoint, or a failed pre-check) are the only non-200
+/// verdicts.
+async fn refresh_endpoints<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
+    Json(request): Json<RefreshEndpointsRequest>,
+) -> Response
+where
+    Services: ProductServices,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader,
+    Time: Clock,
+{
+    let endpoint_ids = request
+        .endpoint_ids()
+        .iter()
+        .map(|endpoint_id| EndpointId::from_uuid(*endpoint_id))
+        .collect();
+    let batch = BatchEndpointRefresh::new(
+        state.services.as_ref(),
+        state.services.as_ref(),
+        state.gateway.as_ref(),
+        state.services.as_ref(),
+        &state.clock,
+        context.actor(),
+        context.actor_principal_id(),
+        state.origin,
+    );
+    match batch.execute(endpoint_ids).await {
+        Ok(outcomes) => json_ok(Json(project_refresh_report(&outcomes))),
+        Err(error) => refresh_error_response(&error),
+    }
+}
+
+/// Maps one batch-refresh rejection onto the HTTP contract.
+///
+/// The pre-check failure is the only boundary verdict reachable here — every
+/// other failure is a per-endpoint outcome inside the 200 report.
+fn refresh_error_response<RepositoryError>(
+    error: &BatchEndpointRefreshError<RepositoryError>,
+) -> Response
+where
+    RepositoryError: Error + 'static,
+{
+    match error {
+        BatchEndpointRefreshError::EmptyTargets => json_error(
+            StatusCode::BAD_REQUEST,
+            "a refresh batch must name at least one endpoint".to_owned(),
+        ),
+        BatchEndpointRefreshError::TooManyTargets { limit } => json_error(
+            StatusCode::BAD_REQUEST,
+            format!("a refresh batch may target at most {limit} endpoints"),
+        ),
+        BatchEndpointRefreshError::DuplicateEndpoint { endpoint_id } => json_error(
+            StatusCode::BAD_REQUEST,
+            format!("refresh batch targets endpoint {endpoint_id} more than once"),
+        ),
+        BatchEndpointRefreshError::UnknownEndpoint { endpoint_id } => json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("endpoint {endpoint_id} is not a managed endpoint"),
+        ),
+        BatchEndpointRefreshError::Precheck(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the refresh targets could not be checked".to_owned(),
+        ),
+    }
+}
+
+/// Projects one refresh batch's independent outcomes onto the wire report.
+///
+/// The counts are server-derived facts: `total` equals the submitted list
+/// length, `succeeded_count` counts only `refreshed` outcomes, and
+/// `failed_count` counts every other outcome (including `not_found`) — the
+/// handler never recomputes a batch-level number.
+fn project_refresh_report(outcomes: &[EndpointRefreshOutcome]) -> BatchRefreshResponse {
+    let total = outcomes.len();
+    let succeeded_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.is_success())
+        .count();
+    BatchRefreshResponse::new(
+        u64::try_from(total).unwrap_or(u64::MAX),
+        u64::try_from(succeeded_count).unwrap_or(u64::MAX),
+        u64::try_from(total.saturating_sub(succeeded_count)).unwrap_or(u64::MAX),
+        outcomes.iter().map(project_refresh_outcome).collect(),
+    )
+}
+
+/// Projects one endpoint's refresh outcome onto its wire row.
+///
+/// A `failed` row carries the classified reason's label in front of the
+/// failure source's own message, so the console renders the classification
+/// without parsing error text.
+fn project_refresh_outcome(outcome: &EndpointRefreshOutcome) -> EndpointRefreshResultResponse {
+    match outcome {
+        EndpointRefreshOutcome::Refreshed {
+            endpoint_id,
+            generation,
+            snapshot_count,
+        } => EndpointRefreshResultResponse::new(
+            endpoint_id.into_uuid(),
+            EndpointRefreshStatusResponse::Refreshed,
+            Some(generation.get()),
+            Some(u64::try_from(*snapshot_count).unwrap_or(u64::MAX)),
+            None,
+        ),
+        EndpointRefreshOutcome::Failed {
+            endpoint_id,
+            reason,
+            message,
+        } => EndpointRefreshResultResponse::new(
+            endpoint_id.into_uuid(),
+            EndpointRefreshStatusResponse::Failed,
+            None,
+            None,
+            Some(format!("{}: {message}", reason.label())),
+        ),
+        EndpointRefreshOutcome::NotFound { endpoint_id } => EndpointRefreshResultResponse::new(
+            endpoint_id.into_uuid(),
+            EndpointRefreshStatusResponse::NotFound,
+            None,
+            None,
+            None,
+        ),
     }
 }
 
@@ -4163,13 +4303,14 @@ mod tests {
     use http_body_util::BodyExt as _;
     use rutilus_application::{
         BoundaryFuture, CapabilitySnapshotRepository, ClassifiedBatchChild, EndpointDiscovery,
+        EndpointRefreshFailureKind, EndpointRefreshOutcome, MAX_REFRESH_TARGETS,
         ProtectedCredentialCreation, ResolvedCredential, ResourceDiagnostics, ResourceObservation,
         StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
         Argon2IdHash, BatchOperation, BatchOperationId, BootstrapCode, BootstrapCodeId,
         CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
-        EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
+        EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
         FailureKind, Operation, OperationId, OperationSource, OperationState, OperationTarget,
         PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState, RedfishCommand,
         RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId,
@@ -4220,6 +4361,46 @@ mod tests {
                 auth_state: AuthTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        )
+    }
+
+    /// Builds the router over a services bundle whose refresh pre-check
+    /// answers from a managed-endpoint list instead of failing — the
+    /// refresh-route validation tests' bench.
+    fn test_refresh_router(managed_endpoints: Vec<Endpoint>) -> Router {
+        router(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: Some(managed_endpoints),
+                refresh_working: false,
+                auth_state: AuthTestState::default(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        )
+    }
+
+    /// Builds the router over a services bundle and gateway whose refresh
+    /// boundaries all answer like a working product slice — the refresh
+    /// route's 200-report test bench.
+    fn test_working_refresh_router(managed_endpoints: Vec<Endpoint>) -> Router {
+        router(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: Some(managed_endpoints),
+                refresh_working: true,
+                auth_state: AuthTestState::default(),
+            }),
+            Arc::new(UnavailableGateway { working: true }),
             FixedClock,
         )
     }
@@ -5546,6 +5727,235 @@ mod tests {
         Ok(())
     }
 
+    /// The refresh route rejects an empty, duplicated, or oversized endpoint
+    /// list with 400 before any endpoint work can start.
+    #[tokio::test]
+    async fn refresh_route_rejects_empty_duplicate_and_oversized_batches()
+    -> Result<(), Box<dyn Error>> {
+        let router = test_router();
+        let endpoint_id = EndpointId::generate();
+
+        let empty = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": []
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(empty).await?["message"],
+            "a refresh batch must name at least one endpoint"
+        );
+
+        let duplicated = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": [endpoint_id.to_string(), endpoint_id.to_string()]
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(duplicated.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(duplicated).await?["message"],
+            format!("refresh batch targets endpoint {endpoint_id} more than once")
+        );
+
+        let ids = (0..=MAX_REFRESH_TARGETS)
+            .map(|_| EndpointId::generate().to_string())
+            .collect::<Vec<_>>();
+        let oversized = router
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": ids
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(oversized).await?["message"],
+            format!("a refresh batch may target at most {MAX_REFRESH_TARGETS} endpoints")
+        );
+        Ok(())
+    }
+
+    /// A body-referenced endpoint that is not managed is unprocessable,
+    /// exactly like the operation submission verdict.
+    #[tokio::test]
+    async fn refresh_route_rejects_unknown_endpoints_before_any_refresh()
+    -> Result<(), Box<dyn Error>> {
+        let router = test_refresh_router(Vec::new());
+        let endpoint_id = EndpointId::generate();
+
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": [endpoint_id.to_string()]
+                    }))?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            json_body(response).await?["message"],
+            format!("endpoint {endpoint_id} is not a managed endpoint")
+        );
+        Ok(())
+    }
+
+    /// An unavailable services bundle maps the failed pre-check to a 503 that
+    /// is never cached, exactly like the operation and batch routes.
+    #[tokio::test]
+    async fn refresh_route_reports_unavailable_precheck() -> Result<(), Box<dyn Error>> {
+        let router = test_router();
+        let endpoint_id = EndpointId::generate();
+
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": [endpoint_id.to_string()]
+                    }))?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        assert_eq!(
+            json_body(response).await?["message"],
+            "the refresh targets could not be checked"
+        );
+        Ok(())
+    }
+
+    /// A working gateway and services bundle turn one valid refresh batch
+    /// into the 200 report: the server-derived counts and one refreshed row
+    /// carrying the committed Generation and snapshot count, never cached.
+    #[tokio::test]
+    async fn refresh_route_returns_the_200_report_for_a_valid_batch() -> Result<(), Box<dyn Error>>
+    {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Refresh batch BMC")?,
+            EndpointAddress::parse("https://192.0.2.70")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![70])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let router = test_working_refresh_router(vec![endpoint.clone()]);
+
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/endpoints/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint_ids": [endpoint.id().to_string()]
+                    }))?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        let report = json_body(response).await?;
+        assert_eq!(report["total"], 1);
+        assert_eq!(report["succeeded_count"], 1);
+        assert_eq!(report["failed_count"], 0);
+        let results = report["results"]
+            .as_array()
+            .ok_or("results must be a list")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["endpoint_id"],
+            endpoint.id().into_uuid().to_string()
+        );
+        assert_eq!(results[0]["status"], "refreshed");
+        assert_eq!(results[0]["generation"], 1);
+        assert_eq!(results[0]["snapshot_count"], 2);
+        assert_eq!(results[0]["message"], Value::Null);
+        Ok(())
+    }
+
+    /// The 200 report carries the server-derived counts and one independent
+    /// row per endpoint: refreshed rows carry the committed Generation and
+    /// snapshot count, failed rows the classified message, and vanished
+    /// endpoints their own status.
+    #[test]
+    fn refresh_report_projection_carries_per_endpoint_results() -> Result<(), Box<dyn Error>> {
+        let first = EndpointId::generate();
+        let second = EndpointId::generate();
+        let missing = EndpointId::generate();
+        let generation = RefreshGeneration::new(9)?;
+        let outcomes = vec![
+            EndpointRefreshOutcome::Refreshed {
+                endpoint_id: first,
+                generation,
+                snapshot_count: 31,
+            },
+            EndpointRefreshOutcome::Failed {
+                endpoint_id: second,
+                reason: EndpointRefreshFailureKind::Read,
+                message: "connection refused".to_owned(),
+            },
+            EndpointRefreshOutcome::NotFound {
+                endpoint_id: missing,
+            },
+        ];
+
+        let report = project_refresh_report(&outcomes);
+
+        assert_eq!(report.total(), 3);
+        assert_eq!(report.succeeded_count(), 1);
+        assert_eq!(report.failed_count(), 2);
+        assert_eq!(report.results().len(), 3);
+        assert_eq!(report.results()[0].endpoint_id(), first.into_uuid());
+        assert_eq!(
+            report.results()[0].status(),
+            EndpointRefreshStatusResponse::Refreshed
+        );
+        assert_eq!(report.results()[0].generation(), Some(9));
+        assert_eq!(report.results()[0].snapshot_count(), Some(31));
+        assert_eq!(report.results()[0].message(), None);
+        assert_eq!(report.results()[1].endpoint_id(), second.into_uuid());
+        assert_eq!(
+            report.results()[1].status(),
+            EndpointRefreshStatusResponse::Failed
+        );
+        assert_eq!(report.results()[1].generation(), None);
+        assert_eq!(
+            report.results()[1].message(),
+            Some("resource read failed: connection refused")
+        );
+        assert_eq!(report.results()[2].endpoint_id(), missing.into_uuid());
+        assert_eq!(
+            report.results()[2].status(),
+            EndpointRefreshStatusResponse::NotFound
+        );
+        assert_eq!(report.results()[2].message(), None);
+        Ok(())
+    }
+
     async fn json_body(response: Response) -> Result<Value, Box<dyn Error>> {
         let bytes = response.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&bytes)?)
@@ -6662,7 +7072,16 @@ mod tests {
             &self,
             _credential_id: CredentialId,
         ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.refresh_working;
+            Box::pin(async move {
+                if !working {
+                    return Err(MockWriteError);
+                }
+                Ok(Some(ResolvedCredential::new(
+                    CredentialUsername::parse("administrator").map_err(|_| MockWriteError)?,
+                    String::from("secret").into(),
+                )))
+            })
         }
     }
 
@@ -6694,18 +7113,46 @@ mod tests {
 
         fn find_endpoint(
             &self,
-            _endpoint_id: EndpointId,
+            endpoint_id: EndpointId,
         ) -> BoundaryFuture<'_, Result<Option<Endpoint>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let managed = self.managed_endpoints.clone();
+            Box::pin(async move {
+                let Some(managed) = managed else {
+                    return Err(MockWriteError);
+                };
+                Ok(managed
+                    .into_iter()
+                    .find(|endpoint| endpoint.id() == endpoint_id))
+            })
         }
 
         fn commit_resource_generation<'a>(
             &'a self,
-            _endpoint_id: EndpointId,
-            _observations: &'a [ResourceObservation],
-            _observed_at: OffsetDateTime,
+            endpoint_id: EndpointId,
+            observations: &'a [ResourceObservation],
+            observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.refresh_working;
+            Box::pin(async move {
+                if !working {
+                    return Err(MockWriteError);
+                }
+                let generation = RefreshGeneration::new(1).map_err(|_| MockWriteError)?;
+                Ok(observations
+                    .iter()
+                    .map(|observation| {
+                        ResourceSnapshot::new(
+                            ResourceId::generate(),
+                            endpoint_id,
+                            observation.feature(),
+                            observation.odata_id().clone(),
+                            observation.payload().clone(),
+                            observed_at,
+                            generation,
+                        )
+                    })
+                    .collect())
+            })
         }
     }
 
@@ -6718,7 +7165,8 @@ mod tests {
             _observations: &'a [EndpointCapabilityObservation],
             _observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.refresh_working;
+            Box::pin(async move { if working { Ok(()) } else { Err(MockWriteError) } })
         }
     }
 
@@ -6729,7 +7177,8 @@ mod tests {
             &'a self,
             _event: &'a AuditEvent,
         ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.refresh_working;
+            Box::pin(async move { if working { Ok(()) } else { Err(MockWriteError) } })
         }
     }
 
@@ -7154,7 +7603,18 @@ mod tests {
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
         ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.working;
+            Box::pin(async move {
+                if !working {
+                    return Err(MockWriteError);
+                }
+                Ok(EndpointDiscovery::new(vec![
+                    EndpointCapabilityObservation::new(
+                        EndpointCapability::Systems,
+                        CapabilityState::Supported,
+                    ),
+                ]))
+            })
         }
     }
 
@@ -7168,7 +7628,27 @@ mod tests {
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let working = self.working;
+            Box::pin(async move {
+                if !working {
+                    return Err(MockWriteError);
+                }
+                Ok(vec![
+                    ResourceObservation::new(
+                        ResourceFeature::ServiceRoot,
+                        ResourceODataId::parse("/redfish/v1/").map_err(|_| MockWriteError)?,
+                        ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)
+                            .map_err(|_| MockWriteError)?,
+                    ),
+                    ResourceObservation::new(
+                        ResourceFeature::Systems,
+                        ResourceODataId::parse("/redfish/v1/Systems/1")
+                            .map_err(|_| MockWriteError)?,
+                        ResourceSnapshotPayload::parse(r#"{"Name":"System"}"#)
+                            .map_err(|_| MockWriteError)?,
+                    ),
+                ])
+            })
         }
     }
 
