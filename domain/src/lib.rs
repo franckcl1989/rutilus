@@ -45,8 +45,8 @@ pub use capability::{
     OEM_CAPABILITY_LEDGER_ORDER, UiLocation, UiLocationParseError,
 };
 pub use center::{
-    BINDING_CODE_CHARACTERS, BINDING_CODE_TTL, BindingCode, BindingCodeError,
-    BindingCodeParseError, BindingCodeVerificationError, CenterBinding, CenterBindingError,
+    BINDING_CODE_CHARACTERS, BINDING_CODE_TTL, BindingCode, BindingCodeParseError,
+    BindingCodeVerificationError, CODE_ALPHABET, CenterBinding, CenterBindingError,
     CenterBindingEvent, CenterBindingState, CenterBindingStateParseError, IdempotencyDecision,
     InboxEntry, InboxEntryState, InboxEntryStateParseError, InboxEvent, InstanceKind,
     InstanceKindParseError, InvalidCenterBindingTransition, InvalidInboxTransition,

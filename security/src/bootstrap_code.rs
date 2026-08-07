@@ -16,14 +16,11 @@
 
 use std::{error::Error, fmt};
 
+use rutilus_domain::CODE_ALPHABET;
 use sha2::{Digest, Sha256};
 
 /// Number of characters in every product bootstrap code.
 pub const BOOTSTRAP_CODE_CHARACTERS: usize = 20;
-
-/// The unambiguous base32 alphabet: the RFC 4648 alphabet with the four
-/// visually confusable characters (`0`, `O`, `1`, `I`) removed.
-const CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 /// Generates a fresh one-time bootstrap code.
 ///

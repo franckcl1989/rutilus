@@ -397,6 +397,7 @@ mod tests {
         BINDING_CODE_TTL, BindingCode, CenterBinding, CenterBindingId, InstanceId, InstanceKind,
         SiteInstance,
     };
+    use rutilus_security::generate_binding_code;
     use sea_orm::{ActiveModelTrait, Set};
     use time::Duration;
 
@@ -434,7 +435,7 @@ mod tests {
         let base = time::OffsetDateTime::now_utc();
         let site = site_instance(base);
         store.create_instance(&site).await?;
-        let code = BindingCode::generate()?;
+        let code = generate_binding_code()?;
         let binding = pending_binding(&site, &code, base);
 
         store.create_binding(&binding).await?;
@@ -454,7 +455,7 @@ mod tests {
         assert_eq!(by_site.id(), binding.id());
 
         // A second active binding for the same site is refused.
-        let second = pending_binding(&site, &BindingCode::generate()?, base);
+        let second = pending_binding(&site, &generate_binding_code()?, base);
         assert!(matches!(
             store.create_binding(&second).await,
             Err(CenterBindingRepositoryError::AlreadyActiveBinding { .. })
@@ -471,7 +472,7 @@ mod tests {
         store
             .create_binding(&pending_binding(
                 &other_site,
-                &BindingCode::generate()?,
+                &generate_binding_code()?,
                 base,
             ))
             .await?;
@@ -487,7 +488,7 @@ mod tests {
         let base = time::OffsetDateTime::now_utc();
         let site = site_instance(base);
         store.create_instance(&site).await?;
-        let code = BindingCode::generate()?;
+        let code = generate_binding_code()?;
         let binding = pending_binding(&site, &code, base);
         store.create_binding(&binding).await?;
 
@@ -532,7 +533,7 @@ mod tests {
             base,
         );
         store.create_instance(&other_site).await?;
-        let other_code = BindingCode::generate()?;
+        let other_code = generate_binding_code()?;
         let other_binding = pending_binding(&other_site, &other_code, base);
         store.create_binding(&other_binding).await?;
         let fingerprint = rutilus_domain::CertificateFingerprint::from_bytes([0x77; 32]);
@@ -561,14 +562,14 @@ mod tests {
         let base = time::OffsetDateTime::now_utc();
         let site = site_instance(base);
         store.create_instance(&site).await?;
-        let code = BindingCode::generate()?;
+        let code = generate_binding_code()?;
         let binding = pending_binding(&site, &code, base);
         store.create_binding(&binding).await?;
 
         // A wrong code is refused by hash comparison.
         assert!(matches!(
             store
-                .bind_with_code(binding.id(), &BindingCode::generate()?, None, base)
+                .bind_with_code(binding.id(), &generate_binding_code()?, None, base)
                 .await,
             Err(CenterBindingRepositoryError::CodeMismatch)
         ));
@@ -581,7 +582,7 @@ mod tests {
             base,
         );
         store.create_instance(&expired_site).await?;
-        let expired_code = BindingCode::generate()?;
+        let expired_code = generate_binding_code()?;
         let expired = CenterBinding::new_pending(
             CenterBindingId::generate(),
             String::from("https://center.example"),
@@ -625,7 +626,7 @@ mod tests {
         let base = time::OffsetDateTime::now_utc();
         let site = site_instance(base);
         store.create_instance(&site).await?;
-        let code = BindingCode::generate()?;
+        let code = generate_binding_code()?;
         let binding = pending_binding(&site, &code, base);
         store.create_binding(&binding).await?;
 
@@ -653,7 +654,7 @@ mod tests {
         ));
 
         // After the revocation the site can register again.
-        let rebind = pending_binding(&site, &BindingCode::generate()?, base + Duration::SECOND);
+        let rebind = pending_binding(&site, &generate_binding_code()?, base + Duration::SECOND);
         store.create_binding(&rebind).await?;
 
         store.close().await?;

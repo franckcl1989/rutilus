@@ -10,12 +10,14 @@ use rutilus_domain::{CredentialId, CredentialVersionId};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+mod binding_code;
 mod bootstrap_code;
 mod master_key;
 mod password_hash;
 mod session_token;
 mod totp;
 
+pub use binding_code::{BindingCodeError, generate_binding_code};
 pub use bootstrap_code::{
     BOOTSTRAP_CODE_CHARACTERS, BootstrapCodeError, generate_bootstrap_code, hash_bootstrap_code,
 };
