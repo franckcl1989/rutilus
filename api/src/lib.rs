@@ -8,9 +8,11 @@ use std::{fmt, num::NonZeroU64};
 // the domain's own surface exactly.
 pub use rutilus_domain::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
-    CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol, EventType,
-    ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
-    SetBootSourceOverride, StartUpdate, SystemCommand, UpdateCommand,
+    CreateSubscription, DeleteSubscription, EraseToken, EraseType, EventCommand,
+    EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
+    ProfileId, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand, SetBootSourceOverride,
+    StartUpdate, SystemCommand, TokenData, TokenType, UpdateCommand,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
