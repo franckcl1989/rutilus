@@ -1174,19 +1174,47 @@ where
             .await
             .map_err(CenterSyncError::Inventory)?;
         let mut changed = false;
-        for item in items {
+        for item in &items {
             let endpoint_id = item.endpoint().id();
             let generation = item.generation().map_or(0, RefreshGeneration::get);
             let reported = watermark.get(&endpoint_id).copied();
             if reported.is_none() || reported < Some(generation) {
                 changed = true;
-                self.enqueue_endpoint_snapshot(&item, generation).await?;
+                self.enqueue_endpoint_snapshot(item, generation).await?;
                 for resource in item.resources() {
-                    self.enqueue_resource_delta(&item, resource, generation)
+                    self.enqueue_resource_delta(item, resource, generation)
                         .await?;
                 }
                 watermark.insert(endpoint_id, generation);
             }
+        }
+        // §21 deletion convergence: an endpoint that was reported but is no
+        // longer in the inventory (a manual DB change, a partial restore, or
+        // a future deletion use case) must drop from the center projection.
+        // The site no longer has the deleted endpoint's resources, so the
+        // delete is endpoint-level — one `ResourceDelta` with `resource:
+        // None` — and the watermark forgets the endpoint, so a re-created
+        // endpoint reports a fresh upsert.
+        let deleted = watermark
+            .keys()
+            .filter(|endpoint_id| {
+                !items
+                    .iter()
+                    .any(|item| item.endpoint().id() == **endpoint_id)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for endpoint_id in deleted {
+            changed = true;
+            self.enqueue_outbox_entry(EnvelopeMessage::ResourceDelta(ResourceDelta {
+                endpoint_id: endpoint_id.to_string(),
+                op: ResourceDeltaOp::Delete as i32,
+                resource: None,
+                payload_json: Vec::new(),
+                observed_at_unix: self.clock.now().unix_timestamp(),
+            }))
+            .await?;
+            watermark.remove(&endpoint_id);
         }
         if changed {
             let now = self.clock.now();
@@ -4088,6 +4116,120 @@ mod tests {
                 message: Some(EnvelopeMessage::Ack(Ack { sequence: 3 })),
             })
             .map_err(|_| std::io::Error::other("the center feed closed"))?;
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        assert!(
+            stopped.is_ok(),
+            "the engine must stop cleanly, got {stopped:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_endpoint_is_reported_as_an_endpoint_level_delete_delta()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        // First report: the snapshot plus one upsert per resource.
+        engine.report_endpoint_projection().await?;
+        assert_eq!(outbox.pending_messages()?.len(), 3);
+
+        // The endpoint disappears from the inventory.
+        store
+            .inventory
+            .lock()
+            .map_err(|_| std::io::Error::other("the mock store lock was poisoned"))?
+            .clear();
+
+        // The next report emits one endpoint-level delete delta and forgets
+        // the endpoint in the watermark.
+        engine.report_endpoint_projection().await?;
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 4);
+        let Some(EnvelopeMessage::ResourceDelta(delta)) = messages.last() else {
+            return Err(std::io::Error::other("the delete was not a ResourceDelta").into());
+        };
+        assert_eq!(delta.endpoint_id, endpoint.id().to_string());
+        assert_eq!(delta.op, ResourceDeltaOp::Delete as i32);
+        assert_eq!(delta.resource, None);
+        assert!(delta.payload_json.is_empty());
+        let value = cursor
+            .cursor_value(instance_id, SyncStream::Endpoint)?
+            .ok_or_else(|| std::io::Error::other("the endpoint cursor is missing"))?;
+        assert_eq!(value, "", "the watermark must forget the deleted endpoint");
+
+        // A third report stays quiet: the deletion was already reported.
+        engine.report_endpoint_projection().await?;
+        assert_eq!(outbox.pending_messages()?.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_endpoint_reaches_the_center_as_a_delete_delta() -> Result<(), Box<dyn Error>>
+    {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let endpoint_id = EndpointId::generate();
+        let instance_id = InstanceId::generate();
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            let store = MockEngineStore::new();
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            // The watermark remembers the endpoint from before its deletion;
+            // the inventory no longer has it.
+            cursor
+                .set(&SyncCursor::new(
+                    SyncCursorId::generate(),
+                    instance_id,
+                    SyncStream::Endpoint,
+                    format!("{endpoint_id}:1"),
+                    now,
+                ))
+                .await?;
+            let outbox = MockOutbox::new(instance_id);
+            let engine = CenterSync::new(
+                transport,
+                &store,
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
+        let mut wire = next_wire(&mut wires).await?;
+        let envelope = next_outbox_frame(&mut wire).await?;
+        assert_eq!(envelope.sequence, 1);
+        let Some(EnvelopeMessage::ResourceDelta(delta)) = envelope.message else {
+            return Err(std::io::Error::other("the delete was not a ResourceDelta").into());
+        };
+        assert_eq!(delta.endpoint_id, endpoint_id.to_string());
+        assert_eq!(delta.op, ResourceDeltaOp::Delete as i32);
+        assert_eq!(delta.resource, None);
+        assert!(delta.payload_json.is_empty());
 
         stop_tx
             .send(())
