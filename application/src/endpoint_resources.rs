@@ -60,6 +60,42 @@ impl ResourceStatusSummary {
     }
 }
 
+/// The §0.5.0 NVIDIA `Truststore` metadata of the `SystemConfigProfile`
+/// chain-root document.
+///
+/// Each field records the presence of one certificate-store link
+/// (`NvidiaCertificates` / `OemCertificates`) of the compiled schema; the
+/// certificate documents behind the links are never fetched and their
+/// certificate payloads never enter the product — the sensitive surface is
+/// deferred to a later slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OemNvidiaSystemConfigProfileTruststore {
+    nvidia_certificates: Option<bool>,
+    oem_certificates: Option<bool>,
+}
+
+impl OemNvidiaSystemConfigProfileTruststore {
+    #[must_use]
+    pub fn new(nvidia_certificates: Option<bool>, oem_certificates: Option<bool>) -> Self {
+        Self {
+            nvidia_certificates,
+            oem_certificates,
+        }
+    }
+
+    /// Whether the `NvidiaCertificates` link was present.
+    #[must_use]
+    pub const fn nvidia_certificates(&self) -> Option<bool> {
+        self.nvidia_certificates
+    }
+
+    /// Whether the `OemCertificates` link was present.
+    #[must_use]
+    pub const fn oem_certificates(&self) -> Option<bool> {
+        self.oem_certificates
+    }
+}
+
 /// One timestamped reading of a `MetricReport` member, retained without
 /// normalization loss: `timestamp` keeps the RFC 3339 instant of the compiled
 /// `Edm.DateTimeOffset` type and `value` the original text of the compiled
@@ -169,6 +205,60 @@ pub enum CoreResourceDetails {
     /// per DSP0266) and stays out of the wire payload, whose field set is
     /// exactly what the infra projection wrote.
     OemSmcKcsInterface { privilege: Option<String> },
+    /// One §0.5.0 NVIDIA system-config-profile chain member: the chain-root
+    /// `SystemConfigProfile` document of the `ComputerSystem`'s `Oem.Nvidia`
+    /// segment, read through the compiled `oem-nvidia-profiles` surface
+    /// (§11.5). The whole chain — this document, its status singleton, the
+    /// profile collection, and each member's profile file — shares the single
+    /// family code `nvidia-system-config-profile`, because the chain root
+    /// decides whether the chain exists at all. The details are the
+    /// `Truststore` metadata: the presence of each certificate-store link,
+    /// never the certificate payloads behind them (the sensitive surface is
+    /// deferred).
+    OemNvidiaSystemConfigProfile {
+        truststore: Option<OemNvidiaSystemConfigProfileTruststore>,
+    },
+    /// One §0.5.0 NVIDIA system-config-profile chain member: the
+    /// `SystemConfigProfileStatus` document. The details are the compiled
+    /// status fields: the `PendingList.Activation` text, the numeric
+    /// `ActiveProfileIndex` / `BmcProfileVersion` / `DefaultProfileIndex`
+    /// indices, and the `FactoryResetStatus` text; each is `None` when the
+    /// endpoint did not publish the property.
+    OemNvidiaSystemConfigProfileStatus {
+        pending_list_activation: Option<String>,
+        active_profile_index: Option<i64>,
+        bmc_profile_version: Option<i64>,
+        factory_reset_status: Option<String>,
+        default_profile_index: Option<i64>,
+    },
+    /// One §0.5.0 NVIDIA system-config-profile chain member: one
+    /// `SystemProfile` member of the profile collection. The details are the
+    /// compiled metadata fields (`Default`, `Owner`, `UUID`, the numeric
+    /// `Version`, and `ProfileName`); the profile file behind the member's
+    /// `ProfileFile` navigation is its own chain document and its own
+    /// variant.
+    OemNvidiaSystemProfile {
+        default: Option<bool>,
+        owner: Option<String>,
+        uuid: Option<String>,
+        version: Option<i64>,
+        profile_name: Option<String>,
+    },
+    /// One §0.5.0 NVIDIA system-config-profile chain member: the
+    /// `SystemProfileFile` document behind one profile member's
+    /// `ProfileFile` navigation. The details are the compiled `Metadata`
+    /// fields (`Activate`, `Delete`, `OriginProfileUUID`, `More_Profiles`,
+    /// `ProjectName`, `UUID`) and the base64 `Profile` content, kept verbatim
+    /// (§12.3).
+    OemNvidiaSystemProfileFile {
+        metadata_activate: Option<bool>,
+        metadata_delete: Option<bool>,
+        metadata_origin_profile_uuid: Option<String>,
+        metadata_more_profiles: Option<bool>,
+        metadata_project_name: Option<String>,
+        metadata_uuid: Option<String>,
+        profile: Option<String>,
+    },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -595,6 +685,9 @@ where
         ResourceFeature::OemDell => project_oem_dell(snapshot, payload)?,
         ResourceFeature::OemSmcSysLockdown => project_oem_smc_sys_lockdown(snapshot, payload)?,
         ResourceFeature::OemSmcKcsInterface => project_oem_smc_kcs_interface(snapshot, payload)?,
+        ResourceFeature::OemNvidiaSystemConfigProfile => {
+            project_oem_nvidia_system_config_profile(snapshot, payload)?
+        }
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
@@ -793,6 +886,159 @@ where
             privilege: parsed.privilege,
         },
     ))
+}
+
+/// Projects one NVIDIA system-config-profile chain snapshot into its details
+/// shape.
+///
+/// The one family code covers the whole chain (the profile service document,
+/// its status singleton, each profile member, and each profile file), so the
+/// snapshot payload carries the chain document's kind — written by the infra
+/// projection, which knows the compiled decode target — and this projector
+/// routes on it. A payload without a recognizable `DocumentType` is one odd
+/// snapshot and fails the projection exactly like an unreadable one.
+// The router projects the four chain document kinds of the one family code
+// in one place; the four arms exceed the pedantic line budget, so the lint
+// is scoped to this router exactly like the fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+fn project_oem_nvidia_system_config_profile<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    let envelope = deserialize_payload::<OemNvidiaSystemConfigProfileEnvelope, RepositoryError>(
+        snapshot, payload,
+    )?;
+    match envelope.document_type {
+        OemNvidiaSystemConfigProfileDocument::SystemConfigProfile => {
+            let parsed = deserialize_payload::<OemNvidiaSystemConfigProfilePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaSystemConfigProfile {
+                    truststore: parsed.truststore.map(
+                        |OemNvidiaSystemConfigProfileTruststorePayload {
+                             nvidia_certificates,
+                             oem_certificates,
+                         }| {
+                            OemNvidiaSystemConfigProfileTruststore::new(
+                                nvidia_certificates,
+                                oem_certificates,
+                            )
+                        },
+                    ),
+                },
+            ))
+        }
+        OemNvidiaSystemConfigProfileDocument::SystemConfigProfileStatus => {
+            let parsed = deserialize_payload::<
+                OemNvidiaSystemConfigProfileStatusPayload,
+                RepositoryError,
+            >(snapshot, payload)?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaSystemConfigProfileStatus {
+                    pending_list_activation: parsed
+                        .pending_list
+                        .and_then(|pending_list| pending_list.activation),
+                    active_profile_index: parsed.active_profile_index,
+                    bmc_profile_version: parsed.bmc_profile_version,
+                    factory_reset_status: parsed.factory_reset_status,
+                    default_profile_index: parsed.default_profile_index,
+                },
+            ))
+        }
+        OemNvidiaSystemConfigProfileDocument::SystemProfile => {
+            let parsed = deserialize_payload::<OemNvidiaSystemProfilePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            Ok((
+                nvidia_common_from_snapshot(snapshot, &parsed),
+                CoreResourceDetails::OemNvidiaSystemProfile {
+                    default: parsed.default,
+                    owner: parsed.owner,
+                    uuid: parsed.uuid,
+                    version: parsed.version,
+                    profile_name: parsed.profile_name,
+                },
+            ))
+        }
+        OemNvidiaSystemConfigProfileDocument::SystemProfileFile => {
+            let parsed = deserialize_payload::<OemNvidiaSystemProfileFilePayload, RepositoryError>(
+                snapshot, payload,
+            )?;
+            let common = nvidia_common_from_snapshot(snapshot, &parsed);
+            let OemNvidiaSystemProfileFileContentPayload { metadata, profile } = parsed
+                .profile_file
+                .unwrap_or(OemNvidiaSystemProfileFileContentPayload {
+                    metadata: None,
+                    profile: None,
+                });
+            let OemNvidiaSystemProfileFileMetadataPayload {
+                activate,
+                delete,
+                origin_profile_uuid,
+                more_profiles,
+                project_name,
+                uuid,
+            } = metadata.unwrap_or(OemNvidiaSystemProfileFileMetadataPayload {
+                activate: None,
+                delete: None,
+                origin_profile_uuid: None,
+                more_profiles: None,
+                project_name: None,
+                uuid: None,
+            });
+            Ok((
+                common,
+                CoreResourceDetails::OemNvidiaSystemProfileFile {
+                    metadata_activate: activate,
+                    metadata_delete: delete,
+                    metadata_origin_profile_uuid: origin_profile_uuid,
+                    metadata_more_profiles: more_profiles,
+                    metadata_project_name: project_name,
+                    metadata_uuid: uuid,
+                    profile,
+                },
+            ))
+        }
+    }
+}
+
+/// Derives the common identity of one NVIDIA chain snapshot.
+///
+/// The compiled NVIDIA documents carry `Id` / `Name` / `Description` on
+/// their `resource::Resource` base, so the infra projection writes them; a
+/// stored snapshot without them (an odd snapshot whose common fields were
+/// never written) falls back to the Supermicro precedent — the final segment
+/// of the snapshot's `@odata.id`, the Redfish `Id` per DSP0266 — instead of
+/// becoming unreadable.
+fn nvidia_common_from_snapshot(
+    snapshot: &ResourceSnapshot,
+    parsed: &impl NvidiaCommonFields,
+) -> CoreResourceCommon {
+    match parsed.id() {
+        Some(id) => CoreResourceCommon {
+            id: id.to_owned(),
+            name: parsed.name().map_or_else(|| id.to_owned(), str::to_owned),
+            description: parsed.description().map(str::to_owned),
+        },
+        None => common_from_odata_id(snapshot.odata_id()),
+    }
+}
+
+/// The common identity fields every NVIDIA chain payload carries (each
+/// optional, with the `@odata.id` fallback when absent).
+trait NvidiaCommonFields {
+    fn id(&self) -> Option<&str>;
+    fn name(&self) -> Option<&str>;
+    fn description(&self) -> Option<&str>;
 }
 
 /// Builds the product-level identity for an OEM document whose compiled
@@ -1594,6 +1840,246 @@ struct OemSmcSysLockdownPayload {
 struct OemSmcKcsInterfacePayload {
     #[serde(rename = "Privilege")]
     privilege: Option<String>,
+}
+
+/// The chain document kinds of the §0.5.0 NVIDIA system-config-profile
+/// family, written into every chain snapshot payload by the infra projection
+/// (which knows the compiled decode target) and consumed here to route the
+/// one family code to the right details shape. The wire spellings are the
+/// `snake_case` type names, matching the infra's serialization. The four
+/// kinds share the `System` prefix by construction (the compiled type names
+/// all begin with `System`), so the pedantic prefix lint is scoped off.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[allow(clippy::enum_variant_names)]
+#[serde(rename_all = "snake_case")]
+enum OemNvidiaSystemConfigProfileDocument {
+    SystemConfigProfile,
+    SystemConfigProfileStatus,
+    SystemProfile,
+    SystemProfileFile,
+}
+
+/// The routing envelope of one NVIDIA chain snapshot: only the
+/// `DocumentType` discriminator, deliberately lenient (no
+/// `deny_unknown_fields`) because the kind-specific payload fields follow in
+/// the same document and each kind payload is decoded strictly afterwards.
+#[derive(Deserialize)]
+struct OemNvidiaSystemConfigProfileEnvelope {
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaSystemConfigProfileDocument,
+}
+
+/// The §0.5.0 NVIDIA `SystemConfigProfile` chain-root snapshot payload,
+/// decoded exactly as the infra projection wrote it: the common identity
+/// fields plus the `Truststore` link-presence metadata. `deny_unknown_fields`
+/// keeps the snapshot contract strict, so a future extra wire field would
+/// make stored snapshots unreadable exactly like an extra top-level key
+/// would. The common fields are optional with an `@odata.id`-derived
+/// fallback, so an odd snapshot without them stays projectable.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemConfigProfilePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaSystemConfigProfileDocument,
+    #[serde(rename = "Truststore")]
+    truststore: Option<OemNvidiaSystemConfigProfileTruststorePayload>,
+}
+
+impl NvidiaCommonFields for OemNvidiaSystemConfigProfilePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The `Truststore` metadata of the chain-root payload: link presence only,
+/// never the certificate payloads behind the links.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemConfigProfileTruststorePayload {
+    #[serde(rename = "NvidiaCertificates")]
+    nvidia_certificates: Option<bool>,
+    #[serde(rename = "OemCertificates")]
+    oem_certificates: Option<bool>,
+}
+
+/// The §0.5.0 NVIDIA `SystemConfigProfileStatus` snapshot payload, decoded
+/// exactly as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemConfigProfileStatusPayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaSystemConfigProfileDocument,
+    #[serde(rename = "PendingList")]
+    pending_list: Option<OemNvidiaSystemConfigProfilePendingListPayload>,
+    #[serde(rename = "ActiveProfileIndex")]
+    active_profile_index: Option<i64>,
+    #[serde(rename = "BmcProfileVersion")]
+    bmc_profile_version: Option<i64>,
+    #[serde(rename = "FactoryResetStatus")]
+    factory_reset_status: Option<String>,
+    #[serde(rename = "DefaultProfileIndex")]
+    default_profile_index: Option<i64>,
+}
+
+impl NvidiaCommonFields for OemNvidiaSystemConfigProfileStatusPayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The `PendingList` member of the status payload.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemConfigProfilePendingListPayload {
+    #[serde(rename = "Activation")]
+    activation: Option<String>,
+}
+
+/// The §0.5.0 NVIDIA `SystemProfile` snapshot payload, decoded exactly as
+/// the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemProfilePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaSystemConfigProfileDocument,
+    #[serde(rename = "Default")]
+    default: Option<bool>,
+    #[serde(rename = "Owner")]
+    owner: Option<String>,
+    #[serde(rename = "UUID")]
+    uuid: Option<String>,
+    #[serde(rename = "Version")]
+    version: Option<i64>,
+    #[serde(rename = "ProfileName")]
+    profile_name: Option<String>,
+}
+
+impl NvidiaCommonFields for OemNvidiaSystemProfilePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The §0.5.0 NVIDIA `SystemProfileFile` snapshot payload, decoded exactly
+/// as the infra projection wrote it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemProfileFilePayload {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    // The discriminator is declared (and strictly parsed) so
+    // `deny_unknown_fields` accepts the key; the router reads the same value
+    // from the envelope, so this copy is intentionally never read.
+    #[allow(dead_code)]
+    #[serde(rename = "DocumentType")]
+    document_type: OemNvidiaSystemConfigProfileDocument,
+    #[serde(rename = "ProfileFile")]
+    profile_file: Option<OemNvidiaSystemProfileFileContentPayload>,
+}
+
+impl NvidiaCommonFields for OemNvidiaSystemProfileFilePayload {
+    fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// The `ProfileFile` member of the profile file payload.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemProfileFileContentPayload {
+    #[serde(rename = "Metadata")]
+    metadata: Option<OemNvidiaSystemProfileFileMetadataPayload>,
+    #[serde(rename = "Profile")]
+    profile: Option<String>,
+}
+
+/// The `Metadata` member of the profile file payload, mirroring the compiled
+/// fields including the vendor's `More_Profiles` underscore spelling.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemNvidiaSystemProfileFileMetadataPayload {
+    #[serde(rename = "Activate")]
+    activate: Option<bool>,
+    #[serde(rename = "Delete")]
+    delete: Option<bool>,
+    #[serde(rename = "OriginProfileUUID")]
+    origin_profile_uuid: Option<String>,
+    #[serde(rename = "More_Profiles")]
+    more_profiles: Option<bool>,
+    #[serde(rename = "ProjectName")]
+    project_name: Option<String>,
+    #[serde(rename = "UUID")]
+    uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2618,6 +3104,175 @@ mod tests {
                 ..
             } if status.health() == Some("OK")
         ));
+        Ok(())
+    }
+
+    // The whole NVIDIA chain is asserted in one test so the four document
+    // kinds and the `@odata.id` fallback stay one contract; the snapshots
+    // exceed the pedantic line budget, so the lint is scoped here exactly
+    // like the other OEM family tests.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn projects_oem_nvidia_chain_without_losing_source_values() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(14)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The whole chain shares the one family code; the
+                // `DocumentType` discriminator written by the infra
+                // projection routes each snapshot to its details shape.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemNvidiaSystemConfigProfile,
+                    "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+                    r#"{"Id":"SystemConfigProfile","Name":"NVIDIA System Config Profile","Description":"Profile service","DocumentType":"system_config_profile","Truststore":{"NvidiaCertificates":true,"OemCertificates":false}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemNvidiaSystemConfigProfile,
+                    "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+                    r#"{"Id":"Status","Name":"System Config Profile Status","Description":"Profile service status","DocumentType":"system_config_profile_status","PendingList":{"Activation":"profile-1"},"ActiveProfileIndex":1,"BmcProfileVersion":2,"FactoryResetStatus":"Idle","DefaultProfileIndex":1}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemNvidiaSystemConfigProfile,
+                    "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+                    r#"{"Id":"1","Name":"Default Profile","Description":"Factory default profile","DocumentType":"system_profile","Default":true,"Owner":"Nvidia","UUID":"11111111-2222-3333-4444-555555555555","Version":1,"ProfileName":"default-profile"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemNvidiaSystemConfigProfile,
+                    "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile",
+                    r#"{"Id":"ProfileFile","Name":"Profile File","Description":"Signed profile file","DocumentType":"system_profile_file","ProfileFile":{"Metadata":{"Activate":true,"Delete":false,"OriginProfileUUID":"11111111-2222-3333-4444-555555555555","More_Profiles":false,"ProjectName":"BlueField","UUID":"11111111-2222-3333-4444-555555555555"},"Profile":"eyJwcm9maWxlIjogInRlc3QifQ=="}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // A chain snapshot whose common identity fields are missing
+                // stays projectable through the `@odata.id` fallback, and a
+                // chain document whose every detail field is absent still
+                // projects `None` details instead of failing.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemNvidiaSystemConfigProfile,
+                    "/redfish/v1/Systems/2/Oem/Nvidia/SystemConfigProfile/Status",
+                    r#"{"DocumentType":"system_config_profile_status"}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 6);
+        let chain_root = &result.resources()[1];
+        assert_eq!(
+            chain_root.feature(),
+            ResourceFeature::OemNvidiaSystemConfigProfile
+        );
+        assert_eq!(
+            chain_root.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        );
+        assert_eq!(chain_root.common().id(), "SystemConfigProfile");
+        assert_eq!(chain_root.common().name(), "NVIDIA System Config Profile");
+        assert_eq!(
+            chain_root.details(),
+            &CoreResourceDetails::OemNvidiaSystemConfigProfile {
+                truststore: Some(OemNvidiaSystemConfigProfileTruststore::new(
+                    Some(true),
+                    Some(false),
+                )),
+            }
+        );
+        let profile = &result.resources()[2];
+        assert_eq!(
+            profile.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+        );
+        assert_eq!(
+            profile.details(),
+            &CoreResourceDetails::OemNvidiaSystemProfile {
+                default: Some(true),
+                owner: Some("Nvidia".to_owned()),
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+                version: Some(1),
+                profile_name: Some("default-profile".to_owned()),
+            }
+        );
+        let profile_file = &result.resources()[3];
+        assert_eq!(
+            profile_file.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+        );
+        assert_eq!(
+            profile_file.details(),
+            &CoreResourceDetails::OemNvidiaSystemProfileFile {
+                metadata_activate: Some(true),
+                metadata_delete: Some(false),
+                metadata_origin_profile_uuid: Some(
+                    "11111111-2222-3333-4444-555555555555".to_owned(),
+                ),
+                metadata_more_profiles: Some(false),
+                metadata_project_name: Some("BlueField".to_owned()),
+                metadata_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+                profile: Some("eyJwcm9maWxlIjogInRlc3QifQ==".to_owned()),
+            }
+        );
+        let status = &result.resources()[4];
+        assert_eq!(
+            status.odata_id().as_str(),
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
+        );
+        assert_eq!(
+            status.details(),
+            &CoreResourceDetails::OemNvidiaSystemConfigProfileStatus {
+                pending_list_activation: Some("profile-1".to_owned()),
+                active_profile_index: Some(1),
+                bmc_profile_version: Some(2),
+                factory_reset_status: Some("Idle".to_owned()),
+                default_profile_index: Some(1),
+            }
+        );
+        // The common identity is derived from the `@odata.id` when the
+        // payload carries none, exactly like the Supermicro fallback.
+        let fallback_status = &result.resources()[5];
+        assert_eq!(
+            fallback_status.common().id(),
+            "Status",
+            "the @odata.id final segment must stand in for the missing Id"
+        );
+        assert_eq!(fallback_status.common().name(), "Status");
+        assert_eq!(fallback_status.common().description(), None);
+        assert_eq!(
+            fallback_status.details(),
+            &CoreResourceDetails::OemNvidiaSystemConfigProfileStatus {
+                pending_list_activation: None,
+                active_profile_index: None,
+                bmc_profile_version: None,
+                factory_reset_status: None,
+                default_profile_index: None,
+            }
+        );
         Ok(())
     }
 

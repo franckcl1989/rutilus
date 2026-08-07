@@ -645,9 +645,12 @@ where
                 },
                 EngineError::Store(source) => TaskMonitorError::Store(source),
                 // `apply` never reports EmptyTargets (the engine rejects
-                // empty target lists at create time); the arm exists only
-                // because `EngineError` is a closed enum.
-                EngineError::EmptyTargets => TaskMonitorError::EmptyTargets(operation_id),
+                // empty target lists at create time) or the batch-creation
+                // limit (that verdict is raised only by `create_batch`); the
+                // arms exist only because `EngineError` is a closed enum.
+                EngineError::EmptyTargets | EngineError::TooManyTargets { .. } => {
+                    TaskMonitorError::EmptyTargets(operation_id)
+                }
             })
     }
 
@@ -1117,6 +1120,44 @@ mod tests {
                     .cloned()
                     .collect())
             })
+        }
+
+        fn create_batch<'a>(
+            &'a self,
+            _batch: &'a rutilus_domain::BatchOperation,
+            _children: &'a [Operation],
+        ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+            // The monitor never creates batches; the submission path owns
+            // that boundary, so this stub is unreachable here.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn find_batch(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>>
+        {
+            // The monitor never reads batches; batch reporting owns that
+            // projection, so this stub is unreachable here.
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn list_batches(
+            &self,
+        ) -> OperationBoundaryFuture<'_, Result<Vec<rutilus_domain::BatchOperation>, Self::Error>>
+        {
+            // The monitor never lists batches; batch reporting owns that
+            // projection, so this stub is unreachable here.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn list_batch_children(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+            // The monitor never lists batch children; batch reporting owns
+            // that projection, so this stub is unreachable here.
+            Box::pin(async move { Ok(Vec::new()) })
         }
     }
 
