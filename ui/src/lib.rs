@@ -10,10 +10,11 @@ use std::{collections::BTreeSet, fmt};
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
     AboutResponse, ArtifactResponse, ArtifactStateResponse, AuditEventResponse, AuditQueryResponse,
-    BatchOperationResponse, BootCommand, BootSource, BootSourceOverrideEnabled,
-    BootSourceOverrideMode, CapabilityEntryResponse, CapabilityStateResponse, ChassisCommand,
-    CoreResourceDetailsResponse, CoreResourceResponse, CreateSubscription,
-    CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
+    BatchDetailResponse, BatchOperationResponse, BatchOperationStateResponse,
+    BatchOutcomeCountsResponse, BatchSummaryResponse, BootCommand, BootSource,
+    BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
+    CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
+    CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
     EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
     EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
     EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse, EndpointSummaryResponse,
@@ -322,6 +323,15 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus { .. }
             | CoreResourceDetailsResponse::OemNvidiaSystemProfile { .. }
             | CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPowerCompliance { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPowerDomain { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPowerPolicy { .. }
+            | CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPowerStateGroup { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPscState { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPsuState { .. }
+            | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
+            | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -519,7 +529,16 @@ fn oem_resource_card(
         | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { .. }
         | CoreResourceDetailsResponse::OemNvidiaSystemConfigProfileStatus { .. }
         | CoreResourceDetailsResponse::OemNvidiaSystemProfile { .. }
-        | CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. } => Some(
+        | CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPowerCompliance { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPowerDomain { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPowerPolicy { .. }
+        | CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPowerStateGroup { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPscState { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPsuState { .. }
+        | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
+        | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. } => Some(
             CoreResourceCardProjection::from_resource(endpoint_id, resource),
         ),
         CoreResourceDetailsResponse::ServiceRoot { .. }
@@ -585,6 +604,33 @@ fn card_facts(
         }
         CoreResourceDetailsResponse::OemNvidiaSystemProfileFile { .. } => {
             oem_nvidia_system_profile_file_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPowerCompliance { .. } => {
+            oem_nvidia_power_compliance_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPowerDomain { .. } => {
+            oem_nvidia_power_domain_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPowerPolicy { .. } => {
+            oem_nvidia_power_policy_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup { .. } => {
+            oem_nvidia_managed_entity_group_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPowerStateGroup { .. } => {
+            oem_nvidia_power_state_group_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPscState { .. } => {
+            oem_nvidia_psc_state_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPsuState { .. } => {
+            oem_nvidia_psu_state_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. } => {
+            oem_nvidia_psu_redundancy_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. } => {
+            oem_nvidia_managed_entity_card_facts(resource)
         }
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
@@ -1769,6 +1815,313 @@ fn oem_nvidia_system_profile_file_card_facts(
     push_fact(&mut facts, "UUID", metadata_uuid.as_deref());
     push_fact(&mut facts, "Profile", profile.as_deref());
     ("NVIDIA Profile File", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPowerComplianceManager` chain-root card under
+/// the §0.5.0 `oem-nvidia-power-management` family.
+///
+/// The compiled `ManagerType` enumeration renders verbatim per §12.3 (the
+/// vendor's wire spelling, e.g. `PowerManager`), never relabeled. The value
+/// renders only when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerCompliance`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_power_compliance_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPowerCompliance { manager_type } = resource else {
+        return ("NVIDIA Power Compliance", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Manager type", manager_type.as_deref());
+    ("NVIDIA Power Compliance", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPowerDomain` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the numeric
+/// `Value`, the `Type` / `Unit` / `SensorReadingType` / `SensorImpl`
+/// enumeration spellings. Each optional value renders only when the document
+/// published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerDomain`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_power_domain_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPowerDomain {
+        value,
+        r#type,
+        unit,
+        sensor_reading_type,
+        sensor_impl,
+    } = resource
+    else {
+        return ("NVIDIA Power Domain", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_i64_fact(&mut facts, "Value", *value);
+    push_fact(&mut facts, "Type", r#type.as_deref());
+    push_fact(&mut facts, "Unit", unit.as_deref());
+    push_fact(
+        &mut facts,
+        "Sensor reading type",
+        sensor_reading_type.as_deref(),
+    );
+    push_fact(&mut facts, "Sensor implementation", sensor_impl.as_deref());
+    ("NVIDIA Power Domain", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPowerPolicy` card under the §0.5.0
+/// `oem-nvidia-power-management` family (the `ACLossPolicy` and
+/// `PSUCompliancePolicy` singletons share one card shape).
+///
+/// The compiled scalar fields render verbatim per §12.3: the
+/// `AutoDeassertPowerBrake` boolean in its canonical wire spelling, the
+/// numeric `Min` / `Max` thresholds, the `Type` / `Unit` enumeration
+/// spellings, and the `PolicyActions` enumeration spelling. Each optional
+/// value renders only when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerPolicy`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_power_policy_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPowerPolicy {
+        auto_deassert_power_brake,
+        min,
+        max,
+        r#type,
+        unit,
+        policy_actions,
+    } = resource
+    else {
+        return ("NVIDIA Power Policy", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_boolean_fact(
+        &mut facts,
+        "Auto deassert power brake",
+        *auto_deassert_power_brake,
+    );
+    push_i64_fact(&mut facts, "Min", *min);
+    push_i64_fact(&mut facts, "Max", *max);
+    push_fact(&mut facts, "Type", r#type.as_deref());
+    push_fact(&mut facts, "Unit", unit.as_deref());
+    push_fact(&mut facts, "Policy actions", policy_actions.as_deref());
+    ("NVIDIA Power Policy", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaManagedEntityGroup` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled `CurrentManagedEntityId` text renders verbatim per §12.3.
+/// The value renders only when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaManagedEntityGroup`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_managed_entity_group_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup {
+        current_managed_entity_id,
+    } = resource
+    else {
+        return ("NVIDIA Managed Entity Group", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Current managed entity",
+        current_managed_entity_id.as_deref(),
+    );
+    ("NVIDIA Managed Entity Group", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPowerStateGroup` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the `PscId` text
+/// and the numeric `GeneratedWatts` / `NumberOfPscs` / `NumberOfLocalPsus`.
+/// Each optional value renders only when the document published the
+/// property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerStateGroup`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_power_state_group_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPowerStateGroup {
+        psc_id,
+        generated_watts,
+        number_of_pscs,
+        number_of_local_psus,
+    } = resource
+    else {
+        return ("NVIDIA Power State Group", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "PSC ID", psc_id.as_deref());
+    push_i64_fact(&mut facts, "Generated watts", *generated_watts);
+    push_i64_fact(&mut facts, "Number of PSCs", *number_of_pscs);
+    push_i64_fact(&mut facts, "Number of local PSUs", *number_of_local_psus);
+    ("NVIDIA Power State Group", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPscState` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the `PscId` text,
+/// the numeric `NumOfOperationalPsus` / `MillisecondsSinceLastHeartbeat`,
+/// the `PowerBrakeAssert` boolean in its canonical wire spelling, and the
+/// `Status` enumeration spelling. Each optional value renders only when the
+/// document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPscState` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_psc_state_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPscState {
+        psc_id,
+        num_of_operational_psus,
+        power_brake_assert,
+        milliseconds_since_last_heartbeat,
+        status,
+    } = resource
+    else {
+        return ("NVIDIA PSC State", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "PSC ID", psc_id.as_deref());
+    push_i64_fact(&mut facts, "Operational PSUs", *num_of_operational_psus);
+    push_boolean_fact(&mut facts, "Power brake assert", *power_brake_assert);
+    push_i64_fact(
+        &mut facts,
+        "Milliseconds since last heartbeat",
+        *milliseconds_since_last_heartbeat,
+    );
+    push_fact(&mut facts, "Status", status.as_deref());
+    ("NVIDIA PSC State", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPsuState` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the `PsuId` text
+/// and the `Presence` / `Input1Active` / `Input2Active` booleans in their
+/// canonical wire spellings. Each optional value renders only when the
+/// document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPsuState` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_psu_state_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPsuState {
+        psu_id,
+        presence,
+        input1active,
+        input2active,
+    } = resource
+    else {
+        return ("NVIDIA PSU State", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "PSU ID", psu_id.as_deref());
+    push_boolean_fact(&mut facts, "Presence", *presence);
+    push_boolean_fact(&mut facts, "Input 1 active", *input1active);
+    push_boolean_fact(&mut facts, "Input 2 active", *input2active);
+    ("NVIDIA PSU State", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaPsuRedundancy` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the
+/// `MaxNumSupported` / `MinNumNeeded` texts and the `RedundancySetting`
+/// enumeration spelling. Each optional value renders only when the document
+/// published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPsuRedundancy`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_psu_redundancy_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaPsuRedundancy {
+        max_num_supported,
+        min_num_needed,
+        redundancy_setting,
+    } = resource
+    else {
+        return ("NVIDIA PSU Redundancy", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Max PSUs supported",
+        max_num_supported.as_deref(),
+    );
+    push_fact(&mut facts, "Min PSUs needed", min_num_needed.as_deref());
+    push_fact(
+        &mut facts,
+        "Redundancy setting",
+        redundancy_setting.as_deref(),
+    );
+    ("NVIDIA PSU Redundancy", facts)
+}
+
+/// Facts for the NVIDIA `NvidiaManagedEntity` card under the §0.5.0
+/// `oem-nvidia-power-management` family.
+///
+/// The compiled scalar fields render verbatim per §12.3: the
+/// `TransportProtocol` enumeration spelling, the `IPv4Address` /
+/// `IPv6Address` address texts, and the numeric `Port`. Each optional value
+/// renders only when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaManagedEntity`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_nvidia_managed_entity_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemNvidiaManagedEntity {
+        transport_protocol,
+        ipv4_address,
+        ipv6_address,
+        port,
+    } = resource
+    else {
+        return ("NVIDIA Managed Entity", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Transport protocol",
+        transport_protocol.as_deref(),
+    );
+    push_fact(&mut facts, "IPv4 address", ipv4_address.as_deref());
+    push_fact(&mut facts, "IPv6 address", ipv6_address.as_deref());
+    push_i64_fact(&mut facts, "Port", *port);
+    ("NVIDIA Managed Entity", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -5475,6 +5828,300 @@ impl From<&OperationResponse> for OperationCardProjection {
     }
 }
 
+/// The derived §13.7 lifecycle phase of one batch, as display vocabulary.
+///
+/// The verdict is a server-derived projection of the children's states and is
+/// never computed client-side; this view type is the UI's own closed
+/// vocabulary of the six batch phases, with the DTO-to-view mapping living
+/// with the fetch layer.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchStateView {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+    Cancelled,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BatchStateView {
+    /// Static English badge label for one derived batch phase.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Unknown => "Unknown",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Semantic badge styling for one derived batch phase.
+    ///
+    /// The tiers mirror the operation badge vocabulary: `Succeeded` is the
+    /// only ok (green) phase, `Failed` the only error (red) phase, `Unknown`
+    /// and `Cancelled` are terminal without a proven result (off, gray), and
+    /// `Queued`/`Running` are active (blue) because the batch is in flight.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Succeeded => "operation-state operation-ok",
+            Self::Failed => "operation-state operation-error",
+            Self::Unknown | Self::Cancelled => "operation-state operation-off",
+            Self::Queued | Self::Running => "operation-state operation-active",
+        }
+    }
+}
+
+/// Maps the wire derived batch verdict onto the display vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<BatchOperationStateResponse> for BatchStateView {
+    fn from(state: BatchOperationStateResponse) -> Self {
+        match state {
+            BatchOperationStateResponse::Queued => Self::Queued,
+            BatchOperationStateResponse::Running => Self::Running,
+            BatchOperationStateResponse::Succeeded => Self::Succeeded,
+            BatchOperationStateResponse::Failed => Self::Failed,
+            BatchOperationStateResponse::Unknown => Self::Unknown,
+            BatchOperationStateResponse::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// One §13.7 outcome count chip of a batch card.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchOutcomeChip {
+    label: &'static str,
+    count: usize,
+    class: &'static str,
+}
+
+/// The §13.7 outcome buckets of one batch card.
+///
+/// The counts are the server-derived projection rendered verbatim — the
+/// client never infers a batch outcome from the children.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchOutcomeChips {
+    succeeded: usize,
+    failed: usize,
+    unknown: usize,
+    unsupported: usize,
+    cancelled: usize,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BatchOutcomeChips {
+    /// The five chips in fixed order, so the card rows read the same every
+    /// time. `Unsupported` is the classified capability-refusal verdict and
+    /// reads as off (gray) like the other non-error terminal buckets: it is a
+    /// distinct known outcome, not an ordinary failure the operator would
+    /// retry against the same endpoint.
+    #[must_use]
+    pub const fn chips(self) -> [BatchOutcomeChip; 5] {
+        [
+            BatchOutcomeChip {
+                label: "Succeeded",
+                count: self.succeeded,
+                class: "operation-state operation-ok",
+            },
+            BatchOutcomeChip {
+                label: "Failed",
+                count: self.failed,
+                class: "operation-state operation-error",
+            },
+            BatchOutcomeChip {
+                label: "Unknown",
+                count: self.unknown,
+                class: "operation-state operation-off",
+            },
+            BatchOutcomeChip {
+                label: "Unsupported",
+                count: self.unsupported,
+                class: "operation-state operation-off",
+            },
+            BatchOutcomeChip {
+                label: "Cancelled",
+                count: self.cancelled,
+                class: "operation-state operation-off",
+            },
+        ]
+    }
+}
+
+/// Maps the wire outcome buckets onto the card chips.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<BatchOutcomeCountsResponse> for BatchOutcomeChips {
+    fn from(counts: BatchOutcomeCountsResponse) -> Self {
+        Self {
+            succeeded: counts.succeeded(),
+            failed: counts.failed(),
+            unknown: counts.unknown(),
+            unsupported: counts.unsupported(),
+            cancelled: counts.cancelled(),
+        }
+    }
+}
+
+/// One §13.7 batch child row: the endpoint that received the write and the
+/// child operation's own §13.2 phase.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BatchChildRowProjection {
+    endpoint_id: String,
+    display_name: String,
+    state: OperationStateView,
+}
+
+/// One §13.7 batch projected for a list card.
+///
+/// `children` stays empty until the card's first expand fetches the full
+/// report; the card renders the server-derived state and the five outcome
+/// chips from the summary alone.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BatchCardProjection {
+    batch_id: String,
+    short_id: String,
+    state: BatchStateView,
+    command: CommandSummaryProjection,
+    created_at_text: String,
+    outcomes: BatchOutcomeChips,
+    children: Vec<BatchChildRowProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BatchCardProjection {
+    /// Static badge label of the derived batch verdict.
+    #[must_use]
+    pub const fn state_label(&self) -> &'static str {
+        self.state.label()
+    }
+
+    /// Semantic badge styling of the derived batch verdict.
+    #[must_use]
+    pub const fn state_class(&self) -> &'static str {
+        self.state.class()
+    }
+}
+
+/// Projects one wire batch summary onto its list card.
+///
+/// The state badge and the outcome chips are the server's derived projection
+/// rendered verbatim; the children rows are fetched separately on first
+/// expand.
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&BatchSummaryResponse> for BatchCardProjection {
+    fn from(response: &BatchSummaryResponse) -> Self {
+        let batch_id = response.batch_id().to_string();
+        Self {
+            batch_id: batch_id.clone(),
+            short_id: short_operation_id(&batch_id),
+            state: BatchStateView::from(response.state()),
+            command: wire_command_summary(response.command()),
+            created_at_text: format_observed_at(&response.created_at()),
+            outcomes: BatchOutcomeChips::from(response.outcomes()),
+            children: Vec::new(),
+        }
+    }
+}
+
+/// Resolves one endpoint's display name from the loaded inventory.
+///
+/// The same inventory mapping as the operation form's target choices; an
+/// endpoint missing from the inventory falls back to the short endpoint id
+/// rather than inventing a name.
+#[cfg(any(target_arch = "wasm32", test))]
+fn endpoint_display_name(inventory: &EndpointInventoryResponse, endpoint_id: &str) -> String {
+    match inventory
+        .endpoints()
+        .iter()
+        .find(|endpoint| endpoint.identity().endpoint_id().to_string() == endpoint_id)
+    {
+        Some(endpoint) => endpoint.identity().display_name().to_owned(),
+        None => short_operation_id(endpoint_id),
+    }
+}
+
+/// Projects one batch's full report into the card's per-endpoint child rows.
+///
+/// Each child carries exactly one target, so the row pairs the child's phase
+/// with the display name of its endpoint.
+#[cfg(any(target_arch = "wasm32", test))]
+fn batch_children_projection(
+    detail: &BatchDetailResponse,
+    inventory: &EndpointInventoryResponse,
+) -> Vec<BatchChildRowProjection> {
+    detail
+        .children()
+        .iter()
+        .map(|child| {
+            let endpoint_id = child
+                .targets()
+                .first()
+                .map(|target| target.endpoint_id().to_string())
+                .unwrap_or_default();
+            BatchChildRowProjection {
+                endpoint_id: endpoint_id.clone(),
+                display_name: endpoint_display_name(inventory, &endpoint_id),
+                state: OperationStateView::from(child.state()),
+            }
+        })
+        .collect()
+}
+
+/// The loading state of the §13.7 batch list.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BatchesListState {
+    Loading,
+    Ready(Vec<BatchCardProjection>),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl BatchesListState {
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    fn has_empty_list(&self) -> bool {
+        matches!(self, Self::Ready(cards) if cards.is_empty())
+    }
+
+    /// One-line count heading, e.g. "3 batches".
+    fn count_text(&self) -> String {
+        let count = match self {
+            Self::Ready(cards) => cards.len(),
+            Self::Loading | Self::Failed => 0,
+        };
+        match count {
+            1 => "1 batch".to_owned(),
+            _ => format!("{count} batches"),
+        }
+    }
+
+    fn cards(&self) -> Vec<BatchCardProjection> {
+        match self {
+            Self::Ready(cards) => cards.clone(),
+            Self::Loading | Self::Failed => Vec::new(),
+        }
+    }
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 /// The §12.3 unified health of one endpoint, ordered from best to worst.
 ///
@@ -6337,7 +6984,7 @@ fn acknowledge_submission(target_count: usize, body: &str) -> Result<(), &'stati
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
 
     use gloo_net::http::Request;
     use leptos::{
@@ -6348,14 +6995,14 @@ mod browser {
     };
     use rutilus_api::{
         AboutResponse, AppendArtifactChunkRequest, ArtifactListResponse, ArtifactProgressResponse,
-        ArtifactResponse, AssignTagRequest, AuditQueryResponse, BeginEndpointTrustRequest,
-        ConfirmEndpointTrustRequest, CreateArtifactRequest, CreateCredentialRequest,
-        CreateGroupRequest, CreateOperationRequest, CredentialInventoryResponse,
-        CredentialSummaryResponse, EndpointCapabilityInventoryResponse, EndpointCsvImportRequest,
-        EndpointCsvImportResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
-        EndpointResourceInventoryResponse, EndpointTrustChallengeResponse,
-        EndpointTrustExpectationRequest, EnrollEndpointRequest, EventListResponse,
-        GroupListResponse, GroupResponse, OperationListResponse, OperationResponse,
+        ArtifactResponse, AssignTagRequest, AuditQueryResponse, BatchDetailResponse,
+        BatchListResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
+        CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
+        CredentialInventoryResponse, CredentialSummaryResponse,
+        EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
+        EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+        EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
+        EventListResponse, GroupListResponse, GroupResponse, OperationListResponse,
         ResourceDiagnosticsResponse, TagListResponse, TelemetrySampleListResponse,
         TelemetrySeriesListResponse, TelemetrySeriesResponse, TrustedEndpointResponse,
     };
@@ -6364,11 +7011,12 @@ mod browser {
 
     use super::{
         ArtifactCardProjection, ArtifactStatusView, ArtifactUploadFailure, ArtifactUploadState,
-        ArtifactsListState, AuditEventCardProjection, AuditListState, BootEnabledView,
-        BootModeView, BootSourceView, CapabilityEntryProjection, CapabilityGroupProjection,
-        CapabilityLoadFailure, CapabilityMatrixProjection, CapabilityMatrixState,
-        CapabilityTargetProjection, CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState,
-        ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
+        ArtifactsListState, AuditEventCardProjection, AuditListState, BatchCardProjection,
+        BatchChildRowProjection, BatchesListState, BootEnabledView, BootModeView, BootSourceView,
+        CapabilityEntryProjection, CapabilityGroupProjection, CapabilityLoadFailure,
+        CapabilityMatrixProjection, CapabilityMatrixState, CapabilityTargetProjection,
+        CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState, ConsoleView,
+        CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
         DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
@@ -6383,12 +7031,12 @@ mod browser {
         TagApplyState, TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
         TelemetryCardProjection, TelemetryListState, TrustChallengeProjection,
         UpdateArtifactChoice, apply_overview_filters, artifact_chunk_range_at,
-        artifact_upload_status_text, base64_encode, build_command, command_summary,
-        diagnostics_optional_text, endpoint_address_draft_error, format_artifact_size,
-        group_member_choices, group_name_draft_error, health_badge_class, health_choices,
-        health_level_label, operation_endpoint_choices, percent_encode_path_segment, sha256_hex,
-        tag_draft_error, toggle_set_membership, trust_mode_label, update_artifact_choices,
-        vendor_choices,
+        artifact_upload_status_text, base64_encode, batch_children_projection, build_command,
+        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
+        format_artifact_size, group_member_choices, group_name_draft_error, health_badge_class,
+        health_choices, health_level_label, operation_endpoint_choices,
+        percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
+        trust_mode_label, update_artifact_choices, vendor_choices,
     };
 
     #[wasm_bindgen(start)]
@@ -10033,6 +10681,50 @@ mod browser {
         }
     }
 
+    /// Loads the persisted §13.7 batch list.
+    ///
+    /// The cards render the server-derived verdict and outcome buckets
+    /// verbatim — the client never derives a batch outcome from the children;
+    /// the per-endpoint child rows are fetched separately on first expand.
+    /// Any transport failure or non-200 status maps to the single static
+    /// unavailable message, exactly like the operation list.
+    async fn fetch_batches() -> BatchesListState {
+        let response = Request::get("/api/v1/batches")
+            .header("Accept", "application/json")
+            .send()
+            .await;
+        let Ok(response) = response else {
+            return BatchesListState::Failed;
+        };
+        if !response.ok() {
+            return BatchesListState::Failed;
+        }
+        match response.json::<BatchListResponse>().await {
+            Ok(list) => BatchesListState::Ready(
+                list.batches()
+                    .iter()
+                    .map(BatchCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => BatchesListState::Failed,
+        }
+    }
+
+    /// Loads one batch's full report for the expanded per-endpoint rows
+    /// (§13.7); `None` when the batch cannot be read.
+    async fn fetch_batch_detail(batch_id: &str) -> Option<BatchDetailResponse> {
+        let path = format!("/api/v1/batches/{batch_id}");
+        let response = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response.ok() {
+            return None;
+        }
+        response.json::<BatchDetailResponse>().await.ok()
+    }
+
     /// Submits one operation draft (§13.1, §13.7).
     ///
     /// The draft must already be validated (the form only calls this after
@@ -10278,6 +10970,14 @@ mod browser {
         // own state.
         let (artifact_list_state, set_artifact_list_state) = signal(ArtifactsListState::Loading);
         let (artifact_list_triggered, set_artifact_list_triggered) = signal(false);
+        // The §13.7 batch area shares the view's load lifecycle: the cards
+        // render the server-derived verdict and outcome buckets, and the
+        // expanded per-endpoint rows are fetched lazily on first expand.
+        let (batches_state, set_batches_state) = signal(BatchesListState::Loading);
+        let (batches_triggered, set_batches_triggered) = signal(false);
+        let (expanded_batches, set_expanded_batches) = signal(BTreeSet::<String>::new());
+        let (expanded_children, set_expanded_children) =
+            signal(HashMap::<String, Vec<BatchChildRowProjection>>::new());
 
         Effect::new(move |_| {
             if active() && !list_triggered.get() {
@@ -10285,6 +10985,16 @@ mod browser {
                 set_list_state.set(OperationsListState::Loading);
                 spawn_local(async move {
                     set_list_state.set(fetch_operations().await);
+                });
+            }
+        });
+
+        Effect::new(move |_| {
+            if active() && !batches_triggered.get() {
+                set_batches_triggered.set(true);
+                set_batches_state.set(BatchesListState::Loading);
+                spawn_local(async move {
+                    set_batches_state.set(fetch_batches().await);
                 });
             }
         });
@@ -10304,8 +11014,12 @@ mod browser {
 
         let on_refresh = move |_| {
             set_list_state.set(OperationsListState::Loading);
+            set_batches_state.set(BatchesListState::Loading);
             spawn_local(async move {
                 set_list_state.set(fetch_operations().await);
+            });
+            spawn_local(async move {
+                set_batches_state.set(fetch_batches().await);
             });
         };
 
@@ -10361,6 +11075,10 @@ mod browser {
                         set_draft_error.set(None);
                         set_list_state.set(OperationsListState::Loading);
                         set_list_state.set(fetch_operations().await);
+                        // A batch submission creates a new batch parent, so
+                        // the batch area refreshes with the operation list.
+                        set_batches_state.set(BatchesListState::Loading);
+                        set_batches_state.set(fetch_batches().await);
                     }
                     Err(message) => set_submit_state.set(OperationSubmitState::Failed(message)),
                 }
@@ -10417,6 +11135,48 @@ mod browser {
                             .cards()
                             .into_iter()
                             .map(|card| view! { <OperationCard card=card /> })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Batch operations"</p>
+                        <h2>{move || batches_state.get().count_text()}</h2>
+                    </div>
+                    <p>"A multi-endpoint write is one batch with a per-endpoint outcome report."</p>
+                </div>
+                <p class="inline-status" hidden=move || !batches_state.get().is_loading()>
+                    "Loading batches..."
+                </p>
+                <p class="form-error" hidden=move || !batches_state.get().is_failed()>
+                    "The batch list is temporarily unavailable."
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !batches_state.get().is_ready() || !batches_state.get().has_empty_list()
+                    }
+                >
+                    "No batch operations have been submitted yet."
+                </p>
+                <div class="resource-list">
+                    {move || {
+                        batches_state
+                            .get()
+                            .cards()
+                            .into_iter()
+                            .map(|card| {
+                                view! {
+                                    <BatchCard
+                                        card=card
+                                        expanded=expanded_batches
+                                        set_expanded=set_expanded_batches
+                                        expanded_children=expanded_children
+                                        set_expanded_children=set_expanded_children
+                                        load_state=load_state
+                                    />
+                                }
+                            })
                             .collect_view()
                     }}
                 </div>
@@ -11175,6 +11935,166 @@ mod browser {
                         <dd>{updated_at_text}</dd>
                     </div>
                 </dl>
+            </article>
+        }
+    }
+
+    /// One §13.7 batch card: the server-derived verdict badge, the five
+    /// outcome count chips, and the expandable per-endpoint rows.
+    ///
+    /// The verdict and the chips come from the list summary and are rendered
+    /// verbatim; the per-endpoint rows are fetched once on first expand and
+    /// pair each child with its endpoint's display name from the loaded
+    /// inventory.
+    #[component]
+    fn BatchCard(
+        card: BatchCardProjection,
+        expanded: ReadSignal<BTreeSet<String>>,
+        set_expanded: WriteSignal<BTreeSet<String>>,
+        expanded_children: ReadSignal<HashMap<String, Vec<BatchChildRowProjection>>>,
+        set_expanded_children: WriteSignal<HashMap<String, Vec<BatchChildRowProjection>>>,
+        load_state: ReadSignal<ConsoleLoadState>,
+    ) -> impl IntoView {
+        let state_label = card.state_label();
+        let state_class = card.state_class();
+        let batch_id = card.batch_id.clone();
+        let short_id = card.short_id.clone();
+        let command_family = card.command.family;
+        let command_payload = card.command.payload.clone();
+        let created_at_text = card.created_at_text.clone();
+        let chips = card.outcomes.chips().to_vec();
+        let is_expanded = {
+            let batch_id = batch_id.clone();
+            move || expanded.with(|set| set.contains(&batch_id))
+        };
+
+        let on_toggle = {
+            let batch_id = batch_id.clone();
+            move |_| {
+                // The containment check is inlined here (instead of calling
+                // `is_expanded`) so the toggle closure never captures the
+                // display closure; the view! macro needs `is_expanded` for
+                // the badge state too.
+                if expanded.with(|set| set.contains(&batch_id)) {
+                    set_expanded.update(|set| {
+                        set.remove(&batch_id);
+                    });
+                    return;
+                }
+                set_expanded.update(|set| {
+                    set.insert(batch_id.clone());
+                });
+                // The full report is fetched once per session on first expand;
+                // a failed fetch leaves the rows empty so a collapse/expand
+                // retries.
+                if !expanded_children.with(|rows| rows.contains_key(&batch_id)) {
+                    let inventory = load_state.get();
+                    let batch_id = batch_id.clone();
+                    spawn_local(async move {
+                        if let Some(detail) = fetch_batch_detail(&batch_id).await {
+                            let children = match &inventory {
+                                ConsoleLoadState::Ready(data) => {
+                                    batch_children_projection(&detail, &data.inventory)
+                                }
+                                ConsoleLoadState::Loading | ConsoleLoadState::Failed(_) => {
+                                    Vec::new()
+                                }
+                            };
+                            set_expanded_children.update(|rows| {
+                                rows.insert(batch_id, children);
+                            });
+                        }
+                    });
+                }
+            }
+        };
+
+        let rows = {
+            let batch_id = batch_id.clone();
+            move || {
+                expanded_children
+                    .get()
+                    .get(&batch_id)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        };
+
+        // The display closure is cloned per use: the view! macro's inline
+        // closures each move-capture their own copy, and the toggle closure
+        // above deliberately does not capture it.
+        let expand_aria = {
+            let is_expanded = is_expanded.clone();
+            move || is_expanded()
+        };
+        let expand_label = {
+            let is_expanded = is_expanded.clone();
+            move || {
+                if is_expanded() {
+                    "Hide endpoints"
+                } else {
+                    "Show endpoints"
+                }
+            }
+        };
+        let children_hidden = {
+            let is_expanded = is_expanded.clone();
+            move || !is_expanded()
+        };
+
+        view! {
+            <article class="credential-card">
+                <div class="operation-card-heading">
+                    <div>
+                        <h3>{command_family}</h3>
+                        <p class="operation-card-id">{short_id}</p>
+                    </div>
+                    <span class=state_class>{state_label}</span>
+                </div>
+                <p class="operation-command-summary">{command_payload}</p>
+                <div class="batch-outcome-chips">
+                    {chips
+                        .iter()
+                        .map(|chip| {
+                            view! {
+                                <span class=chip.class>
+                                    {format!("{} · {}", chip.label, chip.count)}
+                                </span>
+                            }
+                        })
+                        .collect_view()}
+                </div>
+                <dl class="resource-facts">
+                    <div>
+                        <dt>"Created"</dt>
+                        <dd>{created_at_text}</dd>
+                    </div>
+                </dl>
+                <button
+                    type="button"
+                    class="btn"
+                    on:click=on_toggle
+                    aria-expanded=expand_aria
+                >
+                    {expand_label}
+                </button>
+                <div class="batch-children" hidden=children_hidden>
+                    {move || {
+                        rows()
+                            .into_iter()
+                            .map(|row| {
+                                let child_state_label = row.state.label();
+                                let child_state_class = row.state.class();
+                                view! {
+                                    <div class="batch-child-row">
+                                        <span class="batch-child-endpoint">{row.display_name}</span>
+                                        <span class=child_state_class>{child_state_label}</span>
+                                    </div>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </div>
             </article>
         }
     }
@@ -12328,6 +13248,228 @@ mod tests {
                     "metadata_project_name": "BlueField",
                     "metadata_uuid": "11111111-2222-3333-4444-555555555555",
                     "profile": "eyJwcm9maWxlIjogInRlc3QifQ=="
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_power_compliance_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f0",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+                "odata_type": "#NvidiaPowerComplianceManager.v1_0_0.NvidiaPowerComplianceManager",
+                "etag": "W/\"nvidia-pc-1\""
+            },
+            "common": {
+                "id": "PowerCompliance",
+                "name": "NVIDIA Power Compliance",
+                "description": "Power compliance manager"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_power_compliance",
+                "details": {
+                    "manager_type": "PowerManager"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_power_domain_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f1",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+                "odata_type": "#NvidiaPowerDomain.v1_0_0.NvidiaPowerDomain",
+                "etag": "W/\"nvidia-domain-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Domain One",
+                "description": "Power comparison domain"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_power_domain",
+                "details": {
+                    "value": 800,
+                    "type": "Above",
+                    "unit": "Watts",
+                    "sensor_reading_type": "Power",
+                    "sensor_impl": "PhysicalSensor"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_power_policy_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f2",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+                "odata_type": "#NvidiaPowerPolicy.v1_0_0.NvidiaPowerPolicy",
+                "etag": "W/\"nvidia-acloss-1\""
+            },
+            "common": {
+                "id": "ACLossPolicy",
+                "name": "AC Loss Policy",
+                "description": "AC loss power policy"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_power_policy",
+                "details": {
+                    "auto_deassert_power_brake": true,
+                    "min": 200,
+                    "max": 600,
+                    "type": "Inclusive",
+                    "unit": "Watts",
+                    "policy_actions": "AssertPowerBrake"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_managed_entity_group_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f3",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+                "odata_type": "#NvidiaManagedEntityGroup.v1_0_0.NvidiaManagedEntityGroup",
+                "etag": "W/\"nvidia-group-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Managed Entity Group One",
+                "description": "BlueField group"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_managed_entity_group",
+                "details": {
+                    "current_managed_entity_id": "BF1"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_power_state_group_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f4",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+                "odata_type": "#NvidiaPowerStateGroup.v1_0_0.NvidiaPowerStateGroup",
+                "etag": "W/\"nvidia-state-group-1\""
+            },
+            "common": {
+                "id": "PowerStateGroup",
+                "name": "Power State Group",
+                "description": "Power shelf state"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_power_state_group",
+                "details": {
+                    "psc_id": "PSC1",
+                    "generated_watts": 2400,
+                    "number_of_pscs": 1,
+                    "number_of_local_psus": 2
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_psc_state_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f5",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+                "odata_type": "#NvidiaPscState.v1_0_0.NvidiaPscState",
+                "etag": "W/\"nvidia-psc-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Shelf Controller One",
+                "description": "PSC state"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_psc_state",
+                "details": {
+                    "psc_id": "PSC1",
+                    "num_of_operational_psus": 4,
+                    "power_brake_assert": false,
+                    "milliseconds_since_last_heartbeat": 12,
+                    "status": "Operational"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_psu_state_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f6",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+                "odata_type": "#NvidiaPsuState.v1_0_0.NvidiaPsuState",
+                "etag": "W/\"nvidia-psu-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Supply One",
+                "description": "PSU state"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_psu_state",
+                "details": {
+                    "psu_id": "PSU1",
+                    "presence": true,
+                    "input1active": true,
+                    "input2active": false
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_psu_redundancy_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f7",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+                "odata_type": "#NvidiaPsuRedundancy.v1_0_0.NvidiaPsuRedundancy",
+                "etag": "W/\"nvidia-redundancy-1\""
+            },
+            "common": {
+                "id": "PSURedundancy",
+                "name": "PSU Redundancy",
+                "description": "PSU redundancy settings"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_psu_redundancy",
+                "details": {
+                    "max_num_supported": "4",
+                    "min_num_needed": "2",
+                    "redundancy_setting": "NPlusOne"
+                }
+            }
+        })
+    }
+
+    fn oem_nvidia_managed_entity_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789f8",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+                "odata_type": "#NvidiaManagedEntity.v1_0_0.NvidiaManagedEntity",
+                "etag": "W/\"nvidia-entity-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Managed Entity One",
+                "description": "BlueField managed entity"
+            },
+            "resource": {
+                "resource_type": "oem_nvidia_managed_entity",
+                "details": {
+                    "transport_protocol": "HTTPS",
+                    "ipv4_address": "192.0.2.10",
+                    "ipv6_address": "2001:db8::10",
+                    "port": 443
                 }
             }
         })
@@ -15614,6 +16756,247 @@ mod tests {
         Ok(())
     }
 
+    // The nine power-family cards are asserted in one test so the card order
+    // and the full fact surface stay one contract; the nine card projections
+    // exceed the pedantic line budget, so the lint is scoped here exactly
+    // like the other OEM card-form tests.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_nvidia_power_resources()
+    -> Result<(), Box<dyn Error>> {
+        // The api contract has landed the NVIDIA power-compliance and
+        // managed-entity families (`oem-nvidia-power-management`), so a
+        // manager publishing the `Oem.Nvidia` power chain derives the
+        // data-card form through the wire projection, not by direct
+        // construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789af",
+                "display_name": "BlueField BMC",
+                "address": "https://192.0.2.14/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [
+                        oem_nvidia_power_compliance_resource(),
+                        oem_nvidia_power_domain_resource(),
+                        oem_nvidia_power_policy_resource(),
+                        oem_nvidia_managed_entity_group_resource(),
+                        oem_nvidia_power_state_group_resource(),
+                        oem_nvidia_psc_state_resource(),
+                        oem_nvidia_psu_state_resource(),
+                        oem_nvidia_psu_redundancy_resource(),
+                        oem_nvidia_managed_entity_resource()
+                    ]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("an NVIDIA power snapshot must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 9);
+        // The chain root card carries the compiled `ManagerType` spelling
+        // verbatim per §12.3.
+        let compliance = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance")
+            .ok_or("the PowerCompliance card must exist")?;
+        assert_eq!(compliance.type_label, "NVIDIA Power Compliance");
+        assert!(compliance.facts.contains(&ResourceFactProjection {
+            label: "Manager type",
+            value: "PowerManager".to_owned(),
+        }));
+        let domain = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1"
+            })
+            .ok_or("the power domain card must exist")?;
+        assert_eq!(domain.type_label, "NVIDIA Power Domain");
+        // The compiled scalar fields render verbatim per §12.3.
+        assert!(domain.facts.contains(&ResourceFactProjection {
+            label: "Value",
+            value: "800".to_owned(),
+        }));
+        assert!(domain.facts.contains(&ResourceFactProjection {
+            label: "Type",
+            value: "Above".to_owned(),
+        }));
+        assert!(domain.facts.contains(&ResourceFactProjection {
+            label: "Unit",
+            value: "Watts".to_owned(),
+        }));
+        assert!(domain.facts.contains(&ResourceFactProjection {
+            label: "Sensor reading type",
+            value: "Power".to_owned(),
+        }));
+        assert!(domain.facts.contains(&ResourceFactProjection {
+            label: "Sensor implementation",
+            value: "PhysicalSensor".to_owned(),
+        }));
+        let policy = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy"
+            })
+            .ok_or("the power policy card must exist")?;
+        assert_eq!(policy.type_label, "NVIDIA Power Policy");
+        assert!(policy.facts.contains(&ResourceFactProjection {
+            label: "Auto deassert power brake",
+            value: "true".to_owned(),
+        }));
+        assert!(policy.facts.contains(&ResourceFactProjection {
+            label: "Min",
+            value: "200".to_owned(),
+        }));
+        assert!(policy.facts.contains(&ResourceFactProjection {
+            label: "Max",
+            value: "600".to_owned(),
+        }));
+        assert!(policy.facts.contains(&ResourceFactProjection {
+            label: "Type",
+            value: "Inclusive".to_owned(),
+        }));
+        assert!(policy.facts.contains(&ResourceFactProjection {
+            label: "Policy actions",
+            value: "AssertPowerBrake".to_owned(),
+        }));
+        let group = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1"
+            })
+            .ok_or("the managed entity group card must exist")?;
+        assert_eq!(group.type_label, "NVIDIA Managed Entity Group");
+        assert!(group.facts.contains(&ResourceFactProjection {
+            label: "Current managed entity",
+            value: "BF1".to_owned(),
+        }));
+        let state_group = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup"
+            })
+            .ok_or("the power state group card must exist")?;
+        assert_eq!(state_group.type_label, "NVIDIA Power State Group");
+        assert!(state_group.facts.contains(&ResourceFactProjection {
+            label: "PSC ID",
+            value: "PSC1".to_owned(),
+        }));
+        assert!(state_group.facts.contains(&ResourceFactProjection {
+            label: "Generated watts",
+            value: "2400".to_owned(),
+        }));
+        assert!(state_group.facts.contains(&ResourceFactProjection {
+            label: "Number of PSCs",
+            value: "1".to_owned(),
+        }));
+        assert!(state_group.facts.contains(&ResourceFactProjection {
+            label: "Number of local PSUs",
+            value: "2".to_owned(),
+        }));
+        let psc = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1"
+            })
+            .ok_or("the PSC state card must exist")?;
+        assert_eq!(psc.type_label, "NVIDIA PSC State");
+        assert!(psc.facts.contains(&ResourceFactProjection {
+            label: "Operational PSUs",
+            value: "4".to_owned(),
+        }));
+        assert!(psc.facts.contains(&ResourceFactProjection {
+            label: "Power brake assert",
+            value: "false".to_owned(),
+        }));
+        assert!(psc.facts.contains(&ResourceFactProjection {
+            label: "Milliseconds since last heartbeat",
+            value: "12".to_owned(),
+        }));
+        assert!(psc.facts.contains(&ResourceFactProjection {
+            label: "Status",
+            value: "Operational".to_owned(),
+        }));
+        let psu = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1"
+            })
+            .ok_or("the PSU state card must exist")?;
+        assert_eq!(psu.type_label, "NVIDIA PSU State");
+        assert!(psu.facts.contains(&ResourceFactProjection {
+            label: "PSU ID",
+            value: "PSU1".to_owned(),
+        }));
+        assert!(psu.facts.contains(&ResourceFactProjection {
+            label: "Presence",
+            value: "true".to_owned(),
+        }));
+        assert!(psu.facts.contains(&ResourceFactProjection {
+            label: "Input 1 active",
+            value: "true".to_owned(),
+        }));
+        assert!(psu.facts.contains(&ResourceFactProjection {
+            label: "Input 2 active",
+            value: "false".to_owned(),
+        }));
+        let redundancy = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy"
+            })
+            .ok_or("the PSU redundancy card must exist")?;
+        assert_eq!(redundancy.type_label, "NVIDIA PSU Redundancy");
+        assert!(redundancy.facts.contains(&ResourceFactProjection {
+            label: "Max PSUs supported",
+            value: "4".to_owned(),
+        }));
+        assert!(redundancy.facts.contains(&ResourceFactProjection {
+            label: "Min PSUs needed",
+            value: "2".to_owned(),
+        }));
+        assert!(redundancy.facts.contains(&ResourceFactProjection {
+            label: "Redundancy setting",
+            value: "NPlusOne".to_owned(),
+        }));
+        let entity = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"
+            })
+            .ok_or("the managed entity card must exist")?;
+        assert_eq!(entity.type_label, "NVIDIA Managed Entity");
+        assert!(entity.facts.contains(&ResourceFactProjection {
+            label: "Transport protocol",
+            value: "HTTPS".to_owned(),
+        }));
+        assert!(entity.facts.contains(&ResourceFactProjection {
+            label: "IPv4 address",
+            value: "192.0.2.10".to_owned(),
+        }));
+        assert!(entity.facts.contains(&ResourceFactProjection {
+            label: "IPv6 address",
+            value: "2001:db8::10".to_owned(),
+        }));
+        assert!(entity.facts.contains(&ResourceFactProjection {
+            label: "Port",
+            value: "443".to_owned(),
+        }));
+        Ok(())
+    }
+
     #[test]
     fn oem_section_card_form_keeps_the_resource_card_surface() -> Result<(), Box<dyn Error>> {
         // Direct construction pins the switch condition and the card surface
@@ -16620,6 +18003,232 @@ mod tests {
             acknowledge_submission(3, "not json"),
             Err(OperationSubmitState::FAILURE_MESSAGE)
         );
+        Ok(())
+    }
+
+    /// One wire batch summary fixture with the given derived state code and
+    /// outcome buckets, pinned against the console contract.
+    fn batch_summary_fixture(
+        state: &str,
+        outcomes: &serde_json::Value,
+    ) -> Result<BatchSummaryResponse, serde_json::Error> {
+        serde_json::from_value(json!({
+            "batch_id": "01989abc-def0-7abc-8def-0123456789b1",
+            "source": "site",
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": state,
+            "outcomes": outcomes,
+            "created_at": "2026-08-06T09:10:11Z"
+        }))
+    }
+
+    /// The canonical outcome buckets of the batch fixtures: two successes,
+    /// one ordinary failure, one unsupported verdict, and one cancelled —
+    /// `total` six with one child still in flight.
+    fn batch_outcomes_fixture() -> serde_json::Value {
+        json!({
+            "succeeded": 2,
+            "failed": 1,
+            "unknown": 0,
+            "unsupported": 1,
+            "cancelled": 1,
+            "total": 6
+        })
+    }
+
+    #[test]
+    fn batch_state_view_labels_and_classes_pin_the_six_derived_verdicts() {
+        for (state, label, class) in [
+            (
+                BatchOperationStateResponse::Queued,
+                "Queued",
+                "operation-state operation-active",
+            ),
+            (
+                BatchOperationStateResponse::Running,
+                "Running",
+                "operation-state operation-active",
+            ),
+            (
+                BatchOperationStateResponse::Succeeded,
+                "Succeeded",
+                "operation-state operation-ok",
+            ),
+            (
+                BatchOperationStateResponse::Failed,
+                "Failed",
+                "operation-state operation-error",
+            ),
+            (
+                BatchOperationStateResponse::Unknown,
+                "Unknown",
+                "operation-state operation-off",
+            ),
+            (
+                BatchOperationStateResponse::Cancelled,
+                "Cancelled",
+                "operation-state operation-off",
+            ),
+        ] {
+            let view = BatchStateView::from(state);
+            assert_eq!(view.label(), label);
+            assert_eq!(view.class(), class);
+        }
+    }
+
+    #[test]
+    fn batch_card_projection_renders_the_server_derived_state_and_count_chips()
+    -> Result<(), Box<dyn Error>> {
+        let response = batch_summary_fixture("failed", &batch_outcomes_fixture())?;
+        let card = BatchCardProjection::from(&response);
+
+        assert_eq!(card.batch_id, "01989abc-def0-7abc-8def-0123456789b1");
+        assert_eq!(card.short_id, "01989abc");
+        // The derived verdict is the server's, rendered verbatim.
+        assert_eq!(card.state_label(), "Failed");
+        assert_eq!(card.state_class(), "operation-state operation-error");
+        assert_eq!(card.command.family, "System reset");
+        assert_eq!(card.command.payload, "PowerCycle");
+        assert_eq!(card.created_at_text, "2026-08-06T09:10:11Z");
+        // The five chips render the server counts verbatim in fixed order —
+        // the client never derives a batch outcome from the children.
+        let chips = card.outcomes.chips();
+        assert_eq!(
+            chips
+                .iter()
+                .map(|chip| (chip.label, chip.count))
+                .collect::<Vec<_>>(),
+            [
+                ("Succeeded", 2),
+                ("Failed", 1),
+                ("Unknown", 0),
+                ("Unsupported", 1),
+                ("Cancelled", 1),
+            ]
+        );
+        // The unsupported verdict is a distinct chip: it never masquerades as
+        // an ordinary failure count.
+        assert_eq!(chips[3].label, "Unsupported");
+        assert_eq!(chips[3].count, 1);
+        assert_eq!(chips[1].count, 1);
+        // The card starts with no children; the per-endpoint rows arrive with
+        // the detail fetch on first expand.
+        assert!(card.children.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_card_projection_parses_fixtures_for_all_six_derived_states()
+    -> Result<(), Box<dyn Error>> {
+        for (state_code, label, class) in [
+            ("queued", "Queued", "operation-state operation-active"),
+            ("running", "Running", "operation-state operation-active"),
+            ("succeeded", "Succeeded", "operation-state operation-ok"),
+            ("failed", "Failed", "operation-state operation-error"),
+            ("unknown", "Unknown", "operation-state operation-off"),
+            ("cancelled", "Cancelled", "operation-state operation-off"),
+        ] {
+            let response = batch_summary_fixture(state_code, &batch_outcomes_fixture())?;
+            let card = BatchCardProjection::from(&response);
+            assert_eq!(card.state_label(), label, "state code {state_code}");
+            assert_eq!(card.state_class(), class, "state code {state_code}");
+            assert_eq!(card.outcomes.chips()[3].count, 1, "state code {state_code}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_children_projection_pairs_every_endpoint_with_its_display_name()
+    -> Result<(), Box<dyn Error>> {
+        let inventory = inventory()?;
+        let detail = serde_json::from_value::<BatchDetailResponse>(json!({
+            "batch_id": "01989abc-def0-7abc-8def-0123456789b1",
+            "source": "site",
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": "running",
+            "outcomes": batch_outcomes_fixture(),
+            "created_at": "2026-08-06T09:10:11Z",
+            "children": [
+                {
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789b2",
+                    "source": "site",
+                    "targets": [
+                        {
+                            "target_id": "01989abc-def0-7abc-8def-0123456789b3",
+                            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab"
+                        }
+                    ],
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "state": "succeeded",
+                    "created_at": "2026-08-06T09:10:11Z",
+                    "updated_at": "2026-08-06T09:12:13Z"
+                },
+                {
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789b4",
+                    "source": "site",
+                    "targets": [
+                        {
+                            "target_id": "01989abc-def0-7abc-8def-0123456789b5",
+                            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ac"
+                        }
+                    ],
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "state": "failed",
+                    "created_at": "2026-08-06T09:10:11Z",
+                    "updated_at": "2026-08-06T09:12:13Z"
+                },
+                {
+                    "operation_id": "01989abc-def0-7abc-8def-0123456789b6",
+                    "source": "site",
+                    "targets": [
+                        {
+                            "target_id": "01989abc-def0-7abc-8def-0123456789b7",
+                            "endpoint_id": "01989abc-def0-7abc-8def-0123456789dd"
+                        }
+                    ],
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "state": "queued",
+                    "created_at": "2026-08-06T09:10:11Z",
+                    "updated_at": "2026-08-06T09:10:11Z"
+                }
+            ]
+        }))?;
+
+        let rows = batch_children_projection(&detail, &inventory);
+
+        assert_eq!(rows.len(), 3);
+        // The display names come from the loaded inventory, exactly like the
+        // operation form's target choices.
+        assert_eq!(rows[0].endpoint_id, "01989abc-def0-7abc-8def-0123456789ab");
+        assert_eq!(rows[0].display_name, "Rack A BMC");
+        assert_eq!(rows[0].state, OperationStateView::Succeeded);
+        assert_eq!(rows[1].endpoint_id, "01989abc-def0-7abc-8def-0123456789ac");
+        assert_eq!(rows[1].display_name, "Rack B BMC");
+        assert_eq!(rows[1].state, OperationStateView::Failed);
+        // An endpoint missing from the inventory falls back to its short id
+        // instead of inventing a name.
+        assert_eq!(rows[2].endpoint_id, "01989abc-def0-7abc-8def-0123456789dd");
+        assert_eq!(rows[2].display_name, "01989abc");
+        assert_eq!(rows[2].state, OperationStateView::Queued);
+        Ok(())
+    }
+
+    #[test]
+    fn batches_list_state_renders_static_messages_and_counts() -> Result<(), Box<dyn Error>> {
+        assert!(BatchesListState::Loading.is_loading());
+        assert!(BatchesListState::Failed.is_failed());
+        assert_eq!(BatchesListState::Loading.count_text(), "0 batches");
+        assert_eq!(BatchesListState::Failed.count_text(), "0 batches");
+        let empty = BatchesListState::Ready(Vec::new());
+        assert!(empty.is_ready());
+        assert!(empty.has_empty_list());
+        assert_eq!(empty.count_text(), "0 batches");
+        assert_eq!(empty.cards().len(), 0);
+        let response = batch_summary_fixture("failed", &batch_outcomes_fixture())?;
+        let one = BatchesListState::Ready(vec![BatchCardProjection::from(&response)]);
+        assert_eq!(one.count_text(), "1 batch");
+        assert!(!one.has_empty_list());
+        assert_eq!(one.cards().len(), 1);
         Ok(())
     }
 
