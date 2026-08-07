@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "app", "application", "domain", "entity", "infra-redfish", "migration", "operation-engine", "persistence", "platform", "security", "test-support", "ui", "web"]
+members = ["api", "app", "application", "center-protocol", "domain", "entity", "infra-redfish", "migration", "operation-engine", "persistence", "platform", "security", "test-support", "ui", "web"]
 default-members = ["app"]
 resolver = "3"
 
@@ -26,6 +26,9 @@ hmac = "0.13.0"
 http-body-util = "0.1.4"
 leptos = { version = "=0.8.20", default-features = false, features = ["csr"] }
 nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
+prost = "0.14.4"
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rust-embed = { version = "=8.11.0", features = ["debug-embed", "deterministic-timestamps"] }
@@ -35,6 +38,7 @@ rustls-webpki = { version = "0.103.13", default-features = false, features = ["a
 rutilus-api = { path = "api", version = "0.1.0" }
 rutilus-domain = { path = "domain", version = "0.1.0" }
 rutilus-application = { path = "application", version = "0.1.0" }
+rutilus-center-protocol = { path = "center-protocol", version = "0.1.0" }
 rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
 rutilus-entity = { path = "entity", version = "0.1.0" }
 rutilus-migration = { path = "migration", version = "0.1.0" }

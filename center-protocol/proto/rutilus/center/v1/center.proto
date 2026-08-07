@@ -1,0 +1,393 @@
+// Rutilus site-to-center protocol, version 1.
+//
+// This file is the complete wire contract between a Site deployment and the
+// Center aggregation service (design §15). Every WebSocket binary frame
+// carries exactly one `Envelope`; the `sequence` / `acked_sequence` pair
+// implements the §15.4 reliable outbox, and each oneof variant carries one
+// of the fifteen protocol messages.
+//
+// The message set is the §15.2 inventory plus `NegotiationResult`, the
+// fifteenth message that the 0.7.0 design pass added: the center answers
+// every `Hello` with a `NegotiationResult`, so a rejected site learns why
+// it cannot join without relying on a framing-level error.
+//
+// Wire stability rules:
+//   * Field numbers are permanent once shipped.
+//   * Enum value numbers are permanent once shipped; value zero is the
+//     unspecified variant that proto3 decodes when the field is absent.
+//   * String fields carry the stable product codes defined by
+//     `rutilus-domain` (for example `EndpointCapability::as_str` and
+//     `ResourceFeature::as_str`), never free-form labels, unless the field
+//     contract below says otherwise.
+
+syntax = "proto3";
+
+package rutilus.center.v1;
+
+// A WebSocket binary frame payload. Every frame carries exactly one
+// `Envelope`, and every `Envelope` carries exactly one message variant.
+message Envelope {
+  // Outbox sequence of this message (§15.4). Starts at 1 on each
+  // connection; the center acknowledges it with `Ack`.
+  uint64 sequence = 1;
+
+  // The highest outbox sequence the sender knows the peer has accepted.
+  // Each side piggybacks its acknowledgement on every frame it sends.
+  uint64 acked_sequence = 2;
+
+  // The protocol message carried by this frame. Field numbers start at 3
+  // because `sequence` and `acked_sequence` occupy 1 and 2; the variants
+  // follow the §15.2 message order.
+  oneof message {
+    Hello hello = 3;
+    NegotiationResult negotiation_result = 4;
+    CapabilityManifest capability_manifest = 5;
+    EndpointSnapshot endpoint_snapshot = 6;
+    ResourceDelta resource_delta = 7;
+    EventBatch event_batch = 8;
+    OperationOffer operation_offer = 9;
+    OperationAccepted operation_accepted = 10;
+    OperationRejected operation_rejected = 11;
+    OperationProgress operation_progress = 12;
+    OperationCompleted operation_completed = 13;
+    ArtifactManifest artifact_manifest = 14;
+    ArtifactChunk artifact_chunk = 15;
+    Ack ack = 16;
+    Heartbeat heartbeat = 17;
+  }
+}
+
+// The first frame a site sends after connecting (§15.3). Both sides
+// negotiate before any other message is exchanged.
+message Hello {
+  // Product version of the sender; recorded by the peer, never used to
+  // accept or reject a connection.
+  string product_version = 1;
+
+  // The protocol version the sender implements. The receiver rejects the
+  // connection when this differs from its own `CENTER_PROTOCOL_VERSION`.
+  uint32 center_protocol_version = 2;
+
+  // The pinned `nv-redfish` baseline of the sender. The receiver rejects
+  // the connection when this differs from its own baseline, because the
+  // capability ledger and every decoded resource are defined against it.
+  string nv_redfish_baseline = 3;
+
+  // SHA-256 of the concatenated `rutilus-domain` capability ledger codes
+  // in ledger order. The receiver rejects the connection when this differs
+  // from its own `capability_ledger_hash()`.
+  bytes capability_ledger_hash = 4;
+
+  // Stable identity of the site instance, generated at first startup.
+  string instance_id = 5;
+
+  // Operator-chosen display name of the site.
+  string site_name = 6;
+
+  // The last outbox sequence this site has accepted; the center resumes the
+  // reliable outbox from here after a reconnect (§15.4).
+  uint64 last_acked_sequence = 7;
+}
+
+// The center's answer to a `Hello` (§15.3). Added in the 0.7.0 design pass
+// as the fifteenth protocol message.
+message NegotiationResult {
+  // Whether the site may join the center.
+  bool accepted = 1;
+
+  // Why the site was rejected when `accepted` is false. Stable codes:
+  // `protocol-mismatch`, `baseline-mismatch`, `ledger-mismatch`; other
+  // codes may be added by later protocol versions.
+  string reason = 2;
+}
+
+// The complete capability ledger of a site: one entry per
+// `rutilus-domain` ledger capability, in ledger order.
+message CapabilityManifest {
+  // One capability ledger entry.
+  repeated CapabilityEntry capabilities = 1;
+
+  // Unix time (seconds) when this observation was completed.
+  int64 observed_at_unix = 2;
+}
+
+// One capability ledger entry.
+message CapabilityEntry {
+  // The stable `EndpointCapability::as_str` product code.
+  string code = 1;
+
+  // The highest §11.3 state layer the site can report for this capability.
+  CapabilityState state = 2;
+}
+
+// One layer of the §11.3 capability state machine. `UNKNOWN` is the proto3
+// zero value used when the sender has not established a state.
+enum CapabilityState {
+  CAPABILITY_STATE_UNKNOWN = 0;
+  CAPABILITY_STATE_COMPILED = 1;
+  CAPABILITY_STATE_ADVERTISED = 2;
+  CAPABILITY_STATE_USABLE = 3;
+}
+
+// The site-side projection of one endpoint (§15.5). The center stores the
+// summary; BMC credentials and session tokens never leave the site.
+message EndpointSnapshot {
+  // Stable `EndpointId` product code.
+  string endpoint_id = 1;
+
+  // Operator-chosen display name.
+  string display_name = 2;
+
+  // Management address of the BMC as configured on the site.
+  string address = 3;
+
+  // How the site trusts the endpoint TLS certificate.
+  TlsTrust trust = 4;
+
+  // The snapshot generation this projection belongs to; refreshes replace
+  // projections with an older generation.
+  uint64 refresh_generation = 5;
+
+  // The typed resources read from this endpoint.
+  repeated ResourceSummary resources = 6;
+
+  // Endpoint health code (for example `ok`, `degraded`, `unreachable`);
+  // the vocabulary is defined by the center data layer.
+  string health = 7;
+}
+
+// How the site trusts an endpoint TLS certificate. Mirrors
+// `rutilus_domain::TlsTrust` one-to-one.
+enum TlsTrust {
+  TLS_TRUST_UNSPECIFIED = 0;
+  // Verified through system CA validation.
+  TLS_TRUST_SYSTEM_CA = 1;
+  // Explicitly pinned by an administrator.
+  TLS_TRUST_PINNED_CERTIFICATE = 2;
+}
+
+// A typed resource read from an endpoint.
+message ResourceSummary {
+  // The stable `ResourceFeature::as_str` family code.
+  string feature = 1;
+
+  // The Redfish `@odata.id` of the resource.
+  string odata_id = 2;
+
+  // The Redfish `@odata.type` of the resource.
+  string odata_type = 3;
+
+  // The Redfish ETag observed when the resource was read.
+  string etag = 4;
+
+  // The snapshot generation this summary belongs to.
+  uint64 generation = 5;
+}
+
+// An incremental update to one resource projection (§15.5). The center
+// applies `UPSERT` or `DELETE` to the projection identified by
+// `endpoint_id` plus `resource.odata_id`.
+message ResourceDelta {
+  // Stable `EndpointId` product code.
+  string endpoint_id = 1;
+
+  // How the delta applies to the center projection.
+  ResourceDeltaOp op = 2;
+
+  // The resource this delta changes.
+  ResourceSummary resource = 3;
+
+  // The raw decoded resource JSON document; `DELETE` deltas leave this
+  // empty. Stored as bytes so an invalid UTF-8 payload never breaks the
+  // wire.
+  bytes payload_json = 4;
+
+  // Unix time (seconds) when the site observed the change.
+  int64 observed_at_unix = 5;
+}
+
+// How a `ResourceDelta` applies to the center projection.
+enum ResourceDeltaOp {
+  RESOURCE_DELTA_OP_UNSPECIFIED = 0;
+  RESOURCE_DELTA_OP_UPSERT = 1;
+  RESOURCE_DELTA_OP_DELETE = 2;
+}
+
+// A batch of events collected by the site (§15.5).
+message EventBatch {
+  // The collected events.
+  repeated EventRecord events = 1;
+}
+
+// One event observed by the site.
+message EventRecord {
+  // Stable `EventId` product code.
+  string event_id = 1;
+
+  // The Redfish `MessageId` of the event, for example
+  // `ResourceEvent.1.0.ResourceUpdated`.
+  string message_id = 2;
+
+  // Severity of the event.
+  EventSeverity severity = 3;
+
+  // The Redfish target the event reports on.
+  string target = 4;
+
+  // Unix time (seconds) when the event occurred.
+  int64 occurred_at_unix = 5;
+
+  // The raw event JSON document; stored as bytes so an invalid UTF-8
+  // payload never breaks the wire.
+  bytes payload_json = 6;
+}
+
+// Severity of one event. Maps one-to-one to `rutilus_domain::EventSeverity`.
+enum EventSeverity {
+  EVENT_SEVERITY_UNSPECIFIED = 0;
+  EVENT_SEVERITY_OK = 1;
+  EVENT_SEVERITY_WARNING = 2;
+  EVENT_SEVERITY_CRITICAL = 3;
+}
+
+// A center-initiated operation offer (§15.6). The site re-checks every
+// precondition and only `OperationAccepted` transfers execution
+// responsibility; the offer is void after `expires_at_unix`.
+message OperationOffer {
+  // Stable `OperationId` product code; the site treats an offer with an
+  // id it already accepted as a duplicate and returns the existing state.
+  string operation_id = 1;
+
+  // Stable `EndpointId` product code of the target endpoint.
+  string endpoint_id = 2;
+
+  // Stable `SiteId` product code of the offering site.
+  string site_id = 3;
+
+  // The serialized `RedfishCommand` JSON document. The site never receives
+  // a URL, HTTP method, headers, body, or script — only the typed command.
+  bytes command_json = 4;
+
+  // The typed command target.
+  string target = 5;
+
+  // Unix time (seconds) after which the site must reject the offer as
+  // expired.
+  int64 expires_at_unix = 6;
+
+  // Actor context of the operator who initiated the operation, for audit.
+  string actor_context = 7;
+}
+
+// The site's acceptance of an `OperationOffer` (§15.6).
+message OperationAccepted {
+  // Stable `OperationId` product code of the accepted offer.
+  string operation_id = 1;
+
+  // Unix time (seconds) when the site accepted the offer.
+  int64 accepted_at_unix = 2;
+}
+
+// The site's refusal of an `OperationOffer` (§15.6).
+message OperationRejected {
+  // Stable `OperationId` product code of the rejected offer.
+  string operation_id = 1;
+
+  // The §15.6 re-check that failed.
+  OperationRejectedReason reason = 2;
+
+  // Human-readable detail about the rejection.
+  string detail = 3;
+}
+
+// Why the site refused an `OperationOffer`: the §15.6 re-checks plus
+// authorization and command-validity checks. The §15.6 checklist lists
+// endpoint existence, capability presence, credential validity, target
+// state applicability, and expiration; `NOT_AUTHORIZED` and
+// `INVALID_COMMAND` extend it with the operator-authorization and
+// command-validity checks the site performs before acceptance.
+enum OperationRejectedReason {
+  OPERATION_REJECTED_REASON_UNSPECIFIED = 0;
+  // The endpoint no longer exists on the site.
+  OPERATION_REJECTED_REASON_ENDPOINT_MISSING = 1;
+  // The required capability is no longer present on the endpoint.
+  OPERATION_REJECTED_REASON_CAPABILITY_MISSING = 2;
+  // The stored credential is no longer valid.
+  OPERATION_REJECTED_REASON_CREDENTIAL_INVALID = 3;
+  // The target state changed and the preconditions no longer hold.
+  OPERATION_REJECTED_REASON_TARGET_STATE_CHANGED = 4;
+  // The offer expired before the site could check it.
+  OPERATION_REJECTED_REASON_EXPIRED = 5;
+  // The actor is no longer authorized for this operation.
+  OPERATION_REJECTED_REASON_NOT_AUTHORIZED = 6;
+  // The command is not valid for the current endpoint state.
+  OPERATION_REJECTED_REASON_INVALID_COMMAND = 7;
+}
+
+// Progress of an accepted operation, streamed from site to center.
+message OperationProgress {
+  // Stable `OperationId` product code of the operation.
+  string operation_id = 1;
+
+  // The current `rutilus_domain::OperationState::as_str` code.
+  string state = 2;
+
+  // Human-readable detail about the progress.
+  string detail = 3;
+}
+
+// The final outcome of an accepted operation.
+message OperationCompleted {
+  // Stable `OperationId` product code of the operation.
+  string operation_id = 1;
+
+  // Whether the operation achieved its result.
+  bool succeeded = 2;
+
+  // Summary of the outcome, for example the verified result or the
+  // failure reason.
+  string summary = 3;
+}
+
+// Metadata of an artifact transfer (for example an encrypted backup).
+message ArtifactManifest {
+  // Stable `ArtifactId` product code of the artifact.
+  string artifact_id = 1;
+
+  // Operator-chosen name of the artifact.
+  string name = 2;
+
+  // Total size of the artifact in bytes; the receiver rejects a transfer
+  // whose chunks do not add up to this value.
+  uint64 total_bytes = 3;
+
+  // SHA-256 of the complete artifact; the receiver verifies the transfer
+  // against this digest.
+  bytes sha256 = 4;
+}
+
+// One chunk of an artifact transfer. Chunks are ordered by `index`, which
+// starts at 0.
+message ArtifactChunk {
+  // Stable `ArtifactId` product code of the artifact.
+  string artifact_id = 1;
+
+  // Zero-based index of this chunk within the artifact.
+  uint32 index = 2;
+
+  // The chunk payload.
+  bytes data = 3;
+}
+
+// Acknowledgement of one outbox sequence (§15.4).
+message Ack {
+  // The outbox sequence this message acknowledges.
+  uint64 sequence = 1;
+}
+
+// Liveness signal from a site (§15.2). The center declares the connection
+// dead when no frame arrives within the disconnect window.
+message Heartbeat {
+  // Unix time (seconds) when the site sent this heartbeat.
+  int64 sent_at_unix = 1;
+}

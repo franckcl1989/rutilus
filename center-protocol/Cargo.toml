@@ -1,0 +1,23 @@
+[package]
+name = "rutilus-center-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# sha2 implements the capability-ledger hash that version negotiation
+# compares (§15.3); the design's "only prost + rutilus-domain" constraint
+# cannot satisfy the SHA-256 requirement without it.
+prost.workspace = true
+rutilus-domain.workspace = true
+sha2.workspace = true
+
+[build-dependencies]
+# `protoc-bin-vendored` ships a Google-built `protoc` binary inside the
+# crate, so no system `protoc` and no C++ toolchain is required (design §8).
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[lints]
+workspace = true
