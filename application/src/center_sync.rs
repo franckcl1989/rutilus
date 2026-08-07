@@ -28,28 +28,43 @@
 //! the next connection resumes from the last acknowledgment, so no shutdown
 //! sequence needs to complete a half-sent batch.
 
-use std::{collections::VecDeque, error::Error, future::Future, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    error::Error,
+    future::Future,
+    time::Duration,
+};
 
 use rutilus_center_protocol::{
-    Envelope, EnvelopeMessage, Heartbeat, OperationOffer, OperationRejectedReason,
-    SITE_HEARTBEAT_INTERVAL, SITE_RECONNECT_AFTER,
+    ArtifactChunk, ArtifactManifest, EndpointSnapshot, Envelope, EnvelopeMessage, EventBatch,
+    EventRecord, EventSeverity as WireEventSeverity, Heartbeat, OperationOffer,
+    OperationRejectedReason, ResourceDelta, ResourceDeltaOp, ResourceSummary,
+    SITE_HEARTBEAT_INTERVAL, SITE_RECONNECT_AFTER, TlsTrust as WireTlsTrust,
 };
 use rutilus_domain::{
-    CapabilityState, EndpointId, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId,
-    Operation, OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry,
-    OutboxEntryId, RedfishCommand, TargetId,
+    ArtifactId, ArtifactState, CapabilityState, EndpointId, Event, EventId, EventSeverity,
+    InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation, OperationId,
+    OperationSource, OperationState, OperationTarget, OutboxEntry, OutboxEntryId, RedfishCommand,
+    RefreshGeneration, SyncCursor, SyncCursorId, SyncStream, TargetId, TlsTrust,
 };
 use rutilus_operation_engine::OperationStore;
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    BoundaryFuture, CapabilityQueryRepository, Clock, CredentialInventoryRepository,
-    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointInventoryQuery,
-    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointRefreshRepository,
+    ArtifactRepository, BoundaryFuture, CapabilityQueryRepository, Clock,
+    CredentialInventoryRepository, EndpointCapabilityQuery, EndpointCapabilityQueryError,
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
+    EndpointInventoryRepository, EndpointRefreshRepository,
     center_transport::{CenterSession, CenterTransport},
     operation_executor::{required_capability, required_capability_state},
 };
+
+/// The chunk size of one center artifact transfer: 1 MiB of payload per
+/// [`ArtifactChunk`] frame, far below the protocol frame limit
+/// ([`rutilus_center_protocol::MAX_FRAME_BYTES`]) with room for the envelope
+/// overhead, so a chunk never risks an `EncodeLimit` refusal.
+pub const CENTER_ARTIFACT_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// The durable outbox boundary of the site-to-center synchronization
 /// (design §17 D4, §15.4).
@@ -202,6 +217,87 @@ where
     }
 }
 
+/// The per-stream sync cursor boundary of the site-to-center
+/// synchronization (design §17).
+///
+/// Each §17 stream (`endpoint`, `health`, `event`, `artifact`) carries one
+/// monotonic cursor per instance, so a reconnect resumes reporting where the
+/// last batch ended — the §21 0.7.0 incremental sync.
+pub trait CenterCursor: Send + Sync {
+    /// The repository's controlled failure type.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Reads the cursor of one stream; `None` when the stream was never
+    /// reported.
+    fn get(
+        &self,
+        instance_id: InstanceId,
+        stream: SyncStream,
+    ) -> BoundaryFuture<'_, Result<Option<SyncCursor>, Self::Error>>;
+
+    /// Stores the cursor of one stream (insert or replace).
+    fn set<'a>(&'a self, cursor: &'a SyncCursor) -> BoundaryFuture<'a, Result<(), Self::Error>>;
+}
+
+impl<Cursor> CenterCursor for &Cursor
+where
+    Cursor: CenterCursor + ?Sized,
+{
+    type Error = Cursor::Error;
+
+    fn get(
+        &self,
+        instance_id: InstanceId,
+        stream: SyncStream,
+    ) -> BoundaryFuture<'_, Result<Option<SyncCursor>, Self::Error>> {
+        Cursor::get(*self, instance_id, stream)
+    }
+
+    fn set<'a>(&'a self, cursor: &'a SyncCursor) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Cursor::set(*self, cursor)
+    }
+}
+
+/// The bounded event tail boundary of the §21 0.7.0 event reporting.
+///
+/// `list_recent` is the first sync (the newest bounded tail, §14.4 bounded
+/// history); `list_after` is the incremental resume — the events strictly
+/// after the cursor, oldest first, so a batch is contiguous and no event is
+/// skipped or reported twice.
+pub trait CenterEventTail: Send + Sync {
+    /// The repository's controlled failure type.
+    type Error: Error + Send + Sync + 'static;
+
+    /// The newest events first, bounded by `limit`.
+    fn list_recent(&self, limit: u64) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>>;
+
+    /// The events strictly after `after`, oldest first, bounded by `limit`.
+    fn list_after(
+        &self,
+        after: EventId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>>;
+}
+
+impl<EventTail> CenterEventTail for &EventTail
+where
+    EventTail: CenterEventTail + ?Sized,
+{
+    type Error = EventTail::Error;
+
+    fn list_recent(&self, limit: u64) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        EventTail::list_recent(*self, limit)
+    }
+
+    fn list_after(
+        &self,
+        after: EventId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        EventTail::list_after(*self, after, limit)
+    }
+}
+
 /// The decision of the §15.6 rechecks for one operation offer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OfferDecision {
@@ -252,6 +348,10 @@ pub struct CenterSyncOptions {
     /// How many pending outbox entries one flush sends before the next
     /// acknowledgement is needed. Bounds one burst on the wire.
     pub flush_limit: u64,
+    /// The bounded event batch of one §21 0.7.0 event report.
+    pub event_batch_limit: u64,
+    /// The chunk size of one center artifact transfer.
+    pub artifact_chunk_bytes: usize,
 }
 
 impl Default for CenterSyncOptions {
@@ -260,6 +360,8 @@ impl Default for CenterSyncOptions {
             heartbeat_interval: SITE_HEARTBEAT_INTERVAL,
             reconnect_after: SITE_RECONNECT_AFTER,
             flush_limit: 64,
+            event_batch_limit: 256,
+            artifact_chunk_bytes: CENTER_ARTIFACT_CHUNK_BYTES,
         }
     }
 }
@@ -270,34 +372,43 @@ impl Default for CenterSyncOptions {
 /// `CenterClient` in the runtime slice), `Outbox` the durable §15.4 queue
 /// boundary, and `Time` the caller's monotonic clock, supplied at the
 /// boundary exactly like every other use case.
-pub struct CenterSync<Transport, Store, Outbox, Inbox, Time> {
+pub struct CenterSync<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time> {
     transport: Transport,
     store: Store,
     outbox: Outbox,
     inbox: Inbox,
+    cursor: Cursor,
+    events: EventTail,
     clock: Time,
     instance_id: InstanceId,
     options: CenterSyncOptions,
 }
 
-impl<Transport, Store, Outbox, Inbox, Time> CenterSync<Transport, Store, Outbox, Inbox, Time>
+impl<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time>
+    CenterSync<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time>
 where
     Transport: CenterTransport,
     Store: OperationStore
         + EndpointRefreshRepository
         + CapabilityQueryRepository
         + CredentialInventoryRepository
-        + EndpointInventoryRepository,
+        + EndpointInventoryRepository
+        + ArtifactRepository,
     Outbox: CenterOutbox,
     Inbox: CenterInbox,
+    Cursor: CenterCursor,
+    EventTail: CenterEventTail,
     Time: Clock,
 {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         transport: Transport,
         store: Store,
         outbox: Outbox,
         inbox: Inbox,
+        cursor: Cursor,
+        events: EventTail,
         clock: Time,
         instance_id: InstanceId,
         options: CenterSyncOptions,
@@ -307,6 +418,8 @@ where
             store,
             outbox,
             inbox,
+            cursor,
+            events,
             clock,
             instance_id,
             options,
@@ -325,7 +438,8 @@ where
     pub async fn enqueue_outbox_entry(
         &self,
         message: EnvelopeMessage,
-    ) -> Result<OutboxEntry, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OutboxEntry, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         self.outbox
             .enqueue(self.instance_id, &message, self.clock.now())
             .await
@@ -348,7 +462,7 @@ where
     pub async fn run<Stop>(
         &self,
         stop: Stop,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>>
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
     where
         Stop: Future<Output = ()> + Send,
     {
@@ -361,7 +475,7 @@ where
     async fn connect_loop<Stop>(
         &self,
         stop: Stop,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>>
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
     where
         Stop: Future<Output = ()> + Send,
     {
@@ -414,7 +528,7 @@ where
         &self,
         mut session: Session,
         stop: Stop,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>>
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
     where
         Session: CenterSession<Error = Transport::Error>,
         Stop: Future<Output = ()> + Send,
@@ -433,9 +547,10 @@ where
         // connection; unacknowledged entries stay pending and the reconnect
         // flush re-sends them from the last acknowledgement (§15.4).
         let mut sent: VecDeque<(OutboxEntryId, i64)> = VecDeque::new();
-        // The center-operation result reporting enqueues its replies before
-        // the flush, so one batch carries both.
+        // The operation results and the incremental data reporting enqueue
+        // before the flush, so one batch carries them all.
         self.report_center_operations().await?;
+        self.report_incremental_sync().await?;
         self.flush_outbox(&mut session, &mut sent, peer_acked)
             .await?;
         loop {
@@ -488,7 +603,7 @@ where
         session: &mut Session,
         sent: &mut VecDeque<(OutboxEntryId, i64)>,
         peer_acked: u64,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>>
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
     where
         Session: CenterSession<Error = Transport::Error>,
     {
@@ -532,7 +647,7 @@ where
         &self,
         acked_sequence: u64,
         sent: &mut VecDeque<(OutboxEntryId, i64)>,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
         let now = self.clock.now();
         while let Some(&(entry_id, sequence)) = sent.front() {
             let wire_sequence = u64::try_from(sequence)
@@ -564,7 +679,8 @@ where
         &self,
         offer: &OperationOffer,
         received: &Envelope,
-    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         // The wire contract says these fields carry stable product codes; an
         // offer addressed to another site or carrying unparseable ids cannot
         // be recorded and is dropped with a log instead of being guessed at.
@@ -634,7 +750,8 @@ where
         entry: &InboxEntry,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
-    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         let operation_id = entry.operation_id();
         match self.decide_offer(offer, entry, endpoint_id, now).await? {
             OfferDecision::Accept { command } => {
@@ -698,7 +815,8 @@ where
         entry: &InboxEntry,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
-    ) -> Result<OfferDecision, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OfferDecision, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         let Some(endpoint) = self
             .store
             .find_endpoint(endpoint_id)
@@ -788,7 +906,8 @@ where
         entry: &InboxEntry,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
-    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         let operation_id = entry.operation_id();
         let Some(operation) = self
             .store
@@ -842,7 +961,8 @@ where
         endpoint_id: EndpointId,
         state: InboxEntryState,
         now: OffsetDateTime,
-    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<OfferOutcome, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>>
+    {
         let operation_id = entry.operation_id();
         match state {
             InboxEntryState::Rejected => {
@@ -903,7 +1023,7 @@ where
     /// are skipped on the next connection.
     async fn report_center_operations(
         &self,
-    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox>> {
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
         let operations = self
             .store
             .list_operations(None)
@@ -960,6 +1080,340 @@ where
         Ok(())
     }
 
+    /// Reports the §21 0.7.0 incremental data to the center: the endpoint
+    /// projections whose refresh generation advanced, the bounded event
+    /// tail, and the ready artifacts. Every report is cursor-gated — the
+    /// §17 per-stream cursors advance as the content is enqueued, and the
+    /// durable outbox guarantees delivery — so a reconnect reports exactly
+    /// what the center has not seen yet.
+    async fn report_incremental_sync(
+        &self,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        self.report_endpoint_projection().await?;
+        self.report_event_batch().await?;
+        self.report_artifacts().await?;
+        Ok(())
+    }
+
+    /// Reports every endpoint whose refresh generation advanced past the
+    /// `endpoint` stream cursor: one [`EndpointSnapshot`] with the full
+    /// projection and one [`ResourceDelta`] per resource of the new
+    /// generation. The cursor is the `endpoint-id:generation` watermark of
+    /// every endpoint, so an unchanged generation reports nothing.
+    async fn report_endpoint_projection(
+        &self,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let cursor = self
+            .cursor
+            .get(self.instance_id, SyncStream::Endpoint)
+            .await
+            .map_err(CenterSyncError::Cursor)?;
+        let mut watermark = match cursor.as_ref() {
+            Some(cursor) => parse_endpoint_cursor(cursor.cursor_value()).map_err(|source| {
+                CenterSyncError::InvalidCursor {
+                    stream: SyncStream::Endpoint,
+                    source,
+                }
+            })?,
+            None => BTreeMap::new(),
+        };
+        let items = EndpointInventoryQuery::new(&self.store)
+            .execute()
+            .await
+            .map_err(CenterSyncError::Inventory)?;
+        let mut changed = false;
+        for item in items {
+            let endpoint_id = item.endpoint().id();
+            let generation = item.generation().map_or(0, RefreshGeneration::get);
+            let reported = watermark.get(&endpoint_id).copied();
+            if reported.is_none() || reported < Some(generation) {
+                changed = true;
+                self.enqueue_endpoint_snapshot(&item, generation).await?;
+                for resource in item.resources() {
+                    self.enqueue_resource_delta(&item, resource, generation)
+                        .await?;
+                }
+                watermark.insert(endpoint_id, generation);
+            }
+        }
+        if changed {
+            let now = self.clock.now();
+            let value = format_endpoint_cursor(&watermark);
+            self.cursor
+                .set(&SyncCursor::new(
+                    SyncCursorId::generate(),
+                    self.instance_id,
+                    SyncStream::Endpoint,
+                    value,
+                    now,
+                ))
+                .await
+                .map_err(CenterSyncError::Cursor)?;
+        }
+        Ok(())
+    }
+
+    /// Enqueues one [`EndpointSnapshot`]: the site-side projection of the
+    /// endpoint (§15.5 — the center never sees credentials or sessions).
+    /// The health field is the first cut of the vocabulary: `ok` after the
+    /// first completed refresh, `unknown` before it.
+    async fn enqueue_endpoint_snapshot(
+        &self,
+        item: &EndpointInventoryItem,
+        generation: u64,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let endpoint = item.endpoint();
+        let resources = item
+            .resources()
+            .iter()
+            .map(|resource| ResourceSummary {
+                feature: resource.feature().as_str().to_owned(),
+                odata_id: resource.odata_id().as_str().to_owned(),
+                odata_type: resource
+                    .odata_type()
+                    .map_or_else(String::new, |odata_type| odata_type.as_str().to_owned()),
+                etag: resource
+                    .etag()
+                    .map_or_else(String::new, |etag| etag.as_str().to_owned()),
+                generation,
+            })
+            .collect();
+        let trust = match endpoint.trust() {
+            TlsTrust::SystemCa { .. } => WireTlsTrust::SystemCa,
+            TlsTrust::PinnedCertificate { .. } => WireTlsTrust::PinnedCertificate,
+        };
+        self.enqueue_outbox_entry(EnvelopeMessage::EndpointSnapshot(EndpointSnapshot {
+            endpoint_id: endpoint.id().to_string(),
+            display_name: endpoint.display_name().as_str().to_owned(),
+            address: endpoint.address().as_url().to_string(),
+            trust: trust as i32,
+            refresh_generation: generation,
+            resources,
+            health: if generation == 0 {
+                String::from("unknown")
+            } else {
+                String::from("ok")
+            },
+        }))
+        .await
+        .map(|_| ())
+    }
+
+    /// Enqueues one [`ResourceDelta`] upsert for a resource of the new
+    /// generation, carrying the raw decoded resource document.
+    async fn enqueue_resource_delta(
+        &self,
+        item: &EndpointInventoryItem,
+        resource: &rutilus_domain::ResourceSnapshot,
+        generation: u64,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        self.enqueue_outbox_entry(EnvelopeMessage::ResourceDelta(ResourceDelta {
+            endpoint_id: item.endpoint().id().to_string(),
+            op: ResourceDeltaOp::Upsert as i32,
+            resource: Some(ResourceSummary {
+                feature: resource.feature().as_str().to_owned(),
+                odata_id: resource.odata_id().as_str().to_owned(),
+                odata_type: resource
+                    .odata_type()
+                    .map_or_else(String::new, |odata_type| odata_type.as_str().to_owned()),
+                etag: resource
+                    .etag()
+                    .map_or_else(String::new, |etag| etag.as_str().to_owned()),
+                generation,
+            }),
+            payload_json: resource.payload().as_str().as_bytes().to_vec(),
+            observed_at_unix: resource.observed_at().unix_timestamp(),
+        }))
+        .await
+        .map(|_| ())
+    }
+
+    /// Reports the bounded event tail: the newest events on the first sync,
+    /// then everything after the `event` stream cursor. The cursor advances
+    /// to the newest reported event, so the next batch is exactly the events
+    /// in between. The domain event model does not persist the Redfish
+    /// target or the raw event document, so those wire fields stay empty in
+    /// this cut.
+    async fn report_event_batch(
+        &self,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let cursor = self
+            .cursor
+            .get(self.instance_id, SyncStream::Event)
+            .await
+            .map_err(CenterSyncError::Cursor)?;
+        let (events, newest_id) = if let Some(cursor) = cursor.as_ref() {
+            let anchor = cursor.cursor_value().parse::<EventId>().map_err(|_| {
+                CenterSyncError::InvalidCursor {
+                    stream: SyncStream::Event,
+                    source: StoredCursorError::InvalidId,
+                }
+            })?;
+            let events = self
+                .events
+                .list_after(anchor, self.options.event_batch_limit)
+                .await
+                .map_err(CenterSyncError::Events)?;
+            let newest_id = events.last().map(Event::id);
+            (events, newest_id)
+        } else {
+            let events = self
+                .events
+                .list_recent(self.options.event_batch_limit)
+                .await
+                .map_err(CenterSyncError::Events)?;
+            let newest_id = events.first().map(Event::id);
+            (events, newest_id)
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+        let records = events
+            .iter()
+            .map(|event| EventRecord {
+                event_id: event.id().to_string(),
+                message_id: event.message_id().as_str().to_owned(),
+                severity: match event.severity() {
+                    EventSeverity::Ok => WireEventSeverity::Ok,
+                    EventSeverity::Warning => WireEventSeverity::Warning,
+                    EventSeverity::Critical => WireEventSeverity::Critical,
+                } as i32,
+                target: String::new(),
+                occurred_at_unix: event.event_timestamp().unix_timestamp(),
+                payload_json: Vec::new(),
+            })
+            .collect();
+        self.enqueue_outbox_entry(EnvelopeMessage::EventBatch(EventBatch { events: records }))
+            .await?;
+        let now = self.clock.now();
+        self.cursor
+            .set(&SyncCursor::new(
+                SyncCursorId::generate(),
+                self.instance_id,
+                SyncStream::Event,
+                newest_id.map(|event_id| event_id.to_string()).ok_or(
+                    CenterSyncError::InvalidCursor {
+                        stream: SyncStream::Event,
+                        source: StoredCursorError::InvalidId,
+                    },
+                )?,
+                now,
+            ))
+            .await
+            .map_err(CenterSyncError::Cursor)?;
+        Ok(())
+    }
+
+    /// Reports every ready artifact not yet distributed to the center: one
+    /// [`ArtifactManifest`] followed by the [`ArtifactChunk`] frames of the
+    /// artifact bytes, chunked at [`CENTER_ARTIFACT_CHUNK_BYTES`]. The
+    /// `artifact` stream cursor is the last distributed artifact id.
+    async fn report_artifacts(
+        &self,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let cursor = self
+            .cursor
+            .get(self.instance_id, SyncStream::Artifact)
+            .await
+            .map_err(CenterSyncError::Cursor)?;
+        let anchor = match cursor.as_ref() {
+            Some(cursor) => Some(cursor.cursor_value().parse::<ArtifactId>().map_err(|_| {
+                CenterSyncError::InvalidCursor {
+                    stream: SyncStream::Artifact,
+                    source: StoredCursorError::InvalidId,
+                }
+            })?),
+            None => None,
+        };
+        let anchor_created_at = match anchor {
+            Some(anchor_id) => {
+                let artifact = self
+                    .store
+                    .find_artifact(anchor_id)
+                    .await
+                    .map_err(CenterSyncError::Artifact)?
+                    .ok_or(CenterSyncError::InvalidCursor {
+                        stream: SyncStream::Artifact,
+                        source: StoredCursorError::InvalidId,
+                    })?;
+                Some(artifact.created_at())
+            }
+            None => None,
+        };
+        let ready = self
+            .store
+            .list_artifacts_by_state(ArtifactState::Ready)
+            .await
+            .map_err(CenterSyncError::Artifact)?;
+        let mut newest_distributed = None;
+        for artifact in ready {
+            let after_anchor = match (anchor_created_at, anchor) {
+                (Some(anchor_created_at), Some(anchor_id)) => {
+                    artifact.created_at() > anchor_created_at
+                        || (artifact.created_at() == anchor_created_at && artifact.id() > anchor_id)
+                }
+                _ => true,
+            };
+            if !after_anchor {
+                continue;
+            }
+            self.distribute_artifact(&artifact).await?;
+            newest_distributed = Some(artifact.id());
+        }
+        if let Some(newest) = newest_distributed {
+            let now = self.clock.now();
+            self.cursor
+                .set(&SyncCursor::new(
+                    SyncCursorId::generate(),
+                    self.instance_id,
+                    SyncStream::Artifact,
+                    newest.to_string(),
+                    now,
+                ))
+                .await
+                .map_err(CenterSyncError::Cursor)?;
+        }
+        Ok(())
+    }
+
+    /// Enqueues the manifest and the chunk frames of one ready artifact.
+    /// The artifact bytes are read under `spawn_blocking` (design §7.8).
+    async fn distribute_artifact(
+        &self,
+        artifact: &rutilus_domain::Artifact,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let path = self.store.artifact_file_path(artifact.id());
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .map_err(|source| CenterSyncError::ArtifactRead {
+                artifact_id: artifact.id(),
+                source: std::io::Error::other(source.to_string()),
+            })?
+            .map_err(|source| CenterSyncError::ArtifactRead {
+                artifact_id: artifact.id(),
+                source,
+            })?;
+        self.enqueue_outbox_entry(EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+            artifact_id: artifact.id().to_string(),
+            name: artifact.name().as_str().to_owned(),
+            total_bytes: artifact.size_bytes(),
+            sha256: artifact.sha256().into_bytes().to_vec(),
+        }))
+        .await?;
+        let chunk_bytes = self.options.artifact_chunk_bytes;
+        for (index, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+            self.enqueue_outbox_entry(EnvelopeMessage::ArtifactChunk(ArtifactChunk {
+                artifact_id: artifact.id().to_string(),
+                index: u32::try_from(index).map_err(|_| CenterSyncError::SequenceOverflow {
+                    sequence: i64::try_from(index).unwrap_or(i64::MAX),
+                })?,
+                data: chunk.to_vec(),
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Handles one inbound envelope from the center. The reliable outbox
     /// (acknowledgements) and the operation offers arrive in later slices;
     /// every other message — and every message this build does not act on —
@@ -998,8 +1452,11 @@ pub enum CenterSyncError<
     CapabilityError,
     CredentialError,
     InventoryError,
+    ArtifactError,
     OutboxError,
     InboxError,
+    CursorError,
+    EventTailError,
 > where
     TransportError: Error + 'static,
     OperationStoreError: Error + 'static,
@@ -1007,8 +1464,11 @@ pub enum CenterSyncError<
     CapabilityError: Error + 'static,
     CredentialError: Error + 'static,
     InventoryError: Error + 'static,
+    ArtifactError: Error + 'static,
     OutboxError: Error + 'static,
     InboxError: Error + 'static,
+    CursorError: Error + 'static,
+    EventTailError: Error + 'static,
 {
     /// The transport boundary failed; carries the transport's own error.
     #[error("the center transport failed: {0}")]
@@ -1033,6 +1493,10 @@ pub enum CenterSyncError<
     /// the query's own error.
     #[error("the endpoint inventory failed: {0}")]
     Inventory(#[source] EndpointInventoryQueryError<InventoryError>),
+    /// The artifact store boundary failed; carries the repository's own
+    /// error.
+    #[error("the artifact store failed: {0}")]
+    Artifact(#[source] ArtifactError),
     /// The durable outbox boundary failed; carries the repository's own
     /// error.
     #[error("the center outbox failed: {0}")]
@@ -1041,6 +1505,19 @@ pub enum CenterSyncError<
     /// error.
     #[error("the center inbox failed: {0}")]
     Inbox(#[source] InboxError),
+    /// The sync cursor boundary failed; carries the repository's own error.
+    #[error("the sync cursor failed: {0}")]
+    Cursor(#[source] CursorError),
+    /// The event tail boundary failed; carries the repository's own error.
+    #[error("the event tail failed: {0}")]
+    Events(#[source] EventTailError),
+    /// A stored sync cursor value is not parseable.
+    #[error("the stored {stream} cursor value is invalid: {source}")]
+    InvalidCursor {
+        stream: SyncStream,
+        #[source]
+        source: StoredCursorError,
+    },
     /// A wire message could not be serialized into its §9.4 payload record.
     #[error("the message could not be serialized into its payload record: {0}")]
     Payload(#[source] serde_json::Error),
@@ -1058,20 +1535,76 @@ pub enum CenterSyncError<
     /// A stored sequence cannot be represented on the wire.
     #[error("outbox sequence {sequence} cannot be represented on the wire")]
     SequenceOverflow { sequence: i64 },
+    /// An artifact's bytes could not be read for the center distribution.
+    #[error("artifact {artifact_id} could not be read: {source}")]
+    ArtifactRead {
+        artifact_id: ArtifactId,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Why a stored sync cursor value cannot be interpreted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StoredCursorError {
+    /// The endpoint watermark pair is not `id:generation`.
+    #[error("endpoint cursor pair is not endpoint-id:generation")]
+    InvalidEndpointPair,
+    /// A stored stream code is unknown.
+    #[error("the cursor stream code is unknown")]
+    UnknownStream,
+    /// A cursor value carries an unparseable stable id.
+    #[error("the cursor value is not a stable id")]
+    InvalidId,
 }
 
 /// The concrete failure type of one engine step: every boundary error, in
 /// [`CenterSyncError`] variant order.
-type CenterSyncErrorOf<Transport, Store, Outbox, Inbox> = CenterSyncError<
+type CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail> = CenterSyncError<
     <Transport as CenterTransport>::Error,
     <Store as OperationStore>::Error,
     <Store as EndpointRefreshRepository>::Error,
     <Store as CapabilityQueryRepository>::Error,
     <Store as CredentialInventoryRepository>::Error,
     <Store as EndpointInventoryRepository>::Error,
+    <Store as ArtifactRepository>::Error,
     <Outbox as CenterOutbox>::Error,
     <Inbox as CenterInbox>::Error,
+    <Cursor as CenterCursor>::Error,
+    <EventTail as CenterEventTail>::Error,
 >;
+
+/// Parses the `endpoint` stream cursor: the sorted `endpoint-id:generation`
+/// pairs joined by commas (a UUID never contains a colon).
+fn parse_endpoint_cursor(value: &str) -> Result<BTreeMap<EndpointId, u64>, StoredCursorError> {
+    let mut watermark = BTreeMap::new();
+    if value.is_empty() {
+        return Ok(watermark);
+    }
+    for pair in value.split(',') {
+        let Some((id, generation)) = pair.split_once(':') else {
+            return Err(StoredCursorError::InvalidEndpointPair);
+        };
+        let endpoint_id = id
+            .parse::<EndpointId>()
+            .map_err(|_| StoredCursorError::InvalidId)?;
+        let generation = generation
+            .parse::<u64>()
+            .map_err(|_| StoredCursorError::InvalidEndpointPair)?;
+        watermark.insert(endpoint_id, generation);
+    }
+    Ok(watermark)
+}
+
+/// Serializes the `endpoint` stream cursor: the sorted
+/// `endpoint-id:generation` pairs joined by commas.
+fn format_endpoint_cursor(watermark: &BTreeMap<EndpointId, u64>) -> String {
+    watermark
+        .iter()
+        .map(|(endpoint_id, generation)| format!("{endpoint_id}:{generation}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 #[cfg(test)]
 mod tests {
@@ -1089,10 +1622,11 @@ mod tests {
     use rutilus_domain::{
         BatchOperation, BatchOperationId, Credential, CredentialId, CredentialName,
         CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress, EndpointCapability,
-        EndpointDisplayName, EndpointId, InboxEntryState, Operation, OperationId, OperationState,
-        OutboxEntryState, RedfishCommand, RefreshGeneration, ResetType, ResourceFeature,
-        ResourceId, ResourceODataId, ResourceSnapshot, ResourceSnapshotPayload, SystemCommand,
-        TlsCertificate, TlsTrust, decide_inbox_duplicate,
+        EndpointDisplayName, EndpointId, Event, EventId, EventSeverity, InboxEntryState, MessageId,
+        Operation, OperationId, OperationState, OutboxEntryState, RedfishCommand,
+        RefreshGeneration, ResetType, ResourceFeature, ResourceId, ResourceODataId,
+        ResourceSnapshot, ResourceSnapshotPayload, SyncStream, SystemCommand, TlsCertificate,
+        TlsTrust, decide_inbox_duplicate,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore,
@@ -1190,6 +1724,8 @@ mod tests {
         capabilities: Mutex<HashMap<EndpointId, Vec<StoredCapability>>>,
         credentials: Mutex<Vec<Credential>>,
         inventory: Mutex<Vec<EndpointInventoryItem>>,
+        artifacts: Mutex<Vec<rutilus_domain::Artifact>>,
+        artifact_dir: Mutex<Option<tempfile::TempDir>>,
     }
 
     impl MockEngineStore {
@@ -1200,6 +1736,8 @@ mod tests {
                 capabilities: Mutex::new(HashMap::new()),
                 credentials: Mutex::new(Vec::new()),
                 inventory: Mutex::new(Vec::new()),
+                artifacts: Mutex::new(Vec::new()),
+                artifact_dir: Mutex::new(None),
             }
         }
 
@@ -1245,6 +1783,31 @@ mod tests {
                 .lock()
                 .map_err(|_| std::io::Error::other("the mock store lock was poisoned"))?
                 .push(item);
+            Ok(())
+        }
+
+        fn set_artifact(
+            &self,
+            artifact: &rutilus_domain::Artifact,
+            bytes: Vec<u8>,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.artifacts
+                .lock()
+                .map_err(|_| std::io::Error::other("the mock store lock was poisoned"))?
+                .push(artifact.clone());
+            // The engine reads the artifact bytes from the store's
+            // deterministic path, so the mock materializes the file.
+            let mut dir_guard = self
+                .artifact_dir
+                .lock()
+                .map_err(|_| std::io::Error::other("the mock store lock was poisoned"))?;
+            if dir_guard.is_none() {
+                *dir_guard = Some(tempfile::tempdir()?);
+            }
+            let directory = dir_guard
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("the mock artifact directory is missing"))?;
+            std::fs::write(directory.path().join(artifact.id().to_string()), bytes)?;
             Ok(())
         }
 
@@ -1451,6 +2014,76 @@ mod tests {
         }
     }
 
+    impl ArtifactRepository for MockEngineStore {
+        type Error = MockStoreError;
+
+        fn create_artifact<'a>(
+            &'a self,
+            _artifact: &'a rutilus_domain::Artifact,
+        ) -> crate::BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn find_artifact(
+            &self,
+            artifact_id: rutilus_domain::ArtifactId,
+        ) -> crate::BoundaryFuture<'_, Result<Option<rutilus_domain::Artifact>, Self::Error>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .artifacts
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .find(|artifact| artifact.id() == artifact_id)
+                    .cloned())
+            })
+        }
+
+        fn list_artifacts_by_state(
+            &self,
+            state: ArtifactState,
+        ) -> crate::BoundaryFuture<'_, Result<Vec<rutilus_domain::Artifact>, Self::Error>> {
+            Box::pin(async move {
+                let mut artifacts = self
+                    .artifacts
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|artifact| artifact.state() == state)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                artifacts.sort_by_key(|artifact| (artifact.created_at(), artifact.id()));
+                Ok(artifacts)
+            })
+        }
+
+        fn update_artifact(
+            &self,
+            _artifact_id: rutilus_domain::ArtifactId,
+            _uploaded_bytes: u64,
+            _state: ArtifactState,
+            _occurred_at: OffsetDateTime,
+        ) -> crate::BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn artifact_file_path(
+            &self,
+            artifact_id: rutilus_domain::ArtifactId,
+        ) -> std::path::PathBuf {
+            self.artifact_dir
+                .lock()
+                .ok()
+                .and_then(|guard| {
+                    guard
+                        .as_ref()
+                        .map(|directory| directory.path().join(artifact_id.to_string()))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("mock-artifact-{artifact_id}")))
+        }
+    }
+
     /// An in-memory [`CenterInbox`] mirroring the persistence contract: the
     /// operation id is the idempotency key and the state machine is the
     /// domain `InboxEntry`. Every operation succeeds.
@@ -1532,6 +2165,131 @@ mod tests {
         }
     }
 
+    /// An in-memory [`CenterCursor`]: one cursor per (instance, stream),
+    /// exactly like the persistence contract. Every operation succeeds.
+    struct MockCursor {
+        cursors: Mutex<HashMap<(InstanceId, SyncStream), SyncCursor>>,
+    }
+
+    impl MockCursor {
+        fn new() -> Self {
+            Self {
+                cursors: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn cursor_value(
+            &self,
+            instance_id: InstanceId,
+            stream: SyncStream,
+        ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+            Ok(self
+                .cursors
+                .lock()
+                .map_err(|_| std::io::Error::other("the mock cursor lock was poisoned"))?
+                .get(&(instance_id, stream))
+                .map(|cursor| cursor.cursor_value().to_owned()))
+        }
+    }
+
+    impl CenterCursor for MockCursor {
+        type Error = MockStoreError;
+
+        fn get(
+            &self,
+            instance_id: InstanceId,
+            stream: SyncStream,
+        ) -> crate::BoundaryFuture<'_, Result<Option<SyncCursor>, Self::Error>> {
+            Box::pin(async move {
+                Ok(self
+                    .cursors
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .get(&(instance_id, stream))
+                    .cloned())
+            })
+        }
+
+        fn set<'a>(
+            &'a self,
+            cursor: &'a SyncCursor,
+        ) -> crate::BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.cursors
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .insert((cursor.instance_id(), cursor.stream()), cursor.clone());
+                Ok(())
+            })
+        }
+    }
+
+    /// An in-memory [`CenterEventTail`]: the first sync returns the newest
+    /// events, the resume returns everything after the anchor in
+    /// `(observed_at, id)` order.
+    struct MockEventTail {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl MockEventTail {
+        fn new(events: Vec<Event>) -> Self {
+            Self {
+                events: Mutex::new(events),
+            }
+        }
+    }
+
+    impl CenterEventTail for MockEventTail {
+        type Error = MockStoreError;
+
+        fn list_recent(
+            &self,
+            limit: u64,
+        ) -> crate::BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+            Box::pin(async move {
+                let mut events = self.events.lock().map_err(|_| MockStoreError)?.clone();
+                events.sort_by(|left, right| {
+                    right
+                        .observed_at()
+                        .cmp(&left.observed_at())
+                        .then_with(|| right.id().cmp(&left.id()))
+                });
+                events.truncate(usize::try_from(limit).map_err(|_| MockStoreError)?);
+                Ok(events)
+            })
+        }
+
+        fn list_after(
+            &self,
+            after: EventId,
+            limit: u64,
+        ) -> crate::BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+            Box::pin(async move {
+                let events = self.events.lock().map_err(|_| MockStoreError)?;
+                let anchor = events
+                    .iter()
+                    .find(|event| event.id() == after)
+                    .ok_or(MockStoreError)?;
+                let mut after_anchor = events
+                    .iter()
+                    .filter(|event| {
+                        event.observed_at() > anchor.observed_at()
+                            || (event.observed_at() == anchor.observed_at()
+                                && event.id() > anchor.id())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                after_anchor.sort_by(|left, right| {
+                    left.observed_at()
+                        .cmp(&right.observed_at())
+                        .then_with(|| left.id().cmp(&right.id()))
+                });
+                after_anchor.truncate(usize::try_from(limit).map_err(|_| MockStoreError)?);
+                Ok(after_anchor)
+            })
+        }
+    }
+
     /// A fixed clock for the engine tests.
     struct FixedClock(OffsetDateTime);
 
@@ -1546,6 +2304,8 @@ mod tests {
             heartbeat_interval: Duration::from_millis(20),
             reconnect_after: Duration::from_millis(20),
             flush_limit: 64,
+            event_batch_limit: 256,
+            artifact_chunk_bytes: CENTER_ARTIFACT_CHUNK_BYTES,
         }
     }
 
@@ -1735,12 +2495,16 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let outbox = MockOutbox::new(InstanceId::generate());
             let engine = CenterSync::new(
                 transport,
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
                 InstanceId::generate(),
                 engine_options(),
@@ -1801,12 +2565,16 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let outbox = MockOutbox::new(InstanceId::generate());
             let engine = CenterSync::new(
                 transport,
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
                 InstanceId::generate(),
                 engine_options(),
@@ -1847,12 +2615,16 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let outbox = MockOutbox::new(InstanceId::generate());
             let engine = CenterSync::new(
                 transport,
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
                 InstanceId::generate(),
                 engine_options(),
@@ -1896,6 +2668,8 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let instance_id = InstanceId::generate();
             let outbox = MockOutbox::new(instance_id);
             // The offline queue: three messages enqueued while the site has
@@ -1906,6 +2680,8 @@ mod tests {
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(now),
                 instance_id,
                 engine_options(),
@@ -1970,6 +2746,8 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let instance_id = InstanceId::generate();
             let outbox = MockOutbox::new(instance_id);
             outbox.enqueue_heartbeats(3, now)?;
@@ -1978,6 +2756,8 @@ mod tests {
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(now),
                 instance_id,
                 engine_options(),
@@ -2146,6 +2926,8 @@ mod tests {
         store: &'a MockEngineStore,
         outbox: &'a MockOutbox,
         inbox: &'a MockInbox,
+        cursor: &'a MockCursor,
+        events: &'a MockEventTail,
         instance_id: InstanceId,
         now: OffsetDateTime,
     ) -> CenterSync<
@@ -2153,6 +2935,8 @@ mod tests {
         &'a MockEngineStore,
         &'a MockOutbox,
         &'a MockInbox,
+        &'a MockCursor,
+        &'a MockEventTail,
         FixedClock,
     > {
         static TRANSPORT: ChannelTransport = ChannelTransport;
@@ -2161,6 +2945,8 @@ mod tests {
             store,
             outbox,
             inbox,
+            cursor,
+            events,
             FixedClock(now),
             instance_id,
             engine_options(),
@@ -2178,7 +2964,9 @@ mod tests {
     ) -> Result<(OfferOutcome, MockOutbox, MockInbox), Box<dyn Error + Send + Sync>> {
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (offer, received) = offer_for(instance_id, endpoint_id, expires_at_unix)?;
         let outcome = engine.handle_offer(&offer, &received).await?;
         Ok((outcome, outbox, inbox))
@@ -2192,7 +2980,9 @@ mod tests {
         let (store, endpoint) = fully_prepared_store(now)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
 
         let outcome = engine.handle_offer(&offer, &received).await?;
@@ -2397,7 +3187,9 @@ mod tests {
         let (store, endpoint) = fully_prepared_store(now)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (mut offer, _received) =
             offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
         offer.command_json = b"not a redfish command".to_vec();
@@ -2424,7 +3216,9 @@ mod tests {
         let (store, endpoint) = fully_prepared_store(now)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (mut offer, _received) =
             offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
         offer.site_id = InstanceId::generate().to_string();
@@ -2451,7 +3245,9 @@ mod tests {
         let store = MockEngineStore::new();
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
         let first = engine.handle_offer(&offer, &received).await?;
         assert!(matches!(first, OfferOutcome::Rejected { .. }));
@@ -2495,7 +3291,9 @@ mod tests {
         let (store, endpoint) = fully_prepared_store(now)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
         assert_eq!(
             engine.handle_offer(&offer, &received).await?,
@@ -2542,7 +3340,9 @@ mod tests {
         let (store, endpoint) = fully_prepared_store(now)?;
         let outbox = MockOutbox::new(instance_id);
         let inbox = MockInbox::new();
-        let engine = engine_over(&store, &outbox, &inbox, instance_id, now);
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
         let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
         assert_eq!(
             engine.handle_offer(&offer, &received).await?,
@@ -2561,6 +3361,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_projections_are_reported_once_per_generation()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        // First report: the snapshot plus one delta per resource.
+        engine.report_endpoint_projection().await?;
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 3);
+        let Some(EnvelopeMessage::EndpointSnapshot(snapshot)) = messages.first() else {
+            return Err(std::io::Error::other("the first message was not a snapshot").into());
+        };
+        assert_eq!(snapshot.endpoint_id, endpoint.id().to_string());
+        assert_eq!(snapshot.refresh_generation, 1);
+        assert_eq!(snapshot.resources.len(), 2);
+        assert_eq!(snapshot.health, "ok");
+        assert!(matches!(
+            messages.get(1),
+            Some(EnvelopeMessage::ResourceDelta(delta)) if delta.op == ResourceDeltaOp::Upsert as i32
+        ));
+        // The cursor advanced to the reported generation.
+        let value = cursor
+            .cursor_value(instance_id, SyncStream::Endpoint)?
+            .ok_or_else(|| std::io::Error::other("the endpoint cursor is missing"))?;
+        assert_eq!(value, format!("{}:1", endpoint.id()));
+
+        // A second report with an unchanged generation reports nothing.
+        engine.report_endpoint_projection().await?;
+        assert_eq!(outbox.pending_messages()?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_batches_advance_the_cursor_without_skipping()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        // Two events observed at different instants.
+        let first = Event::new(
+            EventId::generate(),
+            EndpointId::generate(),
+            MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+            EventSeverity::Warning,
+            Some(String::from("rebooted")),
+            now,
+            now,
+        )?;
+        let second = Event::new(
+            EventId::generate(),
+            EndpointId::generate(),
+            MessageId::parse("ResourceEvent.1.0.ResourceUpdated")?,
+            EventSeverity::Critical,
+            Some(String::from("thermal trip")),
+            now + time::Duration::MINUTE,
+            now + time::Duration::MINUTE,
+        )?;
+        let events = MockEventTail::new(vec![first.clone(), second.clone()]);
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+
+        // First sync: the newest tail, and the cursor lands on its newest.
+        engine.report_event_batch().await?;
+        let messages = outbox.pending_messages()?;
+        let Some(EnvelopeMessage::EventBatch(batch)) = messages.first() else {
+            return Err(std::io::Error::other("the report was not an EventBatch").into());
+        };
+        assert_eq!(batch.events.len(), 2);
+        let event_cursor = cursor
+            .cursor_value(instance_id, SyncStream::Event)?
+            .ok_or_else(|| std::io::Error::other("the event cursor is missing"))?;
+        assert_eq!(event_cursor, second.id().to_string());
+
+        // The resume after the cursor reports nothing new.
+        engine.report_event_batch().await?;
+        assert_eq!(outbox.pending_messages()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_artifacts_are_distributed_as_manifest_and_chunks()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let store = MockEngineStore::new();
+        let mut artifact = rutilus_domain::Artifact::new(
+            rutilus_domain::ArtifactId::generate(),
+            rutilus_domain::ArtifactName::parse("backup")?,
+            3,
+            rutilus_domain::Sha256Hex::parse(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
+            now,
+        );
+        artifact.record_bytes_received(3)?;
+        artifact.mark_ready()?;
+        store.set_artifact(&artifact, vec![0x01, 0x02, 0x03])?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+
+        // The chunk size is set to one byte so the three-byte artifact
+        // produces exactly three chunk frames after the manifest.
+        let mut options = engine_options();
+        options.artifact_chunk_bytes = 1;
+        let engine = CenterSync::new(
+            &ChannelTransport,
+            &store,
+            &outbox,
+            &inbox,
+            &cursor,
+            &events,
+            FixedClock(now),
+            instance_id,
+            options,
+        );
+        engine.report_artifacts().await?;
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 4);
+        let Some(EnvelopeMessage::ArtifactManifest(manifest)) = messages.first() else {
+            return Err(std::io::Error::other("the first message was not a manifest").into());
+        };
+        assert_eq!(manifest.total_bytes, 3);
+        assert_eq!(manifest.sha256.len(), 32);
+        for (index, message) in messages.iter().enumerate().skip(1) {
+            let EnvelopeMessage::ArtifactChunk(chunk) = message else {
+                return Err(std::io::Error::other("the chunk frame was missing").into());
+            };
+            assert_eq!(chunk.index as usize, index - 1);
+            assert_eq!(
+                chunk.data,
+                vec![u8::try_from(index).map_err(|_| std::io::Error::other("chunk index"))?]
+            );
+        }
+        // The cursor advanced to the distributed artifact.
+        let artifact_cursor = cursor
+            .cursor_value(instance_id, SyncStream::Artifact)?
+            .ok_or_else(|| std::io::Error::other("the artifact cursor is missing"))?;
+        assert_eq!(artifact_cursor, artifact.id().to_string());
+
+        // A second report distributes nothing.
+        engine.report_artifacts().await?;
+        assert_eq!(outbox.pending_messages()?.len(), 4);
+        Ok(())
+    }
+    #[tokio::test]
     async fn a_partial_batch_flushes_again_after_each_acknowledgement() -> Result<(), Box<dyn Error>>
     {
         let now = OffsetDateTime::UNIX_EPOCH;
@@ -2569,6 +3524,8 @@ mod tests {
         let run = tokio::spawn(async move {
             let store = MockEngineStore::new();
             let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
             let instance_id = InstanceId::generate();
             let outbox = MockOutbox::new(instance_id);
             // Five entries, a flush limit of two: the first connection sends
@@ -2581,6 +3538,8 @@ mod tests {
                 &store,
                 outbox,
                 &inbox,
+                &cursor,
+                &events,
                 FixedClock(now),
                 instance_id,
                 options,

@@ -104,6 +104,8 @@ fn engine_options() -> CenterSyncOptions {
         heartbeat_interval,
         reconnect_after: Duration::from_millis(20),
         flush_limit: 64,
+        event_batch_limit: 256,
+        artifact_chunk_bytes: 1024 * 1024,
     }
 }
 
@@ -176,6 +178,8 @@ async fn the_engine_flushes_the_real_outbox_and_resumes_from_the_last_ack()
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let engine = CenterSync::new(
         transport,
+        &store,
+        &store,
         &store,
         &store,
         &store,
@@ -255,6 +259,8 @@ async fn the_engine_keeps_running_locally_while_the_center_is_gone() -> Result<(
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let engine = CenterSync::new(
         transport,
+        &store,
+        &store,
         &store,
         &store,
         &store,

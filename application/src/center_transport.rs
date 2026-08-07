@@ -188,9 +188,7 @@ pub(crate) mod test_support {
 
     /// Connects through a `&Transport` reference, forcing the blanket
     /// reference impl to forward.
-    fn connect_via_reference<T>(
-        transport: &T,
-    ) -> BoundaryFuture<'_, Result<T::Session, T::Error>>
+    fn connect_via_reference<T>(transport: &T) -> BoundaryFuture<'_, Result<T::Session, T::Error>>
     where
         T: CenterTransport,
     {

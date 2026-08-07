@@ -5,11 +5,12 @@ use rutilus_application::{
     EndpointRefreshRepository, InboxInsertOutcome, ResourceObservation, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
-use rutilus_domain::{ArtifactId, ArtifactState};
+use rutilus_domain::{ArtifactId, ArtifactState, SyncStream};
 use rutilus_domain::{
     AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
-    EndpointCapabilityObservation, EndpointId, FailureKind, InboxEntry, InboxEvent, InstanceId,
-    Operation, OperationId, OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot,
+    EndpointCapabilityObservation, EndpointId, Event, EventId, FailureKind, InboxEntry, InboxEvent,
+    InstanceId, Operation, OperationId, OperationState, OutboxEntry, OutboxEntryId,
+    ResourceSnapshot, SyncCursor,
 };
 use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore, RemoteTask,
@@ -21,9 +22,9 @@ use time::OffsetDateTime;
 use crate::{
     ArtifactRepositoryError, AuditRepositoryError, CenterInboxRepositoryError,
     CenterOutboxRepositoryError, CreateInboxOutcome, CredentialRepositoryError,
-    EndpointCapabilityRepositoryError, EndpointRepositoryError, NewResourceSnapshot,
-    OperationRepositoryError, RemoteTaskRepositoryError, ResourceSnapshotRepositoryError,
-    SqliteStore,
+    EndpointCapabilityRepositoryError, EndpointRepositoryError, EventRepositoryError,
+    NewResourceSnapshot, OperationRepositoryError, RemoteTaskRepositoryError,
+    ResourceSnapshotRepositoryError, SqliteStore, SyncCursorRepositoryError,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -345,6 +346,48 @@ impl rutilus_application::CenterInbox for SqliteStore {
             SqliteStore::advance_inbox_entry(self, operation_id, event)
                 .await
                 .map(|_| ())
+        })
+    }
+}
+
+impl rutilus_application::CenterCursor for SqliteStore {
+    type Error = SyncCursorRepositoryError;
+
+    fn get(
+        &self,
+        instance_id: InstanceId,
+        stream: SyncStream,
+    ) -> BoundaryFuture<'_, Result<Option<SyncCursor>, Self::Error>> {
+        Box::pin(async move { SqliteStore::get_sync_cursor(self, instance_id, stream).await })
+    }
+
+    fn set<'a>(&'a self, cursor: &'a SyncCursor) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::set_sync_cursor(self, cursor).await })
+    }
+}
+
+impl rutilus_application::CenterEventTail for SqliteStore {
+    type Error = EventRepositoryError;
+
+    fn list_recent(&self, limit: u64) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::list_recent_events(self, usize::try_from(limit).unwrap_or(usize::MAX))
+                .await
+        })
+    }
+
+    fn list_after(
+        &self,
+        after: EventId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<Event>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::list_events_after(
+                self,
+                after,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+            )
+            .await
         })
     }
 }

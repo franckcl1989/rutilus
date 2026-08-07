@@ -42,7 +42,8 @@ pub use capability_query::{
     EndpointCapabilityQueryError, StoredCapability,
 };
 pub use center_sync::{
-    CenterInbox, CenterOutbox, CenterSync, CenterSyncError, CenterSyncOptions, InboxInsertOutcome,
+    CenterCursor, CenterEventTail, CenterInbox, CenterOutbox, CenterSync, CenterSyncError,
+    CenterSyncOptions, InboxInsertOutcome, StoredCursorError,
 };
 pub use center_transport::{CenterSession, CenterTransport};
 pub use command_executor::{

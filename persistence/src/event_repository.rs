@@ -5,7 +5,11 @@ use rutilus_domain::{
     MessageId, MessageIdError,
 };
 use rutilus_entity::event;
-use sea_orm::{DbErr, EntityTrait, QueryOrder, QuerySelect, Set, TryInsertResult};
+use sea_orm::sea_query::ExprTrait;
+use sea_orm::{
+    ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TryInsertResult,
+};
 use thiserror::Error;
 
 use crate::SqliteStore;
@@ -113,6 +117,55 @@ impl SqliteStore {
         }
         Ok(events)
     }
+
+    /// Lists the events strictly after one anchor event, oldest first from
+    /// the anchor, bounded by `limit`.
+    ///
+    /// This is the resume listing of the §21 0.7.0 center event reporting:
+    /// the sync cursor holds the last reported event id, and this query
+    /// returns exactly the events after it in the §14.4 `(observed_at, id)`
+    /// order — no event is skipped and none is reported twice. The anchor
+    /// event's position is resolved inside the query, so the cursor needs
+    /// only the event id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventRepositoryError::AnchorMissing`] when the anchor event
+    /// is not stored (an event record is immutable, so a missing anchor
+    /// means a corrupt cursor), and [`EventRepositoryError`] variants for
+    /// database failures or corrupt rows.
+    pub async fn list_events_after(
+        &self,
+        after: EventId,
+        limit: usize,
+    ) -> Result<Vec<Event>, EventRepositoryError> {
+        let Some(anchor) = self.find_event(after).await? else {
+            return Err(EventRepositoryError::AnchorMissing { event_id: after });
+        };
+        let anchor_observed_at = anchor.observed_at();
+        let models = event::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(event::Column::ObservedAt.gt(anchor_observed_at))
+                    .add(
+                        event::Column::ObservedAt
+                            .eq(anchor_observed_at)
+                            .and(event::Column::Id.gt(after.into_uuid())),
+                    ),
+            )
+            .order_by_asc(event::Column::ObservedAt)
+            .order_by_asc(event::Column::Id)
+            .limit(limit as u64)
+            .all(&self.database)
+            .await
+            .map_err(EventRepositoryError::Database)?;
+        let mut events = Vec::with_capacity(models.len());
+        for model in models {
+            let event_id = EventId::from_uuid(model.id);
+            events.push(map_stored_event(&model).map_err(|source| corrupt(event_id, source))?);
+        }
+        Ok(events)
+    }
 }
 
 fn project_event(event: &Event) -> event::ActiveModel {
@@ -154,6 +207,8 @@ fn corrupt(event_id: EventId, source: StoredEventError) -> EventRepositoryError 
 pub enum EventRepositoryError {
     #[error("event write coordination is unavailable")]
     Coordinate(#[source] tokio::sync::AcquireError),
+    #[error("the event cursor anchor {event_id} is not stored")]
+    AnchorMissing { event_id: EventId },
     #[error("stored event {event_id} is invalid: {source}")]
     Corrupt {
         event_id: EventId,
