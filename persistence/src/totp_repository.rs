@@ -123,9 +123,10 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns [`TotpRepositoryError::NotFound`] for an unknown id and
-    /// [`TotpRepositoryError`] variants for coordination or database
-    /// failures.
+    /// Returns [`TotpRepositoryError::NotFound`] for an unknown id,
+    /// [`TotpRepositoryError::StaleStep`] when the conditional step guard
+    /// refuses a racing activation, and [`TotpRepositoryError`] variants
+    /// for coordination or database failures.
     pub async fn activate_totp_authenticator(
         &self,
         authenticator_id: TotpAuthenticatorId,
@@ -162,7 +163,19 @@ impl SqliteStore {
             .await
             .map_err(TotpRepositoryError::Database)?;
         if result.rows_affected == 0 {
-            return Err(TotpRepositoryError::NotFound { authenticator_id });
+            // Zero updated rows means either the id is unknown or the
+            // conditional step guard refused a stale activation. The write
+            // gate held here serializes writers, so the follow-up existence
+            // check cannot race another write.
+            let exists = totp_authenticator::Entity::find_by_id(authenticator_id.into_uuid())
+                .one(&self.database)
+                .await
+                .map_err(TotpRepositoryError::Database)?;
+            return if exists.is_some() {
+                Err(TotpRepositoryError::StaleStep { authenticator_id })
+            } else {
+                Err(TotpRepositoryError::NotFound { authenticator_id })
+            };
         }
         Ok(())
     }
@@ -335,6 +348,10 @@ pub enum TotpRepositoryError {
     NotFound {
         authenticator_id: TotpAuthenticatorId,
     },
+    #[error("TOTP activation of {authenticator_id} is stale: a later step was already recorded")]
+    StaleStep {
+        authenticator_id: TotpAuthenticatorId,
+    },
     #[error("TOTP step {authenticator_id} cannot be represented")]
     StepOutOfRange {
         authenticator_id: TotpAuthenticatorId,
@@ -466,11 +483,12 @@ mod tests {
         assert_eq!(active.last_used_step(), Some(7));
 
         // A racing activation with a stale step cannot rewind the recorded
-        // step: the conditional update refuses it, so the row stays.
+        // step: the conditional update refuses it, the refusal is reported
+        // as a stale step (not a missing authenticator), and the row stays.
         let result = store
             .activate_totp_authenticator(first.id(), activated_at, 3)
             .await;
-        assert!(matches!(result, Err(TotpRepositoryError::NotFound { .. })));
+        assert!(matches!(result, Err(TotpRepositoryError::StaleStep { .. })));
         let still_active = store
             .find_totp_authenticator(&key, first.id())
             .await?
