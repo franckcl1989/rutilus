@@ -3423,8 +3423,12 @@ name = "rutilus"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "console",
+ "rcgen",
+ "rustls",
+ "rustls-webpki",
  "rutilus-application",
  "rutilus-domain",
  "rutilus-infra-redfish",
@@ -3434,10 +3438,12 @@ dependencies = [
  "rutilus-security",
  "rutilus-web",
  "secrecy",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "webbrowser",
 ]

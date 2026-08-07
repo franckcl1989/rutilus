@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, io};
+use std::{error::Error, io, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use console::Term;
 use rutilus::{
-    StandaloneRunOptions, StandaloneUnlock, initialize_standalone, run_initialized_standalone,
+    ListenAddress, SiteRunOptions, StandaloneRunOptions, StandaloneUnlock, console_stop_signal,
+    has_system_master_key, initialize_standalone, rewrap_to_system_unlock,
+    run_initialized_standalone, run_site,
 };
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
-use rutilus_platform::DataLocation;
+use rutilus_platform::{DataLocation, InstanceMarkerFile, InstanceMarkerState, ServiceArguments};
 use secrecy::SecretString;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,7 +30,7 @@ enum Command {
         #[arg(long)]
         portable: bool,
     },
-    /// Run the foreground Standalone Web console on an ephemeral loopback port.
+    /// Run the foreground Standalone or Site Web console.
     Run {
         /// Use the data directory beside the executable.
         #[arg(long)]
@@ -36,9 +38,65 @@ enum Command {
         /// Do not open the system default browser after binding succeeds.
         #[arg(long)]
         no_open: bool,
+        #[command(flatten)]
+        site: Option<SiteArgs>,
+    },
+    /// Install, uninstall, or run the system service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Print the product and upstream development-baseline versions.
     Version,
+}
+
+/// The 0.6.0 Site flags shared by `run --site` and the service subcommands.
+#[derive(Debug, Args)]
+struct SiteArgs {
+    /// Run as a Site on the management network (HTTPS required off loopback).
+    #[arg(long, requires = "listen")]
+    site: bool,
+    /// The Site listen address, HOST:PORT (required with --site).
+    #[arg(long, requires = "site")]
+    listen: Option<ListenAddress>,
+    /// TLS certificate chain PEM (with --site; requires --key).
+    #[arg(long, requires_all = ["key", "site"])]
+    cert: Option<PathBuf>,
+    /// TLS private key PEM (with --site; requires --cert).
+    #[arg(long, requires = "cert")]
+    key: Option<PathBuf>,
+}
+
+impl SiteArgs {
+    fn site_options(&self) -> Result<SiteRunOptions, rutilus::SiteConfigError> {
+        let listen = self
+            .listen
+            .clone()
+            .ok_or(rutilus::SiteConfigError::ListenAddress(
+                rutilus::ListenAddressError::MissingPort,
+            ))?;
+        SiteRunOptions::new(listen, self.cert.clone(), self.key.clone())
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Install the product as a system service (Windows SCM, launchd, or systemd).
+    Install {
+        #[command(flatten)]
+        site: SiteArgs,
+        /// Portable data directories cannot back a system service.
+        #[arg(long, hide = true)]
+        portable: bool,
+    },
+    /// Remove the installed system service.
+    Uninstall,
+    /// Run the service body (internal; the service manager starts this).
+    #[command(hide = true)]
+    Run {
+        #[command(flatten)]
+        site: SiteArgs,
+    },
 }
 
 #[tokio::main]
@@ -47,24 +105,170 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Command::Init { portable } => initialize(portable).await?,
-        Command::Run { portable, no_open } => run(portable, no_open).await?,
+        Command::Run {
+            portable,
+            no_open,
+            site,
+        } => run(portable, no_open, site).await?,
+        Command::Service { command } => service(command).await?,
         Command::Version => print_version(),
     }
     Ok(())
 }
 
-async fn run(portable: bool, no_open: bool) -> Result<(), Box<dyn Error>> {
+async fn run(portable: bool, no_open: bool, site: Option<SiteArgs>) -> Result<(), Box<dyn Error>> {
     let location = if portable {
         DataLocation::Portable
     } else {
         DataLocation::Installed
     };
     let paths = location.resolve()?;
-    let terminal = Term::stderr();
-    let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
-    let unlock = StandaloneUnlock::existing(passphrase)?;
-    run_initialized_standalone(&paths, &unlock, StandaloneRunOptions::new(!no_open)).await?;
+    let Some(site) = site else {
+        // The Standalone foreground console.
+        let terminal = Term::stderr();
+        let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+        let unlock = StandaloneUnlock::existing(passphrase)?;
+        run_initialized_standalone(&paths, &unlock, StandaloneRunOptions::new(!no_open)).await?;
+        return Ok(());
+    };
+    // The Site foreground console never opens a browser. An instance that
+    // already carries an OS-protected envelope unlocks unattended; otherwise
+    // the operator unlocks with the passphrase, as in Standalone.
+    let options = site.site_options()?;
+    let unlock = if has_system_master_key(&paths) {
+        None
+    } else {
+        let terminal = Term::stderr();
+        let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+        Some(StandaloneUnlock::existing(passphrase)?)
+    };
+    run_site(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
     Ok(())
+}
+
+async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        ServiceCommand::Install { site, portable } => install_service(&site, portable).await?,
+        ServiceCommand::Uninstall => {
+            rutilus_platform::uninstall().map_err(|error| -> Box<dyn Error> { error.into() })?;
+            println!("Rutilus service uninstalled");
+        }
+        ServiceCommand::Run { site } => run_service(&site).await?,
+    }
+    Ok(())
+}
+
+/// Installs the system service. A 0.6.0 service is always a Site: the
+/// instance's master key is re-wrapped to the operating system's secret
+/// store at install time (unless it already is), so the service boots
+/// unattended.
+async fn install_service(site: &SiteArgs, portable: bool) -> Result<(), Box<dyn Error>> {
+    if portable {
+        return Err("system services cannot use portable data directories".into());
+    }
+    if !site.site {
+        return Err("a 0.6.0 system service must be a Site; pass --site with --listen".into());
+    }
+    let paths = DataLocation::Installed.resolve()?;
+    let marker = InstanceMarkerFile::new(paths.instance_marker_path());
+    match marker
+        .state()
+        .map_err(|error| -> Box<dyn Error> { error.into() })?
+    {
+        InstanceMarkerState::Missing => {
+            return Err("this data directory is not initialized; run `rutilus init` first".into());
+        }
+        InstanceMarkerState::Complete => {}
+    }
+    if !has_system_master_key(&paths) {
+        let terminal = Term::stderr();
+        let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+        rewrap_to_system_unlock(&paths, &passphrase).await?;
+    }
+    let options = site.site_options()?;
+    let executable = std::env::current_exe()?;
+    let arguments = ServiceArguments::new(
+        options.listen().to_string(),
+        options
+            .cert()
+            .map(|path| path.to_string_lossy().into_owned()),
+        options
+            .key()
+            .map(|path| path.to_string_lossy().into_owned()),
+    )?;
+    rutilus_platform::install(&arguments, &executable, paths.data_directory())?;
+    println!("Rutilus service installed");
+    Ok(())
+}
+
+/// Runs the service body: the Site console with the operating-system unlock
+/// and no interactive prompts. On Windows this registers with the SCM and
+/// stops through the SCM stop control; elsewhere the service manager
+/// supervises the same foreground process.
+async fn run_service(site: &SiteArgs) -> Result<(), Box<dyn Error>> {
+    let options = site.site_options()?;
+    let paths = DataLocation::Installed.resolve()?;
+    #[cfg(windows)]
+    {
+        run_windows_service(&paths, &options).await
+    }
+    #[cfg(not(windows))]
+    {
+        run_site(&paths, &options, None, console_stop_signal())
+            .await
+            .map_err(Into::into)
+    }
+}
+
+/// Runs the Site body under the SCM: dispatches the service, waits for the
+/// control handler to be registered, then serves until the SCM requests a
+/// stop (or the console stop signal fires), drains, and releases the SCM
+/// thread.
+#[cfg(windows)]
+async fn run_windows_service(
+    paths: &rutilus_platform::RuntimePaths,
+    options: &SiteRunOptions,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+
+    use rutilus_platform::{ServiceControl, dispatch_service};
+    use tokio::sync::oneshot;
+
+    let control = Arc::new(ServiceControl::new());
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    let mut dispatch = {
+        let control = Arc::clone(&control);
+        tokio::task::spawn_blocking(move || dispatch_service(control, ready_sender))
+    };
+    tokio::select! {
+        ready = ready_receiver => {
+            ready.map_err(|_| io::Error::other("the service dispatcher ended before registering"))??;
+        }
+        ended = &mut dispatch => {
+            ended.map_err(|error| -> Box<dyn Error> { error.into() })??;
+            return Err("the service dispatcher exited immediately; is this process running under the Windows service manager?".into());
+        }
+    }
+    let result = run_site(paths, options, None, service_stop_signal(control.clone())).await;
+    control.finish();
+    match dispatch.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("The service dispatcher failed: {error}"),
+        Err(error) => eprintln!("The service dispatcher task failed: {error}"),
+    }
+    result.map_err(|error| -> Box<dyn Error> { error.into() })
+}
+
+/// The Site service's stop future: the SCM stop control, or the console
+/// stop signal.
+#[cfg(windows)]
+async fn service_stop_signal(
+    control: std::sync::Arc<rutilus_platform::ServiceControl>,
+) -> io::Result<()> {
+    tokio::select! {
+        signal = console_stop_signal() => signal,
+        () = control.wait_stop() => Ok(()),
+    }
 }
 
 async fn initialize(portable: bool) -> Result<(), Box<dyn Error>> {
@@ -107,7 +311,7 @@ fn print_version() {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, ListenAddress, ServiceCommand, SiteArgs};
 
     #[test]
     fn parses_the_documented_version_subcommand() {
@@ -131,6 +335,109 @@ mod tests {
                 command: Command::Run {
                     portable: true,
                     no_open: true,
+                    site: None,
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_the_site_run_subcommand_with_tls_material() -> Result<(), clap::Error> {
+        let parsed = Cli::try_parse_from([
+            "rutilus",
+            "run",
+            "--site",
+            "--listen",
+            "0.0.0.0:8443",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+        ])?;
+
+        let Command::Run {
+            site: Some(site), ..
+        } = parsed.command
+        else {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                "expected the Site run subcommand",
+            ));
+        };
+        assert!(site.site);
+        assert_eq!(
+            site.listen.map(|listen| listen.to_string()).as_deref(),
+            Some("0.0.0.0:8443")
+        );
+        assert_eq!(site.cert.as_deref(), Some(std::path::Path::new("cert.pem")));
+        assert_eq!(site.key.as_deref(), Some(std::path::Path::new("key.pem")));
+        Ok(())
+    }
+
+    #[test]
+    fn site_flags_enforce_listen_and_pairing_dependencies() {
+        assert!(Cli::try_parse_from(["rutilus", "run", "--site"]).is_err());
+        assert!(Cli::try_parse_from(["rutilus", "run", "--listen", "127.0.0.1:8080"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "run",
+                "--site",
+                "--listen",
+                "127.0.0.1:8080",
+                "--cert",
+                "cert.pem",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_service_install_uninstall_and_hidden_run() {
+        let install = Cli::try_parse_from([
+            "rutilus",
+            "service",
+            "install",
+            "--site",
+            "--listen",
+            "0.0.0.0:8443",
+        ]);
+        assert!(matches!(
+            install,
+            Ok(Cli {
+                command: Command::Service {
+                    command: ServiceCommand::Install { .. }
+                }
+            })
+        ));
+
+        let uninstall = Cli::try_parse_from(["rutilus", "service", "uninstall"]);
+        assert!(matches!(
+            uninstall,
+            Ok(Cli {
+                command: Command::Service {
+                    command: ServiceCommand::Uninstall
+                }
+            })
+        ));
+
+        let run = Cli::try_parse_from([
+            "rutilus",
+            "service",
+            "run",
+            "--site",
+            "--listen",
+            "0.0.0.0:8443",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "key.pem",
+        ]);
+        assert!(matches!(
+            run,
+            Ok(Cli {
+                command: Command::Service {
+                    command: ServiceCommand::Run { .. }
                 }
             })
         ));
@@ -150,5 +457,23 @@ mod tests {
                 command: Command::Init { portable: true }
             })
         ));
+    }
+
+    #[test]
+    fn listen_addresses_parse_through_the_cli() -> Result<(), clap::Error> {
+        let listen = ListenAddress::parse("127.0.0.1:8443").map_err(|error| {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+        })?;
+        let site = SiteArgs {
+            site: true,
+            listen: Some(listen),
+            cert: None,
+            key: None,
+        };
+        let options = site.site_options().map_err(|error| {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+        })?;
+        assert_eq!(options.listen().to_string(), "127.0.0.1:8443");
+        Ok(())
     }
 }
