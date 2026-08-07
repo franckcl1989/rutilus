@@ -1512,12 +1512,13 @@ fn project_enrollment(
             // Network, Accounts, Bios, BootOptions, SecureBoot, the
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, the PcieDevices/Assembly/SoftwareInventory read
-            // families, and the EventService/EventSubscription/
-            // TelemetryService/MetricDefinition/MetricReport/TaskService/Task
-            // service families) intentionally stay out of the three-field
-            // enrollment counts; the typed resource-inventory route carries
-            // their full snapshots instead.
+            // surface, the OemDell §11.5 OEM family, the
+            // PcieDevices/Assembly/SoftwareInventory read families, and the
+            // EventService/EventSubscription/TelemetryService/
+            // MetricDefinition/MetricReport/TaskService/Task service
+            // families) intentionally stay out of the three-field enrollment
+            // counts; the typed resource-inventory route carries their full
+            // snapshots instead.
             ResourceFeature::ServiceRoot
             | ResourceFeature::Processors
             | ResourceFeature::Memory
@@ -1535,6 +1536,7 @@ fn project_enrollment(
             | ResourceFeature::LogServices
             | ResourceFeature::ManagerNetworkProtocol
             | ResourceFeature::HostInterfaces
+            | ResourceFeature::OemDell
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
@@ -2334,6 +2336,7 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::System { .. } => project_system_details(details),
         CoreResourceDetails::Chassis { .. } => project_chassis_details(details),
         CoreResourceDetails::Manager { .. } => project_manager_details(details),
+        CoreResourceDetails::OemDell { .. } => project_oem_dell_details(details),
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
@@ -2525,6 +2528,37 @@ fn project_manager_details(details: &CoreResourceDetails) -> CoreResourceDetails
         version: version.clone(),
         power_state: power_state.clone(),
         status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §11.5 Dell OEM family into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemDell` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_dell_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemDell {
+        server_model,
+        server_service_tag,
+        server_generation,
+        server_bmc_mac_address,
+        server_name,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemDell {
+            server_model: None,
+            server_service_tag: None,
+            server_generation: None,
+            server_bmc_mac_address: None,
+            server_name: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemDell {
+        server_model: server_model.clone(),
+        server_service_tag: server_service_tag.clone(),
+        server_generation: server_generation.clone(),
+        server_bmc_mac_address: server_bmc_mac_address.clone(),
+        server_name: server_name.clone(),
     }
 }
 
@@ -3655,6 +3689,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_oem_dell_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = oem_dell_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 2);
+        // The inventory orders snapshots by `@odata.id`, so the service root
+        // (the `/redfish/v1` prefix) sorts before the manager's Dell
+        // Attributes document.
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        assert_eq!(resources[1]["resource"]["resource_type"], "oem_dell");
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"
+        );
+        assert_eq!(resources[1]["common"]["name"], "Dell Attributes");
+        assert_eq!(
+            resources[1]["resource"]["details"]["server_model"],
+            "PowerEdge R750"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["server_service_tag"],
+            "ABC1234"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["server_generation"],
+            "16G"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["server_bmc_mac_address"],
+            "14:18:77:aa:bb:cc"
+        );
+        assert_eq!(
+            resources[1]["resource"]["details"]["server_name"],
+            "rack-1-server-2"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_storage_network_and_ethernet_typed_resources() -> Result<(), Box<dyn Error>> {
         let item = storage_network_inventory_item()?;
         let endpoint_id = item.endpoint().id();
@@ -4397,6 +4481,48 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![processor, memory, system, root],
+        )?)
+    }
+
+    fn oem_dell_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Dell OEM BMC")?,
+            EndpointAddress::parse("https://192.0.2.38")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![38])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        let oem_dell = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemDell,
+            "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+            r#"{"Id":"1","Name":"Dell Attributes","Description":"Dell iDRAC attributes","ServerModel":"PowerEdge R750","ServerServiceTag":"ABC1234","ServerGeneration":"16G","ServerBmcMacAddress":"14:18:77:aa:bb:cc","ServerName":"rack-1-server-2"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#DellAttributes.v1_0_0.DellAttributes",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"dell-attributes-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, oem_dell],
         )?)
     }
 
