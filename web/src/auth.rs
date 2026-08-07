@@ -824,16 +824,7 @@ where
                 .insert(AuthContext::unauthenticated(state.actor));
             next.run(request).await
         }
-        RouteAccess::Always { .. } | RouteAccess::GuardedOnly { .. } => {
-            let roles = match access {
-                RouteAccess::Always { roles, .. } | RouteAccess::GuardedOnly { roles, .. } => roles,
-                RouteAccess::Public => unreachable!(),
-            };
-            let mutation = match access {
-                RouteAccess::Always { mutation, .. }
-                | RouteAccess::GuardedOnly { mutation, .. } => mutation,
-                RouteAccess::Public => unreachable!(),
-            };
+        RouteAccess::Always { roles, mutation } | RouteAccess::GuardedOnly { roles, mutation } => {
             // In open mode the product surface is served without a session;
             // the always-required routes still need one.
             let requires_session = guarded || matches!(access, RouteAccess::Always { .. });
