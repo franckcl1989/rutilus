@@ -1622,7 +1622,18 @@ where
     // policy from the same bootstrap state.
     let policy = match services.store.has_unconsumed_bootstrap_code().await {
         Ok(true) => AuthPolicy::PendingBootstrap(AuthGate::open()),
-        _ => AuthPolicy::Guarded,
+        Ok(false) => AuthPolicy::Guarded,
+        Err(error) => {
+            // Fail closed (Guarded) like a consumed code, but record the
+            // query failure: a store that cannot answer the first-run gate
+            // must not look indistinguishable from an already-claimed
+            // instance, or the operator diagnoses a login problem that is
+            // actually a storage problem.
+            eprintln!(
+                "could not read the bootstrap-code state for the first-run gate, starting guarded: {error}"
+            );
+            AuthPolicy::Guarded
+        }
     };
     // The server's graceful drain waits for the background tasks to have
     // fully stopped first (design §7.8: stop scheduling and listening, then
