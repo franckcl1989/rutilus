@@ -6,12 +6,12 @@ use rutilus_application::{
 };
 use rutilus_domain::{
     AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
-    EndpointCapabilityObservation, EndpointId, Operation, OperationId, OperationState,
+    EndpointCapabilityObservation, EndpointId, FailureKind, Operation, OperationId, OperationState,
     ResourceSnapshot,
 };
 use rutilus_operation_engine::{
-    BoundaryFuture as OperationBoundaryFuture, OperationStore, RemoteTask, RemoteTaskState,
-    RemoteTaskStore,
+    BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore, RemoteTask,
+    RemoteTaskState, RemoteTaskStore,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -161,6 +161,14 @@ impl OperationStore for SqliteStore {
         })
     }
 
+    fn record_failure_kind(
+        &self,
+        operation_id: OperationId,
+        kind: FailureKind,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::record_failure_kind(self, operation_id, kind).await })
+    }
+
     fn list_operations(
         &self,
         state: Option<OperationState>,
@@ -192,7 +200,7 @@ impl OperationStore for SqliteStore {
     fn list_batch_children(
         &self,
         batch_id: BatchOperationId,
-    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+    ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         Box::pin(async move { SqliteStore::list_batch_children(self, batch_id).await })
     }
 }

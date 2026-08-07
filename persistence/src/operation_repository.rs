@@ -1,7 +1,7 @@
 use rutilus_domain::{
-    BatchOperation, BatchOperationId, Operation, OperationId, OperationSource,
-    OperationSourceParseError, OperationState, OperationStateParseError, OperationTarget,
-    OperationTimelineError, RedfishCommand,
+    BatchOperation, BatchOperationId, FailureKind, FailureKindParseError, Operation, OperationId,
+    OperationSource, OperationSourceParseError, OperationState, OperationStateParseError,
+    OperationTarget, OperationTimelineError, RedfishCommand,
 };
 use rutilus_entity::{batch_operation, operation, operation_target};
 use sea_orm::{
@@ -207,16 +207,21 @@ impl SqliteStore {
         Ok(batches)
     }
 
-    /// Lists one batch's child operations in target order.
+    /// Lists one batch's child operations in target order, paired with each
+    /// child's persisted failure classification (§13.7).
     ///
     /// The children are ordinary persisted operations, so each is rehydrated
     /// as a complete aggregate through [`Self::find_operation`]'s mapping —
     /// including its command — and one corrupt child poisons the whole
     /// listing. Each child carries exactly one target, so ordering by that
     /// target's identity is a total order; batch reporting (design §13.7)
-    /// pairs every endpoint with its child in this deterministic order. An
-    /// unknown batch id returns an empty list; the parent existence is a
-    /// separate [`Self::find_batch`] read.
+    /// pairs every endpoint with its child in this deterministic order. The
+    /// failure kind is rehydrated through the domain [`FailureKind`]
+    /// deserializer with the same corrupt-aggregate rule as the state and
+    /// source codes: a stored code this build cannot classify makes the
+    /// whole listing [`OperationRepositoryError::Corrupt`]. An unknown batch
+    /// id returns an empty list; the parent existence is a separate
+    /// [`Self::find_batch`] read.
     ///
     /// # Errors
     ///
@@ -225,7 +230,7 @@ impl SqliteStore {
     pub async fn list_batch_children(
         &self,
         batch_id: BatchOperationId,
-    ) -> Result<Vec<Operation>, OperationRepositoryError> {
+    ) -> Result<Vec<(Operation, Option<FailureKind>)>, OperationRepositoryError> {
         let transaction = self
             .database
             .begin()
@@ -239,17 +244,75 @@ impl SqliteStore {
         let mut children = Vec::with_capacity(models.len());
         for model in models {
             let operation_id = OperationId::from_uuid(model.id);
-            children.push(map_stored_operation(&transaction, operation_id, model).await?);
+            let failure_kind = model
+                .failure_kind
+                .as_deref()
+                .map(|code| {
+                    code.parse::<FailureKind>()
+                        .map_err(StoredOperationError::InvalidFailureKind)
+                        .map_err(|source| corrupt(operation_id, source))
+                })
+                .transpose()?;
+            let operation = map_stored_operation(&transaction, operation_id, model).await?;
+            children.push((operation, failure_kind));
         }
         // Target order: each child carries exactly one target, so the target
         // identity orders the batch; a corrupt zero-target row (impossible
         // through the engine) sorts first by `None` instead of panicking.
-        children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        children.sort_by_key(|(child, _)| child.targets().first().map(|target| target.target_id()));
         transaction
             .commit()
             .await
             .map_err(OperationRepositoryError::Database)?;
         Ok(children)
+    }
+
+    /// Persists the §13.7 failure classification of one operation, written
+    /// by the refusal path before the `Failed` transition.
+    ///
+    /// The write is a single-column update and deliberately does not touch
+    /// `updated_at`: the timeline records state transitions, and the kind is
+    /// a classification fact, not a state step. The crash window between
+    /// this write and the `Failed` transition is harmless by design —
+    /// reporting reads the kind only to bucket a `Failed` child, and the
+    /// domain state machine never treats the column as a state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError::NotFound`] for an unknown id and
+    /// [`OperationRepositoryError`] variants for coordination or database
+    /// failures.
+    pub async fn record_failure_kind(
+        &self,
+        operation_id: OperationId,
+        kind: FailureKind,
+    ) -> Result<(), OperationRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(OperationRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let model = operation::Entity::find_by_id(operation_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?
+            .ok_or(OperationRepositoryError::NotFound { operation_id })?;
+        let mut active = model.into_active_model();
+        active.failure_kind = Set(Some(kind.as_str().to_owned()));
+        active
+            .update(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(())
     }
 
     /// Reads one complete operation aggregate by stable identity.
@@ -434,8 +497,11 @@ where
         state: Set(domain.state().as_str().to_owned()),
         command: Set(serialize_command(&domain.command())?),
         // A batch child carries its parent link at the persistence layer
-        // only; the domain `Operation` aggregate has no batch concept.
+        // only; the domain `Operation` aggregate has no batch concept. New
+        // operations are never born classified: the failure kind is written
+        // by the refusal path before a `Failed` transition.
         batch_id: Set(batch_id),
+        failure_kind: Set(None),
         created_at: Set(domain.created_at()),
         updated_at: Set(domain.updated_at()),
     }
@@ -604,6 +670,8 @@ pub enum StoredOperationError {
     InvalidCommand(#[source] serde_json::Error),
     #[error("operation timeline is invalid: {0}")]
     InvalidTimeline(#[source] OperationTimelineError),
+    #[error("operation failure kind code is invalid: {0}")]
+    InvalidFailureKind(#[source] FailureKindParseError),
 }
 
 /// Why persisted batch data cannot be mapped into valid product types.
@@ -628,7 +696,7 @@ mod tests {
         ArtifactId, BatchOperation, BatchOperationId, BootCommand, BootSource,
         BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateSubscription,
         EndpointId, EventCommand, EventDestinationProtocol, EventSubscriptionError, EventType,
-        ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
+        FailureKind, ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
         SetBootSourceOverride, StartUpdate, SystemCommand, TargetId, UpdateCommand,
     };
     use rutilus_entity::{batch_operation, operation, operation_target};
@@ -1121,6 +1189,7 @@ mod tests {
             state: Set(String::from("queued")),
             command: Set(serialize_command(&one_command())?),
             batch_id: Set(None),
+            failure_kind: Set(None),
             created_at: Set(created_at),
             updated_at: Set(created_at - Duration::SECOND),
         }
@@ -1189,6 +1258,7 @@ mod tests {
                 state: Set(String::from("queued")),
                 command: Set(String::from(command)),
                 batch_id: Set(None),
+                failure_kind: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -1231,6 +1301,7 @@ mod tests {
             state: Set(String::from("queued")),
             command: Set(String::from(r#"{"Storage": {}}"#)),
             batch_id: Set(None),
+            failure_kind: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -1298,10 +1369,19 @@ mod tests {
             assert_eq!(stored.targets()[0], child.targets()[0]);
             stored_children.push(stored);
         }
-        // The batch listing returns its children in target order.
+        // The batch listing returns its children in target order; fresh
+        // children are never born classified, so every pair reads back with
+        // no failure kind.
         let mut expected = stored_children;
         expected.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
-        assert_eq!(store.list_batch_children(batch.id()).await?, expected);
+        assert_eq!(
+            store.list_batch_children(batch.id()).await?,
+            expected
+                .iter()
+                .cloned()
+                .map(|child| (child, None))
+                .collect::<Vec<_>>()
+        );
         assert!(
             store
                 .find_batch(BatchOperationId::generate())
@@ -1366,6 +1446,143 @@ mod tests {
         assert_eq!(stored.state(), OperationState::Validating);
         assert_eq!(stored.updated_at(), transitioned_at);
         assert_eq!(store.list_batch_children(batch.id()).await?.len(), 2);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorded_failure_kinds_round_trip_with_batch_children() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let created_at = OffsetDateTime::now_utc();
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            one_command(),
+            created_at,
+        );
+        let mut children = (0..2)
+            .map(|index| {
+                queued_operation(
+                    OperationSource::Site,
+                    &[OperationTarget::new(
+                        TargetId::generate(),
+                        EndpointId::generate(),
+                    )],
+                    one_command(),
+                    created_at + Duration::SECOND * index,
+                )
+            })
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        store.create_batch(&batch, &children).await?;
+
+        // The classified child reads back with its kind; the unclassified
+        // child reads back with None — the kind is only ever written by the
+        // refusal path, so the pairing is per child, never invented.
+        let classified_id = children[0].id();
+        let unclassified_id = children[1].id();
+        store
+            .record_failure_kind(classified_id, FailureKind::CapabilityUnsupported)
+            .await?;
+        let stored = store.list_batch_children(batch.id()).await?;
+        assert_eq!(stored.len(), 2);
+        let classified = stored
+            .iter()
+            .find(|(child, _)| child.id() == classified_id)
+            .ok_or("the classified child is missing")?;
+        assert_eq!(classified.1, Some(FailureKind::CapabilityUnsupported));
+        let unclassified = stored
+            .iter()
+            .find(|(child, _)| child.id() == unclassified_id)
+            .ok_or("the unclassified child is missing")?;
+        assert_eq!(unclassified.1, None);
+
+        // The classification write is not a state step: the timeline is
+        // untouched by the kind.
+        let stored_classified = store
+            .find_operation(classified_id)
+            .await?
+            .ok_or("the classified operation is missing")?;
+        assert_eq!(stored_classified.state(), OperationState::Queued);
+        assert_eq!(stored_classified.updated_at(), created_at);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_failure_kind_rejects_unknown_ids() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let unknown = OperationId::generate();
+
+        assert!(matches!(
+            store
+                .record_failure_kind(unknown, FailureKind::CapabilityUnsupported)
+                .await,
+            Err(OperationRepositoryError::NotFound { operation_id })
+                if operation_id == unknown
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_failure_kind_codes_this_build_cannot_classify() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let now = OffsetDateTime::now_utc();
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            one_command(),
+            now,
+        );
+        let child = queued_operation(
+            OperationSource::Site,
+            &[OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            one_command(),
+            now,
+        );
+        store
+            .create_batch(&batch, std::slice::from_ref(&child))
+            .await?;
+
+        // A kind code no product build can classify is refused at the
+        // database (the CHECK constraint), so rehydration never has to guess
+        // a kind — the same guard as the source-code precedent. The
+        // repository's InvalidFailureKind rehydration arm stays as
+        // defense-in-depth for rows written before the CHECK existed.
+        let child_id = child.id();
+        let invalid_kind = operation::ActiveModel {
+            id: Set(child_id.into_uuid()),
+            source: Set(String::from("site")),
+            state: Set(String::from("failed")),
+            command: Set(serialize_command(&one_command())?),
+            batch_id: Set(Some(batch.id().into_uuid())),
+            failure_kind: Set(Some(String::from("capability-missing"))),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .update(&store.database)
+        .await;
+        assert!(
+            invalid_kind.is_err(),
+            "an unknown failure-kind code must be refused by the database"
+        );
+
+        // The refused write changed nothing: the child still reads back as
+        // the untouched queued row.
+        let stored = store.list_batch_children(batch.id()).await?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, child);
+        assert_eq!(stored[0].1, None);
 
         store.close().await?;
         drop(directory);
