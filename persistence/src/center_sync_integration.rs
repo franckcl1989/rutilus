@@ -14,15 +14,21 @@ use std::{error::Error, future::Future, time::Duration};
 use rutilus_application::{
     BoundaryFuture, CenterSession, CenterSync, CenterSyncOptions, CenterTransport,
 };
-use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage, Heartbeat};
+use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage, Heartbeat, OperationOffer};
 use rutilus_domain::{
-    EndpointId, Event, EventId, EventSeverity, InstanceId, InstanceKind, MessageId, OutboxEntry,
-    SiteInstance, SyncCursor, SyncCursorId, SyncStream,
+    CapabilityState, CredentialId, CredentialName, CredentialUsername, CredentialVersionId,
+    Endpoint, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
+    EndpointDisplayName, EndpointId, Event, EventId, EventSeverity, InboxEntryState, InstanceId,
+    InstanceKind, MessageId, OperationId, OperationSource, OperationState, OutboxEntry,
+    RedfishCommand, ResetType, ResourceFeature, ResourceODataId, ResourceSnapshotPayload,
+    SiteInstance, SyncCursor, SyncCursorId, SyncStream, SystemCommand, TlsCertificate, TlsTrust,
 };
+use rutilus_security::{MasterKey, encrypt_credential};
+use secrecy::SecretString;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-use crate::SqliteStore;
+use crate::{NewCredential, NewResourceSnapshot, SqliteStore};
 
 /// A mock center session error that cannot occur: every mock operation
 /// succeeds.
@@ -291,6 +297,265 @@ async fn the_engine_keeps_running_locally_while_the_center_is_gone() -> Result<(
     }
     let pending = store.list_pending_outbox(instance_id, 10).await?;
     assert_eq!(pending.len(), 2, "the offline queue must keep the entries");
+
+    stop_tx
+        .send(())
+        .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut engine_run)
+        .await
+        .map_err(|_| std::io::Error::other("the engine did not stop in time"))?;
+    assert!(
+        stopped.is_ok(),
+        "the engine must stop cleanly, got {stopped:?}"
+    );
+    Ok(())
+}
+
+/// Seeds the real store with one endpoint an offer can pass every §15.6
+/// recheck against: the credential, the endpoint, the Supported capability,
+/// and the projection containing the offer target.
+async fn seed_offerable_endpoint(
+    store: &SqliteStore,
+    now: OffsetDateTime,
+) -> Result<Endpoint, Box<dyn Error>> {
+    let key = MasterKey::from_boxed_bytes(Box::new([0x41; 32]));
+    let credential_id = CredentialId::generate();
+    let protected_secret = encrypt_credential(
+        &key,
+        credential_id,
+        CredentialVersionId::generate(),
+        &SecretString::from(String::from("root secret")),
+    )?;
+    store
+        .create_credential(NewCredential::new(
+            CredentialName::parse("Lab administrator")?,
+            CredentialUsername::parse("root")?,
+            protected_secret,
+        ))
+        .await?;
+    let endpoint = Endpoint::try_new(
+        EndpointId::generate(),
+        EndpointDisplayName::parse("Rack A BMC")?,
+        EndpointAddress::parse("https://192.0.2.10")?,
+        TlsTrust::PinnedCertificate {
+            certificate: TlsCertificate::from_der(b"offer integration certificate".to_vec())?,
+            trusted_at: now,
+        },
+        credential_id,
+        now,
+        now,
+    )?;
+    store.create_endpoint(endpoint.clone()).await?;
+    store
+        .replace_endpoint_capabilities(
+            endpoint.id(),
+            &[EndpointCapabilityObservation::new(
+                EndpointCapability::Systems,
+                CapabilityState::Supported,
+            )],
+            now,
+        )
+        .await?;
+    store
+        .commit_resource_generation(
+            endpoint.id(),
+            &[
+                NewResourceSnapshot::new(
+                    ResourceFeature::ServiceRoot,
+                    ResourceODataId::parse("/redfish/v1")?,
+                    ResourceSnapshotPayload::parse(r#"{"@odata.id":"/redfish/v1"}"#)?,
+                ),
+                NewResourceSnapshot::new(
+                    ResourceFeature::Systems,
+                    ResourceODataId::parse("/redfish/v1/Systems/1")?,
+                    ResourceSnapshotPayload::parse(r#"{"@odata.id":"/redfish/v1/Systems/1"}"#)?,
+                ),
+            ],
+            now,
+        )
+        .await?;
+    Ok(endpoint)
+}
+
+/// Builds one operation offer for the site.
+fn offer_for(
+    instance_id: InstanceId,
+    endpoint_id: EndpointId,
+    now: OffsetDateTime,
+) -> Result<OperationOffer, Box<dyn Error>> {
+    Ok(OperationOffer {
+        operation_id: OperationId::generate().to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        site_id: instance_id.to_string(),
+        command_json: serde_json::to_vec(&RedfishCommand::System(SystemCommand::Reset(
+            ResetType::PowerCycle,
+        )))?,
+        target: String::from("/redfish/v1/Systems/1"),
+        expires_at_unix: now.unix_timestamp() + 3600,
+        actor_context: String::from("principal-7"),
+    })
+}
+
+#[tokio::test]
+async fn the_engine_accepts_an_offer_against_the_real_store() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let directory = tempfile::tempdir()?;
+    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let instance_id = InstanceId::generate();
+    let site = SiteInstance::new(
+        instance_id,
+        String::from("Site One"),
+        InstanceKind::Site,
+        now,
+    );
+    store.create_instance(&site).await?;
+    let endpoint = seed_offerable_endpoint(&store, now).await?;
+
+    let (transport, mut wires) = MockTransport::new();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let engine = CenterSync::new(
+        transport,
+        &store,
+        &store,
+        &store,
+        &store,
+        &store,
+        FixedClock(now),
+        instance_id,
+        engine_options(),
+    );
+    let mut engine_run = Box::pin(engine.run(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let mut wire = next_wire(&mut engine_run, &mut wires).await?;
+    // The connect reports the prepared projection first: one snapshot and
+    // two upserts (§21 0.7.0 incremental sync).
+    for sequence in [1, 2, 3] {
+        let envelope = await_engine_or_frame(&mut engine_run, &mut wire).await?;
+        assert_eq!(envelope.sequence, sequence);
+    }
+
+    // The center sends one operation offer.
+    let offer = offer_for(instance_id, endpoint.id(), now)?;
+    wire.inbound
+        .send(Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: Some(EnvelopeMessage::OperationOffer(offer.clone())),
+        })
+        .map_err(|_| std::io::Error::other("the center feed closed"))?;
+
+    // The durable reply reaches the center without any acknowledgement, and
+    // the real store carries the state: the inbox entry advanced
+    // received → accepted, and the operation is persisted under the offer's
+    // stable id with the Center source.
+    let envelope = await_engine_or_frame(&mut engine_run, &mut wire).await?;
+    assert_eq!(envelope.sequence, 4);
+    let Some(EnvelopeMessage::OperationAccepted(accepted)) = envelope.message else {
+        return Err(std::io::Error::other("the reply was not an OperationAccepted").into());
+    };
+    assert_eq!(accepted.operation_id, offer.operation_id);
+    let operation_id: OperationId = offer.operation_id.parse()?;
+    let entry = store
+        .find_inbox_entry_by_operation(operation_id)
+        .await?
+        .ok_or_else(|| std::io::Error::other("the inbox entry is missing"))?;
+    assert_eq!(entry.state(), InboxEntryState::Accepted);
+    let operation = store
+        .find_operation(operation_id)
+        .await?
+        .ok_or_else(|| std::io::Error::other("the operation is missing"))?;
+    assert_eq!(operation.source(), OperationSource::Center);
+    assert_eq!(operation.state(), OperationState::Queued);
+
+    stop_tx
+        .send(())
+        .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), &mut engine_run)
+        .await
+        .map_err(|_| std::io::Error::other("the engine did not stop in time"))?;
+    assert!(
+        stopped.is_ok(),
+        "the engine must stop cleanly, got {stopped:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_duplicate_offer_stays_idempotent_against_the_real_store() -> Result<(), Box<dyn Error>> {
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let directory = tempfile::tempdir()?;
+    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let instance_id = InstanceId::generate();
+    let site = SiteInstance::new(
+        instance_id,
+        String::from("Site One"),
+        InstanceKind::Site,
+        now,
+    );
+    store.create_instance(&site).await?;
+    let endpoint = seed_offerable_endpoint(&store, now).await?;
+
+    let (transport, mut wires) = MockTransport::new();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let engine = CenterSync::new(
+        transport,
+        &store,
+        &store,
+        &store,
+        &store,
+        &store,
+        FixedClock(now),
+        instance_id,
+        engine_options(),
+    );
+    let mut engine_run = Box::pin(engine.run(async move {
+        let _ = stop_rx.await;
+    }));
+
+    let mut wire = next_wire(&mut engine_run, &mut wires).await?;
+    for _ in 0..3 {
+        let _ = await_engine_or_frame(&mut engine_run, &mut wire).await?;
+    }
+    let offer = offer_for(instance_id, endpoint.id(), now)?;
+    for sequence in [1_u64, 2] {
+        wire.inbound
+            .send(Envelope {
+                sequence,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::OperationOffer(offer.clone())),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = await_engine_or_frame(&mut engine_run, &mut wire).await?;
+        let Some(message) = envelope.message else {
+            return Err(std::io::Error::other("the reply frame carried no message").into());
+        };
+        match message {
+            EnvelopeMessage::OperationAccepted(_) => {}
+            EnvelopeMessage::OperationProgress(progress) => {
+                assert_eq!(progress.operation_id, offer.operation_id);
+            }
+            other => {
+                return Err(
+                    std::io::Error::other(format!("unexpected reply frame: {other:?}")).into(),
+                );
+            }
+        }
+    }
+
+    // The re-delivered offer never executed twice: one operation row, and
+    // the inbox entry still carries the accepted state.
+    let operation_id: OperationId = offer.operation_id.parse()?;
+    assert_eq!(store.list_operations(None).await?.len(), 1);
+    assert_eq!(
+        store
+            .find_inbox_entry_by_operation(operation_id)
+            .await?
+            .ok_or_else(|| std::io::Error::other("the inbox entry is missing"))?
+            .state(),
+        InboxEntryState::Accepted
+    );
 
     stop_tx
         .send(())
