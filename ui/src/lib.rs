@@ -313,6 +313,8 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             // service families follow the same rule.
             CoreResourceDetailsResponse::ServiceRoot { .. }
             | CoreResourceDetailsResponse::OemDell { .. }
+            | CoreResourceDetailsResponse::OemSmcSysLockdown { .. }
+            | CoreResourceDetailsResponse::OemSmcKcsInterface { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -504,7 +506,9 @@ fn oem_resource_card(
     resource: &CoreResourceResponse,
 ) -> Option<CoreResourceCardProjection> {
     match resource.resource() {
-        CoreResourceDetailsResponse::OemDell { .. } => Some(
+        CoreResourceDetailsResponse::OemDell { .. }
+        | CoreResourceDetailsResponse::OemSmcSysLockdown { .. }
+        | CoreResourceDetailsResponse::OemSmcKcsInterface { .. } => Some(
             CoreResourceCardProjection::from_resource(endpoint_id, resource),
         ),
         CoreResourceDetailsResponse::ServiceRoot { .. }
@@ -553,6 +557,12 @@ fn card_facts(
         CoreResourceDetailsResponse::Chassis { .. } => chassis_card_facts(resource),
         CoreResourceDetailsResponse::Manager { .. } => manager_card_facts(resource),
         CoreResourceDetailsResponse::OemDell { .. } => oem_dell_card_facts(resource),
+        CoreResourceDetailsResponse::OemSmcSysLockdown { .. } => {
+            oem_smc_sys_lockdown_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemSmcKcsInterface { .. } => {
+            oem_smc_kcs_interface_card_facts(resource)
+        }
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
         CoreResourceDetailsResponse::Storage { .. } => storage_card_facts(resource),
@@ -1531,6 +1541,60 @@ fn oem_dell_card_facts(
     );
     push_fact(&mut facts, "Server name", server_name.as_deref());
     ("Dell OEM", facts)
+}
+
+/// Facts for the Supermicro `SysLockdown` OEM card under the §0.5.0
+/// `oem-supermicro` family.
+///
+/// The manager `SysLockdown` document's only substantive typed field is the
+/// `SysLockdownEnabled` boolean, rendered in its canonical wire spelling
+/// (`true` / `false`) per §12.3 — the product never reinterprets the vendor
+/// value. The optional value renders only when the document published the
+/// property.
+///
+/// The dispatcher guarantees this receives the `OemSmcSysLockdown` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_smc_sys_lockdown_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemSmcSysLockdown {
+        sys_lockdown_enabled,
+    } = resource
+    else {
+        return ("Supermicro SysLockdown", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "SysLockdown enabled",
+        sys_lockdown_enabled.map(|enabled| if enabled { "true" } else { "false" }),
+    );
+    ("Supermicro SysLockdown", facts)
+}
+
+/// Facts for the Supermicro `KcsInterface` OEM card under the §0.5.0
+/// `oem-supermicro` family.
+///
+/// The manager `KCSInterface` document's `Privilege` value is the vendor's
+/// enum spelling kept verbatim per §12.3 (e.g. `Administrator`, `DisableKCS`)
+/// — never translated into a product label. The optional value renders only
+/// when the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemSmcKcsInterface` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_smc_kcs_interface_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemSmcKcsInterface { privilege } = resource else {
+        return ("Supermicro KCS Interface", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Privilege", privilege.as_deref());
+    ("Supermicro KCS Interface", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -11886,6 +11950,50 @@ mod tests {
         })
     }
 
+    fn oem_smc_sys_lockdown_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789da",
+                "odata_id": "/redfish/v1/Managers/1/SysLockdown",
+                "odata_type": "#SysLockdown.v1_0_0.SysLockdown",
+                "etag": "W/\"sys-lockdown-1\""
+            },
+            "common": {
+                "id": "SysLockdown",
+                "name": "SysLockdown",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "oem_smc_sys_lockdown",
+                "details": {
+                    "sys_lockdown_enabled": true
+                }
+            }
+        })
+    }
+
+    fn oem_smc_kcs_interface_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789db",
+                "odata_id": "/redfish/v1/Managers/1/KCSInterface",
+                "odata_type": "#KCSInterface.v1_0_0.KCSInterface",
+                "etag": "W/\"kcs-interface-1\""
+            },
+            "common": {
+                "id": "KCSInterface",
+                "name": "KCSInterface",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "oem_smc_kcs_interface",
+                "details": {
+                    "privilege": "Operator"
+                }
+            }
+        })
+    }
+
     fn capability_inventory_with_oem(
         standard_states: &[Option<&str>],
         oem_states: &[Option<&str>],
@@ -14954,6 +15062,67 @@ mod tests {
         assert!(dell.facts.contains(&ResourceFactProjection {
             label: "Server name",
             value: "rack-1-server-2".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_supermicro_resources()
+    -> Result<(), Box<dyn Error>> {
+        // The api contract has landed the Supermicro OEM families
+        // (`oem-supermicro`), so a Supermicro snapshot (a manager publishing
+        // `SysLockdown` and `KCSInterface` documents) derives the data-card
+        // form through the wire projection, not by direct construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789ad",
+                "display_name": "Rack C BMC",
+                "address": "https://192.0.2.12/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [
+                        oem_smc_sys_lockdown_resource(),
+                        oem_smc_kcs_interface_resource()
+                    ]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("a Supermicro snapshot must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 2);
+        let sys_lockdown = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/SysLockdown")
+            .ok_or("the SysLockdown card must exist")?;
+        assert_eq!(sys_lockdown.type_label, "Supermicro SysLockdown");
+        // The compiled schema models no `Name`, so the card identity is the
+        // resource's own `@odata.id` final segment, never an invented label.
+        assert_eq!(sys_lockdown.name, "SysLockdown");
+        // The vendor's boolean is rendered in its canonical wire spelling
+        // verbatim (§12.3).
+        assert!(sys_lockdown.facts.contains(&ResourceFactProjection {
+            label: "SysLockdown enabled",
+            value: "true".to_owned(),
+        }));
+        let kcs_interface = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/KCSInterface")
+            .ok_or("the KCSInterface card must exist")?;
+        assert_eq!(kcs_interface.type_label, "Supermicro KCS Interface");
+        assert_eq!(kcs_interface.name, "KCSInterface");
+        // The vendor's enum spelling is kept verbatim per §12.3.
+        assert!(kcs_interface.facts.contains(&ResourceFactProjection {
+            label: "Privilege",
+            value: "Operator".to_owned(),
         }));
         Ok(())
     }
