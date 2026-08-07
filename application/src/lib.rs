@@ -3,6 +3,7 @@
 mod artifact_store;
 mod audit_log;
 mod batch_query;
+mod batch_refresh;
 mod capability_query;
 mod command_executor;
 mod credential_management;
@@ -30,6 +31,10 @@ pub use artifact_store::{
 };
 pub use audit_log::{AuditEventWriter, AuditRecordError};
 pub use batch_query::{BatchDetail, BatchQuery, BatchQueryError, BatchSummary};
+pub use batch_refresh::{
+    BatchEndpointRefresh, BatchEndpointRefreshError, EndpointRefreshFailureKind,
+    EndpointRefreshOutcome, MAX_CONCURRENT_REFRESHES, MAX_REFRESH_TARGETS,
+};
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
