@@ -77,6 +77,41 @@ pub enum ResourceFeature {
     /// variant addresses only the read surface and must not be mistaken for a
     /// capability code (see the ledger-consistency test).
     OemNvidiaSystemConfigProfile,
+    /// The §2.1 `oem-nvidia-power-management` read surface, added as a typed
+    /// resource family in the 0.5 slice. The family reads the manager-scoped
+    /// NVIDIA `NvidiaPowerComplianceManager` chain — the compliance manager
+    /// document, its `PowerDomains` collection members, the `ACLossPolicy` /
+    /// `PSUCompliancePolicy` singletons, the `ManagedEntityGroups` collection
+    /// members, the `PowerStateGroup` document with its `PowerShelfControllers`
+    /// and `PowerSupplies` collection members, and the `PSURedundancy`
+    /// singleton — through the `Nvidia` OEM namespace of the `Manager`
+    /// document. One family covers the whole chain because the chain's root
+    /// document (the `NvidiaPowerComplianceManager` behind the
+    /// `PowerCompliance` navigation) decides whether the chain exists at all.
+    /// The family code is `nvidia-power-compliance` (not
+    /// `oem-nvidia-power-management`, which stays the capability code, and
+    /// not `oem-nvidia`, which stays the namespace capability code): the one
+    /// `oem-nvidia-power-management` capability covers the read surface and
+    /// the namespace advertisement that precedes it, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code (see the ledger-consistency test).
+    OemNvidiaPowerCompliance,
+    /// The §2.1 `oem-nvidia-power-management` read surface, added as a typed
+    /// resource family in the 0.5 slice. The family reads the manager-scoped
+    /// NVIDIA managed-entity chain — the `NvidiaManagedEntityGroupCollection`
+    /// behind the compliance manager's `ManagedEntityGroups` navigation (the
+    /// chain's entry navigation, whose presence decides whether the chain
+    /// exists at all) and, through each group member's `ManagedEntities`
+    /// navigation, the `NvidiaManagedEntity` members — through the `Nvidia`
+    /// OEM namespace of the `Manager` document. The family code is
+    /// `nvidia-managed-entity` (not `oem-nvidia-power-management`, which
+    /// stays the capability code, and not `oem-nvidia`, which stays the
+    /// namespace capability code): the one `oem-nvidia-power-management`
+    /// capability covers the read surface and the namespace advertisement
+    /// that precedes it, so this variant addresses only the read surface and
+    /// must not be mistaken for a capability code (see the
+    /// ledger-consistency test).
+    OemNvidiaManagedEntity,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -216,6 +251,8 @@ impl ResourceFeature {
             Self::OemSmcSysLockdown => "supermicro-sys-lockdown",
             Self::OemSmcKcsInterface => "supermicro-kcs-interface",
             Self::OemNvidiaSystemConfigProfile => "nvidia-system-config-profile",
+            Self::OemNvidiaPowerCompliance => "nvidia-power-compliance",
+            Self::OemNvidiaManagedEntity => "nvidia-managed-entity",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
@@ -265,6 +302,8 @@ impl FromStr for ResourceFeature {
             "supermicro-sys-lockdown" => Ok(Self::OemSmcSysLockdown),
             "supermicro-kcs-interface" => Ok(Self::OemSmcKcsInterface),
             "nvidia-system-config-profile" => Ok(Self::OemNvidiaSystemConfigProfile),
+            "nvidia-power-compliance" => Ok(Self::OemNvidiaPowerCompliance),
+            "nvidia-managed-entity" => Ok(Self::OemNvidiaManagedEntity),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
@@ -834,6 +873,8 @@ mod tests {
             ResourceFeature::OemSmcSysLockdown,
             ResourceFeature::OemSmcKcsInterface,
             ResourceFeature::OemNvidiaSystemConfigProfile,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaManagedEntity,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
@@ -1044,6 +1085,22 @@ mod tests {
                 ResourceFeature::OemNvidiaSystemConfigProfile,
                 EndpointCapability::OemNvidiaProfiles,
             ),
+            // The 0.5 NVIDIA power-compliance and managed-entity families
+            // follow the same precedent: each family reads one manager-scoped
+            // chain inside the `Nvidia` namespace, so both map to the
+            // `oem-nvidia-power-management` capability (the feature that
+            // advertises that namespace) under the narrower family codes
+            // `nvidia-power-compliance` and `nvidia-managed-entity` — never
+            // the `oem-nvidia` or `oem-nvidia-power-management` capability
+            // codes, which stay with the ledger.
+            (
+                ResourceFeature::OemNvidiaPowerCompliance,
+                EndpointCapability::OemNvidiaPowerManagement,
+            ),
+            (
+                ResourceFeature::OemNvidiaManagedEntity,
+                EndpointCapability::OemNvidiaPowerManagement,
+            ),
         ];
         for (feature, capability) in subsidiary {
             assert_ne!(feature.as_str(), capability.as_str());
@@ -1161,6 +1218,48 @@ mod tests {
         );
         assert_eq!(
             "oem-nvidia".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        // The 0.5 NVIDIA power-compliance and managed-entity families keep
+        // their narrow `nvidia-power-compliance` / `nvidia-managed-entity`
+        // codes; the `oem-nvidia` namespace capability and the
+        // `oem-nvidia-power-management` feature capability stay with the
+        // ledger, so the snapshot and capability inventories cannot silently
+        // drift into aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemNvidiaPowerCompliance.as_str(),
+            "nvidia-power-compliance"
+        );
+        assert_eq!(
+            ResourceFeature::OemNvidiaManagedEntity.as_str(),
+            "nvidia-managed-entity"
+        );
+        assert_eq!(
+            EndpointCapability::OemNvidiaPowerManagement.as_str(),
+            "oem-nvidia-power-management"
+        );
+        assert_eq!(
+            "nvidia-power-compliance".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemNvidiaPowerCompliance)
+        );
+        assert_eq!(
+            "nvidia-power-compliance".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "nvidia-managed-entity".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemNvidiaManagedEntity)
+        );
+        assert_eq!(
+            "nvidia-managed-entity".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-nvidia-power-management".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemNvidiaPowerManagement)
+        );
+        assert_eq!(
+            "oem-nvidia-power-management".parse::<ResourceFeature>(),
             Err(ResourceFeatureParseError)
         );
     }
@@ -1289,6 +1388,41 @@ mod tests {
             "oem-nvidia-system-config-profile",
             "oem-nvidia",
             "oem-nvidia-profiles",
+            // The 0.5 NVIDIA power-compliance family: singular, snake_case,
+            // and CamelCase forms would address a different surface, the
+            // vendor-less names would collide with the product's
+            // vendor-prefixed family space, and the `oem-nvidia` /
+            // `oem-nvidia-power-management` capability codes (plus the
+            // hypothetical per-surface extensions) must stay unparseable as
+            // families so the ledger and the snapshot inventory never alias.
+            "nvidia-power-compliance/",
+            "nvidia_power_compliance",
+            "nvidiapowercompliance",
+            "NvidiaPowerCompliance",
+            "power-compliance",
+            "power_compliance",
+            "PowerCompliance",
+            "nvidia-power-compliances",
+            "nvidia-power",
+            "oem-nvidia-power-compliance",
+            "oem-nvidia-power-management",
+            // The 0.5 NVIDIA managed-entity family: singular, snake_case, and
+            // CamelCase forms would address a different surface, the
+            // vendor-less names would collide with the product's
+            // vendor-prefixed family space, and the `oem-nvidia` /
+            // `oem-nvidia-power-management` capability codes (plus the
+            // hypothetical per-surface extensions) must stay unparseable as
+            // families so the ledger and the snapshot inventory never alias.
+            "nvidia-managed-entity/",
+            "nvidia_managed_entity",
+            "nvidiamanagedentity",
+            "NvidiaManagedEntity",
+            "managed-entity",
+            "managed_entity",
+            "ManagedEntity",
+            "nvidia-managed-entities",
+            "nvidia-managed-entity-group",
+            "oem-nvidia-managed-entity",
             "host-interface",
             "host-interfaces/",
             "hostinterface",

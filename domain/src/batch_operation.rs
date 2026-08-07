@@ -23,7 +23,7 @@
 
 use time::OffsetDateTime;
 
-use crate::{BatchOperationId, OperationSource, OperationState, RedfishCommand};
+use crate::{BatchOperationId, FailureKind, OperationSource, OperationState, RedfishCommand};
 
 /// One persisted batch parent (§13.7).
 ///
@@ -192,6 +192,40 @@ pub fn derive_batch_state(children: &[OperationState]) -> BatchOperationState {
     Batch::Unknown
 }
 
+/// One child operation's outcome as reporting sees it (§13.7).
+///
+/// The state is the child's terminal (or in-flight) [`OperationState`]; the
+/// `failure_kind` is the persisted classification of a `Failed` child, `None`
+/// for every other state and for failures the product does not classify. The
+/// pair is what the batch summary needs: a `Failed` child with
+/// [`FailureKind::CapabilityUnsupported`] is an unsupported-command verdict,
+/// not an ordinary failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationOutcome {
+    state: OperationState,
+    failure_kind: Option<FailureKind>,
+}
+
+impl OperationOutcome {
+    #[must_use]
+    pub const fn new(state: OperationState, failure_kind: Option<FailureKind>) -> Self {
+        Self {
+            state,
+            failure_kind,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(self) -> OperationState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn failure_kind(self) -> Option<FailureKind> {
+        self.failure_kind
+    }
+}
+
 /// The outcome buckets of one batch's completed children (§13.7).
 ///
 /// `total` counts every child; the named buckets count only terminal
@@ -203,11 +237,9 @@ pub struct BatchOutcomeCounts {
     succeeded: usize,
     failed: usize,
     unknown: usize,
-    /// Counted from the batch's unsupported-command failures; always zero in
-    /// this slice because the failure classification that separates
-    /// "unsupported" from "failed" (`failure_kind`) lands with the batch
-    /// reporting slice. Until then, an unsupported command fails its child
-    /// operation like any other failure and is counted in [`Self::failed`].
+    /// Counted from the batch's unsupported-command failures: a `Failed`
+    /// child whose persisted [`FailureKind`] is `capability-unsupported`.
+    /// Every other `Failed` child is counted in [`Self::failed`].
     unsupported: usize,
     cancelled: usize,
     total: usize,
@@ -248,24 +280,30 @@ impl BatchOutcomeCounts {
 /// Summarizes the children's terminal outcomes into the batch buckets
 /// (§13.7).
 ///
-/// Each terminal child state maps to exactly one bucket (`Succeeded`,
-/// `Failed`, `Unknown`, or `Cancelled`); `unsupported` stays zero until the
-/// failure classification that separates it from `Failed` lands, and
-/// `total` counts every child, including the ones still in flight.
+/// Each terminal child maps to exactly one bucket: `Succeeded`, `Unknown`,
+/// and `Cancelled` map by state alone, while a `Failed` child maps to the
+/// `unsupported` bucket when its persisted [`FailureKind`] is
+/// `capability-unsupported` and to `failed` otherwise — the kind is a fact of
+/// the child's persisted record, never derived from anything else. `total`
+/// counts every child, including the ones still in flight, which are counted
+/// in no bucket.
 #[must_use]
-pub fn summarize(children: &[OperationState]) -> BatchOutcomeCounts {
+pub fn summarize(outcomes: &[OperationOutcome]) -> BatchOutcomeCounts {
     let mut counts = BatchOutcomeCounts {
         succeeded: 0,
         failed: 0,
         unknown: 0,
         unsupported: 0,
         cancelled: 0,
-        total: children.len(),
+        total: outcomes.len(),
     };
-    for state in children {
-        match state {
+    for outcome in outcomes {
+        match outcome.state {
             OperationState::Succeeded => counts.succeeded += 1,
-            OperationState::Failed => counts.failed += 1,
+            OperationState::Failed => match outcome.failure_kind {
+                Some(FailureKind::CapabilityUnsupported) => counts.unsupported += 1,
+                None => counts.failed += 1,
+            },
             OperationState::Unknown => counts.unknown += 1,
             OperationState::Cancelled => counts.cancelled += 1,
             OperationState::Queued
@@ -281,7 +319,8 @@ pub fn summarize(children: &[OperationState]) -> BatchOutcomeCounts {
 #[cfg(test)]
 mod tests {
     use crate::{
-        BatchOperationId, OperationSource, OperationState, RedfishCommand, ResetType, SystemCommand,
+        BatchOperationId, FailureKind, OperationSource, OperationState, RedfishCommand, ResetType,
+        SystemCommand,
     };
 
     use super::*;
@@ -445,22 +484,53 @@ mod tests {
     #[test]
     fn summarize_buckets_terminal_outcomes_and_counts_every_child() {
         let counts = summarize(&[
-            OperationState::Succeeded,
-            OperationState::Failed,
-            OperationState::Unknown,
-            OperationState::Cancelled,
-            OperationState::Queued,
-            OperationState::Running,
-            OperationState::Succeeded,
+            OperationOutcome::new(OperationState::Succeeded, None),
+            OperationOutcome::new(OperationState::Failed, None),
+            OperationOutcome::new(OperationState::Unknown, None),
+            OperationOutcome::new(OperationState::Cancelled, None),
+            OperationOutcome::new(OperationState::Queued, None),
+            OperationOutcome::new(OperationState::Running, None),
+            OperationOutcome::new(OperationState::Succeeded, None),
         ]);
         assert_eq!(counts.succeeded(), 2);
         assert_eq!(counts.failed(), 1);
         assert_eq!(counts.unknown(), 1);
         assert_eq!(counts.cancelled(), 1);
-        // In-flight children are counted in total but in no outcome bucket;
-        // unsupported stays zero until the failure classification lands.
+        // In-flight children are counted in total but in no outcome bucket.
         assert_eq!(counts.unsupported(), 0);
         assert_eq!(counts.total(), 7);
+    }
+
+    #[test]
+    fn summarize_buckets_classified_failures_as_unsupported() {
+        let counts = summarize(&[
+            // A classified capability refusal is the unsupported verdict, not
+            // an ordinary failure.
+            OperationOutcome::new(
+                OperationState::Failed,
+                Some(FailureKind::CapabilityUnsupported),
+            ),
+            // An unclassified failure stays in the failed bucket.
+            OperationOutcome::new(OperationState::Failed, None),
+            OperationOutcome::new(OperationState::Succeeded, None),
+            // A kind on a non-failed child is never counted: the kind only
+            // ever classifies a Failed record (the write order guarantees it
+            // is written before the transition), and reporting must not
+            // invent an unsupported verdict from a success row.
+            OperationOutcome::new(
+                OperationState::Succeeded,
+                Some(FailureKind::CapabilityUnsupported),
+            ),
+            OperationOutcome::new(
+                OperationState::Cancelled,
+                Some(FailureKind::CapabilityUnsupported),
+            ),
+        ]);
+        assert_eq!(counts.succeeded(), 2);
+        assert_eq!(counts.failed(), 1);
+        assert_eq!(counts.unsupported(), 1);
+        assert_eq!(counts.cancelled(), 1);
+        assert_eq!(counts.total(), 5);
     }
 
     #[test]

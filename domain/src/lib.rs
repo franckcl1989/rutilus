@@ -10,6 +10,7 @@ mod credential;
 mod endpoint;
 mod endpoint_address;
 mod event;
+mod failure_kind;
 mod group;
 mod ids;
 mod operation;
@@ -30,7 +31,8 @@ pub use audit::{
     AuditVerification, ProductPermission,
 };
 pub use batch_operation::{
-    BatchOperation, BatchOperationState, BatchOutcomeCounts, derive_batch_state, summarize,
+    BatchOperation, BatchOperationState, BatchOutcomeCounts, OperationOutcome, derive_batch_state,
+    summarize,
 };
 pub use capability::{
     CAPABILITY_LEDGER_ORDER, CapabilityClassification, CapabilityState, CapabilityStateParseError,
@@ -51,6 +53,7 @@ pub use event::{
     Event, EventId, EventSeverity, EventSeverityParseError, EventTimelineError, MessageId,
     MessageIdError,
 };
+pub use failure_kind::{FailureKind, FailureKindParseError};
 pub use group::{Group, GroupId, GroupName, GroupNameError, GroupRestoreError};
 pub use ids::{
     ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, CredentialId,
