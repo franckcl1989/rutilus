@@ -332,6 +332,7 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::OemNvidiaPsuState { .. }
             | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
             | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. }
+            | CoreResourceDetailsResponse::OemLenovoSecurityService { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -538,7 +539,8 @@ fn oem_resource_card(
         | CoreResourceDetailsResponse::OemNvidiaPscState { .. }
         | CoreResourceDetailsResponse::OemNvidiaPsuState { .. }
         | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
-        | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. } => Some(
+        | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. }
+        | CoreResourceDetailsResponse::OemLenovoSecurityService { .. } => Some(
             CoreResourceCardProjection::from_resource(endpoint_id, resource),
         ),
         CoreResourceDetailsResponse::ServiceRoot { .. }
@@ -631,6 +633,9 @@ fn card_facts(
         }
         CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. } => {
             oem_nvidia_managed_entity_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemLenovoSecurityService { .. } => {
+            oem_lenovo_security_service_card_facts(resource)
         }
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
@@ -2122,6 +2127,30 @@ fn oem_nvidia_managed_entity_card_facts(
     push_fact(&mut facts, "IPv6 address", ipv6_address.as_deref());
     push_i64_fact(&mut facts, "Port", *port);
     ("NVIDIA Managed Entity", facts)
+}
+
+/// Projects the §11.5 Lenovo `SecurityService` document into the card facts
+/// vocabulary.
+///
+/// The document contributes one optional field (§12.3): `FirmwareRollback`
+/// is an optional property (e.g. `Enabled`, `Disabled`, or
+/// `UnsupportedValue` for a value this build cannot classify) — never
+/// translated into a product label. The optional value renders only when
+/// the document published the property.
+///
+/// The dispatcher guarantees this receives the `OemLenovoSecurityService`
+/// variant; the fallback keeps a stable empty facts list instead of panicking
+/// if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_lenovo_security_service_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemLenovoSecurityService { fw_rollback } = resource else {
+        return ("Lenovo Security Service", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Firmware rollback", fw_rollback.as_deref());
+    ("Lenovo Security Service", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]

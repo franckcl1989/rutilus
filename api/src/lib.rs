@@ -1089,6 +1089,20 @@ pub enum CoreResourceDetailsResponse {
         ipv6_address: Option<String>,
         port: Option<i64>,
     },
+    /// One §0.5.0 OEM family member projected from the typed Redfish Lenovo
+    /// `LenovoSecurityService` schema (`LenovoSecurityService`,
+    /// nv-redfish-schema 0.13, `oem-lenovo` feature).
+    ///
+    /// The manager's `SecurityService` document is the Lenovo OEM surface
+    /// nv-redfish 0.13 compiles on the `Manager` (§11.5: an OEM surface is
+    /// projected only when upstream strongly types it), read through the
+    /// `Security` navigation of the `Oem.Lenovo` segment. `fw_rollback` is
+    /// the vendor's enum spelling verbatim (e.g. `Enabled`, `Disabled`, or
+    /// `UnsupportedValue` for a value this build cannot classify), per §12.3;
+    /// the compiled schema models it inside the `Configurator` segment and
+    /// the upstream wrapper collapses that nesting onto its single
+    /// `fw_rollback()` accessor, so the wire carries the flattened value.
+    OemLenovoSecurityService { fw_rollback: Option<String> },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
@@ -5374,6 +5388,75 @@ mod tests {
             ),
             CoreResourceDetailsResponse::OemSmcKcsInterface {
                 privilege: Some("Administrator".to_owned()),
+            },
+        )
+    }
+
+    #[test]
+    fn core_resource_contract_carries_oem_lenovo_wire_values() -> Result<(), Box<dyn Error>> {
+        let security_service = oem_lenovo_security_service_resource();
+
+        // The wire carries the vendor's `FWRollback` enum spelling verbatim
+        // per §12.3 (the `Configurator` nesting of the compiled schema
+        // collapses onto the wrapper's flattened accessor).
+        assert_eq!(
+            serde_json::to_value(&security_service)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b8",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+                    "odata_type": "#LenovoSecurityService.v1_0_0.LenovoSecurityService",
+                    "etag": "W/\"lenovo-security-1\""
+                },
+                "common": {
+                    "id": "SecurityService",
+                    "name": "Lenovo Security Service",
+                    "description": "Lenovo security service"
+                },
+                "resource": {
+                    "resource_type": "oem_lenovo_security_service",
+                    "details": {
+                        "fw_rollback": "Enabled"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(
+                &security_service
+            )?)?,
+            security_service
+        );
+        // The strict field contract refuses a foreign key, so the wire shape
+        // cannot drift from the typed surface.
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "oem_lenovo_security_service",
+                "details": {
+                    "fw_rollback": "Disabled",
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn oem_lenovo_security_service_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b8"),
+                "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService".to_owned(),
+                Some("#LenovoSecurityService.v1_0_0.LenovoSecurityService".to_owned()),
+                Some("W/\"lenovo-security-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "SecurityService".to_owned(),
+                "Lenovo Security Service".to_owned(),
+                Some("Lenovo security service".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemLenovoSecurityService {
+                fw_rollback: Some("Enabled".to_owned()),
             },
         )
     }
