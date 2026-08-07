@@ -22,6 +22,28 @@
 //! offline by construction (§20.2): stop the instance, verify and decrypt
 //! the package, check the product and schema versions, restore the data,
 //! and let the operator start the instance.
+//!
+//! # Cross-machine restore (§20.2)
+//!
+//! The package is encrypted with the instance master key, so only the
+//! instance holding that key can open it — the §20.2 instance-identity
+//! binding. Restoring a backup on a *different* machine therefore requires
+//! carrying the key itself, not just the package:
+//!
+//! 1. Initialize the target machine and leave it stopped.
+//! 2. Copy the source machine's passphrase envelope (`master-key.rut` below
+//!    the source data directory) over the target machine's `master-key.rut`.
+//! 3. Run `backup restore` with the same passphrase the source envelope was
+//!    created with — the carried envelope must match the backup.
+//!
+//! The passphrase envelope is a portable file, so this supported flow works
+//! across machines and platforms. The operating-system envelope
+//! (`system-master-key.rut`, DPAPI/Keychain) is bound to the machine that
+//! created it and cannot be carried; §10.3 Site/Center instances always use
+//! the system envelope, so they are not restorable across machines. A naive
+//! restore without the carried envelope fails with a key-mismatch error
+//! whose message names both possible causes (wrong passphrase, or another
+//! instance's backup).
 
 use std::{
     collections::HashSet,
@@ -181,25 +203,49 @@ pub async fn create_backup(
 /// unlocks the package and proves the package belongs to this instance. The
 /// package is verified and decrypted, the product and schema versions are
 /// checked, and the database, key envelopes, instance marker, TLS pair, and
-/// artifact files are restored into the data directory.
+/// artifact files are restored into the data directory. The restored
+/// database is then opened read-only and verified against the package
+/// snapshot before the outcome is reported.
+///
+/// Cross-machine restores are supported only with a carried passphrase
+/// envelope (see the module documentation): a key mismatch here — the
+/// envelope cannot be unlocked, or the package refuses the recovered key —
+/// is reported with an error naming both the wrong-passphrase cause and the
+/// other-instance cause, since the two are indistinguishable.
 ///
 /// # Errors
 ///
 /// Returns [`BackupError`] when the instance is running, the master key is
 /// unrecoverable or does not match the package, the package is invalid, the
-/// versions are incompatible, or any file cannot be written.
+/// versions are incompatible, or any file cannot be written or verified.
 pub async fn restore_backup(
     paths: &RuntimePaths,
     unlock: &BackupKeyUnlock,
     package_path: &Path,
 ) -> Result<RestoreOutcome, BackupError> {
     let _runtime_lock = acquire_stopped_instance(paths)?;
-    let master_key = recover_instance_master_key(paths, unlock).await?;
+    let master_key = match recover_instance_master_key(paths, unlock).await {
+        Ok(master_key) => master_key,
+        Err(error)
+            if matches!(
+                error,
+                BackupError::MasterKeyProtection(_) | BackupError::SystemMasterKeyProtection(_)
+            ) =>
+        {
+            // A failed unlock cannot be attributed to a wrong passphrase
+            // alone: the envelope present may belong to another machine.
+            return Err(BackupError::RestoreUnlockAuthentication(Box::new(error)));
+        }
+        Err(error) => return Err(error),
+    };
     let package = fs::read(package_path).map_err(|source| BackupError::ReadPackage {
         path: package_path.to_path_buf(),
         source,
     })?;
-    let backup = open_backup_package(&master_key, &package).map_err(BackupError::Package)?;
+    let backup = open_backup_package(&master_key, &package).map_err(|error| match error {
+        BackupPackageError::AuthenticationFailed => BackupError::RestorePackageAuthentication,
+        other => BackupError::Package(other),
+    })?;
     check_product_version(&backup)?;
 
     let database_entry = backup
@@ -228,6 +274,24 @@ pub async fn restore_backup(
 
     restore_database_files(paths.database_path(), &snapshot).map_err(BackupError::RestoreFiles)?;
     let restored = restore_data_directory_files(paths, &backup)?;
+
+    // §20.2 verification: the restored database must be byte-identical to
+    // the verified package snapshot and must open read-only with a known
+    // schema before the restore is reported complete. The staged read-only
+    // inspection applies no migrations; pending migrations still apply at
+    // the next real open.
+    let restored_database = fs::read(paths.database_path()).map_err(|source| {
+        BackupError::ReadRestored {
+            path: paths.database_path().to_path_buf(),
+            source,
+        }
+    })?;
+    if restored_database != snapshot.database() {
+        return Err(BackupError::RestoredDatabaseDiffers);
+    }
+    restore_compatibility(&restored_database)
+        .await
+        .map_err(BackupError::RestoreCheck)?;
 
     Ok(RestoreOutcome {
         restored_entries: restored,
@@ -595,6 +659,30 @@ pub enum BackupError {
     RestoreCheck(#[source] RestoreCheckError),
     #[error("failed to restore the database files: {0}")]
     RestoreFiles(#[source] RestoreError),
+    #[error("failed to read the restored database at {path} for verification: {source}")]
+    ReadRestored {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("restore verification failed: the restored database differs from the verified backup snapshot")]
+    RestoredDatabaseDiffers,
+    #[error(
+        "the backup package could not be authenticated with this instance's master key: the \
+         passphrase is wrong, or the backup was created by another instance — a cross-machine \
+         restore requires first copying the source instance's passphrase envelope over this \
+         instance's envelope; instances protected by the operating-system envelope \
+         (DPAPI/Keychain) cannot restore across machines"
+    )]
+    RestorePackageAuthentication,
+    #[error(
+        "this instance's master key could not be unlocked: the passphrase is wrong, or the key \
+         envelope belongs to another instance — a cross-machine restore requires first copying \
+         the source instance's passphrase envelope over this instance's envelope; instances \
+         protected by the operating-system envelope (DPAPI/Keychain) cannot restore across \
+         machines: {0}"
+    )]
+    RestoreUnlockAuthentication(#[source] Box<BackupError>),
     #[error("backup entry {name:?} has an unusable artifact identity")]
     InvalidArtifactEntryName { name: String },
 }
@@ -605,7 +693,7 @@ mod tests {
 
     use rutilus_domain::{CredentialId, CredentialName, CredentialUsername, CredentialVersionId};
     use rutilus_persistence::SqliteStore;
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret as _, SecretString};
 
     use super::*;
 
@@ -721,9 +809,126 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            Err(BackupError::Package(
-                rutilus_security::BackupPackageError::AuthenticationFailed
+            Err(BackupError::RestorePackageAuthentication)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_machine_restore_requires_carrying_the_source_envelope()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (source_paths, source_unlock) = initialized_instance(directory.path()).await?;
+        // Seed one credential under the source instance's own master key, so
+        // the final decryption proves the carried envelope's key unlocks the
+        // restored data (the `initialized_instance` helper's credential uses
+        // a fixed test key and cannot prove that).
+        let source_key = recover_instance_master_key(&source_paths, &source_unlock).await?;
+        let source_store = SqliteStore::open(source_paths.database_path()).await?;
+        let protected = rutilus_security::encrypt_credential(
+            &source_key,
+            CredentialId::generate(),
+            CredentialVersionId::generate(),
+            &SecretString::from(String::from("seed password")),
+        )?;
+        source_store
+            .create_credential(rutilus_persistence::NewCredential::new(
+                CredentialName::parse("carried-seed")?,
+                CredentialUsername::parse("administrator")?,
+                protected,
             ))
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        source_store.close().await?;
+        let output = directory.path().join("source.rut");
+        create_backup(&source_paths, &source_unlock, Some(&output)).await?;
+        let source_envelope = std::fs::read(source_paths.master_key_path())?;
+
+        // The target machine is a fresh instance initialized with the same
+        // passphrase. The naive restore (package alone, no carried envelope)
+        // must fail with the key-mismatch error whose message names the
+        // cross-machine remedy.
+        let target_paths = RuntimePaths::from_root(directory.path().join("target"))?;
+        let passphrase = SecretString::from(String::from("correct local unlock phrase"));
+        let confirmation = passphrase.clone();
+        let target_unlock = crate::StandaloneUnlock::confirm(passphrase, &confirmation)?;
+        crate::initialize_standalone(&target_paths, &target_unlock).await?;
+        let target_unlock = passphrase_unlock("correct local unlock phrase");
+        assert!(matches!(
+            restore_backup(&target_paths, &target_unlock, &output).await,
+            Err(BackupError::RestorePackageAuthentication)
+        ));
+
+        // The supported flow: carry the source passphrase envelope over the
+        // target's, then restore with the source passphrase.
+        std::fs::write(target_paths.master_key_path(), &source_envelope)?;
+        let restored = restore_backup(&target_paths, &target_unlock, &output).await?;
+        assert_eq!(restored.pending_migrations(), 0);
+
+        // The restored data is the source's, and the carried envelope still
+        // unlocks it: the master key recovered from the restored envelope
+        // decrypts the restored credential ciphertext, and the restored
+        // store serves the source's rows.
+        let mut names = stored_credential_names(&target_paths).await?;
+        names.sort();
+        assert_eq!(names, vec!["carried-seed", "first-seed"]);
+        let master_key = recover_instance_master_key(&target_paths, &target_unlock).await?;
+        let store = SqliteStore::open(target_paths.database_path()).await?;
+        let credentials = store
+            .list_credentials(10)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        let carried = credentials
+            .iter()
+            .find(|credential| credential.name().as_str() == "carried-seed")
+            .ok_or_else(|| io::Error::other("carried-seed is missing after the restore"))?;
+        let stored = store
+            .find_active_credential(carried.id())
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        store.close().await?;
+        let stored = stored.ok_or_else(|| io::Error::other("restored credential is missing"))?;
+        let password = rutilus_security::decrypt_credential(&master_key, stored.protected_secret())
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        assert_eq!(password.expose_secret(), "seed password");
+
+        // The restore wrote the package's envelope over the carried one: the
+        // target now holds the source machine's exact envelope bytes.
+        assert_eq!(
+            std::fs::read(target_paths.master_key_path())?,
+            source_envelope
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_with_a_source_passphrase_against_a_fresh_envelope_names_the_remedy()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (source_paths, source_unlock) = initialized_instance(directory.path()).await?;
+        let output = directory.path().join("source.rut");
+        create_backup(&source_paths, &source_unlock, Some(&output)).await?;
+
+        // The target machine uses a different passphrase and the operator
+        // supplies the source one: the local envelope itself refuses the
+        // passphrase, which is indistinguishable from a wrong passphrase, so
+        // the error must carry the cross-machine remedy.
+        let target_paths = RuntimePaths::from_root(directory.path().join("target"))?;
+        let passphrase = SecretString::from(String::from("target machine passphrase"));
+        let confirmation = passphrase.clone();
+        let target_unlock = crate::StandaloneUnlock::confirm(passphrase, &confirmation)?;
+        crate::initialize_standalone(&target_paths, &target_unlock).await?;
+
+        let result = restore_backup(
+            &target_paths,
+            &passphrase_unlock("correct local unlock phrase"),
+            &output,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(BackupError::RestoreUnlockAuthentication(inner))
+                if matches!(inner.as_ref(), BackupError::MasterKeyProtection(_))
         ));
         Ok(())
     }

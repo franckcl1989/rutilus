@@ -77,6 +77,12 @@ enum BackupCommand {
         output: Option<PathBuf>,
     },
     /// Restore one backup package into the data directory, offline (§20.2).
+    ///
+    /// A backup is encrypted with the source instance's master key, so a
+    /// cross-machine restore requires first copying the source machine's
+    /// passphrase envelope over this machine's envelope and then restoring
+    /// with the source passphrase. Instances protected by the operating
+    /// system's envelope (DPAPI/Keychain) cannot restore across machines.
     Restore {
         /// Use the data directory beside the executable.
         #[arg(long)]
