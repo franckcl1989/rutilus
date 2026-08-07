@@ -3,6 +3,7 @@
 mod backup;
 mod center_acceptor;
 mod center_ca;
+mod center_client;
 mod center_ws;
 mod doctor;
 mod event_listener;
@@ -24,6 +25,7 @@ pub use center_acceptor::{
     CenterConnection, CenterConnectionError, ClientIdentity,
 };
 pub use center_ca::{CenterCa, CenterCaError, SiteClientCertificate};
+pub use center_client::{CenterClientConfig, CenterClientError, CenterClientOptions, CenterLink};
 pub use center_ws::CenterFrameHandler;
 pub use doctor::{CheckLevel, DoctorCheck, DoctorReport, run_doctor};
 pub use licenses::{THIRD_PARTY_LICENSES, ThirdPartyLicense, licenses_text};

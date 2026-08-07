@@ -355,6 +355,12 @@ impl CenterConnection {
                         inbound_frame(message).map_err(CenterConnectionError::Frame)?
                     }
                     Ok(Some(Err(source))) => {
+                        // An abruptly closed transport is the site's normal
+                        // end: it reconnects on its own schedule. Only a
+                        // protocol-level failure is worth surfacing.
+                        if connection_ended(&source) {
+                            return Ok(());
+                        }
                         return Err(CenterConnectionError::Read {
                             source: Box::new(source),
                         });
@@ -435,6 +441,16 @@ impl CenterConnection {
             }
         }
     }
+}
+
+/// Whether a WebSocket read failure is just the peer's connection ending
+/// (an I/O error on the dead socket, or the transport's own closed
+/// markers) rather than a protocol-level failure.
+fn connection_ended(error: &WsError) -> bool {
+    matches!(
+        error,
+        WsError::ConnectionClosed | WsError::AlreadyClosed | WsError::Io(_)
+    )
 }
 
 /// Loads the persisted center server pair below `tls/`, or issues a fresh
