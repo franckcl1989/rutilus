@@ -4787,6 +4787,48 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn exposes_oem_lenovo_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = oem_lenovo_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        // The `SecurityService` document carries the flattened `FWRollback`
+        // enum spelling verbatim per §12.3 (the `Configurator` nesting of the
+        // compiled schema collapses onto the wrapper's accessor).
+        assert_eq!(
+            resources[1]["resource"]["resource_type"],
+            "oem_lenovo_security_service"
+        );
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+        );
+        assert_eq!(
+            resources[1]["source"]["odata_type"],
+            "#LenovoSecurityService.v1_0_0.LenovoSecurityService"
+        );
+        assert_eq!(resources[1]["source"]["etag"], "W/\"lenovo-security-1\"");
+        assert_eq!(resources[1]["common"]["name"], "Lenovo Security Service");
+        assert_eq!(
+            resources[1]["resource"]["details"]["fw_rollback"],
+            "Enabled"
+        );
+        Ok(())
+    }
+
     // The 157-line test exceeds the pedantic line budget because the whole
     // NVIDIA wire surface (the system chain plus the power chains) is
     // asserted in one contract; the lint is scoped here exactly like the
@@ -6207,6 +6249,52 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, kcs_interface, sys_lockdown],
+        )?)
+    }
+
+    fn oem_lenovo_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Lenovo OEM BMC")?,
+            EndpointAddress::parse("https://192.0.2.41")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![41])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        // The compiled `LenovoSecurityService` base requires `Id` / `Name`
+        // and the projection follows the upstream `fw_rollback()` accessor
+        // surface, so the payload carries the common fields plus the
+        // flattened `FWRollback` enum spelling.
+        let security_service = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemLenovoSecurityService,
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+            r#"{"Id":"SecurityService","Name":"Lenovo Security Service","Description":"Lenovo security service","FWRollback":"Enabled"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#LenovoSecurityService.v1_0_0.LenovoSecurityService",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"lenovo-security-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, security_service],
         )?)
     }
 

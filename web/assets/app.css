@@ -416,7 +416,13 @@ dd {
 .inventory-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 0.8rem;
   margin: 0 0 1.2rem;
+}
+
+.inventory-actions .form-hint {
+  margin: 0;
 }
 
 .form-panel {
@@ -680,7 +686,22 @@ dd {
 .endpoint-card-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 1rem;
   margin-top: 0.9rem;
+}
+
+.endpoint-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #aebbd0;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.endpoint-select input {
+  accent-color: #83c8d5;
 }
 
 .capability-summary {
@@ -1373,4 +1394,127 @@ dd {
   color: #8495ad;
   font-size: 0.78rem;
   line-height: 1.5;
+}
+
+/* §16.2 sign-in surface: the auth screens cover the console while the
+   client is loading, claiming the product, or signing in. The overlay is a
+   fixed full-screen layer, so the console markup behind it stays untouched
+   and the CSS alone decides what is visible. */
+.auth-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  overflow-y: auto;
+  background: linear-gradient(180deg, #0a0f1c 0%, #0d1626 100%);
+}
+
+.auth-card {
+  width: min(26rem, calc(100% - 2rem));
+  display: grid;
+  gap: 1rem;
+  padding: clamp(1.75rem, 5vw, 2.75rem);
+  border: 1px solid rgb(143 171 207 / 20%);
+  border-radius: 1.5rem;
+  background: rgb(16 25 40 / 92%);
+  box-shadow: 0 2rem 7rem rgb(0 0 0 / 40%);
+}
+
+.auth-card h2 {
+  margin: 0 0 0.5rem;
+}
+
+.auth-card label {
+  display: grid;
+  gap: 0.35rem;
+  color: #9fb2c9;
+  font-size: 0.8rem;
+  font-weight: 650;
+}
+
+.auth-card input,
+.auth-card select {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.auth-check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.auth-check input {
+  width: auto;
+}
+
+.auth-note {
+  margin: 0;
+  color: #8495ad;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.auth-error {
+  margin: 0;
+  color: #ff8f8f;
+  font-size: 0.8rem;
+}
+
+/* §16.1 administration views: the user and session tables. */
+.auth-admin {
+  margin-top: 1.5rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.auth-admin-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.auth-admin-form input {
+  flex: 1 1 14rem;
+}
+
+.auth-table {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.auth-table-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid rgb(143 171 207 / 14%);
+  border-radius: 0.8rem;
+  background: rgb(16 25 40 / 60%);
+  font-size: 0.82rem;
+}
+
+.auth-table-name {
+  font-weight: 650;
+  min-width: 8rem;
+}
+
+.auth-table-role,
+.auth-table-state {
+  color: #9fb2c9;
+}
+
+.auth-table-time {
+  color: #6f8299;
+}
+
+.auth-table-row .btn {
+  margin-left: auto;
+}
+
+.auth-table-row select {
+  width: auto;
 }
