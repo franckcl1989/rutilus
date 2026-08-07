@@ -342,6 +342,35 @@ impl OperationStore for StandaloneState {
     ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         <SqliteStore as OperationStore>::list_operations(&self.store, state)
     }
+
+    fn create_batch<'a>(
+        &'a self,
+        batch: &'a rutilus_domain::BatchOperation,
+        children: &'a [Operation],
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        <SqliteStore as OperationStore>::create_batch(&self.store, batch, children)
+    }
+
+    fn find_batch(
+        &self,
+        batch_id: rutilus_domain::BatchOperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>>
+    {
+        <SqliteStore as OperationStore>::find_batch(&self.store, batch_id)
+    }
+
+    fn list_batches(
+        &self,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<rutilus_domain::BatchOperation>, Self::Error>> {
+        <SqliteStore as OperationStore>::list_batches(&self.store)
+    }
+
+    fn list_batch_children(
+        &self,
+        batch_id: rutilus_domain::BatchOperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        <SqliteStore as OperationStore>::list_batch_children(&self.store, batch_id)
+    }
 }
 
 impl RemoteTaskStore for StandaloneState {

@@ -605,6 +605,44 @@ mod tests {
                     .collect())
             })
         }
+
+        fn create_batch<'a>(
+            &'a self,
+            _batch: &'a rutilus_domain::BatchOperation,
+            _children: &'a [Operation],
+        ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+            // The sweep never creates batches; the submission path owns
+            // that boundary.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn find_batch(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>>
+        {
+            // The sweep never reads batches; batch reporting owns that
+            // projection.
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn list_batches(
+            &self,
+        ) -> OperationBoundaryFuture<'_, Result<Vec<rutilus_domain::BatchOperation>, Self::Error>>
+        {
+            // The sweep never lists batches; batch reporting owns that
+            // projection.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn list_batch_children(
+            &self,
+            _batch_id: rutilus_domain::BatchOperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+            // The sweep never lists batch children; batch reporting owns
+            // that projection.
+            Box::pin(async move { Ok(Vec::new()) })
+        }
     }
 
     /// One recorded driver call with the seam method that produced it.
