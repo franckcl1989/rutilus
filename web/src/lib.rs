@@ -2812,6 +2812,9 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::OemNvidiaManagedEntity { .. } => {
             project_oem_nvidia_managed_entity_details(details)
         }
+        CoreResourceDetails::OemLenovoSecurityService { .. } => {
+            project_oem_lenovo_security_service_details(details)
+        }
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
@@ -3468,6 +3471,23 @@ fn project_oem_nvidia_managed_entity_details(
         ipv4_address: ipv4_address.clone(),
         ipv6_address: ipv6_address.clone(),
         port: *port,
+    }
+}
+
+/// Projects the §11.5 Lenovo `SecurityService` document into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemLenovoSecurityService`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_lenovo_security_service_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemLenovoSecurityService { fw_rollback } = details else {
+        return CoreResourceDetailsResponse::OemLenovoSecurityService { fw_rollback: None };
+    };
+    CoreResourceDetailsResponse::OemLenovoSecurityService {
+        fw_rollback: fw_rollback.clone(),
     }
 }
 

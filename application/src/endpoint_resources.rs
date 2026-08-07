@@ -369,6 +369,20 @@ pub enum CoreResourceDetails {
         ipv6_address: Option<String>,
         port: Option<i64>,
     },
+    /// One §0.5.0 OEM family member: the manager's Lenovo `SecurityService`
+    /// document, read through the compiled `oem-lenovo` surface (§11.5 — an
+    /// OEM surface is projected only when upstream compiles it). The
+    /// `FWRollback` value is the vendor's enum spelling verbatim (e.g.
+    /// `Enabled`, `Disabled`, or `UnsupportedValue` for a value this build
+    /// cannot classify), never translated, per §12.3. The compiled schema
+    /// models the rollback state inside the `Configurator` segment, and the
+    /// upstream `LenovoSecurityService::fw_rollback` wrapper collapses that
+    /// nesting onto its single typed accessor; the projection follows the
+    /// wrapper surface, so the wire carries the flattened `FWRollback` field.
+    /// The compiled base `resource::Resource` requires `Id` / `Name`, so the
+    /// product identity comes from the payload exactly like every standard
+    /// family.
+    OemLenovoSecurityService { fw_rollback: Option<String> },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -810,15 +824,7 @@ where
             project_oem_nvidia_managed_entity(snapshot, payload)?
         }
         ResourceFeature::OemLenovoSecurityService => {
-            // The typed projection of the Lenovo `SecurityService` document
-            // lands with the §11.5 resource-details slice; this arm keeps
-            // the compiled family's snapshot countable and storable, and
-            // reports the missing projection as a controlled error instead
-            // of panicking.
-            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
-                resource_id: snapshot.resource_id(),
-                feature: snapshot.feature(),
-            });
+            project_oem_lenovo_security_service(snapshot, payload)?
         }
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
@@ -1018,6 +1024,25 @@ where
             privilege: parsed.privilege,
         },
     ))
+}
+
+fn project_oem_lenovo_security_service<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemLenovoSecurityServicePayload, _, RepositoryError>(
+        snapshot,
+        payload,
+        |parsed| CoreResourceDetails::OemLenovoSecurityService {
+            fw_rollback: parsed.fw_rollback,
+        },
+    )
 }
 
 /// Projects one NVIDIA system-config-profile chain snapshot into its details
@@ -2133,6 +2158,37 @@ struct OemSmcSysLockdownPayload {
 struct OemSmcKcsInterfacePayload {
     #[serde(rename = "Privilege")]
     privilege: Option<String>,
+}
+
+/// The §0.5.0 Lenovo `SecurityService` snapshot payload, decoded exactly as
+/// the infra projection wrote it: the common identity fields (required
+/// because the compiled base `resource::Resource` requires `Id` / `Name`)
+/// plus the flattened `FWRollback` enum spelling the upstream
+/// `LenovoSecurityService::fw_rollback` wrapper surface projects, verbatim
+/// per §12.3. `deny_unknown_fields` keeps the snapshot contract strict, so a
+/// future extra wire field would make stored snapshots unreadable exactly
+/// like an extra top-level key would.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemLenovoSecurityServicePayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "FWRollback")]
+    fw_rollback: Option<String>,
+}
+
+impl CommonPayload for OemLenovoSecurityServicePayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 /// The chain document kinds of the §0.5.0 NVIDIA system-config-profile
@@ -4160,6 +4216,79 @@ mod tests {
             &CoreResourceDetails::OemSmcSysLockdown {
                 sys_lockdown_enabled: None,
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_oem_lenovo_security_service_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(14)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemLenovoSecurityService,
+                    "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+                    r#"{"Id":"SecurityService","Name":"Lenovo Security Service","Description":"Lenovo security service","FWRollback":"Enabled"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // A document whose `Configurator` segment was absent still
+                // projects with `None` details, not an unreadable one.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemLenovoSecurityService,
+                    "/redfish/v1/Managers/2/Oem/Lenovo/SecurityService",
+                    r#"{"Id":"SecurityService","Name":"Lenovo Security Service"}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 3);
+        // The inventory orders snapshots by `@odata.id`, so the manager-1
+        // document sorts before the manager-2 document.
+        let security = &result.resources()[1];
+        assert_eq!(
+            security.feature(),
+            ResourceFeature::OemLenovoSecurityService
+        );
+        assert_eq!(
+            security.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+        );
+        assert_eq!(security.common().id(), "SecurityService");
+        assert_eq!(security.common().name(), "Lenovo Security Service");
+        assert_eq!(
+            security.common().description(),
+            Some("Lenovo security service")
+        );
+        assert_eq!(
+            security.details(),
+            &CoreResourceDetails::OemLenovoSecurityService {
+                fw_rollback: Some("Enabled".to_owned()),
+            }
+        );
+        assert_eq!(
+            result.resources()[2].details(),
+            &CoreResourceDetails::OemLenovoSecurityService { fw_rollback: None }
         );
         Ok(())
     }
