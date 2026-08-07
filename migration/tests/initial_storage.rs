@@ -152,6 +152,7 @@ fn audit_event_model(
         operation_id: Set(operation_id),
         event_sequence: Set(event_sequence),
         actor: Set(String::from("local-operator")),
+        actor_principal_id: Set(None),
         origin: Set(String::from("standalone")),
         target_kind: Set(String::from("endpoint-address")),
         target_endpoint_id: Set(None),

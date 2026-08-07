@@ -16,6 +16,7 @@ mod m20260805_000011_batch_operations;
 mod m20260807_000001_nvidia_families;
 mod m20260807_000002_operation_failure_kinds;
 mod m20260807_000003_nvidia_families;
+mod m20260807_000005_product_users;
 
 pub struct Migrator;
 
@@ -37,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000001_nvidia_families::Migration),
             Box::new(m20260807_000002_operation_failure_kinds::Migration),
             Box::new(m20260807_000003_nvidia_families::Migration),
+            Box::new(m20260807_000005_product_users::Migration),
         ]
     }
 }

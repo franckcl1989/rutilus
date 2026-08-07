@@ -221,6 +221,9 @@ fn project_event(event: &AuditEvent) -> audit_event::ActiveModel {
         operation_id: Set(context.operation_id().into_uuid()),
         event_sequence: Set(i64::from(event.sequence().get())),
         actor: Set(context.actor().as_str().to_owned()),
+        actor_principal_id: Set(context
+            .actor_principal_id()
+            .map(rutilus_domain::PrincipalId::into_uuid)),
         origin: Set(context.origin().as_str().to_owned()),
         target_kind: Set(target_kind.to_owned()),
         target_endpoint_id: Set(target_endpoint_id),
@@ -273,7 +276,7 @@ fn map_context(model: &audit_event::Model) -> Result<AuditOperationContext, Stor
         AuditAction::from_str(&model.action).map_err(StoredAuditEventError::UnknownAction)?;
     let redfish_operation = AuditRedfishOperation::from_str(&model.redfish_operation)
         .map_err(StoredAuditEventError::UnknownRedfishOperation)?;
-    AuditOperationContext::try_new(
+    AuditOperationContext::try_new_with_actor_principal(
         AuditOperationId::from_uuid(model.operation_id),
         actor,
         origin,
@@ -282,6 +285,9 @@ fn map_context(model: &audit_event::Model) -> Result<AuditOperationContext, Stor
         permission,
         action,
         redfish_operation,
+        model
+            .actor_principal_id
+            .map(rutilus_domain::PrincipalId::from_uuid),
     )
     .map_err(StoredAuditEventError::InvalidContext)
 }
