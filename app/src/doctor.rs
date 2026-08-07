@@ -274,7 +274,7 @@ fn tls_check(paths: &RuntimePaths) -> DoctorCheck {
             "not configured (the loopback console runs without TLS)",
         );
     }
-    match site_runtime::read_certificate(&cert_path) {
+    match crate::tls_material::read_certificate(&cert_path) {
         Ok(certificate) => check(
             "TLS certificate",
             CheckLevel::Ok,

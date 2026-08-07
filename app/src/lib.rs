@@ -10,6 +10,7 @@ mod scheduler;
 mod site_runtime;
 mod standalone_runtime;
 mod telemetry_sampler;
+mod tls_material;
 
 pub use backup::{
     BackupError, BackupKeyUnlock, BackupOutcome, RestoreOutcome, create_backup, restore_backup,
@@ -36,3 +37,4 @@ pub use standalone_runtime::{
     StandaloneInstanceError, StandaloneRunError, StandaloneRunOptions, console_stop_signal,
     run_initialized_standalone, run_standalone,
 };
+pub use tls_material::TlsMaterialError;

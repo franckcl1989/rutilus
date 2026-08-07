@@ -36,14 +36,18 @@ use rutilus_security::{RewrapError, RewrappedMasterKey, UnlockSource, rewrap_mas
 use rutilus_web::{AuthPolicy, AuthServices, ProductServices, WebProductInfo, router_with_auth};
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
 use crate::{
     StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError, StandaloneRunError,
-    StandaloneUnlock, SystemClock, standalone_runtime::run_background_services,
+    StandaloneUnlock, SystemClock,
+    standalone_runtime::run_background_services,
+    tls_material::{
+        TlsMaterialError, key_der_bytes, pem_encode, persist_text, read_certificate,
+        read_private_key,
+    },
 };
 
 /// One host:port pair for a Site listener, where the host is an IP literal
@@ -243,11 +247,11 @@ impl SiteTls {
                 Self::generate_and_persist(paths, listen)
             }
             (Err(cert_error), Err(key_error)) => Err(SiteTlsError::ReadPair {
-                cert_error: Box::new(cert_error),
-                key_error: Box::new(key_error),
+                cert_error: Box::new(cert_error.into()),
+                key_error: Box::new(key_error.into()),
             }),
-            (Ok(_), Err(key_error)) => Err(key_error),
-            (Err(cert_error), Ok(_)) => Err(cert_error),
+            (Ok(_), Err(key_error)) => Err(key_error.into()),
+            (Err(cert_error), Ok(_)) => Err(cert_error.into()),
         }
     }
 
@@ -289,173 +293,31 @@ impl SiteTls {
     }
 }
 
-fn is_missing(error: &SiteTlsError) -> bool {
+fn is_missing(error: &TlsMaterialError) -> bool {
     matches!(
         error,
-        SiteTlsError::ReadFile { source, .. } if source.kind() == io::ErrorKind::NotFound
+        TlsMaterialError::ReadFile { source, .. } if source.kind() == io::ErrorKind::NotFound
     )
 }
 
-fn key_der_bytes<'a>(key: &'a PrivateKeyDer<'a>) -> Result<&'a [u8], SiteTlsError> {
-    match key {
-        PrivateKeyDer::Pkcs8(key) => Ok(key.secret_pkcs8_der()),
-        PrivateKeyDer::Pkcs1(key) => Ok(key.secret_pkcs1_der()),
-        PrivateKeyDer::Sec1(key) => Ok(key.secret_sec1_der()),
-        // `#[non_exhaustive]`: a future key encoding has no PEM form in this
-        // release, so it cannot be persisted.
-        _ => Err(SiteTlsError::UnsupportedPrivateKey),
-    }
-}
-
-/// The defensive bound for one PEM file: certificates and keys are small.
-const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
-
-fn read_bounded(path: &Path) -> Result<Vec<u8>, SiteTlsError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|source| SiteTlsError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.len() > MAX_TLS_FILE_BYTES {
-        return Err(SiteTlsError::FileTooLarge {
-            path: path.to_path_buf(),
-        });
-    }
-    let bytes = std::fs::read(path).map_err(|source| SiteTlsError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if bytes.len() as u64 > MAX_TLS_FILE_BYTES {
-        return Err(SiteTlsError::FileTooLarge {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(bytes)
-}
-
-/// Reads one bounded PEM certificate file.
-///
-/// # Errors
-///
-/// Returns [`SiteTlsError`] when the file is missing, oversized, or not a
-/// valid PEM certificate.
-pub(crate) fn read_certificate(path: &Path) -> Result<CertificateDer<'static>, SiteTlsError> {
-    use rustls::pki_types::pem::PemObject as _;
-
-    let bytes = read_bounded(path)?;
-    CertificateDer::from_pem_slice(&bytes).map_err(|source| SiteTlsError::InvalidCertificate {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Reads one bounded PEM private key file.
-///
-/// # Errors
-///
-/// Returns [`SiteTlsError`] when the file is missing, oversized, or not a
-/// valid PEM private key.
-fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, SiteTlsError> {
-    use rustls::pki_types::pem::PemObject as _;
-
-    let bytes = read_bounded(path)?;
-    PrivateKeyDer::from_pem_slice(&bytes).map_err(|source| SiteTlsError::InvalidPrivateKey {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Persists one PEM text atomically. The private key's 0600 restriction is
-/// applied to the temporary file before any secret bytes are written.
-///
-/// # Errors
-///
-/// Returns [`SiteTlsError::WritePrivateKey`] retaining the exact I/O stage.
-fn persist_text(path: &Path, content: &str) -> Result<(), SiteTlsError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TLS material path has no parent directory",
-            ),
-        })?;
-    std::fs::create_dir_all(parent).map_err(|source| SiteTlsError::WritePrivateKey {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut temporary =
-        NamedTempFile::new_in(parent).map_err(|source| SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    restrict_private_key_permissions(temporary.path())?;
-    std::io::Write::write_all(&mut temporary, content.as_bytes()).map_err(|source| {
-        SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source,
+/// Maps the shared TLS material file failures onto the Site's error
+/// vocabulary, so the Site listener's public error messages are unchanged
+/// by the shared helper module.
+impl From<TlsMaterialError> for SiteTlsError {
+    fn from(error: TlsMaterialError) -> Self {
+        match error {
+            TlsMaterialError::ReadFile { path, source } => Self::ReadFile { path, source },
+            TlsMaterialError::FileTooLarge { path } => Self::FileTooLarge { path },
+            TlsMaterialError::InvalidCertificate { path, source } => {
+                Self::InvalidCertificate { path, source }
+            }
+            TlsMaterialError::InvalidPrivateKey { path, source } => {
+                Self::InvalidPrivateKey { path, source }
+            }
+            TlsMaterialError::UnsupportedPrivateKey => Self::UnsupportedPrivateKey,
+            TlsMaterialError::Persist { path, source } => Self::WritePrivateKey { path, source },
         }
-    })?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|source| SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let persisted = temporary
-        .persist(path)
-        .map_err(|error| SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source: error.error,
-        })?;
-    persisted
-        .sync_all()
-        .map_err(|source| SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok(())
-}
-
-/// Restricts a freshly created TLS temporary file to mode 0600 before any
-/// secret bytes are written (Unix only; Windows has no POSIX modes).
-#[cfg(unix)]
-fn restrict_private_key_permissions(path: &Path) -> Result<(), SiteTlsError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
-        SiteTlsError::WritePrivateKey {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
-// The non-Unix twin mirrors the Unix signature so the call sites stay
-// cfg-free; Windows has no POSIX modes to enforce.
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn restrict_private_key_permissions(_path: &Path) -> Result<(), SiteTlsError> {
-    Ok(())
-}
-
-/// Encodes one DER value as a standard base64-wrapped PEM block.
-fn pem_encode(label: &str, der: &[u8]) -> String {
-    use base64::Engine as _;
-    use std::fmt::Write as _;
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut pem = String::with_capacity(encoded.len() + 64);
-    let _ = writeln!(pem, "-----BEGIN {label}-----");
-    for chunk in encoded.as_bytes().chunks(64) {
-        // Base64 output is pure ASCII, so bytes map one-to-one to characters.
-        pem.extend(chunk.iter().map(|byte| *byte as char));
-        pem.push('\n');
     }
-    let _ = writeln!(pem, "-----END {label}-----");
-    pem
 }
 
 /// Generates a self-signed certificate whose SAN covers the listen host and
