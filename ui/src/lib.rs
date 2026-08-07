@@ -11,21 +11,24 @@ use std::{collections::BTreeSet, fmt};
 use rutilus_api::{
     AboutResponse, ArtifactResponse, ArtifactStateResponse, AuditEventResponse, AuditQueryResponse,
     BatchDetailResponse, BatchOperationResponse, BatchOperationStateResponse,
-    BatchOutcomeCountsResponse, BatchSummaryResponse, BootCommand, BootSource,
-    BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
+    BatchOutcomeCountsResponse, BatchRefreshResponse, BatchSummaryResponse, BootCommand,
+    BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
     CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
     CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
     EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
     EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+    EndpointRefreshResultResponse, EndpointRefreshStatusResponse,
     EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse, EndpointSummaryResponse,
     EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EventCommand, EventDestinationProtocol, EventListResponse,
-    EventResponse, EventType, GroupResponse, ManagerCommand, MetricValueResponse,
-    OperationResponse, OperationSourceResponse, OperationStateResponse, RedfishCommand,
-    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse,
-    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
+    EndpointTrustExpectationRequest, EraseToken, EraseType, EventCommand, EventDestinationProtocol,
+    EventListResponse, EventResponse, EventType, GroupResponse, ManagerCommand,
+    MetricValueResponse, NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand,
+    NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse, OperationSourceResponse,
+    OperationStateResponse, ProfileFile, ProfileId, RedfishCommand, ResetKeysType, ResetType,
+    ResourceDiagnosticsResponse, ResourceStatusResponse, RoleResponse, SecureBootCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
     TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
-    TlsTrustModeResponse, UiLocationResponse, UpdateCommand,
+    TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -513,8 +516,9 @@ const OEM_UNSUPPORTED_NOTICE: &str =
 /// [`CoreResourceCardProjection::from_resource`] path so the family renders
 /// with the same card surface as every standard family, and
 /// [`OemSectionProjection::of_snapshot`] then derives the card form
-/// automatically. The `OemDell` family (the §0.5.0 `oem-dell-attributes`
-/// surface) has landed; later vendor families (HPE, Lenovo, NVIDIA, ...)
+/// automatically. The Dell, Supermicro, NVIDIA, and Lenovo families (the
+/// §0.5.0 `oem-dell-attributes`, `oem-supermicro`, `oem-nvidia*`, and
+/// `oem-lenovo` surfaces) have landed; later vendor families (HPE, ...)
 /// extend this match the same way. Standard families and vendors the
 /// baseline has not typed stay out, so their endpoints keep the honest
 /// §11.5 placeholder.
@@ -2129,14 +2133,13 @@ fn oem_nvidia_managed_entity_card_facts(
     ("NVIDIA Managed Entity", facts)
 }
 
-/// Projects the §11.5 Lenovo `SecurityService` document into the card facts
-/// vocabulary.
+/// Facts for the Lenovo `SecurityService` OEM card under the §0.5.0
+/// `oem-lenovo` family.
 ///
-/// The document contributes one optional field (§12.3): `FirmwareRollback`
-/// is an optional property (e.g. `Enabled`, `Disabled`, or
-/// `UnsupportedValue` for a value this build cannot classify) — never
-/// translated into a product label. The optional value renders only when
-/// the document published the property.
+/// The `FWRollback` value is the vendor's enum spelling kept verbatim per
+/// §12.3 (e.g. `Enabled`, `Disabled`, or `UnsupportedValue` for a value this
+/// build cannot classify) — never translated into a product label. The
+/// optional value renders only when the document published the property.
 ///
 /// The dispatcher guarantees this receives the `OemLenovoSecurityService`
 /// variant; the fallback keeps a stable empty facts list instead of panicking
@@ -2245,6 +2248,34 @@ fn push_fact(facts: &mut Vec<ResourceFactProjection>, label: &'static str, value
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+/// The §16.1 role of the signed-in principal, mirrored from the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoleView {
+    Administrator,
+    Operator,
+    Viewer,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl RoleView {
+    const fn from_wire(role: RoleResponse) -> Self {
+        match role {
+            RoleResponse::Administrator => Self::Administrator,
+            RoleResponse::Operator => Self::Operator,
+            RoleResponse::Viewer => Self::Viewer,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Administrator => "Administrator",
+            Self::Operator => "Operator",
+            Self::Viewer => "Viewer",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 /// One of the top-level console sections reachable from the navigation bar.
 ///
 /// `Capabilities` is a per-endpoint drill-down: the navigation entry only
@@ -2264,11 +2295,13 @@ enum ConsoleView {
     Artifacts,
     Telemetry,
     Diagnostics,
+    Users,
+    Sessions,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 12] = [
+    const ALL: [ConsoleView; 14] = [
         Self::Overview,
         Self::Groups,
         Self::Credentials,
@@ -2281,6 +2314,8 @@ impl ConsoleView {
         Self::Artifacts,
         Self::Telemetry,
         Self::Diagnostics,
+        Self::Users,
+        Self::Sessions,
     ];
 
     const fn label(self) -> &'static str {
@@ -2297,6 +2332,18 @@ impl ConsoleView {
             Self::Artifacts => "Artifacts",
             Self::Telemetry => "Telemetry",
             Self::Diagnostics => "Diagnostics",
+            Self::Users => "Users",
+            Self::Sessions => "Sessions",
+        }
+    }
+
+    /// Whether the §16.1 role of the signed-in principal may open this
+    /// view: the user and session administration views are Administrator
+    /// only, every other view is open to all three roles.
+    const fn allowed_for(self, role: Option<RoleView>) -> bool {
+        match self {
+            Self::Users | Self::Sessions => matches!(role, Some(RoleView::Administrator)),
+            _ => true,
         }
     }
 }
@@ -3188,6 +3235,87 @@ impl CsvImportReportProjection {
     }
 }
 
+/// One endpoint's independent result inside a refresh batch report.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RefreshResultRowProjection {
+    endpoint_id: String,
+    display_name: String,
+    status_label: &'static str,
+    is_success: bool,
+    detail: Option<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl RefreshResultRowProjection {
+    fn from_row(
+        row: &EndpointRefreshResultResponse,
+        inventory: &EndpointInventoryResponse,
+    ) -> Self {
+        let endpoint_id = row.endpoint_id().to_string();
+        let (status_label, is_success, detail) = match row.status() {
+            EndpointRefreshStatusResponse::Refreshed => (
+                "Refreshed",
+                true,
+                Some(format!(
+                    "Generation {} — {} snapshots",
+                    row.generation().unwrap_or_default(),
+                    row.snapshot_count().unwrap_or_default(),
+                )),
+            ),
+            EndpointRefreshStatusResponse::Failed => {
+                ("Failed", false, row.message().map(str::to_owned))
+            }
+            EndpointRefreshStatusResponse::NotFound => {
+                ("Not found", false, row.message().map(str::to_owned))
+            }
+        };
+        Self {
+            display_name: endpoint_display_name(inventory, &endpoint_id),
+            endpoint_id,
+            status_label,
+            is_success,
+            detail,
+        }
+    }
+}
+
+/// The server-provided report of one refresh batch submission.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RefreshBatchReportProjection {
+    total: u64,
+    succeeded_count: u64,
+    failed_count: u64,
+    rows: Vec<RefreshResultRowProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl RefreshBatchReportProjection {
+    fn from_response(
+        response: &BatchRefreshResponse,
+        inventory: &EndpointInventoryResponse,
+    ) -> Self {
+        Self {
+            total: response.total(),
+            succeeded_count: response.succeeded_count(),
+            failed_count: response.failed_count(),
+            rows: response
+                .results()
+                .iter()
+                .map(|row| RefreshResultRowProjection::from_row(row, inventory))
+                .collect(),
+        }
+    }
+
+    fn summary_text(&self) -> String {
+        format!(
+            "{} of {} endpoints refreshed; {} failed",
+            self.succeeded_count, self.total, self.failed_count
+        )
+    }
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 /// The lazy-loading state of the credential inventory section.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3334,6 +3462,49 @@ impl ImportFailure {
             Self::MalformedReport => "The server response could not be read.".to_owned(),
             Self::Rejected { status } => {
                 format!("The server rejected the import request (HTTP {status}).")
+            }
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The progression of one refresh batch submission from the overview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RefreshBatchState {
+    Idle,
+    InFlight,
+    Ready(RefreshBatchReportProjection),
+    Failed(RefreshFailure),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl RefreshBatchState {
+    const fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight)
+    }
+
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// Why a refresh batch could not be completed or reported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RefreshFailure {
+    Unavailable,
+    MalformedReport,
+    Rejected { status: u16 },
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl RefreshFailure {
+    fn message(&self) -> String {
+        match self {
+            Self::Unavailable => "The refresh service is temporarily unavailable.".to_owned(),
+            Self::MalformedReport => "The server response could not be read.".to_owned(),
+            Self::Rejected { status } => {
+                format!("The server rejected the refresh request (HTTP {status}).")
             }
         }
     }
@@ -3889,6 +4060,220 @@ impl CommandFamilyView {
     }
 }
 
+/// The NVIDIA OEM face chosen in the operation form, as display vocabulary.
+///
+/// The three faces mirror the domain `OemCommand` exactly and group the nine
+/// actions of the §11.5 write surface.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OemFaceView {
+    SystemConfigProfile,
+    DebugToken,
+    PowerSmoothing,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OemFaceView {
+    /// Every face in domain order, so the form cannot miss a variant.
+    const ALL: [Self; 3] = [
+        Self::SystemConfigProfile,
+        Self::DebugToken,
+        Self::PowerSmoothing,
+    ];
+
+    /// Static English label for one OEM face.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SystemConfigProfile => "System config profile",
+            Self::DebugToken => "Debug token",
+            Self::PowerSmoothing => "Power smoothing",
+        }
+    }
+}
+
+/// One NVIDIA OEM action selectable in the form, grouped by its face.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OemActionView {
+    ProfileUpdate,
+    ProfileFactoryReset,
+    ProfileActivate,
+    TokenGenerate,
+    TokenInstall,
+    TokenDisable,
+    TokenErase,
+    PowerActivatePreset,
+    PowerApplyOverrides,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OemActionView {
+    /// Every action in face order, so the form cannot miss a variant.
+    const ALL: [Self; 9] = [
+        Self::ProfileUpdate,
+        Self::ProfileFactoryReset,
+        Self::ProfileActivate,
+        Self::TokenGenerate,
+        Self::TokenInstall,
+        Self::TokenDisable,
+        Self::TokenErase,
+        Self::PowerActivatePreset,
+        Self::PowerApplyOverrides,
+    ];
+
+    /// The face one action belongs to.
+    #[must_use]
+    pub const fn face(self) -> OemFaceView {
+        match self {
+            Self::ProfileUpdate | Self::ProfileFactoryReset | Self::ProfileActivate => {
+                OemFaceView::SystemConfigProfile
+            }
+            Self::TokenGenerate | Self::TokenInstall | Self::TokenDisable | Self::TokenErase => {
+                OemFaceView::DebugToken
+            }
+            Self::PowerActivatePreset | Self::PowerApplyOverrides => OemFaceView::PowerSmoothing,
+        }
+    }
+
+    /// Static English label for one OEM action.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProfileUpdate => "Update profile",
+            Self::ProfileFactoryReset => "Factory reset",
+            Self::ProfileActivate => "Activate profile",
+            Self::TokenGenerate => "Generate token",
+            Self::TokenInstall => "Install token",
+            Self::TokenDisable => "Disable token",
+            Self::TokenErase => "Erase tokens",
+            Self::PowerActivatePreset => "Activate preset profile",
+            Self::PowerApplyOverrides => "Apply admin overrides",
+        }
+    }
+}
+
+/// The debug token type argument of an OEM action.
+///
+/// The member set mirrors the domain `TokenType` exactly, which follows the
+/// `nv-redfish-schema` 0.13.0 `NvidiaDebugTokenManagement_v1.xml` `TokenType`
+/// enum; the const member-set test keeps this aligned.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the all-caps acronym spellings stay in the
+// `as_str` matches.
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenTypeView {
+    Frc,
+    Crcs,
+    Crdt,
+    DebugFirmwareRunning,
+    DebugFirmwareUnlock,
+    OtpDumpEnable,
+    JtagUnlock,
+    HardwareUnlock,
+    RuntimeDebugUnlock,
+    FeatureUnlock,
+    Mtdt,
+    CcplexArmJtagDebugCont,
+    NvJtagControl,
+    DiagnosticBoot,
+    BpmpFirmwareDebugFs,
+    FirmwareDebugKnobs,
+    FirewallLifting,
+    Verbosity,
+    SmaDebugCapability,
+    CpldDebugCapability,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl TokenTypeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 20] = [
+        Self::Frc,
+        Self::Crcs,
+        Self::Crdt,
+        Self::DebugFirmwareRunning,
+        Self::DebugFirmwareUnlock,
+        Self::OtpDumpEnable,
+        Self::JtagUnlock,
+        Self::HardwareUnlock,
+        Self::RuntimeDebugUnlock,
+        Self::FeatureUnlock,
+        Self::Mtdt,
+        Self::CcplexArmJtagDebugCont,
+        Self::NvJtagControl,
+        Self::DiagnosticBoot,
+        Self::BpmpFirmwareDebugFs,
+        Self::FirmwareDebugKnobs,
+        Self::FirewallLifting,
+        Self::Verbosity,
+        Self::SmaDebugCapability,
+        Self::CpldDebugCapability,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frc => "FRC",
+            Self::Crcs => "CRCS",
+            Self::Crdt => "CRDT",
+            Self::DebugFirmwareRunning => "DebugFirmwareRunning",
+            Self::DebugFirmwareUnlock => "DebugFirmwareUnlock",
+            Self::OtpDumpEnable => "OTPDumpEnable",
+            Self::JtagUnlock => "JtagUnlock",
+            Self::HardwareUnlock => "HardwareUnlock",
+            Self::RuntimeDebugUnlock => "RuntimeDebugUnlock",
+            Self::FeatureUnlock => "FeatureUnlock",
+            Self::Mtdt => "MTDT",
+            Self::CcplexArmJtagDebugCont => "CcplexArmJtagDebugCont",
+            Self::NvJtagControl => "NVJtagControl",
+            Self::DiagnosticBoot => "DiagnosticBoot",
+            Self::BpmpFirmwareDebugFs => "BpmpFirmwareDebugFS",
+            Self::FirmwareDebugKnobs => "FirmwareDebugKnobs",
+            Self::FirewallLifting => "FirewallLifting",
+            Self::Verbosity => "Verbosity",
+            Self::SmaDebugCapability => "SMADebugCapability",
+            Self::CpldDebugCapability => "CpldDebugCapability",
+        }
+    }
+}
+
+/// The erase scope argument of the OEM erase action.
+///
+/// The member set mirrors the domain `EraseType` exactly, which follows the
+/// `nv-redfish-schema` 0.13.0 `NvidiaDebugTokenManagement_v1.xml` `EraseType`
+/// enum.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EraseTypeView {
+    EraseAll,
+    EraseAllAndRatchetCounterIncreased,
+    TokenType,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl EraseTypeView {
+    /// Every member in CSDL order.
+    const ALL: [Self; 3] = [
+        Self::EraseAll,
+        Self::EraseAllAndRatchetCounterIncreased,
+        Self::TokenType,
+    ];
+
+    /// Returns the exact CSDL member name, which is also the wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EraseAll => "EraseAll",
+            Self::EraseAllAndRatchetCounterIncreased => "EraseAllAndRatchetCounterIncreased",
+            Self::TokenType => "TokenType",
+        }
+    }
+}
+
 /// The reset action argument used by system, manager, and chassis resets.
 ///
 /// The member set mirrors the domain `ResetType` exactly, which follows the
@@ -4300,6 +4685,36 @@ enum OperationCommandDraft {
     SecureBoot(SecureBootActionView),
     Event(EventActionDraft),
     Update(UpdateDraft),
+    Oem(OemCommandDraft),
+}
+
+/// The NVIDIA OEM command assembled from the operation form (§11.5).
+///
+/// This is the form-side counterpart of the domain `OemCommand`: the same
+/// three faces with the same CSDL action and parameter vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OemCommandDraft {
+    ProfileUpdate {
+        profile_file: String,
+    },
+    ProfileFactoryReset,
+    ProfileActivate,
+    TokenGenerate {
+        token_type: TokenTypeView,
+    },
+    TokenInstall {
+        token_data: String,
+    },
+    TokenDisable,
+    TokenErase {
+        erase_type: EraseTypeView,
+        token_type: TokenTypeView,
+    },
+    PowerActivatePreset {
+        profile_id: i64,
+    },
+    PowerApplyOverrides,
 }
 
 /// The §14.3 firmware-update payload assembled from the operation form.
@@ -4338,6 +4753,23 @@ enum EventActionDraft {
 struct CommandSummaryProjection {
     family: &'static str,
     payload: String,
+}
+
+/// The stable select key of one OEM action, so the form options and the
+/// selected value stay one vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_action_key(action: OemActionView) -> &'static str {
+    match action {
+        OemActionView::ProfileUpdate => "profile-update",
+        OemActionView::ProfileFactoryReset => "profile-factory-reset",
+        OemActionView::ProfileActivate => "profile-activate",
+        OemActionView::TokenGenerate => "token-generate",
+        OemActionView::TokenInstall => "token-install",
+        OemActionView::TokenDisable => "token-disable",
+        OemActionView::TokenErase => "token-erase",
+        OemActionView::PowerActivatePreset => "power-activate-preset",
+        OemActionView::PowerApplyOverrides => "power-apply-overrides",
+    }
 }
 
 /// Projects one command draft into its one-line card summary.
@@ -4417,6 +4849,37 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
                 payload,
             }
         }
+        OperationCommandDraft::Oem(draft) => CommandSummaryProjection {
+            family: CommandFamilyView::Oem.label(),
+            payload: oem_draft_summary(draft),
+        },
+    }
+}
+
+/// One-line payload summary of an NVIDIA OEM command draft.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_draft_summary(draft: &OemCommandDraft) -> String {
+    match draft {
+        OemCommandDraft::ProfileUpdate { .. } => "Profile · Update".to_owned(),
+        OemCommandDraft::ProfileFactoryReset => "Profile · Factory reset".to_owned(),
+        OemCommandDraft::ProfileActivate => "Profile · Activate".to_owned(),
+        OemCommandDraft::TokenGenerate { token_type } => {
+            format!("Token · Generate · {}", token_type.as_str())
+        }
+        OemCommandDraft::TokenInstall { .. } => "Token · Install".to_owned(),
+        OemCommandDraft::TokenDisable => "Token · Disable".to_owned(),
+        OemCommandDraft::TokenErase {
+            erase_type,
+            token_type,
+        } => format!(
+            "Token · Erase · {} · {}",
+            erase_type.as_str(),
+            token_type.as_str()
+        ),
+        OemCommandDraft::PowerActivatePreset { profile_id } => {
+            format!("Power smoothing · Activate preset · {profile_id}")
+        }
+        OemCommandDraft::PowerApplyOverrides => "Power smoothing · Apply overrides".to_owned(),
     }
 }
 
@@ -4449,6 +4912,20 @@ struct OperationFormDraft {
     /// The optional push URI; empty means the default multipart dispatch of
     /// the locally stored artifact.
     push_uri: String,
+    /// The chosen NVIDIA OEM face (grouping the action select).
+    oem_face: Option<OemFaceView>,
+    /// The chosen NVIDIA OEM action.
+    oem_action: Option<OemActionView>,
+    /// The JSON profile file content of a profile update.
+    profile_file: String,
+    /// The token type argument of the debug-token actions.
+    token_type: Option<TokenTypeView>,
+    /// The Base64 token data of a token installation.
+    token_data: String,
+    /// The erase scope argument of the token erase action.
+    erase_type: Option<EraseTypeView>,
+    /// The preset profile id of a power-smoothing activation.
+    profile_id: String,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -4472,6 +4949,13 @@ impl OperationFormDraft {
             subscription_id: String::new(),
             artifact_id: None,
             push_uri: String::new(),
+            oem_face: None,
+            oem_action: None,
+            profile_file: String::new(),
+            token_type: None,
+            token_data: String::new(),
+            erase_type: None,
+            profile_id: String::new(),
         }
     }
 
@@ -4507,6 +4991,9 @@ impl OperationFormDraft {
     /// # Errors
     ///
     /// Returns the first invalid field as [`OperationFormError`].
+    // The validation walks every §7.5 family in order; the pedantic line
+    // budget is exceeded by the family count, so the lint is scoped here.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(&self) -> Result<OperationCommandDraft, OperationFormError> {
         if self.selected_endpoint_ids.is_empty() {
             return Err(OperationFormError::EndpointsRequired);
@@ -4606,10 +5093,60 @@ impl OperationFormDraft {
                 Ok(OperationCommandDraft::Update(self.update_draft()?))
             }
             CommandFamilyView::Oem => {
-                // The §7.5 oem-command form faces land with the nvidia oem
-                // command surface; until then the family is refused rather
-                // than fabricated.
-                Err(OperationFormError::FamilyRequired)
+                let Some(action) = self.oem_action else {
+                    return Err(OperationFormError::OemActionRequired);
+                };
+                let draft = match action {
+                    OemActionView::ProfileUpdate => {
+                        let profile_file = self.profile_file.trim();
+                        if profile_file.is_empty() {
+                            return Err(OperationFormError::ProfileFileRequired);
+                        }
+                        OemCommandDraft::ProfileUpdate {
+                            profile_file: profile_file.to_owned(),
+                        }
+                    }
+                    OemActionView::ProfileFactoryReset => OemCommandDraft::ProfileFactoryReset,
+                    OemActionView::ProfileActivate => OemCommandDraft::ProfileActivate,
+                    OemActionView::TokenGenerate => {
+                        let Some(token_type) = self.token_type else {
+                            return Err(OperationFormError::TokenTypeRequired);
+                        };
+                        OemCommandDraft::TokenGenerate { token_type }
+                    }
+                    OemActionView::TokenInstall => {
+                        let token_data = self.token_data.trim();
+                        if token_data.is_empty() {
+                            return Err(OperationFormError::TokenDataRequired);
+                        }
+                        OemCommandDraft::TokenInstall {
+                            token_data: token_data.to_owned(),
+                        }
+                    }
+                    OemActionView::TokenDisable => OemCommandDraft::TokenDisable,
+                    OemActionView::TokenErase => {
+                        let Some(erase_type) = self.erase_type else {
+                            return Err(OperationFormError::EraseTypeRequired);
+                        };
+                        let Some(token_type) = self.token_type else {
+                            return Err(OperationFormError::TokenTypeRequired);
+                        };
+                        OemCommandDraft::TokenErase {
+                            erase_type,
+                            token_type,
+                        }
+                    }
+                    OemActionView::PowerActivatePreset => {
+                        let profile_id = self
+                            .profile_id
+                            .trim()
+                            .parse::<i64>()
+                            .map_err(|_| OperationFormError::ProfileIdInvalid)?;
+                        OemCommandDraft::PowerActivatePreset { profile_id }
+                    }
+                    OemActionView::PowerApplyOverrides => OemCommandDraft::PowerApplyOverrides,
+                };
+                Ok(OperationCommandDraft::Oem(draft))
             }
         }
     }
@@ -4658,6 +5195,12 @@ enum OperationFormError {
     SubscriptionIdRequired,
     ArtifactRequired,
     PushUriInvalid,
+    OemActionRequired,
+    ProfileFileRequired,
+    TokenTypeRequired,
+    TokenDataRequired,
+    EraseTypeRequired,
+    ProfileIdInvalid,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -4682,6 +5225,12 @@ impl OperationFormError {
             Self::SubscriptionIdRequired => "A subscription ID is required.",
             Self::ArtifactRequired => "Choose a ready firmware artifact.",
             Self::PushUriInvalid => "The push URI must be an http(s) URL.",
+            Self::OemActionRequired => "Choose an OEM action.",
+            Self::ProfileFileRequired => "The profile file JSON is required.",
+            Self::TokenTypeRequired => "Choose a token type.",
+            Self::TokenDataRequired => "The Base64 token data is required.",
+            Self::EraseTypeRequired => "Choose the erase scope.",
+            Self::ProfileIdInvalid => "The profile id must be a whole number.",
         }
     }
 }
@@ -5682,6 +6231,9 @@ fn domain_event_type(event_type: EventTypeView) -> EventType {
 /// vocabulary member maps to exactly one domain member; the const member-set
 /// tests keep the two vocabularies aligned.
 #[cfg(any(target_arch = "wasm32", test))]
+// The mapping covers every §7.5 family and payload; the pedantic line budget
+// is exceeded by the family count, so the lint is scoped here.
+#[allow(clippy::too_many_lines)]
 fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, OperationFormError> {
     match command {
         OperationCommandDraft::Reset { family, reset_type } => {
@@ -5763,6 +6315,94 @@ fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, Oper
                 StartUpdate::new(artifact_id, update.push_uri.clone()),
             )))
         }
+        OperationCommandDraft::Oem(draft) => {
+            let command = match draft {
+                OemCommandDraft::ProfileUpdate { profile_file } => RedfishCommand::Oem(
+                    OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::Update(
+                        ProfileFile::new(profile_file.clone()),
+                    )),
+                ),
+                OemCommandDraft::ProfileFactoryReset => RedfishCommand::Oem(
+                    OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::FactoryReset),
+                ),
+                OemCommandDraft::ProfileActivate => {
+                    RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                        NvidiaSystemConfigProfileCommand::ActivateProfile,
+                    ))
+                }
+                OemCommandDraft::TokenGenerate { token_type } => {
+                    RedfishCommand::Oem(OemCommand::DebugToken(
+                        NvidiaDebugTokenCommand::GenerateToken(domain_token_type(*token_type)),
+                    ))
+                }
+                OemCommandDraft::TokenInstall { token_data } => {
+                    RedfishCommand::Oem(OemCommand::DebugToken(
+                        NvidiaDebugTokenCommand::InstallToken(TokenData::new(token_data.clone())),
+                    ))
+                }
+                OemCommandDraft::TokenDisable => RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::DisableToken,
+                )),
+                OemCommandDraft::TokenErase {
+                    erase_type,
+                    token_type,
+                } => RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::EraseToken(EraseToken::new(
+                        domain_erase_type(*erase_type),
+                        domain_token_type(*token_type),
+                    )),
+                )),
+                OemCommandDraft::PowerActivatePreset { profile_id } => RedfishCommand::Oem(
+                    OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ActivatePresetProfile(
+                        ProfileId::new(*profile_id),
+                    )),
+                ),
+                OemCommandDraft::PowerApplyOverrides => RedfishCommand::Oem(
+                    OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ApplyAdminOverrides),
+                ),
+            };
+            Ok(command)
+        }
+    }
+}
+
+/// Maps the form `TokenTypeView` member onto the domain `TokenType` member.
+/// The const member-set tests keep the two vocabularies aligned.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_token_type(value: TokenTypeView) -> TokenType {
+    match value {
+        TokenTypeView::Frc => TokenType::Frc,
+        TokenTypeView::Crcs => TokenType::Crcs,
+        TokenTypeView::Crdt => TokenType::Crdt,
+        TokenTypeView::DebugFirmwareRunning => TokenType::DebugFirmwareRunning,
+        TokenTypeView::DebugFirmwareUnlock => TokenType::DebugFirmwareUnlock,
+        TokenTypeView::OtpDumpEnable => TokenType::OtpDumpEnable,
+        TokenTypeView::JtagUnlock => TokenType::JtagUnlock,
+        TokenTypeView::HardwareUnlock => TokenType::HardwareUnlock,
+        TokenTypeView::RuntimeDebugUnlock => TokenType::RuntimeDebugUnlock,
+        TokenTypeView::FeatureUnlock => TokenType::FeatureUnlock,
+        TokenTypeView::Mtdt => TokenType::Mtdt,
+        TokenTypeView::CcplexArmJtagDebugCont => TokenType::CcplexArmJtagDebugCont,
+        TokenTypeView::NvJtagControl => TokenType::NvJtagControl,
+        TokenTypeView::DiagnosticBoot => TokenType::DiagnosticBoot,
+        TokenTypeView::BpmpFirmwareDebugFs => TokenType::BpmpFirmwareDebugFs,
+        TokenTypeView::FirmwareDebugKnobs => TokenType::FirmwareDebugKnobs,
+        TokenTypeView::FirewallLifting => TokenType::FirewallLifting,
+        TokenTypeView::Verbosity => TokenType::Verbosity,
+        TokenTypeView::SmaDebugCapability => TokenType::SmaDebugCapability,
+        TokenTypeView::CpldDebugCapability => TokenType::CpldDebugCapability,
+    }
+}
+
+/// Maps the form `EraseTypeView` member onto the domain `EraseType` member.
+#[cfg(any(target_arch = "wasm32", test))]
+fn domain_erase_type(value: EraseTypeView) -> EraseType {
+    match value {
+        EraseTypeView::EraseAll => EraseType::EraseAll,
+        EraseTypeView::EraseAllAndRatchetCounterIncreased => {
+            EraseType::EraseAllAndRatchetCounterIncreased
+        }
+        EraseTypeView::TokenType => EraseType::TokenType,
     }
 }
 
@@ -5772,6 +6412,9 @@ fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, Oper
 /// the same family label and payload vocabulary, so the card of a submitted
 /// operation reads exactly like the form preview that produced it.
 #[cfg(any(target_arch = "wasm32", test))]
+// The projection covers every §7.5 family and payload; the pedantic line
+// budget is exceeded by the family count, so the lint is scoped here.
+#[allow(clippy::too_many_lines)]
 fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
     match command {
         RedfishCommand::System(SystemCommand::Reset(reset_type)) => CommandSummaryProjection {
@@ -5847,10 +6490,45 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                 payload: payload_text,
             }
         }
-        RedfishCommand::Oem(_) => CommandSummaryProjection {
+        RedfishCommand::Oem(oem) => CommandSummaryProjection {
             family: CommandFamilyView::Oem.label(),
-            payload: "OEM (NVIDIA)".to_owned(),
-        }
+            payload: match oem {
+                OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::Update(_)) => {
+                    "Profile · Update".to_owned()
+                }
+                OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::FactoryReset) => {
+                    "Profile · Factory reset".to_owned()
+                }
+                OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::ActivateProfile,
+                ) => "Profile · Activate".to_owned(),
+                OemCommand::DebugToken(NvidiaDebugTokenCommand::GenerateToken(token_type)) => {
+                    format!("Token · Generate · {token_type}")
+                }
+                OemCommand::DebugToken(NvidiaDebugTokenCommand::InstallToken(_)) => {
+                    "Token · Install".to_owned()
+                }
+                OemCommand::DebugToken(NvidiaDebugTokenCommand::DisableToken) => {
+                    "Token · Disable".to_owned()
+                }
+                OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(erase)) => {
+                    format!(
+                        "Token · Erase · {} · {}",
+                        erase.erase_type(),
+                        erase.token_type()
+                    )
+                }
+                OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ActivatePresetProfile(
+                    profile_id,
+                )) => format!(
+                    "Power smoothing · Activate preset · {}",
+                    profile_id.profile_id()
+                ),
+                OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ApplyAdminOverrides) => {
+                    "Power smoothing · Apply overrides".to_owned()
+                }
+            },
+        },
     }
 }
 
@@ -7030,7 +7708,7 @@ fn acknowledge_submission(target_count: usize, body: &str) -> Result<(), &'stati
 mod browser {
     use std::collections::{BTreeSet, HashMap};
 
-    use gloo_net::http::Request;
+    use gloo_net::http::{Request, RequestBuilder, Response};
     use leptos::{
         mount::mount_to_body,
         prelude::*,
@@ -7039,16 +7717,20 @@ mod browser {
     };
     use rutilus_api::{
         AboutResponse, AppendArtifactChunkRequest, ArtifactListResponse, ArtifactProgressResponse,
-        ArtifactResponse, AssignTagRequest, AuditQueryResponse, BatchDetailResponse,
-        BatchListResponse, BeginEndpointTrustRequest, ConfirmEndpointTrustRequest,
+        ArtifactResponse, AssignRoleRequest, AssignTagRequest, AuditQueryResponse,
+        BatchDetailResponse, BatchListResponse, BatchRefreshResponse, BeginEndpointTrustRequest,
+        BootstrapCompleteRequest, BootstrapCompleteResponse, ConfirmEndpointTrustRequest,
         CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
-        CredentialInventoryResponse, CredentialSummaryResponse,
+        CreateUserRequest, CredentialInventoryResponse, CredentialSummaryResponse,
         EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
         EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-        EventListResponse, GroupListResponse, GroupResponse, OperationListResponse,
-        ResourceDiagnosticsResponse, TagListResponse, TelemetrySampleListResponse,
-        TelemetrySeriesListResponse, TelemetrySeriesResponse, TrustedEndpointResponse,
+        EventListResponse, GroupListResponse, GroupResponse, LoginRequest, LoginResponse,
+        LogoutRequest, MeResponse, OperationListResponse, PrincipalStateResponse,
+        RefreshEndpointsRequest, ResourceDiagnosticsResponse, RevokeSessionRequest, RoleResponse,
+        SessionAdminResponse, SetPrincipalStateRequest, TagListResponse,
+        TelemetrySampleListResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
+        TrustedEndpointResponse, UserAdminResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -7064,24 +7746,796 @@ mod browser {
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
         DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
-        EnrollmentDraft, EnrollmentDraftError, EventActionView, EventCardProjection,
+        EnrollmentDraft, EnrollmentDraftError, EraseTypeView, EventActionView, EventCardProjection,
         EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
         GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
         GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState,
-        OEM_UNSUPPORTED_NOTICE, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
-        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
-        OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
-        OverviewFilterSelections, ResetKeysTypeView, ResetTypeView, SecureBootActionView,
-        TagApplyState, TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
-        TelemetryCardProjection, TelemetryListState, TrustChallengeProjection,
-        UpdateArtifactChoice, apply_overview_filters, artifact_chunk_range_at,
-        artifact_upload_status_text, base64_encode, batch_children_projection, build_command,
-        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
-        format_artifact_size, group_member_choices, group_name_draft_error, health_badge_class,
-        health_choices, health_level_label, operation_endpoint_choices,
+        OEM_UNSUPPORTED_NOTICE, OemActionView, OemFaceView, OnboardingCredentialsState,
+        OnboardingFailure, OnboardingStep, OperationCardProjection, OperationCommandDraft,
+        OperationEndpointChoice, OperationFormDraft, OperationFormError, OperationSubmitState,
+        OperationsListState, OverviewFilterSelections, RefreshBatchReportProjection,
+        RefreshBatchState, RefreshFailure, ResetKeysTypeView, ResetTypeView, RoleView,
+        SecureBootActionView, TagApplyState, TagCardProjection, TagDraft, TagDraftError,
+        TagInventoryView, TagsListState, TelemetryCardProjection, TelemetryListState,
+        TokenTypeView, TrustChallengeProjection, UpdateArtifactChoice, apply_overview_filters,
+        artifact_chunk_range_at, artifact_upload_status_text, base64_encode,
+        batch_children_projection, build_command, command_summary, diagnostics_optional_text,
+        endpoint_address_draft_error, format_artifact_size, format_observed_at,
+        group_member_choices, group_name_draft_error, health_badge_class, health_choices,
+        health_level_label, oem_action_key, operation_endpoint_choices,
         percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
         trust_mode_label, update_artifact_choices, vendor_choices,
     };
+
+    /// The first screen decision of the console (§16.2).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AuthScreen {
+        /// The `me` round-trip has not answered yet.
+        Loading,
+        /// An unconsumed bootstrap code exists: the first-run claim screen.
+        Bootstrap,
+        /// Sessions are enforced and none is presented: the sign-in screen.
+        Login,
+        /// The console is usable.
+        Console,
+    }
+
+    /// The CSRF token of the presenting session, held only in memory
+    /// (§16.2 "CSRF 防护"): the session cookie lives in the browser, and
+    /// this module-level token accompanies every mutating request.
+    static CSRF_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+
+    /// The in-memory CSRF token of the presenting session.
+    fn csrf_token() -> Option<String> {
+        CSRF_TOKEN
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn set_csrf_token(token: String) {
+        if let Ok(mut slot) = CSRF_TOKEN
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+        {
+            *slot = Some(token);
+        }
+    }
+
+    /// Flips to the sign-in screen when a request is refused with 401.
+    static SESSION_EXPIRED: std::sync::OnceLock<RwSignal<bool>> = std::sync::OnceLock::new();
+
+    fn session_expired_signal() -> RwSignal<bool> {
+        *SESSION_EXPIRED.get_or_init(|| RwSignal::new(false))
+    }
+
+    fn mark_session_expired() {
+        session_expired_signal().set(true);
+    }
+
+    /// Whether a response is usable; a 401 marks the session as expired so
+    /// the shell returns to the sign-in screen.
+    fn response_ok(response: &Response) -> bool {
+        if response.status() == 401 {
+            mark_session_expired();
+        }
+        response.ok()
+    }
+
+    /// Adds the presenting CSRF token to one mutating request (§16.2).
+    fn with_csrf(request: RequestBuilder) -> RequestBuilder {
+        match csrf_token() {
+            Some(token) => request.header("X-CSRF-Token", &token),
+            None => request,
+        }
+    }
+
+    /// The §16.2 session state of the client: the console's first screen
+    /// decision.
+    async fn fetch_me() -> Option<MeResponse> {
+        let response = Request::get("/api/v1/auth/me")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response_ok(&response) {
+            return None;
+        }
+        response.json::<MeResponse>().await.ok()
+    }
+
+    /// Presents credentials and returns the CSRF token of the fresh
+    /// session. The browser stores the session cookie automatically.
+    async fn post_login(
+        username: &str,
+        password: &str,
+        totp_code: Option<&str>,
+    ) -> Result<LoginResponse, String> {
+        let request = LoginRequest::new(
+            username.to_owned(),
+            password.to_owned().into(),
+            totp_code.map(str::to_owned),
+        );
+        let Ok(request) = Request::post("/api/v1/auth/login").json(&request) else {
+            return Err("the sign-in request could not be prepared".to_owned());
+        };
+        let Ok(response) = request.send().await else {
+            return Err("the sign-in request could not be sent".to_owned());
+        };
+        if !response_ok(&response) {
+            return Err("sign-in failed".to_owned());
+        }
+        response
+            .json::<LoginResponse>()
+            .await
+            .map_err(|_| "the sign-in response could not be parsed".to_owned())
+    }
+
+    /// Claims the product with the one-time code and the first password.
+    async fn post_bootstrap(
+        code: &str,
+        password: &str,
+        totp_secret: Option<&str>,
+        totp_code: Option<&str>,
+    ) -> Result<BootstrapCompleteResponse, String> {
+        let request = BootstrapCompleteRequest::new(
+            code.to_owned(),
+            password.to_owned().into(),
+            totp_secret.map(str::to_owned),
+            totp_code.map(str::to_owned),
+        );
+        let Ok(request) = Request::post("/api/v1/auth/bootstrap").json(&request) else {
+            return Err("the bootstrap request could not be prepared".to_owned());
+        };
+        let Ok(response) = request.send().await else {
+            return Err("the bootstrap request could not be sent".to_owned());
+        };
+        if !response_ok(&response) {
+            return Err("bootstrap failed — check the one-time code".to_owned());
+        }
+        response
+            .json::<BootstrapCompleteResponse>()
+            .await
+            .map_err(|_| "the bootstrap response could not be parsed".to_owned())
+    }
+
+    /// Signs the presenting session out.
+    async fn post_logout() -> bool {
+        let Ok(request) = with_csrf(Request::post("/api/v1/auth/logout")).json(&LogoutRequest {})
+        else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// The §16.2 session administration listing.
+    async fn fetch_sessions() -> Option<SessionAdminResponse> {
+        let response = Request::get("/api/v1/admin/sessions")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response_ok(&response) {
+            return None;
+        }
+        response.json::<SessionAdminResponse>().await.ok()
+    }
+
+    /// Revokes one presented session (§16.2).
+    async fn post_revoke_session(session_id: &str) -> bool {
+        let Ok(session_id) = uuid::Uuid::parse_str(session_id) else {
+            return false;
+        };
+        let request = RevokeSessionRequest::new(session_id);
+        let Ok(request) = with_csrf(Request::post("/api/v1/admin/sessions")).json(&request) else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// The §16.1 user administration listing.
+    async fn fetch_users() -> Option<UserAdminResponse> {
+        let response = Request::get("/api/v1/admin/users")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !response_ok(&response) {
+            return None;
+        }
+        response.json::<UserAdminResponse>().await.ok()
+    }
+
+    /// Creates one product user with its §16.1 role.
+    async fn post_create_user(name: &str, role: RoleResponse) -> bool {
+        let request = CreateUserRequest::new(name.to_owned(), role);
+        let Ok(request) = with_csrf(Request::post("/api/v1/admin/users")).json(&request) else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Transitions one principal's enabled/disabled state (§16.1).
+    async fn post_set_user_state(principal_id: &str, state: PrincipalStateResponse) -> bool {
+        let request = SetPrincipalStateRequest::new(state);
+        let path = format!("/api/v1/admin/users/{principal_id}/state");
+        let Ok(request) = with_csrf(Request::post(&path)).json(&request) else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// Reassigns one principal's §16.1 role.
+    async fn post_assign_role(principal_id: &str, role: RoleResponse) -> bool {
+        let request = AssignRoleRequest::new(role);
+        let path = format!("/api/v1/admin/users/{principal_id}/role");
+        let Ok(request) = with_csrf(Request::post(&path)).json(&request) else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response.ok()
+    }
+
+    /// The §16.2 sign-in screen: username, password, and the optional TOTP
+    /// code of an active authenticator.
+    #[component]
+    fn LoginView(on_success: Callback<()>) -> impl IntoView {
+        let (username, set_username) = signal(String::new());
+        let (password, set_password) = signal(String::new());
+        let (totp_code, set_totp_code) = signal(String::new());
+        let (error, set_error) = signal(None::<String>);
+        let (busy, set_busy) = signal(false);
+
+        let submit = move |_| {
+            if busy.get() {
+                return;
+            }
+            set_busy.set(true);
+            set_error.set(None);
+            let username = username.get();
+            let password = password.get();
+            let totp_code = totp_code.get();
+            spawn_local(async move {
+                let totp = (!totp_code.is_empty()).then_some(totp_code.as_str());
+                match post_login(&username, &password, totp).await {
+                    Ok(response) => {
+                        set_csrf_token(response.csrf_token().to_owned());
+                        on_success.run(());
+                    }
+                    Err(message) => {
+                        set_busy.set(false);
+                        set_error.set(Some(message));
+                    }
+                }
+            });
+        };
+
+        view! {
+            <section class="auth-screen" aria-label="Sign in">
+                <div class="auth-card">
+                    <p class="eyebrow">"Local Redfish management"</p>
+                    <h2>"Sign in"</h2>
+                    <label>
+                        "Username"
+                        <input
+                            type="text"
+                            autocomplete="username"
+                            prop:value=username
+                            on:input=move |event| set_username.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label>
+                        "Password"
+                        <input
+                            type="password"
+                            autocomplete="current-password"
+                            prop:value=password
+                            on:input=move |event| set_password.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label>
+                        "TOTP code (if enrolled)"
+                        <input
+                            type="text"
+                            inputmode="numeric"
+                            autocomplete="one-time-code"
+                            placeholder="6 digits"
+                            prop:value=totp_code
+                            on:input=move |event| set_totp_code.set(event_target_value(&event))
+                        />
+                    </label>
+                    <p class="auth-error" hidden=move || error.get().is_none()>
+                        {move || error.get().unwrap_or_default()}
+                    </p>
+                    <button type="button" class="btn btn-primary" disabled=move || busy.get() on:click=submit>
+                        "Sign in"
+                    </button>
+                </div>
+            </section>
+        }
+    }
+
+    /// The §16.2 first-run screen: the one-time bootstrap code and the
+    /// first administrator password, with the optional TOTP enrollment.
+    #[component]
+    fn BootstrapView(on_success: Callback<()>) -> impl IntoView {
+        let (code, set_code) = signal(String::new());
+        let (password, set_password) = signal(String::new());
+        let (confirmation, set_confirmation) = signal(String::new());
+        let (want_totp, set_want_totp) = signal(false);
+        let (totp_secret, set_totp_secret) = signal(String::new());
+        let (totp_code, set_totp_code) = signal(String::new());
+        let (error, set_error) = signal(None::<String>);
+        let (busy, set_busy) = signal(false);
+
+        let submit = move |_| {
+            if busy.get() {
+                return;
+            }
+            set_error.set(None);
+            if password.get() != confirmation.get() {
+                set_error.set(Some("the passwords do not match".to_owned()));
+                return;
+            }
+            if password.get().chars().count() < 12 {
+                set_error.set(Some(
+                    "the password must contain at least 12 characters".to_owned(),
+                ));
+                return;
+            }
+            set_busy.set(true);
+            let code = code.get();
+            let password = password.get();
+            let totp_pair = want_totp
+                .get()
+                .then(|| (totp_secret.get(), totp_code.get()));
+            spawn_local(async move {
+                let (secret, activation) = match &totp_pair {
+                    Some((secret, activation)) => {
+                        (Some(secret.as_str()), Some(activation.as_str()))
+                    }
+                    None => (None, None),
+                };
+                match post_bootstrap(&code, &password, secret, activation).await {
+                    Ok(response) => {
+                        set_csrf_token(response.csrf_token().to_owned());
+                        on_success.run(());
+                    }
+                    Err(message) => {
+                        set_busy.set(false);
+                        set_error.set(Some(message));
+                    }
+                }
+            });
+        };
+
+        view! {
+            <section class="auth-screen" aria-label="First-run setup">
+                <div class="auth-card">
+                    <p class="eyebrow">"Local Redfish management"</p>
+                    <h2>"First-run setup"</h2>
+                    <p class="auth-note">
+                        "Enter the one-time bootstrap code printed by the console to set the administrator password."
+                    </p>
+                    <label>
+                        "Bootstrap code"
+                        <input
+                            type="text"
+                            autocomplete="off"
+                            spellcheck="false"
+                            prop:value=code
+                            on:input=move |event| set_code.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label>
+                        "New password"
+                        <input
+                            type="password"
+                            autocomplete="new-password"
+                            prop:value=password
+                            on:input=move |event| set_password.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label>
+                        "Confirm password"
+                        <input
+                            type="password"
+                            autocomplete="new-password"
+                            prop:value=confirmation
+                            on:input=move |event| set_confirmation.set(event_target_value(&event))
+                        />
+                    </label>
+                    <label class="auth-check">
+                        <input
+                            type="checkbox"
+                            prop:checked=want_totp
+                            on:change=move |event| set_want_totp.set(event_target_checked(&event))
+                        />
+                        "Set up TOTP now (optional)"
+                    </label>
+                    <div hidden=move || !want_totp.get()>
+                        <label>
+                            "Secret from your authenticator app"
+                            <input
+                                type="text"
+                                autocomplete="off"
+                                spellcheck="false"
+                                prop:value=totp_secret
+                                on:input=move |event| set_totp_secret.set(event_target_value(&event))
+                            />
+                        </label>
+                        <label>
+                            "Activation code"
+                            <input
+                                type="text"
+                                inputmode="numeric"
+                                autocomplete="one-time-code"
+                                placeholder="6 digits"
+                                prop:value=totp_code
+                                on:input=move |event| set_totp_code.set(event_target_value(&event))
+                            />
+                        </label>
+                    </div>
+                    <p class="auth-error" hidden=move || error.get().is_none()>
+                        {move || error.get().unwrap_or_default()}
+                    </p>
+                    <button type="button" class="btn btn-primary" disabled=move || busy.get() on:click=submit>
+                        "Set up"
+                    </button>
+                </div>
+            </section>
+        }
+    }
+
+    /// The §16.1 user administration view: the principal listing, state
+    /// transitions, role assignments, and the create-user form.
+    #[component]
+    fn UsersView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Users;
+        let (list_state, set_list_state) = signal(UsersListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (draft_name, set_draft_name) = signal(String::new());
+        let (draft_role, set_draft_role) = signal(RoleView::Viewer);
+        let (draft_error, set_draft_error) = signal(None::<String>);
+        let (create_state, set_create_state) = signal(CreateUserState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(UsersListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(match fetch_users().await {
+                        Some(response) => UsersListState::Ready(response),
+                        None => UsersListState::Failed,
+                    });
+                });
+            }
+        });
+
+        let reload_list = move || {
+            set_list_state.set(UsersListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(match fetch_users().await {
+                    Some(response) => UsersListState::Ready(response),
+                    None => UsersListState::Failed,
+                });
+            });
+        };
+        let on_reload = move |_| reload_list();
+
+        let on_create = move |_| {
+            if draft_name.get().trim().is_empty() {
+                set_draft_error.set(Some("the user name is required".to_owned()));
+                return;
+            }
+            set_create_state.set(CreateUserState::InFlight);
+            let name = draft_name.get();
+            let role = draft_role.get();
+            spawn_local(async move {
+                let role = match role {
+                    RoleView::Administrator => RoleResponse::Administrator,
+                    RoleView::Operator => RoleResponse::Operator,
+                    RoleView::Viewer => RoleResponse::Viewer,
+                };
+                if post_create_user(&name, role).await {
+                    set_create_state.set(CreateUserState::Created);
+                    set_draft_name.set(String::new());
+                    reload_list();
+                } else {
+                    set_create_state.set(CreateUserState::Failed);
+                }
+            });
+        };
+
+        let on_set_state = move |principal_id: String, state: PrincipalStateResponse| {
+            spawn_local(async move {
+                if post_set_user_state(&principal_id, state).await {
+                    reload_list();
+                }
+            });
+        };
+
+        let on_assign_role = move |principal_id: String, role: RoleResponse| {
+            spawn_local(async move {
+                if post_assign_role(&principal_id, role).await {
+                    reload_list();
+                }
+            });
+        };
+
+        view! {
+            <section class="auth-admin" hidden=move || !active()>
+                <div class="section-heading">
+                    <div>
+                        <p class="section-label">"Administration"</p>
+                        <h2>"Users"</h2>
+                    </div>
+                    <button type="button" class="btn" on:click=on_reload>
+                        "Refresh"
+                    </button>
+                </div>
+                <div class="auth-admin-form">
+                    <input
+                        type="text"
+                        placeholder="User name"
+                        autocomplete="off"
+                        spellcheck="false"
+                        prop:value=draft_name
+                        on:input=move |event| set_draft_name.set(event_target_value(&event))
+                    />
+                    <select
+                        aria-label="New user role"
+                        on:change=move |event| {
+                            let value = event_target_value(&event);
+                            set_draft_role.set(match value.as_str() {
+                                "Administrator" => RoleView::Administrator,
+                                "Operator" => RoleView::Operator,
+                                _ => RoleView::Viewer,
+                            });
+                        }
+                    >
+                        <option value="Administrator">"Administrator"</option>
+                        <option value="Operator">"Operator"</option>
+                        <option value="Viewer">"Viewer"</option>
+                    </select>
+                    <button type="button" class="btn btn-primary" on:click=on_create>
+                        "Create user"
+                    </button>
+                </div>
+                <p class="auth-error" hidden=move || draft_error.get().is_none()>
+                    {move || draft_error.get().unwrap_or_default()}
+                </p>
+                <p class="auth-note" hidden=move || create_state.get() != CreateUserState::Failed>
+                    "The user could not be created."
+                </p>
+                <div class="auth-table" hidden=move || !matches!(list_state.get(), UsersListState::Ready(_))>
+                    {move || {
+                        let UsersListState::Ready(response) = list_state.get() else {
+                            return Vec::new();
+                        };
+                        response
+                            .users()
+                            .iter()
+                            .map(|user| {
+                                let principal_id = user.id().to_owned();
+                                let principal_id_for_select = principal_id.clone();
+                                let enabled = user.state() == PrincipalStateResponse::Enabled;
+                                let role_label = user
+                                    .role()
+                                    .map(RoleView::from_wire)
+                                    .map(RoleView::label)
+                                    .unwrap_or("—")
+                                    .to_owned();
+                                let name = user.name().to_owned();
+                                let state_label = if enabled {
+                                    "enabled".to_owned()
+                                } else {
+                                    "disabled".to_owned()
+                                };
+                                let action_label = if enabled {
+                                    "Disable".to_owned()
+                                } else {
+                                    "Enable".to_owned()
+                                };
+                                view! {
+                                    <div class="auth-table-row">
+                                        <span class="auth-table-name">{name}</span>
+                                        <span class="auth-table-role">{role_label}</span>
+                                        <span class="auth-table-state">{state_label}</span>
+                                        <select
+                                            aria-label="Role"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                let role = match value.as_str() {
+                                                    "Administrator" => RoleResponse::Administrator,
+                                                    "Operator" => RoleResponse::Operator,
+                                                    _ => RoleResponse::Viewer,
+                                                };
+                                                on_assign_role(principal_id_for_select.clone(), role);
+                                            }
+                                        >
+                                            <option value="Administrator">"Administrator"</option>
+                                            <option value="Operator">"Operator"</option>
+                                            <option value="Viewer">"Viewer"</option>
+                                        </select>
+                                        <button
+                                            type="button"
+                                            class="btn"
+                                            on:click=move |_| {
+                                                let state = if enabled {
+                                                    PrincipalStateResponse::Disabled
+                                                } else {
+                                                    PrincipalStateResponse::Enabled
+                                                };
+                                                on_set_state(principal_id.clone(), state);
+                                            }
+                                        >
+                                            {action_label}
+                                        </button>
+                                    </div>
+                                }
+                            })
+                            .collect()
+                    }}
+                </div>
+                <p class="auth-note" hidden=move || !list_state.get().is_failed()>
+                    "The user list is temporarily unavailable."
+                </p>
+            </section>
+        }
+    }
+
+    /// The §16.2 session administration view: every session with its
+    /// lifecycle and the per-session revocation action.
+    #[component]
+    fn SessionsView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::Sessions;
+        let (list_state, set_list_state) = signal(SessionsListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(SessionsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(match fetch_sessions().await {
+                        Some(response) => SessionsListState::Ready(response),
+                        None => SessionsListState::Failed,
+                    });
+                });
+            }
+        });
+
+        let reload_list = move || {
+            set_list_state.set(SessionsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(match fetch_sessions().await {
+                    Some(response) => SessionsListState::Ready(response),
+                    None => SessionsListState::Failed,
+                });
+            });
+        };
+        let on_reload = move |_| reload_list();
+
+        let on_revoke = move |session_id: String| {
+            spawn_local(async move {
+                if post_revoke_session(&session_id).await {
+                    reload_list();
+                }
+            });
+        };
+
+        view! {
+            <section class="auth-admin" hidden=move || !active()>
+                <div class="section-heading">
+                    <div>
+                        <p class="section-label">"Administration"</p>
+                        <h2>"Sessions"</h2>
+                    </div>
+                    <button type="button" class="btn" on:click=on_reload>
+                        "Refresh"
+                    </button>
+                </div>
+                <div class="auth-table" hidden=move || !matches!(list_state.get(), SessionsListState::Ready(_))>
+                    {move || {
+                        let SessionsListState::Ready(response) = list_state.get() else {
+                            return Vec::new();
+                        };
+                        response
+                            .sessions()
+                            .iter()
+                            .map(|session| {
+                                let session_id = session.session_id().to_owned();
+                                let name = session.principal_name().to_owned();
+                                let created = format_observed_at(&session.created_at());
+                                let last_used = format_observed_at(&session.last_used_at());
+                                let expires = format_observed_at(&session.expires_at());
+                                let revoked = session.revoked_at().is_some();
+                                let current = session.is_current();
+                                view! {
+                                    <div class="auth-table-row">
+                                        <span class="auth-table-name">{name.clone()}</span>
+                                        <span class="auth-table-time">"created " {created}</span>
+                                        <span class="auth-table-time">"used " {last_used}</span>
+                                        <span class="auth-table-time">"expires " {expires}</span>
+                                        <span class="auth-table-state">
+                                            {if revoked { "revoked" } else if current { "current" } else { "active" }}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            class="btn"
+                                            disabled=revoked || current
+                                            on:click=move |_| on_revoke(session_id.clone())
+                                        >
+                                            "Revoke"
+                                        </button>
+                                    </div>
+                                }
+                            })
+                            .collect()
+                    }}
+                </div>
+                <p class="auth-note" hidden=move || !list_state.get().is_failed()>
+                    "The session list is temporarily unavailable."
+                </p>
+            </section>
+        }
+    }
+
+    /// The loading state of the §16.1 user administration listing.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum UsersListState {
+        Idle,
+        Loading,
+        Ready(UserAdminResponse),
+        Failed,
+    }
+
+    impl UsersListState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+    }
+
+    /// The outcome of one create-user submission.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CreateUserState {
+        Idle,
+        InFlight,
+        Created,
+        Failed,
+    }
+
+    /// The loading state of the §16.2 session administration listing.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SessionsListState {
+        Idle,
+        Loading,
+        Ready(SessionAdminResponse),
+        Failed,
+    }
+
+    impl SessionsListState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+    }
 
     #[wasm_bindgen(start)]
     pub fn start() {
@@ -7090,10 +8544,64 @@ mod browser {
 
     #[component]
     fn ProductShell() -> impl IntoView {
+        // The console data loads once at mount; the auth screen decides
+        // when it is shown and reloads it after a fresh sign-in.
         let (state, set_state) = signal(ConsoleLoadState::Loading);
         spawn_local(async move {
             set_state.set(fetch_console().await);
         });
+
+        // The §16.2 first-screen decision: `me` answers whether the client
+        // is signed in, whether the first-run bootstrap claim is pending,
+        // and which role the signed-in principal holds. The console content
+        // renders only in the Console screen.
+        let (auth_screen, set_auth_screen) = signal(AuthScreen::Loading);
+        let (auth_principal, set_auth_principal) =
+            signal(None::<rutilus_api::PrincipalSummaryResponse>);
+        let decide_auth_screen = move |_| {
+            spawn_local(async move {
+                match fetch_me().await {
+                    Some(me) if me.authenticated() => {
+                        set_auth_principal.set(me.principal().cloned());
+                        set_auth_screen.set(AuthScreen::Console);
+                        // A fresh session must load fresh console data: the
+                        // earlier attempts were refused without one.
+                        set_state.set(ConsoleLoadState::Loading);
+                        spawn_local(async move {
+                            set_state.set(fetch_console().await);
+                        });
+                    }
+                    Some(me) if me.bootstrap_pending() => {
+                        set_auth_principal.set(None);
+                        set_auth_screen.set(AuthScreen::Bootstrap);
+                    }
+                    _ => {
+                        set_auth_principal.set(None);
+                        set_auth_screen.set(AuthScreen::Login);
+                    }
+                }
+            });
+        };
+        decide_auth_screen(());
+        let on_auth_success = Callback::new(decide_auth_screen);
+        // A 401 anywhere in the console returns the client to the sign-in
+        // screen (§16.2 session enforcement).
+        Effect::new(move |_| {
+            if session_expired_signal().get() {
+                session_expired_signal().set(false);
+                set_auth_screen.set(AuthScreen::Login);
+            }
+        });
+        let on_logout = move |_| {
+            spawn_local(async move {
+                if post_logout().await {
+                    set_csrf_token(String::new());
+                }
+                session_expired_signal().set(false);
+                decide_auth_screen(());
+            });
+        };
+
         let (view, set_view) = signal(ConsoleView::Overview);
 
         // The capability drill-down keeps its target and matrix state at the
@@ -7152,6 +8660,13 @@ mod browser {
         let (tags_state, set_tags_state) = signal(TagsListState::Idle);
         let (tags_triggered, set_tags_triggered) = signal(false);
 
+        // The §14.2 refresh-selection state lives at the shell level because
+        // the Overview section renders here: the selection is the set of
+        // endpoint ids whose cards are checked, and the batch report belongs
+        // to the same inventory view that launched it.
+        let (selected_endpoint_ids, set_selected_endpoint_ids) = signal(BTreeSet::<String>::new());
+        let (refresh_state, set_refresh_state) = signal(RefreshBatchState::Idle);
+
         Effect::new(move |_| {
             if state.with(ConsoleLoadState::is_ready) && !tags_triggered.get() {
                 set_tags_triggered.set(true);
@@ -7196,6 +8711,42 @@ mod browser {
             set_filter_health.set(BTreeSet::new());
         };
 
+        let on_toggle_selection = Callback::new(move |endpoint_id: String| {
+            set_selected_endpoint_ids.update(|set| toggle_set_membership(set, endpoint_id));
+        });
+
+        let on_refresh_selected = move |_| {
+            let selected: Vec<String> = selected_endpoint_ids.get().into_iter().collect();
+            if selected.is_empty() {
+                return;
+            }
+            let ConsoleLoadState::Ready(data) = state.get() else {
+                return;
+            };
+            let inventory = data.inventory;
+            set_refresh_state.set(RefreshBatchState::InFlight);
+            spawn_local(async move {
+                match post_endpoint_refresh(&selected, &inventory).await {
+                    Ok(report) => {
+                        set_refresh_state.set(RefreshBatchState::Ready(report));
+                        set_selected_endpoint_ids.set(BTreeSet::new());
+                        // The refreshed Generations changed what the cards
+                        // render, so the console reloads exactly like a
+                        // manual "Refresh inventory" click.
+                        set_state.set(ConsoleLoadState::Loading);
+                        spawn_local(async move {
+                            set_state.set(fetch_console().await);
+                        });
+                        set_tags_triggered.set(false);
+                        set_tags_state.set(TagsListState::Loading);
+                    }
+                    Err(failure) => {
+                        set_refresh_state.set(RefreshBatchState::Failed(failure));
+                    }
+                }
+            });
+        };
+
         let filters_active = move || {
             !OverviewFilterSelections {
                 search: filter_search.get(),
@@ -7236,9 +8787,28 @@ mod browser {
                 && filtered_endpoint_cards().is_empty()
         };
 
+        let console_active = move || auth_screen.get() == AuthScreen::Console;
+        let auth_screen_view = move || match auth_screen.get() {
+            AuthScreen::Loading => view! {
+                <section class="auth-screen" aria-label="Loading">
+                    <div class="auth-card">
+                        <p class="eyebrow">"Local Redfish management"</p>
+                        <p class="auth-note">"Checking…"</p>
+                    </div>
+                </section>
+            }
+            .into_any(),
+            AuthScreen::Bootstrap => {
+                view! { <BootstrapView on_success=on_auth_success /> }.into_any()
+            }
+            AuthScreen::Login => view! { <LoginView on_success=on_auth_success /> }.into_any(),
+            AuthScreen::Console => view! {}.into_any(),
+        };
+
         view! {
             <main id="app" aria-live="polite">
-                <header class="product-header">
+                {auth_screen_view}
+                <header class="product-header" hidden=move || !console_active()>
                     <div>
                         <p class="eyebrow">"Local Redfish management"</p>
                         <h1>"Rutilus"</h1>
@@ -7258,9 +8828,17 @@ mod browser {
                             </dd>
                         </div>
                     </dl>
+                    <button
+                        type="button"
+                        class="btn"
+                        hidden=move || !console_active()
+                        on:click=on_logout
+                    >
+                        "Sign out"
+                    </button>
                 </header>
 
-                <nav class="view-nav" aria-label="Console sections">
+                <nav class="view-nav" aria-label="Console sections" hidden=move || !console_active()>
                     {ConsoleView::ALL
                         .iter()
                         .map(|candidate| {
@@ -7276,11 +8854,20 @@ mod browser {
                             // an endpoint (and, for diagnostics, a resource)
                             // chosen from a card first, so their navigation
                             // entries stay hidden until a target is selected.
+                            // The user and session administration entries are
+                            // §16.1 Administrator only.
                             let hidden = move || {
                                 (candidate == ConsoleView::Capabilities
                                     && capability_target.get().is_none())
                                     || (candidate == ConsoleView::Diagnostics
                                         && diagnostics_target.get().is_none())
+                                    || !candidate.allowed_for(
+                                        auth_principal
+                                            .get()
+                                            .as_ref()
+                                            .and_then(|principal| principal.role())
+                                            .map(RoleView::from_wire),
+                                    )
                             };
                             view! {
                                 <button
@@ -7313,12 +8900,36 @@ mod browser {
                     <div class="inventory-actions">
                         <button
                             type="button"
+                            class="btn btn-primary"
+                            disabled=move || {
+                                state.with(ConsoleLoadState::is_loading)
+                                    || refresh_state.get().is_in_flight()
+                                    || selected_endpoint_ids.get().is_empty()
+                            }
+                            on:click=on_refresh_selected
+                        >
+                            "Refresh selected"
+                        </button>
+                        <button
+                            type="button"
                             class="btn"
                             disabled=move || state.with(ConsoleLoadState::is_loading)
                             on:click=on_refresh_inventory
                         >
                             "Refresh inventory"
                         </button>
+                        <p
+                            class="form-hint"
+                            hidden=move || selected_endpoint_ids.get().is_empty()
+                        >
+                            {move || {
+                                let count = selected_endpoint_ids.get().len();
+                                match count {
+                                    1 => "1 endpoint selected".to_owned(),
+                                    _ => format!("{count} endpoints selected"),
+                                }
+                            }}
+                        </p>
                     </div>
                     <div class="overview-filter-bar">
                         <div class="filter-field filter-field-search">
@@ -7450,9 +9061,14 @@ mod browser {
                             filtered_endpoint_cards()
                                 .into_iter()
                                 .map(|card| {
+                                    let selected = selected_endpoint_ids
+                                        .get()
+                                        .contains(&card.endpoint_id);
                                     view! {
                                         <EndpointCard
                                             card=card
+                                            selected=selected
+                                            on_toggle_selection=on_toggle_selection
                                             on_view_capabilities=on_view_capabilities
                                             on_open_diagnostics=on_open_diagnostics
                                         />
@@ -7461,6 +9077,68 @@ mod browser {
                                 .collect_view()
                         }}
                     </div>
+                    <div
+                        class="form-panel result-panel"
+                        hidden=move || !refresh_state.get().is_ready()
+                    >
+                        <p class="section-label">"Refresh report"</p>
+                        <p class="inline-status success">
+                            {move || match refresh_state.get() {
+                                RefreshBatchState::Ready(report) => report.summary_text(),
+                                _ => String::new(),
+                            }}
+                        </p>
+                        <table class="results-table">
+                            <thead>
+                                <tr>
+                                    <th>"Endpoint"</th>
+                                    <th>"Result"</th>
+                                    <th>"Detail"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {move || {
+                                    let RefreshBatchState::Ready(report) = refresh_state.get()
+                                    else {
+                                        return Vec::new();
+                                    };
+                                    report
+                                        .rows
+                                        .into_iter()
+                                        .map(|row| {
+                                            let result_class = if row.is_success {
+                                                "result-success"
+                                            } else {
+                                                "result-failure"
+                                            };
+                                            view! {
+                                                <tr>
+                                                    <td class="result-address">
+                                                        {row.display_name}
+                                                    </td>
+                                                    <td class=result_class>{row.status_label}</td>
+                                                    <td class="result-detail">
+                                                        {move || row.detail.clone()}
+                                                    </td>
+                                                </tr>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </tbody>
+                        </table>
+                    </div>
+                    <p
+                        class="form-error"
+                        hidden=move || {
+                            !matches!(refresh_state.get(), RefreshBatchState::Failed(_))
+                        }
+                    >
+                        {move || match refresh_state.get() {
+                            RefreshBatchState::Failed(failure) => failure.message(),
+                            _ => String::new(),
+                        }}
+                    </p>
                 </section>
 
                 <CredentialsView view=view />
@@ -7490,6 +9168,8 @@ mod browser {
                     set_triggered=set_diagnostics_triggered
                     on_back=on_back_to_overview
                 />
+                <UsersView view=view />
+                <SessionsView view=view />
             </main>
         }
     }
@@ -7497,9 +9177,12 @@ mod browser {
     #[component]
     fn EndpointCard(
         card: EndpointCardProjection,
+        selected: bool,
+        on_toggle_selection: Callback<String>,
         on_view_capabilities: Callback<CapabilityTargetProjection>,
         on_open_diagnostics: Callback<DiagnosticsTargetProjection>,
     ) -> impl IntoView {
+        let endpoint_id_for_selection = card.endpoint_id.clone();
         let systems = card.resource_counts.map_or(0, |counts| counts.systems);
         let chassis = card.resource_counts.map_or(0, |counts| counts.chassis);
         let managers = card.resource_counts.map_or(0, |counts| counts.managers);
@@ -7549,6 +9232,17 @@ mod browser {
                     <span>{card.snapshot_label}</span>
                 </div>
                 <div class="endpoint-card-actions">
+                    <label class="endpoint-select">
+                        <input
+                            type="checkbox"
+                            aria-label="Select this endpoint for refresh"
+                            prop:checked=selected
+                            on:change=move |_| {
+                                on_toggle_selection.run(endpoint_id_for_selection.clone());
+                            }
+                        />
+                        <span>"Refresh"</span>
+                    </label>
                     <button
                         type="button"
                         class="btn"
@@ -8444,7 +10138,7 @@ mod browser {
         else {
             return GroupsListState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return GroupsListState::Failed;
         }
         let Some(inventory) = response.json::<GroupListResponse>().await.ok() else {
@@ -8464,7 +10158,10 @@ mod browser {
     /// 409 verdict).
     async fn create_group(name: &str) -> bool {
         let request = CreateGroupRequest::new(name.to_owned());
-        let Some(prepared) = Request::post("/api/v1/groups").json(&request).ok() else {
+        let Some(prepared) = with_csrf(Request::post("/api/v1/groups"))
+            .json(&request)
+            .ok()
+        else {
             return false;
         };
         let Some(response) = prepared.send().await.ok() else {
@@ -8489,7 +10186,7 @@ mod browser {
         else {
             return GroupDetailState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return GroupDetailState::Failed;
         }
         let Some(group) = response.json::<GroupResponse>().await.ok() else {
@@ -8504,7 +10201,7 @@ mod browser {
     /// Deletes one §14.2 group through `DELETE /api/v1/groups/{group_id}`.
     async fn delete_group(group_id: &str) -> bool {
         let path = format!("/api/v1/groups/{group_id}");
-        let Some(response) = Request::delete(&path).send().await.ok() else {
+        let Some(response) = with_csrf(Request::delete(&path)).send().await.ok() else {
             return false;
         };
         response.ok()
@@ -8514,7 +10211,7 @@ mod browser {
     /// `PUT /api/v1/groups/{group_id}/members/{endpoint_id}`.
     async fn put_group_member(group_id: &str, endpoint_id: &str) -> bool {
         let path = format!("/api/v1/groups/{group_id}/members/{endpoint_id}");
-        let Some(response) = Request::put(&path).send().await.ok() else {
+        let Some(response) = with_csrf(Request::put(&path)).send().await.ok() else {
             return false;
         };
         response.ok()
@@ -8524,7 +10221,7 @@ mod browser {
     /// `DELETE /api/v1/groups/{group_id}/members/{endpoint_id}`.
     async fn delete_group_member(group_id: &str, endpoint_id: &str) -> bool {
         let path = format!("/api/v1/groups/{group_id}/members/{endpoint_id}");
-        let Some(response) = Request::delete(&path).send().await.ok() else {
+        let Some(response) = with_csrf(Request::delete(&path)).send().await.ok() else {
             return false;
         };
         response.ok()
@@ -8541,7 +10238,7 @@ mod browser {
         else {
             return TagsListState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return TagsListState::Failed;
         }
         let Some(list) = response.json::<TagListResponse>().await.ok() else {
@@ -8573,7 +10270,7 @@ mod browser {
             return false;
         };
         let request = AssignTagRequest::new(summary.identity().endpoint_id(), tag_name.to_owned());
-        let Some(prepared) = Request::put("/api/v1/tags").json(&request).ok() else {
+        let Some(prepared) = with_csrf(Request::put("/api/v1/tags")).json(&request).ok() else {
             return false;
         };
         let Some(response) = prepared.send().await.ok() else {
@@ -8591,7 +10288,7 @@ mod browser {
     async fn delete_endpoint_tag(endpoint_id: &str, tag_name: &str) -> bool {
         let encoded_name = percent_encode_path_segment(tag_name);
         let path = format!("/api/v1/endpoints/{endpoint_id}/tags/{encoded_name}");
-        let Some(response) = Request::delete(&path).send().await.ok() else {
+        let Some(response) = with_csrf(Request::delete(&path)).send().await.ok() else {
             return false;
         };
         response.ok()
@@ -8619,7 +10316,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<AboutResponse>().await.ok()
@@ -8631,7 +10328,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<EndpointInventoryResponse>().await.ok()
@@ -8651,7 +10348,7 @@ mod browser {
                 .send()
                 .await
                 .ok()?;
-            if !response.ok() {
+            if !response_ok(&response) {
                 return None;
             }
             resources.push(
@@ -10468,7 +12165,7 @@ mod browser {
         if response.status() == 404 {
             return DiagnosticsState::Failed(DiagnosticsLoadFailure::ResourceNotFound);
         }
-        if !response.ok() {
+        if !response_ok(&response) {
             return DiagnosticsState::Failed(DiagnosticsLoadFailure::Unavailable);
         }
         match response.json::<ResourceDiagnosticsResponse>().await {
@@ -10496,7 +12193,7 @@ mod browser {
         if response.status() == 404 {
             return CapabilityMatrixState::Failed(CapabilityLoadFailure::EndpointNotFound);
         }
-        if !response.ok() {
+        if !response_ok(&response) {
             return CapabilityMatrixState::Failed(CapabilityLoadFailure::Unavailable);
         }
         match response.json::<EndpointCapabilityInventoryResponse>().await {
@@ -10513,7 +12210,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<AuditQueryResponse>().await.ok()
@@ -10538,7 +12235,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<EventListResponse>().await.ok()
@@ -10553,7 +12250,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         let series = response.json::<TelemetrySeriesListResponse>().await.ok()?;
@@ -10579,7 +12276,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<TelemetrySampleListResponse>().await.ok()
@@ -10591,7 +12288,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<CredentialInventoryResponse>().await.ok()
@@ -10603,13 +12300,13 @@ mod browser {
             draft.username.clone(),
             draft.password.clone().into(),
         );
-        let response = Request::post("/api/v1/credentials")
+        let response = with_csrf(Request::post("/api/v1/credentials"))
             .json(&request)
             .ok()?
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<CredentialSummaryResponse>().await.ok()
@@ -10617,13 +12314,13 @@ mod browser {
 
     async fn begin_endpoint_trust(address: &str) -> Option<EndpointTrustChallengeResponse> {
         let request = BeginEndpointTrustRequest::new(address.to_owned());
-        let response = Request::post("/api/v1/endpoints/trust")
+        let response = with_csrf(Request::post("/api/v1/endpoints/trust"))
             .json(&request)
             .ok()?
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<EndpointTrustChallengeResponse>().await.ok()
@@ -10634,13 +12331,13 @@ mod browser {
         trust: &EndpointTrustExpectationRequest,
     ) -> Option<()> {
         let request = ConfirmEndpointTrustRequest::new(address.to_owned(), trust.clone());
-        let response = Request::post("/api/v1/endpoints/trust/expect")
+        let response = with_csrf(Request::post("/api/v1/endpoints/trust/expect"))
             .json(&request)
             .ok()?
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response
@@ -10662,13 +12359,13 @@ mod browser {
             trust.clone(),
             credential.credential_id(),
         );
-        let response = Request::post("/api/v1/endpoints")
+        let response = with_csrf(Request::post("/api/v1/endpoints"))
             .json(&request)
             .ok()?
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<EndpointEnrollmentResponse>().await.ok()
@@ -10678,13 +12375,13 @@ mod browser {
         csv: &str,
     ) -> Result<CsvImportReportProjection, ImportFailure> {
         let request = EndpointCsvImportRequest::new(csv.to_owned());
-        let response = Request::post("/api/v1/endpoints/import")
+        let response = with_csrf(Request::post("/api/v1/endpoints/import"))
             .json(&request)
             .map_err(|_| ImportFailure::Unavailable)?
             .send()
             .await
             .map_err(|_| ImportFailure::Unavailable)?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return Err(ImportFailure::Rejected {
                 status: response.status(),
             });
@@ -10694,6 +12391,45 @@ mod browser {
             .await
             .map_err(|_| ImportFailure::MalformedReport)?;
         Ok(CsvImportReportProjection::from_response(&report))
+    }
+
+    /// Refreshes the selected managed endpoints in one bounded batch and
+    /// projects the server's per-endpoint report.
+    ///
+    /// The endpoint ids come from the loaded inventory, so the id-to-UUID
+    /// parse follows the operation form's inference pattern; a parse failure
+    /// means the console and the server disagree about the inventory and is
+    /// reported like a malformed server response. A non-200 verdict maps to
+    /// the rejection message carrying the HTTP status, and the report
+    /// projection resolves display names against the inventory the selection
+    /// was made from.
+    async fn post_endpoint_refresh(
+        endpoint_ids: &[String],
+        inventory: &EndpointInventoryResponse,
+    ) -> Result<RefreshBatchReportProjection, RefreshFailure> {
+        let parsed: Result<Vec<_>, _> = endpoint_ids.iter().map(|id| id.parse()).collect();
+        let Ok(parsed) = parsed else {
+            return Err(RefreshFailure::MalformedReport);
+        };
+        let request = RefreshEndpointsRequest::new(parsed);
+        let response = with_csrf(Request::post("/api/v1/endpoints/refresh"))
+            .json(&request)
+            .map_err(|_| RefreshFailure::Unavailable)?
+            .send()
+            .await
+            .map_err(|_| RefreshFailure::Unavailable)?;
+        if !response_ok(&response) {
+            return Err(RefreshFailure::Rejected {
+                status: response.status(),
+            });
+        }
+        let report = response
+            .json::<BatchRefreshResponse>()
+            .await
+            .map_err(|_| RefreshFailure::MalformedReport)?;
+        Ok(RefreshBatchReportProjection::from_response(
+            &report, inventory,
+        ))
     }
 
     /// Loads the persisted §13 operation list.
@@ -10711,7 +12447,7 @@ mod browser {
         let Ok(response) = response else {
             return OperationsListState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return OperationsListState::Failed;
         }
         match response.json::<OperationListResponse>().await {
@@ -10740,7 +12476,7 @@ mod browser {
         let Ok(response) = response else {
             return BatchesListState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return BatchesListState::Failed;
         }
         match response.json::<BatchListResponse>().await {
@@ -10763,7 +12499,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<BatchDetailResponse>().await.ok()
@@ -10799,13 +12535,13 @@ mod browser {
             return Err(OperationSubmitState::FAILURE_MESSAGE);
         };
         let request = CreateOperationRequest::new(None, targets, command);
-        let response = Request::post("/api/v1/operations")
+        let response = with_csrf(Request::post("/api/v1/operations"))
             .json(&request)
             .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?
             .send()
             .await
             .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return Err(OperationSubmitState::FAILURE_MESSAGE);
         }
         let body = response
@@ -10830,7 +12566,7 @@ mod browser {
         else {
             return ArtifactsListState::Failed;
         };
-        if !response.ok() {
+        if !response_ok(&response) {
             return ArtifactsListState::Failed;
         }
         match response.json::<ArtifactListResponse>().await {
@@ -10853,7 +12589,7 @@ mod browser {
             .send()
             .await
             .ok()?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return None;
         }
         response.json::<ArtifactResponse>().await.ok()
@@ -10865,13 +12601,13 @@ mod browser {
     async fn create_artifact(name: &str, bytes: &[u8]) -> Result<String, ArtifactUploadFailure> {
         let size_bytes = u64::try_from(bytes.len()).ok().unwrap_or(0);
         let request = CreateArtifactRequest::new(name.to_owned(), size_bytes, sha256_hex(bytes));
-        let response = Request::post("/api/v1/artifacts")
+        let response = with_csrf(Request::post("/api/v1/artifacts"))
             .json(&request)
             .map_err(|_| ArtifactUploadFailure::Unavailable)?
             .send()
             .await
             .map_err(|_| ArtifactUploadFailure::Unavailable)?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return Err(ArtifactUploadFailure::CreateRejected {
                 status: response.status(),
             });
@@ -10893,13 +12629,13 @@ mod browser {
     ) -> Result<ArtifactProgressResponse, ArtifactUploadFailure> {
         let path = format!("/api/v1/artifacts/{artifact_id}/chunks");
         let request = AppendArtifactChunkRequest::new(offset, data);
-        let response = Request::post(&path)
+        let response = with_csrf(Request::post(&path))
             .json(&request)
             .map_err(|_| ArtifactUploadFailure::Unavailable)?
             .send()
             .await
             .map_err(|_| ArtifactUploadFailure::Unavailable)?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return Err(ArtifactUploadFailure::ChunkRejected {
                 status: response.status(),
             });
@@ -10914,11 +12650,11 @@ mod browser {
     /// verifies them against the declared SHA-256 (§14.3).
     async fn finalize_artifact(artifact_id: &str) -> Result<(), ArtifactUploadFailure> {
         let path = format!("/api/v1/artifacts/{artifact_id}/finalize");
-        let response = Request::post(&path)
+        let response = with_csrf(Request::post(&path))
             .send()
             .await
             .map_err(|_| ArtifactUploadFailure::Unavailable)?;
-        if !response.ok() {
+        if !response_ok(&response) {
             return Err(ArtifactUploadFailure::FinalizeRejected {
                 status: response.status(),
             });
@@ -11369,6 +13105,85 @@ mod browser {
             set_error.set(None);
             set_submit_state.set(OperationSubmitState::Idle);
         };
+        let on_oem_face_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = match value.as_str() {
+                "system-config-profile" => Some(OemFaceView::SystemConfigProfile),
+                "debug-token" => Some(OemFaceView::DebugToken),
+                "power-smoothing" => Some(OemFaceView::PowerSmoothing),
+                _ => None,
+            };
+            set_draft.update(|draft| {
+                draft.oem_face = selected;
+                // An action of the other face would be a stale choice after
+                // the face changes, so it is dropped with the face.
+                if let Some(face) = selected {
+                    if draft.oem_action.is_some_and(|action| action.face() != face) {
+                        draft.oem_action = None;
+                    }
+                }
+            });
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_oem_action_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = match value.as_str() {
+                "profile-update" => Some(OemActionView::ProfileUpdate),
+                "profile-factory-reset" => Some(OemActionView::ProfileFactoryReset),
+                "profile-activate" => Some(OemActionView::ProfileActivate),
+                "token-generate" => Some(OemActionView::TokenGenerate),
+                "token-install" => Some(OemActionView::TokenInstall),
+                "token-disable" => Some(OemActionView::TokenDisable),
+                "token-erase" => Some(OemActionView::TokenErase),
+                "power-activate-preset" => Some(OemActionView::PowerActivatePreset),
+                "power-apply-overrides" => Some(OemActionView::PowerApplyOverrides),
+                _ => None,
+            };
+            set_draft.update(|draft| {
+                draft.oem_action = selected;
+                // The face follows the action, so the action list can never
+                // show an action outside the chosen face.
+                if let Some(action) = selected {
+                    draft.oem_face = Some(action.face());
+                }
+            });
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_token_type_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = TokenTypeView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.token_type = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_erase_type_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = EraseTypeView::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == value);
+            set_draft.update(|draft| draft.erase_type = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_profile_file_input = move |event| {
+            set_draft.update(|draft| draft.profile_file = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_token_data_input = move |event| {
+            set_draft.update(|draft| draft.token_data = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_profile_id_input = move |event| {
+            set_draft.update(|draft| draft.profile_id = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
 
         // The reset families share one parameter block; any of the three
         // selections shows it.
@@ -11393,6 +13208,8 @@ mod browser {
             move || draft.get().event_action == Some(EventActionView::CreateSubscription);
         let is_delete_subscription =
             move || draft.get().event_action == Some(EventActionView::DeleteSubscription);
+        let oem_action_selected =
+            move |action: OemActionView| draft.get().oem_action == Some(action);
         // The live preview shows exactly what the card of a submitted
         // operation will render, because both use the same projection.
         let preview_text = move || match draft.get().try_build() {
@@ -11892,6 +13709,224 @@ mod browser {
                         >
                             {OperationFormError::PushUriInvalid.message()}
                         </p>
+                    </div>
+                </div>
+
+                <div class="form-field" hidden=move || !family_selected(CommandFamilyView::Oem)>
+                    <div class="form-field">
+                        <label for="operation-oem-face">"OEM face"</label>
+                        <select
+                            id="operation-oem-face"
+                            class="form-select"
+                            prop:value=move || match draft.get().oem_face {
+                                Some(OemFaceView::SystemConfigProfile) => {
+                                    "system-config-profile".to_owned()
+                                }
+                                Some(OemFaceView::DebugToken) => "debug-token".to_owned(),
+                                Some(OemFaceView::PowerSmoothing) => "power-smoothing".to_owned(),
+                                None => String::new(),
+                            }
+                            on:change=on_oem_face_change
+                        >
+                            <option value="">"Choose an OEM face"</option>
+                            {OemFaceView::ALL
+                                .into_iter()
+                                .map(|face| {
+                                    let value = match face {
+                                        OemFaceView::SystemConfigProfile => {
+                                            "system-config-profile"
+                                        }
+                                        OemFaceView::DebugToken => "debug-token",
+                                        OemFaceView::PowerSmoothing => "power-smoothing",
+                                    };
+                                    view! { <option value=value>{face.label()}</option> }
+                                })
+                                .collect_view()}
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <label for="operation-oem-action">"Action"</label>
+                        <select
+                            id="operation-oem-action"
+                            class="form-select"
+                            prop:value=move || {
+                                draft
+                                    .get()
+                                    .oem_action
+                                    .map_or_else(String::new, |action| {
+                                        oem_action_key(action).to_owned()
+                                    })
+                            }
+                            on:change=on_oem_action_change
+                        >
+                            <option value="">"Choose an action"</option>
+                            {OemActionView::ALL
+                                .into_iter()
+                                .filter(move |action| {
+                                    draft
+                                        .get()
+                                        .oem_face
+                                        .is_none_or(|face| action.face() == face)
+                                })
+                                .map(|action| {
+                                    view! {
+                                        <option value=oem_action_key(action)>{action.label()}</option>
+                                    }
+                                })
+                                .collect_view()}
+                        </select>
+                        <p
+                            class="form-error"
+                            hidden=move || field_error(OperationFormError::OemActionRequired).is_empty()
+                        >
+                            {OperationFormError::OemActionRequired.message()}
+                        </p>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::ProfileUpdate)>
+                        <div class="form-field">
+                            <label for="operation-profile-file">"Profile file (JSON)"</label>
+                            <textarea
+                                id="operation-profile-file"
+                                class="form-input"
+                                rows="4"
+                                placeholder=r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#
+                                prop:value=move || draft.get().profile_file
+                                on:input=on_profile_file_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::ProfileFileRequired).is_empty()
+                            >
+                                {OperationFormError::ProfileFileRequired.message()}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenGenerate)>
+                        <div class="form-field">
+                            <label for="operation-token-type">"Token type"</label>
+                            <select
+                                id="operation-token-type"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .token_type
+                                        .map_or_else(String::new, |t| t.as_str().to_owned())
+                                }
+                                on:change=on_token_type_change
+                            >
+                                <option value="">"Choose a token type"</option>
+                                {TokenTypeView::ALL
+                                    .into_iter()
+                                    .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::TokenTypeRequired).is_empty()
+                            >
+                                {OperationFormError::TokenTypeRequired.message()}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenInstall)>
+                        <div class="form-field">
+                            <label for="operation-token-data">"Token data (Base64)"</label>
+                            <input
+                                id="operation-token-data"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="dG9rZW4tZGF0YQ=="
+                                prop:value=move || draft.get().token_data
+                                on:input=on_token_data_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::TokenDataRequired).is_empty()
+                            >
+                                {OperationFormError::TokenDataRequired.message()}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenErase)>
+                        <div class="form-field">
+                            <label for="operation-erase-type">"Erase scope"</label>
+                            <select
+                                id="operation-erase-type"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .erase_type
+                                        .map_or_else(String::new, |e| e.as_str().to_owned())
+                                }
+                                on:change=on_erase_type_change
+                            >
+                                <option value="">"Choose an erase scope"</option>
+                                {EraseTypeView::ALL
+                                    .into_iter()
+                                    .map(|e| view! { <option value=e.as_str()>{e.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::EraseTypeRequired).is_empty()
+                            >
+                                {OperationFormError::EraseTypeRequired.message()}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-erase-token-type">"Token type"</label>
+                            <select
+                                id="operation-erase-token-type"
+                                class="form-select"
+                                prop:value=move || {
+                                    draft
+                                        .get()
+                                        .token_type
+                                        .map_or_else(String::new, |t| t.as_str().to_owned())
+                                }
+                                on:change=on_token_type_change
+                            >
+                                <option value="">"Choose a token type"</option>
+                                {TokenTypeView::ALL
+                                    .into_iter()
+                                    .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
+                                    .collect_view()}
+                            </select>
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::TokenTypeRequired).is_empty()
+                            >
+                                {OperationFormError::TokenTypeRequired.message()}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::PowerActivatePreset)>
+                        <div class="form-field">
+                            <label for="operation-profile-id">"Preset profile id"</label>
+                            <input
+                                id="operation-profile-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="3"
+                                prop:value=move || draft.get().profile_id
+                                on:input=on_profile_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || field_error(OperationFormError::ProfileIdInvalid).is_empty()
+                            >
+                                {OperationFormError::ProfileIdInvalid.message()}
+                            </p>
+                        </div>
                     </div>
                 </div>
 
@@ -13187,6 +15222,28 @@ mod tests {
                 "resource_type": "oem_smc_kcs_interface",
                 "details": {
                     "privilege": "Operator"
+                }
+            }
+        })
+    }
+
+    fn oem_lenovo_security_service_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789ed",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+                "odata_type": "#LenovoSecurityService.v1_0_0.LenovoSecurityService",
+                "etag": "W/\"lenovo-security-1\""
+            },
+            "common": {
+                "id": "SecurityService",
+                "name": "Lenovo Security Service",
+                "description": "Lenovo security service"
+            },
+            "resource": {
+                "resource_type": "oem_lenovo_security_service",
+                "details": {
+                    "fw_rollback": "Enabled"
                 }
             }
         })
@@ -14694,6 +16751,117 @@ mod tests {
     }
 
     #[test]
+    fn refresh_report_projection_preserves_every_row_outcome() -> Result<(), Box<dyn Error>> {
+        let inventory = inventory()?;
+        let report = serde_json::from_value::<BatchRefreshResponse>(json!({
+            "total": 3,
+            "succeeded_count": 1,
+            "failed_count": 2,
+            "results": [
+                {
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+                    "status": "refreshed",
+                    "generation": 8,
+                    "snapshot_count": 31,
+                    "message": null
+                },
+                {
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789ac",
+                    "status": "failed",
+                    "generation": null,
+                    "snapshot_count": null,
+                    "message": "resource read failed: connection refused"
+                },
+                {
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789ad",
+                    "status": "not_found",
+                    "generation": null,
+                    "snapshot_count": null,
+                    "message": null
+                }
+            ]
+        }))?;
+        let projection = RefreshBatchReportProjection::from_response(&report, &inventory);
+
+        assert_eq!(projection.total, 3);
+        assert_eq!(projection.succeeded_count, 1);
+        assert_eq!(projection.failed_count, 2);
+        assert_eq!(
+            projection.summary_text(),
+            "1 of 3 endpoints refreshed; 2 failed"
+        );
+        let refreshed = projection.rows.first().ok_or("refreshed row must exist")?;
+        assert!(refreshed.is_success);
+        assert_eq!(refreshed.status_label, "Refreshed");
+        assert_eq!(
+            refreshed.endpoint_id,
+            "01989abc-def0-7abc-8def-0123456789ab"
+        );
+        assert_eq!(refreshed.display_name, "Rack A BMC");
+        assert_eq!(
+            refreshed.detail,
+            Some("Generation 8 — 31 snapshots".to_owned())
+        );
+        let failed = projection.rows.get(1).ok_or("failed row must exist")?;
+        assert!(!failed.is_success);
+        assert_eq!(failed.status_label, "Failed");
+        assert_eq!(failed.display_name, "Rack B BMC");
+        assert_eq!(
+            failed.detail,
+            Some("resource read failed: connection refused".to_owned())
+        );
+        let missing = projection.rows.get(2).ok_or("not-found row must exist")?;
+        assert!(!missing.is_success);
+        assert_eq!(missing.status_label, "Not found");
+        assert_eq!(missing.display_name, "01989abc");
+        assert_eq!(missing.detail, None);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_failure_messages_cover_every_rejection() {
+        assert_eq!(
+            RefreshFailure::Unavailable.message(),
+            "The refresh service is temporarily unavailable."
+        );
+        assert_eq!(
+            RefreshFailure::MalformedReport.message(),
+            "The server response could not be read."
+        );
+        assert_eq!(
+            RefreshFailure::Rejected { status: 422 }.message(),
+            "The server rejected the refresh request (HTTP 422)."
+        );
+        assert_ne!(RefreshBatchState::Idle, RefreshBatchState::InFlight);
+        assert!(RefreshBatchState::InFlight.is_in_flight());
+        assert!(!RefreshBatchState::Idle.is_in_flight());
+        let empty_report = RefreshBatchReportProjection {
+            total: 0,
+            succeeded_count: 0,
+            failed_count: 0,
+            rows: Vec::new(),
+        };
+        assert!(matches!(
+            RefreshBatchState::Ready(empty_report),
+            RefreshBatchState::Ready(_)
+        ));
+        assert!(
+            RefreshBatchState::Ready(RefreshBatchReportProjection {
+                total: 0,
+                succeeded_count: 0,
+                failed_count: 0,
+                rows: Vec::new(),
+            })
+            .is_ready()
+        );
+        assert!(matches!(
+            RefreshBatchState::Failed(RefreshFailure::Unavailable),
+            RefreshBatchState::Failed(_)
+        ));
+        assert!(!RefreshBatchState::Failed(RefreshFailure::Unavailable).is_ready());
+    }
+
+    #[test]
     fn audit_query_projection_renders_secret_free_event_cards() -> Result<(), Box<dyn Error>> {
         let query = serde_json::from_value::<AuditQueryResponse>(json!({
             "events": [
@@ -15761,6 +17929,29 @@ mod tests {
     }
 
     #[test]
+    fn role_view_mirrors_the_wire_contract_and_gates_admin_views() {
+        assert_eq!(
+            RoleView::from_wire(RoleResponse::Administrator),
+            RoleView::Administrator
+        );
+        assert_eq!(
+            RoleView::from_wire(RoleResponse::Operator),
+            RoleView::Operator
+        );
+        assert_eq!(RoleView::from_wire(RoleResponse::Viewer), RoleView::Viewer);
+        assert_eq!(RoleView::Administrator.label(), "Administrator");
+        assert_eq!(RoleView::Operator.label(), "Operator");
+        assert_eq!(RoleView::Viewer.label(), "Viewer");
+        assert!(ConsoleView::Users.allowed_for(Some(RoleView::Administrator)));
+        assert!(!ConsoleView::Users.allowed_for(Some(RoleView::Operator)));
+        assert!(!ConsoleView::Users.allowed_for(Some(RoleView::Viewer)));
+        assert!(!ConsoleView::Users.allowed_for(None));
+        assert!(!ConsoleView::Sessions.allowed_for(Some(RoleView::Operator)));
+        assert!(ConsoleView::Overview.allowed_for(None));
+        assert!(ConsoleView::Operations.allowed_for(Some(RoleView::Viewer)));
+    }
+
+    #[test]
     fn console_views_and_loading_state_expose_static_labels() {
         assert_eq!(
             ConsoleView::ALL,
@@ -15777,6 +17968,8 @@ mod tests {
                 ConsoleView::Artifacts,
                 ConsoleView::Telemetry,
                 ConsoleView::Diagnostics,
+                ConsoleView::Users,
+                ConsoleView::Sessions,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -16652,6 +18845,53 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_lenovo_resources() -> Result<(), Box<dyn Error>>
+    {
+        // The api contract has landed the Lenovo OEM family (`oem-lenovo`),
+        // so a Lenovo snapshot (a manager publishing a `SecurityService`
+        // document) derives the data-card form through the wire projection,
+        // not by direct construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789af",
+                "display_name": "Rack E BMC",
+                "address": "https://192.0.2.14/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [
+                        oem_lenovo_security_service_resource()
+                    ]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("a Lenovo snapshot must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 1);
+        let security_service = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService")
+            .ok_or("the SecurityService card must exist")?;
+        assert_eq!(security_service.type_label, "Lenovo Security Service");
+        assert_eq!(security_service.name, "Lenovo Security Service");
+        // The vendor's `FWRollback` enum spelling is kept verbatim per §12.3,
+        // never translated into a product label.
+        assert!(security_service.facts.contains(&ResourceFactProjection {
+            label: "Firmware rollback",
+            value: "Enabled".to_owned(),
+        }));
+        Ok(())
+    }
+
     // The four NVIDIA chain documents are asserted in one test so the card
     // order and the full fact surface stay one contract; the four card
     // projections exceed the pedantic line budget, so the lint is scoped
@@ -17381,6 +19621,112 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn oem_view_vocabularies_follow_the_domain_and_group_their_actions() {
+        let faces = [
+            OemFaceView::SystemConfigProfile,
+            OemFaceView::DebugToken,
+            OemFaceView::PowerSmoothing,
+        ];
+        assert_eq!(OemFaceView::ALL.len(), faces.len());
+        for (face, label) in
+            faces
+                .into_iter()
+                .zip(["System config profile", "Debug token", "Power smoothing"])
+        {
+            assert_eq!(face.label(), label);
+        }
+        assert_eq!(OemActionView::ALL.len(), 9);
+        for action in OemActionView::ALL {
+            assert!(!action.label().is_empty());
+        }
+        for (action, face) in [
+            (
+                OemActionView::ProfileUpdate,
+                OemFaceView::SystemConfigProfile,
+            ),
+            (
+                OemActionView::ProfileFactoryReset,
+                OemFaceView::SystemConfigProfile,
+            ),
+            (
+                OemActionView::ProfileActivate,
+                OemFaceView::SystemConfigProfile,
+            ),
+            (OemActionView::TokenGenerate, OemFaceView::DebugToken),
+            (OemActionView::TokenInstall, OemFaceView::DebugToken),
+            (OemActionView::TokenDisable, OemFaceView::DebugToken),
+            (OemActionView::TokenErase, OemFaceView::DebugToken),
+            (
+                OemActionView::PowerActivatePreset,
+                OemFaceView::PowerSmoothing,
+            ),
+            (
+                OemActionView::PowerApplyOverrides,
+                OemFaceView::PowerSmoothing,
+            ),
+        ] {
+            assert_eq!(action.face(), face);
+        }
+        for (action, key) in [
+            (OemActionView::ProfileUpdate, "profile-update"),
+            (OemActionView::ProfileFactoryReset, "profile-factory-reset"),
+            (OemActionView::ProfileActivate, "profile-activate"),
+            (OemActionView::TokenGenerate, "token-generate"),
+            (OemActionView::TokenInstall, "token-install"),
+            (OemActionView::TokenDisable, "token-disable"),
+            (OemActionView::TokenErase, "token-erase"),
+            (OemActionView::PowerActivatePreset, "power-activate-preset"),
+            (OemActionView::PowerApplyOverrides, "power-apply-overrides"),
+        ] {
+            assert_eq!(oem_action_key(action), key);
+        }
+        let token_members = [
+            (TokenTypeView::Frc, "FRC"),
+            (TokenTypeView::Crcs, "CRCS"),
+            (TokenTypeView::Crdt, "CRDT"),
+            (TokenTypeView::DebugFirmwareRunning, "DebugFirmwareRunning"),
+            (TokenTypeView::DebugFirmwareUnlock, "DebugFirmwareUnlock"),
+            (TokenTypeView::OtpDumpEnable, "OTPDumpEnable"),
+            (TokenTypeView::JtagUnlock, "JtagUnlock"),
+            (TokenTypeView::HardwareUnlock, "HardwareUnlock"),
+            (TokenTypeView::RuntimeDebugUnlock, "RuntimeDebugUnlock"),
+            (TokenTypeView::FeatureUnlock, "FeatureUnlock"),
+            (TokenTypeView::Mtdt, "MTDT"),
+            (
+                TokenTypeView::CcplexArmJtagDebugCont,
+                "CcplexArmJtagDebugCont",
+            ),
+            (TokenTypeView::NvJtagControl, "NVJtagControl"),
+            (TokenTypeView::DiagnosticBoot, "DiagnosticBoot"),
+            (TokenTypeView::BpmpFirmwareDebugFs, "BpmpFirmwareDebugFS"),
+            (TokenTypeView::FirmwareDebugKnobs, "FirmwareDebugKnobs"),
+            (TokenTypeView::FirewallLifting, "FirewallLifting"),
+            (TokenTypeView::Verbosity, "Verbosity"),
+            (TokenTypeView::SmaDebugCapability, "SMADebugCapability"),
+            (TokenTypeView::CpldDebugCapability, "CpldDebugCapability"),
+        ];
+        assert_eq!(TokenTypeView::ALL.len(), token_members.len());
+        for (member, wire) in token_members {
+            assert_eq!(member.as_str(), wire);
+            assert_eq!(domain_token_type(member).as_str(), wire);
+        }
+        let erase_members = [
+            (EraseTypeView::EraseAll, "EraseAll"),
+            (
+                EraseTypeView::EraseAllAndRatchetCounterIncreased,
+                "EraseAllAndRatchetCounterIncreased",
+            ),
+            (EraseTypeView::TokenType, "TokenType"),
+        ];
+        assert_eq!(EraseTypeView::ALL.len(), erase_members.len());
+        for (member, wire) in erase_members {
+            assert_eq!(member.as_str(), wire);
+            assert_eq!(domain_erase_type(member).as_str(), wire);
+        }
+    }
+
+    #[test]
     fn reset_type_view_members_follow_the_csdl() {
         let members = [
             (ResetTypeView::On, "On"),
@@ -17725,6 +20071,198 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn oem_form_drafts_build_typed_commands_and_reject_incomplete_forms() {
+        let endpoint = "01989abc-def0-7abc-8def-0123456789ad".to_owned();
+        let mut draft = OperationFormDraft::new();
+        draft.toggle_endpoint(endpoint.clone());
+        draft.family = Some(CommandFamilyView::Oem);
+        assert_eq!(
+            draft.try_build(),
+            Err(OperationFormError::OemActionRequired)
+        );
+
+        draft.oem_action = Some(OemActionView::ProfileUpdate);
+        assert_eq!(
+            draft.try_build(),
+            Err(OperationFormError::ProfileFileRequired)
+        );
+        draft.profile_file = "  {\"UUID\":\"1\"}  ".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Ok(OperationCommandDraft::Oem(OemCommandDraft::ProfileUpdate {
+                profile_file: "{\"UUID\":\"1\"}".to_owned(),
+            }))
+        );
+
+        let mut generate = OperationFormDraft::new();
+        generate.toggle_endpoint(endpoint.clone());
+        generate.family = Some(CommandFamilyView::Oem);
+        generate.oem_action = Some(OemActionView::TokenGenerate);
+        assert_eq!(
+            generate.try_build(),
+            Err(OperationFormError::TokenTypeRequired)
+        );
+        generate.token_type = Some(TokenTypeView::Frc);
+        assert_eq!(
+            generate.try_build(),
+            Ok(OperationCommandDraft::Oem(OemCommandDraft::TokenGenerate {
+                token_type: TokenTypeView::Frc,
+            }))
+        );
+
+        let mut install = OperationFormDraft::new();
+        install.toggle_endpoint(endpoint.clone());
+        install.family = Some(CommandFamilyView::Oem);
+        install.oem_action = Some(OemActionView::TokenInstall);
+        assert_eq!(
+            install.try_build(),
+            Err(OperationFormError::TokenDataRequired)
+        );
+        install.token_data = "dG9rZW4tZGF0YQ==".to_owned();
+        assert_eq!(
+            install.try_build(),
+            Ok(OperationCommandDraft::Oem(OemCommandDraft::TokenInstall {
+                token_data: "dG9rZW4tZGF0YQ==".to_owned(),
+            }))
+        );
+
+        let mut erase = OperationFormDraft::new();
+        erase.toggle_endpoint(endpoint.clone());
+        erase.family = Some(CommandFamilyView::Oem);
+        erase.oem_action = Some(OemActionView::TokenErase);
+        assert_eq!(
+            erase.try_build(),
+            Err(OperationFormError::EraseTypeRequired)
+        );
+        erase.erase_type = Some(EraseTypeView::EraseAll);
+        assert_eq!(
+            erase.try_build(),
+            Err(OperationFormError::TokenTypeRequired)
+        );
+        erase.token_type = Some(TokenTypeView::Crdt);
+        assert_eq!(
+            erase.try_build(),
+            Ok(OperationCommandDraft::Oem(OemCommandDraft::TokenErase {
+                erase_type: EraseTypeView::EraseAll,
+                token_type: TokenTypeView::Crdt,
+            }))
+        );
+
+        let mut activate = OperationFormDraft::new();
+        activate.toggle_endpoint(endpoint.clone());
+        activate.family = Some(CommandFamilyView::Oem);
+        activate.oem_action = Some(OemActionView::PowerActivatePreset);
+        activate.profile_id = "not-a-number".to_owned();
+        assert_eq!(
+            activate.try_build(),
+            Err(OperationFormError::ProfileIdInvalid)
+        );
+        activate.profile_id = " 3 ".to_owned();
+        assert_eq!(
+            activate.try_build(),
+            Ok(OperationCommandDraft::Oem(
+                OemCommandDraft::PowerActivatePreset { profile_id: 3 }
+            ))
+        );
+
+        // The unit actions need no payload beyond the action choice.
+        for action in [
+            OemActionView::ProfileFactoryReset,
+            OemActionView::ProfileActivate,
+            OemActionView::TokenDisable,
+            OemActionView::PowerApplyOverrides,
+        ] {
+            let mut unit = OperationFormDraft::new();
+            unit.toggle_endpoint(endpoint.clone());
+            unit.family = Some(CommandFamilyView::Oem);
+            unit.oem_action = Some(action);
+            assert!(
+                unit.try_build().is_ok(),
+                "action {action:?} must build without a payload"
+            );
+        }
+    }
+
+    #[test]
+    fn built_oem_commands_serialize_to_the_domain_wire_contract() -> Result<(), Box<dyn Error>> {
+        for (draft, golden) in [
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::ProfileUpdate {
+                    profile_file: "{\"UUID\":\"1\"}".to_owned(),
+                }),
+                r#"{"Oem":{"SystemConfigProfile":{"Update":{"profile_file":"{\"UUID\":\"1\"}"}}}}"#,
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::ProfileFactoryReset),
+                r#"{"Oem":{"SystemConfigProfile":"FactoryReset"}}"#,
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::TokenGenerate {
+                    token_type: TokenTypeView::Frc,
+                }),
+                r#"{"Oem":{"DebugToken":{"GenerateToken":"FRC"}}}"#,
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::TokenErase {
+                    erase_type: EraseTypeView::EraseAll,
+                    token_type: TokenTypeView::Crdt,
+                }),
+                r#"{"Oem":{"DebugToken":{"EraseToken":{"erase_type":"EraseAll","token_type":"CRDT"}}}}"#,
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::PowerActivatePreset { profile_id: 3 }),
+                r#"{"Oem":{"PowerSmoothing":{"ActivatePresetProfile":{"profile_id":3}}}}"#,
+            ),
+        ] {
+            let command = build_command(&draft).map_err(|error| error.message().to_owned())?;
+            assert_eq!(serde_json::to_string(&command)?, golden);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oem_command_draft_summaries_project_face_and_payload() {
+        for (draft, payload) in [
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::ProfileUpdate {
+                    profile_file: "{}".to_owned(),
+                }),
+                "Profile · Update",
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::ProfileFactoryReset),
+                "Profile · Factory reset",
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::TokenGenerate {
+                    token_type: TokenTypeView::Frc,
+                }),
+                "Token · Generate · FRC",
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::TokenErase {
+                    erase_type: EraseTypeView::EraseAll,
+                    token_type: TokenTypeView::Crdt,
+                }),
+                "Token · Erase · EraseAll · CRDT",
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::PowerActivatePreset { profile_id: 3 }),
+                "Power smoothing · Activate preset · 3",
+            ),
+            (
+                OperationCommandDraft::Oem(OemCommandDraft::PowerApplyOverrides),
+                "Power smoothing · Apply overrides",
+            ),
+        ] {
+            let summary = command_summary(&draft);
+            assert_eq!(summary.family, "OEM (NVIDIA)");
+            assert_eq!(summary.payload, payload);
+        }
     }
 
     /// One artifact card fixture for the update choice filtering tests; the
@@ -18357,6 +20895,9 @@ mod tests {
         Ok(())
     }
 
+    // The wire literal table exceeds the pedantic line budget, so the lint
+    // is scoped here exactly like the other fixture-table tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn wire_command_summaries_render_every_family() -> Result<(), Box<dyn Error>> {
         for (wire, family, payload) in [
@@ -18408,6 +20949,72 @@ mod tests {
                 json!({ "Event": { "DeleteSubscription": { "subscription_id": "Sub-1" } } }),
                 "Event subscription",
                 "Delete · Sub-1",
+            ),
+            (
+                json!({
+                    "Oem": {
+                        "SystemConfigProfile": {
+                            "Update": { "profile_file": "{}" }
+                        }
+                    }
+                }),
+                "OEM (NVIDIA)",
+                "Profile · Update",
+            ),
+            (
+                json!({ "Oem": { "SystemConfigProfile": "FactoryReset" } }),
+                "OEM (NVIDIA)",
+                "Profile · Factory reset",
+            ),
+            (
+                json!({ "Oem": { "SystemConfigProfile": "ActivateProfile" } }),
+                "OEM (NVIDIA)",
+                "Profile · Activate",
+            ),
+            (
+                json!({ "Oem": { "DebugToken": { "GenerateToken": "FRC" } } }),
+                "OEM (NVIDIA)",
+                "Token · Generate · FRC",
+            ),
+            (
+                json!({ "Oem": { "DebugToken": { "InstallToken": { "token_data": "AA==" } } } }),
+                "OEM (NVIDIA)",
+                "Token · Install",
+            ),
+            (
+                json!({ "Oem": { "DebugToken": "DisableToken" } }),
+                "OEM (NVIDIA)",
+                "Token · Disable",
+            ),
+            (
+                json!({
+                    "Oem": {
+                        "DebugToken": {
+                            "EraseToken": {
+                                "erase_type": "EraseAll",
+                                "token_type": "CRDT"
+                            }
+                        }
+                    }
+                }),
+                "OEM (NVIDIA)",
+                "Token · Erase · EraseAll · CRDT",
+            ),
+            (
+                json!({
+                    "Oem": {
+                        "PowerSmoothing": {
+                            "ActivatePresetProfile": { "profile_id": 3 }
+                        }
+                    }
+                }),
+                "OEM (NVIDIA)",
+                "Power smoothing · Activate preset · 3",
+            ),
+            (
+                json!({ "Oem": { "PowerSmoothing": "ApplyAdminOverrides" } }),
+                "OEM (NVIDIA)",
+                "Power smoothing · Apply overrides",
             ),
         ] {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;
