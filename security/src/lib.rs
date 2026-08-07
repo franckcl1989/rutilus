@@ -10,12 +10,22 @@ use rutilus_domain::{CredentialId, CredentialVersionId};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+mod bootstrap_code;
 mod master_key;
+mod password_hash;
+mod session_token;
+mod totp;
 
+pub use bootstrap_code::{
+    BOOTSTRAP_CODE_CHARACTERS, BootstrapCodeError, generate_bootstrap_code, hash_bootstrap_code,
+};
 pub use master_key::{
     MASTER_KEY_ENVELOPE_LENGTH, MasterKey, MasterKeyProtectionError, ProtectedMasterKey,
     protect_master_key, recover_master_key,
 };
+pub use password_hash::{PasswordHashError, hash_password, verify_password};
+pub use session_token::{CsrfToken, SessionToken, SessionTokenError, TOKEN_LENGTH};
+pub use totp::{TotpSecretError, TotpUriError, generate_totp_secret, totp_uri, verify_code};
 
 /// Byte length of every persisted `XChaCha20-Poly1305` credential nonce.
 pub const CREDENTIAL_NONCE_LENGTH: usize = 24;
