@@ -1,14 +1,18 @@
 use std::{error::Error, fmt, str::FromStr};
 
-/// A standard Redfish capability tracked by the capability ledger.
+/// A Redfish capability tracked by the capability ledger.
 ///
-/// Each variant maps to one public `nv-redfish` feature. The variants are the
-/// complete §2.1 standard-feature inventory (30 entries), declared in the same
-/// order as the design document, so the 0.2 ledger can enumerate every
-/// capability the product may compile. Persisted identity is the `as_str()`
-/// product code, which is stable across milestones: the 0.1 codes
-/// ("session-service", "systems", "chassis", "managers") keep their values
-/// even where the upstream feature has since been renamed (see `Systems`).
+/// Each variant maps to one public `nv-redfish` feature. The standard variants
+/// are the complete §2.1 standard-feature inventory (30 entries), declared in
+/// the same order as the design document; the OEM variants are the complete
+/// §2.1 OEM-feature inventory (14 entries) in the compiled-feature order of
+/// `COMPILED_OEM_FEATURES`, so the ledger can enumerate every capability the
+/// product may compile. Persisted identity is the `as_str()` product code,
+/// which is stable across milestones: the 0.1 codes ("session-service",
+/// "systems", "chassis", "managers") keep their values even where the upstream
+/// feature has since been renamed (see `Systems`), while every OEM code equals
+/// its `nv-redfish` feature name because the feature set is the contract the
+/// 0.8.0 baseline freezes (§2.3).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EndpointCapability {
     Accounts,
@@ -43,6 +47,73 @@ pub enum EndpointCapability {
     TelemetryService,
     Thermal,
     UpdateService,
+    /// The §2.1 AMI OEM feature (`oem-ami`). Its advertisement is the `Ami`
+    /// namespace key in the `Oem` segment of a decoded resource; the
+    /// per-resource extension surfaces (Service Root, `ConfigBMC`) are read
+    /// from that namespace in the read slice.
+    OemAmi,
+    /// The §2.1 Dell OEM feature (`oem-dell`). Its advertisement is the
+    /// `Dell` namespace key in the `Oem` segment of a decoded resource.
+    OemDell,
+    /// The §2.1 Dell Attributes OEM feature (`oem-dell-attributes`). It
+    /// compiles as a feature superset of `oem-dell` and reads the `Attributes`
+    /// resource inside the same `Dell` namespace, so this slice observes the
+    /// namespace advertisement only; the `Attributes` resource itself is read
+    /// in the read slice.
+    OemDellAttributes,
+    /// The §2.1 Delta OEM feature (`oem-delta`). Its advertisement is the
+    /// `deltaenergysystems` namespace key in the `Oem` segment of a decoded
+    /// resource (the key used by `nv-redfish` itself for Delta power
+    /// supplies).
+    OemDelta,
+    /// The §2.1 HPE OEM feature (`oem-hpe`). Its advertisement is the `Hpe`
+    /// namespace key in the `Oem` segment of a decoded resource.
+    OemHpe,
+    /// The §2.1 Lenovo OEM feature (`oem-lenovo`). Its advertisement is the
+    /// `Lenovo` namespace key in the `Oem` segment of a decoded resource.
+    OemLenovo,
+    /// The §2.1 `LiteOn` OEM feature (`oem-liteon`). Unlike every other vendor
+    /// feature it is not advertised by an `Oem` namespace key: `nv-redfish`
+    /// 0.13 gates `LiteOn` support on the chassis `Manufacturer` hardware-id
+    /// value "LITE-ON TECHNOLOGY CORP.", and the probe mirrors that exact
+    /// signal (§11.3 advertised through decoded resources).
+    OemLiteOn,
+    /// The §2.1 NVIDIA OEM feature (`oem-nvidia`). Its advertisement is the
+    /// `Nvidia` namespace key in the `Oem` segment of a decoded resource.
+    OemNvidia,
+    /// The §2.1 NVIDIA CPER OEM feature (`oem-nvidia-cper`). It compiles as a
+    /// feature superset of `oem-nvidia` and reads CPER records inside the same
+    /// `Nvidia` namespace, so this slice observes the namespace advertisement
+    /// only; CPER record presence is verified in the read slice.
+    OemNvidiaCper,
+    /// The §2.1 NVIDIA Fabrics OEM feature (`oem-nvidia-fabrics`). It compiles
+    /// as a feature superset of `oem-nvidia` and reads fabric data inside the
+    /// same `Nvidia` namespace, so this slice observes the namespace
+    /// advertisement only; fabric surface presence is verified in the read
+    /// slice.
+    OemNvidiaFabrics,
+    /// The §2.1 NVIDIA Power Management OEM feature
+    /// (`oem-nvidia-power-management`). It compiles as a feature superset of
+    /// `oem-nvidia` and reads power-management data inside the same `Nvidia`
+    /// namespace, so this slice observes the namespace advertisement only;
+    /// power-management surface presence is verified in the read slice.
+    OemNvidiaPowerManagement,
+    /// The §2.1 NVIDIA Profiles OEM feature (`oem-nvidia-profiles`). It
+    /// compiles as a feature superset of `oem-nvidia` and reads profile data
+    /// inside the same `Nvidia` namespace, so this slice observes the
+    /// namespace advertisement only; profile surface presence is verified in
+    /// the read slice.
+    OemNvidiaProfiles,
+    /// The §2.1 NVIDIA Security OEM feature (`oem-nvidia-security`). It
+    /// compiles as a feature superset of `oem-nvidia` and reads security data
+    /// inside the same `Nvidia` namespace, so this slice observes the
+    /// namespace advertisement only; security surface presence is verified in
+    /// the read slice.
+    OemNvidiaSecurity,
+    /// The §2.1 Supermicro OEM feature (`oem-supermicro`). Its advertisement
+    /// is the `Supermicro` namespace key in the `Oem` segment of a decoded
+    /// resource.
+    OemSupermicro,
 }
 
 impl EndpointCapability {
@@ -80,6 +151,20 @@ impl EndpointCapability {
             Self::TelemetryService => "telemetry-service",
             Self::Thermal => "thermal",
             Self::UpdateService => "update-service",
+            Self::OemAmi => "oem-ami",
+            Self::OemDell => "oem-dell",
+            Self::OemDellAttributes => "oem-dell-attributes",
+            Self::OemDelta => "oem-delta",
+            Self::OemHpe => "oem-hpe",
+            Self::OemLenovo => "oem-lenovo",
+            Self::OemLiteOn => "oem-liteon",
+            Self::OemNvidia => "oem-nvidia",
+            Self::OemNvidiaCper => "oem-nvidia-cper",
+            Self::OemNvidiaFabrics => "oem-nvidia-fabrics",
+            Self::OemNvidiaPowerManagement => "oem-nvidia-power-management",
+            Self::OemNvidiaProfiles => "oem-nvidia-profiles",
+            Self::OemNvidiaSecurity => "oem-nvidia-security",
+            Self::OemSupermicro => "oem-supermicro",
         }
     }
 
@@ -117,6 +202,24 @@ impl EndpointCapability {
             Self::TelemetryService => "telemetry-service",
             Self::Thermal => "thermal",
             Self::UpdateService => "update-service",
+            // OEM product codes are the upstream feature names: the compiled
+            // feature set is the contract the 0.8.0 baseline freezes (§2.3),
+            // so there is no legacy code to preserve and both inventories must
+            // address the same wire surface.
+            Self::OemAmi => "oem-ami",
+            Self::OemDell => "oem-dell",
+            Self::OemDellAttributes => "oem-dell-attributes",
+            Self::OemDelta => "oem-delta",
+            Self::OemHpe => "oem-hpe",
+            Self::OemLenovo => "oem-lenovo",
+            Self::OemLiteOn => "oem-liteon",
+            Self::OemNvidia => "oem-nvidia",
+            Self::OemNvidiaCper => "oem-nvidia-cper",
+            Self::OemNvidiaFabrics => "oem-nvidia-fabrics",
+            Self::OemNvidiaPowerManagement => "oem-nvidia-power-management",
+            Self::OemNvidiaProfiles => "oem-nvidia-profiles",
+            Self::OemNvidiaSecurity => "oem-nvidia-security",
+            Self::OemSupermicro => "oem-supermicro",
         }
     }
 
@@ -127,9 +230,13 @@ impl EndpointCapability {
     /// data, so they are Infrastructure. Every remaining standard feature maps
     /// to a viewable or operable surface (§12.2) and is `UserFacing` —
     /// including `UpdateService`, whose `SoftwareInventory` and update
-    /// operations are operator-visible rather than internal plumbing. No
-    /// standard feature is classified as `LegacyCompatibility` or `Internal`
-    /// in the 0.2 ledger.
+    /// operations are operator-visible rather than internal plumbing. Every
+    /// OEM capability is `UserFacing` too: the §12.2 Oem page presents the
+    /// vendor-namespace data that the compiled feature decodes, and §11.5
+    /// forbids private OEM access paths, so an OEM capability is either a
+    /// presented surface or `UnsupportedByNvRedfishBaseline` (absent from the
+    /// ledger entirely). No capability is classified as `LegacyCompatibility`
+    /// or `Internal` in the 0.2 ledger.
     #[must_use]
     pub const fn classification(self) -> CapabilityClassification {
         match self {
@@ -161,7 +268,21 @@ impl EndpointCapability {
             | Self::Storages
             | Self::TelemetryService
             | Self::Thermal
-            | Self::UpdateService => CapabilityClassification::UserFacing,
+            | Self::UpdateService
+            | Self::OemAmi
+            | Self::OemDell
+            | Self::OemDellAttributes
+            | Self::OemDelta
+            | Self::OemHpe
+            | Self::OemLenovo
+            | Self::OemLiteOn
+            | Self::OemNvidia
+            | Self::OemNvidiaCper
+            | Self::OemNvidiaFabrics
+            | Self::OemNvidiaPowerManagement
+            | Self::OemNvidiaProfiles
+            | Self::OemNvidiaSecurity
+            | Self::OemSupermicro => CapabilityClassification::UserFacing,
         }
     }
 
@@ -204,19 +325,39 @@ impl EndpointCapability {
             Self::Thermal => UiLocation::Thermal,
             Self::UpdateService => UiLocation::Update,
             Self::Systems => UiLocation::Systems,
+            // Every OEM capability is presented on the single §12.2 Oem page:
+            // the page is vendor-driven (sections per present namespace), so
+            // per-vendor pages would duplicate navigation for devices that
+            // carry several vendor extensions.
+            Self::OemAmi
+            | Self::OemDell
+            | Self::OemDellAttributes
+            | Self::OemDelta
+            | Self::OemHpe
+            | Self::OemLenovo
+            | Self::OemLiteOn
+            | Self::OemNvidia
+            | Self::OemNvidiaCper
+            | Self::OemNvidiaFabrics
+            | Self::OemNvidiaPowerManagement
+            | Self::OemNvidiaProfiles
+            | Self::OemNvidiaSecurity
+            | Self::OemSupermicro => UiLocation::Oem,
         }
     }
 }
 
-/// The complete §2.1 standard-feature inventory in design-document order.
+/// The complete §2.1 capability inventory: the 30 standard features in
+/// design-document order followed by the 14 OEM features in the compiled
+/// feature order of [`OEM_CAPABILITY_LEDGER_ORDER`].
 ///
-/// This is the canonical enumeration for every ledger projection: the 0.2
-/// Endpoint capability page renders exactly these 30 entries, and an entry
-/// without a persisted observation still appears so the UI can explain why
-/// the feature is missing instead of hiding it. The order must stay aligned
-/// with §2.1, so queries, persistence round-trips, and the capability page
-/// all enumerate the ledger identically.
-pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 30] = [
+/// This is the canonical enumeration for every ledger projection: the Endpoint
+/// capability page renders exactly these 44 entries, and an entry without a
+/// persisted observation still appears so the UI can explain why the feature
+/// is missing instead of hiding it. The order must stay aligned with §2.1 and
+/// with the compiled OEM feature order, so queries, persistence round-trips,
+/// and the capability page all enumerate the ledger identically.
+pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 44] = [
     EndpointCapability::Accounts,
     EndpointCapability::Assembly,
     EndpointCapability::Bios,
@@ -247,6 +388,48 @@ pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 30] = [
     EndpointCapability::TelemetryService,
     EndpointCapability::Thermal,
     EndpointCapability::UpdateService,
+    EndpointCapability::OemAmi,
+    EndpointCapability::OemDell,
+    EndpointCapability::OemDellAttributes,
+    EndpointCapability::OemDelta,
+    EndpointCapability::OemHpe,
+    EndpointCapability::OemLenovo,
+    EndpointCapability::OemLiteOn,
+    EndpointCapability::OemNvidia,
+    EndpointCapability::OemNvidiaCper,
+    EndpointCapability::OemNvidiaFabrics,
+    EndpointCapability::OemNvidiaPowerManagement,
+    EndpointCapability::OemNvidiaProfiles,
+    EndpointCapability::OemNvidiaSecurity,
+    EndpointCapability::OemSupermicro,
+];
+
+/// The complete §2.1 OEM-feature inventory in the compiled feature order.
+///
+/// This is the canonical enumeration for the OEM section of the capability
+/// ledger and the one-to-one contract with the infra `COMPILED_OEM_FEATURES`
+/// constant: `infra-redfish` asserts its compiled feature list equals exactly
+/// these codes in exactly this order, so the domain ledger and the linked
+/// binary cannot drift. The order mirrors the `nv-redfish` feature table
+/// (`oem-ami`, `oem-dell`, `oem-dell-attributes`, `oem-delta`, `oem-hpe`,
+/// `oem-lenovo`, `oem-liteon`, `oem-nvidia` and its five sub-features,
+/// `oem-supermicro`), which is also the order the 0.8.0 baseline freezes
+/// (§2.3).
+pub const OEM_CAPABILITY_LEDGER_ORDER: [EndpointCapability; 14] = [
+    EndpointCapability::OemAmi,
+    EndpointCapability::OemDell,
+    EndpointCapability::OemDellAttributes,
+    EndpointCapability::OemDelta,
+    EndpointCapability::OemHpe,
+    EndpointCapability::OemLenovo,
+    EndpointCapability::OemLiteOn,
+    EndpointCapability::OemNvidia,
+    EndpointCapability::OemNvidiaCper,
+    EndpointCapability::OemNvidiaFabrics,
+    EndpointCapability::OemNvidiaPowerManagement,
+    EndpointCapability::OemNvidiaProfiles,
+    EndpointCapability::OemNvidiaSecurity,
+    EndpointCapability::OemSupermicro,
 ];
 
 impl fmt::Display for EndpointCapability {
@@ -290,6 +473,20 @@ impl FromStr for EndpointCapability {
             "telemetry-service" => Ok(Self::TelemetryService),
             "thermal" => Ok(Self::Thermal),
             "update-service" => Ok(Self::UpdateService),
+            "oem-ami" => Ok(Self::OemAmi),
+            "oem-dell" => Ok(Self::OemDell),
+            "oem-dell-attributes" => Ok(Self::OemDellAttributes),
+            "oem-delta" => Ok(Self::OemDelta),
+            "oem-hpe" => Ok(Self::OemHpe),
+            "oem-lenovo" => Ok(Self::OemLenovo),
+            "oem-liteon" => Ok(Self::OemLiteOn),
+            "oem-nvidia" => Ok(Self::OemNvidia),
+            "oem-nvidia-cper" => Ok(Self::OemNvidiaCper),
+            "oem-nvidia-fabrics" => Ok(Self::OemNvidiaFabrics),
+            "oem-nvidia-power-management" => Ok(Self::OemNvidiaPowerManagement),
+            "oem-nvidia-profiles" => Ok(Self::OemNvidiaProfiles),
+            "oem-nvidia-security" => Ok(Self::OemNvidiaSecurity),
+            "oem-supermicro" => Ok(Self::OemSupermicro),
             _ => Err(EndpointCapabilityParseError),
         }
     }
@@ -352,7 +549,7 @@ pub enum UiLocation {
     Telemetry,
     Update,
     Tasks,
-    /// Vendor-proprietary surfaces; no standard feature maps here yet.
+    /// Vendor-proprietary surfaces; every §2.1 OEM capability maps here.
     Oem,
     /// Read-only diagnostic surfaces; no capability maps here yet.
     Diagnostics,
@@ -557,6 +754,7 @@ impl EndpointCapabilityObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource_snapshot::{ResourceFeature, ResourceFeatureParseError};
 
     /// The §2.1 standard-feature inventory, in design-document order. The
     /// ledger must map exactly this set and nothing else.
@@ -591,6 +789,27 @@ mod tests {
         "telemetry-service",
         "thermal",
         "update-service",
+    ];
+
+    /// The §2.1 OEM-feature inventory, in the compiled-feature order of the
+    /// infra `COMPILED_OEM_FEATURES` constant. The OEM ledger must map exactly
+    /// this set and nothing else; `infra-redfish` asserts the mirror image on
+    /// its own constant.
+    const OEM_FEATURES: [&str; 14] = [
+        "oem-ami",
+        "oem-dell",
+        "oem-dell-attributes",
+        "oem-delta",
+        "oem-hpe",
+        "oem-lenovo",
+        "oem-liteon",
+        "oem-nvidia",
+        "oem-nvidia-cper",
+        "oem-nvidia-fabrics",
+        "oem-nvidia-power-management",
+        "oem-nvidia-profiles",
+        "oem-nvidia-security",
+        "oem-supermicro",
     ];
 
     /// Every §12.2 Endpoint page, in navigation order.
@@ -634,7 +853,7 @@ mod tests {
 
     #[test]
     fn capability_ledger_covers_every_standard_feature_exactly_once() {
-        assert_eq!(CAPABILITY_LEDGER_ORDER.len(), STANDARD_FEATURES.len());
+        assert_eq!(CAPABILITY_LEDGER_ORDER.len(), 44);
         let mut upstream_features = Vec::new();
         for capability in CAPABILITY_LEDGER_ORDER {
             let feature = capability.upstream_feature();
@@ -643,10 +862,17 @@ mod tests {
                 "{} must name a non-empty upstream feature",
                 capability.as_str()
             );
-            assert!(
-                STANDARD_FEATURES.contains(&feature),
-                "upstream feature {feature} is not in the §2.1 inventory"
-            );
+            if OEM_CAPABILITY_LEDGER_ORDER.contains(&capability) {
+                assert!(
+                    OEM_FEATURES.contains(&feature),
+                    "OEM upstream feature {feature} is not in the §2.1 OEM inventory"
+                );
+            } else {
+                assert!(
+                    STANDARD_FEATURES.contains(&feature),
+                    "upstream feature {feature} is not in the §2.1 inventory"
+                );
+            }
             assert!(
                 !upstream_features.contains(&feature),
                 "upstream feature {feature} is mapped by more than one capability"
@@ -660,6 +886,52 @@ mod tests {
                     .any(|capability| capability.upstream_feature() == feature),
                 "§2.1 feature {feature} has no capability variant"
             );
+        }
+    }
+
+    #[test]
+    fn oem_ledger_covers_every_compiled_oem_feature_exactly_once() {
+        let mut product_codes = Vec::new();
+        for capability in OEM_CAPABILITY_LEDGER_ORDER {
+            let feature = capability.upstream_feature();
+            assert!(
+                OEM_FEATURES.contains(&feature),
+                "OEM upstream feature {feature} is not in the §2.1 OEM inventory"
+            );
+            // OEM product codes are the feature names: the compiled feature
+            // set is the contract the 0.8.0 baseline freezes, so the domain
+            // ledger and the linked binary must address the same wire string.
+            assert_eq!(
+                capability.as_str(),
+                feature,
+                "{} must keep its upstream feature name as its product code",
+                capability.as_str()
+            );
+            assert!(
+                !product_codes.contains(&capability.as_str()),
+                "product code {} is used by more than one OEM capability",
+                capability.as_str()
+            );
+            product_codes.push(capability.as_str());
+        }
+        for feature in OEM_FEATURES {
+            assert!(
+                OEM_CAPABILITY_LEDGER_ORDER
+                    .iter()
+                    .any(|capability| capability.upstream_feature() == feature),
+                "§2.1 OEM feature {feature} has no capability variant"
+            );
+        }
+        // The full ledger appends the OEM inventory after the 30 standard
+        // entries, so every projection shares one canonical order: the
+        // standard section keeps the §2.1 order and the OEM section follows
+        // the compiled feature order.
+        assert_eq!(
+            &CAPABILITY_LEDGER_ORDER[30..],
+            &OEM_CAPABILITY_LEDGER_ORDER[..]
+        );
+        for (capability, feature) in CAPABILITY_LEDGER_ORDER[..30].iter().zip(STANDARD_FEATURES) {
+            assert_eq!(capability.upstream_feature(), feature);
         }
     }
 
@@ -702,6 +974,18 @@ mod tests {
                 capability.as_str()
             );
         }
+        // §2.4 classifies every OEM capability as UserFacing: the §12.2 Oem
+        // page presents the vendor-namespace data that the compiled feature
+        // decodes, and §11.5 leaves no other legal handling for compiled OEM
+        // data than presenting it through the upstream types.
+        for capability in OEM_CAPABILITY_LEDGER_ORDER {
+            assert_eq!(
+                capability.classification(),
+                CapabilityClassification::UserFacing,
+                "{} must be UserFacing",
+                capability.as_str()
+            );
+        }
     }
 
     #[test]
@@ -718,6 +1002,36 @@ mod tests {
             EndpointCapability::TaskService.ui_location(),
             UiLocation::Tasks
         );
+        // Every OEM capability lands on the single §12.2 Oem page.
+        for capability in OEM_CAPABILITY_LEDGER_ORDER {
+            assert_eq!(
+                capability.ui_location(),
+                UiLocation::Oem,
+                "{} must be presented on the Oem page",
+                capability.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn oem_capability_codes_stay_distinct_from_resource_family_codes() {
+        // The 0.5 slice adds the first OEM resource family (`OemDell`, the
+        // Dell `Attributes` document read) under the narrower family code
+        // `dell-attributes`. The remaining OEM surfaces (CPER, fabrics, power
+        // management, profiles, security, and the other vendor pages) arrive
+        // with the read slice. Either way, no OEM capability code may parse
+        // as a `ResourceFeature`: families address the read surface under
+        // surface codes, so the two inventories cannot silently drift into
+        // aliasing each other. A new OEM family must extend this assertion's
+        // exclusion list if it ever needs a code from the capability space.
+        for capability in OEM_CAPABILITY_LEDGER_ORDER {
+            assert_eq!(
+                capability.as_str().parse::<ResourceFeature>(),
+                Err(ResourceFeatureParseError),
+                "{} must not be addressable as a resource family code",
+                capability.as_str()
+            );
+        }
     }
 
     #[test]

@@ -28,6 +28,17 @@ pub enum ResourceFeature {
     Systems,
     Chassis,
     Managers,
+    /// The §2.1 `oem-dell-attributes` read surface, added as a typed resource
+    /// family in the 0.5 slice. The family reads the manager-scoped Dell
+    /// `Attributes` document through the `Dell` OEM namespace. The family
+    /// code is `dell-attributes` (not `oem-dell-attributes`, which stays the
+    /// capability code, and not `oem-dell`, which stays the namespace
+    /// capability code): the one `oem-dell-attributes` capability covers the
+    /// `Attributes` read surface and the namespace advertisement that
+    /// precedes it, so this variant addresses only the read surface and must
+    /// not be mistaken for a capability code (see the ledger-consistency
+    /// test).
+    OemDell,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -163,6 +174,7 @@ impl ResourceFeature {
             Self::Systems => "systems",
             Self::Chassis => "chassis",
             Self::Managers => "managers",
+            Self::OemDell => "dell-attributes",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
@@ -208,6 +220,7 @@ impl FromStr for ResourceFeature {
             "systems" => Ok(Self::Systems),
             "chassis" => Ok(Self::Chassis),
             "managers" => Ok(Self::Managers),
+            "dell-attributes" => Ok(Self::OemDell),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
@@ -773,6 +786,7 @@ mod tests {
             ResourceFeature::Systems,
             ResourceFeature::Chassis,
             ResourceFeature::Managers,
+            ResourceFeature::OemDell,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
@@ -945,6 +959,17 @@ mod tests {
                 EndpointCapability::TelemetryService,
             ),
             (ResourceFeature::Task, EndpointCapability::TaskService),
+            // The 0.5 Dell Attributes family follows the same precedent: the
+            // family reads the manager's Dell `Attributes` document, so it
+            // maps to the `oem-dell-attributes` capability (the feature that
+            // decodes that document) under the narrower family code
+            // `dell-attributes` — never the `oem-dell` or
+            // `oem-dell-attributes` capability codes, which stay with the
+            // ledger.
+            (
+                ResourceFeature::OemDell,
+                EndpointCapability::OemDellAttributes,
+            ),
         ];
         for (feature, capability) in subsidiary {
             assert_ne!(feature.as_str(), capability.as_str());
@@ -965,6 +990,29 @@ mod tests {
         );
         assert_eq!(ResourceFeature::MetricReport.as_str(), "metric-report");
         assert_eq!(ResourceFeature::Task.as_str(), "task");
+        // The 0.5 Dell Attributes family keeps its narrow `dell-attributes`
+        // code; the `oem-dell` namespace capability and the
+        // `oem-dell-attributes` feature capability stay with the ledger, so
+        // the snapshot and capability inventories cannot silently drift into
+        // aliasing each other.
+        assert_eq!(ResourceFeature::OemDell.as_str(), "dell-attributes");
+        assert_eq!(EndpointCapability::OemDell.as_str(), "oem-dell");
+        assert_eq!(
+            EndpointCapability::OemDellAttributes.as_str(),
+            "oem-dell-attributes"
+        );
+        assert_eq!(
+            "dell-attributes".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemDell)
+        );
+        assert_eq!(
+            "dell-attributes".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-dell-attributes".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemDellAttributes)
+        );
     }
 
     // The exhaustive near-miss spellings below exceed the pedantic line
@@ -1034,6 +1082,19 @@ mod tests {
             "manager-net-protocol",
             "ManagerNetworkProtocol",
             "manager-network",
+            // The 0.5 Dell Attributes family: singular and snake_case forms
+            // would address a different surface, and the `oem-dell` /
+            // `oem-dell-attributes` capability codes must stay unparseable as
+            // families so the ledger and the snapshot inventory never alias.
+            "dell-attribute",
+            "dell-attributes/",
+            "dell_attributes",
+            "dellattributes",
+            "DellAttributes",
+            "attributes",
+            "oem-dell",
+            "oem-dell-attribute",
+            "oem-dell-attributes",
             "host-interface",
             "host-interfaces/",
             "hostinterface",

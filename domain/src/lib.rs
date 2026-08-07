@@ -30,8 +30,8 @@ pub use audit::{
 };
 pub use capability::{
     CAPABILITY_LEDGER_ORDER, CapabilityClassification, CapabilityState, CapabilityStateParseError,
-    EndpointCapability, EndpointCapabilityObservation, EndpointCapabilityParseError, UiLocation,
-    UiLocationParseError,
+    EndpointCapability, EndpointCapabilityObservation, EndpointCapabilityParseError,
+    OEM_CAPABILITY_LEDGER_ORDER, UiLocation, UiLocationParseError,
 };
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,
