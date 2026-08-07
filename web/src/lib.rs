@@ -1512,8 +1512,9 @@ fn project_enrollment(
             // Network, Accounts, Bios, BootOptions, SecureBoot, the
             // Power/Thermal/Sensors/Controls telemetry families, the
             // LogServices/ManagerNetworkProtocol/HostInterfaces manager
-            // surface, the OemDell §11.5 OEM family, the
-            // PcieDevices/Assembly/SoftwareInventory read families, and the
+            // surface, the OemDell / OemSmcSysLockdown / OemSmcKcsInterface
+            // §11.5 OEM families, the PcieDevices/Assembly/SoftwareInventory
+            // read families, and the
             // EventService/EventSubscription/TelemetryService/
             // MetricDefinition/MetricReport/TaskService/Task service
             // families) intentionally stay out of the three-field enrollment
@@ -1537,6 +1538,8 @@ fn project_enrollment(
             | ResourceFeature::ManagerNetworkProtocol
             | ResourceFeature::HostInterfaces
             | ResourceFeature::OemDell
+            | ResourceFeature::OemSmcSysLockdown
+            | ResourceFeature::OemSmcKcsInterface
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
@@ -2337,6 +2340,12 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::Chassis { .. } => project_chassis_details(details),
         CoreResourceDetails::Manager { .. } => project_manager_details(details),
         CoreResourceDetails::OemDell { .. } => project_oem_dell_details(details),
+        CoreResourceDetails::OemSmcSysLockdown { .. } => {
+            project_oem_smc_sys_lockdown_details(details)
+        }
+        CoreResourceDetails::OemSmcKcsInterface { .. } => {
+            project_oem_smc_kcs_interface_details(details)
+        }
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
@@ -2559,6 +2568,45 @@ fn project_oem_dell_details(details: &CoreResourceDetails) -> CoreResourceDetail
         server_generation: server_generation.clone(),
         server_bmc_mac_address: server_bmc_mac_address.clone(),
         server_name: server_name.clone(),
+    }
+}
+
+/// Projects the §11.5 Supermicro `SysLockdown` OEM family into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemSmcSysLockdown` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_smc_sys_lockdown_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemSmcSysLockdown {
+        sys_lockdown_enabled,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemSmcSysLockdown {
+            sys_lockdown_enabled: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemSmcSysLockdown {
+        sys_lockdown_enabled: *sys_lockdown_enabled,
+    }
+}
+
+/// Projects the §11.5 Supermicro `KcsInterface` OEM family into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemSmcKcsInterface` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_smc_kcs_interface_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemSmcKcsInterface { privilege } = details else {
+        return CoreResourceDetailsResponse::OemSmcKcsInterface { privilege: None };
+    };
+    CoreResourceDetailsResponse::OemSmcKcsInterface {
+        privilege: privilege.clone(),
     }
 }
 
@@ -3739,6 +3787,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposes_oem_smc_typed_resources() -> Result<(), Box<dyn Error>> {
+        let item = oem_smc_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 3);
+        // The inventory orders snapshots by `@odata.id`, so the service root
+        // (the `/redfish/v1` prefix) sorts before the manager's Supermicro
+        // documents, with `KCSInterface` before `SysLockdown`.
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        assert_eq!(
+            resources[1]["resource"]["resource_type"],
+            "oem_smc_kcs_interface"
+        );
+        assert_eq!(
+            resources[1]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/KCSInterface"
+        );
+        assert_eq!(resources[1]["common"]["name"], "KCSInterface");
+        assert_eq!(resources[1]["resource"]["details"]["privilege"], "Operator");
+        assert_eq!(
+            resources[2]["resource"]["resource_type"],
+            "oem_smc_sys_lockdown"
+        );
+        assert_eq!(
+            resources[2]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/SysLockdown"
+        );
+        assert_eq!(resources[2]["common"]["name"], "SysLockdown");
+        assert_eq!(
+            resources[2]["resource"]["details"]["sys_lockdown_enabled"],
+            true
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn exposes_storage_network_and_ethernet_typed_resources() -> Result<(), Box<dyn Error>> {
         let item = storage_network_inventory_item()?;
         let endpoint_id = item.endpoint().id();
@@ -4523,6 +4618,61 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, oem_dell],
+        )?)
+    }
+
+    fn oem_smc_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Supermicro OEM BMC")?,
+            EndpointAddress::parse("https://192.0.2.39")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![39])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        // The compiled Supermicro schemas model no `Id` / `Name`, so the
+        // payloads carry only the typed document fields and the product
+        // identity is derived from each snapshot's `@odata.id`.
+        let sys_lockdown = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemSmcSysLockdown,
+            "/redfish/v1/Managers/1/SysLockdown",
+            r#"{"SysLockdownEnabled":true}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#SysLockdown.v1_0_0.SysLockdown")?)
+        .with_etag(ResourceEtag::parse("W/\"sys-lockdown-1\"")?);
+        let kcs_interface = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemSmcKcsInterface,
+            "/redfish/v1/Managers/1/KCSInterface",
+            r#"{"Privilege":"Operator"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#KCSInterface.v1_0_0.KCSInterface",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"kcs-interface-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![root, kcs_interface, sys_lockdown],
         )?)
     }
 
