@@ -847,6 +847,34 @@ dd {
   color: #8495ad;
 }
 
+/* ----- Batch operation area (design 13.7) ----- */
+.batch-outcome-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.7rem;
+}
+
+.batch-children {
+  margin-top: 0.7rem;
+  border-top: 1px solid rgb(143 171 207 / 18%);
+  padding-top: 0.6rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.batch-child-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.82rem;
+}
+
+.batch-child-endpoint {
+  color: #ccd7e5;
+}
+
 /* Choice grids for command families, event types, and endpoints */
 .command-choice-grid {
   display: flex;

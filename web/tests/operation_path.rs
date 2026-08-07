@@ -21,12 +21,12 @@ use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, EventRepository, OperationStore, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
-    TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
+    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReader,
+    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryRepository, EndpointRefreshRepository, EventRepository, OperationStore,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
@@ -299,10 +299,20 @@ impl OperationStore for MockServices {
         })
     }
 
+    fn record_failure_kind(
+        &self,
+        _operation_id: OperationId,
+        _kind: rutilus_domain::FailureKind,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        // The submission paths never classify failures; the executor's
+        // refusal path owns that write, so this stub is unreachable here.
+        Box::pin(async { Ok(()) })
+    }
+
     fn list_batch_children(
         &self,
         batch_id: BatchOperationId,
-    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         Box::pin(async move {
             let mut children = self
                 .state
@@ -313,9 +323,11 @@ impl OperationStore for MockServices {
                 .cloned()
                 .unwrap_or_default();
             // Target order (§13.7): each child carries exactly one target, so
-            // ordering by that target's identity is a total order.
+            // ordering by that target's identity is a total order. The
+            // submission paths never classify failures, so every child reads
+            // back unclassified.
             children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
-            Ok(children)
+            Ok(children.into_iter().map(|child| (child, None)).collect())
         })
     }
 }

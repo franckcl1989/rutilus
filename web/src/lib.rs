@@ -18,54 +18,56 @@ use rutilus_api::{
     AboutResponse, AppendArtifactChunkRequest, ArtifactFinalizeFailureResponse,
     ArtifactListResponse, ArtifactProgressResponse, ArtifactResponse, ArtifactStateResponse,
     AssignTagRequest, AuditEventResponse, AuditOutcomeResponse, AuditQueryResponse,
-    AuditTargetResponse, BatchOperationResponse, BeginEndpointTrustRequest,
-    CapabilityClassificationResponse, CapabilityEntryResponse, CapabilityStateResponse,
-    ConfirmEndpointTrustRequest, CoreResourceCommonResponse, CoreResourceCountsResponse,
-    CoreResourceDetailsResponse, CoreResourceResponse, CoreResourceSourceResponse,
-    CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
-    CredentialInventoryResponse, CredentialSummaryResponse, EndpointCapabilityInventoryResponse,
-    EndpointCsvImportRequest, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
-    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointIdentityResponse,
-    EndpointInventoryResponse, EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
-    EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-    ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
-    HealthResponse, MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse,
-    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
-    OperationTargetResponse, ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse,
-    TagResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
+    AuditTargetResponse, BatchDetailResponse, BatchListResponse, BatchOperationResponse,
+    BatchOperationStateResponse, BatchOutcomeCountsResponse, BatchSummaryResponse,
+    BeginEndpointTrustRequest, CapabilityClassificationResponse, CapabilityEntryResponse,
+    CapabilityStateResponse, ConfirmEndpointTrustRequest, CoreResourceCommonResponse,
+    CoreResourceCountsResponse, CoreResourceDetailsResponse, CoreResourceResponse,
+    CoreResourceSourceResponse, CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest,
+    CreateOperationRequest, CredentialInventoryResponse, CredentialSummaryResponse,
+    EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
+    EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse,
+    EndpointIdentityResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
+    EndpointResourceSnapshotResponse, EndpointSnapshotSummaryResponse, EndpointSummaryResponse,
+    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
+    EndpointTrustExpectationRequest, EnrollEndpointRequest, ErrorResponse, EventListResponse,
+    EventResponse, GroupListResponse, GroupResponse, HealthResponse, MetricValueResponse,
+    OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse, OperationResponse,
+    OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
+    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
+    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
     TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
     UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
-    ArtifactStoreError, AuditEventWriter, AuditedOnboardEndpointError, BoundaryFuture,
-    CapabilityLedgerEntry, CapabilityQueryRepository, CapabilitySnapshotRepository, Clock,
-    CoreResourceDetails, CoreResourceReader, CoreResourceSummary, CredentialCreation,
-    CredentialCreationError, CredentialCreationRepository, CredentialInventoryQuery,
-    CredentialInventoryQueryError, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointCapabilityQuery,
-    EndpointCapabilityQueryError, EndpointCsvImportExecutor, EndpointCsvImportReport,
-    EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment, EndpointEnrollmentError,
-    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
-    EndpointInventoryRepository, EndpointRefreshRepository, EndpointResourceInventory,
-    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, EndpointTrustChallenge,
-    EndpointTrustEstablishment, EndpointTrustExpectation, EndpointTrustExpectationError,
-    EnrolledEndpoint, EventRepository, GroupManagement, GroupManagementError, GroupRepository,
-    NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest, OperationStore,
-    OperationSubmission, RedfishDiscovery, ResourceDiagnostics, ResourceDiagnosticsQuery,
-    ResourceDiagnosticsQueryError, ResourceStatusSummary, SubmissionError, TagManagement,
-    TagManagementError, TagRepository, TelemetryRepository, TlsIdentityProbe, TrustedEndpoint,
-    parse_endpoint_csv,
+    ArtifactStoreError, AuditEventWriter, AuditedOnboardEndpointError, BatchDetail, BatchQuery,
+    BatchSummary, BoundaryFuture, CapabilityLedgerEntry, CapabilityQueryRepository,
+    CapabilitySnapshotRepository, Clock, CoreResourceDetails, CoreResourceReader,
+    CoreResourceSummary, CredentialCreation, CredentialCreationError, CredentialCreationRepository,
+    CredentialInventoryQuery, CredentialInventoryQueryError, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointCapabilityQuery, EndpointCapabilityQueryError, EndpointCsvImportExecutor,
+    EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult, EndpointEnrollment,
+    EndpointEnrollmentError, EndpointInventoryItem, EndpointInventoryQuery,
+    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointRefreshRepository,
+    EndpointResourceInventory, EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
+    EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
+    EndpointTrustExpectationError, EnrolledEndpoint, EventRepository, GroupManagement,
+    GroupManagementError, GroupRepository, NewCredentialRequest, OnboardEndpointError,
+    OnboardEndpointRequest, OperationStore, OperationSubmission, RedfishDiscovery,
+    ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
+    ResourceStatusSummary, SubmissionError, TagManagement, TagManagementError, TagRepository,
+    TelemetryRepository, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation,
-    CapabilityClassification, CapabilityState, CertificateFingerprintParseError, Credential,
-    CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointDisplayName, EndpointId, Event, Group, GroupId, GroupName, Operation, OperationId,
-    OperationSource, OperationState, OperationTarget, ResourceFeature, ResourceId,
-    ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
-    TlsTrust, UiLocation,
+    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
+    BatchOperationState, BatchOutcomeCounts, CapabilityClassification, CapabilityState,
+    CertificateFingerprintParseError, Credential, CredentialId, CredentialName, CredentialUsername,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, Event, Group,
+    GroupId, GroupName, Operation, OperationId, OperationSource, OperationState, OperationTarget,
+    ResourceFeature, ResourceId, ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample,
+    TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -333,6 +335,14 @@ where
         .route(
             "/api/v1/operations/{operation_id}",
             get(operation_detail::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/batches",
+            get(list_batches::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/batches/{batch_id}",
+            get(batch_detail::<Services, Gateway, Time>),
         )
         .route(
             "/api/v1/artifacts",
@@ -1134,6 +1144,52 @@ where
     }
 }
 
+/// Lists every batch parent with its derived state and outcome summary, in
+/// acceptance order (§13.7).
+///
+/// The verdict and the buckets are server-derived facts: the handler projects
+/// exactly what the application query derived from the children and never
+/// recomputes a batch-level number.
+async fn list_batches<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let query = BatchQuery::new(state.services.as_ref());
+    // The query surface has exactly one verdict: the store boundary.
+    let Ok(batches) = query.list_batches().await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut response = Json(BatchListResponse::new(
+        batches.iter().map(project_batch_summary).collect(),
+    ))
+    .into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Returns one batch's full report: the derived summary plus every child
+/// operation in target order (§13.7).
+async fn batch_detail<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    AxumPath(batch_id): AxumPath<String>,
+) -> Response
+where
+    Services: ProductServices,
+{
+    let Ok(batch_id) = batch_id.parse::<BatchOperationId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "batch id is invalid".to_owned());
+    };
+    let query = BatchQuery::new(state.services.as_ref());
+    match query.batch_detail(batch_id).await {
+        Ok(Some(detail)) => json_ok(Json(project_batch_detail(&detail))),
+        Ok(None) => uncached_status(StatusCode::NOT_FOUND),
+        // The query surface has exactly one verdict: the store boundary.
+        Err(_) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 /// Declares one firmware artifact manifest before any byte is transferred
 /// (§14.3) and returns its `Uploading` projection.
 ///
@@ -1448,6 +1504,55 @@ fn project_operation_target(target: &OperationTarget) -> OperationTargetResponse
     )
 }
 
+/// Projects one derived batch verdict onto its console wire value.
+fn project_batch_state(state: BatchOperationState) -> BatchOperationStateResponse {
+    match state {
+        BatchOperationState::Queued => BatchOperationStateResponse::Queued,
+        BatchOperationState::Running => BatchOperationStateResponse::Running,
+        BatchOperationState::Succeeded => BatchOperationStateResponse::Succeeded,
+        BatchOperationState::Failed => BatchOperationStateResponse::Failed,
+        BatchOperationState::Unknown => BatchOperationStateResponse::Unknown,
+        BatchOperationState::Cancelled => BatchOperationStateResponse::Cancelled,
+    }
+}
+
+/// Projects the domain outcome buckets onto their console wire shape.
+fn project_batch_outcomes(counts: BatchOutcomeCounts) -> BatchOutcomeCountsResponse {
+    BatchOutcomeCountsResponse::new(
+        counts.succeeded(),
+        counts.failed(),
+        counts.unknown(),
+        counts.unsupported(),
+        counts.cancelled(),
+        counts.total(),
+    )
+}
+
+/// Projects one derived batch summary onto its console card (§13.7).
+fn project_batch_summary(summary: &BatchSummary) -> BatchSummaryResponse {
+    BatchSummaryResponse::new(
+        summary.batch().id().into_uuid(),
+        project_operation_source(summary.batch().source()),
+        summary.batch().command(),
+        project_batch_state(summary.state()),
+        project_batch_outcomes(summary.outcomes()),
+        summary.batch().created_at(),
+    )
+}
+
+/// Projects one batch's full report onto its console detail (§13.7).
+fn project_batch_detail(detail: &BatchDetail) -> BatchDetailResponse {
+    BatchDetailResponse::new(
+        detail.summary().batch().id().into_uuid(),
+        project_operation_source(detail.summary().batch().source()),
+        detail.summary().batch().command(),
+        project_batch_state(detail.summary().state()),
+        project_batch_outcomes(detail.summary().outcomes()),
+        detail.summary().batch().created_at(),
+        detail.children().iter().map(project_operation).collect(),
+    )
+}
+
 fn project_operation_source(source: OperationSource) -> OperationSourceResponse {
     match source {
         OperationSource::Standalone => OperationSourceResponse::Standalone,
@@ -1610,6 +1715,8 @@ fn project_enrollment(
             | ResourceFeature::OemSmcSysLockdown
             | ResourceFeature::OemSmcKcsInterface
             | ResourceFeature::OemNvidiaSystemConfigProfile
+            | ResourceFeature::OemNvidiaPowerCompliance
+            | ResourceFeature::OemNvidiaManagedEntity
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
@@ -2428,6 +2535,33 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::OemNvidiaSystemProfileFile { .. } => {
             project_oem_nvidia_system_profile_file_details(details)
         }
+        CoreResourceDetails::OemNvidiaPowerCompliance { .. } => {
+            project_oem_nvidia_power_compliance_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPowerDomain { .. } => {
+            project_oem_nvidia_power_domain_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPowerPolicy { .. } => {
+            project_oem_nvidia_power_policy_details(details)
+        }
+        CoreResourceDetails::OemNvidiaManagedEntityGroup { .. } => {
+            project_oem_nvidia_managed_entity_group_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPowerStateGroup { .. } => {
+            project_oem_nvidia_power_state_group_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPscState { .. } => {
+            project_oem_nvidia_psc_state_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPsuState { .. } => {
+            project_oem_nvidia_psu_state_details(details)
+        }
+        CoreResourceDetails::OemNvidiaPsuRedundancy { .. } => {
+            project_oem_nvidia_psu_redundancy_details(details)
+        }
+        CoreResourceDetails::OemNvidiaManagedEntity { .. } => {
+            project_oem_nvidia_managed_entity_details(details)
+        }
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
@@ -2819,6 +2953,271 @@ fn project_oem_nvidia_system_profile_file_details(
         metadata_project_name: metadata_project_name.clone(),
         metadata_uuid: metadata_uuid.clone(),
         profile: profile.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPowerComplianceManager` chain-root
+/// document into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerCompliance`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_power_compliance_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPowerCompliance { manager_type } = details else {
+        return CoreResourceDetailsResponse::OemNvidiaPowerCompliance { manager_type: None };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPowerCompliance {
+        manager_type: manager_type.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPowerDomain` member into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerDomain`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_power_domain_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPowerDomain {
+        value,
+        r#type,
+        unit,
+        sensor_reading_type,
+        sensor_impl,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPowerDomain {
+            value: None,
+            r#type: None,
+            unit: None,
+            sensor_reading_type: None,
+            sensor_impl: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPowerDomain {
+        value: *value,
+        r#type: r#type.clone(),
+        unit: unit.clone(),
+        sensor_reading_type: sensor_reading_type.clone(),
+        sensor_impl: sensor_impl.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPowerPolicy` document into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerPolicy`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_power_policy_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPowerPolicy {
+        auto_deassert_power_brake,
+        min,
+        max,
+        r#type,
+        unit,
+        policy_actions,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPowerPolicy {
+            auto_deassert_power_brake: None,
+            min: None,
+            max: None,
+            r#type: None,
+            unit: None,
+            policy_actions: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPowerPolicy {
+        auto_deassert_power_brake: *auto_deassert_power_brake,
+        min: *min,
+        max: *max,
+        r#type: r#type.clone(),
+        unit: unit.clone(),
+        policy_actions: policy_actions.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaManagedEntityGroup` member into the
+/// shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaManagedEntityGroup`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_managed_entity_group_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaManagedEntityGroup {
+        current_managed_entity_id,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup {
+            current_managed_entity_id: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaManagedEntityGroup {
+        current_managed_entity_id: current_managed_entity_id.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPowerStateGroup` document into the
+/// shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPowerStateGroup`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_power_state_group_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPowerStateGroup {
+        psc_id,
+        generated_watts,
+        number_of_pscs,
+        number_of_local_psus,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPowerStateGroup {
+            psc_id: None,
+            generated_watts: None,
+            number_of_pscs: None,
+            number_of_local_psus: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPowerStateGroup {
+        psc_id: psc_id.clone(),
+        generated_watts: *generated_watts,
+        number_of_pscs: *number_of_pscs,
+        number_of_local_psus: *number_of_local_psus,
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPscState` member into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPscState` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_nvidia_psc_state_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPscState {
+        psc_id,
+        num_of_operational_psus,
+        power_brake_assert,
+        milliseconds_since_last_heartbeat,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPscState {
+            psc_id: None,
+            num_of_operational_psus: None,
+            power_brake_assert: None,
+            milliseconds_since_last_heartbeat: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPscState {
+        psc_id: psc_id.clone(),
+        num_of_operational_psus: *num_of_operational_psus,
+        power_brake_assert: *power_brake_assert,
+        milliseconds_since_last_heartbeat: *milliseconds_since_last_heartbeat,
+        status: status.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPsuState` member into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPsuState` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_nvidia_psu_state_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPsuState {
+        psu_id,
+        presence,
+        input1active,
+        input2active,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPsuState {
+            psu_id: None,
+            presence: None,
+            input1active: None,
+            input2active: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPsuState {
+        psu_id: psu_id.clone(),
+        presence: *presence,
+        input1active: *input1active,
+        input2active: *input2active,
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaPsuRedundancy` document into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaPsuRedundancy`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_psu_redundancy_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaPsuRedundancy {
+        max_num_supported,
+        min_num_needed,
+        redundancy_setting,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaPsuRedundancy {
+            max_num_supported: None,
+            min_num_needed: None,
+            redundancy_setting: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaPsuRedundancy {
+        max_num_supported: max_num_supported.clone(),
+        min_num_needed: min_num_needed.clone(),
+        redundancy_setting: redundancy_setting.clone(),
+    }
+}
+
+/// Projects the §11.5 NVIDIA `NvidiaManagedEntity` member into the shared
+/// wire contract.
+///
+/// The dispatcher guarantees this receives the `OemNvidiaManagedEntity`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_oem_nvidia_managed_entity_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemNvidiaManagedEntity {
+        transport_protocol,
+        ipv4_address,
+        ipv6_address,
+        port,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemNvidiaManagedEntity {
+            transport_protocol: None,
+            ipv4_address: None,
+            ipv6_address: None,
+            port: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemNvidiaManagedEntity {
+        transport_protocol: transport_protocol.clone(),
+        ipv4_address: ipv4_address.clone(),
+        ipv6_address: ipv6_address.clone(),
+        port: *port,
     }
 }
 
@@ -3649,21 +4048,23 @@ fn content_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fmt};
+    use std::{collections::HashMap, error::Error, fmt, sync::Mutex};
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
     use rutilus_application::{
-        BoundaryFuture, CapabilitySnapshotRepository, EndpointDiscovery,
+        BoundaryFuture, CapabilitySnapshotRepository, ClassifiedBatchChild, EndpointDiscovery,
         ProtectedCredentialCreation, ResolvedCredential, ResourceDiagnostics, ResourceObservation,
         StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
-        CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
-        EndpointCapabilityObservation, EndpointDisplayName, EndpointId, RefreshGeneration,
-        ResourceEtag, ResourceFeature, ResourceId, ResourceODataId, ResourceODataType,
-        ResourceSnapshot, ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries,
-        TelemetrySeriesId, TlsCertificate, TlsTrust,
+        BatchOperation, BatchOperationId, CredentialId, CredentialUsername, CredentialVersionId,
+        Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
+        FailureKind, Operation, OperationId, OperationSource, OperationState, OperationTarget,
+        RedfishCommand, RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId,
+        ResourceODataId, ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, SeriesKey,
+        SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+        TlsCertificate, TlsTrust,
     };
     use secrecy::SecretString;
     use serde_json::{Value, json};
@@ -3681,7 +4082,26 @@ mod tests {
             WebProductInfo::new("0.1.0-test", "0.13.0-test"),
             AuditActor::LocalOperator,
             DeploymentPosture::Standalone,
-            Arc::new(UnavailableWriteServices { inventory }),
+            Arc::new(UnavailableWriteServices {
+                inventory,
+                batch_store: BatchTestStore::failing(),
+            }),
+            Arc::new(UnavailableGateway),
+            FixedClock,
+        )
+    }
+
+    /// Builds the router over a services bundle whose batch store is a
+    /// working in-memory store — the §13.7 route projections' test bench.
+    fn test_batch_router(batch_store: BatchTestStore) -> Router {
+        router(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store,
+            }),
             Arc::new(UnavailableGateway),
             FixedClock,
         )
@@ -4045,6 +4465,11 @@ mod tests {
         Ok(())
     }
 
+    // The 157-line test exceeds the pedantic line budget because the whole
+    // NVIDIA wire surface (the system chain plus the power chains) is
+    // asserted in one contract; the lint is scoped here exactly like the
+    // other fixture-sequence tests.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn exposes_oem_nvidia_typed_resources() -> Result<(), Box<dyn Error>> {
         let item = oem_nvidia_inventory_item()?;
@@ -4061,72 +4486,166 @@ mod tests {
         let resources = body["snapshot"]["details"]["resources"]
             .as_array()
             .ok_or("resources must be an array")?;
-        assert_eq!(resources.len(), 5);
+        assert_eq!(resources.len(), 14);
         // The inventory orders snapshots by `@odata.id`, so the service root
-        // sorts before the chain documents, and within the chain the profile
-        // collection members sort before the status singleton (`Profiles` <
-        // `Status`).
+        // sorts before the manager chain (`Managers` < `Systems`), and within
+        // the manager chain the singletons sort before the collection
+        // members (`ACLossPolicy` < `ManagedEntityGroups` < `PSURedundancy` <
+        // `PowerDomains` < `PowerStateGroup`), and within the system chain
+        // the profile collection members sort before the status singleton
+        // (`Profiles` < `Status`).
         assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        // The power-compliance chain root carries the compiled `ManagerType`
+        // enumeration spelling verbatim.
         assert_eq!(
             resources[1]["resource"]["resource_type"],
-            "oem_nvidia_system_config_profile"
+            "oem_nvidia_power_compliance"
         );
         assert_eq!(
             resources[1]["source"]["odata_id"],
-            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
         );
         assert_eq!(
-            resources[1]["common"]["name"],
-            "NVIDIA System Config Profile"
+            resources[1]["resource"]["details"]["manager_type"],
+            "PowerManager"
         );
-        assert_eq!(
-            resources[1]["resource"]["details"]["truststore"]["nvidia_certificates"],
-            true
-        );
-        assert_eq!(
-            resources[1]["resource"]["details"]["truststore"]["oem_certificates"],
-            false
-        );
+        // The ACLossPolicy singleton shares the power-policy variant with
+        // the PSU compliance policy.
         assert_eq!(
             resources[2]["resource"]["resource_type"],
-            "oem_nvidia_system_profile"
+            "oem_nvidia_power_policy"
         );
         assert_eq!(
             resources[2]["source"]["odata_id"],
-            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy"
         );
-        assert_eq!(resources[2]["resource"]["details"]["owner"], "Nvidia");
-        assert_eq!(resources[2]["resource"]["details"]["version"], 1);
+        assert_eq!(
+            resources[2]["resource"]["details"]["policy_actions"],
+            "AssertPowerBrake"
+        );
+        assert_eq!(resources[2]["resource"]["details"]["min"], 200);
+        // The managed entity group member carries the compiled id text.
         assert_eq!(
             resources[3]["resource"]["resource_type"],
-            "oem_nvidia_system_profile_file"
+            "oem_nvidia_managed_entity_group"
         );
         assert_eq!(
-            resources[3]["source"]["odata_id"],
-            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+            resources[3]["resource"]["details"]["current_managed_entity_id"],
+            "BF1"
         );
-        assert_eq!(
-            resources[3]["resource"]["details"]["metadata_origin_profile_uuid"],
-            "11111111-2222-3333-4444-555555555555"
-        );
-        assert_eq!(
-            resources[3]["resource"]["details"]["profile"],
-            "eyJwcm9maWxlIjogInRlc3QifQ=="
-        );
+        // The managed entity member carries the compiled scalar fields.
         assert_eq!(
             resources[4]["resource"]["resource_type"],
-            "oem_nvidia_system_config_profile_status"
+            "oem_nvidia_managed_entity"
         );
         assert_eq!(
             resources[4]["source"]["odata_id"],
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["transport_protocol"],
+            "HTTPS"
+        );
+        assert_eq!(
+            resources[4]["resource"]["details"]["ipv4_address"],
+            "192.0.2.10"
+        );
+        assert_eq!(resources[4]["resource"]["details"]["port"], 443);
+        // The PSU redundancy singleton carries the compiled scalar fields.
+        assert_eq!(
+            resources[5]["resource"]["resource_type"],
+            "oem_nvidia_psu_redundancy"
+        );
+        assert_eq!(
+            resources[5]["resource"]["details"]["redundancy_setting"],
+            "NPlusOne"
+        );
+        // A power domain member carries the compiled scalar fields.
+        assert_eq!(
+            resources[6]["resource"]["resource_type"],
+            "oem_nvidia_power_domain"
+        );
+        assert_eq!(resources[6]["resource"]["details"]["type"], "Above");
+        assert_eq!(resources[6]["resource"]["details"]["value"], 800);
+        // The power state group carries the compiled scalar fields.
+        assert_eq!(
+            resources[7]["resource"]["resource_type"],
+            "oem_nvidia_power_state_group"
+        );
+        assert_eq!(resources[7]["resource"]["details"]["generated_watts"], 2400);
+        // A PSC state member carries the compiled scalar fields.
+        assert_eq!(
+            resources[8]["resource"]["resource_type"],
+            "oem_nvidia_psc_state"
+        );
+        assert_eq!(resources[8]["resource"]["details"]["status"], "Operational");
+        // A PSU state member carries the compiled scalar fields.
+        assert_eq!(
+            resources[9]["resource"]["resource_type"],
+            "oem_nvidia_psu_state"
+        );
+        assert_eq!(resources[9]["resource"]["details"]["presence"], true);
+        // The system-config-profile chain follows the manager chain.
+        assert_eq!(
+            resources[10]["resource"]["resource_type"],
+            "oem_nvidia_system_config_profile"
+        );
+        assert_eq!(
+            resources[10]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+        );
+        assert_eq!(
+            resources[10]["common"]["name"],
+            "NVIDIA System Config Profile"
+        );
+        assert_eq!(
+            resources[10]["resource"]["details"]["truststore"]["nvidia_certificates"],
+            true
+        );
+        assert_eq!(
+            resources[10]["resource"]["details"]["truststore"]["oem_certificates"],
+            false
+        );
+        assert_eq!(
+            resources[11]["resource"]["resource_type"],
+            "oem_nvidia_system_profile"
+        );
+        assert_eq!(
+            resources[11]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1"
+        );
+        assert_eq!(resources[11]["resource"]["details"]["owner"], "Nvidia");
+        assert_eq!(resources[11]["resource"]["details"]["version"], 1);
+        assert_eq!(
+            resources[12]["resource"]["resource_type"],
+            "oem_nvidia_system_profile_file"
+        );
+        assert_eq!(
+            resources[12]["source"]["odata_id"],
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1/ProfileFile"
+        );
+        assert_eq!(
+            resources[12]["resource"]["details"]["metadata_origin_profile_uuid"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(
+            resources[12]["resource"]["details"]["profile"],
+            "eyJwcm9maWxlIjogInRlc3QifQ=="
+        );
+        assert_eq!(
+            resources[13]["resource"]["resource_type"],
+            "oem_nvidia_system_config_profile_status"
+        );
+        assert_eq!(
+            resources[13]["source"]["odata_id"],
             "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status"
         );
         assert_eq!(
-            resources[4]["resource"]["details"]["pending_list_activation"],
+            resources[13]["resource"]["details"]["pending_list_activation"],
             "profile-1"
         );
         assert_eq!(
-            resources[4]["resource"]["details"]["active_profile_index"],
+            resources[13]["resource"]["details"]["active_profile_index"],
             1
         );
         Ok(())
@@ -4745,6 +5264,171 @@ mod tests {
         Ok(())
     }
 
+    /// Every batch route maps an unavailable services bundle to a `503` that
+    /// is never cached, exactly like the operation routes.
+    #[tokio::test]
+    async fn batch_routes_report_unavailable_services() -> Result<(), Box<dyn Error>> {
+        let router = test_router();
+
+        let listed = router
+            .clone()
+            .oneshot(Request::get("/api/v1/batches").body(Body::empty())?)
+            .await?;
+        assert_eq!(listed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            listed.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+
+        let detailed = router
+            .oneshot(
+                Request::get(format!("/api/v1/batches/{}", BatchOperationId::generate()))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detailed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            detailed.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        Ok(())
+    }
+
+    /// The §13.7 routes project the server-derived verdict and buckets: the
+    /// listing carries each batch's derived state and outcome counts, and the
+    /// detail adds every child in target order. The route never derives a
+    /// batch fact itself.
+    // The walk covers the listing, the detail, and both error statuses, so
+    // the line count is the coverage.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn batch_routes_project_derived_states_and_outcome_buckets() -> Result<(), Box<dyn Error>>
+    {
+        let store = BatchTestStore::working();
+        let base = OffsetDateTime::UNIX_EPOCH;
+        // A finished batch: one classified failure, one ordinary failure, two
+        // successes — derived `failed` with the unsupported bucket separated.
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle));
+        let failed_batch = BatchOperation::new(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            command.clone(),
+            base,
+        );
+        store.insert(
+            &failed_batch,
+            &[
+                (
+                    OperationState::Failed,
+                    Some(FailureKind::CapabilityUnsupported),
+                ),
+                (OperationState::Failed, None),
+                (OperationState::Succeeded, None),
+                (OperationState::Succeeded, None),
+            ],
+        )?;
+        // A running batch: one child still queued — the partial sum stays
+        // below total.
+        let running_batch = BatchOperation::new(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            command,
+            base + Duration::SECOND,
+        );
+        store.insert(
+            &running_batch,
+            &[
+                (OperationState::Succeeded, None),
+                (OperationState::Queued, None),
+            ],
+        )?;
+        let router = test_batch_router(store);
+
+        let listed = router
+            .clone()
+            .oneshot(Request::get("/api/v1/batches").body(Body::empty())?)
+            .await?;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let list = json_body(listed).await?;
+        assert_eq!(list["batches"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            list["batches"][0]["batch_id"],
+            failed_batch.id().into_uuid().to_string()
+        );
+        assert_eq!(list["batches"][0]["state"], "failed");
+        assert_eq!(
+            list["batches"][0]["outcomes"],
+            json!({
+                "succeeded": 2,
+                "failed": 1,
+                "unknown": 0,
+                "unsupported": 1,
+                "cancelled": 0,
+                "total": 4
+            })
+        );
+        assert_eq!(
+            list["batches"][1]["batch_id"],
+            running_batch.id().into_uuid().to_string()
+        );
+        assert_eq!(list["batches"][1]["state"], "running");
+        assert_eq!(list["batches"][1]["outcomes"]["total"], 2);
+        assert_eq!(list["batches"][1]["outcomes"]["succeeded"], 1);
+
+        let detailed = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/batches/{}", failed_batch.id()))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detailed.status(), StatusCode::OK);
+        let detail = json_body(detailed).await?;
+        assert_eq!(
+            detail["batch_id"],
+            failed_batch.id().into_uuid().to_string()
+        );
+        assert_eq!(detail["state"], "failed");
+        assert_eq!(detail["children"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            detail["command"],
+            json!({ "System": { "Reset": "PowerCycle" } })
+        );
+        // The children are ordinary operation projections in target order.
+        let child_ids = detail["children"]
+            .as_array()
+            .ok_or("children must be a list")?
+            .iter()
+            .map(|child| {
+                child["operation_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| std::io::Error::other("a child operation id is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sorted = child_ids.clone();
+        sorted.sort();
+        assert_eq!(
+            child_ids, sorted,
+            "the detail must carry the children in target order"
+        );
+
+        // A malformed batch id is a client error; an unknown id is 404.
+        let bad_id = router
+            .clone()
+            .oneshot(Request::get("/api/v1/batches/not-a-uuid").body(Body::empty())?)
+            .await?;
+        assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
+        let unknown = router
+            .oneshot(
+                Request::get(format!("/api/v1/batches/{}", BatchOperationId::generate()))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
     async fn json_body(response: Response) -> Result<Value, Box<dyn Error>> {
         let bytes = response.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&bytes)?)
@@ -4975,6 +5659,12 @@ mod tests {
         )?)
     }
 
+    // The 198-line fixture exceeds the pedantic line budget because it
+    // serves the whole NVIDIA chain surface (the system chain plus the power
+    // chains) in one inventory; the lint is scoped here exactly like the
+    // other fixture builders. The `psc_state` / `psu_state` bindings are two
+    // letters apart, so the similar-names lint is scoped off as well.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn oem_nvidia_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
         let created_at = OffsetDateTime::UNIX_EPOCH;
         let observed_at = created_at + Duration::SECOND;
@@ -5051,9 +5741,138 @@ mod tests {
             "#NvidiaSystemProfileFile.NvidiaSystemProfileFile",
         )?)
         .with_etag(ResourceEtag::parse("W/\"nvidia-profile-file-1\"")?);
+        // The NVIDIA power-compliance chain shares the one
+        // `nvidia-power-compliance` family code; each snapshot payload
+        // carries its `DocumentType` discriminator so the application
+        // boundary routes the snapshot to the right details shape. The
+        // managed-entity chain shares the one `nvidia-managed-entity` family
+        // code under the single `ManagedEntity` document kind.
+        let power_compliance = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+            r#"{"Id":"PowerCompliance","Name":"NVIDIA Power Compliance","Description":"Power compliance manager","DocumentType":"power_compliance_manager","ManagerType":"PowerManager"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPowerComplianceManager.v1_0_0.NvidiaPowerComplianceManager",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-pc-1\"")?);
+        let ac_loss_policy = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+            r#"{"Id":"ACLossPolicy","Name":"AC Loss Policy","Description":"AC loss power policy","DocumentType":"power_policy","AutoDeassertPowerBrake":true,"Min":200,"Max":600,"Type":"Inclusive","Unit":"Watts","PolicyActions":"AssertPowerBrake"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPowerPolicy.v1_0_0.NvidiaPowerPolicy",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-acloss-1\"")?);
+        let entity_group = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+            r#"{"Id":"1","Name":"Managed Entity Group One","Description":"BlueField group","DocumentType":"managed_entity_group","CurrentManagedEntityId":"BF1"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaManagedEntityGroup.v1_0_0.NvidiaManagedEntityGroup",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-group-1\"")?);
+        let managed_entity = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaManagedEntity,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+            r#"{"Id":"1","Name":"Managed Entity One","Description":"BlueField managed entity","DocumentType":"managed_entity","TransportProtocol":"HTTPS","IPv4Address":"192.0.2.10","IPv6Address":"2001:db8::10","Port":443}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaManagedEntity.v1_0_0.NvidiaManagedEntity",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-entity-1\"")?);
+        let redundancy = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+            r#"{"Id":"PSURedundancy","Name":"PSU Redundancy","Description":"PSU redundancy settings","DocumentType":"psu_redundancy","MaxNumSupported":"4","MinNumNeeded":"2","RedundancySetting":"NPlusOne"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPsuRedundancy.v1_0_0.NvidiaPsuRedundancy",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-redundancy-1\"")?);
+        let power_domain = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+            r#"{"Id":"1","Name":"Power Domain One","Description":"Power comparison domain","DocumentType":"power_domain","Value":800,"Type":"Above","Unit":"Watts","SensorReadingType":"Power","SensorImpl":"PhysicalSensor"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPowerDomain.v1_0_0.NvidiaPowerDomain",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-domain-1\"")?);
+        let power_state_group = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+            r#"{"Id":"PowerStateGroup","Name":"Power State Group","Description":"Power shelf state","DocumentType":"power_state_group","PscId":"PSC1","GeneratedWatts":2400,"NumberOfPscs":1,"NumberOfLocalPsus":2}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPowerStateGroup.v1_0_0.NvidiaPowerStateGroup",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-state-group-1\"")?);
+        let psc_state = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+            r#"{"Id":"1","Name":"Power Shelf Controller One","Description":"PSC state","DocumentType":"psc_state","PscId":"PSC1","NumOfOperationalPsus":4,"PowerBrakeAssert":false,"MillisecondsSinceLastHeartbeat":12,"Status":"Operational"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPscState.v1_0_0.NvidiaPscState",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-psc-1\"")?);
+        let psu_state = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemNvidiaPowerCompliance,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+            r#"{"Id":"1","Name":"Power Supply One","Description":"PSU state","DocumentType":"psu_state","PsuId":"PSU1","Presence":true,"Input1Active":true,"Input2Active":false}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#NvidiaPsuState.v1_0_0.NvidiaPsuState",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"nvidia-psu-1\"")?);
         Ok(EndpointInventoryItem::try_new(
             endpoint,
-            vec![root, chain_root, profile, profile_file, status],
+            vec![
+                root,
+                chain_root,
+                profile,
+                profile_file,
+                status,
+                power_compliance,
+                ac_loss_policy,
+                entity_group,
+                managed_entity,
+                redundancy,
+                power_domain,
+                power_state_group,
+                psc_state,
+                psu_state,
+            ],
         )?)
     }
 
@@ -5552,6 +6371,90 @@ mod tests {
     #[derive(Clone)]
     struct UnavailableWriteServices {
         inventory: Result<Vec<EndpointInventoryItem>, MockWriteError>,
+        /// The §13.7 batch store behind the batch routes: `fail` keeps the
+        /// default bundle unavailable (every existing test's expectation),
+        /// while the batch-route tests arm a working in-memory store.
+        batch_store: BatchTestStore,
+    }
+
+    /// In-memory batch store for the §13.7 route tests.
+    ///
+    /// The store holds batch parents and their children exactly like the
+    /// production repository — including the per-child failure kinds — so the
+    /// route tests exercise the real derived-state and bucket projections end
+    /// to end. `fail` mirrors the unavailable-bundle default.
+    #[derive(Clone)]
+    struct BatchTestStore {
+        rows: Arc<Mutex<HashMap<OperationId, Operation>>>,
+        batch_rows: Arc<Mutex<HashMap<BatchOperationId, BatchOperation>>>,
+        batch_children: Arc<Mutex<HashMap<BatchOperationId, Vec<ClassifiedBatchChild>>>>,
+        fail: bool,
+    }
+
+    impl BatchTestStore {
+        fn failing() -> Self {
+            Self::with_failure(true)
+        }
+
+        fn working() -> Self {
+            Self::with_failure(false)
+        }
+
+        fn with_failure(fail: bool) -> Self {
+            Self {
+                rows: Arc::new(Mutex::new(HashMap::new())),
+                batch_rows: Arc::new(Mutex::new(HashMap::new())),
+                batch_children: Arc::new(Mutex::new(HashMap::new())),
+                fail,
+            }
+        }
+
+        /// Inserts one batch with its children at the given states and kinds;
+        /// the batch and the children are stored exactly as the repository
+        /// would persist them.
+        fn insert(
+            &self,
+            batch: &BatchOperation,
+            children: &[(OperationState, Option<FailureKind>)],
+        ) -> Result<(), MockWriteError> {
+            let mut operations = Vec::with_capacity(children.len());
+            for (state, _) in children {
+                let operation = Operation::try_from_parts(
+                    OperationId::generate(),
+                    batch.source(),
+                    vec![OperationTarget::new(
+                        TargetId::generate(),
+                        EndpointId::generate(),
+                    )],
+                    batch.command(),
+                    *state,
+                    batch.created_at(),
+                    batch.created_at() + Duration::SECOND,
+                )
+                .map_err(|_| MockWriteError)?;
+                operations.push(operation);
+            }
+            operations.sort_by_key(|child| child.targets()[0].target_id());
+            self.rows
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .extend(operations.iter().cloned().map(|child| (child.id(), child)));
+            self.batch_rows
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .insert(batch.id(), batch.clone());
+            self.batch_children
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .insert(
+                    batch.id(),
+                    operations
+                        .into_iter()
+                        .zip(children.iter().map(|(_, kind)| *kind))
+                        .collect(),
+                );
+            Ok(())
+        }
     }
 
     /// Every gateway boundary reports a controlled failure so the read-path
@@ -5785,22 +6688,69 @@ mod tests {
             Box::pin(async { Err(MockWriteError) })
         }
 
-        fn find_batch(
+        fn record_failure_kind(
             &self,
-            _batch_id: rutilus_domain::BatchOperationId,
-        ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+            _operation_id: OperationId,
+            _kind: FailureKind,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            // The route tests never classify failures; the executor's refusal
+            // path owns that write, so this stub is unreachable here.
             Box::pin(async { Err(MockWriteError) })
         }
 
+        fn find_batch(
+            &self,
+            batch_id: rutilus_domain::BatchOperationId,
+        ) -> BoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+            let store = self.batch_store.clone();
+            Box::pin(async move {
+                if store.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(store
+                    .batch_rows
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .get(&batch_id)
+                    .cloned())
+            })
+        }
+
         fn list_batches(&self) -> BoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let store = self.batch_store.clone();
+            Box::pin(async move {
+                if store.fail {
+                    return Err(MockWriteError);
+                }
+                let mut batches = store
+                    .batch_rows
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                batches.sort_by_key(|batch| (batch.created_at(), batch.id()));
+                Ok(batches)
+            })
         }
 
         fn list_batch_children(
             &self,
-            _batch_id: rutilus_domain::BatchOperationId,
-        ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            batch_id: rutilus_domain::BatchOperationId,
+        ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+            let store = self.batch_store.clone();
+            Box::pin(async move {
+                if store.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(store
+                    .batch_children
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .get(&batch_id)
+                    .cloned()
+                    .unwrap_or_default())
+            })
         }
     }
 

@@ -27,12 +27,12 @@ use axum::{
 use http_body_util::BodyExt as _;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, EventRepository, OperationStore, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability,
-    TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
+    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReader,
+    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryRepository, EndpointRefreshRepository, EventRepository, OperationStore,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
@@ -285,10 +285,18 @@ impl OperationStore for MockServices {
         Box::pin(async { Err(MockError::Persistence) })
     }
 
+    fn record_failure_kind(
+        &self,
+        _operation_id: OperationId,
+        _kind: rutilus_domain::FailureKind,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
     fn list_batch_children(
         &self,
         _batch_id: rutilus_domain::BatchOperationId,
-    ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         Box::pin(async { Err(MockError::Persistence) })
     }
 }
