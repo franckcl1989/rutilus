@@ -3598,6 +3598,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "uuid",
  "webbrowser",
 ]
 

@@ -61,6 +61,19 @@ pub struct DatabaseSnapshot {
 }
 
 impl DatabaseSnapshot {
+    /// Rebuilds a snapshot from verified entry bytes (restore path).
+    ///
+    /// The caller is responsible for the bytes' provenance — a restore
+    /// supplies the decrypted and digest-verified database entry of an
+    /// authenticated backup package.
+    #[must_use]
+    pub fn from_parts(database: Vec<u8>, wal: Option<Vec<u8>>) -> Self {
+        Self {
+            database,
+            wal: wal.filter(|wal| !wal.is_empty()),
+        }
+    }
+
     /// The consistent main database file bytes.
     #[must_use]
     pub fn database(&self) -> &[u8] {
@@ -118,16 +131,25 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns [`DbErr`] when the applied-migration query fails.
-    pub async fn applied_migration_count(&self) -> Result<u32, DbErr> {
-        let applied = Migrator::get_applied_migrations_read_only(&self.database).await?;
-        u32::try_from(applied.len()).map_err(|_| {
-            DbErr::Custom(format!(
-                "applied migration count {} exceeds the u32 schema version",
-                applied.len()
-            ))
+    /// Returns [`AppliedMigrationsError`] when the applied-migration query
+    /// fails or the count exceeds the `u32` schema-version range.
+    pub async fn applied_migration_count(&self) -> Result<u32, AppliedMigrationsError> {
+        let applied = Migrator::get_applied_migrations_read_only(&self.database)
+            .await
+            .map_err(AppliedMigrationsError::Inspect)?;
+        u32::try_from(applied.len()).map_err(|_| AppliedMigrationsError::Overflow {
+            count: applied.len(),
         })
     }
+}
+
+/// A controlled failure while reading the applied migration count.
+#[derive(Debug, Error)]
+pub enum AppliedMigrationsError {
+    #[error("failed to read the applied migrations: {0}")]
+    Inspect(#[source] DbErr),
+    #[error("applied migration count {count} exceeds the u32 schema-version range")]
+    Overflow { count: usize },
 }
 
 /// Replaces the live database files with one snapshot's bytes.

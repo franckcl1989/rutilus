@@ -5,12 +5,14 @@ use std::{error::Error, io, path::PathBuf};
 use clap::{Args, Parser, Subcommand};
 use console::Term;
 use rutilus::{
-    ListenAddress, SiteRunOptions, StandaloneRunOptions, StandaloneUnlock, console_stop_signal,
-    has_system_master_key, initialize_standalone, rewrap_to_system_unlock,
+    BackupKeyUnlock, ListenAddress, SiteRunOptions, StandaloneRunOptions, StandaloneUnlock,
+    console_stop_signal, has_system_master_key, initialize_standalone, rewrap_to_system_unlock,
     run_initialized_standalone, run_site,
 };
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
-use rutilus_platform::{DataLocation, InstanceMarkerFile, InstanceMarkerState, ServiceArguments};
+use rutilus_platform::{
+    DataLocation, InstanceMarkerFile, InstanceMarkerState, RuntimePaths, ServiceArguments,
+};
 use secrecy::SecretString;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,8 +48,42 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Create or restore one encrypted product backup package.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+    /// Self-check the data directory, database, master key, service, and TLS.
+    Doctor {
+        /// Use the data directory beside the executable.
+        #[arg(long)]
+        portable: bool,
+    },
+    /// Print the third-party licenses of this build.
+    Licenses,
     /// Print the product and upstream development-baseline versions.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Write one encrypted backup package of the stopped instance (§20.1).
+    Create {
+        /// Use the data directory beside the executable.
+        #[arg(long)]
+        portable: bool,
+        /// Write the package to this path instead of the default backups/ directory.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Restore one backup package into the data directory, offline (§20.2).
+    Restore {
+        /// Use the data directory beside the executable.
+        #[arg(long)]
+        portable: bool,
+        /// The backup package file to restore.
+        path: PathBuf,
+    },
 }
 
 /// The 0.6.0 Site flags shared by `run --site` and the service subcommands.
@@ -111,9 +147,92 @@ async fn main() -> Result<(), Box<dyn Error>> {
             site,
         } => run(portable, no_open, site).await?,
         Command::Service { command } => service(command).await?,
+        Command::Backup { command } => backup(command).await?,
+        Command::Doctor { portable } => doctor(portable).await?,
+        Command::Licenses => print_licenses(),
         Command::Version => print_version(),
     }
     Ok(())
+}
+
+async fn backup(command: BackupCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        BackupCommand::Create { portable, output } => {
+            let paths = resolve_location(portable)?;
+            let unlock = prompt_backup_unlock(&paths)?;
+            let outcome = rutilus::create_backup(&paths, &unlock, output.as_deref()).await?;
+            println!(
+                "Backup written to {} ({} entries, schema version {})",
+                outcome.path().display(),
+                outcome.entry_count(),
+                outcome.schema_version()
+            );
+        }
+        BackupCommand::Restore { portable, path } => {
+            let paths = resolve_location(portable)?;
+            let unlock = prompt_backup_unlock(&paths)?;
+            let outcome = rutilus::restore_backup(&paths, &unlock, &path).await?;
+            println!(
+                "Restore complete: {} entries restored; {} pending migrations will apply at the next start",
+                outcome.restored_entries(),
+                outcome.pending_migrations()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The backup commands' unlock: the OS-protected envelope when present,
+/// otherwise the interactive local unlock passphrase.
+fn prompt_backup_unlock(paths: &RuntimePaths) -> Result<BackupKeyUnlock, Box<dyn Error>> {
+    if has_system_master_key(paths) {
+        return Ok(BackupKeyUnlock::System);
+    }
+    let terminal = Term::stderr();
+    let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+    Ok(BackupKeyUnlock::Passphrase(passphrase))
+}
+
+fn resolve_location(portable: bool) -> Result<RuntimePaths, Box<dyn Error>> {
+    let location = if portable {
+        DataLocation::Portable
+    } else {
+        DataLocation::Installed
+    };
+    location
+        .resolve()
+        .map_err(|error| -> Box<dyn Error> { error.into() })
+}
+
+async fn doctor(portable: bool) -> Result<(), Box<dyn Error>> {
+    let location = if portable {
+        DataLocation::Portable
+    } else {
+        DataLocation::Installed
+    };
+    let report = rutilus::run_doctor(location).await;
+    for check in report.checks() {
+        println!(
+            "[{}] {}: {}",
+            check.level().tag(),
+            check.label(),
+            check.detail()
+        );
+    }
+    if report.has_failure() {
+        let failures = report
+            .checks()
+            .iter()
+            .filter(|check| check.level() == rutilus::CheckLevel::Fail)
+            .count();
+        Err(format!("doctor found {failures} failing check(s)").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn print_licenses() {
+    print!("{}", rutilus::licenses_text());
 }
 
 async fn run(portable: bool, no_open: bool, site: Option<SiteArgs>) -> Result<(), Box<dyn Error>> {
@@ -311,7 +430,7 @@ fn print_version() {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ListenAddress, ServiceCommand, SiteArgs};
+    use super::{BackupCommand, Cli, Command, ListenAddress, ServiceCommand, SiteArgs};
 
     #[test]
     fn parses_the_documented_version_subcommand() {
@@ -439,6 +558,79 @@ mod tests {
                 command: Command::Service {
                     command: ServiceCommand::Run { .. }
                 }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_backup_create_and_restore_subcommands() {
+        let create = Cli::try_parse_from([
+            "rutilus",
+            "backup",
+            "create",
+            "--portable",
+            "--output",
+            "backup.rut",
+        ]);
+        assert!(matches!(
+            create,
+            Ok(Cli {
+                command: Command::Backup {
+                    command: BackupCommand::Create {
+                        portable: true,
+                        output: Some(_)
+                    }
+                }
+            })
+        ));
+
+        let default_output = Cli::try_parse_from(["rutilus", "backup", "create"]);
+        assert!(matches!(
+            default_output,
+            Ok(Cli {
+                command: Command::Backup {
+                    command: BackupCommand::Create {
+                        portable: false,
+                        output: None
+                    }
+                }
+            })
+        ));
+
+        let restore = Cli::try_parse_from(["rutilus", "backup", "restore", "backup.rut"]);
+        assert!(matches!(
+            restore,
+            Ok(Cli {
+                command: Command::Backup {
+                    command: BackupCommand::Restore {
+                        portable: false,
+                        path: _
+                    }
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["rutilus", "backup", "restore"]).is_err());
+        assert!(Cli::try_parse_from(["rutilus", "backup"]).is_err());
+    }
+
+    #[test]
+    fn parses_doctor_and_licenses_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["rutilus", "doctor"]),
+            Ok(Cli {
+                command: Command::Doctor { portable: false }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rutilus", "doctor", "--portable"]),
+            Ok(Cli {
+                command: Command::Doctor { portable: true }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["rutilus", "licenses"]),
+            Ok(Cli {
+                command: Command::Licenses
             })
         ));
     }

@@ -338,7 +338,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, SiteTlsError> {
 ///
 /// Returns [`SiteTlsError`] when the file is missing, oversized, or not a
 /// valid PEM certificate.
-fn read_certificate(path: &Path) -> Result<CertificateDer<'static>, SiteTlsError> {
+pub(crate) fn read_certificate(path: &Path) -> Result<CertificateDer<'static>, SiteTlsError> {
     use rustls::pki_types::pem::PemObject as _;
 
     let bytes = read_bounded(path)?;
@@ -545,7 +545,10 @@ fn build_server_config(
 }
 
 /// The SHA-256 fingerprint of one certificate, printed colon-separated.
-fn fingerprint(cert: &CertificateDer<'_>) -> String {
+///
+/// `pub(crate)` so the doctor self-check can report the persisted pair's
+/// fingerprint without re-parsing it.
+pub(crate) fn fingerprint(cert: &CertificateDer<'_>) -> String {
     let digest = Sha256::digest(cert.as_ref());
     digest
         .iter()

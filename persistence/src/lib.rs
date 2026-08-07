@@ -40,11 +40,11 @@ mod telemetry_repository;
 mod totp_repository;
 
 pub use application_adapter::{EndpointInventoryPersistenceError, EndpointRefreshPersistenceError};
-pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError};
+pub use artifact_repository::{ArtifactRepositoryError, StoredArtifactError, artifact_file_path};
 pub use audit_repository::{AuditRepositoryError, StoredAuditEventError};
 pub use backup_snapshot::{
-    DatabaseSnapshot, RestoreCheckError, RestoreCompatibility, RestoreError, SnapshotError,
-    restore_compatibility, restore_database_files,
+    AppliedMigrationsError, DatabaseSnapshot, RestoreCheckError, RestoreCompatibility,
+    RestoreError, SnapshotError, restore_compatibility, restore_database_files,
 };
 pub use bootstrap_repository::{BootstrapRepositoryError, StoredBootstrapCodeError};
 pub use center_binding_repository::{
@@ -314,6 +314,28 @@ fn existing_regular_database(database_path: &Path) -> Result<bool, OpenStoreErro
 }
 
 async fn migrations_are_pending(database_path: &Path) -> Result<bool, OpenStoreError> {
+    Ok(migration_counts(database_path).await?.pending > 0)
+}
+
+/// The applied and pending migration counts of one closed database.
+///
+/// Read-only: the inspection never applies a migration, so a doctor check
+/// can report the migration state without modifying the database.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MigrationCounts {
+    /// Migrations already recorded in the database.
+    pub applied: usize,
+    /// Migrations this binary would apply on the next open.
+    pub pending: usize,
+}
+
+/// Inspects one closed database's migration state read-only.
+///
+/// # Errors
+///
+/// Returns [`OpenStoreError`] when the database cannot be opened read-only
+/// or the migration state cannot be read.
+pub async fn migration_counts(database_path: &Path) -> Result<MigrationCounts, OpenStoreError> {
     let mut options = sqlite_read_only_connect_options(database_path);
     options.sqlx_logging(false);
     let database =
@@ -323,12 +345,20 @@ async fn migrations_are_pending(database_path: &Path) -> Result<bool, OpenStoreE
                 path: database_path.to_path_buf(),
                 source,
             })?;
+    let applied = Migrator::get_applied_migrations_read_only(&database)
+        .await
+        .map_err(|source| OpenStoreError::InspectMigrations {
+            path: database_path.to_path_buf(),
+            source,
+        })?
+        .len();
     let pending = Migrator::get_pending_migrations_read_only(&database)
         .await
         .map_err(|source| OpenStoreError::InspectMigrations {
             path: database_path.to_path_buf(),
             source,
-        })?;
+        })?
+        .len();
     database
         .close()
         .await
@@ -336,7 +366,7 @@ async fn migrations_are_pending(database_path: &Path) -> Result<bool, OpenStoreE
             path: database_path.to_path_buf(),
             source,
         })?;
-    Ok(!pending.is_empty())
+    Ok(MigrationCounts { applied, pending })
 }
 
 pub(crate) fn sqlite_connect_options(

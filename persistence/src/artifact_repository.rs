@@ -296,14 +296,21 @@ impl SqliteStore {
     /// directory first.
     #[must_use]
     pub fn artifact_file_path(&self, artifact_id: ArtifactId) -> PathBuf {
-        let data_directory = self
-            .database_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        data_directory
-            .join(ARTIFACT_DIRECTORY_NAME)
-            .join(format!("{artifact_id}.{ARTIFACT_FILE_EXTENSION}"))
+        artifact_file_path(&self.database_path, artifact_id)
     }
+}
+
+/// The deterministic on-disk location of one artifact's bytes.
+///
+/// A pure function of the database location and the artifact identity, so a
+/// restore can place the artifact files of a backup package back where the
+/// restored database rows expect them.
+#[must_use]
+pub fn artifact_file_path(database_path: &Path, artifact_id: ArtifactId) -> PathBuf {
+    let data_directory = database_path.parent().unwrap_or_else(|| Path::new("."));
+    data_directory
+        .join(ARTIFACT_DIRECTORY_NAME)
+        .join(format!("{artifact_id}.{ARTIFACT_FILE_EXTENSION}"))
 }
 
 fn map_stored_artifact(
