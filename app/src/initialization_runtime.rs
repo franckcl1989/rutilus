@@ -165,14 +165,15 @@ pub async fn initialize_standalone(
 /// The claim flow (§16.2 "首次启动生成一次性 Bootstrap Code") later binds
 /// the code, sets the administrator's first password, and opens the initial
 /// session. The seeding is idempotent — a resumed initialization that
-/// already wrote the rows skips them — and the code is printed to the
-/// terminal exactly when it is generated, because the raw value exists
-/// nowhere else.
+/// already wrote the rows skips them, after verifying the one-time code is
+/// still pending — and the code is printed to the terminal exactly when it
+/// is generated, because the raw value exists nowhere else.
 ///
 /// # Errors
 ///
-/// Returns [`InitializationError`] when the code cannot be generated or any
-/// seeding write fails.
+/// Returns [`InitializationError`] when the code cannot be generated, any
+/// seeding write fails, the pending-code state cannot be inspected, or the
+/// seeded rows are inconsistent (principal without a pending code).
 async fn seed_bootstrap_administrator(store: &SqliteStore) -> Result<(), InitializationError> {
     let admin_name = PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME)
         .map_err(|_| InitializationError::InvalidBootstrapPrincipalName)?;
@@ -182,6 +183,21 @@ async fn seed_bootstrap_administrator(store: &SqliteStore) -> Result<(), Initial
         .map_err(InitializationError::SeedPrincipal)?
         .is_some()
     {
+        // A resumed initialization must leave the first-run claim reachable:
+        // the sign-in gate serves the claim flow only while an unconsumed
+        // bootstrap code exists. A principal without a pending code means an
+        // earlier seeding failed between the principal write and the code
+        // write, and that failure was never surfaced. Refuse to "resume"
+        // silently — the raw code exists nowhere else, so the operator must
+        // repair the store (delete the seeded rows and re-run, or add a
+        // fresh code manually).
+        let pending = store
+            .has_unconsumed_bootstrap_code()
+            .await
+            .map_err(InitializationError::InspectBootstrapCode)?;
+        if !pending {
+            return Err(InitializationError::InconsistentSeeding);
+        }
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
@@ -282,6 +298,12 @@ pub enum InitializationError {
     GenerateBootstrapCode(#[source] BootstrapCodeError),
     #[error("failed to persist the one-time bootstrap code: {0}")]
     SeedBootstrap(#[source] BootstrapRepositoryError),
+    #[error("failed to inspect the pending one-time bootstrap code: {0}")]
+    InspectBootstrapCode(#[source] BootstrapRepositoryError),
+    #[error(
+        "seeding is inconsistent: the built-in administrator exists but no unconsumed bootstrap code remains; delete the seeded rows and re-run initialization, or add a fresh code manually"
+    )]
+    InconsistentSeeding,
 }
 
 #[cfg(test)]
@@ -363,6 +385,70 @@ mod tests {
             initialize_standalone(&paths, &unlock).await,
             Err(InitializationError::AlreadyInitialized)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seeding_fails_when_the_principal_exists_without_a_bootstrap_code(
+    ) -> Result<(), Box<dyn Error>> {
+        // Simulate an earlier seeding that wrote the administrator rows but
+        // failed before the one-time code row could be persisted: the store
+        // must refuse to resume silently, so the initialization surfaces the
+        // inconsistency instead of leaving an instance whose first-run claim
+        // can never succeed.
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("database.sqlite3")).await?;
+        let admin_name = PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME)?;
+        let now = OffsetDateTime::now_utc();
+        let administrator = Principal::new(PrincipalId::generate(), admin_name, now);
+        store.create_principal(&administrator).await?;
+        store
+            .assign_role(&RoleAssignment::new(
+                administrator.id(),
+                Role::Administrator,
+                None,
+                now,
+            ))
+            .await?;
+
+        let result = seed_bootstrap_administrator(&store).await;
+
+        assert!(matches!(
+            result,
+            Err(InitializationError::InconsistentSeeding)
+        ));
+        assert!(
+            !store.has_unconsumed_bootstrap_code().await?,
+            "the failed seeding must not fabricate a code"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("delete the seeded rows"),
+            "the error must point at the manual repair"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seeding_resumes_when_principal_and_code_both_exist() -> Result<(), Box<dyn Error>> {
+        // The resumption path of a seeding that completed both writes (for
+        // example interrupted only at the instance-marker commit) must stay
+        // idempotent and keep the pending code untouched.
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("database.sqlite3")).await?;
+        seed_bootstrap_administrator(&store).await?;
+
+        let resumed = seed_bootstrap_administrator(&store).await;
+
+        assert!(resumed.is_ok());
+        assert!(
+            store.has_unconsumed_bootstrap_code().await?,
+            "the pending code must survive the resumed seeding"
+        );
+        store.close().await?;
         Ok(())
     }
 
