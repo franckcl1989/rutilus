@@ -17,9 +17,10 @@ use rutilus_infra_redfish::{CoreResourceProjection, RedfishGateway, SystemCaStat
 use secrecy::SecretString;
 use time::OffsetDateTime;
 
+use super::fixtures;
 use super::http::HttpMethod;
 use super::route;
-use super::{MockBmc, MockState};
+use super::{MockBmc, MockProfile, MockState};
 
 /// The Mock BMC account; the fixture records any user name, so this is the
 /// value the demo credentials should use.
@@ -211,6 +212,55 @@ fn session_delete_removes_only_the_named_session() {
     );
     assert_eq!(second.status, "204 No Content");
     assert_eq!(state.active_sessions(), 0);
+}
+
+#[test]
+fn dell_profile_swaps_identity_and_serves_attributes_route_only() -> Result<(), Box<dyn Error>> {
+    // The fixture mapping: the Dell profile swaps the Service Root identity
+    // strings and adds the manager `Oem.Dell` segment, while the default
+    // profile documents stay byte-identical (no `Oem` namespace anywhere).
+    let default_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Rutilus))?;
+    assert_eq!(default_root["Vendor"], "Rutilus Test");
+    assert!(default_root.get("Oem").is_none());
+    let dell_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Dell))?;
+    assert_eq!(dell_root["Vendor"], "Dell Inc.");
+    assert_eq!(dell_root["Product"], "PowerEdge R750");
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+    let dell_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Dell))?;
+    assert!(dell_manager["Oem"]["Dell"].is_object());
+
+    // The §11.5 `DellAttributes` route is served only under the Dell profile.
+    let dell_state = MockState::with_profile(MockProfile::Dell);
+    let attributes = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        &[],
+        &dell_state,
+    );
+    assert_eq!(attributes.status, "200 OK");
+    let attributes_body: serde_json::Value = serde_json::from_str(&attributes.body)?;
+    assert_eq!(attributes_body["Id"], "1");
+    assert_eq!(
+        attributes_body["Attributes"]["ServerModel"],
+        "PowerEdge R750"
+    );
+
+    // Under the default profile the same path is a Redfish-shaped 404, so the
+    // default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    let missing = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        &[],
+        &default_state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    Ok(())
 }
 
 #[tokio::test]

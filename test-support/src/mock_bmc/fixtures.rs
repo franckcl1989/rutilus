@@ -16,6 +16,18 @@
 //! definition and one metric report, and `TaskService` with one task). Links
 //! the tree does not serve are omitted entirely, so the capability probe
 //! reports `NotAdvertised` for them instead of guessing paths.
+//!
+//! Vendor profiles (0.5.0) pick among the documents at the profile level:
+//! the default [`super::profile::MockProfile::Rutilus`] tree is exactly the
+//! const set below, while the Dell profile swaps the Service Root identity
+//! strings ([`SERVICE_ROOT_DELL`]), adds the `Oem.Dell` segment to the
+//! manager document ([`MANAGER_DELL`]), and serves the §11.5
+//! `DellAttributes` document ([`DELL_ATTRIBUTES`]); everything else is
+//! shared. [`service_root`] and [`manager`] select the profile-specific
+//! documents, and the route table gates the Dell Attributes route on the
+//! profile, so no vendor surface can leak into another profile.
+
+use super::profile::MockProfile;
 
 /// `GET /redfish/v1` -- the Service Root.
 ///
@@ -33,6 +45,35 @@ pub(crate) const SERVICE_ROOT: &str = r##"{
     "RedfishVersion":"1.20.0",
     "Vendor":"Rutilus Test",
     "Product":"Mock BMC",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1` -- the Service Root of the Dell vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real Dell
+/// iDRAC identifies itself as Vendor "Dell Inc." and carries the `PowerEdge`
+/// model as the product. The navigation surface is byte-identical to
+/// [`SERVICE_ROOT`], and no `Oem` segment is served here because the Dell
+/// namespace lives on the manager document, exactly where `nv-redfish` 0.13
+/// and the gateway's probe look for it.
+pub(crate) const SERVICE_ROOT_DELL: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"Dell Inc.",
+    "Product":"PowerEdge R750",
     "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
     "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
     "Systems":{"@odata.id":"/redfish/v1/Systems"},
@@ -446,6 +487,63 @@ pub(crate) const MANAGER: &str = r#"{
     "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"}
 }"#;
 
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the Dell vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the `Oem.Dell` segment that
+/// advertises the Dell OEM namespace: the capability probe decides
+/// `oem-dell` from the decoded `Oem` keys (§11.3 advertised layer) and the
+/// gateway's §11.5 `DellAttributes` read gates on the literal `Dell` key, so
+/// this one addition switches both layers on. The document mirrors the
+/// `MANAGER_WITH_DELL_OEM_BODY` fixture `rutilus-infra-redfish` decodes in
+/// its own Dell tests.
+pub(crate) const MANAGER_DELL: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{"Dell":{}}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Dell/DellAttributes/1` -- the §11.5 Dell
+/// `DellAttributes` document of the Dell vendor profile.
+///
+/// The document mirrors the `DELL_ATTRIBUTES_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own Dell tests (the typed base
+/// fields `Id`, `Name`, and `Description` plus the identity `Attributes`
+/// bag), so the gateway's typed navigation into the compiled
+/// `DellAttributes` schema succeeds against the mock. The five pinned
+/// identity attributes match the upstream fixture values; the extra
+/// `BiosVersion` bag entry exercises the unprojected-key path, exactly like
+/// the infra fixture.
+pub(crate) const DELL_ATTRIBUTES: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+    "@odata.etag":"W/\"dell-attributes-1\"",
+    "Id":"1",
+    "Name":"Dell Attributes",
+    "Description":"Dell iDRAC attributes",
+    "Attributes":{
+        "ServerModel":"PowerEdge R750",
+        "ServerServiceTag":"ABC1234",
+        "ServerGeneration":"16G",
+        "ServerBmcMacAddress":"14:18:77:aa:bb:cc",
+        "ServerName":"rack-1-server-2",
+        "BiosVersion":"2.14.2"
+    }
+}"#;
+
 /// `GET /redfish/v1/Managers/1/LogServices` -- the log service collection
 /// with the single event-log member.
 pub(crate) const LOG_SERVICES_COLLECTION: &str = r##"{
@@ -823,3 +921,25 @@ pub(crate) const NOT_FOUND: &str = r#"{
         "message":"The resource identified by the request URI was not found."
     }
 }"#;
+
+/// The Service Root document of one vendor profile.
+///
+/// The default profile keeps the byte-identical [`SERVICE_ROOT`]; only the
+/// profile-specific identity strings are swapped in for another vendor.
+pub(crate) fn service_root(profile: MockProfile) -> &'static str {
+    match profile {
+        MockProfile::Rutilus => SERVICE_ROOT,
+        MockProfile::Dell => SERVICE_ROOT_DELL,
+    }
+}
+
+/// The `Managers/1` document of one vendor profile.
+///
+/// The default profile keeps the byte-identical [`MANAGER`]; the Dell
+/// profile adds the `Oem.Dell` segment that advertises its OEM namespace.
+pub(crate) fn manager(profile: MockProfile) -> &'static str {
+    match profile {
+        MockProfile::Rutilus => MANAGER,
+        MockProfile::Dell => MANAGER_DELL,
+    }
+}

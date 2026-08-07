@@ -30,10 +30,11 @@ relevant after the `BmcFactory` abstraction lands.
 cargo run -p rutilus-test-support --bin mock-bmc
 ```
 
-Optional: `--port 8443` to pin a fixed port. The binary prints:
+Optional: `--port 8443` to pin a fixed port, and `--profile dell` to serve
+the Dell vendor profile instead of the default. The binary prints:
 
 ```text
-Rutilus Mock Redfish BMC listening at https://127.0.0.1:64153/
+Rutilus Mock Redfish BMC (profile: rutilus) listening at https://127.0.0.1:64153/
 SHA-256 fingerprint: E6:E8:CA:7E:A3:6C:B7:C7:0B:E0:D8:C8:D0:8C:47:8B:90:2B:97:30:45:BD:C3:C5:9C:61:AC:7E:5E:02:A6:26
 ```
 
@@ -140,6 +141,27 @@ from what the product actually parses. Links the tree does not serve are
 omitted rather than 404'd, so the capability probe reports `NotAdvertised`
 for them instead of classifying a guessed path.
 
+## Vendor profiles
+
+`MockBmc::start()` serves the default Rutilus Test profile;
+`MockBmc::start_with_profile(MockProfile::Dell)` (or `mock-bmc
+--profile dell`) serves the Dell iDRAC profile:
+
+- Default (`MockProfile::Rutilus`): Vendor "Rutilus Test" / Product "Mock
+  BMC", no `Oem` namespace anywhere in the tree, so every §2.1 OEM capability
+  probes `NotAdvertised`.
+- Dell (`MockProfile::Dell`): Vendor "Dell Inc." / Product "PowerEdge R750";
+  `Managers/1` advertises `Oem.Dell` and the mock serves
+  `/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1` with the five pinned
+  identity attributes (ServerModel, ServerServiceTag, ServerGeneration,
+  ServerBmcMacAddress, ServerName), so the gateway's §11.5 Dell Attributes
+  read decodes a real document. Every other document of the tree is shared
+  with the default profile, and the Dell Attributes route 404s under any
+  other profile.
+- The profile enum is the extension point for 0.5.0's xFusion/Inspur
+  standard-pattern verification: a vendor that serves no OEM surface is a new
+  profile variant that only changes the Service Root identity strings.
+
 ## Behavior contract
 
 - **TLS**: loopback HTTPS with a deterministic self-signed RSA-2048 leaf
@@ -182,8 +204,11 @@ Session lifecycle with exact wire-sequence assertions, and refresh.
 
 ### Public API
 
-- `MockBmc::start()` / `MockBmc::bind(port)` -- bind and serve in the
-  background; `stop()` shuts down and releases the port.
+- `MockBmc::start()` / `MockBmc::bind(port)` -- bind and serve the default
+  profile in the background; `MockBmc::start_with_profile(profile)` /
+  `MockBmc::bind_with_profile(port, profile)` serve a vendor profile
+  (`MockProfile::Rutilus` | `MockProfile::Dell`); `stop()` shuts down and
+  releases the port.
 - `MockBmc::endpoint_address()` / `url()` -- the endpoint to enroll.
 - `MockBmc::fingerprint()` / `fingerprint_text()` / `certificate_der()` --
   the TLS identity for trust construction and Pin assertions.

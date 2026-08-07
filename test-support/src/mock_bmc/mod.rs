@@ -10,6 +10,8 @@
 //!
 //! - [`tls`]: the deterministic self-signed leaf identity (fixed key, CN,
 //!   serial, and validity), plus the SHA-256 fingerprint exposure.
+//! - [`profile`]: the vendor fixture profiles ([`MockProfile`]) the mock can
+//!   serve, fixing the Service Root identity and the served `Oem` surface.
 //! - [`fixtures`]: the static Redfish JSON documents of the fixture tree.
 //! - [`http`]: minimal HTTP/1.1 request parsing and response rendering.
 //! - [`route`]: method/path dispatch, Session creation/deletion ledger.
@@ -20,10 +22,12 @@
 
 mod fixtures;
 mod http;
+mod profile;
 mod route;
 mod tls;
 
 pub use http::RequestRecord;
+pub use profile::MockProfile;
 pub use tls::{MockTlsIdentity, MockTlsIdentityError};
 
 use std::{
@@ -80,7 +84,9 @@ impl MockBmc {
     ///
     /// The listener accepts only IPv4 loopback connections, and the served
     /// certificate is the deterministic [`MockTlsIdentity`], so the
-    /// fingerprint is the same on every run.
+    /// fingerprint is the same on every run. The default
+    /// [`MockProfile::Rutilus`] fixture tree is served; use
+    /// [`MockBmc::bind_with_profile`] for a vendor profile.
     ///
     /// # Errors
     ///
@@ -89,6 +95,17 @@ impl MockBmc {
     /// configuration cannot be built, or the local address cannot be
     /// projected into an [`EndpointAddress`].
     pub async fn bind(port: u16) -> Result<Self, MockBmcError> {
+        Self::bind_with_profile(port, MockProfile::Rutilus).await
+    }
+
+    /// Binds the Mock BMC to the requested loopback port (`0` selects a
+    /// free ephemeral port), serving the given vendor [`MockProfile`]
+    /// fixture tree.
+    ///
+    /// # Errors
+    ///
+    /// See [`MockBmc::bind`].
+    pub async fn bind_with_profile(port: u16, profile: MockProfile) -> Result<Self, MockBmcError> {
         let identity = MockTlsIdentity::generate()?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
             .await
@@ -96,7 +113,7 @@ impl MockBmc {
         let socket = listener.local_addr().map_err(MockBmcError::LocalAddress)?;
         let config = identity.server_config()?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
-        let state = Arc::new(MockState::new());
+        let state = Arc::new(MockState::with_profile(profile));
         let (stop, receiver) = watch::channel(false);
         let task = tokio::spawn(serve_loop(listener, acceptor, Arc::clone(&state), receiver));
         Ok(Self {
@@ -114,7 +131,17 @@ impl MockBmc {
     ///
     /// See [`MockBmc::bind`].
     pub async fn start() -> Result<Self, MockBmcError> {
-        Self::bind(0).await
+        Self::start_with_profile(MockProfile::Rutilus).await
+    }
+
+    /// Starts the Mock BMC on a free ephemeral loopback port, serving the
+    /// given vendor [`MockProfile`] fixture tree.
+    ///
+    /// # Errors
+    ///
+    /// See [`MockBmc::bind`].
+    pub async fn start_with_profile(profile: MockProfile) -> Result<Self, MockBmcError> {
+        Self::bind_with_profile(0, profile).await
     }
 
     /// Returns the endpoint address the product can enroll
@@ -226,18 +253,34 @@ pub enum MockBmcError {
 
 /// Shared state between the serve loop and the [`MockBmc`] handle.
 pub(crate) struct MockState {
+    profile: MockProfile,
     ledger: Mutex<SessionLedger>,
     requests_served: AtomicU64,
     records: Mutex<Vec<RequestRecord>>,
 }
 
 impl MockState {
+    /// Builds the mock state for the default [`MockProfile::Rutilus`] tree.
     fn new() -> Self {
+        Self::with_profile(MockProfile::Rutilus)
+    }
+
+    /// Builds the mock state for one vendor profile; the profile fixes the
+    /// fixture documents the route table serves and never changes after
+    /// bind.
+    fn with_profile(profile: MockProfile) -> Self {
         Self {
+            profile,
             ledger: Mutex::new(SessionLedger::new()),
             requests_served: AtomicU64::new(0),
             records: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The vendor profile this mock serves; the route table selects the
+    /// profile-specific fixture documents from it.
+    pub(crate) fn profile(&self) -> MockProfile {
+        self.profile
     }
 
     fn record_request(&self, method: &str, target: &str, headers: Vec<(String, String)>) {

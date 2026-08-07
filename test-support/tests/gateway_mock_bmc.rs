@@ -4,8 +4,9 @@
 //! Mock BMC, proving the §19.1 Mock-BMC test layer through public APIs only:
 //! trust-first onboarding of the mock's self-signed identity, the Service
 //! Root read, the complete 44-capability probe (30 standard §2.1 features and
-//! 14 OEM features), the typed core resource read, and the Session
-//! create/delete lifecycle.
+//! 14 OEM features), the typed core resource read, the Session create/delete
+//! lifecycle, and the 0.5.0 vendor profiles (the Dell profile's `oem-dell`
+//! probe states and its §11.5 `DellAttributes` snapshot).
 //!
 //! Every test starts its own `MockBmc` on an ephemeral port, so the suite is
 //! self-contained: it needs no manual setup, no fixture files, and no
@@ -19,7 +20,7 @@ use rutilus_domain::{
     ResourceFeature, TlsTrust,
 };
 use rutilus_infra_redfish::{CoreResourceProjection, RedfishGateway, SystemCaStatus};
-use rutilus_test_support::{MockBmc, RequestRecord};
+use rutilus_test_support::{MockBmc, MockProfile, RequestRecord};
 use secrecy::SecretString;
 use time::OffsetDateTime;
 
@@ -604,6 +605,204 @@ fn assert_projection_payload(
         expected,
         "{} payload field {field}",
         projection.odata_id()
+    );
+    Ok(())
+}
+
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the Dell profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides `oem-dell` from the
+/// already-decoded manager member and never probes a vendor URL.
+const DELL_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the Dell profile: the 51 requests of the default profile plus the
+/// single §11.5 `DellAttributes` fetch.
+const DELL_RESOURCE_READ_REQUEST_COUNT: u64 = 52;
+
+#[tokio::test]
+async fn dell_profile_probes_oem_dell_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Dell).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile: a vendor profile only swaps the identity
+    // strings and the OEM surface, never the standard tree.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The Dell profile advertises exactly the Dell namespace: the decoded
+    // manager member carries `Oem.Dell`, so `oem-dell` and its
+    // `oem-dell-attributes` sub-feature probe `Supported`; no other vendor
+    // namespace is served, so every remaining OEM capability stays
+    // `NotAdvertised` (§11.3 advertised layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemDell | EndpointCapability::OemDellAttributes => {
+                CapabilityState::Supported
+            }
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("Dell Inc."),
+        "the probe must carry the Dell Service Root identity"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        DELL_PROBE_REQUEST_COUNT,
+        "the Dell namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete Dell read surface is asserted in one test so the request
+// position and the 29-resource order stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint
+// on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn dell_profile_reads_oem_dell_attributes_snapshot() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Dell).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The Dell read surface adds exactly the §11.5 `DellAttributes` snapshot
+    // to the default 28-resource tree, in the documented read order: it is
+    // one manager surface, projected right after the manager's
+    // `HostInterfaces` member and before the root-level `Accounts` family.
+    assert_eq!(resources.len(), 29);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::OemDell,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The `DellAttributes` snapshot carries the manager's `Oem.Dell` surface:
+    // the crafted `{manager}/Oem/Dell/DellAttributes/{id}` identity, its
+    // upstream ETag, and the five pinned identity attributes exactly as
+    // published; the unpinned `BiosVersion` bag entry stays out of the
+    // strictly projectable field set.
+    let dell = &resources[19];
+    assert_eq!(dell.feature(), ResourceFeature::OemDell);
+    assert_eq!(
+        dell.odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1"
+    );
+    assert!(
+        dell.etag().is_some(),
+        "{} must carry its upstream ETag",
+        dell.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(dell.payload().as_str())?;
+    assert_eq!(payload["Id"], "1");
+    assert_eq!(payload["Name"], "Dell Attributes");
+    assert_eq!(payload["Description"], "Dell iDRAC attributes");
+    assert_eq!(payload["ServerModel"], "PowerEdge R750");
+    assert_eq!(payload["ServerServiceTag"], "ABC1234");
+    assert_eq!(payload["ServerGeneration"], "16G");
+    assert_eq!(payload["ServerBmcMacAddress"], "14:18:77:aa:bb:cc");
+    assert_eq!(payload["ServerName"], "rack-1-server-2");
+    assert!(
+        payload.get("BiosVersion").is_none(),
+        "the unpinned attribute bag entry must not leak into the snapshot"
+    );
+
+    // The gateway fetches the `DellAttributes` document exactly once, as one
+    // manager surface right after the `HostInterfaces/1` member, and through
+    // the Session token transport like every other read.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        DELL_RESOURCE_READ_REQUEST_COUNT,
+        "the Dell read must issue exactly one request beyond the default flow"
+    );
+    let host_interface_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/HostInterfaces/1")
+        .ok_or_else(|| io::Error::other("HostInterfaces/1 is missing from the request log"))?;
+    let dell_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1")
+        .ok_or_else(|| {
+            io::Error::other("the Dell Attributes fetch is missing from the request log")
+        })?;
+    assert_eq!(
+        dell_index,
+        host_interface_index + 1,
+        "the Dell Attributes fetch must follow the manager's HostInterfaces member"
+    );
+    assert_eq!(
+        requests[dell_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the Dell Attributes fetch must authenticate with the Session token"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
     );
     Ok(())
 }

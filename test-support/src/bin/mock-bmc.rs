@@ -11,7 +11,7 @@
 use std::error::Error;
 
 use clap::Parser;
-use rutilus_test_support::MockBmc;
+use rutilus_test_support::{MockBmc, MockProfile};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -22,13 +22,29 @@ struct Cli {
     /// Loopback TCP port to listen on; 0 (the default) selects a free port.
     #[arg(long, default_value_t = 0)]
     port: u16,
+
+    /// Vendor fixture profile to serve: `rutilus` (the default, no vendor
+    /// `Oem` namespace) or `dell` (Dell identity plus the §11.5
+    /// `DellAttributes` surface).
+    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell"])]
+    profile: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let mock = MockBmc::bind(cli.port).await?;
-    println!("Rutilus Mock Redfish BMC listening at {}", mock.url());
+    // `clap` restricts the value to the two documented names, so any other
+    // spelling falls back to the default profile.
+    let profile = match cli.profile.as_str() {
+        "dell" => MockProfile::Dell,
+        _ => MockProfile::Rutilus,
+    };
+    let mock = MockBmc::bind_with_profile(cli.port, profile).await?;
+    println!(
+        "Rutilus Mock Redfish BMC (profile: {}) listening at {}",
+        profile.name(),
+        mock.url()
+    );
     println!("SHA-256 fingerprint: {}", mock.fingerprint_text());
     println!("Pin this fingerprint when Rutilus asks for the TLS identity.");
     println!("Press Ctrl-C to stop the mock.");

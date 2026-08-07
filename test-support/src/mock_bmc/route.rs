@@ -5,13 +5,17 @@
 //! any network. The Session ledger is the only mutable resource state: the
 //! product creates one transient Session per operation and deletes it before
 //! returning, which the ledger records and the [`MockBmc::active_sessions`]
-//! accessor exposes.
+//! accessor exposes. The vendor profile (0.5.0) selects the profile-specific
+//! fixture documents, and the vendor `Oem` routes are gated on it: the Dell
+//! Attributes surface exists only under the Dell profile, so no vendor
+//! namespace can leak into another profile's tree.
 
 use serde_json::Value;
 
 use super::MockState;
 use super::fixtures;
 use super::http::{HttpMethod, HttpResponse};
+use super::profile::MockProfile;
 
 /// The path prefix of one Session resource inside the Session collection.
 const SESSIONS_PREFIX: &str = "/redfish/v1/SessionService/Sessions/";
@@ -46,7 +50,7 @@ pub(crate) fn dispatch(
 ) -> HttpResponse {
     let path = target.trim_end_matches('/');
     match (method, path) {
-        (HttpMethod::Get, "/redfish/v1") => json_ok(fixtures::SERVICE_ROOT),
+        (HttpMethod::Get, "/redfish/v1") => json_ok(fixtures::service_root(state.profile())),
         (HttpMethod::Get, "/redfish/v1/SessionService") => json_ok(fixtures::SESSION_SERVICE),
         (HttpMethod::Get, "/redfish/v1/SessionService/Sessions") => sessions_collection(state),
         (HttpMethod::Post, "/redfish/v1/SessionService/Sessions") => create_session(body, state),
@@ -108,7 +112,15 @@ pub(crate) fn dispatch(
             json_ok(fixtures::ASSEMBLY_FAN)
         }
         (HttpMethod::Get, "/redfish/v1/Managers") => json_ok(fixtures::MANAGERS_COLLECTION),
-        (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::MANAGER),
+        (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::manager(state.profile())),
+        // The §11.5 `DellAttributes` leaf is a vendor fixture: it exists only
+        // under the Dell profile, and any other profile must 404 it like any
+        // unserved path instead of leaking a vendor namespace.
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1")
+            if state.profile() == MockProfile::Dell =>
+        {
+            json_ok(fixtures::DELL_ATTRIBUTES)
+        }
         (HttpMethod::Get, "/redfish/v1/Managers/1/LogServices") => {
             json_ok(fixtures::LOG_SERVICES_COLLECTION)
         }

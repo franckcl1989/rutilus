@@ -28,6 +28,16 @@
 //! and it tracks its Session ledger ([`MockBmc::active_sessions`]) so a test
 //! can prove the product's transient Sessions are cleaned up.
 //!
+//! The fixture tree is selected by vendor profile ([`MockProfile`]):
+//! [`MockBmc::start`] serves the default `Rutilus` tree (Vendor "Rutilus
+//! Test", no `Oem` namespace anywhere), while [`MockBmc::start_with_profile`]
+//! swaps in a vendor tree -- the `Dell` profile serves the §11.5
+//! `DellAttributes` surface behind the manager's `Oem.Dell` segment, and a
+//! vendor that serves no OEM surface is a new profile variant that only
+//! changes the identity strings (the 0.5.0 xFusion/Inspur standard-pattern
+//! basis). Vendor-standard integration tests can therefore drive a realistic
+//! vendor identity instead of the generic fixture.
+//!
 //! # Demo flow
 //!
 //! ```text
@@ -84,4 +94,6 @@
 
 mod mock_bmc;
 
-pub use mock_bmc::{MockBmc, MockBmcError, MockTlsIdentity, MockTlsIdentityError, RequestRecord};
+pub use mock_bmc::{
+    MockBmc, MockBmcError, MockProfile, MockTlsIdentity, MockTlsIdentityError, RequestRecord,
+};
