@@ -98,6 +98,14 @@ impl SqliteStore {
     /// before and after the main file and the copy retries (bounded) until
     /// both reads agree.
     ///
+    /// The race window is narrow: while the gate is held no writer can
+    /// commit, so the WAL cannot grow and no automatic checkpoint can be
+    /// scheduled — only a passive checkpoint already in flight can still
+    /// move frames mid-copy. `SQLite` moves whole 4 `KiB`-aligned pages, so
+    /// the before/after comparison always pairs the main file with a
+    /// complete pre- or post-checkpoint WAL, never a torn mixture, and the
+    /// bounded retry absorbs the window.
+    ///
     /// # Errors
     ///
     /// Returns [`SnapshotError`] when write coordination is unavailable, a
