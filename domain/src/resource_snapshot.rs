@@ -39,6 +39,28 @@ pub enum ResourceFeature {
     /// not be mistaken for a capability code (see the ledger-consistency
     /// test).
     OemDell,
+    /// The §2.1 `oem-supermicro` read surface, added as a typed resource
+    /// family in the 0.5 slice. The family reads the manager-scoped Supermicro
+    /// `SysLockdown` document through the `Supermicro` OEM namespace. The
+    /// family code is `supermicro-sys-lockdown` (not `oem-supermicro`, which
+    /// stays the namespace capability code, and not `oem-supermicro-sys-lockdown`,
+    /// which stays unallocated in the capability space): the one
+    /// `oem-supermicro` capability covers the namespace advertisement that
+    /// precedes the read, so this variant addresses only the read surface and
+    /// must not be mistaken for a capability code (see the ledger-consistency
+    /// test).
+    OemSmcSysLockdown,
+    /// The §2.1 `oem-supermicro` read surface, added as a typed resource
+    /// family in the 0.5 slice. The family reads the manager-scoped Supermicro
+    /// `KCSInterface` document through the `Supermicro` OEM namespace. The
+    /// family code is `supermicro-kcs-interface` (not `oem-supermicro`, which
+    /// stays the namespace capability code, and not
+    /// `oem-supermicro-kcs-interface`, which stays unallocated in the
+    /// capability space): the one `oem-supermicro` capability covers the
+    /// namespace advertisement that precedes the read, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code (see the ledger-consistency test).
+    OemSmcKcsInterface,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -175,6 +197,8 @@ impl ResourceFeature {
             Self::Chassis => "chassis",
             Self::Managers => "managers",
             Self::OemDell => "dell-attributes",
+            Self::OemSmcSysLockdown => "supermicro-sys-lockdown",
+            Self::OemSmcKcsInterface => "supermicro-kcs-interface",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
@@ -221,6 +245,8 @@ impl FromStr for ResourceFeature {
             "chassis" => Ok(Self::Chassis),
             "managers" => Ok(Self::Managers),
             "dell-attributes" => Ok(Self::OemDell),
+            "supermicro-sys-lockdown" => Ok(Self::OemSmcSysLockdown),
+            "supermicro-kcs-interface" => Ok(Self::OemSmcKcsInterface),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
@@ -787,6 +813,8 @@ mod tests {
             ResourceFeature::Chassis,
             ResourceFeature::Managers,
             ResourceFeature::OemDell,
+            ResourceFeature::OemSmcSysLockdown,
+            ResourceFeature::OemSmcKcsInterface,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
@@ -970,6 +998,21 @@ mod tests {
                 ResourceFeature::OemDell,
                 EndpointCapability::OemDellAttributes,
             ),
+            // The 0.5 Supermicro families follow the same precedent: each
+            // family reads one manager document inside the `Supermicro`
+            // namespace, so both map to the `oem-supermicro` namespace
+            // capability (the feature that advertises that namespace) under
+            // the narrower family codes `supermicro-sys-lockdown` and
+            // `supermicro-kcs-interface` — never the `oem-supermicro`
+            // capability code, which stays with the ledger.
+            (
+                ResourceFeature::OemSmcSysLockdown,
+                EndpointCapability::OemSupermicro,
+            ),
+            (
+                ResourceFeature::OemSmcKcsInterface,
+                EndpointCapability::OemSupermicro,
+            ),
         ];
         for (feature, capability) in subsidiary {
             assert_ne!(feature.as_str(), capability.as_str());
@@ -1012,6 +1055,44 @@ mod tests {
         assert_eq!(
             "oem-dell-attributes".parse::<EndpointCapability>(),
             Ok(EndpointCapability::OemDellAttributes)
+        );
+        // The 0.5 Supermicro families keep their narrow
+        // `supermicro-sys-lockdown` / `supermicro-kcs-interface` codes; the
+        // `oem-supermicro` namespace capability stays with the ledger, so the
+        // snapshot and capability inventories cannot silently drift into
+        // aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemSmcSysLockdown.as_str(),
+            "supermicro-sys-lockdown"
+        );
+        assert_eq!(
+            ResourceFeature::OemSmcKcsInterface.as_str(),
+            "supermicro-kcs-interface"
+        );
+        assert_eq!(EndpointCapability::OemSupermicro.as_str(), "oem-supermicro");
+        assert_eq!(
+            "supermicro-sys-lockdown".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemSmcSysLockdown)
+        );
+        assert_eq!(
+            "supermicro-sys-lockdown".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "supermicro-kcs-interface".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemSmcKcsInterface)
+        );
+        assert_eq!(
+            "supermicro-kcs-interface".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-supermicro".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemSupermicro)
+        );
+        assert_eq!(
+            "oem-supermicro".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
         );
     }
 
@@ -1095,6 +1176,29 @@ mod tests {
             "oem-dell",
             "oem-dell-attribute",
             "oem-dell-attributes",
+            // The 0.5 Supermicro families: singular and snake_case forms
+            // would address a different surface, the vendor-less names would
+            // collide with the product's vendor-prefixed family space, and
+            // the `oem-supermicro` capability code (plus its hypothetical
+            // per-document extensions) must stay unparseable as families so
+            // the ledger and the snapshot inventory never alias.
+            "supermicro-sys-lockdown/",
+            "supermicro_sys_lockdown",
+            "supermicrosyslockdown",
+            "sys-lockdown",
+            "sys_lockdown",
+            "SysLockdown",
+            "smc-sys-lockdown",
+            "oem-supermicro-sys-lockdown",
+            "supermicro-kcs-interface/",
+            "supermicro_kcs_interface",
+            "supermicrokcsinterface",
+            "kcs-interface",
+            "kcs_interface",
+            "KCSInterface",
+            "smc-kcs-interface",
+            "oem-supermicro-kcs-interface",
+            "oem-supermicro",
             "host-interface",
             "host-interfaces/",
             "hostinterface",
