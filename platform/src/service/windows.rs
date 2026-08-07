@@ -34,12 +34,12 @@ use windows_sys::Win32::{
     System::Services::{
         ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
         OpenSCManagerW, OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_HANDLE,
-        SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
-        SERVICE_AUTO_START, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN,
-        SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_RUNNING, SERVICE_START_PENDING,
-        SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-        SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
-        StartServiceCtrlDispatcherW, StartServiceW,
+        SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+        SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_INTERROGATE,
+        SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
+        SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+        SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+        SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
     },
 };
 use windows_sys::core::PWSTR;
@@ -462,6 +462,35 @@ pub(super) fn uninstall_service() -> Result<(), super::ServiceUninstallError> {
         }
     }
     Ok(())
+}
+
+/// Reports whether the product service is registered with the SCM.
+///
+/// The query opens the SCM read-only (`SC_MANAGER_CONNECT`) and the service
+/// with `SERVICE_QUERY_STATUS` only, so the doctor check never requires
+/// administrative privileges.
+pub(super) fn query_service_status() -> Result<super::ServiceStatus, super::ServiceStatusError> {
+    use super::{ServiceStatus, ServiceStatusError};
+
+    let service_name = encode_wide(SERVICE_NAME);
+    unsafe {
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return Err(ServiceStatusError::Scm(scm_error()));
+        }
+        let service = OpenServiceW(manager, service_name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let code = GetLastError();
+            CloseServiceHandle(manager);
+            if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(ServiceStatus::NotInstalled);
+            }
+            return Err(ServiceStatusError::Scm(os_error(code)));
+        }
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        Ok(ServiceStatus::Installed)
+    }
 }
 
 /// Stops one running service and waits for its STOPPED state, tolerating a

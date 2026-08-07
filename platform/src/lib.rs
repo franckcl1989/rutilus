@@ -16,8 +16,8 @@ pub use master_key_file::{MasterKeyFile, MasterKeyFileError};
 pub use runtime_lock::{RuntimeLock, RuntimeLockError};
 pub use runtime_paths::{DataLocation, DataPathError, RuntimePaths};
 pub use service::{
-    ServiceArguments, ServiceArgumentsError, ServiceInstallError, ServiceUninstallError, install,
-    uninstall,
+    ServiceArguments, ServiceArgumentsError, ServiceInstallError, ServiceStatus,
+    ServiceStatusError, ServiceUninstallError, install, service_status, uninstall,
 };
 pub use system_master_key_file::{SystemMasterKeyFile, SystemMasterKeyFileError};
 pub use system_secret_store::{SystemSecretStore, SystemSecretStoreError, UnlockSource};

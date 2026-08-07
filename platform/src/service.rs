@@ -313,6 +313,43 @@ pub fn uninstall() -> Result<(), ServiceUninstallError> {
     platform_uninstall()
 }
 
+/// Whether the product service is currently registered with the platform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStatus {
+    /// The service is registered (Windows SCM entry, launchd agent, or
+    /// systemd user unit).
+    Installed,
+    /// No service registration exists.
+    NotInstalled,
+    /// This platform has no supported service manager.
+    UnsupportedPlatform,
+}
+
+/// Reports the registration state of the product system service.
+///
+/// The durable registration artifact is the source of truth, mirroring
+/// [`install`] and [`uninstall`]: the Windows SCM service entry, the launchd
+/// agent plist, or the systemd user unit file.
+///
+/// # Errors
+///
+/// Returns [`ServiceStatusError`] when the platform's service manager
+/// cannot be queried.
+pub fn service_status() -> Result<ServiceStatus, ServiceStatusError> {
+    platform_service_status()
+}
+
+/// A controlled failure while querying the system-service registration.
+#[derive(Debug, Error)]
+pub enum ServiceStatusError {
+    #[cfg(windows)]
+    #[error("the Windows service manager refused the status query: {0}")]
+    Scm(#[source] std::io::Error),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[error("the service registration directory is unavailable (no HOME)")]
+    HomeUnavailable,
+}
+
 #[cfg(windows)]
 fn platform_install(
     arguments: &ServiceArguments,
@@ -325,6 +362,11 @@ fn platform_install(
 #[cfg(windows)]
 fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     windows::uninstall_service()
+}
+
+#[cfg(windows)]
+fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
+    windows::query_service_status()
 }
 
 #[cfg(target_os = "macos")]
@@ -385,6 +427,20 @@ fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     std::fs::remove_file(&plist).map_err(|source| ServiceUninstallError::Plist {
         path: plist,
         source,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
+    let home = std::env::var_os("HOME").ok_or(ServiceStatusError::HomeUnavailable)?;
+    let plist = PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+    Ok(if plist.is_file() {
+        ServiceStatus::Installed
+    } else {
+        ServiceStatus::NotInstalled
     })
 }
 
@@ -476,6 +532,21 @@ fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     std::fs::remove_file(&unit).map_err(|source| ServiceUninstallError::Unit { path: unit, source })
 }
 
+#[cfg(target_os = "linux")]
+fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
+    let home = std::env::var_os("HOME").ok_or(ServiceStatusError::HomeUnavailable)?;
+    let unit = PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(SYSTEMD_UNIT_NAME);
+    Ok(if unit.is_file() {
+        ServiceStatus::Installed
+    } else {
+        ServiceStatus::NotInstalled
+    })
+}
+
 /// Runs one service-manager activation command and reports failures without
 /// failing the install: the unit/plist file is the durable artifact, and the
 /// service manager may be unavailable in the current session (containers,
@@ -506,6 +577,11 @@ fn platform_install(
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn platform_uninstall() -> Result<(), ServiceUninstallError> {
     Err(ServiceUninstallError::UnsupportedPlatform)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
+    Ok(ServiceStatus::UnsupportedPlatform)
 }
 
 /// A controlled failure while registering the system service.
