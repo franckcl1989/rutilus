@@ -60,6 +60,15 @@ async fn create_resource_table(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                         // capability codes that stay with the capability
                         // ledger.
                         "dell-attributes",
+                        // The 0.5 Supermicro families read the manager's
+                        // `SysLockdown` and `KCSInterface` documents; the
+                        // codes are the narrow surface codes of
+                        // `ResourceFeature::OemSmcSysLockdown` /
+                        // `OemSmcKcsInterface`, distinct from the
+                        // `oem-supermicro` capability code that stays with
+                        // the capability ledger.
+                        "supermicro-sys-lockdown",
+                        "supermicro-kcs-interface",
                         "processors",
                         "memory",
                         "storages",
