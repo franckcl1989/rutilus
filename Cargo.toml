@@ -60,6 +60,11 @@ thiserror = "2.0.19"
 time = "0.3.55"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+# The site-to-center WebSocket transport (§15): the same 0.24 line that
+# axum's `ws` feature would pull in, used directly because the center
+# connection layer is a dedicated listener (no HTTP router) and the site
+# side needs a WebSocket *client*, which axum does not provide.
+tokio-tungstenite = "0.24"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["set-header"] }
 url = "2.5.8"

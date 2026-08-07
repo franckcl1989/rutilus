@@ -214,6 +214,11 @@ pub const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
         license: "MIT OR Apache-2.0",
     },
     ThirdPartyLicense {
+        name: "tokio-tungstenite",
+        version: "0.24.0",
+        license: "MIT OR Apache-2.0",
+    },
+    ThirdPartyLicense {
         name: "tokio-util",
         version: "0.7.19",
         license: "MIT OR Apache-2.0",
@@ -421,9 +426,9 @@ mod tests {
                 .map(|key| key.strip_suffix(".workspace").unwrap_or(key))
                 .filter(|name| {
                     !name.is_empty()
-                        && name
-                            .chars()
-                            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+                        && name.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                        })
                 })
             else {
                 continue;

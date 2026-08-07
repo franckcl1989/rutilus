@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod backup;
+mod center_acceptor;
+mod center_ca;
+mod center_ws;
 mod doctor;
 mod event_listener;
 mod initialization_runtime;
@@ -11,10 +14,17 @@ mod site_runtime;
 mod standalone_runtime;
 mod telemetry_sampler;
 mod tls_material;
+mod x509;
 
 pub use backup::{
     BackupError, BackupKeyUnlock, BackupOutcome, RestoreOutcome, create_backup, restore_backup,
 };
+pub use center_acceptor::{
+    CenterAcceptError, CenterAcceptor, CenterAcceptorError, CenterAcceptorOptions,
+    CenterConnection, CenterConnectionError, ClientIdentity,
+};
+pub use center_ca::{CenterCa, CenterCaError, SiteClientCertificate};
+pub use center_ws::CenterFrameHandler;
 pub use doctor::{CheckLevel, DoctorCheck, DoctorReport, run_doctor};
 pub use licenses::{THIRD_PARTY_LICENSES, ThirdPartyLicense, licenses_text};
 
@@ -38,3 +48,4 @@ pub use standalone_runtime::{
     run_initialized_standalone, run_standalone,
 };
 pub use tls_material::TlsMaterialError;
+pub use x509::DerReadError;
