@@ -55,12 +55,18 @@ pub enum MockProfile {
     /// tree is shared with the default profile.
     Dell,
     /// The NVIDIA `BlueField` fixture tree: Vendor "NVIDIA" / Product
-    /// `BlueField-3`, `Systems/1` advertises `Oem.Nvidia` (which flips the
-    /// `oem-nvidia*` capability probe to `Supported`), and the §11.5
-    /// system-config-profile chain is served — the profile service document,
-    /// its status singleton, the profile collection, one profile member, and
-    /// its profile file. Every other document of the tree is shared with the
-    /// default profile.
+    /// `BlueField-3`, `Systems/1` and `Managers/1` both advertise
+    /// `Oem.Nvidia` (which flips the `oem-nvidia*` capability probe to
+    /// `Supported`), and the §11.5 chains are served — the
+    /// system-config-profile chain (the profile service document, its status
+    /// singleton, the profile collection, one profile member, and its
+    /// profile file) plus the manager-scoped power-compliance chain (the
+    /// compliance manager document, its power domain collection member, the
+    /// two policy singletons, the managed entity group collection member,
+    /// the power state group with its PSC and PSU state collection members,
+    /// and the PSU redundancy singleton) and the managed-entity chain (the
+    /// entity collection member behind the group). Every other document of
+    /// the tree is shared with the default profile.
     Nvidia,
 }
 

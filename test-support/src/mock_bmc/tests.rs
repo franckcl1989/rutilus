@@ -101,8 +101,33 @@ const RESOURCE_READ_REQUEST_COUNT: u64 = 51;
 /// the `Assembly` document and the `UpdateService` document (the probe
 /// fetches each advertised document; `pcie-devices` is presence-only and
 /// adds no request), and the Session delete. Unadvertised features add no
-/// requests.
+/// requests. The count is identical for every vendor profile: the probe
+/// decodes `Oem` keys from documents it already fetched, so the NVIDIA
+/// profile's extra `Oem.Nvidia` segments add no probe requests.
 const CAPABILITY_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The extra read requests the NVIDIA profile's manager chains add over the
+/// default tree: the compliance document, the `PowerDomains` collection with
+/// its member, the `ACLossPolicy` / `PSUCompliancePolicy` singletons, the
+/// `ManagedEntityGroups` collection with its member and the member's
+/// `ManagedEntities` collection with its entity member, the
+/// `PowerStateGroup` document with its `PowerShelfControllers` and
+/// `PowerSupplies` collections with their members, and the `PSURedundancy`
+/// singleton.
+const NVIDIA_POWER_CHAIN_EXTRA_REQUEST_COUNT: u64 = 15;
+
+/// The extra read requests the NVIDIA profile's system-config-profile chain
+/// adds over the default tree: the profile service document, its status
+/// singleton, the profile collection, the profile member, and its profile
+/// file.
+const NVIDIA_SYSTEM_CHAIN_EXTRA_REQUEST_COUNT: u64 = 5;
+
+/// The resource-read request count of the NVIDIA profile: the default tree's
+/// 51 requests plus the system-config-profile chain (5) and the manager
+/// power-compliance / managed-entity chains (15).
+const NVIDIA_RESOURCE_READ_REQUEST_COUNT: u64 = RESOURCE_READ_REQUEST_COUNT
+    + NVIDIA_SYSTEM_CHAIN_EXTRA_REQUEST_COUNT
+    + NVIDIA_POWER_CHAIN_EXTRA_REQUEST_COUNT;
 
 #[test]
 fn deterministic_identity_reproduces_fingerprint_and_text() -> Result<(), Box<dyn Error>> {
@@ -260,6 +285,233 @@ fn dell_profile_swaps_identity_and_serves_attributes_route_only() -> Result<(), 
         &default_state,
     );
     assert_eq!(missing.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
+fn nvidia_profile_swaps_identity_and_serves_power_chain_routes_only() -> Result<(), Box<dyn Error>>
+{
+    // The fixture mapping: the NVIDIA profile swaps the Service Root
+    // identity strings, adds the manager `Oem.Nvidia` segment (the System
+    // member already carried one), and serves the §11.5 power-compliance
+    // chain routes.
+    let nvidia_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Nvidia))?;
+    assert_eq!(nvidia_root["Vendor"], "NVIDIA");
+    assert_eq!(nvidia_root["Product"], "BlueField-3");
+    let nvidia_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Nvidia))?;
+    assert_eq!(
+        nvidia_manager["Oem"]["Nvidia"]["@odata.type"],
+        "#NvidiaManager.v1_9_0.NvidiaManager"
+    );
+    assert_eq!(
+        nvidia_manager["Oem"]["Nvidia"]["PowerCompliance"]["@odata.id"],
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
+    );
+    // The default profile's manager keeps no `Oem` namespace.
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+
+    // The §11.5 power chain routes are served only under the NVIDIA profile.
+    let nvidia_state = MockState::with_profile(MockProfile::Nvidia);
+    let compliance = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        &[],
+        &nvidia_state,
+    );
+    assert_eq!(compliance.status, "200 OK");
+    let compliance_body: serde_json::Value = serde_json::from_str(&compliance.body)?;
+    assert_eq!(compliance_body["ManagerType"], "PowerManager");
+    let entity = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        &[],
+        &nvidia_state,
+    );
+    assert_eq!(entity.status, "200 OK");
+
+    // Under the default profile the same paths are Redfish-shaped 404s, so
+    // the default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    for path in [
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+    ] {
+        let missing = route::dispatch(HttpMethod::Get, path, &[], &default_state);
+        assert_eq!(missing.status, "404 Not Found", "{path}");
+    }
+    Ok(())
+}
+
+// The 125-line test exceeds the pedantic line budget because the whole
+// NVIDIA demo flow (probe, read, refresh, wire sequence) is asserted in one
+// contract; the lint is scoped here exactly like the other flow tests. The
+// probe/read request counts are `u64` (the mock's counter type), so the
+// window indices use explicit truncation-safe `usize` casts on every
+// supported target.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[tokio::test]
+async fn mock_serves_the_nvidia_demo_flow_and_cleans_up() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Nvidia).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let address = mock.endpoint_address();
+    let observation = gateway.observe_tls(&address).await?;
+    let trust = TlsTrust::PinnedCertificate {
+        certificate: observation.certificate().clone(),
+        trusted_at: OffsetDateTime::now_utc(),
+    };
+    let username = CredentialUsername::parse(MOCK_USERNAME)?;
+    let password = SecretString::from(MOCK_PASSWORD);
+
+    // The probe is unchanged by the vendor profile: the `Oem.Nvidia`
+    // segments flip the `oem-nvidia*` capabilities to `Supported` without
+    // adding a single request, so the count stays the default tree's 34.
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    for capability in [
+        EndpointCapability::OemNvidia,
+        EndpointCapability::OemNvidiaPowerManagement,
+        EndpointCapability::OemNvidiaProfiles,
+    ] {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the probe must delete its transient Session before returning"
+    );
+
+    // The typed core resource read carries the standard families plus the
+    // system-config-profile chain and the manager power-compliance and
+    // managed-entity chains.
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+    assert_eq!(
+        resources.len(),
+        28 + 4 + 10,
+        "the NVIDIA profile adds the four system-config-profile documents and the ten power-chain documents"
+    );
+    // The system-config-profile chain: the profile service document, its
+    // status singleton, the profile member, and its profile file.
+    let nvidia_system: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::OemNvidiaSystemConfigProfile)
+        .collect();
+    assert_eq!(nvidia_system.len(), 4);
+    assert!(nvidia_system.iter().any(|resource| {
+        resource.odata_id().as_str() == "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile"
+    }));
+    // The power-compliance chain: the compliance manager, the power domain
+    // member, the two policies, the managed entity group member, the power
+    // state group, the PSC and PSU state members, and the PSU redundancy.
+    let nvidia_power: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::OemNvidiaPowerCompliance)
+        .collect();
+    assert_eq!(nvidia_power.len(), 9);
+    assert!(nvidia_power.iter().any(|resource| {
+        resource.odata_id().as_str() == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
+    }));
+    // The managed-entity chain: the entity member behind the group.
+    let nvidia_entities: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::OemNvidiaManagedEntity)
+        .collect();
+    assert_eq!(nvidia_entities.len(), 1);
+    assert_eq!(
+        nvidia_entities[0].odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+
+    // A refresh repeats the same flow against the same fixture tree.
+    let refreshed = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+    assert_eq!(refreshed.len(), resources.len());
+    assert_eq!(mock.active_sessions(), 0);
+
+    // The whole demo flow is deterministic: probe + read + refresh.
+    assert_eq!(
+        mock.requests_served(),
+        CAPABILITY_PROBE_REQUEST_COUNT + 2 * NVIDIA_RESOURCE_READ_REQUEST_COUNT
+    );
+
+    // The wire sequence of one read starts with the Session lifecycle, then
+    // the systems and chassis surface, then the manager surface with the
+    // power chains right after the manager member, and closes with the
+    // Session delete. The token is fixed, so the Session create/delete pair
+    // is the same wire shape as the default flow.
+    let requests = mock.requests();
+    let request_paths = requests
+        .iter()
+        .map(|request| request.path().to_owned())
+        .collect::<Vec<_>>();
+    let read_start = CAPABILITY_PROBE_REQUEST_COUNT as usize;
+    let read_end = read_start + NVIDIA_RESOURCE_READ_REQUEST_COUNT as usize;
+    assert_eq!(
+        &request_paths[read_start..read_start + 10],
+        &[
+            "/redfish/v1",
+            "/redfish/v1/SessionService",
+            "/redfish/v1/SessionService/Sessions",
+            "/redfish/v1/SessionService/Sessions",
+            "/redfish/v1/Systems",
+            "/redfish/v1/Systems/1",
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile",
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Status",
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles",
+            "/redfish/v1/Systems/1/Oem/Nvidia/SystemConfigProfile/Profiles/1",
+        ]
+    );
+    assert_eq!(
+        &request_paths[read_start + 38..read_start + 43],
+        &[
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        ]
+    );
+    // The read closes with the Session delete (the probe's Session is the
+    // first one, so the first read's Session is the second).
+    assert_eq!(
+        request_paths[read_end - 1],
+        "/redfish/v1/SessionService/Sessions/2"
+    );
+    let session = requests
+        .iter()
+        .find(|request| request.method() == "POST")
+        .ok_or("a Session create must exist")?;
+    assert_eq!(session.path(), "/redfish/v1/SessionService/Sessions");
+    assert_eq!(session.header("X-Auth-Token"), None);
+
+    mock.stop().await?;
     Ok(())
 }
 

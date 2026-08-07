@@ -145,6 +145,91 @@ pub(crate) fn dispatch(
         }
         (HttpMethod::Get, "/redfish/v1/Managers") => json_ok(fixtures::MANAGERS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Managers/1") => json_ok(fixtures::manager(state.profile())),
+        // The §11.5 NVIDIA power-compliance and managed-entity chains are
+        // vendor fixtures: they exist only under the NVIDIA profile, and any
+        // other profile must 404 them like any unserved path instead of
+        // leaking a vendor namespace. The chains are reached through the
+        // `Oem.Nvidia` segment's `PowerCompliance` navigation and its
+        // sub-navigations, so the routes mirror the exact `@odata.id` values
+        // the fixture serves.
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_COMPLIANCE)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_DOMAINS_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_DOMAIN_1)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_AC_LOSS_POLICY)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_POWER_PSU_COMPLIANCE_POLICY)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_MANAGED_ENTITY_GROUP_1)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_MANAGED_ENTITIES_COLLECTION)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+        ) if state.profile() == MockProfile::Nvidia => json_ok(fixtures::NVIDIA_MANAGED_ENTITY_1),
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_POWER_STATE_GROUP)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_PSC_STATES_COLLECTION)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+        ) if state.profile() == MockProfile::Nvidia => json_ok(fixtures::NVIDIA_PSC_STATE_1),
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+        ) if state.profile() == MockProfile::Nvidia => {
+            json_ok(fixtures::NVIDIA_PSU_STATES_COLLECTION)
+        }
+        (
+            HttpMethod::Get,
+            "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+        ) if state.profile() == MockProfile::Nvidia => json_ok(fixtures::NVIDIA_PSU_STATE_1),
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy")
+            if state.profile() == MockProfile::Nvidia =>
+        {
+            json_ok(fixtures::NVIDIA_PSU_REDUNDANCY)
+        }
         // The §11.5 `DellAttributes` leaf is a vendor fixture: it exists only
         // under the Dell profile, and any other profile must 404 it like any
         // unserved path instead of leaking a vendor namespace.

@@ -24,12 +24,14 @@
 //! manager document ([`MANAGER_DELL`]), and serves the §11.5
 //! `DellAttributes` document ([`DELL_ATTRIBUTES`]); the NVIDIA profile swaps
 //! the Service Root identity strings ([`SERVICE_ROOT_NVIDIA`]), adds the
-//! `Oem.Nvidia` segment to the System document ([`SYSTEM_NVIDIA`]), and
-//! serves the §11.5 system-config-profile chain
-//! ([`NVIDIA_SYSTEM_CONFIG_PROFILE`], [`NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS`],
-//! [`NVIDIA_PROFILES_COLLECTION`], [`NVIDIA_SYSTEM_PROFILE_1`], and
-//! [`NVIDIA_SYSTEM_PROFILE_FILE_1`]); everything else is shared.
-//! [`service_root`], [`manager`], and [`system`] select the
+//! `Oem.Nvidia` segment to the System document ([`SYSTEM_NVIDIA`]) and to
+//! the manager document ([`MANAGER_NVIDIA`]), and serves the §11.5
+//! system-config-profile chain ([`NVIDIA_SYSTEM_CONFIG_PROFILE`],
+//! [`NVIDIA_SYSTEM_CONFIG_PROFILE_STATUS`], [`NVIDIA_PROFILES_COLLECTION`],
+//! [`NVIDIA_SYSTEM_PROFILE_1`], and [`NVIDIA_SYSTEM_PROFILE_FILE_1`]) plus
+//! the manager-scoped power-compliance and managed-entity chains
+//! ([`NVIDIA_POWER_COMPLIANCE`] and its sub-documents); everything else is
+//! shared. [`service_root`], [`manager`], and [`system`] select the
 //! profile-specific documents, and the route table gates the vendor routes
 //! on the profile, so no vendor surface can leak into another profile.
 
@@ -675,6 +677,248 @@ pub(crate) const DELL_ATTRIBUTES: &str = r#"{
     }
 }"#;
 
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the NVIDIA vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the `Oem.Nvidia` segment that
+/// advertises the NVIDIA OEM namespace and carries the inline versioned
+/// `NvidiaManager` object with the `PowerCompliance` navigation: the
+/// capability probe decides the `oem-nvidia*` capabilities from the decoded
+/// `Oem` keys (§11.3 advertised layer) and the gateway's §11.5
+/// power-compliance and managed-entity reads gate on the discriminated
+/// `NvidiaManager.v1_9_0` segment, so this one addition switches both layers
+/// on for the manager surface.
+pub(crate) const MANAGER_NVIDIA: &str = r##"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{"Nvidia":{
+        "@odata.type":"#NvidiaManager.v1_9_0.NvidiaManager",
+        "PowerCompliance":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"}
+    }}
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance` -- the §11.5
+/// NVIDIA `NvidiaPowerComplianceManager` chain root of the NVIDIA vendor
+/// profile, carrying every sub-navigation of the power-compliance family.
+///
+/// The document mirrors the fixture `rutilus-infra-redfish` decodes in its
+/// own NVIDIA manager tests (the typed base fields, the `ManagerType`
+/// enumeration, and the six sub-navigations), so the gateway's typed
+/// navigation into the compiled `NvidiaPowerComplianceManager` schema
+/// succeeds against the mock.
+pub(crate) const NVIDIA_POWER_COMPLIANCE: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance",
+    "@odata.etag":"W/\"nvidia-pc-1\"",
+    "Id":"PowerCompliance",
+    "Name":"NVIDIA Power Compliance",
+    "Description":"Power compliance manager",
+    "ManagerType":"PowerManager",
+    "PowerDomains":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains"},
+    "ACLossPolicy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy"},
+    "PSUCompliancePolicy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy"},
+    "ManagedEntityGroups":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups"},
+    "PowerStateGroup":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup"},
+    "PSURedundancy":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy"}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains` --
+/// the power domain collection with the single member.
+pub(crate) const NVIDIA_POWER_DOMAINS_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaPowerDomainCollection.NvidiaPowerDomainCollection",
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains",
+    "Id":"PowerDomains",
+    "Name":"Power Domain Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1` --
+/// the power domain member with every compiled scalar field populated.
+pub(crate) const NVIDIA_POWER_DOMAIN_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1",
+    "@odata.etag":"W/\"nvidia-domain-1\"",
+    "Id":"1",
+    "Name":"Power Domain One",
+    "Description":"Power comparison domain",
+    "Value":800,
+    "Type":"Above",
+    "Unit":"Watts",
+    "SensorReadingType":"Power",
+    "SensorImpl":"PhysicalSensor",
+    "PowerPolicies":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerDomains/1/PowerPolicies"}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy` --
+/// the AC loss power policy singleton.
+pub(crate) const NVIDIA_POWER_AC_LOSS_POLICY: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ACLossPolicy",
+    "@odata.etag":"W/\"nvidia-acloss-1\"",
+    "Id":"ACLossPolicy",
+    "Name":"AC Loss Policy",
+    "Description":"AC loss power policy",
+    "AutoDeassertPowerBrake":true,
+    "Min":200,
+    "Max":600,
+    "Type":"Inclusive",
+    "Unit":"Watts",
+    "DwellTime":"PT1S",
+    "PolicyActions":"AssertPowerBrake"
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy`
+/// -- the PSU compliance power policy singleton.
+pub(crate) const NVIDIA_POWER_PSU_COMPLIANCE_POLICY: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSUCompliancePolicy",
+    "@odata.etag":"W/\"nvidia-psupolicy-1\"",
+    "Id":"PSUCompliancePolicy",
+    "Name":"PSU Compliance Policy",
+    "Description":"PSU compliance power policy",
+    "AutoDeassertPowerBrake":false,
+    "Min":100,
+    "Max":500,
+    "Type":"Below",
+    "Unit":"Watts",
+    "DwellTime":"PT2S",
+    "PolicyActions":"DoNothing"
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups`
+/// -- the managed entity group collection with the single member.
+pub(crate) const NVIDIA_MANAGED_ENTITY_GROUPS_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaManagedEntityGroupCollection.NvidiaManagedEntityGroupCollection",
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups",
+    "Id":"ManagedEntityGroups",
+    "Name":"Managed Entity Group Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1`
+/// -- the managed entity group member with its `ManagedEntities` navigation.
+pub(crate) const NVIDIA_MANAGED_ENTITY_GROUP_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1",
+    "@odata.etag":"W/\"nvidia-group-1\"",
+    "Id":"1",
+    "Name":"Managed Entity Group One",
+    "Description":"BlueField group",
+    "CurrentManagedEntityId":"BF1",
+    "ManagedEntities":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities"}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities`
+/// -- the managed entity collection with the single member.
+pub(crate) const NVIDIA_MANAGED_ENTITIES_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaManagedEntityCollection.NvidiaManagedEntityCollection",
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities",
+    "Id":"ManagedEntities",
+    "Name":"Managed Entity Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1`
+/// -- the managed entity member with every compiled scalar field populated.
+pub(crate) const NVIDIA_MANAGED_ENTITY_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/ManagedEntityGroups/1/ManagedEntities/1",
+    "@odata.etag":"W/\"nvidia-entity-1\"",
+    "Id":"1",
+    "Name":"Managed Entity One",
+    "Description":"BlueField managed entity",
+    "TransportProtocol":"HTTPS",
+    "IPv4Address":{"Address":"192.0.2.10","SubnetMask":"255.255.255.0","Gateway":"192.0.2.1"},
+    "IPv6Address":{"Address":"2001:db8::10","PrefixLength":64},
+    "Port":443
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup` --
+/// the power state group document with its two state collections.
+pub(crate) const NVIDIA_POWER_STATE_GROUP: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup",
+    "@odata.etag":"W/\"nvidia-state-group-1\"",
+    "Id":"PowerStateGroup",
+    "Name":"Power State Group",
+    "Description":"Power shelf state",
+    "PscId":"PSC1",
+    "GeneratedWatts":2400,
+    "NumberOfPscs":1,
+    "NumberOfLocalPsus":2,
+    "PowerShelfControllers":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers"},
+    "PowerSupplies":{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies"}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers`
+/// -- the power shelf controller state collection with the single member.
+pub(crate) const NVIDIA_PSC_STATES_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaPscStateCollection.NvidiaPscStateCollection",
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers",
+    "Id":"PowerShelfControllers",
+    "Name":"Power Shelf Controller Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1`
+/// -- the PSC state member with every compiled scalar field populated.
+pub(crate) const NVIDIA_PSC_STATE_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerShelfControllers/1",
+    "@odata.etag":"W/\"nvidia-psc-1\"",
+    "Id":"1",
+    "Name":"Power Shelf Controller One",
+    "Description":"PSC state",
+    "PscId":"PSC1",
+    "NumOfOperationalPsus":4,
+    "PowerBrakeAssert":false,
+    "MillisecondsSinceLastHeartbeat":12,
+    "Status":"Operational"
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies`
+/// -- the power supply state collection with the single member.
+pub(crate) const NVIDIA_PSU_STATES_COLLECTION: &str = r##"{
+    "@odata.type":"#NvidiaPsuStateCollection.NvidiaPsuStateCollection",
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies",
+    "Id":"PowerSupplies",
+    "Name":"Power Supply Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1"}]
+}"##;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1`
+/// -- the PSU state member with every compiled scalar field populated.
+pub(crate) const NVIDIA_PSU_STATE_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PowerStateGroup/PowerSupplies/1",
+    "@odata.etag":"W/\"nvidia-psu-1\"",
+    "Id":"1",
+    "Name":"Power Supply One",
+    "Description":"PSU state",
+    "PsuId":"PSU1",
+    "Presence":true,
+    "Input1Active":true,
+    "Input2Active":false
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy` --
+/// the PSU redundancy singleton with every compiled scalar field populated.
+pub(crate) const NVIDIA_PSU_REDUNDANCY: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance/PSURedundancy",
+    "@odata.etag":"W/\"nvidia-redundancy-1\"",
+    "Id":"PSURedundancy",
+    "Name":"PSU Redundancy",
+    "Description":"PSU redundancy settings",
+    "MaxNumSupported":"4",
+    "MinNumNeeded":"2",
+    "RedundancySetting":"NPlusOne"
+}"#;
+
 /// `GET /redfish/v1/Managers/1/LogServices` -- the log service collection
 /// with the single event-log member.
 pub(crate) const LOG_SERVICES_COLLECTION: &str = r##"{
@@ -1096,13 +1340,18 @@ pub(crate) const SERVICE_ROOT_NVIDIA: &str = r##"{
 /// The `Managers/1` document of one vendor profile.
 ///
 /// The default profile keeps the byte-identical [`MANAGER`]; the Dell
-/// profile adds the `Oem.Dell` segment that advertises its OEM namespace.
+/// profile adds the `Oem.Dell` segment that advertises its OEM namespace,
+/// and the NVIDIA profile adds the `Oem.Nvidia` segment that advertises its
+/// OEM namespace and navigates the power-compliance and managed-entity
+/// chains.
 pub(crate) fn manager(profile: MockProfile) -> &'static str {
     match profile {
-        // The NVIDIA profile shares the default manager document: the
-        // NVIDIA OEM surface lives on the System member, not the manager.
-        MockProfile::Rutilus | MockProfile::Nvidia => MANAGER,
+        MockProfile::Rutilus => MANAGER,
         MockProfile::Dell => MANAGER_DELL,
+        // The NVIDIA profile carries the `Oem.Nvidia` segment on both the
+        // System member (the system-config-profile chain) and the Manager
+        // member (the power-compliance and managed-entity chains).
+        MockProfile::Nvidia => MANAGER_NVIDIA,
     }
 }
 

@@ -631,8 +631,15 @@ const NVIDIA_PROBE_REQUEST_COUNT: u64 = 34;
 /// with the NVIDIA profile: the 51 requests of the default profile plus the
 /// five §11.5 system-config-profile chain fetches (the profile service
 /// document, its status singleton, the profile collection, the profile
-/// member, and its profile file).
-const NVIDIA_RESOURCE_READ_REQUEST_COUNT: u64 = 56;
+/// member, and its profile file) plus the fifteen power-compliance and
+/// managed-entity chain fetches (the compliance document, the `PowerDomains`
+/// collection with its member, the `ACLossPolicy` / `PSUCompliancePolicy`
+/// singletons, the `ManagedEntityGroups` collection with its member and the
+/// member's `ManagedEntities` collection with its entity member, the
+/// `PowerStateGroup` document with its `PowerShelfControllers` and
+/// `PowerSupplies` collections with their members, and the `PSURedundancy`
+/// singleton).
+const NVIDIA_RESOURCE_READ_REQUEST_COUNT: u64 = 71;
 
 #[tokio::test]
 async fn dell_profile_probes_oem_dell_supported_with_standard_surface_unchanged()
@@ -904,8 +911,11 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
     // system-config-profile snapshots to the default 28-resource tree (the
     // chain root, its status singleton, the profile member, and its profile
     // file), in the documented read order: they follow the System member and
-    // precede the system's `Bios` singleton.
-    assert_eq!(resources.len(), 32);
+    // precede the system's `Bios` singleton. The manager's `Oem.Nvidia`
+    // segment adds the ten power-chain snapshots (nine power-compliance
+    // documents and one managed-entity document), which follow the manager's
+    // standard surface and precede the `Accounts` family.
+    assert_eq!(resources.len(), 42);
     let features: Vec<ResourceFeature> = resources
         .iter()
         .map(CoreResourceProjection::feature)
@@ -936,6 +946,22 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
+            // The power-compliance chain: the compliance manager, the power
+            // domain member, the two policies, the managed entity group
+            // member, the power state group, the PSC and PSU state members,
+            // and the PSU redundancy. The managed entity member follows its
+            // group (the shared traversal reads each group member's
+            // `ManagedEntities` collection right after the group document).
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaManagedEntity,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaPowerCompliance,
             ResourceFeature::Accounts,
             ResourceFeature::SoftwareInventory,
             ResourceFeature::EventService,
@@ -1010,6 +1036,76 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
         "eyJwcm9maWxlIjogInRlc3QifQ=="
     );
 
+    // The power-compliance chain root follows the manager's standard surface
+    // and carries the compiled `ManagerType` enumeration spelling verbatim.
+    let power_compliance = &resources[23];
+    assert_eq!(
+        power_compliance.odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance"
+    );
+    let payload: serde_json::Value = serde_json::from_str(power_compliance.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "power_compliance_manager");
+    assert_eq!(payload["ManagerType"], "PowerManager");
+    assert!(payload.get("PowerDomains").is_none());
+    let power_domain = &resources[24];
+    let payload: serde_json::Value = serde_json::from_str(power_domain.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "power_domain");
+    assert_eq!(payload["Value"], 800);
+    assert_eq!(payload["Type"], "Above");
+    assert_eq!(payload["Unit"], "Watts");
+    assert_eq!(payload["SensorReadingType"], "Power");
+    assert_eq!(payload["SensorImpl"], "PhysicalSensor");
+    let ac_loss = &resources[25];
+    let payload: serde_json::Value = serde_json::from_str(ac_loss.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "power_policy");
+    assert_eq!(payload["PolicyActions"], "AssertPowerBrake");
+    assert_eq!(payload["Type"], "Inclusive");
+    assert!(payload.get("DwellTime").is_none());
+    let psu_policy = &resources[26];
+    let payload: serde_json::Value = serde_json::from_str(psu_policy.payload().as_str())?;
+    assert_eq!(payload["PolicyActions"], "DoNothing");
+    let group = &resources[27];
+    let payload: serde_json::Value = serde_json::from_str(group.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "managed_entity_group");
+    assert_eq!(payload["CurrentManagedEntityId"], "BF1");
+    // The managed-entity family: the entity member follows its group (the
+    // shared traversal reads each group member's `ManagedEntities`
+    // collection right after the group document).
+    let entity = &resources[28];
+    assert_eq!(entity.feature(), ResourceFeature::OemNvidiaManagedEntity);
+    let payload: serde_json::Value = serde_json::from_str(entity.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "managed_entity");
+    assert_eq!(payload["TransportProtocol"], "HTTPS");
+    assert_eq!(payload["IPv4Address"], "192.0.2.10");
+    assert_eq!(payload["IPv6Address"], "2001:db8::10");
+    assert_eq!(payload["Port"], 443);
+    let state_group = &resources[29];
+    let payload: serde_json::Value = serde_json::from_str(state_group.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "power_state_group");
+    assert_eq!(payload["GeneratedWatts"], 2400);
+    assert_eq!(payload["NumberOfPscs"], 1);
+    assert_eq!(payload["NumberOfLocalPsus"], 2);
+    let psc = &resources[30];
+    let payload: serde_json::Value = serde_json::from_str(psc.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "psc_state");
+    assert_eq!(payload["NumOfOperationalPsus"], 4);
+    assert_eq!(payload["PowerBrakeAssert"], false);
+    assert_eq!(payload["MillisecondsSinceLastHeartbeat"], 12);
+    assert_eq!(payload["Status"], "Operational");
+    let psu = &resources[31];
+    let payload: serde_json::Value = serde_json::from_str(psu.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "psu_state");
+    assert_eq!(payload["PsuId"], "PSU1");
+    assert_eq!(payload["Presence"], true);
+    assert_eq!(payload["Input1Active"], true);
+    assert_eq!(payload["Input2Active"], false);
+    let redundancy = &resources[32];
+    let payload: serde_json::Value = serde_json::from_str(redundancy.payload().as_str())?;
+    assert_eq!(payload["DocumentType"], "psu_redundancy");
+    assert_eq!(payload["MaxNumSupported"], "4");
+    assert_eq!(payload["MinNumNeeded"], "2");
+    assert_eq!(payload["RedundancySetting"], "NPlusOne");
+
     // The gateway fetches the chain documents exactly once each, right after
     // the System member and before the `Bios` singleton, and through the
     // Session token transport like every other read.
@@ -1017,7 +1113,7 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
     assert_eq!(
         mock.requests_served(),
         NVIDIA_RESOURCE_READ_REQUEST_COUNT,
-        "the NVIDIA read must issue exactly five requests beyond the default flow"
+        "the NVIDIA read must issue exactly twenty requests beyond the default flow"
     );
     let system_index = requests
         .iter()
@@ -1047,6 +1143,28 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
         requests[profile_file_index].header("x-auth-token"),
         Some("test-session-token"),
         "the chain fetches must authenticate with the Session token"
+    );
+    // The manager power chain is fetched right after the manager member and
+    // its standard surface, through the same Session token transport.
+    let manager_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1")
+        .ok_or_else(|| io::Error::other("Managers/1 is missing from the request log"))?;
+    let power_compliance_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/Oem/Nvidia/PowerCompliance")
+        .ok_or_else(|| {
+            io::Error::other("the PowerCompliance fetch is missing from the request log")
+        })?;
+    assert_eq!(
+        power_compliance_index,
+        manager_index + 6,
+        "the power chain must be read right after the manager's standard surface"
+    );
+    assert_eq!(
+        requests[power_compliance_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the power chain fetches must authenticate with the Session token"
     );
     assert_eq!(
         mock.active_sessions(),
