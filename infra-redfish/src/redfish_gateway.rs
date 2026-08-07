@@ -35,6 +35,16 @@ use nv_redfish::{
     // feature's own generated module (`oem::dell::schema`), not in the base
     // `schema` module where the standard types are re-exported.
     oem::dell::schema::dell_attributes::DellAttributes as DellAttributesSchema,
+    // The Supermicro OEM feature compiles its own generated module tree
+    // (`oem::supermicro::schema`) exactly like the Dell feature: the
+    // `smc_manager_extensions` schema models the manager's embedded
+    // `Oem.Supermicro` segment, whose two `NavProperty` fields navigate to
+    // the `SysLockdown` and `KcsInterface` documents.
+    oem::supermicro::schema::kcs_interface::{
+        KcsInterface as KcsInterfaceSchema, Privilege as KcsPrivilegeSchema,
+    },
+    oem::supermicro::schema::smc_manager_extensions::Manager as SmcManagerExtensionsSchema,
+    oem::supermicro::schema::sys_lockdown::SysLockdown as SysLockdownSchema,
     schema::{
         assembly::Assembly as AssemblySchema,
         assembly::AssemblyData as AssemblyDataSchema,
@@ -1434,6 +1444,7 @@ async fn read_manager_resources(
             .await?,
         );
         resources.extend(read_manager_dell_attributes(&manager, bmc, identity, trust).await?);
+        resources.extend(read_manager_supermicro_oem(&manager, bmc, identity, trust).await?);
     }
     Ok(resources)
 }
@@ -1488,6 +1499,74 @@ async fn read_manager_dell_attributes(
         return Ok(Vec::new());
     };
     Ok(vec![projection])
+}
+
+/// Reads one manager's Supermicro `SysLockdown` and `KcsInterface` documents
+/// (§11.5).
+///
+/// The Supermicro read mirrors `nv-redfish`'s own manager OEM constructor:
+/// only a manager document that advertises `Oem.Supermicro` is probed, the
+/// embedded segment is decoded into the compiled `smc_manager_extensions`
+/// schema, and each present `NavProperty` field is resolved through the same
+/// typed navigation the upstream `sys_lockdown` / `kcs_interface` wrappers
+/// perform — an embedded reference is fetched by its `@odata.id`, an embedded
+/// expanded object is used as-is, never a raw JSON read. Unlike the Dell
+/// Attributes surface there is no crafted URL: the Supermicro documents are
+/// referenced by the manager's own `Oem.Supermicro` segment, so the product
+/// follows the vendor's embedded navigation instead of building one.
+///
+/// A manager without `Oem.Supermicro`, or with an `Oem.Supermicro` segment
+/// the compiled schema cannot decode, produces no snapshot and no fabricated
+/// request; a failed or undecodable document is one odd manager surface and
+/// follows the member-level skip semantics like any other member fetch.
+async fn read_manager_supermicro_oem(
+    manager: &ManagerSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(oem_value) = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Supermicro"))
+    else {
+        return Ok(Vec::new());
+    };
+    // The embedded `Oem.Supermicro` value is vendor-shaped until the compiled
+    // `smc_manager_extensions` schema decodes it; a segment the compiled
+    // schema rejects is one odd manager surface and leaves the whole
+    // Supermicro family absent, exactly like an undecodable member.
+    let extensions: SmcManagerExtensionsSchema = match serde_json::from_value(oem_value.clone()) {
+        Ok(extensions) => extensions,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut resources = Vec::new();
+    // Each present navigation property follows the singleton decision: an
+    // absent link leaves that document absent, a failed fetch skips it with
+    // the member-level semantics, and a failed projection skips it as well.
+    resources.extend(
+        read_singleton_resources(
+            extensions.sys_lockdown.as_ref(),
+            bmc,
+            identity,
+            trust,
+            smc_sys_lockdown_projection,
+        )
+        .await?,
+    );
+    resources.extend(
+        read_singleton_resources(
+            extensions.kcs_interface.as_ref(),
+            bmc,
+            identity,
+            trust,
+            smc_kcs_interface_projection,
+        )
+        .await?,
+    );
+    Ok(resources)
 }
 
 /// Reads the `Accounts` family through the root-level `AccountService` link,
@@ -4063,6 +4142,42 @@ struct DellAttributesPayload {
     server_name: Option<String>,
 }
 
+/// The §0.5.0 Supermicro `SysLockdown` family projection.
+///
+/// The field set is exactly the `OemSmcSysLockdownPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The compiled
+/// `SysLockdown` schema models only `SysLockdownEnabled` beside its base
+/// `@odata.id` / `@odata.etag` (which stay on the snapshot, not the payload):
+/// it flattens a `resource::Item` base that carries no `Id` / `Name` /
+/// `Description` properties, so unlike every standard family there are no
+/// common fields to project — the application boundary derives the product
+/// identity from the snapshot's `@odata.id` instead.
+#[derive(Serialize)]
+struct SmcSysLockdownPayload {
+    #[serde(rename = "SysLockdownEnabled", skip_serializing_if = "Option::is_none")]
+    sys_lockdown_enabled: Option<bool>,
+}
+
+/// The §0.5.0 Supermicro `KcsInterface` family projection.
+///
+/// The field set is exactly the `OemSmcKcsInterfacePayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The compiled
+/// `KcsInterface` schema models `Privilege` (an enum serialized by its
+/// vendor-defined wire spelling, e.g. `Administrator`, `DisableKCS`) beside
+/// its base `@odata.id` / `@odata.etag`, which stay on the snapshot; the
+/// `@Redfish.Settings` annotations are meta-annotations, not document
+/// content, and stay out exactly like every other family. The schema models
+/// no `Id` / `Name` / `Description` properties either, so there are no common
+/// fields to project — the application boundary derives the product identity
+/// from the snapshot's `@odata.id` instead.
+#[derive(Serialize)]
+struct SmcKcsInterfacePayload {
+    #[serde(rename = "Privilege", skip_serializing_if = "Option::is_none")]
+    privilege: Option<KcsPrivilegeSchema>,
+}
+
 /// The §0.2.0 `processors` family projection.
 ///
 /// The field set is exactly the `ProcessorPayload` the application boundary
@@ -4793,6 +4908,50 @@ fn dell_attributes_projection(
         ResourceFeature::OemDell,
         attributes.odata_id(),
         attributes.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed Supermicro `SysLockdown` document into the OEM family.
+///
+/// The `@odata.id` and `ETag` come from the typed schema base exactly like
+/// every other family; the `SysLockdownEnabled` boolean is projected with the
+/// compiled `Edm.Boolean` semantics (an absent property projects as `None`
+/// and is skipped on the wire). The document is one manager surface, so an
+/// unrepresentable identifier or payload is skipped by the caller through the
+/// member-level `member_projection` semantics.
+fn smc_sys_lockdown_projection(
+    sys_lockdown: &SysLockdownSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = SmcSysLockdownPayload {
+        sys_lockdown_enabled: sys_lockdown.sys_lockdown_enabled,
+    };
+    build_core_projection(
+        ResourceFeature::OemSmcSysLockdown,
+        sys_lockdown.odata_id(),
+        sys_lockdown.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed Supermicro `KcsInterface` document into the OEM family.
+///
+/// The `@odata.id` and `ETag` come from the typed schema exactly like every
+/// other family; the `Privilege` enum is serialized by its vendor-defined
+/// wire spelling (never translated, per §12.3), and an absent property
+/// projects as `None` and is skipped on the wire. The document is one manager
+/// surface, so an unrepresentable identifier or payload is skipped by the
+/// caller through the member-level `member_projection` semantics.
+fn smc_kcs_interface_projection(
+    kcs_interface: &KcsInterfaceSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = SmcKcsInterfacePayload {
+        privilege: kcs_interface.privilege,
+    };
+    build_core_projection(
+        ResourceFeature::OemSmcKcsInterface,
+        kcs_interface.odata_id(),
+        kcs_interface.etag(),
         &payload,
     )
 }
@@ -7419,6 +7578,58 @@ mod tests {
         }
     }"#;
 
+    /// A Manager member whose `Oem.Supermicro` segment embeds the two
+    /// navigation references the Supermicro read follows: `SysLockdown` and
+    /// `KCSInterface`, each carrying the `@odata.id` the compiled
+    /// `smc_manager_extensions` schema resolves through `NavProperty` — the
+    /// same embedded-reference shape nv-redfish's own Supermicro manager
+    /// constructor decodes (reference form, so each leaf is fetched by its
+    /// `@odata.id`).
+    const MANAGER_WITH_SUPERMICRO_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Supermicro":{
+            "SysLockdown":{"@odata.id":"/redfish/v1/Managers/1/SysLockdown"},
+            "KCSInterface":{"@odata.id":"/redfish/v1/Managers/1/KCSInterface"}
+        }}
+    }"#;
+
+    /// A Manager member whose `Oem.Supermicro` segment cannot be decoded by
+    /// the compiled `smc_manager_extensions` schema: the `SysLockdown` key
+    /// carries a non-object value, so the segment is one odd manager surface
+    /// and leaves the whole Supermicro family absent without a request.
+    const MANAGER_WITH_UNDECODABLE_SUPERMICRO_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Supermicro":{"SysLockdown":5}}
+    }"#;
+
+    /// The typed Supermicro `SysLockdown` document served at the embedded
+    /// `@odata.id`. The compiled schema models only `SysLockdownEnabled`
+    /// beside the `@odata.id` / `@odata.etag`; it flattens a `resource::Item`
+    /// base that carries no `Id` / `Name` / `Description` properties, so the
+    /// fixture deliberately carries none (an unmodeled wire `Id` would be
+    /// dropped by the typed decode either way, per §11.5's two-way rule).
+    const SUPERMICRO_SYS_LOCKDOWN_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/SysLockdown",
+        "@odata.etag":"W/\"sys-lockdown-1\"",
+        "SysLockdownEnabled":true
+    }"#;
+
+    /// The typed Supermicro `KcsInterface` document served at the embedded
+    /// `@odata.id`, carrying the vendor's enum spelling verbatim.
+    const SUPERMICRO_KCS_INTERFACE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/KCSInterface",
+        "@odata.etag":"W/\"kcs-interface-1\"",
+        "Privilege":"Administrator"
+    }"#;
+
     const FULL_SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -8976,6 +9187,27 @@ mod tests {
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
         "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one manager that advertises `Oem.Supermicro`:
+    /// the `SysLockdown` and `KcsInterface` documents are read right after
+    /// the manager member, each fetched through the `@odata.id` embedded in
+    /// the `Oem.Supermicro` segment, exactly like the other manager-bound
+    /// families.
+    const CORE_RESOURCE_WITH_SUPERMICRO_OEM_REQUEST_PATHS: [&str; 13] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/SysLockdown",
+        "/redfish/v1/Managers/1/KCSInterface",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -10735,6 +10967,248 @@ mod tests {
         // refuses to reinterpret it as text.
         assert_eq!(dell_attribute_string(&attributes, "ServerGeneration"), None);
         assert_eq!(dell_attribute_string(&attributes, "ServerServiceTag"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_supermicro_oem_documents_through_embedded_navigation()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_SUPERMICRO_OEM_BODY),
+                ("200 OK", SUPERMICRO_SYS_LOCKDOWN_BODY),
+                ("200 OK", SUPERMICRO_KCS_INTERFACE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        let sys_lockdown = &resources[4];
+        assert_eq!(sys_lockdown.feature(), ResourceFeature::OemSmcSysLockdown);
+        assert_eq!(
+            sys_lockdown.odata_id().as_str(),
+            "/redfish/v1/Managers/1/SysLockdown"
+        );
+        assert_eq!(
+            sys_lockdown.etag().map(ResourceEtag::as_str),
+            Some("W/\"sys-lockdown-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(sys_lockdown.payload().as_str())?;
+        assert_eq!(payload["SysLockdownEnabled"], true);
+        let kcs_interface = &resources[5];
+        assert_eq!(kcs_interface.feature(), ResourceFeature::OemSmcKcsInterface);
+        assert_eq!(
+            kcs_interface.odata_id().as_str(),
+            "/redfish/v1/Managers/1/KCSInterface"
+        );
+        assert_eq!(
+            kcs_interface.etag().map(ResourceEtag::as_str),
+            Some("W/\"kcs-interface-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(kcs_interface.payload().as_str())?;
+        assert_eq!(payload["Privilege"], "Administrator");
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_SUPERMICRO_OEM_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_without_supermicro_oem_produces_no_oem_snapshot() -> Result<(), Box<dyn Error>>
+    {
+        // An `Oem` segment of another vendor must not be mistaken for
+        // Supermicro, and a manager without any `Oem` segment stays
+        // untouched; neither case issues a Supermicro probe.
+        for manager_body in [MANAGER_BODY, MANAGER_WITH_OTHER_OEM_BODY] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                CORE_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", manager_body),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(resources.iter().all(|resource| {
+                !matches!(
+                    resource.feature(),
+                    ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface
+                )
+            }));
+            // No Supermicro probe was issued: the request sequence is exactly
+            // the plain manager read.
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_supermicro_oem_segment_leaves_the_family_absent()
+    -> Result<(), Box<dyn Error>> {
+        // An `Oem.Supermicro` segment the compiled `smc_manager_extensions`
+        // schema cannot decode (here: a non-object `SysLockdown` key) is one
+        // odd manager surface: the read succeeds and leaves both Supermicro
+        // families absent, and no leaf request is ever fabricated.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_UNDECODABLE_SUPERMICRO_OEM_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources.iter().all(|resource| {
+            !matches!(
+                resource.feature(),
+                ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface
+            )
+        }));
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undecodable_supermicro_documents_are_skipped_like_one_odd_member()
+    -> Result<(), Box<dyn Error>> {
+        // Both leaf documents cannot be decoded into the compiled schemas
+        // (missing the required `@odata.id`) and are one odd manager surface
+        // each: the read succeeds and leaves both families absent, while the
+        // embedded probes stay observable as requests, like every
+        // member-level skip.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_SUPERMICRO_OEM_BODY),
+                ("200 OK", "{}"),
+                ("200 OK", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(resources.iter().all(|resource| {
+            !matches!(
+                resource.feature(),
+                ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface
+            )
+        }));
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_SUPERMICRO_OEM_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn smc_document_projections_keep_the_typed_field_contract() -> Result<(), Box<dyn Error>> {
+        // The compiled schemas are the type boundary: the typed boolean and
+        // the vendor enum spelling are projected verbatim, and an absent
+        // field is skipped on the wire instead of coerced.
+        let sys_lockdown: SysLockdownSchema = serde_json::from_str(SUPERMICRO_SYS_LOCKDOWN_BODY)?;
+        let projection = smc_sys_lockdown_projection(&sys_lockdown)?;
+        assert_eq!(projection.feature(), ResourceFeature::OemSmcSysLockdown);
+        assert_eq!(
+            projection.odata_id().as_str(),
+            "/redfish/v1/Managers/1/SysLockdown"
+        );
+        assert_eq!(
+            projection.payload().as_str(),
+            r#"{"SysLockdownEnabled":true}"#
+        );
+        let bare: SysLockdownSchema =
+            serde_json::from_str(r#"{"@odata.id":"/redfish/v1/Managers/1/SysLockdown"}"#)?;
+        assert_eq!(smc_sys_lockdown_projection(&bare)?.payload().as_str(), "{}");
+
+        let kcs_interface: KcsInterfaceSchema =
+            serde_json::from_str(SUPERMICRO_KCS_INTERFACE_BODY)?;
+        let projection = smc_kcs_interface_projection(&kcs_interface)?;
+        assert_eq!(projection.feature(), ResourceFeature::OemSmcKcsInterface);
+        assert_eq!(
+            projection.payload().as_str(),
+            r#"{"Privilege":"Administrator"}"#
+        );
+        // The enum spelling stays exactly the vendor's wire value, including
+        // the non-snake `DisableKCS` case (§12.3).
+        let disable: KcsInterfaceSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Managers/1/KCSInterface","Privilege":"DisableKCS"}"#,
+        )?;
+        assert_eq!(
+            smc_kcs_interface_projection(&disable)?.payload().as_str(),
+            r#"{"Privilege":"DisableKCS"}"#
+        );
+        let bare: KcsInterfaceSchema =
+            serde_json::from_str(r#"{"@odata.id":"/redfish/v1/Managers/1/KCSInterface"}"#)?;
+        assert_eq!(
+            smc_kcs_interface_projection(&bare)?.payload().as_str(),
+            "{}"
+        );
         Ok(())
     }
 
