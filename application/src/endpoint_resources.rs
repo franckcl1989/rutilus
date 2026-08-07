@@ -150,6 +150,25 @@ pub enum CoreResourceDetails {
         server_bmc_mac_address: Option<String>,
         server_name: Option<String>,
     },
+    /// One §0.5.0 Supermicro OEM family member: the manager's `SysLockdown`
+    /// document, read through the compiled `oem-supermicro` surface (§11.5 —
+    /// an OEM surface is projected only when upstream compiles it). The
+    /// `SysLockdownEnabled` boolean is the document's only substantive typed
+    /// field; the compiled schema models no `Id` / `Name` / `Description`, so
+    /// the product identity is derived from the snapshot's `@odata.id` (the
+    /// Redfish `Id` equals the final path segment per DSP0266) and stays out
+    /// of the wire payload, whose field set is exactly what the infra
+    /// projection wrote.
+    OemSmcSysLockdown { sys_lockdown_enabled: Option<bool> },
+    /// One §0.5.0 Supermicro OEM family member: the manager's `KCSInterface`
+    /// document, read through the compiled `oem-supermicro` surface (§11.5).
+    /// The `Privilege` value is the vendor's enum spelling verbatim (e.g.
+    /// `Administrator`, `DisableKCS`); the compiled schema models no `Id` /
+    /// `Name` / `Description`, so the product identity is derived from the
+    /// snapshot's `@odata.id` (the Redfish `Id` equals the final path segment
+    /// per DSP0266) and stays out of the wire payload, whose field set is
+    /// exactly what the infra projection wrote.
+    OemSmcKcsInterface { privilege: Option<String> },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -574,6 +593,8 @@ where
         ResourceFeature::Chassis => project_chassis(snapshot, payload)?,
         ResourceFeature::Managers => project_manager(snapshot, payload)?,
         ResourceFeature::OemDell => project_oem_dell(snapshot, payload)?,
+        ResourceFeature::OemSmcSysLockdown => project_oem_smc_sys_lockdown(snapshot, payload)?,
+        ResourceFeature::OemSmcKcsInterface => project_oem_smc_kcs_interface(snapshot, payload)?,
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
@@ -728,6 +749,81 @@ where
             server_name: parsed.server_name,
         }
     })
+}
+
+fn project_oem_smc_sys_lockdown<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    // Unlike every standard family the payload carries no `Id` / `Name` /
+    // `Description` (the compiled schema models none, so the infra projection
+    // could never have seen them), and the common identity is derived from
+    // the snapshot's `@odata.id` instead of the payload.
+    let parsed =
+        deserialize_payload::<OemSmcSysLockdownPayload, RepositoryError>(snapshot, payload)?;
+    Ok((
+        common_from_odata_id(snapshot.odata_id()),
+        CoreResourceDetails::OemSmcSysLockdown {
+            sys_lockdown_enabled: parsed.sys_lockdown_enabled,
+        },
+    ))
+}
+
+fn project_oem_smc_kcs_interface<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    let parsed =
+        deserialize_payload::<OemSmcKcsInterfacePayload, RepositoryError>(snapshot, payload)?;
+    Ok((
+        common_from_odata_id(snapshot.odata_id()),
+        CoreResourceDetails::OemSmcKcsInterface {
+            privilege: parsed.privilege,
+        },
+    ))
+}
+
+/// Builds the product-level identity for an OEM document whose compiled
+/// schema carries no `Id` / `Name` / `Description` properties.
+///
+/// The compiled Supermicro `SysLockdown` and `KcsInterface` types flatten a
+/// `resource::Item` base that models only `@odata.id`, `@odata.etag`, and
+/// the `@Redfish.Settings` annotations, so the wire `Id` / `Name` keys are
+/// not part of the typed surface and cannot be projected (§11.5 two-way
+/// rule). The Redfish spec (DSP0266 §7.4) requires `Id` to equal the final
+/// segment of `@odata.id`, so that segment is the resource's own identity —
+/// the exact `Id` a standard family derives from its typed `Id` property —
+/// and never a product-invented label. `Name` falls back to the `Id`-derived
+/// identity because the compiled schema carries no `Name` property (a
+/// standard family takes its `Name` from the typed `Name` property instead).
+/// A trailing slash would make the naive last segment empty, so empty
+/// segments are filtered out before the final segment is taken; an `@odata.id`
+/// with nothing but separators (or the empty string) falls back to the whole
+/// value unchanged rather than deriving an empty identity. `Description`
+/// stays `None`.
+fn common_from_odata_id(odata_id: &ResourceODataId) -> CoreResourceCommon {
+    let identity = odata_id
+        .as_str()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(odata_id.as_str());
+    CoreResourceCommon {
+        id: identity.to_owned(),
+        name: identity.to_owned(),
+        description: None,
+    }
 }
 
 fn project_processor<RepositoryError>(
@@ -1471,6 +1567,33 @@ impl CommonPayload for OemDellPayload {
             description: self.description.clone(),
         }
     }
+}
+
+/// The §0.5.0 Supermicro `SysLockdown` snapshot payload, decoded exactly as
+/// the infra projection wrote it: only the `SysLockdownEnabled` boolean the
+/// compiled schema models. `deny_unknown_fields` keeps the snapshot contract
+/// strict, so a future extra wire field would make stored snapshots
+/// unreadable exactly like an extra top-level key would. The payload carries
+/// no `Id` / `Name` / `Description` because the compiled schema has none; the
+/// projection derives the product identity from the snapshot's `@odata.id`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemSmcSysLockdownPayload {
+    #[serde(rename = "SysLockdownEnabled")]
+    sys_lockdown_enabled: Option<bool>,
+}
+
+/// The §0.5.0 Supermicro `KcsInterface` snapshot payload, decoded exactly as
+/// the infra projection wrote it: only the `Privilege` enum spelling the
+/// compiled schema models, kept verbatim. `deny_unknown_fields` keeps the
+/// snapshot contract strict, and the payload carries no `Id` / `Name` /
+/// `Description` because the compiled schema has none; the projection derives
+/// the product identity from the snapshot's `@odata.id`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemSmcKcsInterfacePayload {
+    #[serde(rename = "Privilege")]
+    privilege: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2606,6 +2729,124 @@ mod tests {
                 server_name: Some("rack-1-server-2".to_owned()),
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_oem_smc_families_without_losing_source_values() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(13)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemSmcSysLockdown,
+                    "/redfish/v1/Managers/1/SysLockdown",
+                    r#"{"SysLockdownEnabled":true}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemSmcKcsInterface,
+                    "/redfish/v1/Managers/1/KCSInterface",
+                    r#"{"Privilege":"Operator"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // A document whose only field was absent is still a snapshot
+                // with `None` details, not an unreadable one.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemSmcSysLockdown,
+                    "/redfish/v1/Managers/2/SysLockdown",
+                    r"{}",
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 4);
+        // The inventory orders snapshots by `@odata.id`, so `KCSInterface`
+        // sorts before the two `SysLockdown` documents.
+        let kcs_interface = &result.resources()[1];
+        assert_eq!(kcs_interface.feature(), ResourceFeature::OemSmcKcsInterface);
+        assert_eq!(
+            kcs_interface.odata_id().as_str(),
+            "/redfish/v1/Managers/1/KCSInterface"
+        );
+        // The compiled schema models no `Id` / `Name`, so the product
+        // identity is the resource's own `@odata.id` final segment.
+        assert_eq!(kcs_interface.common().id(), "KCSInterface");
+        assert_eq!(kcs_interface.common().name(), "KCSInterface");
+        assert_eq!(kcs_interface.common().description(), None);
+        assert_eq!(
+            kcs_interface.details(),
+            &CoreResourceDetails::OemSmcKcsInterface {
+                privilege: Some("Operator".to_owned()),
+            }
+        );
+        let sys_lockdown = &result.resources()[2];
+        assert_eq!(sys_lockdown.feature(), ResourceFeature::OemSmcSysLockdown);
+        assert_eq!(
+            sys_lockdown.odata_id().as_str(),
+            "/redfish/v1/Managers/1/SysLockdown"
+        );
+        assert_eq!(sys_lockdown.common().id(), "SysLockdown");
+        assert_eq!(sys_lockdown.common().name(), "SysLockdown");
+        assert_eq!(
+            sys_lockdown.details(),
+            &CoreResourceDetails::OemSmcSysLockdown {
+                sys_lockdown_enabled: Some(true),
+            }
+        );
+        assert_eq!(
+            result.resources()[3].details(),
+            &CoreResourceDetails::OemSmcSysLockdown {
+                sys_lockdown_enabled: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_identity_derives_the_final_odata_id_segment_without_empty_fallbacks()
+    -> Result<(), Box<dyn Error>> {
+        // A trailing slash must not derive an empty identity: empty segments
+        // are filtered before the final one is taken.
+        let trailing = common_from_odata_id(&ResourceODataId::parse(
+            "/redfish/v1/Managers/1/SysLockdown/",
+        )?);
+        assert_eq!(trailing.id(), "SysLockdown");
+        assert_eq!(trailing.name(), "SysLockdown");
+        assert_eq!(trailing.description(), None);
+        // A plain path derives its final segment.
+        let plain = common_from_odata_id(&ResourceODataId::parse(
+            "/redfish/v1/Managers/1/KCSInterface",
+        )?);
+        assert_eq!(plain.id(), "KCSInterface");
+        assert_eq!(plain.name(), "KCSInterface");
+        // A separator-only identifier has no segment to derive and falls
+        // back to the whole value unchanged instead of an empty identity.
+        let separators = common_from_odata_id(&ResourceODataId::parse("/")?);
+        assert_eq!(separators.id(), "/");
+        assert_eq!(separators.name(), "/");
         Ok(())
     }
 
