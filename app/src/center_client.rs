@@ -319,6 +319,71 @@ impl CenterLink {
         Ok(())
     }
 
+    /// Sends one envelope exactly as given (0.7.0 S4).
+    ///
+    /// The §15.4 durable outbox — owned by the application engine — assigns
+    /// the envelope's sequence, so this raw send bypasses the
+    /// connection-local counter of [`Self::send`] and delivers the envelope
+    /// as built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterClientError::Frame`] when the envelope exceeds the
+    /// protocol frame limit, and [`CenterClientError::Send`] when the
+    /// transport fails.
+    pub async fn send_envelope(&mut self, envelope: Envelope) -> Result<(), CenterClientError> {
+        let frame = encode_frame(&envelope).map_err(CenterClientError::Frame)?;
+        self.ws
+            .send(Message::Binary(frame))
+            .await
+            .map_err(|source| CenterClientError::Send {
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    /// Waits for the next inbound envelope (0.7.0 S4).
+    ///
+    /// WebSocket control frames (ping, pong) are absorbed — the pong is
+    /// flushed to the wire — and `Ok(None)` reports a clean close of the
+    /// connection, which the engine treats as the reconnect trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterClientError::Frame`] when a binary message does not
+    /// decode as exactly one frame, [`CenterClientError::ProtocolViolation`]
+    /// for a non-binary data message, and [`CenterClientError::Transport`]
+    /// for transport failures.
+    pub async fn receive_envelope(&mut self) -> Result<Option<Envelope>, CenterClientError> {
+        loop {
+            match self.ws.next().await {
+                Some(Ok(message)) => {
+                    match inbound_frame(message).map_err(CenterClientError::Frame)? {
+                        InboundFrame::Envelope(envelope) => return Ok(Some(envelope)),
+                        InboundFrame::Control => {
+                            self.ws
+                                .flush()
+                                .await
+                                .map_err(|source| CenterClientError::Flush {
+                                    source: Box::new(source),
+                                })?;
+                        }
+                        InboundFrame::Closed => return Ok(None),
+                        InboundFrame::ProtocolViolation => {
+                            return Err(CenterClientError::ProtocolViolation);
+                        }
+                    }
+                }
+                Some(Err(source)) => {
+                    return Err(CenterClientError::Transport {
+                        source: Box::new(source),
+                    });
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
     /// Consumes the connection: sends one [`Heartbeat`] every heartbeat
     /// interval and dispatches every center frame to `handler`. The loop
     /// ends when the transport closes or fails — the site then reconnects
@@ -496,6 +561,7 @@ pub enum CenterClientError {
 mod tests {
     use std::{error::Error, io, mem, time::Duration};
 
+    use rutilus_application::{CenterSession, CenterTransport};
     use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage, Heartbeat};
     use rutilus_domain::{CertificateFingerprint, InstanceId};
     use rutilus_platform::RuntimePaths;
@@ -790,6 +856,70 @@ mod tests {
         let stop = async {};
         let result = config.connect_with_retry(stop).await;
         assert!(matches!(result, Err(CenterClientError::StopRequested)));
+        Ok(())
+    }
+
+    /// The center-side handler that records every received frame and
+    /// answers it with one Heartbeat, so the site's session receive has
+    /// something to read.
+    struct HeartbeatEcho(tokio::sync::mpsc::Sender<Envelope>);
+
+    impl CenterFrameHandler<CenterConnection> for HeartbeatEcho {
+        async fn on_frame(&mut self, connection: &mut CenterConnection, envelope: Envelope) {
+            let _ = self.0.send(envelope).await;
+            let _ = connection
+                .send(EnvelopeMessage::Heartbeat(Heartbeat { sent_at_unix: 123 }))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_transport_adapter_preserves_envelopes_and_receives_frames()
+    -> Result<(), Box<dyn Error>> {
+        // The application boundary (0.7.0 S4): connect through the
+        // CenterTransport trait, send an envelope whose durable sequence the
+        // engine assigned, and receive the center's reply on the session.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let (mut acceptor, _) = bind_acceptor(&paths).await?;
+        let site = InstanceId::generate();
+        let identity = issued_identity(&acceptor, site)?;
+        let config = site_config(&acceptor, &identity, site)?;
+
+        let (center_frames, mut center_rx) = tokio::sync::mpsc::channel(4);
+        let center: tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> =
+            tokio::spawn(async move {
+                let connection = acceptor.accept().await?;
+                connection.run(HeartbeatEcho(center_frames)).await?;
+                Ok(())
+            });
+
+        let mut session = CenterTransport::connect(&config).await?;
+        // The envelope carries the durable outbox sequence; the transport
+        // must deliver it exactly as given.
+        let sent = Envelope {
+            sequence: 42,
+            acked_sequence: 7,
+            message: Some(EnvelopeMessage::Ack(Ack { sequence: 42 })),
+        };
+        session.send(sent.clone()).await?;
+        let received = center_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("no frame reached the center"))?;
+        assert_eq!(received, sent);
+
+        // The center's echo reply arrives on the session's receive.
+        let reply = session
+            .receive()
+            .await?
+            .ok_or_else(|| io::Error::other("the session ended before the reply"))?;
+        assert!(matches!(
+            reply.message,
+            Some(EnvelopeMessage::Heartbeat(Heartbeat { sent_at_unix: 123 }))
+        ));
+
+        center.abort();
         Ok(())
     }
 
