@@ -1,0 +1,2165 @@
+//! The 0.7.0 center-shape storage vocabulary (design §17, D2/D4/D6).
+//!
+//! This module carries the pure domain types of the site-to-center shape:
+//! the registered deployment [`SiteInstance`] (D6 — on the center side an
+//! instance names a registered site, on the site side it names the site's
+//! own identity), the [`CenterBinding`] with its Pending → Bound → Revoked
+//! state machine and one-time [`BindingCode`] (D2 — only the SHA-256 hash is
+//! ever persisted, with a short TTL), the [`OutboxEntry`] and [`InboxEntry`]
+//! envelope queues with their state machines (D4 storage only — the
+//! transport itself is a later slice), and the per-stream [`SyncCursor`].
+//!
+//! State changes are driven exclusively by the explicit transition functions
+//! (§7.1): `center_binding_transition`, `outbox_transition`, and
+//! `inbox_transition`; there is no other path that changes a stored state.
+//! A string stored in the database is rehydrated with the `FromStr` code
+//! parsers, but changing it still requires a legal transition.
+//!
+//! The payload columns of both queues hold the serde JSON serialization of a
+//! `center-protocol` `Envelope` — the §9.4 `TypedPayloadJson` rule: they can
+//! only ever come from a type successfully serialized, never from arbitrary
+//! hand-written JSON, and this crate does not parse the structure (the
+//! protocol crate owns the type, so the payload is carried here as opaque
+//! text exactly like `resource_snapshots.typed_payload_json`).
+
+use std::{error::Error, fmt, str::FromStr};
+
+use sha2::{Digest, Sha256};
+use time::{Duration, OffsetDateTime};
+
+use crate::{
+    CenterBindingId, CertificateFingerprint, InboxEntryId, InstanceId, OperationId, OutboxEntryId,
+    SyncCursorId,
+};
+
+/// How long an outstanding binding code stays valid after it is issued:
+/// 15 minutes (design D2 — the short TTL bounds the window in which a leaked
+/// or intercepted code can still claim the site).
+pub const BINDING_CODE_TTL: Duration = Duration::minutes(15);
+
+/// Number of characters in every binding code (design D2).
+pub const BINDING_CODE_CHARACTERS: usize = 20;
+
+/// The unambiguous base32 alphabet shared with the §16.2 bootstrap codes:
+/// the RFC 4648 alphabet with `0`, `O`, `1`, and `I` removed, so no
+/// handwritten code can be misread.
+const CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+/// A one-time site-to-center binding code (design D2).
+///
+/// The code is 20 characters drawn uniformly from the unambiguous base32
+/// alphabet — 100 bits of entropy, the same floor as the §16.2 bootstrap
+/// codes — and only its SHA-256 hash is ever persisted
+/// (`center_bindings.binding_code_hash`). The raw code is generated here,
+/// shown to the operator exactly once, and never stored anywhere.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingCode(String);
+
+impl BindingCode {
+    /// Generates a fresh one-time binding code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingCodeError::RandomnessUnavailable`] when the operating
+    /// system cannot supply cryptographically secure random bytes.
+    pub fn generate() -> Result<Self, BindingCodeError> {
+        let mut indices = [0_u8; BINDING_CODE_CHARACTERS];
+        getrandom::fill(&mut indices).map_err(BindingCodeError::RandomnessUnavailable)?;
+        let code = indices
+            .into_iter()
+            .map(|index| CODE_ALPHABET[usize::from(index) % CODE_ALPHABET.len()] as char)
+            .collect::<String>();
+        Ok(Self(code))
+    }
+
+    /// Returns the canonical (uppercase) code text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the SHA-256 hash of the canonical code form, the only
+    /// representation ever persisted (design D2).
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.0.as_bytes()).into()
+    }
+
+    /// Compares a stored hash against this code's hash in constant time, so
+    /// a comparison timing leak never shortens a guess.
+    #[must_use]
+    pub fn verify_hash(&self, stored: &[u8; 32]) -> bool {
+        constant_time_eq(&self.hash(), stored)
+    }
+}
+
+impl fmt::Display for BindingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Compares two 32-byte values without early exit, so the comparison always
+/// takes the same time no matter how many bytes differ.
+#[must_use]
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for (left_byte, right_byte) in left.iter().zip(right) {
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
+impl FromStr for BindingCode {
+    type Err = BindingCodeParseError;
+
+    /// Parses a presented code, normalizing it to the canonical uppercase
+    /// form so a presented code compares exactly like the code that was
+    /// printed.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_uppercase();
+        if normalized.len() != BINDING_CODE_CHARACTERS
+            || !normalized.bytes().all(|byte| CODE_ALPHABET.contains(&byte))
+        {
+            return Err(BindingCodeParseError);
+        }
+        Ok(Self(normalized))
+    }
+}
+
+/// A presented binding code is not in the canonical shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BindingCodeParseError;
+
+impl fmt::Display for BindingCodeParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "binding code must be {BINDING_CODE_CHARACTERS} characters of the unambiguous \
+             base32 alphabet"
+        )
+    }
+}
+
+impl Error for BindingCodeParseError {}
+
+/// A controlled failure while generating a binding code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingCodeError {
+    /// The operating system did not provide cryptographically secure randomness.
+    RandomnessUnavailable(getrandom::Error),
+}
+
+impl fmt::Display for BindingCodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RandomnessUnavailable(_) => {
+                formatter.write_str("cryptographic randomness is unavailable")
+            }
+        }
+    }
+}
+
+impl Error for BindingCodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RandomnessUnavailable(error) => Some(error),
+        }
+    }
+}
+
+/// The kind of one registered deployment instance (design D6).
+///
+/// The code returned by [`Self::as_str`] is the stable snake-case code used
+/// by persistence and protocols; it never changes across milestones.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InstanceKind {
+    /// A registered site (center side) or the site's own identity (site side).
+    Site,
+    /// The center's own identity row.
+    Center,
+}
+
+impl InstanceKind {
+    /// Returns the stable product code used by persistence and protocols.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Site => "site",
+            Self::Center => "center",
+        }
+    }
+}
+
+impl fmt::Display for InstanceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for InstanceKind {
+    type Err = InstanceKindParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "site" => Ok(Self::Site),
+            "center" => Ok(Self::Center),
+            _ => Err(InstanceKindParseError),
+        }
+    }
+}
+
+/// A persisted instance kind is unknown to this product build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstanceKindParseError;
+
+impl fmt::Display for InstanceKindParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown instance kind code")
+    }
+}
+
+impl Error for InstanceKindParseError {}
+
+/// One registered deployment identity (design D6).
+///
+/// On the center side a `SiteInstance` names one registered site; on the
+/// site side it names the site's own identity — a single-center binding
+/// means exactly one row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SiteInstance {
+    id: InstanceId,
+    display_name: String,
+    kind: InstanceKind,
+    created_at: OffsetDateTime,
+}
+
+impl SiteInstance {
+    #[must_use]
+    pub const fn new(
+        id: InstanceId,
+        display_name: String,
+        kind: InstanceKind,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            display_name,
+            kind,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> InstanceId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> InstanceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// The lifecycle phase of one site-to-center binding (design D2, D6).
+///
+/// The phase code returned by [`Self::as_str`] is the stable snake-case code
+/// used by persistence and protocols; it never changes across milestones.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CenterBindingState {
+    /// The site has registered and a one-time binding code is outstanding
+    /// (`expires_at` bounds its short TTL).
+    Pending,
+    /// The site presented the code and the center recorded the binding.
+    Bound,
+    /// The binding was revoked; the site must re-register to bind again.
+    Revoked,
+}
+
+impl CenterBindingState {
+    /// Returns the stable product code used by persistence and protocols.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Bound => "bound",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl fmt::Display for CenterBindingState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CenterBindingState {
+    type Err = CenterBindingStateParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "bound" => Ok(Self::Bound),
+            "revoked" => Ok(Self::Revoked),
+            _ => Err(CenterBindingStateParseError),
+        }
+    }
+}
+
+/// A persisted binding state is unknown to this product build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CenterBindingStateParseError;
+
+impl fmt::Display for CenterBindingStateParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown center binding state code")
+    }
+}
+
+impl Error for CenterBindingStateParseError {}
+
+/// The input event that drives the §17.2 binding state machine.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CenterBindingEvent {
+    /// The site presented the valid, unexpired binding code. Moves `Pending`
+    /// to `Bound`.
+    CodeAccepted,
+    /// The operator revoked the binding. Moves `Pending` or `Bound` to
+    /// `Revoked`.
+    Revoked,
+}
+
+impl CenterBindingEvent {
+    /// Returns a stable logging code for the event.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeAccepted => "code-accepted",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl fmt::Display for CenterBindingEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A state-machine step was attempted from a state in which the event cannot
+/// occur (§7.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidCenterBindingTransition {
+    from: CenterBindingState,
+    event: CenterBindingEvent,
+}
+
+impl InvalidCenterBindingTransition {
+    /// Returns the state the binding was in when the event was attempted.
+    #[must_use]
+    pub const fn from_state(self) -> CenterBindingState {
+        self.from
+    }
+
+    /// Returns the event that cannot occur in [`Self::from_state`].
+    #[must_use]
+    pub const fn event(self) -> CenterBindingEvent {
+        self.event
+    }
+}
+
+impl fmt::Display for InvalidCenterBindingTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "event {} cannot occur in center binding state {}",
+            self.event, self.from
+        )
+    }
+}
+
+impl Error for InvalidCenterBindingTransition {}
+
+/// Applies `event` to `current` and returns the next binding state (§7.1).
+///
+/// The matrix is fully enumerated: every `(state, event)` pair is named in an
+/// explicit arm with no wildcard.
+///
+/// # Errors
+///
+/// Returns [`InvalidCenterBindingTransition`] when the event cannot occur in
+/// the current state.
+pub const fn center_binding_transition(
+    current: CenterBindingState,
+    event: CenterBindingEvent,
+) -> Result<CenterBindingState, InvalidCenterBindingTransition> {
+    use CenterBindingEvent as Event;
+    use CenterBindingState as State;
+    match current {
+        State::Pending => match event {
+            Event::CodeAccepted => Ok(State::Bound),
+            Event::Revoked => Ok(State::Revoked),
+        },
+        State::Bound => match event {
+            Event::CodeAccepted => Err(invalid_center_binding_transition(current, event)),
+            Event::Revoked => Ok(State::Revoked),
+        },
+        State::Revoked => match event {
+            Event::CodeAccepted | Event::Revoked => {
+                Err(invalid_center_binding_transition(current, event))
+            }
+        },
+    }
+}
+
+const fn invalid_center_binding_transition(
+    current: CenterBindingState,
+    event: CenterBindingEvent,
+) -> InvalidCenterBindingTransition {
+    InvalidCenterBindingTransition {
+        from: current,
+        event,
+    }
+}
+
+/// Why a presented code cannot bind a pending registration (design D2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingCodeVerificationError {
+    /// The binding is not pending, so no code can bind it.
+    NotPending,
+    /// The outstanding code has expired at the verification time.
+    Expired,
+    /// The presented code does not match the outstanding code.
+    CodeMismatch,
+}
+
+impl fmt::Display for BindingCodeVerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPending => formatter.write_str("binding is not pending"),
+            Self::Expired => formatter.write_str("binding code has expired"),
+            Self::CodeMismatch => formatter.write_str("binding code does not match"),
+        }
+    }
+}
+
+impl Error for BindingCodeVerificationError {}
+
+/// Why persisted binding data cannot be mapped into valid product types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CenterBindingError {
+    /// The stored code hash is not exactly 32 bytes.
+    InvalidCodeHash,
+    /// The stored state does not match the stored code-hash, expiry, and
+    /// bound-time columns (the schema CHECK mirror).
+    InvalidStateShape,
+    /// The binding time precedes the creation time.
+    BoundBeforeCreation,
+    /// The code expiry precedes the creation time.
+    ExpiryBeforeCreation,
+}
+
+impl fmt::Display for CenterBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCodeHash => {
+                formatter.write_str("stored binding code hash is not 32 bytes")
+            }
+            Self::InvalidStateShape => {
+                formatter.write_str("stored binding columns do not match the binding state")
+            }
+            Self::BoundBeforeCreation => {
+                formatter.write_str("binding time cannot precede the creation time")
+            }
+            Self::ExpiryBeforeCreation => {
+                formatter.write_str("code expiry cannot precede the creation time")
+            }
+        }
+    }
+}
+
+impl Error for CenterBindingError {}
+
+/// One site-to-center binding record (design D2, D6).
+///
+/// The state is private and only changes through the explicit transition
+/// methods [`CenterBinding::bind`] and [`CenterBinding::revoke`], which route
+/// through the pure `center_binding_transition` matrix; there is no mutation
+/// path that could write an arbitrary state (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CenterBinding {
+    id: CenterBindingId,
+    center_url: String,
+    site_instance_id: InstanceId,
+    state: CenterBindingState,
+    binding_code_hash: Option<[u8; 32]>,
+    site_cert_fingerprint: Option<CertificateFingerprint>,
+    bound_at: Option<OffsetDateTime>,
+    expires_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+}
+
+impl CenterBinding {
+    /// Creates a pending binding: the site has registered with the center
+    /// and the one-time code is outstanding until `expires_at` (design D2).
+    ///
+    /// Only the hash of the issued code is stored, never the code itself.
+    #[must_use]
+    pub fn new_pending(
+        id: CenterBindingId,
+        center_url: String,
+        site_instance_id: InstanceId,
+        code: &BindingCode,
+        expires_at: OffsetDateTime,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            center_url,
+            site_instance_id,
+            state: CenterBindingState::Pending,
+            binding_code_hash: Some(code.hash()),
+            site_cert_fingerprint: None,
+            bound_at: None,
+            expires_at: Some(expires_at),
+            created_at,
+        }
+    }
+
+    /// Rehydrates a persisted binding record.
+    ///
+    /// This is the only way to construct a binding in a non-`Pending` state;
+    /// it is reserved for persistence loading, which must accept whatever
+    /// the database stored. The stored columns must match the state shape
+    /// (the schema CHECK mirror), and transitions still go through the
+    /// `center_binding_transition` matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterBindingError`] when the stored columns violate the
+    /// binding invariants.
+    // The rehydration takes every stored column of the nine-column row; the
+    // full shape is the point of the validation (the allow-list lints accept
+    // the same exhaustive rehydration style).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_parts(
+        id: CenterBindingId,
+        center_url: String,
+        site_instance_id: InstanceId,
+        state: CenterBindingState,
+        binding_code_hash: Option<&[u8]>,
+        site_cert_fingerprint: Option<CertificateFingerprint>,
+        bound_at: Option<OffsetDateTime>,
+        expires_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+    ) -> Result<Self, CenterBindingError> {
+        let binding_code_hash = binding_code_hash
+            .map(<[u8; 32]>::try_from)
+            .transpose()
+            .map_err(|_| CenterBindingError::InvalidCodeHash)?;
+        let shape_matches = match state {
+            CenterBindingState::Pending => {
+                binding_code_hash.is_some() && expires_at.is_some() && bound_at.is_none()
+            }
+            CenterBindingState::Bound => {
+                binding_code_hash.is_none() && expires_at.is_none() && bound_at.is_some()
+            }
+            CenterBindingState::Revoked => binding_code_hash.is_none() && expires_at.is_none(),
+        };
+        if !shape_matches {
+            return Err(CenterBindingError::InvalidStateShape);
+        }
+        if bound_at.is_some_and(|bound_at| bound_at < created_at) {
+            return Err(CenterBindingError::BoundBeforeCreation);
+        }
+        if expires_at.is_some_and(|expires_at| expires_at < created_at) {
+            return Err(CenterBindingError::ExpiryBeforeCreation);
+        }
+        Ok(Self {
+            id,
+            center_url,
+            site_instance_id,
+            state,
+            binding_code_hash,
+            site_cert_fingerprint,
+            bound_at,
+            expires_at,
+            created_at,
+        })
+    }
+
+    /// Binds the site at `now`: the presented code was accepted, the code is
+    /// consumed (its hash and expiry are cleared), and the binding time and
+    /// site certificate fingerprint are recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidCenterBindingTransition`] when the binding is not
+    /// pending; the binding is then left completely unchanged.
+    pub fn bind(
+        &mut self,
+        site_cert_fingerprint: Option<CertificateFingerprint>,
+        now: OffsetDateTime,
+    ) -> Result<(), InvalidCenterBindingTransition> {
+        let next = center_binding_transition(self.state, CenterBindingEvent::CodeAccepted)?;
+        self.state = next;
+        self.binding_code_hash = None;
+        self.expires_at = None;
+        self.site_cert_fingerprint = site_cert_fingerprint;
+        self.bound_at = Some(now);
+        Ok(())
+    }
+
+    /// Revokes the binding: the outstanding code (if any) is consumed and
+    /// the binding becomes terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidCenterBindingTransition`] when the binding is already
+    /// revoked; the binding is then left completely unchanged.
+    pub fn revoke(&mut self) -> Result<(), InvalidCenterBindingTransition> {
+        let next = center_binding_transition(self.state, CenterBindingEvent::Revoked)?;
+        self.state = next;
+        self.binding_code_hash = None;
+        self.expires_at = None;
+        Ok(())
+    }
+
+    /// Verifies a presented code against this binding at `now` (design D2):
+    /// the binding must be pending, the code must not be expired, and the
+    /// presented code's hash must match the stored hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingCodeVerificationError`] when the binding is not
+    /// pending, the code is expired, or the presented code does not match.
+    pub fn verify_code(
+        &self,
+        presented: &BindingCode,
+        now: OffsetDateTime,
+    ) -> Result<(), BindingCodeVerificationError> {
+        if self.state != CenterBindingState::Pending {
+            return Err(BindingCodeVerificationError::NotPending);
+        }
+        if self.is_expired(now) {
+            return Err(BindingCodeVerificationError::Expired);
+        }
+        let stored = self
+            .binding_code_hash
+            .ok_or(BindingCodeVerificationError::CodeMismatch)?;
+        if !presented.verify_hash(&stored) {
+            return Err(BindingCodeVerificationError::CodeMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reports whether the outstanding binding code has expired at `now`.
+    ///
+    /// A non-pending binding has no outstanding code and is never "expired"
+    /// by this judgment; the state machine rules its lifecycle instead.
+    #[must_use]
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.expires_at.is_some_and(|expires_at| now > expires_at)
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> CenterBindingId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn center_url(&self) -> &str {
+        &self.center_url
+    }
+
+    #[must_use]
+    pub const fn site_instance_id(&self) -> InstanceId {
+        self.site_instance_id
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> CenterBindingState {
+        self.state
+    }
+
+    /// Returns the stored hash of the outstanding code; present only while
+    /// pending (the code is consumed when the binding binds or revokes).
+    #[must_use]
+    pub const fn binding_code_hash(&self) -> Option<[u8; 32]> {
+        self.binding_code_hash
+    }
+
+    #[must_use]
+    pub const fn site_cert_fingerprint(&self) -> Option<CertificateFingerprint> {
+        self.site_cert_fingerprint
+    }
+
+    #[must_use]
+    pub const fn bound_at(&self) -> Option<OffsetDateTime> {
+        self.bound_at
+    }
+
+    /// Returns when the outstanding code expires; present only while pending.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<OffsetDateTime> {
+        self.expires_at
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// The lifecycle phase of one outbound envelope (design §17, D4).
+///
+/// The phase code returned by [`Self::as_str`] is the stable snake-case code
+/// used by persistence and protocols; it never changes across milestones.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OutboxEntryState {
+    /// The envelope is queued for delivery.
+    Pending,
+    /// The center acknowledged the envelope (§15.2 `Ack`).
+    Acked,
+}
+
+impl OutboxEntryState {
+    /// Returns the stable product code used by persistence and protocols.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Acked => "acked",
+        }
+    }
+}
+
+impl fmt::Display for OutboxEntryState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OutboxEntryState {
+    type Err = OutboxEntryStateParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "acked" => Ok(Self::Acked),
+            _ => Err(OutboxEntryStateParseError),
+        }
+    }
+}
+
+/// A persisted outbox state is unknown to this product build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxEntryStateParseError;
+
+impl fmt::Display for OutboxEntryStateParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown outbox entry state code")
+    }
+}
+
+impl Error for OutboxEntryStateParseError {}
+
+/// The input event that drives the outbox state machine.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OutboxEvent {
+    /// The center acknowledged the envelope. Moves `Pending` to `Acked`.
+    Acknowledged,
+}
+
+impl OutboxEvent {
+    /// Returns a stable logging code for the event.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Acknowledged => "acknowledged",
+        }
+    }
+}
+
+impl fmt::Display for OutboxEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A state-machine step was attempted from a state in which the event cannot
+/// occur (§7.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidOutboxTransition {
+    from: OutboxEntryState,
+    event: OutboxEvent,
+}
+
+impl InvalidOutboxTransition {
+    /// Returns the state the entry was in when the event was attempted.
+    #[must_use]
+    pub const fn from_state(self) -> OutboxEntryState {
+        self.from
+    }
+
+    /// Returns the event that cannot occur in [`Self::from_state`].
+    #[must_use]
+    pub const fn event(self) -> OutboxEvent {
+        self.event
+    }
+}
+
+impl fmt::Display for InvalidOutboxTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "event {} cannot occur in outbox entry state {}",
+            self.event, self.from
+        )
+    }
+}
+
+impl Error for InvalidOutboxTransition {}
+
+/// Applies `event` to `current` and returns the next outbox state (§7.1).
+///
+/// # Errors
+///
+/// Returns [`InvalidOutboxTransition`] when the event cannot occur in the
+/// current state.
+pub const fn outbox_transition(
+    current: OutboxEntryState,
+    event: OutboxEvent,
+) -> Result<OutboxEntryState, InvalidOutboxTransition> {
+    use OutboxEntryState as State;
+    use OutboxEvent as Event;
+    match current {
+        State::Pending => match event {
+            Event::Acknowledged => Ok(State::Acked),
+        },
+        State::Acked => match event {
+            Event::Acknowledged => Err(invalid_outbox_transition(current, event)),
+        },
+    }
+}
+
+const fn invalid_outbox_transition(
+    current: OutboxEntryState,
+    event: OutboxEvent,
+) -> InvalidOutboxTransition {
+    InvalidOutboxTransition {
+        from: current,
+        event,
+    }
+}
+
+/// Why persisted outbox data cannot be mapped into valid product types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboxEntryError {
+    /// The retry count is negative.
+    NegativeRetryCount,
+    /// An acked entry does not carry its acknowledgement time, or a pending
+    /// entry does.
+    InvalidAckPairing,
+    /// The acknowledgement time precedes the creation time.
+    AckBeforeCreation,
+}
+
+impl fmt::Display for OutboxEntryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeRetryCount => {
+                formatter.write_str("outbox retry count cannot be negative")
+            }
+            Self::InvalidAckPairing => {
+                formatter.write_str("outbox entry state does not match the ack time")
+            }
+            Self::AckBeforeCreation => {
+                formatter.write_str("outbox ack time cannot precede the creation time")
+            }
+        }
+    }
+}
+
+impl Error for OutboxEntryError {}
+
+/// One envelope queued for delivery to the center (design §17, D4).
+///
+/// `payload_json` holds the §9.4 `TypedPayloadJson` serialization of a
+/// `center-protocol` `Envelope`; `sequence` is the envelope's per-instance
+/// sequence number. The state is private and only changes through
+/// [`OutboxEntry::ack`], which routes through the pure `outbox_transition`
+/// matrix (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxEntry {
+    id: OutboxEntryId,
+    instance_id: InstanceId,
+    sequence: i64,
+    payload_json: String,
+    state: OutboxEntryState,
+    retry_count: i64,
+    created_at: OffsetDateTime,
+    acked_at: Option<OffsetDateTime>,
+}
+
+impl OutboxEntry {
+    /// Queues a new outbound envelope in the `Pending` state.
+    #[must_use]
+    pub fn new(
+        id: OutboxEntryId,
+        instance_id: InstanceId,
+        sequence: i64,
+        payload_json: String,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            instance_id,
+            sequence,
+            payload_json,
+            state: OutboxEntryState::Pending,
+            retry_count: 0,
+            created_at,
+            acked_at: None,
+        }
+    }
+
+    /// Rehydrates a persisted outbox record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboxEntryError`] when the stored columns violate the
+    /// outbox invariants.
+    // The rehydration takes every stored column of the eight-column row; the
+    // full shape is the point of the validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_parts(
+        id: OutboxEntryId,
+        instance_id: InstanceId,
+        sequence: i64,
+        payload_json: String,
+        state: OutboxEntryState,
+        retry_count: i64,
+        created_at: OffsetDateTime,
+        acked_at: Option<OffsetDateTime>,
+    ) -> Result<Self, OutboxEntryError> {
+        if retry_count < 0 {
+            return Err(OutboxEntryError::NegativeRetryCount);
+        }
+        match (state, acked_at) {
+            (OutboxEntryState::Pending, Some(_)) | (OutboxEntryState::Acked, None) => {
+                return Err(OutboxEntryError::InvalidAckPairing);
+            }
+            _ => {}
+        }
+        if acked_at.is_some_and(|acked_at| acked_at < created_at) {
+            return Err(OutboxEntryError::AckBeforeCreation);
+        }
+        Ok(Self {
+            id,
+            instance_id,
+            sequence,
+            payload_json,
+            state,
+            retry_count,
+            created_at,
+            acked_at,
+        })
+    }
+
+    /// Marks the envelope acknowledged at `now`: the center's `Ack` arrived
+    /// and the entry leaves the delivery queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidOutboxTransition`] when the entry is already acked;
+    /// the entry is then left completely unchanged.
+    pub fn ack(&mut self, now: OffsetDateTime) -> Result<(), InvalidOutboxTransition> {
+        let next = outbox_transition(self.state, OutboxEvent::Acknowledged)?;
+        self.state = next;
+        self.acked_at = Some(now);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> OutboxEntryId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> i64 {
+        self.sequence
+    }
+
+    /// Returns the §9.4 `TypedPayloadJson` serialization of the envelope.
+    #[must_use]
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> OutboxEntryState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn retry_count(&self) -> i64 {
+        self.retry_count
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn acked_at(&self) -> Option<OffsetDateTime> {
+        self.acked_at
+    }
+}
+
+/// The lifecycle phase of one inbound envelope (design §17, D4).
+///
+/// The phase code returned by [`Self::as_str`] is the stable snake-case code
+/// used by persistence and protocols; it never changes across milestones.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InboxEntryState {
+    /// The envelope was received and nothing has been decided yet.
+    Received,
+    /// The offered operation was accepted and is being executed.
+    Accepted,
+    /// The offered operation was rejected; the outcome is final.
+    Rejected,
+    /// The accepted operation completed; the outcome is final.
+    Completed,
+}
+
+impl InboxEntryState {
+    /// Returns the stable product code used by persistence and protocols.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Completed => "completed",
+        }
+    }
+
+    /// Reports whether the entry lifecycle has finished: `Rejected` and
+    /// `Completed` absorb every further event.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Rejected | Self::Completed)
+    }
+}
+
+impl fmt::Display for InboxEntryState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for InboxEntryState {
+    type Err = InboxEntryStateParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "received" => Ok(Self::Received),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "completed" => Ok(Self::Completed),
+            _ => Err(InboxEntryStateParseError),
+        }
+    }
+}
+
+/// A persisted inbox state is unknown to this product build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboxEntryStateParseError;
+
+impl fmt::Display for InboxEntryStateParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown inbox entry state code")
+    }
+}
+
+impl Error for InboxEntryStateParseError {}
+
+/// The input event that drives the inbox state machine.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InboxEvent {
+    /// The site accepted the offered operation and started executing it.
+    /// Moves `Received` to `Accepted`.
+    Accepted,
+    /// The site rejected the offered operation. Moves `Received` to
+    /// `Rejected`.
+    Rejected,
+    /// The accepted operation finished. Moves `Accepted` to `Completed`.
+    Completed,
+}
+
+impl InboxEvent {
+    /// Returns a stable logging code for the event.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Completed => "completed",
+        }
+    }
+
+    /// Returns the only state this event is legal in: the state the entry
+    /// must carry before the transition.
+    #[must_use]
+    pub const fn from_state(self) -> InboxEntryState {
+        match self {
+            Self::Accepted | Self::Rejected => InboxEntryState::Received,
+            Self::Completed => InboxEntryState::Accepted,
+        }
+    }
+
+    /// Returns the state this event moves the entry to.
+    #[must_use]
+    pub const fn to_state(self) -> InboxEntryState {
+        match self {
+            Self::Accepted => InboxEntryState::Accepted,
+            Self::Rejected => InboxEntryState::Rejected,
+            Self::Completed => InboxEntryState::Completed,
+        }
+    }
+}
+
+impl fmt::Display for InboxEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A state-machine step was attempted from a state in which the event cannot
+/// occur (§7.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidInboxTransition {
+    from: InboxEntryState,
+    event: InboxEvent,
+}
+
+impl InvalidInboxTransition {
+    /// Returns the state the entry was in when the event was attempted.
+    #[must_use]
+    pub const fn from_state(self) -> InboxEntryState {
+        self.from
+    }
+
+    /// Returns the event that cannot occur in [`Self::from_state`].
+    #[must_use]
+    pub const fn event(self) -> InboxEvent {
+        self.event
+    }
+}
+
+impl fmt::Display for InvalidInboxTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "event {} cannot occur in inbox entry state {}",
+            self.event, self.from
+        )
+    }
+}
+
+impl Error for InvalidInboxTransition {}
+
+/// Applies `event` to `current` and returns the next inbox state (§7.1).
+///
+/// The matrix is fully enumerated: every `(state, event)` pair is named in an
+/// explicit arm with no wildcard.
+///
+/// # Errors
+///
+/// Returns [`InvalidInboxTransition`] when the event cannot occur in the
+/// current state.
+pub const fn inbox_transition(
+    current: InboxEntryState,
+    event: InboxEvent,
+) -> Result<InboxEntryState, InvalidInboxTransition> {
+    use InboxEntryState as State;
+    use InboxEvent as Event;
+    match current {
+        State::Received => match event {
+            Event::Accepted => Ok(State::Accepted),
+            Event::Rejected => Ok(State::Rejected),
+            Event::Completed => Err(invalid_inbox_transition(current, event)),
+        },
+        State::Accepted => match event {
+            Event::Completed => Ok(State::Completed),
+            Event::Accepted | Event::Rejected => Err(invalid_inbox_transition(current, event)),
+        },
+        State::Rejected | State::Completed => match event {
+            Event::Accepted | Event::Rejected | Event::Completed => {
+                Err(invalid_inbox_transition(current, event))
+            }
+        },
+    }
+}
+
+const fn invalid_inbox_transition(
+    current: InboxEntryState,
+    event: InboxEvent,
+) -> InvalidInboxTransition {
+    InvalidInboxTransition {
+        from: current,
+        event,
+    }
+}
+
+/// One envelope received from the center (design §17, D4).
+///
+/// `operation_id` is the §17.5 idempotency key — the same operation id must
+/// never execute twice — and `expires_at` bounds how long the offered
+/// operation stays actionable. The state is private and only changes through
+/// the transition methods, which route through the pure `inbox_transition`
+/// matrix (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InboxEntry {
+    id: InboxEntryId,
+    operation_id: OperationId,
+    instance_id: InstanceId,
+    payload_json: String,
+    state: InboxEntryState,
+    expires_at: OffsetDateTime,
+    received_at: OffsetDateTime,
+}
+
+impl InboxEntry {
+    /// Rehydrates a persisted inbox record in the `Received` state.
+    #[must_use]
+    pub fn new(
+        id: InboxEntryId,
+        operation_id: OperationId,
+        instance_id: InstanceId,
+        payload_json: String,
+        expires_at: OffsetDateTime,
+        received_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            operation_id,
+            instance_id,
+            payload_json,
+            state: InboxEntryState::Received,
+            expires_at,
+            received_at,
+        }
+    }
+
+    /// Rehydrates a persisted inbox record in whatever state the database
+    /// stored.
+    #[must_use]
+    pub fn from_parts(
+        id: InboxEntryId,
+        operation_id: OperationId,
+        instance_id: InstanceId,
+        payload_json: String,
+        state: InboxEntryState,
+        expires_at: OffsetDateTime,
+        received_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            operation_id,
+            instance_id,
+            payload_json,
+            state,
+            expires_at,
+            received_at,
+        }
+    }
+
+    /// Applies `event`, advancing the state machine.
+    ///
+    /// On success the state becomes `inbox_transition(state, event)`; on
+    /// [`InvalidInboxTransition`] the entry is left completely unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidInboxTransition`] when the event cannot occur in the
+    /// current state.
+    pub fn apply(&mut self, event: InboxEvent) -> Result<(), InvalidInboxTransition> {
+        let next = inbox_transition(self.state, event)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// Reports whether the offered operation has expired at `now`: past the
+    /// `expires_at` bound the offer is no longer actionable, and the
+    /// executor must not start it.
+    #[must_use]
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        now > self.expires_at
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> InboxEntryId {
+        self.id
+    }
+
+    /// Returns the §17.5 idempotency key of the operation.
+    #[must_use]
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    /// Returns the §9.4 `TypedPayloadJson` serialization of the envelope.
+    #[must_use]
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> InboxEntryState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+
+    #[must_use]
+    pub const fn received_at(&self) -> OffsetDateTime {
+        self.received_at
+    }
+}
+
+/// The §17.5 idempotency decision for an incoming operation id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdempotencyDecision {
+    /// No stored entry carries the operation id: the operation is new and
+    /// proceeds.
+    Proceed,
+    /// A stored entry is still being processed (`Received` or `Accepted`):
+    /// the duplicate must not start a second execution.
+    InProgress,
+    /// A stored entry reached its final outcome (`Rejected` or `Completed`):
+    /// the duplicate is answered with the recorded outcome instead of being
+    /// executed again.
+    AlreadyResolved(InboxEntryState),
+}
+
+/// Applies the §17.5 idempotency rule: the same `OperationId` stored twice
+/// must have exactly one business effect.
+#[must_use]
+pub fn decide_inbox_duplicate(existing: Option<InboxEntryState>) -> IdempotencyDecision {
+    match existing {
+        None => IdempotencyDecision::Proceed,
+        Some(InboxEntryState::Received | InboxEntryState::Accepted) => {
+            IdempotencyDecision::InProgress
+        }
+        Some(state) => IdempotencyDecision::AlreadyResolved(state),
+    }
+}
+
+/// The stable code of one site-to-center sync stream (design §17).
+///
+/// Each stream carries its own monotonic cursor so a reconnect resumes where
+/// the last acknowledged batch ended.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SyncStream {
+    /// Endpoint and resource snapshots.
+    Endpoint,
+    /// Endpoint health observations.
+    Health,
+    /// Redfish events.
+    Event,
+    /// Firmware artifacts.
+    Artifact,
+}
+
+impl SyncStream {
+    /// Returns the stable product code used by persistence and protocols.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Health => "health",
+            Self::Event => "event",
+            Self::Artifact => "artifact",
+        }
+    }
+}
+
+impl fmt::Display for SyncStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SyncStream {
+    type Err = SyncStreamParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "endpoint" => Ok(Self::Endpoint),
+            "health" => Ok(Self::Health),
+            "event" => Ok(Self::Event),
+            "artifact" => Ok(Self::Artifact),
+            _ => Err(SyncStreamParseError),
+        }
+    }
+}
+
+/// A persisted sync stream is unknown to this product build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyncStreamParseError;
+
+impl fmt::Display for SyncStreamParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown sync stream code")
+    }
+}
+
+impl Error for SyncStreamParseError {}
+
+/// One per-instance sync-stream cursor (design §17).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncCursor {
+    id: SyncCursorId,
+    instance_id: InstanceId,
+    stream: SyncStream,
+    cursor_value: String,
+    updated_at: OffsetDateTime,
+}
+
+impl SyncCursor {
+    #[must_use]
+    pub const fn new(
+        id: SyncCursorId,
+        instance_id: InstanceId,
+        stream: SyncStream,
+        cursor_value: String,
+        updated_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            id,
+            instance_id,
+            stream,
+            cursor_value,
+            updated_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> SyncCursorId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    #[must_use]
+    pub const fn stream(&self) -> SyncStream {
+        self.stream
+    }
+
+    #[must_use]
+    pub fn cursor_value(&self) -> &str {
+        &self.cursor_value
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> OffsetDateTime {
+        self.updated_at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use time::Duration;
+
+    use super::*;
+
+    /// Every binding state, so the matrix test cannot silently miss a variant.
+    const ALL_BINDING_STATES: [CenterBindingState; 3] = [
+        CenterBindingState::Pending,
+        CenterBindingState::Bound,
+        CenterBindingState::Revoked,
+    ];
+
+    /// Every binding event, so the matrix test cannot silently miss a variant.
+    const ALL_BINDING_EVENTS: [CenterBindingEvent; 2] = [
+        CenterBindingEvent::CodeAccepted,
+        CenterBindingEvent::Revoked,
+    ];
+
+    /// The complete binding transition table: 3 legal moves out of the 6
+    /// `(state, event)` pairs. Every other pair must be rejected.
+    const LEGAL_BINDING_TRANSITIONS: [(
+        CenterBindingState,
+        CenterBindingEvent,
+        CenterBindingState,
+    ); 3] = [
+        (
+            CenterBindingState::Pending,
+            CenterBindingEvent::CodeAccepted,
+            CenterBindingState::Bound,
+        ),
+        (
+            CenterBindingState::Pending,
+            CenterBindingEvent::Revoked,
+            CenterBindingState::Revoked,
+        ),
+        (
+            CenterBindingState::Bound,
+            CenterBindingEvent::Revoked,
+            CenterBindingState::Revoked,
+        ),
+    ];
+
+    fn issued_code() -> BindingCode {
+        BindingCode(String::from("23456789ABCDEFGHJKLM"))
+    }
+
+    fn pending_binding(
+        code: &BindingCode,
+        created_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> CenterBinding {
+        CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            String::from("https://center.example"),
+            InstanceId::generate(),
+            code,
+            expires_at,
+            created_at,
+        )
+    }
+
+    #[test]
+    fn binding_codes_are_exactly_20_characters_of_the_unambiguous_alphabet()
+    -> Result<(), Box<dyn Error>> {
+        for _ in 0..64 {
+            let code = BindingCode::generate()?;
+            assert_eq!(code.as_str().len(), BINDING_CODE_CHARACTERS);
+            assert!(
+                code.as_str()
+                    .bytes()
+                    .all(|byte| CODE_ALPHABET.contains(&byte)),
+                "every character must come from the unambiguous alphabet"
+            );
+            assert!(
+                !code
+                    .as_str()
+                    .bytes()
+                    .any(|byte| matches!(byte, b'0' | b'O' | b'1' | b'I')),
+                "the confusable characters must never appear"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn binding_code_hashing_is_deterministic_and_normalizes_case() -> Result<(), Box<dyn Error>> {
+        let first = BindingCode::generate()?;
+        let second = BindingCode::generate()?;
+
+        assert_ne!(first, second);
+        assert_eq!(first.hash(), first.hash());
+        assert_ne!(first.hash(), second.hash());
+        assert_eq!(first.hash().len(), 32);
+        assert!(
+            first.verify_hash(&first.hash()),
+            "a code must verify against its own hash"
+        );
+        assert!(!first.verify_hash(&second.hash()));
+
+        // The parser normalizes a presented code to the canonical uppercase
+        // form, so the hash of the parsed form is the stored contract.
+        let lowercase = first.as_str().to_ascii_lowercase();
+        let parsed: BindingCode = lowercase.parse()?;
+        assert_eq!(parsed, first);
+        assert_eq!(parsed.hash(), first.hash());
+        Ok(())
+    }
+
+    #[test]
+    fn binding_code_parse_refuses_unknown_characters_and_lengths() {
+        assert_eq!("short".parse::<BindingCode>(), Err(BindingCodeParseError));
+        assert_eq!(
+            "00000000000000000000".parse::<BindingCode>(),
+            Err(BindingCodeParseError),
+            "the confusable digits are not alphabet members"
+        );
+        assert_eq!(
+            "IIIIIIIIIIIIIIIIIIII".parse::<BindingCode>(),
+            Err(BindingCodeParseError),
+            "the confusable letter I is not an alphabet member"
+        );
+        assert_eq!(
+            "23456789ABCDEFGHJKLMN".parse::<BindingCode>(),
+            Err(BindingCodeParseError),
+            "21 characters are too long"
+        );
+        // Surrounding whitespace is trimmed before validation.
+        let code = issued_code();
+        assert_eq!(format!("  {code}  ").parse::<BindingCode>(), Ok(code));
+    }
+
+    #[test]
+    fn binding_state_and_event_codes_round_trip_and_reject_unknown_values() {
+        for state in ALL_BINDING_STATES {
+            let code = state.as_str();
+            assert!(
+                !code.is_empty(),
+                "center binding state codes must not be empty"
+            );
+            assert_eq!(code.parse(), Ok(state));
+            assert_eq!(state.to_string(), code);
+        }
+        assert_eq!(
+            "binding".parse::<CenterBindingState>(),
+            Err(CenterBindingStateParseError)
+        );
+        for event in ALL_BINDING_EVENTS {
+            assert!(!event.as_str().is_empty());
+            assert_eq!(event.to_string(), event.as_str());
+        }
+    }
+
+    #[test]
+    fn binding_transition_matrix_is_exhaustive_and_consistent() {
+        for from in ALL_BINDING_STATES {
+            for event in ALL_BINDING_EVENTS {
+                let result = center_binding_transition(from, event);
+                match LEGAL_BINDING_TRANSITIONS
+                    .iter()
+                    .find(|&&(legal_from, legal_event, _)| {
+                        legal_from == from && legal_event == event
+                    }) {
+                    Some(&(_, _, to)) => assert_eq!(
+                        result,
+                        Ok(to),
+                        "transition from {from} on event {event} must reach {to}"
+                    ),
+                    None => assert_eq!(
+                        result,
+                        Err(InvalidCenterBindingTransition { from, event }),
+                        "transition from {from} on event {event} must be rejected"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binding_walks_pending_to_bound_to_revoked_and_absorbs_repeat_events()
+    -> Result<(), Box<dyn Error>> {
+        let base = OffsetDateTime::now_utc();
+        let code = issued_code();
+        let mut binding = pending_binding(&code, base, base + BINDING_CODE_TTL);
+        assert_eq!(binding.state(), CenterBindingState::Pending);
+        assert_eq!(binding.binding_code_hash(), Some(code.hash()));
+        assert_eq!(binding.bound_at(), None);
+        assert!(!binding.is_expired(base));
+
+        // A pending binding can revoke without ever binding.
+        let mut revoked_early = pending_binding(&code, base, base + BINDING_CODE_TTL);
+        revoked_early.revoke()?;
+        assert_eq!(revoked_early.state(), CenterBindingState::Revoked);
+        assert_eq!(revoked_early.binding_code_hash(), None);
+        assert!(matches!(
+            revoked_early.revoke(),
+            Err(InvalidCenterBindingTransition {
+                from: CenterBindingState::Revoked,
+                event: CenterBindingEvent::Revoked,
+            })
+        ));
+
+        // The code binds the site and is consumed.
+        let bound_at = base + Duration::MINUTE;
+        binding.bind(None, bound_at)?;
+        assert_eq!(binding.state(), CenterBindingState::Bound);
+        assert_eq!(binding.bound_at(), Some(bound_at));
+        assert_eq!(
+            binding.binding_code_hash(),
+            None,
+            "the one-time code must be consumed by the bind"
+        );
+        assert_eq!(binding.expires_at(), None);
+        assert!(!binding.is_expired(bound_at));
+        assert!(matches!(
+            binding.bind(None, bound_at + Duration::SECOND),
+            Err(InvalidCenterBindingTransition {
+                from: CenterBindingState::Bound,
+                event: CenterBindingEvent::CodeAccepted,
+            })
+        ));
+
+        binding.revoke()?;
+        assert_eq!(binding.state(), CenterBindingState::Revoked);
+        assert!(matches!(
+            binding.revoke(),
+            Err(InvalidCenterBindingTransition {
+                from: CenterBindingState::Revoked,
+                event: CenterBindingEvent::Revoked,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn verify_code_accepts_the_issued_code_and_refuses_mismatches() -> Result<(), Box<dyn Error>> {
+        let base = OffsetDateTime::now_utc();
+        let code = issued_code();
+        let binding = pending_binding(&code, base, base + BINDING_CODE_TTL);
+        assert_eq!(binding.verify_code(&code, base), Ok(()));
+        assert_eq!(
+            binding.verify_code(&BindingCode::generate()?, base),
+            Err(BindingCodeVerificationError::CodeMismatch)
+        );
+        assert_eq!(
+            binding.verify_code(&code, base + BINDING_CODE_TTL + Duration::SECOND),
+            Err(BindingCodeVerificationError::Expired)
+        );
+
+        let mut bound = binding;
+        bound.bind(None, base + Duration::MINUTE)?;
+        assert_eq!(
+            bound.verify_code(&code, base + Duration::MINUTE),
+            Err(BindingCodeVerificationError::NotPending)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binding_rehydration_validates_the_stored_shape() -> Result<(), Box<dyn Error>> {
+        let base = OffsetDateTime::now_utc();
+        let code = issued_code();
+        let hash = code.hash();
+
+        // The pending shape round-trips.
+        let pending = CenterBinding::try_from_parts(
+            CenterBindingId::generate(),
+            String::from("https://center.example"),
+            InstanceId::generate(),
+            CenterBindingState::Pending,
+            Some(&hash),
+            None,
+            None,
+            Some(base + BINDING_CODE_TTL),
+            base,
+        )?;
+        assert_eq!(pending.state(), CenterBindingState::Pending);
+
+        // The bound shape round-trips.
+        let bound = CenterBinding::try_from_parts(
+            CenterBindingId::generate(),
+            String::from("https://center.example"),
+            InstanceId::generate(),
+            CenterBindingState::Bound,
+            None,
+            Some(CertificateFingerprint::from_bytes([0xAA; 32])),
+            Some(base + Duration::MINUTE),
+            None,
+            base,
+        )?;
+        assert_eq!(bound.state(), CenterBindingState::Bound);
+        assert_eq!(
+            bound.binding_code_hash(),
+            None,
+            "a bound binding must not carry the consumed code hash"
+        );
+
+        // A pending row with a short hash is corrupt.
+        assert!(matches!(
+            CenterBinding::try_from_parts(
+                CenterBindingId::generate(),
+                String::from("https://center.example"),
+                InstanceId::generate(),
+                CenterBindingState::Pending,
+                Some(&hash[..31]),
+                None,
+                None,
+                Some(base + BINDING_CODE_TTL),
+                base,
+            ),
+            Err(CenterBindingError::InvalidCodeHash)
+        ));
+        // A bound row still carrying the code hash contradicts the shape.
+        assert_eq!(
+            CenterBinding::try_from_parts(
+                CenterBindingId::generate(),
+                String::from("https://center.example"),
+                InstanceId::generate(),
+                CenterBindingState::Bound,
+                Some(&hash),
+                None,
+                Some(base + Duration::MINUTE),
+                None,
+                base,
+            ),
+            Err(CenterBindingError::InvalidStateShape)
+        );
+        // A pending row whose bound time is set contradicts the shape.
+        assert_eq!(
+            CenterBinding::try_from_parts(
+                CenterBindingId::generate(),
+                String::from("https://center.example"),
+                InstanceId::generate(),
+                CenterBindingState::Pending,
+                Some(&hash),
+                None,
+                Some(base),
+                Some(base + BINDING_CODE_TTL),
+                base,
+            ),
+            Err(CenterBindingError::InvalidStateShape)
+        );
+        // A bound time before creation is a broken timeline.
+        assert_eq!(
+            CenterBinding::try_from_parts(
+                CenterBindingId::generate(),
+                String::from("https://center.example"),
+                InstanceId::generate(),
+                CenterBindingState::Bound,
+                None,
+                None,
+                Some(base - Duration::SECOND),
+                None,
+                base,
+            ),
+            Err(CenterBindingError::BoundBeforeCreation)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn instance_kind_codes_round_trip_and_reject_unknown_values() {
+        for kind in [InstanceKind::Site, InstanceKind::Center] {
+            assert_eq!(kind.as_str().parse(), Ok(kind));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(
+            "standalone".parse::<InstanceKind>(),
+            Err(InstanceKindParseError),
+            "a standalone deployment is not an instance kind"
+        );
+    }
+
+    #[test]
+    fn outbox_state_codes_round_trip_and_ack_is_a_single_transition() -> Result<(), Box<dyn Error>>
+    {
+        for state in [OutboxEntryState::Pending, OutboxEntryState::Acked] {
+            assert_eq!(state.as_str().parse(), Ok(state));
+        }
+        assert_eq!(
+            "sent".parse::<OutboxEntryState>(),
+            Err(OutboxEntryStateParseError)
+        );
+
+        let base = OffsetDateTime::now_utc();
+        let mut entry = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            InstanceId::generate(),
+            1,
+            String::from(r#"{"sequence":1}"#),
+            base,
+        );
+        assert_eq!(entry.state(), OutboxEntryState::Pending);
+        assert_eq!(entry.retry_count(), 0);
+        assert_eq!(entry.acked_at(), None);
+
+        let acked_at = base + Duration::SECOND;
+        entry.ack(acked_at)?;
+        assert_eq!(entry.state(), OutboxEntryState::Acked);
+        assert_eq!(entry.acked_at(), Some(acked_at));
+        assert!(matches!(
+            entry.ack(acked_at + Duration::SECOND),
+            Err(InvalidOutboxTransition {
+                from: OutboxEntryState::Acked,
+                event: OutboxEvent::Acknowledged,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_rehydration_validates_ack_pairing_and_retry_count() -> Result<(), Box<dyn Error>> {
+        let base = OffsetDateTime::now_utc();
+        let id = OutboxEntryId::generate();
+        let instance_id = InstanceId::generate();
+
+        // The acked shape round-trips.
+        let acked = OutboxEntry::try_from_parts(
+            id,
+            instance_id,
+            3,
+            String::from(r#"{"sequence":3}"#),
+            OutboxEntryState::Acked,
+            2,
+            base,
+            Some(base + Duration::SECOND),
+        )?;
+        assert_eq!(acked.state(), OutboxEntryState::Acked);
+
+        // A pending row with an ack time contradicts the pairing.
+        assert_eq!(
+            OutboxEntry::try_from_parts(
+                id,
+                instance_id,
+                3,
+                String::from(r#"{"sequence":3}"#),
+                OutboxEntryState::Pending,
+                0,
+                base,
+                Some(base),
+            ),
+            Err(OutboxEntryError::InvalidAckPairing)
+        );
+        // An acked row without an ack time contradicts the pairing.
+        assert_eq!(
+            OutboxEntry::try_from_parts(
+                id,
+                instance_id,
+                3,
+                String::from(r#"{"sequence":3}"#),
+                OutboxEntryState::Acked,
+                0,
+                base,
+                None,
+            ),
+            Err(OutboxEntryError::InvalidAckPairing)
+        );
+        // A negative retry count is corrupt.
+        assert_eq!(
+            OutboxEntry::try_from_parts(
+                id,
+                instance_id,
+                3,
+                String::from(r#"{"sequence":3}"#),
+                OutboxEntryState::Pending,
+                -1,
+                base,
+                None,
+            ),
+            Err(OutboxEntryError::NegativeRetryCount)
+        );
+        // An ack time before creation is a broken timeline.
+        assert_eq!(
+            OutboxEntry::try_from_parts(
+                id,
+                instance_id,
+                3,
+                String::from(r#"{"sequence":3}"#),
+                OutboxEntryState::Acked,
+                0,
+                base,
+                Some(base - Duration::SECOND),
+            ),
+            Err(OutboxEntryError::AckBeforeCreation)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inbox_state_codes_round_trip_and_reject_unknown_values() {
+        for state in [
+            InboxEntryState::Received,
+            InboxEntryState::Accepted,
+            InboxEntryState::Rejected,
+            InboxEntryState::Completed,
+        ] {
+            assert_eq!(state.as_str().parse(), Ok(state));
+            assert_eq!(state.to_string(), state.as_str());
+        }
+        assert_eq!(
+            "finished".parse::<InboxEntryState>(),
+            Err(InboxEntryStateParseError)
+        );
+        assert!(InboxEntryState::Rejected.is_terminal());
+        assert!(InboxEntryState::Completed.is_terminal());
+        assert!(!InboxEntryState::Received.is_terminal());
+        assert!(!InboxEntryState::Accepted.is_terminal());
+    }
+
+    #[test]
+    fn inbox_lifecycle_walks_received_to_completed_and_to_rejected() -> Result<(), Box<dyn Error>> {
+        let base = OffsetDateTime::now_utc();
+        let mut accepted = InboxEntry::new(
+            InboxEntryId::generate(),
+            OperationId::generate(),
+            InstanceId::generate(),
+            String::from(r#"{"operation_id":"1"}"#),
+            base + Duration::hours(1),
+            base,
+        );
+        assert_eq!(accepted.state(), InboxEntryState::Received);
+
+        accepted.apply(InboxEvent::Accepted)?;
+        assert_eq!(accepted.state(), InboxEntryState::Accepted);
+        assert!(matches!(
+            accepted.apply(InboxEvent::Accepted),
+            Err(InvalidInboxTransition {
+                from: InboxEntryState::Accepted,
+                event: InboxEvent::Accepted,
+            })
+        ));
+        accepted.apply(InboxEvent::Completed)?;
+        assert_eq!(accepted.state(), InboxEntryState::Completed);
+        assert!(matches!(
+            accepted.apply(InboxEvent::Completed),
+            Err(InvalidInboxTransition {
+                from: InboxEntryState::Completed,
+                event: InboxEvent::Completed,
+            })
+        ));
+
+        let mut rejected = InboxEntry::new(
+            InboxEntryId::generate(),
+            OperationId::generate(),
+            InstanceId::generate(),
+            String::from(r#"{"operation_id":"2"}"#),
+            base + Duration::hours(1),
+            base,
+        );
+        rejected.apply(InboxEvent::Rejected)?;
+        assert_eq!(rejected.state(), InboxEntryState::Rejected);
+        assert!(matches!(
+            rejected.apply(InboxEvent::Completed),
+            Err(InvalidInboxTransition {
+                from: InboxEntryState::Rejected,
+                event: InboxEvent::Completed,
+            })
+        ));
+
+        // A received entry cannot jump straight to completed.
+        let mut jump = InboxEntry::new(
+            InboxEntryId::generate(),
+            OperationId::generate(),
+            InstanceId::generate(),
+            String::from(r#"{"operation_id":"3"}"#),
+            base + Duration::hours(1),
+            base,
+        );
+        assert!(matches!(
+            jump.apply(InboxEvent::Completed),
+            Err(InvalidInboxTransition {
+                from: InboxEntryState::Received,
+                event: InboxEvent::Completed,
+            })
+        ));
+        assert_eq!(jump.state(), InboxEntryState::Received);
+        Ok(())
+    }
+
+    #[test]
+    fn inbox_expiry_judgment_bounds_the_actionable_window() {
+        let base = OffsetDateTime::now_utc();
+        let expires_at = base + Duration::MINUTE;
+        let entry = InboxEntry::new(
+            InboxEntryId::generate(),
+            OperationId::generate(),
+            InstanceId::generate(),
+            String::from(r#"{"operation_id":"1"}"#),
+            expires_at,
+            base,
+        );
+
+        assert!(!entry.is_expired(base));
+        assert!(
+            !entry.is_expired(expires_at),
+            "the bound itself is still actionable"
+        );
+        assert!(entry.is_expired(expires_at + Duration::SECOND));
+    }
+
+    #[test]
+    fn idempotency_decision_maps_stored_states() {
+        assert_eq!(decide_inbox_duplicate(None), IdempotencyDecision::Proceed);
+        assert_eq!(
+            decide_inbox_duplicate(Some(InboxEntryState::Received)),
+            IdempotencyDecision::InProgress
+        );
+        assert_eq!(
+            decide_inbox_duplicate(Some(InboxEntryState::Accepted)),
+            IdempotencyDecision::InProgress
+        );
+        assert_eq!(
+            decide_inbox_duplicate(Some(InboxEntryState::Rejected)),
+            IdempotencyDecision::AlreadyResolved(InboxEntryState::Rejected)
+        );
+        assert_eq!(
+            decide_inbox_duplicate(Some(InboxEntryState::Completed)),
+            IdempotencyDecision::AlreadyResolved(InboxEntryState::Completed)
+        );
+    }
+
+    #[test]
+    fn sync_stream_codes_round_trip_and_reject_unknown_values() {
+        for stream in [
+            SyncStream::Endpoint,
+            SyncStream::Health,
+            SyncStream::Event,
+            SyncStream::Artifact,
+        ] {
+            assert_eq!(stream.as_str().parse(), Ok(stream));
+            assert_eq!(stream.to_string(), stream.as_str());
+        }
+        assert_eq!("telemetry".parse::<SyncStream>(), Err(SyncStreamParseError));
+    }
+
+    #[test]
+    fn site_instance_exposes_its_registration_facts() {
+        let base = OffsetDateTime::now_utc();
+        let instance = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Site One"),
+            InstanceKind::Site,
+            base,
+        );
+        assert_eq!(instance.kind(), InstanceKind::Site);
+        assert_eq!(instance.display_name(), "Site One");
+        assert_eq!(instance.created_at(), base);
+    }
+
+    #[test]
+    fn sync_cursor_exposes_its_stream_facts() {
+        let base = OffsetDateTime::now_utc();
+        let cursor = SyncCursor::new(
+            SyncCursorId::generate(),
+            InstanceId::generate(),
+            SyncStream::Event,
+            String::from("100"),
+            base,
+        );
+        assert_eq!(cursor.stream(), SyncStream::Event);
+        assert_eq!(cursor.cursor_value(), "100");
+        assert_eq!(cursor.updated_at(), base);
+    }
+}

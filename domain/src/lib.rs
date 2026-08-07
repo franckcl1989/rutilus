@@ -6,6 +6,7 @@ mod artifact;
 mod audit;
 mod batch_operation;
 mod capability;
+mod center;
 mod credential;
 mod endpoint;
 mod endpoint_address;
@@ -43,6 +44,17 @@ pub use capability::{
     EndpointCapability, EndpointCapabilityObservation, EndpointCapabilityParseError,
     OEM_CAPABILITY_LEDGER_ORDER, UiLocation, UiLocationParseError,
 };
+pub use center::{
+    BINDING_CODE_CHARACTERS, BINDING_CODE_TTL, BindingCode, BindingCodeError,
+    BindingCodeParseError, BindingCodeVerificationError, CenterBinding, CenterBindingError,
+    CenterBindingEvent, CenterBindingState, CenterBindingStateParseError, IdempotencyDecision,
+    InboxEntry, InboxEntryState, InboxEntryStateParseError, InboxEvent, InstanceKind,
+    InstanceKindParseError, InvalidCenterBindingTransition, InvalidInboxTransition,
+    InvalidOutboxTransition, OutboxEntry, OutboxEntryError, OutboxEntryState,
+    OutboxEntryStateParseError, OutboxEvent, SiteInstance, SyncCursor, SyncStream,
+    SyncStreamParseError, center_binding_transition, decide_inbox_duplicate, inbox_transition,
+    outbox_transition,
+};
 pub use credential::{
     Credential, CredentialName, CredentialNameError, CredentialTimelineError, CredentialUsername,
     CredentialUsernameError,
@@ -60,9 +72,9 @@ pub use event::{
 pub use failure_kind::{FailureKind, FailureKindParseError};
 pub use group::{Group, GroupId, GroupName, GroupNameError, GroupRestoreError};
 pub use ids::{
-    ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, BootstrapCodeId, CredentialId,
-    CredentialVersionId, EndpointId, OperationId, PrincipalId, ResourceId, SessionId, TargetId,
-    TotpAuthenticatorId,
+    ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, BootstrapCodeId, CenterBindingId,
+    CredentialId, CredentialVersionId, EndpointId, InboxEntryId, InstanceId, OperationId,
+    OutboxEntryId, PrincipalId, ResourceId, SessionId, SyncCursorId, TargetId, TotpAuthenticatorId,
 };
 pub use operation::{
     InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,

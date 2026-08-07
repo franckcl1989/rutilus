@@ -122,13 +122,38 @@ define_id!(
      First startup generates a bootstrap code so the initial administrator\n\
      can claim the product; the code hash is stored, never the code itself."
 );
+define_id!(
+    InstanceId,
+    "The stable identity of one registered deployment instance (design D6).\n\n\
+     On the center side an instance row names one registered site; on the\n\
+     site side the row names the site's own identity — a single-center\n\
+     binding means exactly one row."
+);
+define_id!(
+    CenterBindingId,
+    "The stable identity of one site-to-center binding record (design D2, D6)."
+);
+define_id!(
+    OutboxEntryId,
+    "The stable identity of one envelope queued for delivery to the center\n\
+     (§17, D4)."
+);
+define_id!(
+    InboxEntryId,
+    "The stable identity of one envelope received from the center (§17, D4)."
+);
+define_id!(
+    SyncCursorId,
+    "The stable identity of one per-instance sync-stream cursor (§17)."
+);
 
 #[cfg(test)]
 mod tests {
     use super::{
         ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, BootstrapCodeId,
-        CredentialId, CredentialVersionId, EndpointId, OperationId, PrincipalId, ResourceId,
-        SessionId, TargetId, TotpAuthenticatorId,
+        CenterBindingId, CredentialId, CredentialVersionId, EndpointId, InboxEntryId, InstanceId,
+        OperationId, OutboxEntryId, PrincipalId, ResourceId, SessionId, SyncCursorId, TargetId,
+        TotpAuthenticatorId,
     };
 
     #[test]
@@ -231,6 +256,27 @@ mod tests {
         let bootstrap = BootstrapCodeId::generate();
         assert_eq!(bootstrap.into_uuid().get_version_num(), 7);
         assert_eq!(bootstrap.to_string().parse::<BootstrapCodeId>()?, bootstrap);
+        Ok(())
+    }
+
+    #[test]
+    fn center_shape_identifiers_are_uuid_v7_and_round_trip() -> Result<(), uuid::Error> {
+        let instance = InstanceId::generate();
+        let binding = CenterBindingId::generate();
+        let outbox = OutboxEntryId::generate();
+        let inbox = InboxEntryId::generate();
+        let cursor = SyncCursorId::generate();
+
+        assert_eq!(instance.into_uuid().get_version_num(), 7);
+        assert_eq!(binding.into_uuid().get_version_num(), 7);
+        assert_eq!(outbox.into_uuid().get_version_num(), 7);
+        assert_eq!(inbox.into_uuid().get_version_num(), 7);
+        assert_eq!(cursor.into_uuid().get_version_num(), 7);
+        assert_eq!(instance.to_string().parse::<InstanceId>()?, instance);
+        assert_eq!(binding.to_string().parse::<CenterBindingId>()?, binding);
+        assert_eq!(outbox.to_string().parse::<OutboxEntryId>()?, outbox);
+        assert_eq!(inbox.to_string().parse::<InboxEntryId>()?, inbox);
+        assert_eq!(cursor.to_string().parse::<SyncCursorId>()?, cursor);
         Ok(())
     }
 }
