@@ -2100,6 +2100,155 @@ impl EndpointCsvImportResponse {
     }
 }
 
+/// Secret-free input that refreshes several managed endpoints in one bounded
+/// batch.
+///
+/// `endpoint_ids` is a list of managed endpoint UUIDs; the non-empty,
+/// duplicate-free, bounded, and managed-endpoint checks happen in the
+/// application batch-refresh use case so the wire contract stays a pure
+/// projection, exactly like the operation submission request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshEndpointsRequest {
+    endpoint_ids: Vec<Uuid>,
+}
+
+impl RefreshEndpointsRequest {
+    #[must_use]
+    pub const fn new(endpoint_ids: Vec<Uuid>) -> Self {
+        Self { endpoint_ids }
+    }
+
+    /// Returns the endpoint UUIDs in submission order.
+    #[must_use]
+    pub fn endpoint_ids(&self) -> &[Uuid] {
+        &self.endpoint_ids
+    }
+}
+
+/// The independent terminal status of one endpoint inside a refresh batch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointRefreshStatusResponse {
+    /// The endpoint's complete resource Generation committed and its
+    /// capability snapshot was replaced.
+    Refreshed,
+    /// The endpoint refresh failed for a classified reason; the last complete
+    /// snapshot is retained (§9.5).
+    Failed,
+    /// The endpoint disappeared between the batch pre-check and its refresh.
+    NotFound,
+}
+
+/// One independent, secret-free result inside an endpoint refresh batch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointRefreshResultResponse {
+    endpoint_id: Uuid,
+    status: EndpointRefreshStatusResponse,
+    generation: Option<u64>,
+    snapshot_count: Option<u64>,
+    message: Option<String>,
+}
+
+impl EndpointRefreshResultResponse {
+    #[must_use]
+    pub const fn new(
+        endpoint_id: Uuid,
+        status: EndpointRefreshStatusResponse,
+        generation: Option<u64>,
+        snapshot_count: Option<u64>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            status,
+            generation,
+            snapshot_count,
+            message,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> EndpointRefreshStatusResponse {
+        self.status
+    }
+
+    /// Returns the committed Generation of a `refreshed` result.
+    #[must_use]
+    pub const fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    /// Returns the number of committed snapshots of a `refreshed` result.
+    #[must_use]
+    pub const fn snapshot_count(&self) -> Option<u64> {
+        self.snapshot_count
+    }
+
+    /// Returns the classified failure detail of a `failed` result.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+/// Per-endpoint results for one refresh batch.
+///
+/// The response is complete for the submitted list: every endpoint appears
+/// exactly once, `total` equals the submitted count, and `failed_count`
+/// counts every result that is not `refreshed` (including `not_found`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRefreshResponse {
+    total: u64,
+    succeeded_count: u64,
+    failed_count: u64,
+    results: Vec<EndpointRefreshResultResponse>,
+}
+
+impl BatchRefreshResponse {
+    #[must_use]
+    pub const fn new(
+        total: u64,
+        succeeded_count: u64,
+        failed_count: u64,
+        results: Vec<EndpointRefreshResultResponse>,
+    ) -> Self {
+        Self {
+            total,
+            succeeded_count,
+            failed_count,
+            results,
+        }
+    }
+
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    #[must_use]
+    pub const fn succeeded_count(&self) -> u64 {
+        self.succeeded_count
+    }
+
+    #[must_use]
+    pub const fn failed_count(&self) -> u64 {
+        self.failed_count
+    }
+
+    #[must_use]
+    pub fn results(&self) -> &[EndpointRefreshResultResponse] {
+        &self.results
+    }
+}
+
 /// The stable, secret-free target of one audit event.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -8186,6 +8335,108 @@ mod tests {
         assert!(
             serde_json::from_value::<EndpointCsvImportRequest>(json!({ "csv": "", "file": "" }))
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_batch_contract_returns_independent_per_endpoint_results()
+    -> Result<(), Box<dyn Error>> {
+        let first = uuid!("01989abc-def0-7abc-8def-0123456789e1");
+        let second = uuid!("01989abc-def0-7abc-8def-0123456789e2");
+        let missing = uuid!("01989abc-def0-7abc-8def-0123456789e3");
+        let request = RefreshEndpointsRequest::new(vec![first, second, missing]);
+        let refreshed = EndpointRefreshResultResponse::new(
+            first,
+            EndpointRefreshStatusResponse::Refreshed,
+            Some(9),
+            Some(31),
+            None,
+        );
+        let failed = EndpointRefreshResultResponse::new(
+            second,
+            EndpointRefreshStatusResponse::Failed,
+            None,
+            None,
+            Some("resource read failed: connection refused".to_owned()),
+        );
+        let not_found = EndpointRefreshResultResponse::new(
+            missing,
+            EndpointRefreshStatusResponse::NotFound,
+            None,
+            None,
+            None,
+        );
+        let response = BatchRefreshResponse::new(3, 1, 2, vec![refreshed, failed, not_found]);
+
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({ "endpoint_ids": [first, second, missing] })
+        );
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "total": 3,
+                "succeeded_count": 1,
+                "failed_count": 2,
+                "results": [
+                    {
+                        "endpoint_id": first,
+                        "status": "refreshed",
+                        "generation": 9,
+                        "snapshot_count": 31,
+                        "message": null
+                    },
+                    {
+                        "endpoint_id": second,
+                        "status": "failed",
+                        "generation": null,
+                        "snapshot_count": null,
+                        "message": "resource read failed: connection refused"
+                    },
+                    {
+                        "endpoint_id": missing,
+                        "status": "not_found",
+                        "generation": null,
+                        "snapshot_count": null,
+                        "message": null
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BatchRefreshResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert_eq!(response.total(), 3);
+        assert_eq!(response.succeeded_count(), 1);
+        assert_eq!(response.failed_count(), 2);
+        assert_eq!(response.results()[0].endpoint_id(), first);
+        assert_eq!(
+            response.results()[0].status(),
+            EndpointRefreshStatusResponse::Refreshed
+        );
+        assert_eq!(response.results()[0].generation(), Some(9));
+        assert_eq!(response.results()[0].snapshot_count(), Some(31));
+        assert_eq!(response.results()[0].message(), None);
+        assert_eq!(
+            response.results()[1].status(),
+            EndpointRefreshStatusResponse::Failed
+        );
+        assert_eq!(
+            response.results()[1].message(),
+            Some("resource read failed: connection refused")
+        );
+        assert_eq!(
+            response.results()[2].status(),
+            EndpointRefreshStatusResponse::NotFound
+        );
+        assert!(
+            serde_json::from_value::<RefreshEndpointsRequest>(json!({
+                "endpoint_ids": [],
+                "extra": true
+            }))
+            .is_err()
         );
         Ok(())
     }
