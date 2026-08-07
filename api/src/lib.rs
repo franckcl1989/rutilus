@@ -814,6 +814,25 @@ pub enum CoreResourceDetailsResponse {
         power_state: Option<String>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §0.5.0 OEM family member projected from the typed Redfish
+    /// Dell-attributes schema (`DellAttributes_v1`, nv-redfish-schema 0.13,
+    /// `oem-dell-attributes` feature).
+    ///
+    /// The manager's Dell `DellAttributes` document is the only Dell OEM
+    /// surface nv-redfish 0.13 compiles (§11.5: an OEM surface is projected
+    /// only when upstream strongly types it), and the details are the five
+    /// Dell iDRAC identity attributes the product pins on that document.
+    /// Each value is `None` when the endpoint did not publish the attribute
+    /// key. The rest of the vendor-specific dynamic attribute bag stays out —
+    /// exactly like the `Bios` family keeps its `Attributes` bag out — because
+    /// the bag is unbounded and untyped by key.
+    OemDell {
+        server_model: Option<String>,
+        server_service_tag: Option<String>,
+        server_generation: Option<String>,
+        server_bmc_mac_address: Option<String>,
+        server_name: Option<String>,
+    },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
@@ -3693,6 +3712,80 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_oem_dell_wire_values() -> Result<(), Box<dyn Error>> {
+        let oem_dell = oem_dell_resource();
+
+        assert_eq!(
+            serde_json::to_value(&oem_dell)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789b1",
+                    "odata_id": "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+                    "odata_type": "#DellAttributes.v1_0_0.DellAttributes",
+                    "etag": "W/\"dell-attributes-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Dell Attributes",
+                    "description": "Dell iDRAC attributes"
+                },
+                "resource": {
+                    "resource_type": "oem_dell",
+                    "details": {
+                        "server_model": "PowerEdge R750",
+                        "server_service_tag": "ABC1234",
+                        "server_generation": "16G",
+                        "server_bmc_mac_address": "14:18:77:aa:bb:cc",
+                        "server_name": "rack-1-server-2"
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&oem_dell)?)?,
+            oem_dell
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "oem_dell",
+                "details": {
+                    "server_model": null,
+                    "server_service_tag": null,
+                    "server_generation": null,
+                    "server_bmc_mac_address": null,
+                    "server_name": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn oem_dell_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789b1"),
+                "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1".to_owned(),
+                Some("#DellAttributes.v1_0_0.DellAttributes".to_owned()),
+                Some("W/\"dell-attributes-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Dell Attributes".to_owned(),
+                Some("Dell iDRAC attributes".to_owned()),
+            ),
+            CoreResourceDetailsResponse::OemDell {
+                server_model: Some("PowerEdge R750".to_owned()),
+                server_service_tag: Some("ABC1234".to_owned()),
+                server_generation: Some("16G".to_owned()),
+                server_bmc_mac_address: Some("14:18:77:aa:bb:cc".to_owned()),
+                server_name: Some("rack-1-server-2".to_owned()),
+            },
+        )
     }
 
     fn processor_resource() -> CoreResourceResponse {
