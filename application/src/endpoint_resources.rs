@@ -792,7 +792,9 @@ where
         #[source]
         source: serde_json::Error,
     },
-    #[error("resource {resource_id} has an {feature} snapshot that is not yet projectable in this layer")]
+    #[error(
+        "resource {resource_id} has an {feature} snapshot that is not yet projectable in this layer"
+    )]
     NotYetProjectable {
         resource_id: ResourceId,
         feature: ResourceFeature,

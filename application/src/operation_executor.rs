@@ -1568,11 +1568,11 @@ mod tests {
         BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
         ChassisCommand, CreateSubscription, CredentialId, DeleteSubscription, Endpoint,
         EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        EventCommand, EventDestinationProtocol, EventType, ManagerCommand,
-        NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
-        OperationSource, OperationTarget, ResetKeysType, ResetType, ResourceSnapshot,
-        SecureBootCommand, SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId,
-        TlsCertificate, TlsTrust, UpdateCommand,
+        EventCommand, EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+        NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OperationSource,
+        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, SecureBootCommand,
+        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
+        TlsTrust, UpdateCommand,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
@@ -4242,8 +4242,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_audit_operations_pin_the_thirteen_write_families()
-    -> Result<(), Box<dyn Error>> {
+    async fn command_audit_operations_pin_the_thirteen_write_families() -> Result<(), Box<dyn Error>>
+    {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
@@ -4387,8 +4387,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debug_token_requires_the_oem_nvidia_security_capability()
-    -> Result<(), Box<dyn Error>> {
+    async fn debug_token_requires_the_oem_nvidia_security_capability() -> Result<(), Box<dyn Error>>
+    {
         let endpoint_id = EndpointId::generate();
         // The endpoint's ledger observes only the profile-service
         // sub-capability: the `OemNvidiaSecurity` capability the debug-token

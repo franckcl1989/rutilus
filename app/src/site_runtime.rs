@@ -1094,8 +1094,8 @@ mod tests {
     /// without CLI material generates and persists a self-signed pair and
     /// serves HTTPS, and a later boot reuses the persisted identity.
     #[tokio::test]
-    async fn non_loopback_bind_generates_persists_and_reuses_self_signed(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn non_loopback_bind_generates_persists_and_reuses_self_signed()
+    -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
         let first_port = free_port(Ipv4Addr::UNSPECIFIED).await?;
@@ -1103,9 +1103,9 @@ mod tests {
         let first =
             SiteBinding::bind(&paths, &SiteRunOptions::new(first_listen, None, None)?).await?;
         assert_eq!(first.url(), format!("https://0.0.0.0:{first_port}/"));
-        let first_tls = first
-            .tls
-            .ok_or_else(|| io::Error::other("the non-loopback bind generated a self-signed pair"))?;
+        let first_tls = first.tls.ok_or_else(|| {
+            io::Error::other("the non-loopback bind generated a self-signed pair")
+        })?;
         assert_eq!(first_tls.fingerprint().split(':').count(), 32);
         assert!(paths.tls_directory().join("cert.pem").is_file());
         assert!(paths.tls_directory().join("key.pem").is_file());
@@ -1125,8 +1125,8 @@ mod tests {
     /// A loopback listen without any TLS material is the plaintext posture,
     /// and no certificate pair is generated for it.
     #[tokio::test]
-    async fn loopback_bind_without_material_is_plaintext_and_generates_nothing(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn loopback_bind_without_material_is_plaintext_and_generates_nothing()
+    -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
         let port = free_port(Ipv4Addr::LOCALHOST).await?;
@@ -1161,7 +1161,8 @@ mod tests {
 
     /// An explicitly provided pair is served over HTTPS even on loopback.
     #[tokio::test]
-    async fn explicitly_provided_pair_serves_https_even_on_loopback() -> Result<(), Box<dyn Error>> {
+    async fn explicitly_provided_pair_serves_https_even_on_loopback() -> Result<(), Box<dyn Error>>
+    {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
         // Seed a pair, then copy it to explicit CLI-style paths.

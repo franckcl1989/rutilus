@@ -66,8 +66,7 @@ async fn execute_operation_shapes_persist_and_foreign_shapes_are_refused()
 
     // An execution under a foreign permission is refused: the action CHECK
     // pins the same shapes as the domain consistency matrix.
-    let mut wrong_permission =
-        execute_row(Uuid::now_v7(), "reset-system", occurred_at);
+    let mut wrong_permission = execute_row(Uuid::now_v7(), "reset-system", occurred_at);
     wrong_permission.permission = Set(String::from("manage-endpoints"));
     assert!(
         wrong_permission.insert(&database).await.is_err(),

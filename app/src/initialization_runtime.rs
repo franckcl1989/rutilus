@@ -389,8 +389,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeding_fails_when_the_principal_exists_without_a_bootstrap_code(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn seeding_fails_when_the_principal_exists_without_a_bootstrap_code()
+    -> Result<(), Box<dyn Error>> {
         // Simulate an earlier seeding that wrote the administrator rows but
         // failed before the one-time code row could be persisted: the store
         // must refuse to resume silently, so the initialization surfaces the
