@@ -18,6 +18,6 @@ pub use onboarding_runtime::{
 };
 pub use standalone_runtime::{
     StandaloneBinding, StandaloneExecutionError, StandaloneInstance, StandaloneInstanceCloseError,
-    StandaloneInstanceError, StandaloneRunError, StandaloneRunOptions, run_initialized_standalone,
-    run_standalone,
+    StandaloneInstanceError, StandaloneRunError, StandaloneRunOptions, console_stop_signal,
+    run_initialized_standalone, run_standalone,
 };

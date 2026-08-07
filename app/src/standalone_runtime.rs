@@ -46,16 +46,18 @@ use rutilus_persistence::{
 };
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
-    MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
+    MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths, SystemMasterKeyFile,
+    SystemMasterKeyFileError, SystemSecretStore, SystemSecretStoreError,
 };
 use rutilus_security::{
     CredentialProtectionError, CsrfToken, MasterKey, MasterKeyProtectionError, PasswordHashError,
-    ProtectedCredentialVersion, SessionToken, SessionTokenError, decrypt_credential,
-    encrypt_credential, hash_bootstrap_code, hash_password, recover_master_key, verify_code,
-    verify_password,
+    ProtectedCredentialVersion, SessionToken, SessionTokenError, SystemMasterKeyError,
+    decrypt_credential, encrypt_credential, hash_bootstrap_code, hash_password, recover_master_key,
+    recover_master_key_system, verify_code, verify_password,
 };
 use rutilus_web::{
-    AuthServices, AuditEventQuery, IssuedSessionTokens, ProductServices, WebProductInfo, router,
+    AuditEventQuery, AuthGate, AuthPolicy, AuthServices, IssuedSessionTokens, ProductServices,
+    WebProductInfo, router_with_auth,
 };
 use secrecy::{SecretBox, SecretString};
 use thiserror::Error;
@@ -103,7 +105,9 @@ pub struct StandaloneInstance {
     state: Arc<StandaloneState>,
 }
 
-struct StandaloneState {
+/// The authenticated runtime state shared with the Site posture's server
+/// and background tasks (crate-internal: only the instance hands it out).
+pub(crate) struct StandaloneState {
     store: SqliteStore,
     master_key: MasterKey,
     _runtime_lock: RuntimeLock,
@@ -797,8 +801,8 @@ impl CapabilitySnapshotRepository for StandaloneState {
 impl EventRepository for StandaloneState {
     type Error = EventRepositoryError;
 
-    /// Delegates the §14.4 event lifecycle to the same `SqliteStore` that
-    /// owns every other aggregate, so the `EventService` listeners (which
+    /// Delegates the §14.4 event lifecycle to the same `SqliteStore`
+    /// that owns every other aggregate, so the `EventService` listeners (which
     /// append through the application ingestion use case) and the console's
     /// event query (which composes the `EventRepository` boundary of the
     /// product-services bundle) always observe one authoritative record —
@@ -976,7 +980,7 @@ impl GroupRepository for StandaloneState {
 /// requires; the crate-local error keeps the boundary's failure type single
 /// while preserving the source chain, like `SharedTelemetryRepositoryError`.
 #[derive(Debug, Error)]
-enum SharedGroupRepositoryError {
+pub(crate) enum SharedGroupRepositoryError {
     #[error("group persistence failed: {0}")]
     Group(#[from] GroupRepositoryError),
     #[error("created group {group_id} cannot be read back")]
@@ -1145,7 +1149,7 @@ impl TelemetryRepository for SharedTelemetryRepository {
 /// error keeps the boundary's failure type single while preserving the
 /// source chain for the loop's `Display` recording.
 #[derive(Debug, Error)]
-enum SharedTelemetryRepositoryError {
+pub(crate) enum SharedTelemetryRepositoryError {
     #[error("telemetry persistence failed: {0}")]
     Telemetry(#[source] TelemetryRepositoryError),
     #[error("enrolled endpoint listing failed: {0}")]
@@ -1204,6 +1208,43 @@ impl StandaloneInstance {
         paths: &RuntimePaths,
         unlock: &StandaloneUnlock,
     ) -> Result<Self, StandaloneInstanceError> {
+        let runtime_lock = Self::acquire_runtime(paths)?;
+        let protected = MasterKeyFile::new(paths.master_key_path())
+            .load()
+            .map_err(StandaloneInstanceError::MasterKeyFile)?;
+        let master_key = recover_master_key(&protected, unlock.passphrase())
+            .map_err(StandaloneInstanceError::MasterKeyProtection)?;
+        Self::assemble(paths, runtime_lock, master_key).await
+    }
+
+    /// Authenticates and opens a completed instance through the operating
+    /// system's secret store (0.6.0 S3: unattended Site service boots).
+    ///
+    /// The OS-protected envelope is loaded and recovered without any
+    /// passphrase; every other check matches [`Self::open`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StandaloneInstanceError`] for lock contention, missing or
+    /// invalid initialization state, a missing or invalid OS-protected
+    /// envelope, OS-store rejection, or database open/migration.
+    pub async fn open_system(
+        paths: &RuntimePaths,
+        store: &SystemSecretStore,
+    ) -> Result<Self, StandaloneInstanceError> {
+        let runtime_lock = Self::acquire_runtime(paths)?;
+        let protected = SystemMasterKeyFile::new(paths.system_master_key_path())
+            .load()
+            .map_err(StandaloneInstanceError::SystemMasterKeyFile)?;
+        let master_key = recover_master_key_system(&protected, store)
+            .await
+            .map_err(StandaloneInstanceError::SystemMasterKeyProtection)?;
+        Self::assemble(paths, runtime_lock, master_key).await
+    }
+
+    /// Acquires the runtime lock and verifies the completed-instance state
+    /// before any key material is touched.
+    fn acquire_runtime(paths: &RuntimePaths) -> Result<RuntimeLock, StandaloneInstanceError> {
         let runtime_lock = RuntimeLock::acquire(paths.runtime_lock_path())
             .map_err(StandaloneInstanceError::RuntimeLock)?;
         let marker = InstanceMarkerFile::new(paths.instance_marker_path());
@@ -1212,11 +1253,15 @@ impl StandaloneInstance {
             InstanceMarkerState::Complete => {}
         }
         require_existing_database(paths.database_path())?;
-        let protected = MasterKeyFile::new(paths.master_key_path())
-            .load()
-            .map_err(StandaloneInstanceError::MasterKeyFile)?;
-        let master_key = recover_master_key(&protected, unlock.passphrase())
-            .map_err(StandaloneInstanceError::MasterKeyProtection)?;
+        Ok(runtime_lock)
+    }
+
+    /// Assembles the authenticated instance around a recovered master key.
+    async fn assemble(
+        paths: &RuntimePaths,
+        runtime_lock: RuntimeLock,
+        master_key: MasterKey,
+    ) -> Result<Self, StandaloneInstanceError> {
         let store = SqliteStore::open(paths.database_path())
             .await
             .map_err(StandaloneInstanceError::OpenStore)?;
@@ -1233,6 +1278,12 @@ impl StandaloneInstance {
     #[must_use]
     pub fn database_path(&self) -> &std::path::Path {
         self.state.store.database_path()
+    }
+
+    /// The authenticated state shared with the Site runtime's server and
+    /// background tasks.
+    pub(crate) fn state(&self) -> Arc<StandaloneState> {
+        Arc::clone(&self.state)
     }
 
     /// Closes `SQLite` before releasing the master key and process lock.
@@ -1322,12 +1373,19 @@ impl StandaloneBinding {
     /// until a tracked shutdown future resolves, then waits for Axum's
     /// graceful drain to complete.
     ///
+    /// The §16.2 session policy is the caller's decision — the Standalone
+    /// runtime arms it from the bootstrap state of its store, while the
+    /// generic run paths pass [`AuthPolicy::Open`]. Serving through
+    /// `into_make_service_with_connect_info` exposes the client address to
+    /// the sign-in rate limiter.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the bound listener fails while serving.
     pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
         options: StandaloneRunOptions,
+        policy: AuthPolicy,
         services: Arc<Services>,
         gateway: Arc<Gateway>,
         clock: Time,
@@ -1346,23 +1404,54 @@ impl StandaloneBinding {
         }
         axum::serve(
             self.listener,
-            router(
+            router_with_auth(
                 WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
                 AuditActor::LocalOperator,
                 DeploymentPosture::Standalone,
+                policy,
                 services,
                 gateway,
                 clock,
-            ),
+            )
+            .into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(shutdown)
         .await
     }
 }
 
+/// The console's stop signal: Ctrl-C on every platform, plus SIGTERM and
+/// SIGHUP on Unix (0.6.0 S3 graceful shutdown — service managers deliver
+/// SIGTERM on stop).
+///
+/// Public so the binary's `service run` path can arm the same stop future
+/// the Site runtime waits on.
+///
+/// # Errors
+///
+/// Returns an I/O error when the operating system cannot arm a signal
+/// handler.
+pub async fn console_stop_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
+            _ = hangup.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 /// Runs the foreground Standalone posture over the injected product services
-/// until Ctrl-C, with structured Axum shutdown and no non-loopback plaintext
-/// mode.
+/// until the console stop signal, with structured Axum shutdown and no
+/// non-loopback plaintext mode.
 ///
 /// # Errors
 ///
@@ -1381,14 +1470,23 @@ where
 {
     let binding = StandaloneBinding::bind().await?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-    let server = binding.serve_until(options, services, gateway, clock, async move {
-        let _result = shutdown_receiver.await;
-    });
+    // The generic run path serves the pre-0.6 open console; the initialized
+    // path arms the policy from its bootstrap state.
+    let server = binding.serve_until(
+        options,
+        AuthPolicy::Open,
+        services,
+        gateway,
+        clock,
+        async move {
+            let _result = shutdown_receiver.await;
+        },
+    );
     tokio::pin!(server);
 
     tokio::select! {
         result = &mut server => result.map_err(StandaloneRunError::Serve),
-        signal = tokio::signal::ctrl_c() => {
+        signal = console_stop_signal() => {
             signal.map_err(StandaloneRunError::Signal)?;
             let _result = shutdown_sender.send(());
             server.await.map_err(StandaloneRunError::Serve)
@@ -1429,43 +1527,26 @@ pub async fn run_initialized_standalone(
     let gateway = Arc::new(gateway);
     let run_result = async {
         let binding = StandaloneBinding::bind().await?;
-        // One stop signal stops the scheduler, the event listeners, the
-        // telemetry sampler, and the server in order; each task owns its own
-        // Arc clones of the authenticated state and the gateway, so it is
-        // `'static` and spawnable.
-        let (stop_signal, stop_watch) = scheduler::StopSignal::new();
-        let scheduler = tokio::spawn(run_operation_scheduler(
-            stop_watch.clone(),
-            Arc::clone(&instance.state),
-            gateway.clone(),
-        ));
-        // §14.4: one EventService listener per enrolled endpoint. The 0.4.0
-        // cut is a startup sweep — a failed inventory listing starts with no
-        // listeners and records the failure; re-arming later is a later
-        // iteration.
-        let listeners = tokio::spawn(run_event_listeners(
-            stop_watch.clone(),
-            list_enrolled_endpoint_ids(instance.state.as_ref()).await,
-            Arc::clone(&instance.state),
-            gateway.clone(),
-        ));
-        // §14.4: the telemetry sampling loop ticks on its own cadence over
-        // the stored MetricReport snapshots, re-listing the enrolled
-        // endpoints every tick.
-        let sampler = tokio::spawn(run_telemetry_sampler(
-            stop_watch.clone(),
-            Arc::clone(&instance.state),
-        ));
-        run_standalone_with_scheduler(
-            binding,
-            options,
+        let services_for_server = Arc::clone(&instance.state);
+        let gateway_for_server = Arc::clone(&gateway);
+        run_background_services(
             Arc::clone(&instance.state),
             gateway,
-            stop_watch,
-            stop_signal,
-            scheduler,
-            listeners,
-            sampler,
+            move |policy, stop_watch, scheduler_done_receiver| {
+                binding.serve_until(
+                    options,
+                    policy,
+                    services_for_server,
+                    gateway_for_server,
+                    SystemClock,
+                    async move {
+                        let mut stop = stop_watch;
+                        stop.stopped().await;
+                        let _ = scheduler_done_receiver.await;
+                    },
+                )
+            },
+            console_stop_signal(),
         )
         .await
     }
@@ -1476,6 +1557,105 @@ pub async fn run_initialized_standalone(
         (Err(source), Ok(())) => Err(StandaloneExecutionError::Run(source)),
         (Ok(()), Err(source)) => Err(StandaloneExecutionError::Close(source)),
         (Err(run), Err(close)) => Err(StandaloneExecutionError::RunAndClose { run, close }),
+    }
+}
+
+/// Serves one initialized console with the operation scheduling loop, the
+/// §14.4 event listeners, and the §14.4 telemetry sampling loop until the
+/// external `stop` future resolves (or the server fails), then drains in the
+/// design §7.8 order: stop scheduling first (the loop finishes its in-flight
+/// tick), then the event listeners (each in-flight event finishes), then the
+/// telemetry sampler (its in-flight sweep finishes), then the HTTP server.
+///
+/// Both the Standalone and Site postures serve through this one drain
+/// structure: each arms its own server future (loopback plaintext or the
+/// Site's HTTPS listener) and its own stop future (the console stop signal,
+/// plus the SCM stop watch for Windows services), and the same one-stop
+/// signal path stops every background task before the store closes.
+///
+/// # Errors
+///
+/// Returns [`StandaloneRunError`] when signal registration or HTTP serving
+/// fails; the background tasks' own shutdowns are always awaited before the
+/// store close.
+pub(crate) async fn run_background_services<Server, Stop>(
+    services: Arc<StandaloneState>,
+    gateway: Arc<RedfishGateway>,
+    make_server: impl FnOnce(AuthPolicy, scheduler::StopWatch, oneshot::Receiver<()>) -> Server,
+    stop: Stop,
+) -> Result<(), StandaloneRunError>
+where
+    Server: Future<Output = io::Result<()>> + Send,
+    Stop: Future<Output = io::Result<()>> + Send,
+{
+    // One stop signal stops the scheduler, the event listeners, the
+    // telemetry sampler, and the server in order; each task owns its own
+    // Arc clones of the authenticated state and the gateway, so it is
+    // `'static` and spawnable.
+    let (stop_signal, stop_watch) = scheduler::StopSignal::new();
+    let mut scheduler = tokio::spawn(run_operation_scheduler(
+        stop_watch.clone(),
+        Arc::clone(&services),
+        Arc::clone(&gateway),
+    ));
+    // §14.4: one EventService listener per enrolled endpoint. The 0.4.0
+    // cut is a startup sweep — a failed inventory listing starts with no
+    // listeners and records the failure; re-arming later is a later
+    // iteration.
+    let mut listeners = tokio::spawn(run_event_listeners(
+        stop_watch.clone(),
+        list_enrolled_endpoint_ids(services.as_ref()).await,
+        Arc::clone(&services),
+        Arc::clone(&gateway),
+    ));
+    // §14.4: the telemetry sampling loop ticks on its own cadence over
+    // the stored MetricReport snapshots, re-listing the enrolled
+    // endpoints every tick.
+    let mut sampler = tokio::spawn(run_telemetry_sampler(
+        stop_watch.clone(),
+        Arc::clone(&services),
+    ));
+    // The §16.2 loopback lifecycle: while an unconsumed bootstrap code
+    // exists the console serves open (the first-run claim must be
+    // reachable), and the claim itself arms the gate; a store that already
+    // consumed its code starts guarded. The Site posture arms the same
+    // policy from the same bootstrap state.
+    let policy = match services.store.has_unconsumed_bootstrap_code().await {
+        Ok(true) => AuthPolicy::PendingBootstrap(AuthGate::open()),
+        _ => AuthPolicy::Guarded,
+    };
+    // The server's graceful drain waits for the background tasks to have
+    // fully stopped first (design §7.8: stop scheduling and listening, then
+    // serve): the channel is fired only after both tasks are joined.
+    let (scheduler_done_sender, scheduler_done_receiver) = oneshot::channel();
+    let server = make_server(policy, stop_watch, scheduler_done_receiver);
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            // The server stopped on its own (a serving failure): stop the
+            // background tasks too, and wait for their drains before closing
+            // the store.
+            stop_signal.signal();
+            drain_scheduler(&mut scheduler).await;
+            drain_listeners(&mut listeners).await;
+            drain_sampler(&mut sampler).await;
+            let _ = scheduler_done_sender.send(());
+            result.map_err(StandaloneRunError::Serve)
+        }
+        signal = stop => {
+            signal.map_err(StandaloneRunError::Signal)?;
+            // §7.8: stop the scheduler first; its in-flight tick finishes.
+            stop_signal.signal();
+            drain_scheduler(&mut scheduler).await;
+            // The listeners drain next; each in-flight event finishes.
+            drain_listeners(&mut listeners).await;
+            // The telemetry sampler drains last; its in-flight sweep
+            // finishes.
+            drain_sampler(&mut sampler).await;
+            let _ = scheduler_done_sender.send(());
+            // The server's shutdown future resolves now; await its drain.
+            server.await.map_err(StandaloneRunError::Serve)
+        }
     }
 }
 
@@ -1724,74 +1904,6 @@ async fn run_operation_scheduler(
     .await;
 }
 
-/// Serves the Standalone console with the operation scheduling loop, the
-/// §14.4 event listeners, and the §14.4 telemetry sampling loop until
-/// Ctrl-C, then drains in the design §7.8 order: stop scheduling first (the
-/// loop finishes its in-flight tick), then the event listeners (each
-/// in-flight event finishes), then the telemetry sampler (its in-flight
-/// sweep finishes), then the HTTP server, and only then return so `SQLite`
-/// can close.
-///
-/// # Errors
-///
-/// Returns [`StandaloneRunError`] when loopback binding, signal registration,
-/// or HTTP serving fails; the background tasks' own shutdowns are always
-/// awaited before the store close.
-///
-/// The function carries the whole shutdown orchestration (binding, options,
-/// all three background tasks, and both stop handles), so the argument count
-/// is inherent to the §7.8 drain order it coordinates.
-#[allow(clippy::too_many_arguments)]
-async fn run_standalone_with_scheduler(
-    binding: StandaloneBinding,
-    options: StandaloneRunOptions,
-    services: Arc<StandaloneState>,
-    gateway: Arc<RedfishGateway>,
-    stop_watch: scheduler::StopWatch,
-    stop_signal: scheduler::StopSignal,
-    mut scheduler: tokio::task::JoinHandle<()>,
-    mut listeners: tokio::task::JoinHandle<()>,
-    mut sampler: tokio::task::JoinHandle<()>,
-) -> Result<(), StandaloneRunError> {
-    // The server's graceful drain waits for the background tasks to have
-    // fully stopped first (design §7.8: stop scheduling and listening, then
-    // serve): the channel is fired only after both tasks are joined.
-    let (scheduler_done_sender, scheduler_done_receiver) = oneshot::channel();
-    let server = binding.serve_until(options, services, gateway, SystemClock, async move {
-        let mut stop = stop_watch;
-        stop.stopped().await;
-        let _ = scheduler_done_receiver.await;
-    });
-    tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => {
-            // The server stopped on its own (a serving failure): stop the
-            // background tasks too, and wait for their drains before closing
-            // the store.
-            stop_signal.signal();
-            drain_scheduler(&mut scheduler).await;
-            drain_listeners(&mut listeners).await;
-            drain_sampler(&mut sampler).await;
-            let _ = scheduler_done_sender.send(());
-            result.map_err(StandaloneRunError::Serve)
-        }
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(StandaloneRunError::Signal)?;
-            // §7.8: stop the scheduler first; its in-flight tick finishes.
-            stop_signal.signal();
-            drain_scheduler(&mut scheduler).await;
-            // The listeners drain next; each in-flight event finishes.
-            drain_listeners(&mut listeners).await;
-            // The telemetry sampler drains last; its in-flight sweep
-            // finishes.
-            drain_sampler(&mut sampler).await;
-            let _ = scheduler_done_sender.send(());
-            // The server's shutdown future resolves now; await its drain.
-            server.await.map_err(StandaloneRunError::Serve)
-        }
-    }
-}
-
 /// Waits for the scheduling-loop task and reports an unexpected failure.
 ///
 /// The loop never returns an error — it exits only on the stop signal — so a
@@ -1873,6 +1985,10 @@ pub enum StandaloneInstanceError {
     MasterKeyFile(#[source] MasterKeyFileError),
     #[error("failed to authenticate the Standalone master key: {0}")]
     MasterKeyProtection(#[source] MasterKeyProtectionError),
+    #[error("failed to load the system-protected Standalone master key: {0}")]
+    SystemMasterKeyFile(#[source] SystemMasterKeyFileError),
+    #[error("failed to recover the system-protected Standalone master key: {0}")]
+    SystemMasterKeyProtection(#[source] SystemMasterKeyError<SystemSecretStoreError>),
     #[error("failed to open the initialized Standalone database: {0}")]
     OpenStore(#[source] OpenStoreError),
 }
@@ -1993,6 +2109,7 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let server = tokio::spawn(binding.serve_until(
             StandaloneRunOptions::new(false),
+            AuthPolicy::Open,
             Arc::clone(&instance.state),
             Arc::new(UnavailableGateway),
             SystemClock,

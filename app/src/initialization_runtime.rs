@@ -3,17 +3,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rutilus_persistence::{CloseStoreError, OpenStoreError, SqliteStore};
+use rutilus_domain::{
+    BootstrapCode, BootstrapCodeId, Principal, PrincipalId, PrincipalName, Role, RoleAssignment,
+};
+use rutilus_persistence::{
+    BootstrapRepositoryError, CloseStoreError, OpenStoreError, PrincipalRepositoryError,
+    SqliteStore,
+};
 use rutilus_platform::{
     InstanceMarkerError, InstanceMarkerFile, InstanceMarkerState, MasterKeyFile,
     MasterKeyFileError, RuntimeLock, RuntimeLockError, RuntimePaths,
 };
 use rutilus_security::{
-    CredentialProtectionError, MasterKey, MasterKeyProtectionError, protect_master_key,
-    recover_master_key,
+    BootstrapCodeError, CredentialProtectionError, MasterKey, MasterKeyProtectionError,
+    generate_bootstrap_code, hash_bootstrap_code, protect_master_key, recover_master_key,
 };
+use rutilus_web::BOOTSTRAP_PRINCIPAL_NAME;
 use secrecy::{ExposeSecret as _, SecretString};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 const MINIMUM_PASSPHRASE_CHARACTERS: usize = 12;
 const MAXIMUM_PASSPHRASE_BYTES: usize = 1024;
@@ -141,12 +149,71 @@ pub async fn initialize_standalone(
     let store = SqliteStore::open(paths.database_path())
         .await
         .map_err(InitializationError::OpenStore)?;
+    seed_bootstrap_administrator(&store).await?;
     store
         .close()
         .await
         .map_err(InitializationError::CloseStore)?;
     marker.create().map_err(InitializationError::CommitMarker)?;
     Ok(outcome)
+}
+
+/// Seeds the §16.2 first-startup state: the built-in administrator
+/// principal with the Administrator role (no password yet) and the one-time
+/// bootstrap code whose raw value is shown to the operator exactly once.
+///
+/// The claim flow (§16.2 "首次启动生成一次性 Bootstrap Code") later binds
+/// the code, sets the administrator's first password, and opens the initial
+/// session. The seeding is idempotent — a resumed initialization that
+/// already wrote the rows skips them — and the code is printed to the
+/// terminal exactly when it is generated, because the raw value exists
+/// nowhere else.
+///
+/// # Errors
+///
+/// Returns [`InitializationError`] when the code cannot be generated or any
+/// seeding write fails.
+async fn seed_bootstrap_administrator(store: &SqliteStore) -> Result<(), InitializationError> {
+    let admin_name = PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME)
+        .map_err(|_| InitializationError::InvalidBootstrapPrincipalName)?;
+    if store
+        .find_principal_by_name(&admin_name)
+        .await
+        .map_err(InitializationError::SeedPrincipal)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let now = OffsetDateTime::now_utc();
+    let administrator = Principal::new(PrincipalId::generate(), admin_name, now);
+    store
+        .create_principal(&administrator)
+        .await
+        .map_err(InitializationError::SeedPrincipal)?;
+    store
+        .assign_role(&RoleAssignment::new(
+            administrator.id(),
+            Role::Administrator,
+            None,
+            now,
+        ))
+        .await
+        .map_err(InitializationError::SeedPrincipal)?;
+    let raw_code = generate_bootstrap_code().map_err(InitializationError::GenerateBootstrapCode)?;
+    let code = BootstrapCode::new(
+        BootstrapCodeId::generate(),
+        hash_bootstrap_code(&raw_code),
+        now,
+    );
+    store
+        .create_bootstrap_code(&code)
+        .await
+        .map_err(InitializationError::SeedBootstrap)?;
+    println!("Rutilus bootstrap code: {raw_code}");
+    println!(
+        "Enter this code in the console's first-run screen to set the administrator password."
+    );
+    Ok(())
 }
 
 fn path_exists(path: &Path) -> Result<bool, InitializationError> {
@@ -207,6 +274,14 @@ pub enum InitializationError {
     CloseStore(#[source] CloseStoreError),
     #[error("database and master key are durable but initialization could not be committed: {0}")]
     CommitMarker(#[source] InstanceMarkerError),
+    #[error("the built-in bootstrap principal name is invalid")]
+    InvalidBootstrapPrincipalName,
+    #[error("failed to create the built-in administrator: {0}")]
+    SeedPrincipal(#[source] PrincipalRepositoryError),
+    #[error("failed to generate the one-time bootstrap code: {0}")]
+    GenerateBootstrapCode(#[source] BootstrapCodeError),
+    #[error("failed to persist the one-time bootstrap code: {0}")]
+    SeedBootstrap(#[source] BootstrapRepositoryError),
 }
 
 #[cfg(test)]
@@ -246,6 +321,47 @@ mod tests {
                 master_key_missing: false,
                 database_missing: true,
             })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialization_seeds_the_bootstrap_administrator() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+
+        initialize_standalone(&paths, &unlock).await?;
+
+        // The first-startup state is durable: the built-in administrator
+        // with the Administrator role and one unconsumed bootstrap code.
+        let store = SqliteStore::open(paths.database_path()).await?;
+        let admin = store
+            .find_principal_by_name(&PrincipalName::parse(BOOTSTRAP_PRINCIPAL_NAME)?)
+            .await?
+            .ok_or("the built-in administrator must exist after initialization")?;
+        let assignment = store
+            .find_role_assignment(admin.id())
+            .await?
+            .ok_or("the administrator must carry a role assignment")?;
+        assert_eq!(assignment.role(), Role::Administrator);
+        assert_eq!(assignment.assigned_by(), None);
+        assert!(
+            store.has_unconsumed_bootstrap_code().await?,
+            "the one-time bootstrap code must be pending"
+        );
+        assert_eq!(
+            store.find_password_credential(admin.id()).await?,
+            None,
+            "the administrator must have no password until the claim"
+        );
+        store.close().await?;
+
+        // A second initialization is refused, so the seeding (and the code
+        // printing) happens exactly once per fresh instance.
+        assert!(matches!(
+            initialize_standalone(&paths, &unlock).await,
+            Err(InitializationError::AlreadyInitialized)
         ));
         Ok(())
     }
