@@ -3812,12 +3812,13 @@ enum CommandFamilyView {
     SecureBoot,
     EventSubscription,
     FirmwareUpdate,
+    Oem,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl CommandFamilyView {
     /// Every family in §7.5 order, so the form cannot miss a variant.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::SystemReset,
         Self::ManagerReset,
         Self::ChassisReset,
@@ -3825,6 +3826,7 @@ impl CommandFamilyView {
         Self::SecureBoot,
         Self::EventSubscription,
         Self::FirmwareUpdate,
+        Self::Oem,
     ];
 
     /// The stable §7.5 family code, matching the domain's wire vocabulary.
@@ -3838,6 +3840,7 @@ impl CommandFamilyView {
             Self::SecureBoot => "secure-boot",
             Self::EventSubscription => "event",
             Self::FirmwareUpdate => "update",
+            Self::Oem => "oem",
         }
     }
 
@@ -3852,6 +3855,7 @@ impl CommandFamilyView {
             Self::SecureBoot => "Secure Boot",
             Self::EventSubscription => "Event subscription",
             Self::FirmwareUpdate => "Firmware update",
+            Self::Oem => "OEM (NVIDIA)",
         }
     }
 }
@@ -4495,7 +4499,8 @@ impl OperationFormDraft {
                     CommandFamilyView::BootOverride
                     | CommandFamilyView::SecureBoot
                     | CommandFamilyView::EventSubscription
-                    | CommandFamilyView::FirmwareUpdate => {
+                    | CommandFamilyView::FirmwareUpdate
+                    | CommandFamilyView::Oem => {
                         // Refused rather than fabricated: the reset arm only
                         // ever receives a reset family from the outer match.
                         return Err(OperationFormError::FamilyRequired);
@@ -4570,6 +4575,12 @@ impl OperationFormDraft {
             }
             CommandFamilyView::FirmwareUpdate => {
                 Ok(OperationCommandDraft::Update(self.update_draft()?))
+            }
+            CommandFamilyView::Oem => {
+                // The §7.5 oem-command form faces land with the nvidia oem
+                // command surface; until then the family is refused rather
+                // than fabricated.
+                Err(OperationFormError::FamilyRequired)
             }
         }
     }
@@ -5806,6 +5817,10 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                 family: CommandFamilyView::FirmwareUpdate.label(),
                 payload: payload_text,
             }
+        }
+        RedfishCommand::Oem(_) => CommandSummaryProjection {
+            family: CommandFamilyView::Oem.label(),
+            payload: "OEM (NVIDIA)".to_owned(),
         }
     }
 }
@@ -17303,6 +17318,7 @@ mod tests {
                 CommandFamilyView::SecureBoot,
                 CommandFamilyView::EventSubscription,
                 CommandFamilyView::FirmwareUpdate,
+                CommandFamilyView::Oem,
             ]
         );
         for (family, code, label) in [
@@ -17325,13 +17341,14 @@ mod tests {
                 "update",
                 "Firmware update",
             ),
+            (CommandFamilyView::Oem, "oem", "OEM (NVIDIA)"),
         ] {
             assert_eq!(family.as_str(), code);
             assert_eq!(family.label(), label);
         }
         // The family codes are the §7.5 wire contract; the families that
         // still have no form surface must not be claimed by one.
-        assert_eq!(CommandFamilyView::ALL.len(), 7);
+        assert_eq!(CommandFamilyView::ALL.len(), 8);
     }
 
     #[test]

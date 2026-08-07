@@ -3381,6 +3381,15 @@ async fn execute_authenticated_command(
         RedfishCommand::Update(_) => Err(CommandExecutionError::Rejected(
             CommandRejection::InvalidCommandPayload,
         )),
+        // The Oem family has no typed execution path through this boundary
+        // in this slice: the §11.5 vendor write surfaces are compiled by
+        // the oem-command gateway work. Reaching this arm means the caller
+        // misrouted the command; the refusal is provable (no write is ever
+        // sent) and the payload is rejected because it cannot be executed
+        // through this boundary.
+        RedfishCommand::Oem(_) => Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        )),
     }
 }
 
@@ -4111,6 +4120,12 @@ async fn verify_authenticated_command(
         // reset families' `CapabilityUnavailable` error — see the
         // `CommandVerifier` contract doc.
         RedfishCommand::Update(_) => verify_authenticated_update(bmc, root, identity, trust).await,
+        // The Oem family has no verification path through this boundary in
+        // this slice; the generic verifier only runs after an accepted
+        // dispatch, and the §11.5 oem-command gateway work compiles the
+        // vendor verification surface. The arm is defensive: the targeted
+        // verification surface is not available here.
+        RedfishCommand::Oem(_) => Err(CommandVerificationError::CapabilityUnavailable),
     }
 }
 

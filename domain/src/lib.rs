@@ -75,9 +75,12 @@ pub use password::{
 };
 pub use redfish_command::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
-    CreateSubscription, DeleteSubscription, EventCommand, EventDestinationProtocol,
-    EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType, ResetType,
-    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, UpdateCommand,
+    CreateSubscription, DeleteSubscription, EraseToken, EraseType, EventCommand,
+    EventDestinationProtocol, EventSubscriptionError, EventType, ManagerCommand,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OemCommand, ProfileFile, ProfileId, RedfishCommand, ResetKeysType, ResetType,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType,
+    UpdateCommand,
 };
 pub use resource_snapshot::{
     RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,

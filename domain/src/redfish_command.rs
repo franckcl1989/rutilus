@@ -676,6 +676,333 @@ pub enum UpdateCommand {
     StartUpdate(StartUpdate),
 }
 
+/// The debug token type requested by the [`NvidiaDebugTokenCommand`] actions.
+///
+/// The member set follows `nv-redfish-schema` 0.13.0's
+/// `NvidiaDebugTokenManagement_v1.xml` `TokenType` enum. The variant names
+/// are the exact CSDL member names; the all-caps acronym members (`FRC`,
+/// `CRCS`, `CRDT`, `MTDT`, `NVJtagControl`, ...) carry serde renames because
+/// the Rust identifiers stay readable while the wire form is pinned by the
+/// member-set test, exactly like `SDCard` and `SyslogTLS`.
+// The variant names are the exact CSDL member names; renaming them would
+// break the wire contract, so the shared `Debug`/`Unlock`/`Capability`
+// suffixes are accepted.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum TokenType {
+    /// The `FRC` token type.
+    #[serde(rename = "FRC")]
+    Frc,
+    /// The `CRCS` token type.
+    #[serde(rename = "CRCS")]
+    Crcs,
+    /// The `CRDT` token type.
+    #[serde(rename = "CRDT")]
+    Crdt,
+    /// The `DebugFirmwareRunning` token type.
+    DebugFirmwareRunning,
+    /// The `DebugFirmwareUnlock` token type.
+    DebugFirmwareUnlock,
+    /// The `OTPDumpEnable` token type.
+    #[serde(rename = "OTPDumpEnable")]
+    OtpDumpEnable,
+    /// The `JtagUnlock` token type.
+    JtagUnlock,
+    /// The `HardwareUnlock` token type.
+    HardwareUnlock,
+    /// The `RuntimeDebugUnlock` token type.
+    RuntimeDebugUnlock,
+    /// The `FeatureUnlock` token type.
+    FeatureUnlock,
+    /// The `MTDT` token type.
+    #[serde(rename = "MTDT")]
+    Mtdt,
+    /// The `CcplexArmJtagDebugCont` token type.
+    CcplexArmJtagDebugCont,
+    /// The `NVJtagControl` token type.
+    #[serde(rename = "NVJtagControl")]
+    NvJtagControl,
+    /// The `DiagnosticBoot` token type.
+    DiagnosticBoot,
+    /// The `BpmpFirmwareDebugFS` token type.
+    #[serde(rename = "BpmpFirmwareDebugFS")]
+    BpmpFirmwareDebugFs,
+    /// The `FirmwareDebugKnobs` token type.
+    FirmwareDebugKnobs,
+    /// The `FirewallLifting` token type.
+    FirewallLifting,
+    /// The `Verbosity` token type.
+    Verbosity,
+    /// The `SMADebugCapability` token type.
+    #[serde(rename = "SMADebugCapability")]
+    SmaDebugCapability,
+    /// The `CpldDebugCapability` token type.
+    CpldDebugCapability,
+}
+
+impl TokenType {
+    /// Returns the exact CSDL member name, which is also the serde wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frc => "FRC",
+            Self::Crcs => "CRCS",
+            Self::Crdt => "CRDT",
+            Self::DebugFirmwareRunning => "DebugFirmwareRunning",
+            Self::DebugFirmwareUnlock => "DebugFirmwareUnlock",
+            Self::OtpDumpEnable => "OTPDumpEnable",
+            Self::JtagUnlock => "JtagUnlock",
+            Self::HardwareUnlock => "HardwareUnlock",
+            Self::RuntimeDebugUnlock => "RuntimeDebugUnlock",
+            Self::FeatureUnlock => "FeatureUnlock",
+            Self::Mtdt => "MTDT",
+            Self::CcplexArmJtagDebugCont => "CcplexArmJtagDebugCont",
+            Self::NvJtagControl => "NVJtagControl",
+            Self::DiagnosticBoot => "DiagnosticBoot",
+            Self::BpmpFirmwareDebugFs => "BpmpFirmwareDebugFS",
+            Self::FirmwareDebugKnobs => "FirmwareDebugKnobs",
+            Self::FirewallLifting => "FirewallLifting",
+            Self::Verbosity => "Verbosity",
+            Self::SmaDebugCapability => "SMADebugCapability",
+            Self::CpldDebugCapability => "CpldDebugCapability",
+        }
+    }
+}
+
+impl fmt::Display for TokenType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The erase scope of [`NvidiaDebugTokenCommand::EraseToken`].
+///
+/// The member set follows `nv-redfish-schema` 0.13.0's
+/// `NvidiaDebugTokenManagement_v1.xml` `EraseType` enum. The `TokenType`
+/// member erases the installed tokens of the token type named by the action's
+/// `TokenType` parameter; its variant name is the CSDL member name and
+/// deliberately collides with the [`TokenType`] enum's own name.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum EraseType {
+    /// Erases all installed tokens from the endpoint device.
+    EraseAll,
+    /// Erases all installed tokens and increments the ratchet counter.
+    EraseAllAndRatchetCounterIncreased,
+    /// Erases the installed tokens of the token type named by the action's
+    /// `TokenType` parameter.
+    TokenType,
+}
+
+impl EraseType {
+    /// Returns the exact CSDL member name, which is also the serde wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EraseAll => "EraseAll",
+            Self::EraseAllAndRatchetCounterIncreased => "EraseAllAndRatchetCounterIncreased",
+            Self::TokenType => "TokenType",
+        }
+    }
+}
+
+impl fmt::Display for EraseType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The payload of [`NvidiaSystemConfigProfileCommand::Update`].
+///
+/// `profile_file` is the JSON string of the profile file (the CSDL
+/// `ProfileFile` parameter, an `Edm.String` marked `Nullable=false`): the
+/// profile carries the metadata whose delete and activation flags decide
+/// whether the update adds, activates, or deletes the profile. The domain
+/// requires the file content exactly like the boot override requires all
+/// three of its fields — a profile-less update cannot be expressed (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileFile {
+    profile_file: String,
+}
+
+impl ProfileFile {
+    /// Constructs one profile update with the JSON profile file content.
+    #[must_use]
+    pub const fn new(profile_file: String) -> Self {
+        Self { profile_file }
+    }
+
+    /// Returns the JSON string of the profile file.
+    #[must_use]
+    pub const fn profile_file(&self) -> &str {
+        self.profile_file.as_str()
+    }
+}
+
+/// The payload of [`NvidiaDebugTokenCommand::InstallToken`].
+///
+/// `token_data` is the Base64-encoded string of the token data (the CSDL
+/// `TokenData` parameter, an `Edm.String` marked `Nullable=false`). The
+/// product treats the value as an opaque Base64 payload exactly like the
+/// CSDL; it never decodes or re-encodes the token (§11.5 two-way rule).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenData {
+    token_data: String,
+}
+
+impl TokenData {
+    /// Constructs one token installation with the Base64 token data.
+    #[must_use]
+    pub const fn new(token_data: String) -> Self {
+        Self { token_data }
+    }
+
+    /// Returns the Base64-encoded token data.
+    #[must_use]
+    pub const fn token_data(&self) -> &str {
+        self.token_data.as_str()
+    }
+}
+
+/// The payload of [`NvidiaDebugTokenCommand::EraseToken`].
+///
+/// The two fields mirror the CSDL `EraseToken` action parameters `EraseType`
+/// and `TokenType` (`NvidiaDebugTokenManagement_v1.xml`); both are marked
+/// `Nullable=false`, and a product command is the complete intent, so both
+/// are required — an erase that leaves the scope open cannot be expressed
+/// (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EraseToken {
+    erase_type: EraseType,
+    token_type: TokenType,
+}
+
+impl EraseToken {
+    /// Constructs one token erase with the erase scope and token type.
+    #[must_use]
+    pub const fn new(erase_type: EraseType, token_type: TokenType) -> Self {
+        Self {
+            erase_type,
+            token_type,
+        }
+    }
+
+    /// Returns the erase scope.
+    #[must_use]
+    pub const fn erase_type(&self) -> EraseType {
+        self.erase_type
+    }
+
+    /// Returns the token type whose tokens are erased.
+    #[must_use]
+    pub const fn token_type(&self) -> TokenType {
+        self.token_type
+    }
+}
+
+/// The payload of [`NvidiaPowerSmoothingCommand::ActivatePresetProfile`].
+///
+/// `profile_id` mirrors the CSDL `ActivatePresetProfile` action parameter
+/// `ProfileId` (`NvidiaPowerSmoothing_v1.xml`, an `Edm.Int64`). The CSDL
+/// marks the parameter optional, but a product command is the complete
+/// intent, so the domain requires the id — an activation without a target
+/// profile cannot be expressed (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileId {
+    profile_id: i64,
+}
+
+impl ProfileId {
+    /// Constructs one preset-profile activation with the profile id.
+    #[must_use]
+    pub const fn new(profile_id: i64) -> Self {
+        Self { profile_id }
+    }
+
+    /// Returns the id of the preset profile to activate.
+    #[must_use]
+    pub const fn profile_id(&self) -> i64 {
+        self.profile_id
+    }
+}
+
+/// Commands against the NVIDIA system config profile service (§11.5, the
+/// §0.5.0 `oem-nvidia-profiles` write surface).
+///
+/// The face targets the `NvidiaSystemConfigProfile` chain root of the
+/// system's `Oem.Nvidia` segment: `Update` and `FactoryReset` run the two
+/// CSDL actions of the profile service document, and `ActivateProfile` runs
+/// the `#NvidiaSystemProfile.Activate` action of the first member of the
+/// service's `Profiles` collection — the endpoint-scoped write rule of
+/// [`crate::ResourceFeature`], exactly like the reset families' first-member
+/// targeting.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum NvidiaSystemConfigProfileCommand {
+    /// Adds, activates, or deletes one profile from its JSON file content.
+    Update(ProfileFile),
+    /// Performs a factory reset of the system, including the DPU and NIC,
+    /// re-activating the default profile when one is installed.
+    FactoryReset,
+    /// Activates the endpoint's first profile member and applies its
+    /// configuration.
+    ActivateProfile,
+}
+
+/// Commands against the NVIDIA debug token surfaces (§11.5, the §0.5.0
+/// `oem-nvidia-security` write surface).
+///
+/// `GenerateToken`, `InstallToken`, and `DisableToken` run the CSDL actions
+/// of the device `NvidiaDebugToken` document behind the system's
+/// `Oem.Nvidia` `CPUDebugToken` navigation; `EraseToken` runs the
+/// `#NvidiaDebugTokenManagement.EraseToken` action of the manager's
+/// `Oem.Nvidia` `DebugTokenManagement` document.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum NvidiaDebugTokenCommand {
+    /// Generates a debug-token challenge of one token type.
+    GenerateToken(TokenType),
+    /// Installs one Base64-encoded debug token.
+    InstallToken(TokenData),
+    /// Disables the currently active token.
+    DisableToken,
+    /// Erases installed tokens, scoped to one token type when requested.
+    EraseToken(EraseToken),
+}
+
+/// Commands against the NVIDIA power smoothing resource (§11.5, the §0.5.0
+/// `oem-nvidia-power-management` write surface).
+///
+/// The face targets the `NvidiaPowerSmoothing` document behind the chassis's
+/// `Oem.Nvidia` segment and runs its two CSDL actions.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum NvidiaPowerSmoothingCommand {
+    /// Activates one preset power profile by its id.
+    ActivatePresetProfile(ProfileId),
+    /// Applies all cached administrator override values at runtime.
+    ApplyAdminOverrides,
+}
+
+/// The vendor write faces of the `Oem` command family (§7.5, §11.5).
+///
+/// Every variant is a compiled upstream vendor family whose CSDL actions are
+/// typed by `nv-redfish-schema` 0.13.0; the §7.5 deferred-list note below
+/// names the vendors whose write surfaces stay uncompiled. The three faces
+/// are deliberately independent types: they target different CSDL resources
+/// (`NvidiaSystemConfigProfile`, `NvidiaDebugToken` /
+/// `NvidiaDebugTokenManagement`, `NvidiaPowerSmoothing`) whose action sets
+/// diverge, exactly like the three reset families.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum OemCommand {
+    /// A command against the NVIDIA system config profile service.
+    SystemConfigProfile(NvidiaSystemConfigProfileCommand),
+    /// A command against the NVIDIA debug token surfaces.
+    DebugToken(NvidiaDebugTokenCommand),
+    /// A command against the NVIDIA power smoothing resource.
+    PowerSmoothing(NvidiaPowerSmoothingCommand),
+}
+
 /// One typed write command — the exhaustive §7.5 command surface.
 ///
 /// Every write the product performs is one value of this enum, and every
@@ -703,8 +1030,10 @@ pub enum UpdateCommand {
 ///   first-cut product flow.
 /// - `Telemetry` — telemetry writes (metric report subscription lifecycle)
 ///   build on the event-service surface and land with it.
-/// - `Oem` — OEM writes have no standardized shape (§11.5) and stay deferred
-///   until an upstream OEM command family is compiled in.
+///
+/// The `Oem` family is no longer deferred: upstream NVIDIA typed actions are
+/// compiled in (see [`OemCommand`]), and the remaining vendors' OEM write
+/// surfaces land as their actions get compiled.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum RedfishCommand {
     /// A command against a system resource.
@@ -721,6 +1050,8 @@ pub enum RedfishCommand {
     Event(EventCommand),
     /// A command against the update service.
     Update(UpdateCommand),
+    /// A command against a compiled vendor OEM surface (§11.5).
+    Oem(OemCommand),
 }
 
 impl RedfishCommand {
@@ -746,6 +1077,7 @@ impl RedfishCommand {
             Self::SecureBoot(_) => "secure-boot",
             Self::Event(_) => "event",
             Self::Update(_) => "update",
+            Self::Oem(_) => "oem",
         }
     }
 }
@@ -858,6 +1190,43 @@ mod tests {
         (EventType::Other, "Other"),
     ];
 
+    /// The exact `TokenType` member set of `nv-redfish-schema` 0.13.0
+    /// `NvidiaDebugTokenManagement_v1.xml`; note the all-caps acronym members
+    /// (`FRC`, `CRCS`, `CRDT`, `MTDT`, `NVJtagControl`, ...).
+    const TOKEN_TYPE_MEMBERS: [(TokenType, &str); 20] = [
+        (TokenType::Frc, "FRC"),
+        (TokenType::Crcs, "CRCS"),
+        (TokenType::Crdt, "CRDT"),
+        (TokenType::DebugFirmwareRunning, "DebugFirmwareRunning"),
+        (TokenType::DebugFirmwareUnlock, "DebugFirmwareUnlock"),
+        (TokenType::OtpDumpEnable, "OTPDumpEnable"),
+        (TokenType::JtagUnlock, "JtagUnlock"),
+        (TokenType::HardwareUnlock, "HardwareUnlock"),
+        (TokenType::RuntimeDebugUnlock, "RuntimeDebugUnlock"),
+        (TokenType::FeatureUnlock, "FeatureUnlock"),
+        (TokenType::Mtdt, "MTDT"),
+        (TokenType::CcplexArmJtagDebugCont, "CcplexArmJtagDebugCont"),
+        (TokenType::NvJtagControl, "NVJtagControl"),
+        (TokenType::DiagnosticBoot, "DiagnosticBoot"),
+        (TokenType::BpmpFirmwareDebugFs, "BpmpFirmwareDebugFS"),
+        (TokenType::FirmwareDebugKnobs, "FirmwareDebugKnobs"),
+        (TokenType::FirewallLifting, "FirewallLifting"),
+        (TokenType::Verbosity, "Verbosity"),
+        (TokenType::SmaDebugCapability, "SMADebugCapability"),
+        (TokenType::CpldDebugCapability, "CpldDebugCapability"),
+    ];
+
+    /// The exact `EraseType` member set of `nv-redfish-schema` 0.13.0
+    /// `NvidiaDebugTokenManagement_v1.xml`; note the `TokenType` member.
+    const ERASE_TYPE_MEMBERS: [(EraseType, &str); 3] = [
+        (EraseType::EraseAll, "EraseAll"),
+        (
+            EraseType::EraseAllAndRatchetCounterIncreased,
+            "EraseAllAndRatchetCounterIncreased",
+        ),
+        (EraseType::TokenType, "TokenType"),
+    ];
+
     /// Asserts that every member serializes to exactly its CSDL wire name,
     /// deserializes back from it, and that unknown member names are rejected.
     fn assert_csdl_member_set<T>(members: &[(T, &str)]) -> Result<(), Box<dyn Error>>
@@ -918,9 +1287,19 @@ mod tests {
         assert_csdl_member_set(&EVENT_TYPE_MEMBERS)
     }
 
+    #[test]
+    fn token_type_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
+        assert_csdl_member_set(&TOKEN_TYPE_MEMBERS)
+    }
+
+    #[test]
+    fn erase_type_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
+        assert_csdl_member_set(&ERASE_TYPE_MEMBERS)
+    }
+
     /// One representative command per family with its expected family code.
     ///
-    /// The seven entries are the exhaustive §7.5 family list for this
+    /// The eight entries are the exhaustive §7.5 family list for this
     /// iteration; adding a family must add an entry here or the
     /// exhaustiveness tests fail.
     fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, EventSubscriptionError> {
@@ -970,6 +1349,14 @@ mod tests {
                 ))),
                 "update",
             ),
+            (
+                RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::Update(ProfileFile::new(
+                        r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#.to_owned(),
+                    )),
+                )),
+                "oem",
+            ),
         ])
     }
 
@@ -990,11 +1377,11 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            7,
+            8,
             "add the new family to `all_families` when a variant is added"
         );
         // The deferred §7.5 families must not be claimed by an existing code.
-        for deferred in ["account", "bios", "storage", "telemetry", "oem"] {
+        for deferred in ["account", "bios", "storage", "telemetry"] {
             assert!(
                 !seen.contains(&deferred),
                 "the deferred family code {deferred} must not be claimed"
@@ -1016,6 +1403,7 @@ mod tests {
                 RedfishCommand::SecureBoot(_) => "secure-boot",
                 RedfishCommand::Event(_) => "event",
                 RedfishCommand::Update(_) => "update",
+                RedfishCommand::Oem(_) => "oem",
             };
             assert_eq!(matched, expected);
             assert_eq!(command.as_str(), matched);
@@ -1038,13 +1426,19 @@ mod tests {
             r#"{"Bios":{"SetAttributes":{}}}"#,
             r#"{"Storage":{"Format":{}}}"#,
             r#"{"Telemetry":{"SubmitTestMetricReport":{}}}"#,
-            r#"{"Oem":{"Custom":{}}}"#,
         ] {
             assert!(
                 serde_json::from_str::<RedfishCommand>(unknown).is_err(),
                 "{unknown} must not deserialize as a command"
             );
         }
+        // The `Oem` family is compiled, but an unknown vendor face under it
+        // stays rejected, so the wire contract cannot drift into accepting a
+        // face no payload can fill.
+        assert!(
+            serde_json::from_str::<RedfishCommand>(r#"{"Oem":{"Custom":{}}}"#).is_err(),
+            "an unknown OEM face must not deserialize as a command"
+        );
         Ok(())
     }
 
@@ -1103,6 +1497,52 @@ mod tests {
                     Some("https://192.0.2.10/upload".to_owned()),
                 ))),
                 r#"{"Update":{"StartUpdate":{"artifact_id":"0198a0c5-9f5e-7b42-8d2e-5a4b6c7d8e9f","push_uri":"https://192.0.2.10/upload"}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::Update(ProfileFile::new(
+                        r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#.to_owned(),
+                    )),
+                )),
+                r#"{"Oem":{"SystemConfigProfile":{"Update":{"profile_file":"{\"UUID\":\"11111111-2222-3333-4444-555555555555\"}"}}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                    NvidiaSystemConfigProfileCommand::FactoryReset,
+                )),
+                r#"{"Oem":{"SystemConfigProfile":"FactoryReset"}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::GenerateToken(TokenType::Frc),
+                )),
+                r#"{"Oem":{"DebugToken":{"GenerateToken":"FRC"}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(
+                    NvidiaDebugTokenCommand::InstallToken(TokenData::new(
+                        "dG9rZW4tZGF0YQ==".to_owned(),
+                    )),
+                )),
+                r#"{"Oem":{"DebugToken":{"InstallToken":{"token_data":"dG9rZW4tZGF0YQ=="}}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(
+                    EraseToken::new(EraseType::EraseAll, TokenType::Crdt),
+                ))),
+                r#"{"Oem":{"DebugToken":{"EraseToken":{"erase_type":"EraseAll","token_type":"CRDT"}}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ActivatePresetProfile(ProfileId::new(3)),
+                )),
+                r#"{"Oem":{"PowerSmoothing":{"ActivatePresetProfile":{"profile_id":3}}}}"#,
+            ),
+            (
+                RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                    NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+                )),
+                r#"{"Oem":{"PowerSmoothing":"ApplyAdminOverrides"}}"#,
             ),
         ];
         for (command, golden) in commands {
@@ -1260,6 +1700,103 @@ mod tests {
             let json = serde_json::to_string(&command)?;
             assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn oem_commands_round_trip_per_face() -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                NvidiaSystemConfigProfileCommand::FactoryReset,
+            )),
+            RedfishCommand::Oem(OemCommand::SystemConfigProfile(
+                NvidiaSystemConfigProfileCommand::ActivateProfile,
+            )),
+            RedfishCommand::Oem(OemCommand::DebugToken(
+                NvidiaDebugTokenCommand::GenerateToken(TokenType::BpmpFirmwareDebugFs),
+            )),
+            RedfishCommand::Oem(OemCommand::DebugToken(
+                NvidiaDebugTokenCommand::DisableToken,
+            )),
+            RedfishCommand::Oem(OemCommand::PowerSmoothing(
+                NvidiaPowerSmoothingCommand::ApplyAdminOverrides,
+            )),
+        ] {
+            let json = serde_json::to_string(&command)?;
+            assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_file_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let profile =
+            ProfileFile::new(r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#.to_owned());
+        assert_eq!(
+            profile.profile_file(),
+            r#"{"UUID":"11111111-2222-3333-4444-555555555555"}"#
+        );
+
+        let json = serde_json::to_string(&profile)?;
+        assert_eq!(
+            json,
+            r#"{"profile_file":"{\"UUID\":\"11111111-2222-3333-4444-555555555555\"}"}"#
+        );
+        assert_eq!(serde_json::from_str::<ProfileFile>(&json)?, profile);
+        assert!(
+            serde_json::from_str::<ProfileFile>(r#"{"profile_file":"{}","metadata":true}"#)
+                .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn token_data_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let token = TokenData::new("dG9rZW4tZGF0YQ==".to_owned());
+        assert_eq!(token.token_data(), "dG9rZW4tZGF0YQ==");
+
+        let json = serde_json::to_string(&token)?;
+        assert_eq!(json, r#"{"token_data":"dG9rZW4tZGF0YQ=="}"#);
+        assert_eq!(serde_json::from_str::<TokenData>(&json)?, token);
+        assert!(
+            serde_json::from_str::<TokenData>(r#"{"token_data":"AA==","binary":true}"#).is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn erase_token_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let erase = EraseToken::new(EraseType::TokenType, TokenType::Mtdt);
+        assert_eq!(erase.erase_type(), EraseType::TokenType);
+        assert_eq!(erase.token_type(), TokenType::Mtdt);
+
+        let json = serde_json::to_string(&erase)?;
+        assert_eq!(json, r#"{"erase_type":"TokenType","token_type":"MTDT"}"#);
+        assert_eq!(serde_json::from_str::<EraseToken>(&json)?, erase);
+        assert!(
+            serde_json::from_str::<EraseToken>(
+                r#"{"erase_type":"EraseAll","token_type":"FRC","scope":1}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_id_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let profile_id = ProfileId::new(3);
+        assert_eq!(profile_id.profile_id(), 3);
+
+        let json = serde_json::to_string(&profile_id)?;
+        assert_eq!(json, r#"{"profile_id":3}"#);
+        assert_eq!(serde_json::from_str::<ProfileId>(&json)?, profile_id);
+        assert!(
+            serde_json::from_str::<ProfileId>(r#"{"profile_id":3,"name":"eco"}"#).is_err(),
+            "unknown payload fields must be rejected"
+        );
         Ok(())
     }
 }

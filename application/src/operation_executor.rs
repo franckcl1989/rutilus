@@ -39,7 +39,7 @@ use rutilus_domain::{
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOperationId,
     AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
     CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
-    EventCommand, FailureKind, ManagerCommand, Operation, OperationEvent, OperationId,
+    EventCommand, FailureKind, ManagerCommand, OemCommand, Operation, OperationEvent, OperationId,
     OperationState, ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand,
     UpdateCommand,
 };
@@ -1231,6 +1231,16 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
         RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
             AuditRedfishOperation::UpdateFirmware
         }
+        // The three OEM faces are audited separately because their
+        // accountability differs: a profile-service write, a debug-token
+        // write, and a power-smoothing write are different §11.5 surfaces.
+        RedfishCommand::Oem(OemCommand::SystemConfigProfile(_)) => {
+            AuditRedfishOperation::OemSystemConfigProfile
+        }
+        RedfishCommand::Oem(OemCommand::DebugToken(_)) => AuditRedfishOperation::OemDebugToken,
+        RedfishCommand::Oem(OemCommand::PowerSmoothing(_)) => {
+            AuditRedfishOperation::OemPowerSmoothing
+        }
     }
 }
 
@@ -1254,6 +1264,17 @@ fn required_capability(command: &RedfishCommand) -> EndpointCapability {
         // A firmware update targets the BMC's UpdateService (§14.3), so the
         // update command requires the update-service capability.
         RedfishCommand::Update(_) => EndpointCapability::UpdateService,
+        // Each OEM face requires the §2.1 sub-capability of its chain: the
+        // profile service, the debug-token surfaces, and the power-smoothing
+        // resource each probe `Supported` whenever the endpoint advertises
+        // the `Nvidia` namespace (§11.3 advertised layer).
+        RedfishCommand::Oem(OemCommand::SystemConfigProfile(_)) => {
+            EndpointCapability::OemNvidiaProfiles
+        }
+        RedfishCommand::Oem(OemCommand::DebugToken(_)) => EndpointCapability::OemNvidiaSecurity,
+        RedfishCommand::Oem(OemCommand::PowerSmoothing(_)) => {
+            EndpointCapability::OemNvidiaPowerManagement
+        }
     }
 }
 

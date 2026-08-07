@@ -159,6 +159,9 @@ stable_audit_codes! {
         CreateEventSubscription => "create-event-subscription",
         DeleteEventSubscription => "delete-event-subscription",
         UpdateFirmware => "update-firmware",
+        OemSystemConfigProfile => "oem-system-config-profile",
+        OemDebugToken => "oem-debug-token",
+        OemPowerSmoothing => "oem-power-smoothing",
         PollRemoteTask => "poll-remote-task",
     }
 }
@@ -564,6 +567,9 @@ impl AuditOperationContext {
             | AuditRedfishOperation::CreateEventSubscription
             | AuditRedfishOperation::DeleteEventSubscription
             | AuditRedfishOperation::UpdateFirmware
+            | AuditRedfishOperation::OemSystemConfigProfile
+            | AuditRedfishOperation::OemDebugToken
+            | AuditRedfishOperation::OemPowerSmoothing
             | AuditRedfishOperation::PollRemoteTask => matches!(
                 (&target, parameters, permission, action),
                 (
