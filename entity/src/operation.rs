@@ -25,6 +25,13 @@ pub struct Model {
     pub state: String,
     /// The typed write command as serde JSON; see the model-level doc.
     pub command: String,
+    /// The §13.7 batch parent this operation belongs to, when it is a batch
+    /// child. Batch children are ordinary single-target operations — the
+    /// executor, scheduler, recovery, and audit paths never need this column
+    /// — so it lives only here, at the entity and persistence layer, and the
+    /// domain `Operation` aggregate does not carry it. Deleting the batch
+    /// cascades the child away (migration 000011).
+    pub batch_id: Option<Uuid>,
     /// When the operation was accepted, before any Redfish interaction.
     pub created_at: TimeDateTimeWithTimeZone,
     /// When the state last changed; `created_at` until the first transition.

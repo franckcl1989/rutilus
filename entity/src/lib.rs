@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod audit_event;
+pub mod batch_operation;
 pub mod credential;
 pub mod credential_version;
 pub mod endpoint;
