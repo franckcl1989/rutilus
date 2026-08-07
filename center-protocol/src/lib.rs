@@ -15,8 +15,11 @@
 //!   limits, the pinned `NV_REDFISH_BASELINE`).
 //!
 //! The generated wire types are not wrapped: the wire type is the wire type
-//! (design §7.2). The crate depends only on `rutilus-domain` (for the
-//! stable capability codes the ledger hash is built from), `prost`, and
+//! (design §7.2). Every generated message and enum derives serde, so an
+//! [`Envelope`] is a §9.4 typed JSON payload: the outbox and inbox payload
+//! columns store `serde_json` of the real wire type, never hand-written
+//! JSON. The crate depends only on `rutilus-domain` (for the stable
+//! capability codes the ledger hash is built from), `prost`, `serde`, and
 //! `sha2` (the ledger hash); it never touches `axum`, `tokio`, `SeaORM`, or
 //! `nv-redfish`.
 
@@ -263,6 +266,65 @@ mod tests {
         assert_round_trip(&Heartbeat {
             sent_at_unix: 1_700_000_000,
         });
+    }
+
+    #[test]
+    fn every_message_round_trips_through_serde_json() -> Result<(), serde_json::Error> {
+        // The §9.4 typed-payload rule: the stored payload of an outbox or
+        // inbox entry is `serde_json` of the real wire type, so an envelope
+        // serialized here must deserialize back to exactly itself.
+        let messages: Vec<EnvelopeMessage> = vec![
+            EnvelopeMessage::Hello(sample_hello()),
+            EnvelopeMessage::NegotiationResult(NegotiationResult {
+                accepted: true,
+                reason: String::new(),
+            }),
+            EnvelopeMessage::CapabilityManifest(sample_capability_manifest()),
+            EnvelopeMessage::EndpointSnapshot(sample_endpoint_snapshot()),
+            EnvelopeMessage::ResourceDelta(sample_resource_delta()),
+            EnvelopeMessage::EventBatch(sample_event_batch()),
+            EnvelopeMessage::OperationOffer(sample_operation_offer()),
+            EnvelopeMessage::OperationAccepted(OperationAccepted {
+                operation_id: String::from("operation-1"),
+                accepted_at_unix: 1_700_000_110,
+            }),
+            EnvelopeMessage::OperationRejected(sample_operation_rejected()),
+            EnvelopeMessage::OperationProgress(OperationProgress {
+                operation_id: String::from("operation-1"),
+                state: String::from("running"),
+                detail: String::from("waiting for the BMC task"),
+            }),
+            EnvelopeMessage::OperationCompleted(OperationCompleted {
+                operation_id: String::from("operation-1"),
+                succeeded: true,
+                summary: String::from("reset verified"),
+            }),
+            EnvelopeMessage::ArtifactManifest(sample_artifact_manifest()),
+            EnvelopeMessage::ArtifactChunk(sample_artifact_chunk()),
+            EnvelopeMessage::Ack(Ack { sequence: 12 }),
+            EnvelopeMessage::Heartbeat(Heartbeat {
+                sent_at_unix: 1_700_000_000,
+            }),
+        ];
+        for (sequence, message) in (1_u64..).zip(messages) {
+            let envelope = Envelope {
+                sequence,
+                acked_sequence: sequence - 1,
+                message: Some(message),
+            };
+            let json = serde_json::to_string(&envelope)?;
+            let decoded: Envelope = serde_json::from_str(&json)?;
+            assert_eq!(decoded, envelope);
+        }
+        let empty = Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: None,
+        };
+        let json = serde_json::to_string(&empty)?;
+        let decoded: Envelope = serde_json::from_str(&json)?;
+        assert_eq!(decoded, empty);
+        Ok(())
     }
 
     #[test]
