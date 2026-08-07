@@ -5,8 +5,9 @@ use rutilus_application::{
     ResourceObservation, StoredCapability,
 };
 use rutilus_domain::{
-    AuditEvent, Credential, Endpoint, EndpointCapabilityObservation, EndpointId, Operation,
-    OperationId, OperationState, ResourceSnapshot,
+    AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
+    EndpointCapabilityObservation, EndpointId, Operation, OperationId, OperationState,
+    ResourceSnapshot,
 };
 use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, OperationStore, RemoteTask, RemoteTaskState,
@@ -165,6 +166,34 @@ impl OperationStore for SqliteStore {
         state: Option<OperationState>,
     ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
         Box::pin(async move { SqliteStore::list_operations(self, state).await })
+    }
+
+    fn create_batch<'a>(
+        &'a self,
+        batch: &'a BatchOperation,
+        children: &'a [Operation],
+    ) -> OperationBoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::create_batch(self, batch, children).await })
+    }
+
+    fn find_batch(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<BatchOperation>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_batch(self, batch_id).await })
+    }
+
+    fn list_batches(
+        &self,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<BatchOperation>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_batches(self).await })
+    }
+
+    fn list_batch_children(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_batch_children(self, batch_id).await })
     }
 }
 

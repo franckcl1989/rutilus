@@ -1,14 +1,16 @@
 use rutilus_domain::{
-    Operation, OperationId, OperationSource, OperationSourceParseError, OperationState,
-    OperationStateParseError, OperationTarget, OperationTimelineError, RedfishCommand,
+    BatchOperation, BatchOperationId, Operation, OperationId, OperationSource,
+    OperationSourceParseError, OperationState, OperationStateParseError, OperationTarget,
+    OperationTimelineError, RedfishCommand,
 };
-use rutilus_entity::{operation, operation_target};
+use rutilus_entity::{batch_operation, operation, operation_target};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
     QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::SqliteStore;
 
@@ -48,12 +50,206 @@ impl SqliteStore {
             .begin()
             .await
             .map_err(OperationRepositoryError::Database)?;
-        insert_operation_aggregate(&transaction, operation).await?;
+        insert_operation_aggregate(&transaction, operation, None).await?;
         transaction
             .commit()
             .await
             .map_err(OperationRepositoryError::Database)?;
         Ok(())
+    }
+
+    /// Atomically persists one batch parent and every child operation
+    /// (design §13.7).
+    ///
+    /// The parent row carries the submission facts — source, the typed
+    /// command as its §9.4 serde JSON serialization, and the acceptance
+    /// time — and each child is persisted through the same
+    /// [`Self::create_operation`] aggregate write with its `batch_id` link
+    /// set, so a child can never exist without its batch (or half a batch
+    /// without the rest): the parent and all children commit in one
+    /// transaction.
+    ///
+    /// Delivery is at-least-once (design §15.4), exactly like
+    /// [`Self::create_operation`]: a batch id that is already stored is a
+    /// no-op — the persisted batch and its children are authoritative and
+    /// are never rewritten, which is what keeps a re-delivered batch from
+    /// re-inserting its children (single business effect per batch).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when write coordination fails, the
+    /// transaction cannot commit, a command cannot be serialized, or a stored
+    /// row violates an aggregate invariant.
+    pub async fn create_batch(
+        &self,
+        batch: &BatchOperation,
+        children: &[Operation],
+    ) -> Result<(), OperationRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(OperationRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let batch_id = batch.id().into_uuid();
+        if batch_operation::Entity::find_by_id(batch_id)
+            .one(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?
+            .is_some()
+        {
+            // At-least-once delivery (design §15.4): the stored batch is
+            // authoritative and must never be rewritten, and its children
+            // must never be re-inserted.
+            transaction
+                .commit()
+                .await
+                .map_err(OperationRepositoryError::Database)?;
+            return Ok(());
+        }
+        batch_operation::ActiveModel {
+            id: Set(batch_id),
+            source: Set(batch.source().as_str().to_owned()),
+            command: Set(serialize_command(&batch.command())?),
+            created_at: Set(batch.created_at()),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(OperationRepositoryError::Database)?;
+        for child in children {
+            insert_operation_aggregate(&transaction, child, Some(batch_id)).await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(())
+    }
+
+    /// Reads one batch parent by stable identity.
+    ///
+    /// The stored command JSON is rehydrated through the domain
+    /// [`RedfishCommand`] deserializer with the same corrupt-aggregate rule
+    /// as [`Self::find_operation`]: a payload this build cannot deserialize,
+    /// or a source code it cannot classify, makes the whole parent
+    /// [`OperationRepositoryError::BatchCorrupt`] instead of being
+    /// half-understood.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or any
+    /// persisted component violates domain invariants.
+    pub async fn find_batch(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> Result<Option<BatchOperation>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let Some(model) = batch_operation::Entity::find_by_id(batch_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?
+        else {
+            transaction
+                .commit()
+                .await
+                .map_err(OperationRepositoryError::Database)?;
+            return Ok(None);
+        };
+        let domain = map_stored_batch(batch_id, &model)?;
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(Some(domain))
+    }
+
+    /// Lists every batch parent in acceptance order.
+    ///
+    /// Results are ordered by creation time and identity so batch reporting
+    /// (design §13.7) replays the same deterministic order as the operation
+    /// listing. Each listed row is rehydrated as a complete parent — including
+    /// its command — so one corrupt command poisons the whole listing, exactly
+    /// like [`Self::list_operations`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or any
+    /// persisted batch violates domain invariants.
+    pub async fn list_batches(&self) -> Result<Vec<BatchOperation>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let models = batch_operation::Entity::find()
+            .order_by_asc(batch_operation::Column::CreatedAt)
+            .order_by_asc(batch_operation::Column::Id)
+            .all(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut batches = Vec::with_capacity(models.len());
+        for model in models {
+            let batch_id = BatchOperationId::from_uuid(model.id);
+            batches.push(map_stored_batch(batch_id, &model)?);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(batches)
+    }
+
+    /// Lists one batch's child operations in target order.
+    ///
+    /// The children are ordinary persisted operations, so each is rehydrated
+    /// as a complete aggregate through [`Self::find_operation`]'s mapping —
+    /// including its command — and one corrupt child poisons the whole
+    /// listing. Each child carries exactly one target, so ordering by that
+    /// target's identity is a total order; batch reporting (design §13.7)
+    /// pairs every endpoint with its child in this deterministic order. An
+    /// unknown batch id returns an empty list; the parent existence is a
+    /// separate [`Self::find_batch`] read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or any
+    /// persisted child violates domain invariants.
+    pub async fn list_batch_children(
+        &self,
+        batch_id: BatchOperationId,
+    ) -> Result<Vec<Operation>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let models = operation::Entity::find()
+            .filter(operation::Column::BatchId.eq(batch_id.into_uuid()))
+            .all(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut children = Vec::with_capacity(models.len());
+        for model in models {
+            let operation_id = OperationId::from_uuid(model.id);
+            children.push(map_stored_operation(&transaction, operation_id, model).await?);
+        }
+        // Target order: each child carries exactly one target, so the target
+        // identity orders the batch; a corrupt zero-target row (impossible
+        // through the engine) sorts first by `None` instead of panicking.
+        children.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(children)
     }
 
     /// Reads one complete operation aggregate by stable identity.
@@ -216,6 +412,7 @@ impl SqliteStore {
 async fn insert_operation_aggregate<C>(
     database: &C,
     domain: &Operation,
+    batch_id: Option<Uuid>,
 ) -> Result<(), OperationRepositoryError>
 where
     C: ConnectionTrait,
@@ -236,6 +433,9 @@ where
         source: Set(domain.source().as_str().to_owned()),
         state: Set(domain.state().as_str().to_owned()),
         command: Set(serialize_command(&domain.command())?),
+        // A batch child carries its parent link at the persistence layer
+        // only; the domain `Operation` aggregate has no batch concept.
+        batch_id: Set(batch_id),
         created_at: Set(domain.created_at()),
         updated_at: Set(domain.updated_at()),
     }
@@ -253,6 +453,29 @@ where
         .map_err(OperationRepositoryError::Database)?;
     }
     Ok(())
+}
+
+fn map_stored_batch(
+    batch_id: BatchOperationId,
+    model: &batch_operation::Model,
+) -> Result<BatchOperation, OperationRepositoryError> {
+    let source = model
+        .source
+        .parse::<OperationSource>()
+        .map_err(StoredBatchError::InvalidSource)
+        .map_err(|source| corrupt_batch(batch_id, source))?;
+    // Rehydration goes through the domain type, never through string
+    // inspection: the deserializer is the only judge of what the stored JSON
+    // means, and anything it refuses corrupts the whole parent (§9.4).
+    let command = serde_json::from_str(&model.command)
+        .map_err(StoredBatchError::InvalidCommand)
+        .map_err(|source| corrupt_batch(batch_id, source))?;
+    Ok(BatchOperation::try_from_parts(
+        batch_id,
+        source,
+        command,
+        model.created_at,
+    ))
 }
 
 async fn map_stored_operation<C>(
@@ -326,6 +549,10 @@ fn corrupt(operation_id: OperationId, source: StoredOperationError) -> Operation
     }
 }
 
+fn corrupt_batch(batch_id: BatchOperationId, source: StoredBatchError) -> OperationRepositoryError {
+    OperationRepositoryError::BatchCorrupt { batch_id, source }
+}
+
 /// A controlled failure while creating, reading, or advancing operations.
 #[derive(Debug, Error)]
 pub enum OperationRepositoryError {
@@ -345,6 +572,12 @@ pub enum OperationRepositoryError {
         operation_id: OperationId,
         #[source]
         source: StoredOperationError,
+    },
+    #[error("stored batch {batch_id} is invalid: {source}")]
+    BatchCorrupt {
+        batch_id: BatchOperationId,
+        #[source]
+        source: StoredBatchError,
     },
     #[error("operation database operation failed: {0}")]
     Database(#[source] DbErr),
@@ -373,18 +606,32 @@ pub enum StoredOperationError {
     InvalidTimeline(#[source] OperationTimelineError),
 }
 
+/// Why persisted batch data cannot be mapped into valid product types.
+#[derive(Debug, Error)]
+pub enum StoredBatchError {
+    #[error("batch source code is invalid: {0}")]
+    InvalidSource(#[source] OperationSourceParseError),
+    /// The stored command JSON cannot be deserialized by this build: a
+    /// malformed document, an unknown command family, or a payload shape this
+    /// build does not know. The whole parent is refused rather than
+    /// half-understood; see [`super::SqliteStore::find_batch`] for the
+    /// upgrade-order consequence.
+    #[error("batch command JSON is invalid: {0}")]
+    InvalidCommand(#[source] serde_json::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
     use rutilus_domain::{
-        ArtifactId, BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode,
-        ChassisCommand, CreateSubscription, EndpointId, EventCommand, EventDestinationProtocol,
-        EventSubscriptionError, EventType, ManagerCommand, RedfishCommand, ResetKeysType,
-        ResetType, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TargetId,
-        UpdateCommand,
+        ArtifactId, BatchOperation, BatchOperationId, BootCommand, BootSource,
+        BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateSubscription,
+        EndpointId, EventCommand, EventDestinationProtocol, EventSubscriptionError, EventType,
+        ManagerCommand, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand,
+        SetBootSourceOverride, StartUpdate, SystemCommand, TargetId, UpdateCommand,
     };
-    use rutilus_entity::{operation, operation_target};
+    use rutilus_entity::{batch_operation, operation, operation_target};
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
     use time::{Duration, OffsetDateTime};
 
@@ -873,6 +1120,7 @@ mod tests {
             source: Set(String::from("standalone")),
             state: Set(String::from("queued")),
             command: Set(serialize_command(&one_command())?),
+            batch_id: Set(None),
             created_at: Set(created_at),
             updated_at: Set(created_at - Duration::SECOND),
         }
@@ -940,6 +1188,7 @@ mod tests {
                 source: Set(String::from("standalone")),
                 state: Set(String::from("queued")),
                 command: Set(String::from(command)),
+                batch_id: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -981,6 +1230,7 @@ mod tests {
             source: Set(String::from("standalone")),
             state: Set(String::from("queued")),
             command: Set(String::from(r#"{"Storage": {}}"#)),
+            batch_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -993,6 +1243,282 @@ mod tests {
                 operation_id,
                 source: StoredOperationError::InvalidCommand(_),
             }) if operation_id == corrupt_id
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_batch_round_trips_parent_and_single_target_children()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let created_at = OffsetDateTime::now_utc();
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            one_command(),
+            created_at,
+        );
+        let children = (0..3)
+            .map(|index| {
+                queued_operation(
+                    OperationSource::Site,
+                    &[OperationTarget::new(
+                        TargetId::generate(),
+                        EndpointId::generate(),
+                    )],
+                    one_command(),
+                    created_at + Duration::SECOND * index,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store.create_batch(&batch, &children).await?;
+
+        // The parent reads back with its submission facts intact.
+        let stored_batch = store
+            .find_batch(batch.id())
+            .await?
+            .ok_or("stored batch is missing")?;
+        assert_eq!(stored_batch, batch);
+        assert_eq!(stored_batch.command(), one_command());
+
+        // Every child is an ordinary operation: readable by its own
+        // OperationId with exactly the one target the batch bound.
+        let mut stored_children = Vec::with_capacity(children.len());
+        for child in &children {
+            let stored = store
+                .find_operation(child.id())
+                .await?
+                .ok_or("stored child is missing")?;
+            assert_eq!(stored, *child);
+            assert_eq!(stored.targets().len(), 1);
+            assert_eq!(stored.targets()[0], child.targets()[0]);
+            stored_children.push(stored);
+        }
+        // The batch listing returns its children in target order.
+        let mut expected = stored_children;
+        expected.sort_by_key(|child| child.targets().first().map(|target| target.target_id()));
+        assert_eq!(store.list_batch_children(batch.id()).await?, expected);
+        assert!(
+            store
+                .find_batch(BatchOperationId::generate())
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .list_batch_children(BatchOperationId::generate())
+                .await?
+                .is_empty()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_batch_delivery_never_rewrites_or_duplicates_children()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let created_at = OffsetDateTime::now_utc();
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Center,
+            one_command(),
+            created_at,
+        );
+        let children = (0..2)
+            .map(|index| {
+                queued_operation(
+                    OperationSource::Center,
+                    &[OperationTarget::new(
+                        TargetId::generate(),
+                        EndpointId::generate(),
+                    )],
+                    one_command(),
+                    created_at + Duration::SECOND * index,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        store.create_batch(&batch, &children).await?;
+        store.create_batch(&batch, &children).await?;
+        assert_eq!(store.list_batch_children(batch.id()).await?.len(), 2);
+
+        // A re-delivered batch must not resurrect children that have already
+        // moved forward (design §15.4 single business effect): transition one
+        // child, then re-deliver the whole batch, and both the state and the
+        // child count must stay untouched.
+        let child_id = children[0].id();
+        let transitioned_at = created_at + Duration::SECOND;
+        store
+            .apply_transition(child_id, OperationState::Validating, transitioned_at)
+            .await?;
+        store.create_batch(&batch, &children).await?;
+        let stored = store
+            .find_operation(child_id)
+            .await?
+            .ok_or("stored child is missing")?;
+        assert_eq!(stored.state(), OperationState::Validating);
+        assert_eq!(stored.updated_at(), transitioned_at);
+        assert_eq!(store.list_batch_children(batch.id()).await?.len(), 2);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_batches_orders_parents_in_acceptance_order() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let earlier = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Standalone,
+            one_command(),
+            base,
+        );
+        let later = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            one_command(),
+            base + Duration::SECOND,
+        );
+        store.create_batch(&earlier, &[]).await?;
+        store.create_batch(&later, &[]).await?;
+
+        let batches = store.list_batches().await?;
+        assert_eq!(
+            batches.iter().map(BatchOperation::id).collect::<Vec<_>>(),
+            vec![earlier.id(), later.id()],
+            "listing without a filter must return every batch in acceptance order"
+        );
+        assert_eq!(store.find_batch(later.id()).await?, Some(later));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_batch_cascades_to_its_children_only() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let created_at = OffsetDateTime::now_utc();
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Standalone,
+            one_command(),
+            created_at,
+        );
+        let child = queued_operation(
+            OperationSource::Standalone,
+            &[OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            one_command(),
+            created_at,
+        );
+        let unlinked = queued_operation(
+            OperationSource::Standalone,
+            &[OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            one_command(),
+            created_at,
+        );
+        store
+            .create_batch(&batch, std::slice::from_ref(&child))
+            .await?;
+        store.create_operation(&unlinked).await?;
+        let batch_uuid = batch.id().into_uuid();
+
+        batch_operation::Entity::delete_by_id(batch_uuid)
+            .exec(&store.database)
+            .await?;
+
+        assert!(
+            store.find_batch(batch.id()).await?.is_none(),
+            "deleting a batch must remove the parent row"
+        );
+        assert_eq!(
+            operation::Entity::find()
+                .filter(operation::Column::BatchId.eq(batch_uuid))
+                .all(&store.database)
+                .await?
+                .len(),
+            0,
+            "deleting a batch must cascade to its children"
+        );
+        assert!(
+            store.find_operation(child.id()).await?.is_none(),
+            "a batch child must not outlive its batch"
+        );
+        assert!(
+            store.find_operation(unlinked.id()).await?.is_some(),
+            "deleting a batch must not touch unlinked operations"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_batch_data_this_build_cannot_classify() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let now = OffsetDateTime::now_utc();
+
+        // A deferred command family (design section 7.5) written directly,
+        // bypassing the repository's serializer — exactly what a future
+        // build's row would look like to this build. Rehydration must refuse
+        // the whole parent, never guess at the command.
+        let corrupt_id = BatchOperationId::generate();
+        batch_operation::ActiveModel {
+            id: Set(corrupt_id.into_uuid()),
+            source: Set(String::from("standalone")),
+            command: Set(String::from(r#"{"Storage": {}}"#)),
+            created_at: Set(now),
+        }
+        .insert(&store.database)
+        .await?;
+        assert!(matches!(
+            store.find_batch(corrupt_id).await,
+            Err(OperationRepositoryError::BatchCorrupt {
+                batch_id,
+                source: StoredBatchError::InvalidCommand(_),
+            }) if batch_id == corrupt_id
+        ));
+
+        // A source code no product build can classify is refused at the
+        // database (the CHECK constraint), so rehydration never has to guess
+        // an origin — the same guard as the operations.source precedent. The
+        // repository's InvalidSource rehydration arm stays as defense-in-depth
+        // for rows written before the CHECK existed.
+        let invalid_source_id = BatchOperationId::generate();
+        let invalid_source = batch_operation::ActiveModel {
+            id: Set(invalid_source_id.into_uuid()),
+            source: Set(String::from("cluster")),
+            command: Set(serialize_command(&one_command())?),
+            created_at: Set(now),
+        }
+        .insert(&store.database)
+        .await;
+        assert!(
+            invalid_source.is_err(),
+            "an unknown source code must be refused by the database"
+        );
+
+        // One corrupt parent poisons the whole batch listing, exactly like
+        // the operation listing's corrupt-command rule.
+        assert!(matches!(
+            store.list_batches().await,
+            Err(OperationRepositoryError::BatchCorrupt { .. })
         ));
 
         store.close().await?;

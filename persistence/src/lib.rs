@@ -41,7 +41,7 @@ pub use endpoint_repository::{EndpointRepositoryError, StoredEndpointError};
 pub use event_repository::{EventRepositoryError, StoredEventError};
 pub use group_repository::{GroupRepositoryError, StoredGroupError};
 pub use migration_backup::{MigrationBackup, MigrationBackupError};
-pub use operation_repository::{OperationRepositoryError, StoredOperationError};
+pub use operation_repository::{OperationRepositoryError, StoredBatchError, StoredOperationError};
 pub use remote_task_repository::{RemoteTaskRepositoryError, StoredRemoteTaskError};
 pub use resource_snapshot_repository::{
     NewResourceSnapshot, ResourceSnapshotRepositoryError, StoredResourceSnapshotError,
