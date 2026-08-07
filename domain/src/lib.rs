@@ -14,10 +14,14 @@ mod failure_kind;
 mod group;
 mod ids;
 mod operation;
+mod password;
 mod redfish_command;
 mod resource_snapshot;
+mod session;
 mod tag;
 mod telemetry;
+mod totp;
+mod user;
 
 pub use artifact::{
     Artifact, ArtifactError, ArtifactName, ArtifactNameError, ArtifactRestoreError, ArtifactState,
@@ -56,12 +60,18 @@ pub use event::{
 pub use failure_kind::{FailureKind, FailureKindParseError};
 pub use group::{Group, GroupId, GroupName, GroupNameError, GroupRestoreError};
 pub use ids::{
-    ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, CredentialId,
-    CredentialVersionId, EndpointId, OperationId, ResourceId, TargetId,
+    ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, BootstrapCodeId, CredentialId,
+    CredentialVersionId, EndpointId, OperationId, PrincipalId, ResourceId, SessionId, TargetId,
+    TotpAuthenticatorId,
 };
 pub use operation::{
     InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,
     OperationState, OperationStateParseError, OperationTarget, OperationTimelineError, transition,
+};
+pub use password::{
+    ARGON2ID_FORMAT, ARGON2ID_HASH_LENGTH, ARGON2ID_MEMORY_KIB, ARGON2ID_PARALLELISM,
+    ARGON2ID_SALT_LENGTH, ARGON2ID_TIME_COST, Argon2IdHash, PasswordCredential,
+    PasswordCredentialError,
 };
 pub use redfish_command::{
     BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
@@ -75,10 +85,20 @@ pub use resource_snapshot::{
     ResourceODataTypeError, ResourceSnapshot, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError,
 };
+pub use session::{Session, SessionError, SessionRestoreError};
 pub use tag::{Tag, TagId, TagName, TagNameError};
 pub use telemetry::{
     NonFiniteSampleValue, SeriesKey, SeriesKeyError, TelemetrySample, TelemetrySeries,
     TelemetrySeriesId,
+};
+pub use totp::{
+    TOTP_DIGITS, TOTP_PERIOD_SECONDS, TOTP_SECRET_LENGTH, TOTP_WINDOW, TotpAuthenticator,
+    TotpAuthenticatorError, TotpRestoreError, TotpState, TotpStateParseError, verify_totp_code,
+};
+pub use user::{
+    BootstrapCode, BootstrapCodeError, Principal, PrincipalName, PrincipalNameError,
+    PrincipalRestoreError, PrincipalState, PrincipalStateParseError, Role, RoleAssignment,
+    RoleParseError,
 };
 
 /// The execution boundary inside the single Rutilus binary.

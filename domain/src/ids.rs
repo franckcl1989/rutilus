@@ -101,12 +101,34 @@ define_id!(
      batch id names the parent that ties the children together, while the\n\
      children keep their own `OperationId` lifecycle records."
 );
+define_id!(
+    PrincipalId,
+    "The stable identity of one product user principal (§16)."
+);
+define_id!(
+    SessionId,
+    "The stable identity of one signed-in product session (§16.2).\n\n\
+     The session id names the `sessions` row; the token presented by the\n\
+     client is a separate random value whose SHA-256 hash is stored in that\n\
+     row, so the id never leaves the product as a bearer secret."
+);
+define_id!(
+    TotpAuthenticatorId,
+    "The stable identity of one optional TOTP authenticator (§16.2)."
+);
+define_id!(
+    BootstrapCodeId,
+    "The stable identity of one one-time bootstrap code (§16.2).\n\n\
+     First startup generates a bootstrap code so the initial administrator\n\
+     can claim the product; the code hash is stored, never the code itself."
+);
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, CredentialId,
-        CredentialVersionId, EndpointId, OperationId, ResourceId, TargetId,
+        ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, BootstrapCodeId,
+        CredentialId, CredentialVersionId, EndpointId, OperationId, PrincipalId, ResourceId,
+        SessionId, TargetId, TotpAuthenticatorId,
     };
 
     #[test]
@@ -186,6 +208,29 @@ mod tests {
 
         assert_eq!(batch.into_uuid().get_version_num(), 7);
         assert_eq!(batch.to_string().parse::<BatchOperationId>()?, batch);
+        Ok(())
+    }
+
+    #[test]
+    fn product_user_identifiers_are_uuid_v7_and_round_trip() -> Result<(), uuid::Error> {
+        let principal = PrincipalId::generate();
+        assert_eq!(principal.into_uuid().get_version_num(), 7);
+        assert_eq!(principal.to_string().parse::<PrincipalId>()?, principal);
+
+        let session = SessionId::generate();
+        assert_eq!(session.into_uuid().get_version_num(), 7);
+        assert_eq!(session.to_string().parse::<SessionId>()?, session);
+
+        let authenticator = TotpAuthenticatorId::generate();
+        assert_eq!(authenticator.into_uuid().get_version_num(), 7);
+        assert_eq!(
+            authenticator.to_string().parse::<TotpAuthenticatorId>()?,
+            authenticator
+        );
+
+        let bootstrap = BootstrapCodeId::generate();
+        assert_eq!(bootstrap.into_uuid().get_version_num(), 7);
+        assert_eq!(bootstrap.to_string().parse::<BootstrapCodeId>()?, bootstrap);
         Ok(())
     }
 }

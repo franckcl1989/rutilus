@@ -4,6 +4,7 @@ use time::OffsetDateTime;
 
 use crate::{
     AuditEventId, AuditOperationId, CredentialId, DeploymentPosture, EndpointAddress, EndpointId,
+    PrincipalId,
 };
 
 macro_rules! stable_audit_codes {
@@ -50,9 +51,17 @@ macro_rules! stable_audit_codes {
 
 stable_audit_codes! {
     /// The accountable product-side identity category for an operation.
+    ///
+    /// `System` names automated product activity, `LocalOperator` names the
+    /// local user at the product console, and `User` names a signed-in
+    /// product principal (§16). A `User`-actor event always carries the
+    /// acting principal's identity in the audit context, and the
+    /// `audit_events` schema pairs the two with a CHECK constraint, so the
+    /// actor category and the principal id cannot drift apart.
     pub enum AuditActor for "actor" {
         System => "system",
         LocalOperator => "local-operator",
+        User => "user",
     }
 }
 
@@ -69,6 +78,15 @@ stable_audit_codes! {
         ManageEndpoints => "manage-endpoints",
         RefreshEndpoints => "refresh-endpoints",
         ExecuteOperations => "execute-operations",
+        ManageCredentials => "manage-credentials",
+        ManageUsers => "manage-users",
+        ManageBackups => "manage-backups",
+        ManageSiteSettings => "manage-site-settings",
+        // The authentication lifecycle permission behind sign-in, sign-out,
+        // and password changes (§16.2): those actions are authorized by
+        // presenting valid credentials, not by a product role, and the
+        // audit record must be able to name the authorization it observed.
+        Authenticate => "authenticate",
     }
 }
 
@@ -88,6 +106,14 @@ stable_audit_codes! {
         RefreshEndpoint => "refresh-endpoint",
         ImportEndpoints => "import-endpoints",
         ExecuteOperation => "execute-operation",
+        Login => "login",
+        Logout => "logout",
+        ChangePassword => "change-password",
+        ManageUsers => "manage-users",
+        ManageSessions => "manage-sessions",
+        ManageTotp => "manage-totp",
+        ManageBackups => "manage-backups",
+        ManageSettings => "manage-settings",
     }
 }
 
@@ -193,6 +219,10 @@ stable_audit_codes! {
         SnapshotPersistenceFailed => "snapshot-persistence-failed",
         CsvInvalid => "csv-invalid",
         EndpointImportRowFailed => "endpoint-import-row-failed",
+        // A sign-in attempt failed: an unknown or disabled principal, a
+        // wrong password, a wrong or replayed TOTP code, or a rate-limited
+        // refusal (§16.2 "登录失败限速").
+        AuthenticationFailed => "authentication-failed",
     }
 }
 
@@ -370,27 +400,18 @@ pub struct AuditOperationContext {
     permission: ProductPermission,
     action: AuditAction,
     redfish_operation: AuditRedfishOperation,
+    actor_principal_id: Option<PrincipalId>,
 }
 
 impl AuditOperationContext {
-    /// Creates one semantically consistent 0.1 audit operation context.
+    /// Creates one semantically consistent audit operation context for a
+    /// non-principal actor.
     ///
-    /// The accepted combinations are exactly the pairs of a product action
-    /// and its typed Redfish operation. The check is an exhaustive match on
-    /// the operation type, so adding an operation type fails to compile
-    /// until its action is decided here — the §7.5 exhaustiveness rule
-    /// applied to the audit vocabulary.
-    ///
-    /// An execution context — [`AuditAction::ExecuteOperation`] with a §7.5
-    /// write operation type or [`AuditRedfishOperation::PollRemoteTask`] —
-    /// targets the endpoint that receives the write and checks
-    /// [`ProductPermission::ExecuteOperations`]. Its parameter summary stays
-    /// [`AuditParameterSummary::EndpointRefresh`] for this iteration: the
-    /// summary vocabulary is projected per-variant by the persistence crate,
-    /// which is not extended here, so `EndpointRefresh` is the closest legal
-    /// summary until an operation-scoped summary lands together with its
-    /// persistence projection. The permission, action, and operation-type
-    /// fields are truthful.
+    /// This is the pre-0.6 constructor surface: the actor is `System` or
+    /// `LocalOperator`, so the context carries no principal identity. It is
+    /// exactly [`AuditOperationContext::try_new_with_actor_principal`] with a
+    /// `None` principal, which the consistency rule therefore refuses for a
+    /// `User` actor.
     ///
     /// # Errors
     ///
@@ -408,6 +429,62 @@ impl AuditOperationContext {
         action: AuditAction,
         redfish_operation: AuditRedfishOperation,
     ) -> Result<Self, AuditOperationContextError> {
+        Self::try_new_with_actor_principal(
+            operation_id,
+            actor,
+            origin,
+            target,
+            parameters,
+            permission,
+            action,
+            redfish_operation,
+            None,
+        )
+    }
+
+    /// Creates one semantically consistent audit operation context.
+    ///
+    /// The accepted combinations are exactly the pairs of a product action
+    /// and its typed Redfish operation. The check is an exhaustive match on
+    /// the operation type, so adding an operation type fails to compile
+    /// until its action is decided here — the §7.5 exhaustiveness rule
+    /// applied to the audit vocabulary.
+    ///
+    /// A `User` actor must name the acting principal (and the schema CHECK
+    /// pins the same rule), so a `User` actor with `None`, or any other actor
+    /// with `Some`, is refused with [`AuditOperationContextError`].
+    ///
+    /// An execution context — [`AuditAction::ExecuteOperation`] with a §7.5
+    /// write operation type or [`AuditRedfishOperation::PollRemoteTask`] —
+    /// targets the endpoint that receives the write and checks
+    /// [`ProductPermission::ExecuteOperations`]. Its parameter summary stays
+    /// [`AuditParameterSummary::EndpointRefresh`] for this iteration: the
+    /// summary vocabulary is projected per-variant by the persistence crate,
+    /// which is not extended here, so `EndpointRefresh` is the closest legal
+    /// summary until an operation-scoped summary lands together with its
+    /// persistence projection. The permission, action, and operation-type
+    /// fields are truthful.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditOperationContextError`] when the target, parameter
+    /// summary, permission, typed Redfish operation, or the actor's
+    /// principal identity does not match the product action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_actor_principal(
+        operation_id: AuditOperationId,
+        actor: AuditActor,
+        origin: DeploymentPosture,
+        target: AuditTarget,
+        parameters: AuditParameterSummary,
+        permission: ProductPermission,
+        action: AuditAction,
+        redfish_operation: AuditRedfishOperation,
+        actor_principal_id: Option<PrincipalId>,
+    ) -> Result<Self, AuditOperationContextError> {
+        if (actor == AuditActor::User) != actor_principal_id.is_some() {
+            return Err(AuditOperationContextError);
+        }
         let consistent = match redfish_operation {
             // Enrollment probes the capabilities of the endpoint address.
             AuditRedfishOperation::ProbeCoreCapabilities => matches!(
@@ -437,6 +514,41 @@ impl AuditOperationContext {
                     AuditParameterSummary::CsvEndpointImport { .. },
                     ProductPermission::ManageEndpoints,
                     AuditAction::ImportEndpoints,
+                ) | (
+                    // The §16.2 authentication lifecycle: sign-in, sign-out,
+                    // and password changes are authorized by presenting
+                    // credentials (the `Authenticate` permission), never by a
+                    // product role. The parameter summary stays the closest
+                    // legal shape — every authentication event has no
+                    // credential, trust, or row-count columns, exactly like
+                    // `EndpointRefresh` — so the summary vocabulary is not
+                    // extended for them.
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::Authenticate,
+                    AuditAction::Login | AuditAction::Logout | AuditAction::ChangePassword,
+                ) | (
+                    // The §16.1 user-management actions. Session and TOTP
+                    // management are part of account administration, so they
+                    // share the `ManageUsers` permission: an auditor reading
+                    // the event sees which user-administration domain was
+                    // touched, not a closest-sounding neighbor.
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ManageUsers,
+                    AuditAction::ManageUsers
+                        | AuditAction::ManageSessions
+                        | AuditAction::ManageTotp,
+                ) | (
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ManageBackups,
+                    AuditAction::ManageBackups,
+                ) | (
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ManageSiteSettings,
+                    AuditAction::ManageSettings,
                 )
             ),
             // Every §7.5 write family and the §13.6 remote-task polling is
@@ -474,6 +586,7 @@ impl AuditOperationContext {
             permission,
             action,
             redfish_operation,
+            actor_principal_id,
         })
     }
 
@@ -515,6 +628,15 @@ impl AuditOperationContext {
     #[must_use]
     pub const fn redfish_operation(&self) -> AuditRedfishOperation {
         self.redfish_operation
+    }
+
+    /// Returns the acting principal, when the actor is a product user.
+    ///
+    /// The value is `Some` exactly when the actor is [`AuditActor::User`];
+    /// the schema CHECK constraint pins the same rule on persisted rows.
+    #[must_use]
+    pub const fn actor_principal_id(&self) -> Option<PrincipalId> {
+        self.actor_principal_id
     }
 }
 
@@ -838,17 +960,34 @@ mod tests {
 
     #[test]
     fn stable_vocabularies_round_trip_without_dynamic_text() {
-        assert_codes(&[AuditActor::System, AuditActor::LocalOperator]);
+        assert_codes(&[
+            AuditActor::System,
+            AuditActor::LocalOperator,
+            AuditActor::User,
+        ]);
         assert_codes(&[
             ProductPermission::ManageEndpoints,
             ProductPermission::RefreshEndpoints,
             ProductPermission::ExecuteOperations,
+            ProductPermission::ManageCredentials,
+            ProductPermission::ManageUsers,
+            ProductPermission::ManageBackups,
+            ProductPermission::ManageSiteSettings,
+            ProductPermission::Authenticate,
         ]);
         assert_codes(&[
             AuditAction::EnrollEndpoint,
             AuditAction::RefreshEndpoint,
             AuditAction::ImportEndpoints,
             AuditAction::ExecuteOperation,
+            AuditAction::Login,
+            AuditAction::Logout,
+            AuditAction::ChangePassword,
+            AuditAction::ManageUsers,
+            AuditAction::ManageSessions,
+            AuditAction::ManageTotp,
+            AuditAction::ManageBackups,
+            AuditAction::ManageSettings,
         ]);
         assert_codes(&[
             AuditRedfishOperation::None,
@@ -891,6 +1030,7 @@ mod tests {
             AuditFailure::SnapshotPersistenceFailed,
             AuditFailure::CsvInvalid,
             AuditFailure::EndpointImportRowFailed,
+            AuditFailure::AuthenticationFailed,
         ]);
         assert_eq!(
             "unknown".parse::<AuditAction>(),
@@ -959,6 +1099,200 @@ mod tests {
             "execute-operations".parse(),
             Ok(ProductPermission::ExecuteOperations)
         );
+    }
+
+    #[test]
+    fn product_user_vocabulary_codes_are_pinned_as_the_stable_wire_contract() {
+        // The same literal-pinning argument as the execute codes: persisted
+        // rows keep the codes they were written under, so the codes added for
+        // the product user milestone are pinned as exact literals.
+        for (action, expected) in [
+            (AuditAction::Login, "login"),
+            (AuditAction::Logout, "logout"),
+            (AuditAction::ChangePassword, "change-password"),
+            (AuditAction::ManageUsers, "manage-users"),
+            (AuditAction::ManageSessions, "manage-sessions"),
+            (AuditAction::ManageTotp, "manage-totp"),
+            (AuditAction::ManageBackups, "manage-backups"),
+            (AuditAction::ManageSettings, "manage-settings"),
+        ] {
+            assert_eq!(action.as_str(), expected);
+            assert_eq!(expected.parse(), Ok(action));
+        }
+        for (permission, expected) in [
+            (ProductPermission::ManageCredentials, "manage-credentials"),
+            (ProductPermission::ManageUsers, "manage-users"),
+            (ProductPermission::ManageBackups, "manage-backups"),
+            (
+                ProductPermission::ManageSiteSettings,
+                "manage-site-settings",
+            ),
+            (ProductPermission::Authenticate, "authenticate"),
+        ] {
+            assert_eq!(permission.as_str(), expected);
+            assert_eq!(expected.parse(), Ok(permission));
+        }
+        let (failure, expected) = (AuditFailure::AuthenticationFailed, "authentication-failed");
+        assert_eq!(failure.as_str(), expected);
+        assert_eq!(expected.parse(), Ok(failure));
+        assert_eq!(AuditActor::User.as_str(), "user");
+        assert_eq!("user".parse(), Ok(AuditActor::User));
+    }
+
+    #[test]
+    fn user_actor_contexts_bind_the_acting_principal() -> Result<(), Box<dyn Error>> {
+        let principal_id = PrincipalId::generate();
+        let principal_execution = |actor_principal_id| {
+            AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Site,
+                AuditTarget::Endpoint(EndpointId::generate()),
+                AuditParameterSummary::EndpointRefresh,
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ResetSystem,
+                actor_principal_id,
+            )
+        };
+        let context = principal_execution(Some(principal_id))?;
+
+        assert_eq!(context.actor(), AuditActor::User);
+        assert_eq!(context.actor_principal_id(), Some(principal_id));
+        assert_eq!(
+            principal_execution(None),
+            Err(AuditOperationContextError),
+            "a User actor must name the acting principal"
+        );
+        assert_eq!(
+            AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::System,
+                DeploymentPosture::Site,
+                AuditTarget::Endpoint(EndpointId::generate()),
+                AuditParameterSummary::EndpointRefresh,
+                ProductPermission::ExecuteOperations,
+                AuditAction::ExecuteOperation,
+                AuditRedfishOperation::ResetSystem,
+                Some(principal_id),
+            ),
+            Err(AuditOperationContextError),
+            "a non-User actor must not carry a principal identity"
+        );
+        // The user-vocabulary actions are constructible through the context
+        // since the 0.6 authentication slice: the consistency matrix accepts
+        // every product action whose shape the 0.6 schema CHECKs pin, and
+        // the two are extended together.
+        let management = AuditOperationContext::try_new_with_actor_principal(
+            AuditOperationId::generate(),
+            AuditActor::User,
+            DeploymentPosture::Site,
+            AuditTarget::Product,
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::ManageUsers,
+            AuditAction::ManageUsers,
+            AuditRedfishOperation::None,
+            Some(principal_id),
+        )?;
+        assert_eq!(management.action(), AuditAction::ManageUsers);
+        assert_eq!(management.permission(), ProductPermission::ManageUsers);
+        // The pre-0.6 constructor surface stays principal-free.
+        let legacy = AuditOperationContext::try_new(
+            AuditOperationId::generate(),
+            AuditActor::System,
+            DeploymentPosture::Site,
+            AuditTarget::Product,
+            AuditParameterSummary::csv_endpoint_import(1)?,
+            ProductPermission::ManageEndpoints,
+            AuditAction::ImportEndpoints,
+            AuditRedfishOperation::None,
+        )?;
+        assert_eq!(legacy.actor_principal_id(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_and_management_contexts_pin_their_shapes() -> Result<(), Box<dyn Error>> {
+        // The §16.2 authentication lifecycle and the §16.1 user-management
+        // actions are the 0.6 authentication slice's audit vocabulary: each
+        // action constructs with exactly its permission, and a foreign
+        // permission is refused so an audit record can never conflate the
+        // authorization it observed.
+        let principal_id = PrincipalId::generate();
+        for (permission, action) in [
+            (ProductPermission::Authenticate, AuditAction::Login),
+            (ProductPermission::Authenticate, AuditAction::Logout),
+            (ProductPermission::Authenticate, AuditAction::ChangePassword),
+            (ProductPermission::ManageUsers, AuditAction::ManageUsers),
+            (ProductPermission::ManageUsers, AuditAction::ManageSessions),
+            (ProductPermission::ManageUsers, AuditAction::ManageTotp),
+            (ProductPermission::ManageBackups, AuditAction::ManageBackups),
+            (
+                ProductPermission::ManageSiteSettings,
+                AuditAction::ManageSettings,
+            ),
+        ] {
+            let context = AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Site,
+                AuditTarget::Product,
+                AuditParameterSummary::EndpointRefresh,
+                permission,
+                action,
+                AuditRedfishOperation::None,
+                Some(principal_id),
+            )?;
+            assert_eq!(context.action(), action);
+            assert_eq!(context.permission(), permission);
+            assert!(matches!(context.target(), AuditTarget::Product));
+            assert_eq!(context.redfish_operation(), AuditRedfishOperation::None);
+        }
+        // A management action under the wrong permission is refused.
+        assert_eq!(
+            AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Site,
+                AuditTarget::Product,
+                AuditParameterSummary::EndpointRefresh,
+                ProductPermission::ManageUsers,
+                AuditAction::Login,
+                AuditRedfishOperation::None,
+                Some(principal_id),
+            ),
+            Err(AuditOperationContextError)
+        );
+        assert_eq!(
+            AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Site,
+                AuditTarget::Product,
+                AuditParameterSummary::EndpointRefresh,
+                ProductPermission::Authenticate,
+                AuditAction::ManageUsers,
+                AuditRedfishOperation::None,
+                Some(principal_id),
+            ),
+            Err(AuditOperationContextError)
+        );
+        // A write operation type never describes an authentication action.
+        assert_eq!(
+            AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Site,
+                AuditTarget::Product,
+                AuditParameterSummary::EndpointRefresh,
+                ProductPermission::Authenticate,
+                AuditAction::Login,
+                AuditRedfishOperation::ResetSystem,
+                Some(principal_id),
+            ),
+            Err(AuditOperationContextError)
+        );
+        Ok(())
     }
 
     #[test]

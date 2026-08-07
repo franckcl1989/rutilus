@@ -20,6 +20,7 @@ csv = "1.4.0"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 getrandom = "0.4.3"
 gloo-net = { version = "0.6.0", default-features = false, features = ["http", "json"] }
+hmac = "0.13.0"
 http-body-util = "0.1.4"
 leptos = { version = "=0.8.20", default-features = false, features = ["csr"] }
 nv-redfish = { version = "=0.13.0", default-features = false, features = ["bmc-http", "std-redfish", "oem-ami", "oem-dell", "oem-dell-attributes", "oem-delta", "oem-hpe", "oem-lenovo", "oem-liteon", "oem-nvidia", "oem-nvidia-cper", "oem-nvidia-fabrics", "oem-nvidia-power-management", "oem-nvidia-profiles", "oem-nvidia-security", "oem-supermicro"] }
@@ -45,6 +46,7 @@ sea-orm-migration = { version = "2.0.1", default-features = false, features = ["
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha1 = "0.11.0"
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
