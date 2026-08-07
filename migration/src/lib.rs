@@ -12,6 +12,8 @@ mod m20260805_000007_artifacts;
 mod m20260805_000008_events;
 mod m20260805_000009_telemetry;
 mod m20260805_000010_groups_tags;
+mod m20260805_000011_batch_operations;
+mod m20260807_000001_nvidia_families;
 
 pub struct Migrator;
 
@@ -29,6 +31,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260805_000008_events::Migration),
             Box::new(m20260805_000009_telemetry::Migration),
             Box::new(m20260805_000010_groups_tags::Migration),
+            Box::new(m20260805_000011_batch_operations::Migration),
+            Box::new(m20260807_000001_nvidia_families::Migration),
         ]
     }
 }

@@ -56,6 +56,9 @@ async fn operations_migration_preserves_aggregate_invariants() -> Result<(), Box
     Ok(())
 }
 
+/// The constraint walk exceeds the pedantic line budget because every §13.1
+/// state and source code is exercised through its own literal row.
+#[allow(clippy::too_many_lines)]
 async fn verify_operation_constraints(
     database: &DatabaseConnection,
     now: OffsetDateTime,
@@ -67,6 +70,7 @@ async fn verify_operation_constraints(
         source: Set(String::from("standalone")),
         state: Set(String::from("queued")),
         command: Set(command.clone()),
+        batch_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -103,6 +107,7 @@ async fn verify_operation_constraints(
             source: Set(String::from("standalone")),
             state: Set(String::from(state)),
             command: Set(String::from(COMMAND_JSON)),
+            batch_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -117,6 +122,7 @@ async fn verify_operation_constraints(
         source: Set(String::from("cluster")),
         state: Set(String::from("queued")),
         command: Set(String::from(COMMAND_JSON)),
+        batch_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -130,6 +136,7 @@ async fn verify_operation_constraints(
         source: Set(String::from("standalone")),
         state: Set(String::from("pending")),
         command: Set(String::from(COMMAND_JSON)),
+        batch_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
