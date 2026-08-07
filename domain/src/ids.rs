@@ -93,12 +93,20 @@ define_id!(
      the persistence `artifact_file_path` contract, so the row and the bytes\n\
      always link deterministically."
 );
+define_id!(
+    BatchOperationId,
+    "The stable identity of one persisted batch parent (§13.7).\n\n\
+     A batch submission creates one `batch_operations` parent row and one\n\
+     ordinary single-target child `Operation` per submitted endpoint; the\n\
+     batch id names the parent that ties the children together, while the\n\
+     children keep their own `OperationId` lifecycle records."
+);
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
-        OperationId, ResourceId, TargetId,
+        ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, CredentialId,
+        CredentialVersionId, EndpointId, OperationId, ResourceId, TargetId,
     };
 
     #[test]
@@ -169,6 +177,15 @@ mod tests {
 
         assert_eq!(artifact.into_uuid().get_version_num(), 7);
         assert_eq!(artifact.to_string().parse::<ArtifactId>()?, artifact);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_operation_identifier_is_uuid_v7_and_round_trips() -> Result<(), uuid::Error> {
+        let batch = BatchOperationId::generate();
+
+        assert_eq!(batch.into_uuid().get_version_num(), 7);
+        assert_eq!(batch.to_string().parse::<BatchOperationId>()?, batch);
         Ok(())
     }
 }

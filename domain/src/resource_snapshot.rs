@@ -61,6 +61,22 @@ pub enum ResourceFeature {
     /// addresses only the read surface and must not be mistaken for a
     /// capability code (see the ledger-consistency test).
     OemSmcKcsInterface,
+    /// The §2.1 `oem-nvidia-profiles` read surface, added as a typed resource
+    /// family in the 0.5 slice. The family reads the system-scoped NVIDIA
+    /// `SystemConfigProfile` chain — the profile service document, its status
+    /// singleton, the profile collection, and each member's `ProfileFile`
+    /// document — through the `Nvidia` OEM namespace of the `ComputerSystem`
+    /// document. One family covers the whole chain because the chain's root
+    /// document decides whether the chain exists at all (unlike the
+    /// one-document-per-family Dell/SMC precedent, the chain members cannot
+    /// exist without their root). The family code is
+    /// `nvidia-system-config-profile` (not `oem-nvidia-profiles`, which stays
+    /// the capability code, and not `oem-nvidia`, which stays the namespace
+    /// capability code): the one `oem-nvidia-profiles` capability covers the
+    /// read surface and the namespace advertisement that precedes it, so this
+    /// variant addresses only the read surface and must not be mistaken for a
+    /// capability code (see the ledger-consistency test).
+    OemNvidiaSystemConfigProfile,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -199,6 +215,7 @@ impl ResourceFeature {
             Self::OemDell => "dell-attributes",
             Self::OemSmcSysLockdown => "supermicro-sys-lockdown",
             Self::OemSmcKcsInterface => "supermicro-kcs-interface",
+            Self::OemNvidiaSystemConfigProfile => "nvidia-system-config-profile",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
@@ -247,6 +264,7 @@ impl FromStr for ResourceFeature {
             "dell-attributes" => Ok(Self::OemDell),
             "supermicro-sys-lockdown" => Ok(Self::OemSmcSysLockdown),
             "supermicro-kcs-interface" => Ok(Self::OemSmcKcsInterface),
+            "nvidia-system-config-profile" => Ok(Self::OemNvidiaSystemConfigProfile),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
@@ -815,6 +833,7 @@ mod tests {
             ResourceFeature::OemDell,
             ResourceFeature::OemSmcSysLockdown,
             ResourceFeature::OemSmcKcsInterface,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
@@ -1013,6 +1032,18 @@ mod tests {
                 ResourceFeature::OemSmcKcsInterface,
                 EndpointCapability::OemSupermicro,
             ),
+            // The 0.5 NVIDIA system-config-profile family follows the same
+            // precedent: the family reads the system's NVIDIA profile chain
+            // inside the `Nvidia` namespace, so it maps to the
+            // `oem-nvidia-profiles` capability (the feature that reads
+            // profile data) under the narrower family code
+            // `nvidia-system-config-profile` — never the `oem-nvidia` or
+            // `oem-nvidia-profiles` capability codes, which stay with the
+            // ledger.
+            (
+                ResourceFeature::OemNvidiaSystemConfigProfile,
+                EndpointCapability::OemNvidiaProfiles,
+            ),
         ];
         for (feature, capability) in subsidiary {
             assert_ne!(feature.as_str(), capability.as_str());
@@ -1092,6 +1123,44 @@ mod tests {
         );
         assert_eq!(
             "oem-supermicro".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        // The 0.5 NVIDIA system-config-profile family keeps its narrow
+        // `nvidia-system-config-profile` code; the `oem-nvidia` namespace
+        // capability and the `oem-nvidia-profiles` feature capability stay
+        // with the ledger, so the snapshot and capability inventories cannot
+        // silently drift into aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemNvidiaSystemConfigProfile.as_str(),
+            "nvidia-system-config-profile"
+        );
+        assert_eq!(EndpointCapability::OemNvidia.as_str(), "oem-nvidia");
+        assert_eq!(
+            EndpointCapability::OemNvidiaProfiles.as_str(),
+            "oem-nvidia-profiles"
+        );
+        assert_eq!(
+            "nvidia-system-config-profile".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemNvidiaSystemConfigProfile)
+        );
+        assert_eq!(
+            "nvidia-system-config-profile".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-nvidia-profiles".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemNvidiaProfiles)
+        );
+        assert_eq!(
+            "oem-nvidia-profiles".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        assert_eq!(
+            "oem-nvidia".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemNvidia)
+        );
+        assert_eq!(
+            "oem-nvidia".parse::<ResourceFeature>(),
             Err(ResourceFeatureParseError)
         );
     }
@@ -1199,6 +1268,27 @@ mod tests {
             "smc-kcs-interface",
             "oem-supermicro-kcs-interface",
             "oem-supermicro",
+            // The 0.5 NVIDIA system-config-profile family: singular,
+            // snake_case, and CamelCase forms would address a different
+            // surface, the vendor-less names would collide with the
+            // product's vendor-prefixed family space, and the `oem-nvidia` /
+            // `oem-nvidia-profiles` capability codes (plus the hypothetical
+            // per-surface extensions) must stay unparseable as families so
+            // the ledger and the snapshot inventory never alias.
+            "nvidia-system-config-profile/",
+            "nvidia_system_config_profile",
+            "nvidiasystemconfigprofile",
+            "NvidiaSystemConfigProfile",
+            "system-config-profile",
+            "system_config_profile",
+            "SystemConfigProfile",
+            "nvidia-system-config-profiles",
+            "nvidia-profile",
+            "nvidia-profiles",
+            "nvidia-system-profile",
+            "oem-nvidia-system-config-profile",
+            "oem-nvidia",
+            "oem-nvidia-profiles",
             "host-interface",
             "host-interfaces/",
             "hostinterface",

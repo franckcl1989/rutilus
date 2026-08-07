@@ -4,6 +4,7 @@ use std::{error::Error, fmt, str::FromStr};
 
 mod artifact;
 mod audit;
+mod batch_operation;
 mod capability;
 mod credential;
 mod endpoint;
@@ -28,6 +29,9 @@ pub use audit::{
     AuditRedfishOperation, AuditSequence, AuditSequenceError, AuditTarget, AuditTlsTrust,
     AuditVerification, ProductPermission,
 };
+pub use batch_operation::{
+    BatchOperation, BatchOperationState, BatchOutcomeCounts, derive_batch_state, summarize,
+};
 pub use capability::{
     CAPABILITY_LEDGER_ORDER, CapabilityClassification, CapabilityState, CapabilityStateParseError,
     EndpointCapability, EndpointCapabilityObservation, EndpointCapabilityParseError,
@@ -49,8 +53,8 @@ pub use event::{
 };
 pub use group::{Group, GroupId, GroupName, GroupNameError, GroupRestoreError};
 pub use ids::{
-    ArtifactId, AuditEventId, AuditOperationId, CredentialId, CredentialVersionId, EndpointId,
-    OperationId, ResourceId, TargetId,
+    ArtifactId, AuditEventId, AuditOperationId, BatchOperationId, CredentialId,
+    CredentialVersionId, EndpointId, OperationId, ResourceId, TargetId,
 };
 pub use operation::{
     InvalidTransition, Operation, OperationEvent, OperationSource, OperationSourceParseError,
