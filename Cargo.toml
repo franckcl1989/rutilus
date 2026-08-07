@@ -61,10 +61,16 @@ uuid = "1.24.0"
 wasm-bindgen = "=0.2.126"
 wasm-bindgen-futures = "=0.4.76"
 webbrowser = { version = "1.2.4", features = ["hardened"] }
+# Windows DPAPI (CryptProtectData) and SCM service registration for the
+# platform crate's OS-backed secret store and system service support.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Services"] }
 zeroize = "1.9.0"
 
+# Deny (not forbid) so the platform crate can scope an `#![allow(unsafe_code)]`
+# to its Windows FFI module while every other crate keeps its own source-level
+# `#![forbid(unsafe_code)]`; Cargo members cannot override a workspace forbid.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

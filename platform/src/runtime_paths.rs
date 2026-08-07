@@ -9,8 +9,10 @@ const PRODUCT_DIRECTORY_NAME: &str = "rutilus";
 const PORTABLE_DIRECTORY_NAME: &str = "rutilus-data";
 const DATABASE_FILE_NAME: &str = "rutilus.db";
 const MASTER_KEY_FILE_NAME: &str = "master-key.rut";
+const SYSTEM_MASTER_KEY_FILE_NAME: &str = "system-master-key.rut";
 const INSTANCE_MARKER_FILE_NAME: &str = "instance.rut";
 const RUNTIME_LOCK_FILE_NAME: &str = ".rutilus.lock";
+const TLS_DIRECTORY_NAME: &str = "tls";
 
 /// User-scoped installed storage or storage carried beside the product binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,8 +42,10 @@ pub struct RuntimePaths {
     data_directory: PathBuf,
     database_path: PathBuf,
     master_key_path: PathBuf,
+    system_master_key_path: PathBuf,
     instance_marker_path: PathBuf,
     runtime_lock_path: PathBuf,
+    tls_directory: PathBuf,
 }
 
 impl RuntimePaths {
@@ -112,8 +116,10 @@ impl RuntimePaths {
         Ok(Self {
             database_path: data_directory.join(DATABASE_FILE_NAME),
             master_key_path: data_directory.join(MASTER_KEY_FILE_NAME),
+            system_master_key_path: data_directory.join(SYSTEM_MASTER_KEY_FILE_NAME),
             instance_marker_path: data_directory.join(INSTANCE_MARKER_FILE_NAME),
             runtime_lock_path: data_directory.join(RUNTIME_LOCK_FILE_NAME),
+            tls_directory: data_directory.join(TLS_DIRECTORY_NAME),
             data_directory,
         })
     }
@@ -133,6 +139,12 @@ impl RuntimePaths {
         &self.master_key_path
     }
 
+    /// The OS-protected master-key envelope path (unattended Site unlocks).
+    #[must_use]
+    pub fn system_master_key_path(&self) -> &Path {
+        &self.system_master_key_path
+    }
+
     #[must_use]
     pub fn instance_marker_path(&self) -> &Path {
         &self.instance_marker_path
@@ -141,6 +153,12 @@ impl RuntimePaths {
     #[must_use]
     pub fn runtime_lock_path(&self) -> &Path {
         &self.runtime_lock_path
+    }
+
+    /// The directory holding the Site's TLS certificate and private key.
+    #[must_use]
+    pub fn tls_directory(&self) -> &Path {
+        &self.tls_directory
     }
 }
 
@@ -213,12 +231,20 @@ mod tests {
             paths.data_directory().join(MASTER_KEY_FILE_NAME)
         );
         assert_eq!(
+            paths.system_master_key_path(),
+            paths.data_directory().join(SYSTEM_MASTER_KEY_FILE_NAME)
+        );
+        assert_eq!(
             paths.instance_marker_path(),
             paths.data_directory().join(INSTANCE_MARKER_FILE_NAME)
         );
         assert_eq!(
             paths.runtime_lock_path(),
             paths.data_directory().join(RUNTIME_LOCK_FILE_NAME)
+        );
+        assert_eq!(
+            paths.tls_directory(),
+            paths.data_directory().join(TLS_DIRECTORY_NAME)
         );
         Ok(())
     }
