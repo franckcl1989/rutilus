@@ -8,18 +8,21 @@
 //! database.
 
 use rutilus_application::{
-    CenterBindingFlow, CenterProjection, CenterSessionAdmission, CenterTrustAnchor,
+    CenterBindingFlow, CenterOperationDispatch, CenterOperationRequest, CenterOperationTracking,
+    CenterProjection, CenterReplyConsumer, CenterSessionAdmission, CenterTrustAnchor,
     IssuedSiteCertificate, ResolvedSite, SiteCertificateIssuer,
 };
 use rutilus_center_protocol::{
-    ArtifactChunk, ArtifactManifest, EndpointSnapshot, EnvelopeMessage, EventBatch, EventRecord,
-    EventSeverity as WireEventSeverity, ResourceDelta, ResourceDeltaOp, ResourceSummary, TlsTrust,
+    ArtifactChunk, ArtifactManifest, EndpointSnapshot, Envelope, EnvelopeMessage, EventBatch,
+    EventRecord, EventSeverity as WireEventSeverity, OperationAccepted, OperationCompleted,
+    ResourceDelta, ResourceDeltaOp, ResourceSummary, TlsTrust,
 };
 use rutilus_domain::{
     ArtifactId, CenterBindingId, CertificateFingerprint, EndpointId, EventId, InstanceId,
-    InstanceKind, SiteInstance,
+    InstanceKind, OperationSource, OperationState, PrincipalId, RedfishCommand, ResetType, Role,
+    RoleAssignment, SiteInstance, SystemCommand,
 };
-use rutilus_entity::{artifact, endpoint, event};
+use rutilus_entity::{artifact, center_inbox, endpoint, event};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::{error::Error, sync::Mutex};
 use time::{Duration, OffsetDateTime};
@@ -418,6 +421,268 @@ async fn the_projection_assembles_artifacts_and_verifies_the_digest() -> Result<
     assert_eq!(row.site_id, Some(site.id().into_uuid()));
     let file = std::fs::read(store.artifact_file_path(artifact_id))?;
     assert_eq!(file, bytes);
+
+    store.close().await?;
+    drop(directory);
+    Ok(())
+}
+
+// The full dispatch-to-reply lifecycle is spelled out as its own
+// assertions, which exceeds the pedantic line budget (the repository tests
+// allow the same lint on their exhaustive assertion tests).
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn dispatch_enqueues_the_offer_and_replies_advance_the_tracking_record()
+-> Result<(), Box<dyn Error>> {
+    let (directory, store) = store_with_directory().await?;
+    let base = base_time();
+    let site = SiteInstance::new(
+        InstanceId::generate(),
+        String::from("Site One"),
+        InstanceKind::Site,
+        base,
+    );
+    store.create_instance(&site).await?;
+    let actor = PrincipalId::generate();
+    store
+        .create_principal(&rutilus_domain::Principal::new(
+            actor,
+            rutilus_domain::PrincipalName::parse("operator")?,
+            base,
+        ))
+        .await?;
+    store
+        .assign_role(&RoleAssignment::new(
+            actor,
+            Role::Administrator,
+            None,
+            base,
+            None,
+        ))
+        .await?;
+    let endpoint_id = EndpointId::generate();
+    // The dispatch routing needs the endpoint projection and its resource.
+    let resolved = resolved_site(site.id(), CenterBindingId::generate());
+    let projection = CenterProjection::new(&store, &store);
+    projection
+        .on_frame(
+            &resolved,
+            1,
+            &EnvelopeMessage::EndpointSnapshot(EndpointSnapshot {
+                endpoint_id: endpoint_id.to_string(),
+                display_name: String::from("Rack A PDU"),
+                address: String::from("https://192.0.2.10"),
+                trust: TlsTrust::SystemCa as i32,
+                refresh_generation: 1,
+                resources: Vec::new(),
+                health: String::from("ok"),
+            }),
+            base,
+        )
+        .await?;
+    projection
+        .on_frame(
+            &resolved,
+            2,
+            &EnvelopeMessage::ResourceDelta(ResourceDelta {
+                endpoint_id: endpoint_id.to_string(),
+                op: ResourceDeltaOp::Upsert as i32,
+                resource: Some(ResourceSummary {
+                    feature: String::from("systems"),
+                    odata_id: String::from("/redfish/v1/Systems/1"),
+                    odata_type: String::from("#ComputerSystem.v1_20_0.ComputerSystem"),
+                    etag: String::new(),
+                    generation: 1,
+                }),
+                payload_json: b"{}".to_vec(),
+                observed_at_unix: 1_699_999_990,
+            }),
+            base,
+        )
+        .await?;
+
+    let dispatch = CenterOperationDispatch::new(&store, &store, &store);
+    let request = CenterOperationRequest::new(
+        site.id(),
+        endpoint_id,
+        rutilus_domain::ResourceODataId::parse("/redfish/v1/Systems/1")?,
+        RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown)),
+        actor,
+    );
+    let dispatched = dispatch.dispatch(&request, base).await?;
+    assert_eq!(
+        dispatched.expires_at(),
+        base + rutilus_application::CENTER_OFFER_TTL
+    );
+
+    // The offer sits in the site's durable outbox.
+    let pending = store.list_pending_outbox(site.id(), 10).await?;
+    assert_eq!(pending.len(), 1);
+    let envelope: Envelope = serde_json::from_str(pending[0].payload_json())?;
+    let Some(EnvelopeMessage::OperationOffer(offer)) = envelope.message else {
+        return Err("the outbox entry is not an operation offer".into());
+    };
+    assert_eq!(offer.operation_id, dispatched.operation_id().to_string());
+    assert_eq!(offer.site_id, site.id().to_string());
+    assert_eq!(offer.target, "/redfish/v1/Systems/1");
+    assert_eq!(offer.actor_context, actor.to_string());
+    assert!(offer.command_json.contains(&b'{'));
+
+    // The tracking record exists in the operations table.
+    let operation = store
+        .find_operation(dispatched.operation_id())
+        .await?
+        .ok_or("the tracking record is missing")?;
+    assert_eq!(operation.source(), OperationSource::Center);
+    assert_eq!(operation.state(), OperationState::Queued);
+
+    // The site's replies advance the record: accepted, then completed.
+    let tracking = CenterOperationTracking::new(&store, &store);
+    tracking
+        .on_reply(
+            site.id(),
+            &Envelope {
+                sequence: 1,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::OperationAccepted(OperationAccepted {
+                    operation_id: dispatched.operation_id().to_string(),
+                    accepted_at_unix: base.unix_timestamp(),
+                })),
+            },
+            base + Duration::SECOND,
+        )
+        .await?;
+    let operation = store
+        .find_operation(dispatched.operation_id())
+        .await?
+        .ok_or("the tracking record is missing")?;
+    assert_eq!(operation.state(), OperationState::Running);
+    tracking
+        .on_reply(
+            site.id(),
+            &Envelope {
+                sequence: 2,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::OperationCompleted(OperationCompleted {
+                    operation_id: dispatched.operation_id().to_string(),
+                    succeeded: true,
+                    summary: String::from("reset verified"),
+                })),
+            },
+            base + Duration::seconds(2),
+        )
+        .await?;
+    let operation = store
+        .find_operation(dispatched.operation_id())
+        .await?
+        .ok_or("the tracking record is missing")?;
+    assert_eq!(operation.state(), OperationState::Succeeded);
+
+    // The reply receipts: one durable row per operation id (the §17.5
+    // idempotency key), its phase advanced to the terminal report.
+    let receipts = center_inbox::Entity::find()
+        .filter(center_inbox::Column::OperationId.eq(dispatched.operation_id().to_string()))
+        .all(&store.database)
+        .await?;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, "completed");
+    assert_eq!(receipts[0].instance_id, site.id().into_uuid());
+
+    store.close().await?;
+    drop(directory);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_site_scoped_operator_cannot_dispatch_to_another_site() -> Result<(), Box<dyn Error>> {
+    let (directory, store) = store_with_directory().await?;
+    let base = base_time();
+    let site = SiteInstance::new(
+        InstanceId::generate(),
+        String::from("Site One"),
+        InstanceKind::Site,
+        base,
+    );
+    store.create_instance(&site).await?;
+    let other = SiteInstance::new(
+        InstanceId::generate(),
+        String::from("Site Two"),
+        InstanceKind::Site,
+        base,
+    );
+    store.create_instance(&other).await?;
+    let actor = PrincipalId::generate();
+    store
+        .create_principal(&rutilus_domain::Principal::new(
+            actor,
+            rutilus_domain::PrincipalName::parse("operator")?,
+            base,
+        ))
+        .await?;
+    // The D3 scoped assignment: the operator manages only Site One.
+    store
+        .assign_role(&RoleAssignment::new(
+            actor,
+            Role::Operator,
+            None,
+            base,
+            Some(site.id()),
+        ))
+        .await?;
+    let endpoint_id = EndpointId::generate();
+    let resolved = resolved_site(site.id(), CenterBindingId::generate());
+    let projection = CenterProjection::new(&store, &store);
+    projection
+        .on_frame(
+            &resolved,
+            1,
+            &EnvelopeMessage::EndpointSnapshot(EndpointSnapshot {
+                endpoint_id: endpoint_id.to_string(),
+                display_name: String::from("Rack A PDU"),
+                address: String::from("https://192.0.2.10"),
+                trust: TlsTrust::SystemCa as i32,
+                refresh_generation: 1,
+                resources: Vec::new(),
+                health: String::from("ok"),
+            }),
+            base,
+        )
+        .await?;
+    projection
+        .on_frame(
+            &resolved,
+            2,
+            &EnvelopeMessage::ResourceDelta(ResourceDelta {
+                endpoint_id: endpoint_id.to_string(),
+                op: ResourceDeltaOp::Upsert as i32,
+                resource: Some(ResourceSummary {
+                    feature: String::from("systems"),
+                    odata_id: String::from("/redfish/v1/Systems/1"),
+                    odata_type: String::from("#ComputerSystem.v1_20_0.ComputerSystem"),
+                    etag: String::new(),
+                    generation: 1,
+                }),
+                payload_json: b"{}".to_vec(),
+                observed_at_unix: 1_699_999_990,
+            }),
+            base,
+        )
+        .await?;
+
+    let dispatch = CenterOperationDispatch::new(&store, &store, &store);
+    // The endpoint belongs to Site One, but the offer is addressed to Site
+    // Two: the scoped operator cannot dispatch there.
+    let request = CenterOperationRequest::new(
+        other.id(),
+        endpoint_id,
+        rutilus_domain::ResourceODataId::parse("/redfish/v1/Systems/1")?,
+        RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown)),
+        actor,
+    );
+    assert!(matches!(
+        dispatch.dispatch(&request, base).await,
+        Err(rutilus_application::CenterDispatchError::NotAuthorized)
+    ));
 
     store.close().await?;
     drop(directory);

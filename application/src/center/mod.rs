@@ -17,8 +17,11 @@
 //!   registry, and the inbound connection engine (§15.4 acknowledgements
 //!   and the durable outbox flush).
 //! - [`projection`] — the center views of the §15.5 site reports.
+//! - [`dispatch`] — the §15.6 operation dispatch, the reply tracking, and
+//!   the §16.1/D3 permission check.
 
 mod binding;
+mod dispatch;
 mod projection;
 mod session;
 
@@ -26,6 +29,12 @@ pub use binding::{
     BindOutcome, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
     CenterTrustAnchor, IdentityValidationError, InstanceRepository, IssuedSiteCertificate,
     RegisteredSite, SiteCertificateIssuer, SiteIdentity, validate_bound_identity,
+};
+pub use dispatch::{
+    CENTER_OFFER_TTL, CenterDispatchError, CenterFrameProcessor, CenterFrameProcessorError,
+    CenterOperationDispatch, CenterOperationRequest, CenterOperationTracking,
+    CenterOperationTrackingError, CenterReplyConsumer, CenterRoleRepository, DispatchedOperation,
+    allows_dispatch,
 };
 pub use projection::{
     CenterContentConsumer, CenterEndpointProjection, CenterProjection, CenterProjectionError,

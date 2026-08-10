@@ -1,18 +1,18 @@
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
     CapabilitySnapshotRepository, CenterBindingRepository, CenterProjectionRepository,
-    CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryItemError, EndpointInventoryRepository, EndpointProjectionWrite,
-    EndpointRefreshRepository, InboxInsertOutcome, InstanceRepository, ProjectionWriteOutcome,
-    ResourceObservation, ResourceProjectionWrite, StoredCapability,
+    CenterRoleRepository, CredentialInventoryRepository, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
+    EndpointProjectionWrite, EndpointRefreshRepository, InboxInsertOutcome, InstanceRepository,
+    ProjectionWriteOutcome, ResourceObservation, ResourceProjectionWrite, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
 use rutilus_domain::{
     Artifact, AuditEvent, BatchOperation, BatchOperationId, BindingCode, CenterBinding,
     CenterBindingId, CertificateFingerprint, Credential, Endpoint, EndpointCapabilityObservation,
     EndpointId, Event, EventId, FailureKind, InboxEntry, InboxEvent, InstanceId, Operation,
-    OperationId, OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot, SiteInstance,
-    SyncCursor,
+    OperationId, OperationState, OutboxEntry, OutboxEntryId, PrincipalId, ResourceSnapshot,
+    RoleAssignment, SiteInstance, SyncCursor,
 };
 use rutilus_domain::{ArtifactId, ArtifactState, SyncStream};
 use rutilus_operation_engine::{
@@ -27,8 +27,8 @@ use crate::{
     CenterInboxRepositoryError, CenterOutboxRepositoryError, CenterProjectionRepositoryError,
     CreateInboxOutcome, CredentialRepositoryError, EndpointCapabilityRepositoryError,
     EndpointRepositoryError, EventRepositoryError, InstanceRepositoryError, NewResourceSnapshot,
-    OperationRepositoryError, RemoteTaskRepositoryError, ResourceSnapshotRepositoryError,
-    SqliteStore, SyncCursorRepositoryError,
+    OperationRepositoryError, PrincipalRepositoryError, RemoteTaskRepositoryError,
+    ResourceSnapshotRepositoryError, SqliteStore, SyncCursorRepositoryError,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -585,6 +585,17 @@ impl CenterProjectionRepository for SqliteStore {
         Box::pin(
             async move { SqliteStore::has_resource_projection(self, endpoint_id, &odata_id).await },
         )
+    }
+}
+
+impl CenterRoleRepository for SqliteStore {
+    type Error = PrincipalRepositoryError;
+
+    fn find_role_assignment(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoundaryFuture<'_, Result<Option<RoleAssignment>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_role_assignment(self, principal_id).await })
     }
 }
 
