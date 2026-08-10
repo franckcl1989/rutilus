@@ -28,6 +28,9 @@ pub use center_acceptor::{
 };
 pub use center_ca::{CenterCa, CenterCaError, SiteClientCertificate};
 pub use center_client::{CenterClientConfig, CenterClientError, CenterClientOptions, CenterLink};
+pub use center_runtime::{
+    CenterCaIssuer, CenterRunError, CenterRunOptions, CenterServicesError, run_center,
+};
 pub use center_ws::CenterFrameHandler;
 pub use doctor::{CheckLevel, DoctorCheck, DoctorReport, run_doctor};
 pub use licenses::{THIRD_PARTY_LICENSES, ThirdPartyLicense, licenses_text};

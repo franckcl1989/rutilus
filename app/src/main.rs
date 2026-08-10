@@ -5,9 +5,9 @@ use std::{error::Error, io, path::PathBuf};
 use clap::{Args, Parser, Subcommand};
 use console::Term;
 use rutilus::{
-    BackupKeyUnlock, ListenAddress, SiteRunOptions, StandaloneRunOptions, StandaloneUnlock,
-    console_stop_signal, has_system_master_key, initialize_standalone, rewrap_to_system_unlock,
-    run_initialized_standalone, run_site,
+    BackupKeyUnlock, CenterRunOptions, ListenAddress, SiteRunOptions, StandaloneRunOptions,
+    StandaloneUnlock, console_stop_signal, has_system_master_key, initialize_standalone,
+    rewrap_to_system_unlock, run_center, run_initialized_standalone, run_site,
 };
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
 use rutilus_platform::{
@@ -32,7 +32,7 @@ enum Command {
         #[arg(long)]
         portable: bool,
     },
-    /// Run the foreground Standalone or Site Web console.
+    /// Run the foreground Standalone, Site, or Center console.
     Run {
         /// Use the data directory beside the executable.
         #[arg(long)]
@@ -41,7 +41,7 @@ enum Command {
         #[arg(long)]
         no_open: bool,
         #[command(flatten)]
-        site: Option<SiteArgs>,
+        posture: Option<PostureArgs>,
     },
     /// Install, uninstall, or run the system service.
     Service {
@@ -92,24 +92,32 @@ enum BackupCommand {
     },
 }
 
-/// The 0.6.0 Site flags shared by `run --site` and the service subcommands.
+/// The 0.6.0 Site and 0.7.0 Center flags shared by `run` and the service
+/// subcommands. The console flags (`--listen`, `--cert`, `--key`) are
+/// shared by both postures; the center protocol listener is Center-only.
 #[derive(Debug, Args)]
-struct SiteArgs {
+struct PostureArgs {
     /// Run as a Site on the management network (HTTPS required off loopback).
-    #[arg(long, requires = "listen")]
+    #[arg(long, conflicts_with = "center")]
     site: bool,
-    /// The Site listen address, HOST:PORT (required with --site).
-    #[arg(long, requires = "site")]
+    /// Run as the Center aggregation service (mTLS site connections).
+    #[arg(long)]
+    center: bool,
+    /// The web console listen address, HOST:PORT.
+    #[arg(long)]
     listen: Option<ListenAddress>,
-    /// TLS certificate chain PEM (with --site; requires --key).
-    #[arg(long, requires_all = ["key", "site"])]
+    /// The center protocol (mTLS) listen address, HOST:PORT (with --center).
+    #[arg(long, requires = "center", conflicts_with = "site")]
+    center_listen: Option<ListenAddress>,
+    /// TLS certificate chain PEM (requires --key).
+    #[arg(long, requires = "key")]
     cert: Option<PathBuf>,
-    /// TLS private key PEM (with --site; requires --cert).
+    /// TLS private key PEM (requires --cert).
     #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
 }
 
-impl SiteArgs {
+impl PostureArgs {
     fn site_options(&self) -> Result<SiteRunOptions, rutilus::SiteConfigError> {
         let listen = self
             .listen
@@ -119,6 +127,32 @@ impl SiteArgs {
             ))?;
         SiteRunOptions::new(listen, self.cert.clone(), self.key.clone())
     }
+
+    fn center_options(&self) -> Result<CenterRunOptions, rutilus::SiteConfigError> {
+        let listen = self
+            .listen
+            .clone()
+            .ok_or(rutilus::SiteConfigError::ListenAddress(
+                rutilus::ListenAddressError::MissingPort,
+            ))?;
+        let center_listen =
+            self.center_listen
+                .clone()
+                .ok_or(rutilus::SiteConfigError::ListenAddress(
+                    rutilus::ListenAddressError::MissingPort,
+                ))?;
+        CenterRunOptions::new(
+            SiteRunOptions::new(listen, self.cert.clone(), self.key.clone())?,
+            center_listen,
+        )
+    }
+}
+
+/// The run or installed service posture with its resolved options.
+#[derive(Clone, Debug)]
+enum Posture {
+    Site(SiteRunOptions),
+    Center(CenterRunOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,7 +160,7 @@ enum ServiceCommand {
     /// Install the product as a system service (Windows SCM, launchd, or systemd).
     Install {
         #[command(flatten)]
-        site: SiteArgs,
+        posture: Option<PostureArgs>,
         /// Portable data directories cannot back a system service.
         #[arg(long, hide = true)]
         portable: bool,
@@ -137,7 +171,7 @@ enum ServiceCommand {
     #[command(hide = true)]
     Run {
         #[command(flatten)]
-        site: SiteArgs,
+        posture: Option<PostureArgs>,
     },
 }
 
@@ -150,8 +184,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Run {
             portable,
             no_open,
-            site,
-        } => run(portable, no_open, site).await?,
+            posture,
+        } => run(portable, no_open, posture).await?,
         Command::Service { command } => service(command).await?,
         Command::Backup { command } => backup(command).await?,
         Command::Doctor { portable } => doctor(portable).await?,
@@ -241,14 +275,18 @@ fn print_licenses() {
     print!("{}", rutilus::licenses_text());
 }
 
-async fn run(portable: bool, no_open: bool, site: Option<SiteArgs>) -> Result<(), Box<dyn Error>> {
+async fn run(
+    portable: bool,
+    no_open: bool,
+    posture: Option<PostureArgs>,
+) -> Result<(), Box<dyn Error>> {
     let location = if portable {
         DataLocation::Portable
     } else {
         DataLocation::Installed
     };
     let paths = location.resolve()?;
-    let Some(site) = site else {
+    let Some(posture) = posture else {
         // The Standalone foreground console.
         let terminal = Term::stderr();
         let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
@@ -256,10 +294,9 @@ async fn run(portable: bool, no_open: bool, site: Option<SiteArgs>) -> Result<()
         run_initialized_standalone(&paths, &unlock, StandaloneRunOptions::new(!no_open)).await?;
         return Ok(());
     };
-    // The Site foreground console never opens a browser. An instance that
-    // already carries an OS-protected envelope unlocks unattended; otherwise
-    // the operator unlocks with the passphrase, as in Standalone.
-    let options = site.site_options()?;
+    // The unlock discipline is shared by the Site and Center postures: an
+    // instance that already carries an OS-protected envelope unlocks
+    // unattended; otherwise the operator unlocks with the passphrase.
     let unlock = if has_system_master_key(&paths) {
         None
     } else {
@@ -267,18 +304,47 @@ async fn run(portable: bool, no_open: bool, site: Option<SiteArgs>) -> Result<()
         let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
         Some(StandaloneUnlock::existing(passphrase)?)
     };
-    run_site(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
+    match resolve_posture(&posture)? {
+        Posture::Site(options) => {
+            // The Site foreground console never opens a browser.
+            run_site(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
+        }
+        Posture::Center(options) => {
+            run_center(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
+        }
+    }
     Ok(())
+}
+
+/// Resolves the posture flags into the concrete run options; a posture
+/// flag without its listen flags is a configuration error.
+///
+/// # Errors
+///
+/// Returns [`rutilus::SiteConfigError::ListenAddress`] when the posture's
+/// listen flags are missing.
+fn resolve_posture(args: &PostureArgs) -> Result<Posture, rutilus::SiteConfigError> {
+    if args.center {
+        return args.center_options().map(Posture::Center);
+    }
+    if args.site {
+        return args.site_options().map(Posture::Site);
+    }
+    Err(rutilus::SiteConfigError::ListenAddress(
+        rutilus::ListenAddressError::MissingPort,
+    ))
 }
 
 async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
     match command {
-        ServiceCommand::Install { site, portable } => install_service(&site, portable).await?,
+        ServiceCommand::Install { posture, portable } => {
+            install_service(posture.as_ref(), portable).await?;
+        }
         ServiceCommand::Uninstall => {
             rutilus_platform::uninstall().map_err(|error| -> Box<dyn Error> { error.into() })?;
             println!("Rutilus service uninstalled");
         }
-        ServiceCommand::Run { site } => run_service(&site).await?,
+        ServiceCommand::Run { posture } => run_service(posture.as_ref()).await?,
     }
     Ok(())
 }
@@ -287,13 +353,21 @@ async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
 /// instance's master key is re-wrapped to the operating system's secret
 /// store at install time (unless it already is), so the service boots
 /// unattended.
-async fn install_service(site: &SiteArgs, portable: bool) -> Result<(), Box<dyn Error>> {
+async fn install_service(
+    posture: Option<&PostureArgs>,
+    portable: bool,
+) -> Result<(), Box<dyn Error>> {
     if portable {
         return Err("system services cannot use portable data directories".into());
     }
-    if !site.site {
-        return Err("a 0.6.0 system service must be a Site; pass --site with --listen".into());
-    }
+    let Some(args) = posture else {
+        return Err(
+            "a system service must be a Site or a Center; pass --site with --listen, or \
+             --center with --listen and --center-listen"
+                .into(),
+        );
+    };
+    let posture = resolve_posture(args)?;
     let paths = DataLocation::Installed.resolve()?;
     let marker = InstanceMarkerFile::new(paths.instance_marker_path());
     match marker
@@ -310,38 +384,85 @@ async fn install_service(site: &SiteArgs, portable: bool) -> Result<(), Box<dyn 
         let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
         rewrap_to_system_unlock(&paths, &passphrase).await?;
     }
-    let options = site.site_options()?;
     let executable = std::env::current_exe()?;
-    let arguments = ServiceArguments::new(
-        options.listen().to_string(),
-        options
-            .cert()
-            .map(|path| path.to_string_lossy().into_owned()),
-        options
-            .key()
-            .map(|path| path.to_string_lossy().into_owned()),
-    )?;
+    let arguments = match posture {
+        Posture::Site(options) => ServiceArguments::new(
+            options.listen().to_string(),
+            options
+                .cert()
+                .map(|path| path.to_string_lossy().into_owned()),
+            options
+                .key()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )?,
+        Posture::Center(options) => ServiceArguments::for_center(
+            options.console().listen().to_string(),
+            options.center_listen().to_string(),
+            options
+                .console()
+                .cert()
+                .map(|path| path.to_string_lossy().into_owned()),
+            options
+                .console()
+                .key()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )?,
+    };
     rutilus_platform::install(&arguments, &executable, paths.data_directory())?;
     println!("Rutilus service installed");
     Ok(())
 }
 
-/// Runs the service body: the Site console with the operating-system unlock
+/// Runs the service body: the Site or Center console with the
+/// operating-system unlock
 /// and no interactive prompts. On Windows this registers with the SCM and
 /// stops through the SCM stop control; elsewhere the service manager
 /// supervises the same foreground process.
-async fn run_service(site: &SiteArgs) -> Result<(), Box<dyn Error>> {
-    let options = site.site_options()?;
+async fn run_service(posture: Option<&PostureArgs>) -> Result<(), Box<dyn Error>> {
     let paths = DataLocation::Installed.resolve()?;
+    // The posture is decided before the closure so the service body owns
+    // its resolved options.
+    let posture = match posture {
+        Some(args) => resolve_posture(args)?,
+        None => {
+            return Err(
+                "a system service must be a Site or a Center; pass --site with --listen, or \
+                 --center with --listen and --center-listen"
+                    .into(),
+            );
+        }
+    };
     #[cfg(windows)]
     {
-        run_windows_service(&paths, &options).await
+        run_windows_service(&paths, |paths, control| {
+            let posture = posture.clone();
+            Box::pin(async move {
+                match posture {
+                    Posture::Site(options) => {
+                        run_site(paths, &options, None, service_stop_signal(control.clone()))
+                            .await
+                            .map_err(Into::into)
+                    }
+                    Posture::Center(options) => {
+                        run_center(paths, &options, None, service_stop_signal(control.clone()))
+                            .await
+                            .map_err(Into::into)
+                    }
+                }
+            })
+        })
+        .await
     }
     #[cfg(not(windows))]
     {
-        run_site(&paths, &options, None, console_stop_signal())
-            .await
-            .map_err(Into::into)
+        match posture {
+            Posture::Site(options) => run_site(&paths, &options, None, console_stop_signal())
+                .await
+                .map_err(Into::into),
+            Posture::Center(options) => run_center(&paths, &options, None, console_stop_signal())
+                .await
+                .map_err(Into::into),
+        }
     }
 }
 
@@ -352,17 +473,18 @@ async fn run_service(site: &SiteArgs) -> Result<(), Box<dyn Error>> {
 #[cfg(windows)]
 async fn run_windows_service(
     paths: &rutilus_platform::RuntimePaths,
-    options: &SiteRunOptions,
+    run_body: impl FnOnce(
+        &rutilus_platform::RuntimePaths,
+        std::sync::Arc<rutilus_platform::ServiceControl>,
+    ) -> rutilus_application::BoundaryFuture<'_, Result<(), Box<dyn Error>>>,
 ) -> Result<(), Box<dyn Error>> {
-    use std::sync::Arc;
-
     use rutilus_platform::{ServiceControl, dispatch_service};
     use tokio::sync::oneshot;
 
-    let control = Arc::new(ServiceControl::new());
+    let control = std::sync::Arc::new(ServiceControl::new());
     let (ready_sender, ready_receiver) = oneshot::channel();
     let mut dispatch = {
-        let control = Arc::clone(&control);
+        let control = std::sync::Arc::clone(&control);
         tokio::task::spawn_blocking(move || dispatch_service(control, ready_sender))
     };
     tokio::select! {
@@ -374,14 +496,14 @@ async fn run_windows_service(
             return Err("the service dispatcher exited immediately; is this process running under the Windows service manager?".into());
         }
     }
-    let result = run_site(paths, options, None, service_stop_signal(control.clone())).await;
+    let result = run_body(paths, control.clone()).await;
     control.finish();
     match dispatch.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("The service dispatcher failed: {error}"),
         Err(error) => eprintln!("The service dispatcher task failed: {error}"),
     }
-    result.map_err(|error| -> Box<dyn Error> { error.into() })
+    result
 }
 
 /// The Site service's stop future: the SCM stop control, or the console
@@ -436,7 +558,7 @@ fn print_version() {
 mod tests {
     use clap::Parser;
 
-    use super::{BackupCommand, Cli, Command, ListenAddress, ServiceCommand, SiteArgs};
+    use super::{BackupCommand, Cli, Command, ListenAddress, PostureArgs, ServiceCommand};
 
     #[test]
     fn parses_the_documented_version_subcommand() {
@@ -460,7 +582,7 @@ mod tests {
                 command: Command::Run {
                     portable: true,
                     no_open: true,
-                    site: None,
+                    posture: None,
                 }
             })
         ));
@@ -481,7 +603,8 @@ mod tests {
         ])?;
 
         let Command::Run {
-            site: Some(site), ..
+            posture: Some(posture),
+            ..
         } = parsed.command
         else {
             return Err(clap::Error::raw(
@@ -489,20 +612,81 @@ mod tests {
                 "expected the Site run subcommand",
             ));
         };
-        assert!(site.site);
+        assert!(posture.site);
         assert_eq!(
-            site.listen.map(|listen| listen.to_string()).as_deref(),
+            posture.listen.as_ref().map(ToString::to_string).as_deref(),
             Some("0.0.0.0:8443")
         );
-        assert_eq!(site.cert.as_deref(), Some(std::path::Path::new("cert.pem")));
-        assert_eq!(site.key.as_deref(), Some(std::path::Path::new("key.pem")));
+        assert_eq!(
+            posture.cert.as_deref(),
+            Some(std::path::Path::new("cert.pem"))
+        );
+        assert_eq!(
+            posture.key.as_deref(),
+            Some(std::path::Path::new("key.pem"))
+        );
         Ok(())
     }
 
     #[test]
-    fn site_flags_enforce_listen_and_pairing_dependencies() {
-        assert!(Cli::try_parse_from(["rutilus", "run", "--site"]).is_err());
-        assert!(Cli::try_parse_from(["rutilus", "run", "--listen", "127.0.0.1:8080"]).is_err());
+    fn parses_the_center_run_subcommand_with_the_protocol_listener() -> Result<(), clap::Error> {
+        let parsed = Cli::try_parse_from([
+            "rutilus",
+            "run",
+            "--center",
+            "--listen",
+            "0.0.0.0:8443",
+            "--center-listen",
+            "0.0.0.0:8444",
+        ])?;
+
+        let Command::Run {
+            posture: Some(posture),
+            ..
+        } = parsed.command
+        else {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                "expected the Center run subcommand",
+            ));
+        };
+        assert!(posture.center);
+        assert_eq!(
+            posture.listen.as_ref().map(ToString::to_string).as_deref(),
+            Some("0.0.0.0:8443")
+        );
+        assert_eq!(
+            posture
+                .center_listen
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("0.0.0.0:8444")
+        );
+        let options = posture.center_options().map_err(|error| {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+        })?;
+        assert_eq!(options.console().listen().to_string(), "0.0.0.0:8443");
+        assert_eq!(options.center_listen().to_string(), "0.0.0.0:8444");
+        Ok(())
+    }
+
+    #[test]
+    fn posture_flags_enforce_the_pairing_dependencies() {
+        // --center-listen requires --center.
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "run",
+                "--site",
+                "--listen",
+                "127.0.0.1:8080",
+                "--center-listen",
+                "127.0.0.1:8444",
+            ])
+            .is_err()
+        );
+        // --cert requires --key (and vice versa).
         assert!(
             Cli::try_parse_from([
                 "rutilus",
@@ -512,6 +696,30 @@ mod tests {
                 "127.0.0.1:8080",
                 "--cert",
                 "cert.pem",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "run",
+                "--site",
+                "--listen",
+                "127.0.0.1:8080",
+                "--key",
+                "key.pem",
+            ])
+            .is_err()
+        );
+        // The postures are mutually exclusive.
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "run",
+                "--site",
+                "--center",
+                "--listen",
+                "127.0.0.1:8080",
             ])
             .is_err()
         );
@@ -529,6 +737,25 @@ mod tests {
         ]);
         assert!(matches!(
             install,
+            Ok(Cli {
+                command: Command::Service {
+                    command: ServiceCommand::Install { .. }
+                }
+            })
+        ));
+
+        let center_install = Cli::try_parse_from([
+            "rutilus",
+            "service",
+            "install",
+            "--center",
+            "--listen",
+            "0.0.0.0:8443",
+            "--center-listen",
+            "0.0.0.0:8444",
+        ]);
+        assert!(matches!(
+            center_install,
             Ok(Cli {
                 command: Command::Service {
                     command: ServiceCommand::Install { .. }
@@ -662,13 +889,15 @@ mod tests {
         let listen = ListenAddress::parse("127.0.0.1:8443").map_err(|error| {
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
         })?;
-        let site = SiteArgs {
+        let posture = PostureArgs {
             site: true,
+            center: false,
             listen: Some(listen),
+            center_listen: None,
             cert: None,
             key: None,
         };
-        let options = site.site_options().map_err(|error| {
+        let options = posture.site_options().map_err(|error| {
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
         })?;
         assert_eq!(options.listen().to_string(), "127.0.0.1:8443");

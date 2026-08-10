@@ -37,12 +37,14 @@ pub const LAUNCHD_LABEL: &str = "com.rutilus.site";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const SYSTEMD_UNIT_NAME: &str = "rutilus.service";
 
-/// Site runtime arguments serialized into a registered service command line.
+/// Site or Center runtime arguments serialized into a registered service
+/// command line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceArguments {
     listen: String,
     cert: Option<String>,
     key: Option<String>,
+    center_listen: Option<String>,
 }
 
 impl ServiceArguments {
@@ -58,16 +60,48 @@ impl ServiceArguments {
         cert: Option<impl Into<String>>,
         key: Option<impl Into<String>>,
     ) -> Result<Self, ServiceArgumentsError> {
+        Self::build(listen, None::<String>, cert, key)
+    }
+
+    /// Builds the Center arguments for one registration: the web console
+    /// listen plus the center protocol listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceArgumentsError::CertificateWithoutKey`] when exactly
+    /// one of `cert`/`key` is supplied, or [`ServiceArgumentsError::Empty`]
+    /// for an empty listen address.
+    pub fn for_center(
+        listen: impl Into<String>,
+        center_listen: impl Into<String>,
+        cert: Option<impl Into<String>>,
+        key: Option<impl Into<String>>,
+    ) -> Result<Self, ServiceArgumentsError> {
+        Self::build(listen, Some(center_listen), cert, key)
+    }
+
+    fn build(
+        listen: impl Into<String>,
+        center_listen: Option<impl Into<String>>,
+        cert: Option<impl Into<String>>,
+        key: Option<impl Into<String>>,
+    ) -> Result<Self, ServiceArgumentsError> {
         let listen = listen.into();
+        let center_listen = center_listen.map(Into::into);
         let cert = cert.map(Into::into);
         let key = key.map(Into::into);
         if cert.is_some() != key.is_some() {
             return Err(ServiceArgumentsError::CertificateWithoutKey);
         }
-        if listen.is_empty() {
+        if listen.is_empty() || center_listen.as_deref().is_some_and(str::is_empty) {
             return Err(ServiceArgumentsError::Empty);
         }
-        Ok(Self { listen, cert, key })
+        Ok(Self {
+            listen,
+            cert,
+            key,
+            center_listen,
+        })
     }
 
     #[must_use]
@@ -85,16 +119,33 @@ impl ServiceArguments {
         self.key.as_deref()
     }
 
-    /// The registered argv: `service run --site --listen ADDR [--cert ...]`.
+    /// The center protocol listener address of a Center registration.
+    #[must_use]
+    pub fn center_listen(&self) -> Option<&str> {
+        self.center_listen.as_deref()
+    }
+
+    /// The registered argv: `service run --site --listen ADDR [--cert ...]`
+    /// for a Site, `service run --center --listen ADDR --center-listen ADDR
+    /// [--cert ...]` for a Center.
     #[must_use]
     pub fn to_argv(&self) -> Vec<String> {
+        let posture = if self.center_listen.is_some() {
+            "--center"
+        } else {
+            "--site"
+        };
         let mut argv = vec![
             "service".to_owned(),
             "run".to_owned(),
-            "--site".to_owned(),
+            posture.to_owned(),
             "--listen".to_owned(),
             self.listen.clone(),
         ];
+        if let Some(center_listen) = &self.center_listen {
+            argv.push("--center-listen".to_owned());
+            argv.push(center_listen.clone());
+        }
         if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
             argv.push("--cert".to_owned());
             argv.push(cert.clone());

@@ -92,7 +92,7 @@ pub struct CenterAcceptor {
     listener: TcpListener,
     tls: Arc<rustls::ServerConfig>,
     address: SocketAddr,
-    ca: CenterCa,
+    ca: Arc<CenterCa>,
     server_fingerprint: CertificateFingerprint,
     options: CenterAcceptorOptions,
 }
@@ -109,7 +109,14 @@ impl CenterAcceptor {
         paths: &RuntimePaths,
         listen: &ListenAddress,
     ) -> Result<Self, CenterAcceptorError> {
-        Self::bind_with_options(paths, listen, CenterAcceptorOptions::default()).await
+        let ca = CenterCa::generate_or_load(paths).map_err(CenterAcceptorError::Ca)?;
+        Self::bind_with_ca(
+            paths,
+            listen,
+            Arc::new(ca),
+            CenterAcceptorOptions::default(),
+        )
+        .await
     }
 
     /// Binds the center listener with explicit timing bounds (tests use
@@ -126,10 +133,28 @@ impl CenterAcceptor {
         options: CenterAcceptorOptions,
     ) -> Result<Self, CenterAcceptorError> {
         let ca = CenterCa::generate_or_load(paths).map_err(CenterAcceptorError::Ca)?;
-        let server = load_or_issue_server_certificate(paths, listen, &ca)?;
+        Self::bind_with_ca(paths, listen, Arc::new(ca), options).await
+    }
+
+    /// Binds the center listener over one prepared CA (the runtime shares
+    /// the CA between the acceptor and its certificate-issuer adapter, so
+    /// the first-start generation happens exactly once).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterAcceptorError`] when the center server certificate
+    /// cannot be loaded or issued, the TLS configuration cannot be
+    /// assembled, or the listener cannot be bound.
+    pub async fn bind_with_ca(
+        paths: &RuntimePaths,
+        listen: &ListenAddress,
+        ca: Arc<CenterCa>,
+        options: CenterAcceptorOptions,
+    ) -> Result<Self, CenterAcceptorError> {
+        let server = load_or_issue_server_certificate(paths, listen, ca.as_ref())?;
         let server_fingerprint =
             CertificateFingerprint::from_certificate_der(server.certificate.as_ref());
-        let tls = build_server_config(&ca, server)?;
+        let tls = build_server_config(ca.as_ref(), server)?;
         let listener = TcpListener::bind((listen.host().to_owned(), listen.port()))
             .await
             .map_err(CenterAcceptorError::Bind)?;
@@ -144,6 +169,13 @@ impl CenterAcceptor {
             server_fingerprint,
             options,
         })
+    }
+
+    /// The center CA: the trust anchor and signing identity shared with the
+    /// runtime's certificate-issuer adapter.
+    #[must_use]
+    pub fn ca(&self) -> Arc<CenterCa> {
+        Arc::clone(&self.ca)
     }
 
     /// The bound listener address.
@@ -325,6 +357,26 @@ impl CenterConnection {
             .next_sequence
             .checked_add(1)
             .ok_or(CenterConnectionError::SequenceOverflow)?;
+        self.send_envelope(envelope).await
+    }
+
+    /// Sends one envelope exactly as given (§15.4 — the reliable-outbox
+    /// engine owns the envelope's sequence and acknowledgement watermark).
+    ///
+    /// The runtime's inbound engine presents the connection as the
+    /// application [`CenterInboundSession`] boundary, which delivers the
+    /// engine-built envelope verbatim; this is the verbatim path, while
+    /// [`CenterConnection::send`] stays the connection-owned framing path of
+    /// the acceptor's own replies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterConnectionError`] when the envelope cannot be
+    /// framed or the transport fails.
+    pub(crate) async fn send_envelope(
+        &mut self,
+        envelope: Envelope,
+    ) -> Result<(), CenterConnectionError> {
         let frame = encode_frame(&envelope).map_err(CenterConnectionError::Frame)?;
         self.ws
             .send(Message::Binary(frame))
@@ -333,6 +385,28 @@ impl CenterConnection {
                 source: Box::new(source),
             })?;
         Ok(())
+    }
+
+    /// Waits for the next inbound envelope: one WebSocket message
+    /// classified under the one-message-one-frame rule, with the idle
+    /// timeout applied and control frames flushed.
+    ///
+    /// `Ok(None)` reports a clean close; the engine treats it as the end of
+    /// the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterConnectionError::IdleTimeout`] when no frame
+    /// arrives within the idle window, and [`CenterConnectionError`] for
+    /// transport and protocol failures.
+    pub(crate) async fn receive_envelope(
+        &mut self,
+    ) -> Result<Option<Envelope>, CenterConnectionError> {
+        let envelope = self.next_frame().await?;
+        if let Some(envelope) = envelope.as_ref() {
+            self.acked_sequence = envelope.sequence;
+        }
+        Ok(envelope)
     }
 
     /// Consumes the connection: reads frames and dispatches each to
@@ -349,6 +423,19 @@ impl CenterConnection {
         H: CenterFrameHandler<CenterConnection>,
     {
         loop {
+            let Some(envelope) = self.next_frame().await? else {
+                return Ok(());
+            };
+            self.acked_sequence = envelope.sequence;
+            handler.on_frame(&mut self, envelope).await;
+        }
+    }
+
+    /// Reads one inbound frame: the next WebSocket message classified under
+    /// the one-message-one-frame rule, with the idle timeout applied and
+    /// control messages flushed (a ping's pong is queued by the transport).
+    async fn next_frame(&mut self) -> Result<Option<Envelope>, CenterConnectionError> {
+        loop {
             let inbound =
                 match tokio::time::timeout(self.options.idle_timeout, self.ws.next()).await {
                     Ok(Some(Ok(message))) => {
@@ -359,13 +446,13 @@ impl CenterConnection {
                         // end: it reconnects on its own schedule. Only a
                         // protocol-level failure is worth surfacing.
                         if connection_ended(&source) {
-                            return Ok(());
+                            return Ok(None);
                         }
                         return Err(CenterConnectionError::Read {
                             source: Box::new(source),
                         });
                     }
-                    Ok(None) => return Ok(()),
+                    Ok(None) => return Ok(None),
                     Err(_) => {
                         return Err(CenterConnectionError::IdleTimeout {
                             after: self.options.idle_timeout,
@@ -373,10 +460,7 @@ impl CenterConnection {
                     }
                 };
             match inbound {
-                InboundFrame::Envelope(envelope) => {
-                    self.acked_sequence = envelope.sequence;
-                    handler.on_frame(&mut self, envelope).await;
-                }
+                InboundFrame::Envelope(envelope) => return Ok(Some(envelope)),
                 InboundFrame::Control => {
                     // A ping's pong is queued by the transport; flush it to
                     // the wire so the peer's liveness probe is answered.
@@ -387,7 +471,7 @@ impl CenterConnection {
                             source: Box::new(source),
                         })?;
                 }
-                InboundFrame::Closed => return Ok(()),
+                InboundFrame::Closed => return Ok(None),
                 InboundFrame::ProtocolViolation => {
                     return Err(CenterConnectionError::ProtocolViolation);
                 }
