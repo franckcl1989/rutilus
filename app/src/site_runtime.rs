@@ -25,9 +25,15 @@ use std::{
 
 use axum::serve::ListenerExt as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rutilus_application::{Clock, CoreResourceReader, RedfishDiscovery, TlsIdentityProbe};
-use rutilus_domain::{AuditActor, DeploymentPosture};
+use rutilus_application::{
+    CenterSync, CenterSyncOptions, Clock, CoreResourceReader, RedfishDiscovery, TlsIdentityProbe,
+};
+use rutilus_domain::{
+    AuditActor, CenterBinding, CenterBindingState, CertificateFingerprint, DeploymentPosture,
+    InstanceId, InstanceKind, SiteInstance,
+};
 use rutilus_infra_redfish::{NV_REDFISH_DEVELOPMENT_BASELINE, RedfishGateway, TlsProbeInitError};
+use rutilus_persistence::{CenterBindingRepositoryError, InstanceRepositoryError, SqliteStore};
 use rutilus_platform::{
     MasterKeyFile, MasterKeyFileError, RuntimePaths, SystemMasterKeyFile, SystemMasterKeyFileError,
     SystemSecretStore, SystemSecretStoreError,
@@ -43,9 +49,9 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
 use crate::{
-    StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError, StandaloneRunError,
-    StandaloneUnlock, SystemClock,
-    standalone_runtime::run_background_services,
+    CenterClientConfig, StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError,
+    StandaloneRunError, StandaloneUnlock, SystemClock, scheduler,
+    standalone_runtime::{StandaloneState, run_background_services},
     tls_material::{
         TlsMaterialError, key_der_bytes, pem_encode, persist_text, read_certificate,
         read_private_key,
@@ -675,24 +681,58 @@ where
     };
     let services_for_server = instance.state();
     let gateway_for_server = Arc::clone(&gateway);
-    let run_result = run_background_services(
-        instance.state(),
-        gateway,
-        move |policy, stop_watch, scheduler_done_receiver| {
-            binding.serve_until(
-                policy,
-                services_for_server,
-                gateway_for_server,
-                SystemClock,
-                async move {
-                    let mut stop = stop_watch;
-                    stop.stopped().await;
-                    let _ = scheduler_done_receiver.await;
-                },
+    // 0.7.0 S7: the center sync engine starts when the site is bound. The
+    // assembly happens once, before the server starts; a bound site whose
+    // material is broken logs the failure and keeps running local-only
+    // (§15.3 local autonomy — a center problem never takes the site down).
+    let center_sync = match assemble_center_sync(&services_for_server.store, paths).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            eprintln!("the site's center material is broken: {error}");
+            None
+        }
+    };
+    if center_sync.is_some() {
+        println!("Rutilus Site is bound to the center; starting the center sync");
+    }
+    // The engine runs on its own stop signal, and the wrapper joins it on
+    // every shutdown path — including a server failure — before `SQLite`
+    // closes, so the engine's state reference is released in time.
+    let run_result = async {
+        let (engine_stop_signal, engine_stop_watch) = scheduler::StopSignal::new();
+        let engine_task = center_sync.map(|bundle| {
+            spawn_center_sync(
+                bundle,
+                Arc::clone(&services_for_server),
+                engine_stop_watch,
+                CenterSyncRuntimeOptions::default(),
             )
-        },
-        stop,
-    )
+        });
+        let services_result = run_background_services(
+            instance.state(),
+            gateway,
+            move |policy, stop_watch, scheduler_done_receiver| {
+                binding.serve_until(
+                    policy,
+                    services_for_server,
+                    gateway_for_server,
+                    SystemClock,
+                    async move {
+                        let mut stop = stop_watch;
+                        stop.stopped().await;
+                        let _ = scheduler_done_receiver.await;
+                    },
+                )
+            },
+            stop,
+        )
+        .await;
+        engine_stop_signal.signal();
+        if let Some(engine_task) = engine_task {
+            let _ = engine_task.await;
+        }
+        services_result
+    }
     .await;
     let close_result = instance.close().await;
     match (run_result, close_result) {
@@ -844,11 +884,338 @@ pub enum SiteInstallError {
     UnexpectedRewrap,
 }
 
+/// The site-side center-sync material (0.7.0 S7): the delivered binding
+/// result persisted below `<data>/tls/`.
+///
+/// The one-time binding flow returns the issued client pair and the center's
+/// §10.4 trust material to the operator; the site persists them as:
+///
+/// - `site-client.crt` / `site-client.key` — the issued client pair (the
+///   exact PEM bytes of the binding result);
+/// - `center-ca.crt` — the center CA certificate (the trust anchor);
+/// - `center-pin.txt` — the pinned center server certificate fingerprint
+///   (§10.4 explicit trust).
+///
+/// The site's own `center_bindings` row (written by the site-side bind
+/// flow) records the center address and the site identity fingerprint; the
+/// runtime cross-checks the loaded client certificate's private-arc
+/// extension against that record, mirroring the center's own admission
+/// check.
+const SITE_CLIENT_CERT_FILE: &str = "site-client.crt";
+const SITE_CLIENT_KEY_FILE: &str = "site-client.key";
+const CENTER_CA_CERT_FILE: &str = "center-ca.crt";
+const CENTER_PIN_FILE: &str = "center-pin.txt";
+
+/// How often the site re-reads its binding while the sync engine runs; a
+/// revoked binding stops the engine (the site keeps running locally).
+const BINDING_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The site's center-sync runtime timing bounds (tests use a short binding
+/// poll instead of the production 30-second one).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CenterSyncRuntimeOptions {
+    /// How often the runtime re-reads the site's binding while the sync
+    /// engine runs.
+    pub binding_poll_interval: Duration,
+}
+
+impl Default for CenterSyncRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            binding_poll_interval: BINDING_POLL_INTERVAL,
+        }
+    }
+}
+
+/// One assembled site-to-center sync bundle: the transport configuration
+/// and the site's own instance identity.
+#[derive(Clone, Debug)]
+pub struct CenterSyncBundle {
+    config: CenterClientConfig,
+    instance: SiteInstance,
+}
+
+impl CenterSyncBundle {
+    #[must_use]
+    pub const fn new(config: CenterClientConfig, instance: SiteInstance) -> Self {
+        Self { config, instance }
+    }
+
+    /// The transport configuration of the site-to-center connection.
+    #[must_use]
+    pub const fn config(&self) -> &CenterClientConfig {
+        &self.config
+    }
+
+    /// The site's own instance identity.
+    #[must_use]
+    pub const fn instance(&self) -> &SiteInstance {
+        &self.instance
+    }
+}
+
+/// A controlled failure while assembling the site's center-sync material.
+#[derive(Debug, Error)]
+pub enum CenterSyncMaterialError {
+    #[error("the center address on the binding is not a host:port pair: {0}")]
+    CenterAddress(#[source] ListenAddressError),
+    #[error("failed to read the site client certificate {path}: {source}")]
+    ClientCertificate {
+        path: PathBuf,
+        #[source]
+        source: TlsMaterialError,
+    },
+    #[error("failed to read the site client key {path}: {source}")]
+    ClientKey {
+        path: PathBuf,
+        #[source]
+        source: TlsMaterialError,
+    },
+    #[error("failed to read the center CA certificate {path}: {source}")]
+    CenterCa {
+        path: PathBuf,
+        #[source]
+        source: TlsMaterialError,
+    },
+    #[error("failed to read the center pin file {path}: {source}")]
+    CenterPin {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the center pin file {0} does not carry a certificate fingerprint: {1}")]
+    PinShape(
+        PathBuf,
+        #[source] rutilus_domain::CertificateFingerprintParseError,
+    ),
+    #[error("the site client certificate cannot be read: {0}")]
+    Certificate(#[from] crate::x509::DerReadError),
+    #[error(
+        "the loaded client certificate carries no site-identity extension; it was not issued by a center"
+    )]
+    NotCenterIssued,
+    #[error(
+        "the loaded client certificate's site identity disagrees with the binding record; the material was replaced"
+    )]
+    FingerprintMismatch,
+    #[error("the site is bound but its center material is incomplete")]
+    IncompleteMaterial,
+    #[error("the instance repository failed: {0}")]
+    Instance(#[source] InstanceRepositoryError),
+    #[error("the binding repository failed: {0}")]
+    Binding(#[source] CenterBindingRepositoryError),
+}
+
+/// Loads the site's center binding and TLS material, returning the sync
+/// bundle when the site is bound (§15.1, 0.7.0 S7).
+///
+/// A site without its own instance row, without a binding, or with a
+/// pending or revoked binding runs local-only (`Ok(None)`). A bound site
+/// whose material is incomplete or disagrees with its binding record is a
+/// broken handoff: [`CenterSyncMaterialError`] is returned and the runtime
+/// keeps the site local while logging the failure — local autonomy
+/// (§15.3) never lets a center problem take the site down.
+///
+/// # Errors
+///
+/// Returns [`CenterSyncMaterialError`] for a broken material set: a
+/// half-written pair, a missing center trust file, an unparseable pin, or
+/// a client certificate that does not carry — or disagrees with — the
+/// binding's site identity.
+pub(crate) async fn assemble_center_sync(
+    store: &SqliteStore,
+    paths: &RuntimePaths,
+) -> Result<Option<CenterSyncBundle>, CenterSyncMaterialError> {
+    let instances = store
+        .list_instances()
+        .await
+        .map_err(CenterSyncMaterialError::Instance)?;
+    let Some(instance) = instances
+        .into_iter()
+        .find(|instance| instance.kind() == InstanceKind::Site)
+    else {
+        // The site's own identity row does not exist; it was never bound.
+        return Ok(None);
+    };
+    let Some(binding) = store
+        .find_binding_by_site(instance.id())
+        .await
+        .map_err(CenterSyncMaterialError::Binding)?
+    else {
+        return Ok(None);
+    };
+    if binding.state() != CenterBindingState::Bound {
+        // A pending or revoked binding does not start the engine.
+        return Ok(None);
+    }
+    let bundle = load_bundle_material(paths, &instance, &binding)?;
+    Ok(Some(bundle))
+}
+
+/// Loads and validates the four material files of one bound site.
+fn load_bundle_material(
+    paths: &RuntimePaths,
+    instance: &SiteInstance,
+    binding: &CenterBinding,
+) -> Result<CenterSyncBundle, CenterSyncMaterialError> {
+    let client_cert_path = paths.tls_directory().join(SITE_CLIENT_CERT_FILE);
+    let client_key_path = paths.tls_directory().join(SITE_CLIENT_KEY_FILE);
+    let center_ca_path = paths.tls_directory().join(CENTER_CA_CERT_FILE);
+    let center_pin_path = paths.tls_directory().join(CENTER_PIN_FILE);
+    let present = [
+        client_cert_path.is_file(),
+        client_key_path.is_file(),
+        center_ca_path.is_file(),
+        center_pin_path.is_file(),
+    ];
+    if !present.iter().all(|present| *present) {
+        if present.iter().all(|present| !*present) {
+            // Never-bound material: the site is bound in the database but
+            // the handoff files were never delivered. A bound site without
+            // material cannot connect; the runtime logs and stays local.
+            return Err(CenterSyncMaterialError::IncompleteMaterial);
+        }
+        // A half-written set is a broken handoff, never silently ignored.
+        return Err(CenterSyncMaterialError::IncompleteMaterial);
+    }
+    let client_certificate = read_certificate(&client_cert_path).map_err(|source| {
+        CenterSyncMaterialError::ClientCertificate {
+            path: client_cert_path,
+            source,
+        }
+    })?;
+    let client_key = read_private_key(&client_key_path).map_err(|source| {
+        CenterSyncMaterialError::ClientKey {
+            path: client_key_path,
+            source,
+        }
+    })?;
+    validate_key_matches_cert(&client_certificate, &client_key)
+        .map_err(|_| CenterSyncMaterialError::IncompleteMaterial)?;
+    let center_ca =
+        read_certificate(&center_ca_path).map_err(|source| CenterSyncMaterialError::CenterCa {
+            path: center_ca_path,
+            source,
+        })?;
+    let pin_text = std::fs::read_to_string(&center_pin_path).map_err(|source| {
+        CenterSyncMaterialError::CenterPin {
+            path: center_pin_path.clone(),
+            source,
+        }
+    })?;
+    let pinned_fingerprint = pin_text
+        .trim()
+        .parse::<CertificateFingerprint>()
+        .map_err(|source| CenterSyncMaterialError::PinShape(center_pin_path, source))?;
+    // The cross-check mirrors the center's own admission (S3b audit item
+    // 1): the certificate's private-arc extension must carry the site
+    // identity the binding recorded. A certificate without the extension
+    // was not issued by a center.
+    let bound_fingerprint = crate::x509::site_identity_fingerprint(&client_certificate)?;
+    let Some(bound_fingerprint) = bound_fingerprint else {
+        return Err(CenterSyncMaterialError::NotCenterIssued);
+    };
+    if let Some(recorded) = binding.site_cert_fingerprint()
+        && recorded != bound_fingerprint
+    {
+        return Err(CenterSyncMaterialError::FingerprintMismatch);
+    }
+    let center = ListenAddress::parse(binding.center_url())
+        .map_err(CenterSyncMaterialError::CenterAddress)?;
+    let config = CenterClientConfig::new(
+        center,
+        center_ca,
+        pinned_fingerprint,
+        client_certificate,
+        client_key,
+        instance.id(),
+        instance.display_name().to_owned(),
+    )
+    .map_err(|_| CenterSyncMaterialError::IncompleteMaterial)?;
+    Ok(CenterSyncBundle::new(config, instance.clone()))
+}
+
+/// Spawns the site-to-center sync engine over one assembled bundle and
+/// returns the task handle.
+///
+/// The engine runs until the shared stop watch fires or the site's binding
+/// is revoked (re-read on the poll interval). The runtime joins the handle
+/// on every shutdown path before `SQLite` closes, so no engine task ever
+/// touches the store after shutdown begins.
+pub(crate) fn spawn_center_sync(
+    bundle: CenterSyncBundle,
+    state: Arc<StandaloneState>,
+    stop: scheduler::StopWatch,
+    options: CenterSyncRuntimeOptions,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_center_sync_task(bundle, state, stop, options))
+}
+
+/// The engine task body: the §15.4 sync loop with the binding-revocation
+/// watch as its stop condition.
+async fn run_center_sync_task(
+    bundle: CenterSyncBundle,
+    state: Arc<StandaloneState>,
+    mut stop: scheduler::StopWatch,
+    options: CenterSyncRuntimeOptions,
+) {
+    let engine = CenterSync::new(
+        bundle.config(),
+        &state.store,
+        &state.store,
+        &state.store,
+        &state.store,
+        &state.store,
+        SystemClock,
+        bundle.instance().id(),
+        CenterSyncOptions::default(),
+    );
+    let poll = options.binding_poll_interval;
+    let binding_site = bundle.instance().id();
+    let store = &state.store;
+    let outcome = engine
+        .run(async move {
+            tokio::select! {
+                () = stop.stopped() => {}
+                () = binding_revoked(store, binding_site, poll) => {
+                    eprintln!(
+                        "the site's center binding was revoked; stopping the center sync"
+                    );
+                }
+            }
+        })
+        .await;
+    if let Err(error) = outcome {
+        eprintln!("the center sync engine stopped with an error: {error}");
+    }
+}
+
+/// Resolves when the site's binding is no longer `Bound` (revoked, or the
+/// row vanished).
+async fn binding_revoked(store: &SqliteStore, site: InstanceId, poll: Duration) {
+    loop {
+        match store.find_binding_by_site(site).await {
+            Ok(Some(binding)) if binding.state() == CenterBindingState::Bound => {}
+            _ => return,
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, net::Ipv4Addr};
+    use std::{collections::VecDeque, error::Error, net::Ipv4Addr, sync::Mutex};
+
+    use rutilus_application::CenterSessionRegistry;
+    use rutilus_domain::{
+        BINDING_CODE_TTL, BindingCode, CenterBinding, CenterBindingId, CertificateFingerprint,
+        InstanceId, InstanceKind, SiteInstance,
+    };
+    use rutilus_platform::{RuntimeLock, RuntimePaths};
+    use rutilus_security::MasterKey;
 
     use super::*;
+    use crate::CenterCa;
 
     fn parse_listen(value: &str) -> Result<ListenAddress, ListenAddressError> {
         ListenAddress::parse(value)
@@ -1181,6 +1548,199 @@ mod tests {
             .map_err(|error| io::Error::other(error.to_string()))?;
         assert!(connector.connect(server_name, client).await.is_err());
         assert!(server.await.map_err(io::Error::other)?.is_err());
+        Ok(())
+    }
+
+    /// A test instance state over one migrated store.
+    async fn test_state(paths: &RuntimePaths) -> Result<Arc<StandaloneState>, Box<dyn Error>> {
+        let store = SqliteStore::open(paths.database_path()).await?;
+        let runtime_lock = RuntimeLock::acquire(paths.runtime_lock_path())?;
+        Ok(Arc::new(StandaloneState {
+            store,
+            master_key: MasterKey::generate()?,
+            _runtime_lock: runtime_lock,
+            audit_tail: Arc::new(Mutex::new(VecDeque::new())),
+            registry: Arc::new(CenterSessionRegistry::new()),
+            center_issuer: Mutex::new(None),
+        }))
+    }
+
+    /// Seeds one bound site: the site's own instance row, a `Bound` binding
+    /// naming `127.0.0.1:1` (an unreachable center for the engine tests),
+    /// and the four delivered material files below `tls/`.
+    async fn seed_bound_site(
+        store: &SqliteStore,
+        paths: &RuntimePaths,
+    ) -> Result<(InstanceId, CenterBindingId, CertificateFingerprint), Box<dyn Error>> {
+        let now = OffsetDateTime::now_utc();
+        let instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        store.create_instance(&instance).await?;
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x42; 32]);
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            "127.0.0.1:1".to_owned(),
+            instance.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        binding.bind(Some(site_fingerprint), now)?;
+        let binding_id = binding.id();
+        store.create_binding(&binding).await?;
+        let ca = CenterCa::generate_or_load(paths)?;
+        let issued = ca.issue_site_certificate(instance.id(), site_fingerprint)?;
+        let (cert_pem, key_pem) = issued.pem_pair();
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_CERT_FILE), cert_pem)?;
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_KEY_FILE), key_pem)?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_CA_CERT_FILE),
+            pem_encode("CERTIFICATE", ca.certificate().as_ref()),
+        )?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_PIN_FILE),
+            CertificateFingerprint::from_bytes([0xAA; 32]).to_string(),
+        )?;
+        Ok((instance.id(), binding_id, site_fingerprint))
+    }
+
+    #[tokio::test]
+    async fn assembly_returns_no_bundle_for_an_unbound_site() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let state = test_state(&paths).await?;
+
+        // No instance row at all: never bound.
+        assert!(assemble_center_sync(&state.store, &paths).await?.is_none());
+
+        // An instance row without a binding: never bound.
+        let now = OffsetDateTime::now_utc();
+        state
+            .store
+            .create_instance(&SiteInstance::new(
+                InstanceId::generate(),
+                "Test Site".to_owned(),
+                InstanceKind::Site,
+                now,
+            ))
+            .await?;
+        assert!(assemble_center_sync(&state.store, &paths).await?.is_none());
+
+        // A pending binding does not start the engine.
+        let instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        state.store.create_instance(&instance).await?;
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            "127.0.0.1:1".to_owned(),
+            instance.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        state.store.create_binding(&binding).await?;
+        assert!(assemble_center_sync(&state.store, &paths).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assembly_loads_the_bundle_of_a_bound_site() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let state = test_state(&paths).await?;
+        let (instance_id, _, _) = seed_bound_site(&state.store, &paths).await?;
+
+        let bundle = assemble_center_sync(&state.store, &paths)
+            .await?
+            .ok_or("a bound site must assemble a bundle")?;
+        assert_eq!(bundle.instance().id(), instance_id);
+        assert_eq!(bundle.instance().display_name(), "Test Site");
+        assert_eq!(bundle.config().center_address().to_string(), "127.0.0.1:1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assembly_refuses_a_bound_site_with_broken_material() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let state = test_state(&paths).await?;
+        let (_, _, _) = seed_bound_site(&state.store, &paths).await?;
+
+        // A replaced client pair whose extension disagrees with the
+        // binding record is refused (the material was swapped).
+        let ca = CenterCa::generate_or_load(&paths)?;
+        let foreign = ca.issue_site_certificate(
+            InstanceId::generate(),
+            CertificateFingerprint::from_bytes([0x99; 32]),
+        )?;
+        let (cert_pem, key_pem) = foreign.pem_pair();
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_CERT_FILE), cert_pem)?;
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_KEY_FILE), key_pem)?;
+        assert!(matches!(
+            assemble_center_sync(&state.store, &paths).await,
+            Err(CenterSyncMaterialError::FingerprintMismatch)
+        ));
+
+        // A missing pin file is a broken handoff.
+        std::fs::remove_file(paths.tls_directory().join(CENTER_PIN_FILE))?;
+        assert!(matches!(
+            assemble_center_sync(&state.store, &paths).await,
+            Err(CenterSyncMaterialError::IncompleteMaterial)
+        ));
+
+        // A half-written client pair is a broken handoff, never silently
+        // ignored.
+        std::fs::remove_file(paths.tls_directory().join(SITE_CLIENT_KEY_FILE))?;
+        assert!(matches!(
+            assemble_center_sync(&state.store, &paths).await,
+            Err(CenterSyncMaterialError::IncompleteMaterial)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sync_engine_stops_on_the_stop_signal_and_after_revocation()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let state = test_state(&paths).await?;
+        let (_, binding_id, _) = seed_bound_site(&state.store, &paths).await?;
+        let bundle = assemble_center_sync(&state.store, &paths)
+            .await?
+            .ok_or("a bound site must assemble a bundle")?;
+        let options = CenterSyncRuntimeOptions {
+            binding_poll_interval: Duration::from_millis(20),
+        };
+
+        // The engine stops on the stop signal (the center at 127.0.0.1:1
+        // is unreachable; the connect loop exits on stop).
+        let (stop_signal, stop_watch) = scheduler::StopSignal::new();
+        let task = spawn_center_sync(bundle.clone(), Arc::clone(&state), stop_watch, options);
+        stop_signal.signal();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .map_err(|_| io::Error::other("the engine did not stop in time"))??;
+
+        // The binding-revocation watch stops a running engine: revoke the
+        // binding while the engine runs and join it.
+        let (revoke_signal, revoke_watch) = scheduler::StopSignal::new();
+        let task = spawn_center_sync(bundle, Arc::clone(&state), revoke_watch, options);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.store.revoke_binding(binding_id).await?;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .map_err(|_| io::Error::other("the engine did not stop after the revocation"))??;
+        let _ = revoke_signal;
         Ok(())
     }
 }

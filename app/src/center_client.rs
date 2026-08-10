@@ -142,6 +142,12 @@ impl CenterClientConfig {
         self
     }
 
+    /// The center's address as recorded on the binding.
+    #[must_use]
+    pub const fn center_address(&self) -> &ListenAddress {
+        &self.center
+    }
+
     /// Establishes one connection to the center: TCP, TLS 1.3 with the
     /// site's client certificate, the §10.4 pin check, the WebSocket
     /// upgrade, and the `Hello`/`NegotiationResult` negotiation.

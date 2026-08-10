@@ -114,9 +114,9 @@ pub struct StandaloneInstance {
 /// one registry between its accept loop and its web console services.
 pub(crate) struct StandaloneState {
     pub(crate) store: SqliteStore,
-    master_key: MasterKey,
-    _runtime_lock: RuntimeLock,
-    audit_tail: Arc<Mutex<VecDeque<AuditEvent>>>,
+    pub(crate) master_key: MasterKey,
+    pub(crate) _runtime_lock: RuntimeLock,
+    pub(crate) audit_tail: Arc<Mutex<VecDeque<AuditEvent>>>,
     pub(crate) registry: Arc<CenterSessionRegistry>,
     /// The center certificate-issuer adapter of the center posture; the
     /// Edge postures keep the empty slot, and the center runtime arms it at
