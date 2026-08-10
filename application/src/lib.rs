@@ -5,6 +5,7 @@ mod audit_log;
 mod batch_query;
 mod batch_refresh;
 mod capability_query;
+mod center;
 mod center_sync;
 mod center_transport;
 mod command_executor;
@@ -40,6 +41,11 @@ pub use batch_refresh::{
 pub use capability_query::{
     CapabilityLedgerEntry, CapabilityQueryRepository, EndpointCapabilityQuery,
     EndpointCapabilityQueryError, StoredCapability,
+};
+pub use center::{
+    BindOutcome, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
+    CenterTrustAnchor, IdentityValidationError, InstanceRepository, IssuedSiteCertificate,
+    RegisteredSite, SiteCertificateIssuer, SiteIdentity, validate_bound_identity,
 };
 pub use center_sync::{
     CenterCursor, CenterEventTail, CenterInbox, CenterOutbox, CenterSync, CenterSyncError,

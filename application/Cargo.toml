@@ -12,6 +12,7 @@ futures.workspace = true
 rutilus-center-protocol.workspace = true
 rutilus-domain.workspace = true
 rutilus-operation-engine.workspace = true
+rutilus-security.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
