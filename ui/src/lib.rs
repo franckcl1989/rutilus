@@ -13,20 +13,21 @@ use rutilus_api::{
     BatchDetailResponse, BatchOperationResponse, BatchOperationStateResponse,
     BatchOutcomeCountsResponse, BatchRefreshResponse, BatchSummaryResponse, BootCommand,
     BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
-    CapabilityStateResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
-    CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse, DeleteSubscription,
-    EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
-    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
-    EndpointRefreshResultResponse, EndpointRefreshStatusResponse,
-    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse, EndpointSummaryResponse,
-    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
-    EndpointTrustExpectationRequest, EraseToken, EraseType, EventCommand, EventDestinationProtocol,
-    EventListResponse, EventResponse, EventType, GroupResponse, ManagerCommand,
-    MetricValueResponse, NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand,
-    NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse, OperationSourceResponse,
-    OperationStateResponse, ProfileFile, ProfileId, RedfishCommand, ResetKeysType, ResetType,
-    ResourceDiagnosticsResponse, ResourceStatusResponse, RoleResponse, SecureBootCommand,
-    SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
+    CapabilityStateResponse, CenterBindingStateResponse, CenterEndpointViewResponse,
+    CenterOperationResponse, CenterSiteResponse, ChassisCommand, CoreResourceDetailsResponse,
+    CoreResourceResponse, CreateSubscription, CredentialInventoryResponse,
+    CredentialSummaryResponse, DeleteSubscription, EndpointCapabilityInventoryResponse,
+    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
+    EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointRefreshResultResponse,
+    EndpointRefreshStatusResponse, EndpointResourceInventoryResponse,
+    EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EraseToken, EraseType,
+    EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
+    GroupResponse, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
+    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
+    OperationSourceResponse, OperationStateResponse, ProfileFile, ProfileId, RedfishCommand,
+    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse, RoleResponse,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
     TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
     TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse, UpdateCommand,
 };
@@ -2297,11 +2298,18 @@ enum ConsoleView {
     Diagnostics,
     Users,
     Sessions,
+    // The 0.7.0 center console (§12.1 "中心连接", audit follow-up S8):
+    // the registered site list with the aggregated endpoint detail, the
+    // §15.6 operation tracking with the submit form, and the binding
+    // management with the one-time code.
+    CenterSites,
+    CenterOperations,
+    CenterBindings,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ConsoleView {
-    const ALL: [ConsoleView; 14] = [
+    const ALL: [ConsoleView; 17] = [
         Self::Overview,
         Self::Groups,
         Self::Credentials,
@@ -2316,6 +2324,9 @@ impl ConsoleView {
         Self::Diagnostics,
         Self::Users,
         Self::Sessions,
+        Self::CenterSites,
+        Self::CenterOperations,
+        Self::CenterBindings,
     ];
 
     const fn label(self) -> &'static str {
@@ -2334,16 +2345,254 @@ impl ConsoleView {
             Self::Diagnostics => "Diagnostics",
             Self::Users => "Users",
             Self::Sessions => "Sessions",
+            Self::CenterSites => "Center sites",
+            Self::CenterOperations => "Center operations",
+            Self::CenterBindings => "Center bindings",
         }
+    }
+
+    /// Whether this view belongs to the center console surface (audit
+    /// follow-up F2/S8): the center views render only on the Center
+    /// posture, and every edge view renders only on the Edge postures.
+    #[must_use]
+    pub const fn is_center_view(self) -> bool {
+        matches!(
+            self,
+            Self::CenterSites | Self::CenterOperations | Self::CenterBindings
+        )
     }
 
     /// Whether the §16.1 role of the signed-in principal may open this
     /// view: the user and session administration views are Administrator
-    /// only, every other view is open to all three roles.
+    /// only, the center binding management is Administrator only (the
+    /// §16.1 center binding matrix), every other view is open to all three
+    /// roles.
     const fn allowed_for(self, role: Option<RoleView>) -> bool {
         match self {
-            Self::Users | Self::Sessions => matches!(role, Some(RoleView::Administrator)),
+            Self::Users | Self::Sessions | Self::CenterBindings => {
+                matches!(role, Some(RoleView::Administrator))
+            }
             _ => true,
+        }
+    }
+}
+
+/// One registered site as the center's §15.5 site view projects it.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CenterSiteCardProjection {
+    site_id: String,
+    display_name: String,
+    binding: Option<CenterBindingStateView>,
+    online: bool,
+    endpoint_count: u64,
+    last_refresh_at: Option<OffsetDateTime>,
+}
+
+/// The binding phase of one registered site (design D2).
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CenterBindingStateView {
+    Pending,
+    Bound,
+    Revoked,
+}
+
+/// One projected remote endpoint of the center's §15.5 endpoint view.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CenterEndpointCardProjection {
+    site_id: Option<String>,
+    endpoint_id: String,
+    display_name: String,
+    address: String,
+    health: String,
+    refresh_generation: u64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One center-dispatched operation in the center's tracking view (§15.6).
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CenterOperationCardProjection {
+    operation_id: String,
+    site_id: Option<String>,
+    endpoint_id: String,
+    command: String,
+    target: Option<String>,
+    state: String,
+    actor: Option<String>,
+    created_at: OffsetDateTime,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// The §15.6 dispatch draft of the center operation form: the site, the
+/// projected endpoint, the typed command target, and the command-family
+/// parameters. The command itself is built by the edge form machinery
+/// ([`OperationFormDraft`]'s per-family validation), so the two forms
+/// cannot drift apart on what makes a complete command.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CenterOperationDraft {
+    site_id: String,
+    endpoint_id: String,
+    target: String,
+    family: Option<CommandFamilyView>,
+    reset_type: Option<ResetTypeView>,
+    boot_source: Option<BootSourceView>,
+    boot_enabled: Option<BootEnabledView>,
+    boot_mode: Option<BootModeView>,
+    secure_boot_action: Option<SecureBootActionView>,
+    reset_keys_type: Option<ResetKeysTypeView>,
+    event_action: Option<EventActionView>,
+    destination: String,
+    protocol: Option<EventProtocolView>,
+    event_types: Vec<EventTypeView>,
+    subscription_id: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl CenterOperationDraft {
+    /// Builds an empty draft: no site, no endpoint, no family.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            site_id: String::new(),
+            endpoint_id: String::new(),
+            target: String::new(),
+            family: None,
+            reset_type: None,
+            boot_source: None,
+            boot_enabled: None,
+            boot_mode: None,
+            secure_boot_action: None,
+            reset_keys_type: None,
+            event_action: None,
+            destination: String::new(),
+            protocol: None,
+            event_types: Vec::new(),
+            subscription_id: String::new(),
+        }
+    }
+
+    /// Builds the typed §15.6 submission payload.
+    ///
+    /// The command validation is the edge form's own: the draft is folded
+    /// into an [`OperationFormDraft`] with the chosen endpoint as its
+    /// single target, so a family's parameter rules (and their error
+    /// messages) are exactly the ones the site console enforces. The
+    /// center-specific fields — the site and the target — are validated
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first invalid field as [`CenterOperationDraftError`].
+    pub fn try_build(&self) -> Result<CenterOperationSubmission, CenterOperationDraftError> {
+        if self.site_id.trim().is_empty() {
+            return Err(CenterOperationDraftError::SiteRequired);
+        }
+        if self.endpoint_id.trim().is_empty() {
+            return Err(CenterOperationDraftError::EndpointRequired);
+        }
+        if self.target.trim().is_empty() {
+            return Err(CenterOperationDraftError::TargetRequired);
+        }
+        let mut form = OperationFormDraft::new();
+        form.selected_endpoint_ids = vec![self.endpoint_id.clone()];
+        form.family = self.family;
+        form.reset_type = self.reset_type;
+        form.boot_source = self.boot_source;
+        form.boot_enabled = self.boot_enabled;
+        form.boot_mode = self.boot_mode;
+        form.secure_boot_action = self.secure_boot_action;
+        form.reset_keys_type = self.reset_keys_type;
+        form.event_action = self.event_action;
+        form.destination.clone_from(&self.destination);
+        form.protocol = self.protocol;
+        form.event_types.clone_from(&self.event_types);
+        form.subscription_id.clone_from(&self.subscription_id);
+        let command = form
+            .try_build()
+            .map_err(CenterOperationDraftError::Command)?;
+        let command = build_command(&command).map_err(CenterOperationDraftError::Command)?;
+        Ok(CenterOperationSubmission {
+            site_id: self.site_id.trim().to_owned(),
+            endpoint_id: self.endpoint_id.trim().to_owned(),
+            target: self.target.trim().to_owned(),
+            command,
+        })
+    }
+}
+
+/// The validated §15.6 submission payload of the center operation form:
+/// the wire contract of `CenterOperationSubmitRequest`.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CenterOperationSubmission {
+    site_id: String,
+    endpoint_id: String,
+    target: String,
+    command: RedfishCommand,
+}
+
+/// Why one center operation submission is incomplete.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CenterOperationDraftError {
+    SiteRequired,
+    EndpointRequired,
+    TargetRequired,
+    Command(OperationFormError),
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&CenterSiteResponse> for CenterSiteCardProjection {
+    fn from(site: &CenterSiteResponse) -> Self {
+        Self {
+            site_id: site.site_id().to_string(),
+            display_name: site.display_name().to_owned(),
+            binding: site.binding().map(|binding| match binding {
+                CenterBindingStateResponse::Pending => CenterBindingStateView::Pending,
+                CenterBindingStateResponse::Bound => CenterBindingStateView::Bound,
+                CenterBindingStateResponse::Revoked => CenterBindingStateView::Revoked,
+            }),
+            online: site.online(),
+            endpoint_count: site.endpoint_count(),
+            last_refresh_at: site.last_refresh_at(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&CenterEndpointViewResponse> for CenterEndpointCardProjection {
+    fn from(endpoint: &CenterEndpointViewResponse) -> Self {
+        Self {
+            site_id: endpoint.site_id().map(|site| site.to_string()),
+            endpoint_id: endpoint.endpoint_id().to_string(),
+            display_name: endpoint.display_name().to_owned(),
+            address: endpoint.address().to_owned(),
+            health: endpoint.health().to_owned(),
+            refresh_generation: endpoint.refresh_generation(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&CenterOperationResponse> for CenterOperationCardProjection {
+    fn from(operation: &CenterOperationResponse) -> Self {
+        let summary = wire_command_summary(operation.command());
+        Self {
+            operation_id: operation.operation_id().to_string(),
+            site_id: operation.site_id().map(|site| site.to_string()),
+            endpoint_id: operation.endpoint_id().to_string(),
+            command: format!("{} · {}", summary.family, summary.payload),
+            target: operation.target().map(str::to_owned),
+            state: OperationStateView::from(operation.state())
+                .label()
+                .to_owned(),
+            actor: operation.actor().map(str::to_owned),
+            created_at: operation.created_at(),
         }
     }
 }
@@ -7719,9 +7968,12 @@ mod browser {
         AboutResponse, AppendArtifactChunkRequest, ArtifactListResponse, ArtifactProgressResponse,
         ArtifactResponse, AssignRoleRequest, AssignTagRequest, AuditQueryResponse,
         BatchDetailResponse, BatchListResponse, BatchRefreshResponse, BeginEndpointTrustRequest,
-        BootstrapCompleteRequest, BootstrapCompleteResponse, ConfirmEndpointTrustRequest,
-        CreateArtifactRequest, CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
-        CreateUserRequest, CredentialInventoryResponse, CredentialSummaryResponse,
+        BootstrapCompleteRequest, BootstrapCompleteResponse, CenterBindingRegisterRequest,
+        CenterBindingRegisterResponse, CenterBindingRevokeRequest, CenterEndpointViewListResponse,
+        CenterOperationListResponse, CenterOperationSubmitRequest, CenterOperationSubmitResponse,
+        CenterSitesResponse, ConfirmEndpointTrustRequest, CreateArtifactRequest,
+        CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest, CreateUserRequest,
+        CredentialInventoryResponse, CredentialSummaryResponse,
         EndpointCapabilityInventoryResponse, EndpointCsvImportRequest, EndpointCsvImportResponse,
         EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
@@ -7733,6 +7985,201 @@ mod browser {
         TrustedEndpointResponse, UserAdminResponse,
     };
     use wasm_bindgen::prelude::wasm_bindgen;
+
+    impl CenterBindingsListState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+
+        const fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready(_))
+        }
+    }
+
+    impl CenterOperationSubmitState {
+        const fn is_in_flight(&self) -> bool {
+            matches!(self, Self::InFlight)
+        }
+    }
+
+    impl CenterOperationsListState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+
+        const fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready(_))
+        }
+
+        const fn is_loading(&self) -> bool {
+            matches!(self, Self::Loading)
+        }
+
+        fn count_text(&self) -> String {
+            let count = match self {
+                Self::Ready(operations) => operations.len(),
+                Self::Idle | Self::Loading | Self::Failed => 0,
+            };
+            match count {
+                1 => "1 center operation".to_owned(),
+                _ => format!("{count} center operations"),
+            }
+        }
+    }
+
+    impl CenterEndpointsDetailState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+
+        const fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready(_))
+        }
+    }
+
+    impl CenterSitesListState {
+        const fn is_failed(&self) -> bool {
+            matches!(self, Self::Failed)
+        }
+
+        const fn is_ready(&self) -> bool {
+            matches!(self, Self::Ready(_))
+        }
+
+        fn count_text(&self) -> String {
+            let count = match self {
+                Self::Ready(sites) => sites.len(),
+                Self::Idle | Self::Loading | Self::Failed => 0,
+            };
+            match count {
+                1 => "1 registered site".to_owned(),
+                _ => format!("{count} registered sites"),
+            }
+        }
+    }
+
+    /// The outcome of one revocation submission.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CenterRevokeState {
+        Idle,
+        InFlight,
+        Succeeded,
+        Failed,
+    }
+
+    /// The outcome of one registration submission.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterRegisterState {
+        Idle,
+        InFlight,
+        Issued(CenterBindingCodeView),
+        Failed,
+    }
+
+    /// The one-time binding code acknowledgement of a registration (design
+    /// D2): the raw code is shown exactly once, here, and never again.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CenterBindingCodeView {
+        site_id: String,
+        binding_id: String,
+        code: String,
+        expires_at: OffsetDateTime,
+    }
+
+    /// The loading state of the center's binding surface (the register form
+    /// results and the revocable site list).
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterBindingsListState {
+        Idle,
+        Loading,
+        Ready(Vec<CenterSiteCardProjection>),
+        Failed,
+    }
+
+    /// The outcome of one center operation submission.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterOperationSubmitState {
+        Idle,
+        InFlight,
+        Succeeded,
+        Failed(String),
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    impl CenterOperationDraftError {
+        /// Static English message of one invalid field.
+        #[must_use]
+        pub const fn message(self) -> &'static str {
+            match self {
+                Self::SiteRequired => "A site must be selected.",
+                Self::EndpointRequired => "An endpoint must be selected.",
+                Self::TargetRequired => "A Redfish target is required.",
+                Self::Command(error) => error.message(),
+            }
+        }
+    }
+
+    /// The loading state of the center's §15.6 operation tracking view.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterOperationsListState {
+        Idle,
+        Loading,
+        Ready(Vec<CenterOperationCardProjection>),
+        Failed,
+    }
+
+    /// The loading state of one site's aggregated endpoint detail.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterEndpointsDetailState {
+        Idle,
+        Loading,
+        Ready(Vec<CenterEndpointCardProjection>),
+        Failed,
+    }
+
+    /// The loading state of the center's §15.5 site list.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum CenterSitesListState {
+        Idle,
+        Loading,
+        Ready(Vec<CenterSiteCardProjection>),
+        Failed,
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    impl CenterBindingStateView {
+        /// Static English label of one binding phase.
+        #[must_use]
+        pub const fn label(self) -> &'static str {
+            match self {
+                Self::Pending => "pending",
+                Self::Bound => "bound",
+                Self::Revoked => "revoked",
+            }
+        }
+    }
+
+    /// The console scope of the serving posture (audit follow-up F2/S8): the
+    /// center console renders the center views, the edge consoles the
+    /// local-management views.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConsoleScopeView {
+        /// The scope probe has not answered yet; the navigation stays hidden.
+        Checking,
+        /// An Edge posture (Standalone or Site).
+        Edge,
+        /// The Center aggregation posture.
+        Center,
+    }
     use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     use super::{
@@ -7741,8 +8188,10 @@ mod browser {
         BatchChildRowProjection, BatchesListState, BootEnabledView, BootModeView, BootSourceView,
         CapabilityEntryProjection, CapabilityGroupProjection, CapabilityLoadFailure,
         CapabilityMatrixProjection, CapabilityMatrixState, CapabilityTargetProjection,
-        CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState, ConsoleView,
-        CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
+        CenterBindingStateView, CenterEndpointCardProjection, CenterOperationCardProjection,
+        CenterOperationDraft, CenterOperationDraftError, CenterOperationSubmission,
+        CenterSiteCardProjection, CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState,
+        ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
         CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
         DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
         DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
@@ -7750,19 +8199,19 @@ mod browser {
         EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
         GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
         GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState,
-        OEM_UNSUPPORTED_NOTICE, OemActionView, OemFaceView, OnboardingCredentialsState,
-        OnboardingFailure, OnboardingStep, OperationCardProjection, OperationCommandDraft,
-        OperationEndpointChoice, OperationFormDraft, OperationFormError, OperationSubmitState,
-        OperationsListState, OverviewFilterSelections, RefreshBatchReportProjection,
-        RefreshBatchState, RefreshFailure, ResetKeysTypeView, ResetTypeView, RoleView,
-        SecureBootActionView, TagApplyState, TagCardProjection, TagDraft, TagDraftError,
-        TagInventoryView, TagsListState, TelemetryCardProjection, TelemetryListState,
-        TokenTypeView, TrustChallengeProjection, UpdateArtifactChoice, apply_overview_filters,
-        artifact_chunk_range_at, artifact_upload_status_text, base64_encode,
-        batch_children_projection, build_command, command_summary, diagnostics_optional_text,
-        endpoint_address_draft_error, format_artifact_size, format_observed_at,
-        group_member_choices, group_name_draft_error, health_badge_class, health_choices,
-        health_level_label, oem_action_key, operation_endpoint_choices,
+        OEM_UNSUPPORTED_NOTICE, OemActionView, OemFaceView, OffsetDateTime,
+        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
+        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
+        OperationSubmitState, OperationsListState, OverviewFilterSelections,
+        RefreshBatchReportProjection, RefreshBatchState, RefreshFailure, ResetKeysTypeView,
+        ResetTypeView, RoleView, SecureBootActionView, TagApplyState, TagCardProjection, TagDraft,
+        TagDraftError, TagInventoryView, TagsListState, TelemetryCardProjection,
+        TelemetryListState, TokenTypeView, TrustChallengeProjection, UpdateArtifactChoice,
+        apply_overview_filters, artifact_chunk_range_at, artifact_upload_status_text,
+        base64_encode, batch_children_projection, build_command, command_summary,
+        diagnostics_optional_text, endpoint_address_draft_error, format_artifact_size,
+        format_observed_at, group_member_choices, group_name_draft_error, health_badge_class,
+        health_choices, health_level_label, oem_action_key, operation_endpoint_choices,
         percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
         trust_mode_label, update_artifact_choices, vendor_choices,
     };
@@ -8498,6 +8947,1089 @@ mod browser {
         }
     }
 
+    #[component]
+    fn CenterSitesView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::CenterSites;
+        let (list_state, set_list_state) = signal(CenterSitesListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (selected_site, set_selected_site) = signal(None::<String>);
+        let (detail_state, set_detail_state) = signal(CenterEndpointsDetailState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(CenterSitesListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(fetch_center_sites().await);
+                });
+            }
+        });
+
+        let reload_sites = move || {
+            set_list_state.set(CenterSitesListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(fetch_center_sites().await);
+            });
+        };
+
+        let on_refresh = move |_| {
+            reload_sites();
+            if let Some(site_id) = selected_site.get() {
+                set_detail_state.set(CenterEndpointsDetailState::Loading);
+                spawn_local(async move {
+                    set_detail_state.set(fetch_center_endpoints(Some(&site_id)).await);
+                });
+            }
+        };
+
+        let on_select_site = Callback::new(move |site_id: String| {
+            set_selected_site.set(Some(site_id.clone()));
+            set_detail_state.set(CenterEndpointsDetailState::Loading);
+            spawn_local(async move {
+                set_detail_state.set(fetch_center_endpoints(Some(&site_id)).await);
+            });
+        });
+
+        let on_clear_site = move |_| {
+            set_selected_site.set(None);
+            set_detail_state.set(CenterEndpointsDetailState::Idle);
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Center connection"</p>
+                        <h2>{move || list_state.get().count_text()}</h2>
+                    </div>
+                    <p>"The §15.5 registered-site view: bindings, presence, and aggregated endpoints."</p>
+                </div>
+                <div class="inventory-actions">
+                    <button
+                        type="button"
+                        class="btn"
+                        disabled=move || matches!(list_state.get(), CenterSitesListState::Loading)
+                        on:click=on_refresh
+                    >
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterSitesListState::Loading)>
+                    "Loading registered sites..."
+                </p>
+                <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                    "The registered-site list is temporarily unavailable."
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || !list_state.get().is_ready() || list_state.get().count_text() != "0 registered sites"
+                >
+                    "No sites are registered yet. Register a site on the Center bindings page."
+                </p>
+                <div class="endpoint-grid">
+                    {move || {
+                        let CenterSitesListState::Ready(sites) = list_state.get() else {
+                            return Vec::new();
+                        };
+                        sites
+                            .into_iter()
+                            .map(|site| {
+                                let site_id = site.site_id.clone();
+                                let site_id_for_click = site_id.clone();
+                                let display_name = site.display_name.clone();
+                                let binding_label = site.binding.map(|binding| binding.label().to_owned());
+                                let online = site.online;
+                                let endpoint_count = site.endpoint_count;
+                                let last_refresh = site.last_refresh_at.as_ref().map(format_observed_at);
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="center-site-card"
+                                        on:click=move |_| on_select_site.run(site_id_for_click.clone())
+                                    >
+                                        <div class="endpoint-title">
+                                            <div>
+                                                <h3>{display_name}</h3>
+                                                <p class="endpoint-address">{site_id}</p>
+                                            </div>
+                                            <span class="trust-badge">
+                                                {move || binding_label.clone().unwrap_or_else(|| "no binding".to_owned())}
+                                            </span>
+                                            <span
+                                                class="status-dot"
+                                                class:status-dot-waiting=move || !online
+                                                title=move || if online { "online" } else { "offline" }
+                                            ></span>
+                                        </div>
+                                        <div class="snapshot-heading">
+                                            <span>{move || match endpoint_count {
+                                                1 => "1 aggregated endpoint".to_owned(),
+                                                count => format!("{count} aggregated endpoints"),
+                                            }}</span>
+                                        </div>
+                                        <p class="endpoint-address">
+                                            {move || last_refresh.clone().map_or_else(|| "no refresh yet".to_owned(), |text| format!("last refresh {text}"))}
+                                        </p>
+                                    </button>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="form-panel result-panel" hidden=move || selected_site.get().is_none()>
+                    <div class="section-heading">
+                        <div>
+                            <p class="section-label">"Site detail"</p>
+                            <h2>{move || selected_site.get().unwrap_or_default()}</h2>
+                        </div>
+                        <button type="button" class="btn" on:click=on_clear_site>
+                            "Close detail"
+                        </button>
+                    </div>
+                    <p class="inline-status" hidden=move || !matches!(detail_state.get(), CenterEndpointsDetailState::Loading)>
+                        "Loading aggregated endpoints..."
+                    </p>
+                    <p class="form-error" hidden=move || !detail_state.get().is_failed()>
+                        "The aggregated endpoint list is temporarily unavailable."
+                    </p>
+                    <p
+                        class="empty-inventory"
+                        hidden=move || {
+                            !matches!(detail_state.get(), CenterEndpointsDetailState::Ready(ref rows) if rows.is_empty())
+                        }
+                    >
+                        "This site has not projected any endpoints yet."
+                    </p>
+                    <table class="results-table" hidden=move || !detail_state.get().is_ready()>
+                        <thead>
+                            <tr>
+                                <th>"Endpoint"</th>
+                                <th>"Address"</th>
+                                <th>"Health"</th>
+                                <th>"Generation"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {move || {
+                                let CenterEndpointsDetailState::Ready(endpoints) = detail_state.get()
+                                else {
+                                    return Vec::new();
+                                };
+                                endpoints
+                                    .into_iter()
+                                    .map(|endpoint| {
+                                        view! {
+                                            <tr>
+                                                <td class="result-address">{endpoint.display_name}</td>
+                                                <td class="result-detail">{endpoint.address}</td>
+                                                <td class="result-detail">{endpoint.health}</td>
+                                                <td class="result-detail">
+                                                    {move || endpoint.refresh_generation.to_string()}
+                                                </td>
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn CenterOperationsView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::CenterOperations;
+        let (list_state, set_list_state) = signal(CenterOperationsListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (sites_state, set_sites_state) = signal(CenterSitesListState::Idle);
+        let (sites_triggered, set_sites_triggered) = signal(false);
+        let (endpoints_state, set_endpoints_state) = signal(CenterEndpointsDetailState::Idle);
+        let (endpoints_triggered, set_endpoints_triggered) = signal(false);
+        let (draft, set_draft) = signal(CenterOperationDraft::new());
+        let (draft_error, set_draft_error) = signal(None::<CenterOperationDraftError>);
+        let (submit_state, set_submit_state) = signal(CenterOperationSubmitState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(CenterOperationsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(fetch_center_operations().await);
+                });
+            }
+        });
+        Effect::new(move |_| {
+            if active() && !sites_triggered.get() {
+                set_sites_triggered.set(true);
+                set_sites_state.set(CenterSitesListState::Loading);
+                spawn_local(async move {
+                    set_sites_state.set(fetch_center_sites().await);
+                });
+            }
+        });
+        Effect::new(move |_| {
+            if active() && !endpoints_triggered.get() {
+                set_endpoints_triggered.set(true);
+                set_endpoints_state.set(CenterEndpointsDetailState::Loading);
+                spawn_local(async move {
+                    set_endpoints_state.set(fetch_center_endpoints(None).await);
+                });
+            }
+        });
+
+        let reload = move |_| {
+            set_list_state.set(CenterOperationsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(fetch_center_operations().await);
+            });
+            set_sites_state.set(CenterSitesListState::Loading);
+            spawn_local(async move {
+                set_sites_state.set(fetch_center_sites().await);
+            });
+            set_endpoints_state.set(CenterEndpointsDetailState::Loading);
+            spawn_local(async move {
+                set_endpoints_state.set(fetch_center_endpoints(None).await);
+            });
+        };
+
+        let on_select_site = Callback::new(move |site_id: String| {
+            set_draft.update(|draft| draft.site_id = site_id);
+            set_draft.update(|draft| draft.endpoint_id = String::new());
+            set_draft_error.set(None);
+            set_submit_state.set(CenterOperationSubmitState::Idle);
+        });
+
+        let on_select_endpoint = Callback::new(move |endpoint_id: String| {
+            set_draft.update(|draft| draft.endpoint_id = endpoint_id);
+            set_draft_error.set(None);
+            set_submit_state.set(CenterOperationSubmitState::Idle);
+        });
+
+        let on_target_input = move |event| {
+            set_draft.update(|draft| draft.target = event_target_value(&event));
+            set_draft_error.set(None);
+            set_submit_state.set(CenterOperationSubmitState::Idle);
+        };
+
+        let on_select_family = Callback::new(move |family: CommandFamilyView| {
+            set_draft.update(|draft| {
+                draft.family = Some(family);
+                // Switching families clears every other family's parameters,
+                // so a later submission can never carry stale selections.
+                draft.reset_type = None;
+                draft.boot_source = None;
+                draft.boot_enabled = None;
+                draft.boot_mode = None;
+                draft.secure_boot_action = None;
+                draft.reset_keys_type = None;
+                draft.event_action = None;
+                draft.destination = String::new();
+                draft.protocol = None;
+                draft.event_types = Vec::new();
+                draft.subscription_id = String::new();
+            });
+            set_draft_error.set(None);
+            set_submit_state.set(CenterOperationSubmitState::Idle);
+        });
+
+        let on_submit = move |_| {
+            let submitted = draft.get();
+            let submission = match submitted.try_build() {
+                Ok(submission) => submission,
+                Err(error) => {
+                    set_draft_error.set(Some(error));
+                    return;
+                }
+            };
+            set_draft_error.set(None);
+            set_submit_state.set(CenterOperationSubmitState::InFlight);
+            spawn_local(async move {
+                match submit_center_operation(&submission).await {
+                    Ok(()) => {
+                        set_submit_state.set(CenterOperationSubmitState::Succeeded);
+                        set_draft.set(CenterOperationDraft::new());
+                        set_draft_error.set(None);
+                        set_list_state.set(CenterOperationsListState::Loading);
+                        spawn_local(async move {
+                            set_list_state.set(fetch_center_operations().await);
+                        });
+                    }
+                    Err(message) => {
+                        set_submit_state
+                            .set(CenterOperationSubmitState::Failed(message.to_owned()));
+                    }
+                }
+            });
+        };
+
+        let site_choices = move || {
+            let CenterSitesListState::Ready(sites) = sites_state.get() else {
+                return Vec::new();
+            };
+            sites
+        };
+        let endpoint_choices = move || {
+            let CenterEndpointsDetailState::Ready(endpoints) = endpoints_state.get() else {
+                return Vec::new();
+            };
+            endpoints
+        };
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Center connection"</p>
+                        <h2>{move || list_state.get().count_text()}</h2>
+                    </div>
+                    <p>"The §15.6 tracking view and the typed dispatch form."</p>
+                </div>
+                <div class="inventory-actions">
+                    <button type="button" class="btn" on:click=reload>
+                        "Refresh"
+                    </button>
+                </div>
+                <p class="inline-status" hidden=move || !list_state.get().is_loading()>
+                    "Loading center operations..."
+                </p>
+                <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                    "The center operation list is temporarily unavailable."
+                </p>
+                <p
+                    class="empty-inventory"
+                    hidden=move || {
+                        !list_state.get().is_ready() || !matches!(list_state.get(), CenterOperationsListState::Ready(ref rows) if rows.is_empty())
+                    }
+                >
+                    "No center operations have been dispatched yet."
+                </p>
+                <div class="form-panel" hidden=move || !list_state.get().is_ready()>
+                    {move || {
+                        let CenterOperationsListState::Ready(operations) = list_state.get()
+                        else {
+                            return Vec::new();
+                        };
+                        operations
+                            .into_iter()
+                            .map(|operation| {
+                                let state_class = if operation.state == "succeeded" {
+                                    "result-success"
+                                } else if operation.state == "failed" || operation.state == "cancelled" {
+                                    "result-failure"
+                                } else {
+                                    "result-detail"
+                                };
+                                view! {
+                                    <div class="auth-table-row">
+                                        <span class="auth-table-name">{operation.command}</span>
+                                        <span class="auth-table-time">
+                                            {move || operation.target.clone().unwrap_or_else(|| "no target on record".to_owned())}
+                                        </span>
+                                        <span class="auth-table-time">
+                                            {move || operation.actor.clone().unwrap_or_else(|| "system".to_owned())}
+                                        </span>
+                                        <span class=state_class>{operation.state}</span>
+                                        <span class="auth-table-time">
+                                            {move || format_observed_at(&operation.created_at)}
+                                        </span>
+                                    </div>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </div>
+                <div class="form-panel">
+                    <p class="section-label">"Dispatch a center operation"</p>
+                    <p class="form-hint">
+                        "The site re-checks every precondition and only accepts what it can execute (§15.6)."
+                    </p>
+                    <div class="form-row">
+                        <label for="center-op-site">"Site"</label>
+                        <select
+                            id="center-op-site"
+                            prop:value=move || draft.get().site_id
+                            on:change=move |event| {
+                                on_select_site.run(event_target_value(&event));
+                            }
+                        >
+                            <option value="">"Choose a site..."</option>
+                            {move || {
+                                site_choices()
+                                    .into_iter()
+                                    .map(|site| {
+                                        let site_id = site.site_id.clone();
+                                        let site_id_for_option = site_id.clone();
+                                        let display_name = site.display_name.clone();
+                                        view! {
+                                            <option value=site_id_for_option.clone()>
+                                                {move || format!("{display_name} ({site_id})")}
+                                            </option>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label for="center-op-endpoint">"Endpoint"</label>
+                        <select
+                            id="center-op-endpoint"
+                            prop:value=move || draft.get().endpoint_id
+                            on:change=move |event| {
+                                on_select_endpoint.run(event_target_value(&event));
+                            }
+                        >
+                            <option value="">"Choose an endpoint..."</option>
+                            {move || {
+                                let site = draft.get().site_id;
+                                endpoint_choices()
+                                    .into_iter()
+                                    .filter(|endpoint| endpoint.site_id.as_deref() == Some(site.as_str()))
+                                    .map(|endpoint| {
+                                        let endpoint_id = endpoint.endpoint_id.clone();
+                                        view! {
+                                            <option value=endpoint_id.clone()>
+                                                {move || format!("{} ({})", endpoint.display_name, endpoint.address)}
+                                            </option>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label for="center-op-target">"Target"</label>
+                        <input
+                            id="center-op-target"
+                            type="text"
+                            placeholder="/redfish/v1/Systems/1"
+                            autocomplete="off"
+                            prop:value=move || draft.get().target
+                            on:input=on_target_input
+                        />
+                    </div>
+                    <div class="form-row">
+                        <label for="center-op-family">"Command family"</label>
+                        <select
+                            id="center-op-family"
+                            prop:value=move || draft.get().family.map(|family| family.as_str()).unwrap_or("")
+                            on:change=move |event| {
+                                let value = event_target_value(&event);
+                                if let Some(family) = CommandFamilyView::ALL
+                                    .into_iter()
+                                    .find(|family| family.as_str() == value)
+                                {
+                                    on_select_family.run(family);
+                                }
+                            }
+                        >
+                            <option value="">"Choose a family..."</option>
+                            {CommandFamilyView::ALL
+                                .into_iter()
+                                .map(|family| {
+                                    view! {
+                                        <option value=family.as_str()>{family.label()}</option>
+                                    }
+                                })
+                                .collect_view()}
+                        </select>
+                    </div>
+                    {move || {
+                        let family = draft.get().family;
+                        match family {
+                            Some(
+                                CommandFamilyView::SystemReset
+                                | CommandFamilyView::ManagerReset
+                                | CommandFamilyView::ChassisReset,
+                            ) => {
+                                view! {
+                                    <div class="form-row">
+                                        <label for="center-op-reset">"Reset type"</label>
+                                        <select
+                                            id="center-op-reset"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(reset) = ResetTypeView::ALL
+                                                    .into_iter()
+                                                    .find(|reset| reset.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.reset_type = Some(reset));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose a reset type..."</option>
+                                            {ResetTypeView::ALL
+                                                .into_iter()
+                                                .map(|reset| {
+                                                    view! {
+                                                        <option value=reset.as_str()>{reset.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::BootOverride) => {
+                                view! {
+                                    <div class="form-row">
+                                        <label for="center-op-boot-source">"Boot source"</label>
+                                        <select
+                                            id="center-op-boot-source"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(source) = BootSourceView::ALL
+                                                    .into_iter()
+                                                    .find(|source| source.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.boot_source = Some(source));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose a boot source..."</option>
+                                            {BootSourceView::ALL
+                                                .into_iter()
+                                                .map(|source| {
+                                                    view! {
+                                                        <option value=source.as_str()>{source.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-boot-enabled">"Enabled"</label>
+                                        <select
+                                            id="center-op-boot-enabled"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(enabled) = BootEnabledView::ALL
+                                                    .into_iter()
+                                                    .find(|enabled| enabled.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.boot_enabled = Some(enabled));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose..."</option>
+                                            {BootEnabledView::ALL
+                                                .into_iter()
+                                                .map(|enabled| {
+                                                    view! {
+                                                        <option value=enabled.as_str()>{enabled.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-boot-mode">"Mode"</label>
+                                        <select
+                                            id="center-op-boot-mode"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(mode) = BootModeView::ALL
+                                                    .into_iter()
+                                                    .find(|mode| mode.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.boot_mode = Some(mode));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose a mode..."</option>
+                                            {BootModeView::ALL
+                                                .into_iter()
+                                                .map(|mode| {
+                                                    view! {
+                                                        <option value=mode.as_str()>{mode.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::SecureBoot) => {
+                                view! {
+                                    <div class="form-row">
+                                        <label for="center-op-secure-boot">"Action"</label>
+                                        <select
+                                            id="center-op-secure-boot"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                let selected = match value.as_str() {
+                                                    "enable" => Some(SecureBootActionView::Enable),
+                                                    "disable" => Some(SecureBootActionView::Disable),
+                                                    "reset-keys" => Some(SecureBootActionView::ResetKeys(
+                                                        ResetKeysTypeView::ResetAllKeysToDefault,
+                                                    )),
+                                                    _ => None,
+                                                };
+                                                set_draft.update(|draft| draft.secure_boot_action = selected);
+                                                set_draft_error.set(None);
+                                                set_submit_state.set(CenterOperationSubmitState::Idle);
+                                            }
+                                        >
+                                            <option value="">"Choose an action..."</option>
+                                            <option value="enable">
+                                                {SecureBootActionView::Enable.label()}
+                                            </option>
+                                            <option value="disable">
+                                                {SecureBootActionView::Disable.label()}
+                                            </option>
+                                            <option value="reset-keys">
+                                                {SecureBootActionView::ResetKeys(ResetKeysTypeView::DeleteAllKeys).label()}
+                                            </option>
+                                        </select>
+                                    </div>
+                                    <div class="form-row" hidden=move || {
+                                        !matches!(draft.get().secure_boot_action, Some(SecureBootActionView::ResetKeys(_)))
+                                    }>
+                                        <label for="center-op-reset-keys">"Key set"</label>
+                                        <select
+                                            id="center-op-reset-keys"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(kind) = ResetKeysTypeView::ALL
+                                                    .into_iter()
+                                                    .find(|kind| kind.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.reset_keys_type = Some(kind));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose a key set..."</option>
+                                            {ResetKeysTypeView::ALL
+                                                .into_iter()
+                                                .map(|kind| {
+                                                    view! {
+                                                        <option value=kind.as_str()>{kind.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::EventSubscription) => {
+                                view! {
+                                    <div class="form-row">
+                                        <label for="center-op-event-action">"Action"</label>
+                                        <select
+                                            id="center-op-event-action"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                let selected = match value.as_str() {
+                                                    "create" => Some(EventActionView::CreateSubscription),
+                                                    "delete" => Some(EventActionView::DeleteSubscription),
+                                                    _ => None,
+                                                };
+                                                set_draft.update(|draft| draft.event_action = selected);
+                                                set_draft_error.set(None);
+                                                set_submit_state.set(CenterOperationSubmitState::Idle);
+                                            }
+                                        >
+                                            <option value="">"Choose an action..."</option>
+                                            <option value="create">
+                                                {EventActionView::CreateSubscription.label()}
+                                            </option>
+                                            <option value="delete">
+                                                {EventActionView::DeleteSubscription.label()}
+                                            </option>
+                                        </select>
+                                    </div>
+                                    <div class="form-row" hidden=move || {
+                                        !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
+                                    }>
+                                        <label for="center-op-destination">"Destination"</label>
+                                        <input
+                                            id="center-op-destination"
+                                            type="text"
+                                            placeholder="https://listener.example/sink"
+                                            autocomplete="off"
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| draft.destination = event_target_value(&event));
+                                                set_draft_error.set(None);
+                                                set_submit_state.set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
+                                    <div class="form-row" hidden=move || {
+                                        !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
+                                    }>
+                                        <label for="center-op-protocol">"Protocol"</label>
+                                        <select
+                                            id="center-op-protocol"
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                if let Some(protocol) = EventProtocolView::ALL
+                                                    .into_iter()
+                                                    .find(|protocol| protocol.as_str() == value)
+                                                {
+                                                    set_draft.update(|draft| draft.protocol = Some(protocol));
+                                                    set_draft_error.set(None);
+                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                }
+                                            }
+                                        >
+                                            <option value="">"Choose a protocol..."</option>
+                                            {EventProtocolView::ALL
+                                                .into_iter()
+                                                .map(|protocol| {
+                                                    view! {
+                                                        <option value=protocol.as_str()>{protocol.as_str()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                    <div class="form-row" hidden=move || {
+                                        !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
+                                    }>
+                                        <label for="center-op-event-types">"Event types"</label>
+                                        <div class="filter-chip-list">
+                                            {EventTypeView::ALL
+                                                .into_iter()
+                                                .map(|event_type| {
+                                                    let code = event_type.as_str();
+                                                    let label = event_type.as_str();
+                                                    view! {
+                                                        <label class="filter-chip">
+                                                            <input
+                                                                type="checkbox"
+                                                                on:change=move |event| {
+                                                                    let checked = event_target_checked(&event);
+                                                                    let code = code;
+                                                                    set_draft.update(|draft| {
+                                                                        if checked {
+                                                                            if let Some(event_type) = EventTypeView::ALL
+                                                                                .into_iter()
+                                                                                .find(|candidate| candidate.as_str() == code)
+                                                                            {
+                                                                                if !draft.event_types.contains(&event_type) {
+                                                                                    draft.event_types.push(event_type);
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            draft.event_types.retain(|candidate| candidate.as_str() != code);
+                                                                        }
+                                                                    });
+                                                                    set_draft_error.set(None);
+                                                                    set_submit_state.set(CenterOperationSubmitState::Idle);
+                                                                }
+                                                            />
+                                                            <span>{label}</span>
+                                                        </label>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </div>
+                                    </div>
+                                    <div class="form-row" hidden=move || {
+                                        !matches!(draft.get().event_action, Some(EventActionView::DeleteSubscription))
+                                    }>
+                                        <label for="center-op-subscription-id">"Subscription id"</label>
+                                        <input
+                                            id="center-op-subscription-id"
+                                            type="text"
+                                            autocomplete="off"
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| draft.subscription_id = event_target_value(&event));
+                                                set_draft_error.set(None);
+                                                set_submit_state.set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::FirmwareUpdate) => {
+                                view! {
+                                    <p class="form-hint">
+                                        "Firmware updates dispatch from the site console, which holds the artifact."
+                                    </p>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::Oem) => {
+                                view! {
+                                    <p class="form-hint">
+                                        "OEM profile files dispatch from the site console, which holds the file."
+                                    </p>
+                                }
+                                    .into_any()
+                            }
+                            None => view! {}.into_any(),
+                        }
+                    }}
+                    <p class="form-error" hidden=move || draft_error.get().is_none()>
+                        {move || draft_error.get().map_or("", |error| error.message())}
+                    </p>
+                    <div class="inventory-actions">
+                        <button
+                            type="button"
+                            class="btn btn-primary"
+                            disabled=move || submit_state.get().is_in_flight()
+                            on:click=on_submit
+                        >
+                            "Dispatch operation"
+                        </button>
+                        <p class="inline-status success" hidden=move || !matches!(submit_state.get(), CenterOperationSubmitState::Succeeded)>
+                            "The operation was dispatched to the site."
+                        </p>
+                        <p class="form-error" hidden=move || !matches!(submit_state.get(), CenterOperationSubmitState::Failed(_))>
+                            {move || match submit_state.get() {
+                                CenterOperationSubmitState::Failed(message) => message,
+                                _ => String::new(),
+                            }}
+                        </p>
+                    </div>
+                </div>
+            </section>
+        }
+    }
+
+    #[component]
+    fn CenterBindingsView(view: ReadSignal<ConsoleView>) -> impl IntoView {
+        let active = move || view.get() == ConsoleView::CenterBindings;
+        let (list_state, set_list_state) = signal(CenterBindingsListState::Idle);
+        let (list_triggered, set_list_triggered) = signal(false);
+        let (display_name, set_display_name) = signal(String::new());
+        let (center_url, set_center_url) = signal(String::new());
+        let (name_error, set_name_error) = signal(None::<&'static str>);
+        let (register_state, set_register_state) = signal(CenterRegisterState::Idle);
+        let (revoke_state, set_revoke_state) = signal(CenterRevokeState::Idle);
+
+        Effect::new(move |_| {
+            if active() && !list_triggered.get() {
+                set_list_triggered.set(true);
+                set_list_state.set(CenterBindingsListState::Loading);
+                spawn_local(async move {
+                    set_list_state.set(match fetch_center_sites().await {
+                        CenterSitesListState::Ready(sites) => CenterBindingsListState::Ready(sites),
+                        _ => CenterBindingsListState::Failed,
+                    });
+                });
+            }
+        });
+
+        let reload_list = move || {
+            set_list_state.set(CenterBindingsListState::Loading);
+            spawn_local(async move {
+                set_list_state.set(match fetch_center_sites().await {
+                    CenterSitesListState::Ready(sites) => CenterBindingsListState::Ready(sites),
+                    _ => CenterBindingsListState::Failed,
+                });
+            });
+        };
+
+        let on_name_input = move |event| {
+            set_display_name.set(event_target_value(&event));
+            set_name_error.set(None);
+            set_register_state.set(CenterRegisterState::Idle);
+        };
+        let on_url_input = move |event| {
+            set_center_url.set(event_target_value(&event));
+            set_name_error.set(None);
+            set_register_state.set(CenterRegisterState::Idle);
+        };
+
+        let on_register = move |_| {
+            let name = display_name.get();
+            if name.trim().is_empty() {
+                set_name_error.set(Some("A site display name is required."));
+                return;
+            }
+            let url = center_url.get();
+            if url.trim().is_empty() {
+                set_name_error.set(Some("The center URL is required."));
+                return;
+            }
+            set_name_error.set(None);
+            set_register_state.set(CenterRegisterState::InFlight);
+            spawn_local(async move {
+                match register_center_site(name.trim(), url.trim()).await {
+                    Ok(code) => {
+                        // The one-time code is shown exactly once, here; a
+                        // later refresh of the view never repeats it.
+                        set_register_state.set(CenterRegisterState::Issued(code));
+                        set_display_name.set(String::new());
+                        set_center_url.set(String::new());
+                        reload_list();
+                    }
+                    Err(message) => {
+                        set_name_error.set(Some(message));
+                        set_register_state.set(CenterRegisterState::Failed);
+                    }
+                }
+            });
+        };
+
+        let on_revoke = Callback::new(move |site_id: String| {
+            set_revoke_state.set(CenterRevokeState::InFlight);
+            spawn_local(async move {
+                let succeeded = revoke_center_binding(&site_id).await;
+                set_revoke_state.set(if succeeded {
+                    CenterRevokeState::Succeeded
+                } else {
+                    CenterRevokeState::Failed
+                });
+                reload_list();
+            });
+        });
+
+        view! {
+            <section class="view-section" hidden=move || !active()>
+                <div class="inventory-heading">
+                    <div>
+                        <p class="section-label">"Center connection"</p>
+                        <h2>"Bindings"</h2>
+                    </div>
+                    <p>"Register a site and hand its one-time code to the site operator (design D2)."</p>
+                </div>
+                <div class="form-panel">
+                    <p class="section-label">"Register a site"</p>
+                    <div class="form-row">
+                        <label for="center-bind-name">"Display name"</label>
+                        <input
+                            id="center-bind-name"
+                            type="text"
+                            autocomplete="off"
+                            placeholder="Rack 7 site"
+                            prop:value=move || display_name.get()
+                            on:input=on_name_input
+                        />
+                    </div>
+                    <div class="form-row">
+                        <label for="center-bind-url">"Center URL the site connects to"</label>
+                        <input
+                            id="center-bind-url"
+                            type="text"
+                            autocomplete="off"
+                            placeholder="center.example:8443"
+                            prop:value=move || center_url.get()
+                            on:input=on_url_input
+                        />
+                    </div>
+                    <p class="form-error" hidden=move || name_error.get().is_none()>
+                        {move || name_error.get().unwrap_or("")}
+                    </p>
+                    <div class="inventory-actions">
+                        <button
+                            type="button"
+                            class="btn btn-primary"
+                            disabled=move || matches!(register_state.get(), CenterRegisterState::InFlight)
+                            on:click=on_register
+                        >
+                            "Register site"
+                        </button>
+                    </div>
+                </div>
+                <div
+                    class="form-panel result-panel"
+                    hidden=move || !matches!(register_state.get(), CenterRegisterState::Issued(_))
+                >
+                    <p class="section-label">"One-time binding code"</p>
+                    <p class="form-hint">
+                        "This code is shown exactly once. Hand it to the site operator; it expires at the shown time."
+                    </p>
+                    {move || {
+                        let CenterRegisterState::Issued(code) = register_state.get() else {
+                            return Vec::new();
+                        };
+                        let binding_code = code.code.clone();
+                        let code_meta = format!(
+                            "Site {} · binding {} · expires {}",
+                            code.site_id,
+                            code.binding_id,
+                            format_observed_at(&code.expires_at)
+                        );
+                        [view! {
+                            <p class="binding-code">{binding_code}</p>
+                            <p class="endpoint-address">{code_meta}</p>
+                        }]
+                        .into_iter()
+                        .collect_view()
+                    }}
+                </div>
+                <div class="form-panel">
+                    <p class="section-label">"Active bindings"</p>
+                    <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterBindingsListState::Loading)>
+                        "Loading bindings..."
+                    </p>
+                    <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                        "The binding list is temporarily unavailable."
+                    </p>
+                    <p
+                        class="empty-inventory"
+                        hidden=move || {
+                            !list_state.get().is_ready() || !matches!(list_state.get(), CenterBindingsListState::Ready(ref rows) if rows.is_empty())
+                        }
+                    >
+                        "No sites are registered yet."
+                    </p>
+                    <div hidden=move || !list_state.get().is_ready()>
+                        {move || {
+                            let CenterBindingsListState::Ready(sites) = list_state.get()
+                            else {
+                                return Vec::new();
+                            };
+                            sites
+                                .into_iter()
+                                .map(|site| {
+                                    let site_id = site.site_id.clone();
+                                    let binding_label = site.binding.map(|binding| binding.label().to_owned());
+                                    let online = site.online;
+                                    let revocable = matches!(site.binding, Some(CenterBindingStateView::Bound | CenterBindingStateView::Pending));
+                                    view! {
+                                        <div class="auth-table-row">
+                                            <span class="auth-table-name">{site.display_name}</span>
+                                            <span class="auth-table-time">
+                                                {move || binding_label.clone().unwrap_or_else(|| "no binding".to_owned())}
+                                            </span>
+                                            <span class="auth-table-time">
+                                                {move || if online { "online" } else { "offline" }}
+                                            </span>
+                                            <button
+                                                type="button"
+                                                class="btn"
+                                                disabled=!revocable
+                                                on:click=move |_| on_revoke.run(site_id.clone())
+                                            >
+                                                "Revoke"
+                                            </button>
+                                        </div>
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </div>
+                    <p class="inline-status success" hidden=move || !matches!(revoke_state.get(), CenterRevokeState::Succeeded)>
+                        "The binding was revoked; the site converges on its next connection."
+                    </p>
+                    <p class="form-error" hidden=move || !matches!(revoke_state.get(), CenterRevokeState::Failed)>
+                        "The revocation was refused; the binding is unchanged."
+                    </p>
+                </div>
+            </section>
+        }
+    }
+
     /// The loading state of the §16.1 user administration listing.
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum UsersListState {
@@ -8544,11 +10076,20 @@ mod browser {
 
     #[component]
     fn ProductShell() -> impl IntoView {
+        // The serving posture decides the console surface (audit follow-up
+        // F2/S8): the center console renders the center views, the edge
+        // consoles the local-management views. The scope probe runs at
+        // mount and again after every fresh sign-in.
+        let (console_scope, set_console_scope) = signal(ConsoleScopeView::Checking);
         // The console data loads once at mount; the auth screen decides
         // when it is shown and reloads it after a fresh sign-in.
         let (state, set_state) = signal(ConsoleLoadState::Loading);
         spawn_local(async move {
-            set_state.set(fetch_console().await);
+            let scope = probe_console_scope().await;
+            set_console_scope.set(scope);
+            if scope == ConsoleScopeView::Edge {
+                set_state.set(fetch_console().await);
+            }
         });
 
         // The §16.2 first-screen decision: `me` answers whether the client
@@ -8565,10 +10106,21 @@ mod browser {
                         set_auth_principal.set(me.principal().cloned());
                         set_auth_screen.set(AuthScreen::Console);
                         // A fresh session must load fresh console data: the
-                        // earlier attempts were refused without one.
+                        // earlier attempts were refused without one. The
+                        // scope probe runs first, so the center console
+                        // never fetches the edge inventory (audit follow-up
+                        // F2 — those routes do not exist on the center).
                         set_state.set(ConsoleLoadState::Loading);
+                        set_console_scope.set(ConsoleScopeView::Checking);
                         spawn_local(async move {
-                            set_state.set(fetch_console().await);
+                            let scope = probe_console_scope().await;
+                            set_console_scope.set(scope);
+                            if scope == ConsoleScopeView::Edge {
+                                set_state.set(ConsoleLoadState::Loading);
+                                spawn_local(async move {
+                                    set_state.set(fetch_console().await);
+                                });
+                            }
                         });
                     }
                     Some(me) if me.bootstrap_pending() => {
@@ -8812,7 +10364,10 @@ mod browser {
                     <div>
                         <p class="eyebrow">"Local Redfish management"</p>
                         <h1>"Rutilus"</h1>
-                        <p id="status">{move || state.with(ConsoleLoadState::status_message)}</p>
+                        <p id="status">{move || match console_scope.get() {
+                            ConsoleScopeView::Center => "Center aggregation console",
+                            _ => state.with(ConsoleLoadState::status_message),
+                        }}</p>
                     </div>
                     <dl id="build" hidden=move || !state.with(ConsoleLoadState::is_ready)>
                         <div>
@@ -8855,10 +10410,17 @@ mod browser {
                             // chosen from a card first, so their navigation
                             // entries stay hidden until a target is selected.
                             // The user and session administration entries are
-                            // §16.1 Administrator only.
+                            // §16.1 Administrator only. The center views
+                            // render only on the Center console and the edge
+                            // views only on the Edge consoles (audit
+                            // follow-up F2/S8), and the navigation stays
+                            // hidden while the scope probe runs.
                             let hidden = move || {
-                                (candidate == ConsoleView::Capabilities
-                                    && capability_target.get().is_none())
+                                console_scope.get() == ConsoleScopeView::Checking
+                                    || candidate.is_center_view()
+                                        != (console_scope.get() == ConsoleScopeView::Center)
+                                    || (candidate == ConsoleView::Capabilities
+                                        && capability_target.get().is_none())
                                     || (candidate == ConsoleView::Diagnostics
                                         && diagnostics_target.get().is_none())
                                     || !candidate.allowed_for(
@@ -9170,6 +10732,9 @@ mod browser {
                 />
                 <UsersView view=view />
                 <SessionsView view=view />
+                <CenterSitesView view=view />
+                <CenterOperationsView view=view />
+                <CenterBindingsView view=view />
             </main>
         }
     }
@@ -12461,6 +14026,180 @@ mod browser {
         }
     }
 
+    /// Probes the serving posture (audit follow-up F2/S8): the
+    /// `/api/v1/center/sites` surface exists only on the Center console, so
+    /// a 200 answers Center and a 404 answers Edge. Anything else (a
+    /// failing center, a network error) falls back to Edge — the edge
+    /// console is the common deployment and the center's views would fail
+    /// the same way.
+    async fn probe_console_scope() -> ConsoleScopeView {
+        match Request::get("/api/v1/center/sites")
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(response) if response.status() == 404 => ConsoleScopeView::Edge,
+            Ok(response) if response_ok(&response) => ConsoleScopeView::Center,
+            _ => ConsoleScopeView::Edge,
+        }
+    }
+
+    /// Loads the center's §15.5 registered-site view.
+    ///
+    /// Any transport failure or non-200 status maps to the single static
+    /// unavailable message, exactly like the audit and credential lists.
+    async fn fetch_center_sites() -> CenterSitesListState {
+        let Ok(response) = Request::get("/api/v1/center/sites")
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return CenterSitesListState::Failed;
+        };
+        if !response_ok(&response) {
+            return CenterSitesListState::Failed;
+        }
+        match response.json::<CenterSitesResponse>().await {
+            Ok(list) => CenterSitesListState::Ready(
+                list.sites()
+                    .iter()
+                    .map(CenterSiteCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => CenterSitesListState::Failed,
+        }
+    }
+
+    /// Loads the center's §15.5 aggregated endpoint view, optionally
+    /// narrowed to one site.
+    async fn fetch_center_endpoints(site_id: Option<&str>) -> CenterEndpointsDetailState {
+        let path = match site_id {
+            Some(site_id) => format!("/api/v1/center/endpoints?site_id={site_id}"),
+            None => "/api/v1/center/endpoints".to_owned(),
+        };
+        let Ok(response) = Request::get(&path)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return CenterEndpointsDetailState::Failed;
+        };
+        if !response_ok(&response) {
+            return CenterEndpointsDetailState::Failed;
+        }
+        match response.json::<CenterEndpointViewListResponse>().await {
+            Ok(list) => CenterEndpointsDetailState::Ready(
+                list.endpoints()
+                    .iter()
+                    .map(CenterEndpointCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => CenterEndpointsDetailState::Failed,
+        }
+    }
+
+    /// Loads the center's §15.6 operation tracking view.
+    async fn fetch_center_operations() -> CenterOperationsListState {
+        let Ok(response) = Request::get("/api/v1/center/operations")
+            .header("Accept", "application/json")
+            .send()
+            .await
+        else {
+            return CenterOperationsListState::Failed;
+        };
+        if !response_ok(&response) {
+            return CenterOperationsListState::Failed;
+        }
+        match response.json::<CenterOperationListResponse>().await {
+            Ok(list) => CenterOperationsListState::Ready(
+                list.operations()
+                    .iter()
+                    .map(CenterOperationCardProjection::from)
+                    .collect(),
+            ),
+            Err(_) => CenterOperationsListState::Failed,
+        }
+    }
+
+    /// Submits one §15.6 center operation: the typed command, the target,
+    /// and the site — nothing else (§15.6).
+    async fn submit_center_operation(
+        submission: &CenterOperationSubmission,
+    ) -> Result<(), &'static str> {
+        let Ok(site_id) = submission.site_id.parse() else {
+            return Err("The submission could not be prepared.");
+        };
+        let Ok(endpoint_id) = submission.endpoint_id.parse() else {
+            return Err("The submission could not be prepared.");
+        };
+        let request = CenterOperationSubmitRequest::new(
+            site_id,
+            endpoint_id,
+            submission.target.clone(),
+            submission.command.clone(),
+        );
+        let Ok(request) = with_csrf(Request::post("/api/v1/center/operations")).json(&request)
+        else {
+            return Err("The submission could not be prepared.");
+        };
+        let Ok(response) = request.send().await else {
+            return Err("The center did not answer.");
+        };
+        if !response_ok(&response) {
+            return Err("The center refused the submission.");
+        }
+        response
+            .json::<CenterOperationSubmitResponse>()
+            .await
+            .map(|_| ())
+            .map_err(|_| "The acknowledgement could not be parsed.")
+    }
+
+    /// Registers one site and returns its one-time binding code (design
+    /// D2); the raw code travels exactly once, here.
+    async fn register_center_site(
+        display_name: &str,
+        center_url: &str,
+    ) -> Result<CenterBindingCodeView, &'static str> {
+        let request =
+            CenterBindingRegisterRequest::new(display_name.to_owned(), center_url.to_owned());
+        let Ok(request) = with_csrf(Request::post("/api/v1/center/bindings")).json(&request) else {
+            return Err("The registration could not be prepared.");
+        };
+        let Ok(response) = request.send().await else {
+            return Err("The center did not answer.");
+        };
+        if !response_ok(&response) {
+            return Err("The center refused the registration.");
+        }
+        response
+            .json::<CenterBindingRegisterResponse>()
+            .await
+            .map(|registered| CenterBindingCodeView {
+                site_id: registered.site_id().to_string(),
+                binding_id: registered.binding_id().to_string(),
+                code: registered.code().to_owned(),
+                expires_at: registered.expires_at(),
+            })
+            .map_err(|_| "The binding code could not be parsed.")
+    }
+
+    /// Revokes the active binding of one site (design D2).
+    async fn revoke_center_binding(site_id: &str) -> bool {
+        let Ok(site_id) = site_id.parse() else {
+            return false;
+        };
+        let request = CenterBindingRevokeRequest::new(site_id);
+        let Ok(request) = with_csrf(Request::post("/api/v1/center/bindings/revoke")).json(&request)
+        else {
+            return false;
+        };
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        response_ok(&response)
+    }
+
     /// Loads the persisted §13.7 batch list.
     ///
     /// The cards render the server-derived verdict and outcome buckets
@@ -14561,7 +16300,10 @@ mod browser {
 mod tests {
     use std::error::Error;
 
-    use rutilus_api::TelemetrySeriesListResponse;
+    use rutilus_api::{
+        CenterEndpointViewListResponse, CenterOperationListResponse, CenterOperationSubmitRequest,
+        CenterSitesResponse, TelemetrySeriesListResponse,
+    };
     use serde_json::json;
 
     use super::*;
@@ -17970,6 +19712,9 @@ mod tests {
                 ConsoleView::Diagnostics,
                 ConsoleView::Users,
                 ConsoleView::Sessions,
+                ConsoleView::CenterSites,
+                ConsoleView::CenterOperations,
+                ConsoleView::CenterBindings,
             ]
         );
         assert_eq!(ConsoleView::Overview.label(), "Overview");
@@ -17994,6 +19739,221 @@ mod tests {
             )
             .is_loading()
         );
+
+        assert_eq!(ConsoleView::CenterSites.label(), "Center sites");
+        assert_eq!(ConsoleView::CenterOperations.label(), "Center operations");
+        assert_eq!(ConsoleView::CenterBindings.label(), "Center bindings");
+    }
+
+    #[test]
+    fn the_center_views_are_scoped_to_the_center_console_posture() {
+        // Audit follow-up F2/S8: the center views render only on the Center
+        // console and every edge view only on the Edge consoles, and the
+        // binding management is Administrator only (the §16.1 matrix).
+        for view in ConsoleView::ALL {
+            let center = view.is_center_view();
+            assert_eq!(
+                center,
+                matches!(
+                    view,
+                    ConsoleView::CenterSites
+                        | ConsoleView::CenterOperations
+                        | ConsoleView::CenterBindings
+                ),
+                "the center-view classification must cover every view"
+            );
+        }
+        assert!(ConsoleView::CenterSites.is_center_view());
+        assert!(ConsoleView::CenterOperations.is_center_view());
+        assert!(ConsoleView::CenterBindings.is_center_view());
+        assert!(!ConsoleView::Overview.is_center_view());
+        assert!(!ConsoleView::Users.is_center_view());
+
+        assert!(ConsoleView::CenterBindings.allowed_for(Some(RoleView::Administrator)));
+        assert!(!ConsoleView::CenterBindings.allowed_for(Some(RoleView::Operator)));
+        assert!(ConsoleView::CenterSites.allowed_for(Some(RoleView::Viewer)));
+        assert!(ConsoleView::CenterOperations.allowed_for(Some(RoleView::Operator)));
+    }
+
+    #[test]
+    fn center_site_cards_project_the_registered_site_wire_shape() -> Result<(), Box<dyn Error>> {
+        let list: CenterSitesResponse = serde_json::from_value(json!({
+            "sites": [
+                {
+                    "site_id": "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f",
+                    "display_name": "Rack 7 site",
+                    "binding": "bound",
+                    "online": true,
+                    "endpoint_count": 3,
+                    "last_refresh_at": "2026-08-05T10:11:12Z"
+                },
+                {
+                    "site_id": "6f6f9e40-2c5a-4b4e-9f6f-8a8a8a8a8a8a",
+                    "display_name": "Rack 8 site",
+                    "binding": "pending",
+                    "online": false,
+                    "endpoint_count": 0,
+                    "last_refresh_at": null
+                }
+            ]
+        }))?;
+        let cards: Vec<CenterSiteCardProjection> = list
+            .sites()
+            .iter()
+            .map(CenterSiteCardProjection::from)
+            .collect();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].site_id, "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f");
+        assert_eq!(cards[0].display_name, "Rack 7 site");
+        assert_eq!(cards[0].binding, Some(CenterBindingStateView::Bound));
+        assert!(cards[0].online);
+        assert_eq!(cards[0].endpoint_count, 3);
+        assert_eq!(
+            cards[0].last_refresh_at,
+            Some(OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?)
+        );
+        assert_eq!(cards[1].binding, Some(CenterBindingStateView::Pending));
+        assert!(!cards[1].online);
+        assert_eq!(cards[1].last_refresh_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn center_endpoint_cards_project_the_aggregated_endpoint_wire_shape()
+    -> Result<(), Box<dyn Error>> {
+        let list: CenterEndpointViewListResponse = serde_json::from_value(json!({
+            "endpoints": [
+                {
+                    "site_id": "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f",
+                    "endpoint_id": "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b",
+                    "display_name": "Rack A BMC",
+                    "address": "https://192.0.2.10/",
+                    "health": "ok",
+                    "refresh_generation": 7
+                }
+            ]
+        }))?;
+        let cards: Vec<CenterEndpointCardProjection> = list
+            .endpoints()
+            .iter()
+            .map(CenterEndpointCardProjection::from)
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0].site_id.as_deref(),
+            Some("6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f")
+        );
+        assert_eq!(cards[0].endpoint_id, "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b");
+        assert_eq!(cards[0].display_name, "Rack A BMC");
+        assert_eq!(cards[0].address, "https://192.0.2.10/");
+        assert_eq!(cards[0].health, "ok");
+        assert_eq!(cards[0].refresh_generation, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn center_operation_cards_project_the_tracking_wire_shape() -> Result<(), Box<dyn Error>> {
+        let list: CenterOperationListResponse = serde_json::from_value(json!({
+            "operations": [
+                {
+                    "operation_id": "6f6f9e40-2c5a-4b4e-9f6f-9c9c9c9c9c9c",
+                    "site_id": "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f",
+                    "endpoint_id": "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b",
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "target": "/redfish/v1/Systems/1",
+                    "state": "queued",
+                    "actor": "admin",
+                    "ttl_expires_at": "2026-08-05T10:26:12Z",
+                    "created_at": "2026-08-05T10:11:12Z"
+                }
+            ]
+        }))?;
+        let cards: Vec<CenterOperationCardProjection> = list
+            .operations()
+            .iter()
+            .map(CenterOperationCardProjection::from)
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0].operation_id,
+            "6f6f9e40-2c5a-4b4e-9f6f-9c9c9c9c9c9c"
+        );
+        assert_eq!(
+            cards[0].site_id.as_deref(),
+            Some("6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f")
+        );
+        assert_eq!(cards[0].endpoint_id, "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b");
+        assert!(cards[0].command.contains("System reset"));
+        assert_eq!(cards[0].target.as_deref(), Some("/redfish/v1/Systems/1"));
+        assert_eq!(cards[0].state, "Queued");
+        assert_eq!(cards[0].actor.as_deref(), Some("admin"));
+        assert_eq!(
+            cards[0].created_at,
+            OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_center_operation_draft_builds_the_wire_submission() -> Result<(), Box<dyn Error>> {
+        // The §15.6 submit contract: the form's validated payload carries
+        // exactly the site, the endpoint, the target, and the typed command.
+        let mut draft = CenterOperationDraft::new();
+        assert_eq!(
+            draft.try_build(),
+            Err(CenterOperationDraftError::SiteRequired)
+        );
+        draft.site_id = "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Err(CenterOperationDraftError::EndpointRequired)
+        );
+        draft.endpoint_id = "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Err(CenterOperationDraftError::TargetRequired)
+        );
+        draft.target = "/redfish/v1/Systems/1".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Err(CenterOperationDraftError::Command(
+                OperationFormError::FamilyRequired
+            ))
+        );
+        draft.family = Some(CommandFamilyView::SystemReset);
+        assert_eq!(
+            draft.try_build(),
+            Err(CenterOperationDraftError::Command(
+                OperationFormError::ResetTypeRequired
+            ))
+        );
+        draft.reset_type = Some(ResetTypeView::PowerCycle);
+        let submission = draft
+            .try_build()
+            .map_err(|_| "the complete draft must build")?;
+        assert_eq!(submission.site_id, "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f");
+        assert_eq!(
+            submission.endpoint_id,
+            "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b"
+        );
+        assert_eq!(submission.target, "/redfish/v1/Systems/1");
+
+        // The wire contract round-trips through CenterOperationSubmitRequest.
+        let request = CenterOperationSubmitRequest::new(
+            submission.site_id.parse()?,
+            submission.endpoint_id.parse()?,
+            submission.target,
+            submission.command,
+        );
+        let wire = serde_json::to_value(&request)?;
+        assert_eq!(wire["site_id"], "6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f");
+        assert_eq!(wire["endpoint_id"], "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b");
+        assert_eq!(wire["target"], "/redfish/v1/Systems/1");
+        assert_eq!(
+            wire["command"],
+            json!({ "System": { "Reset": "PowerCycle" } })
+        );
+        Ok(())
     }
 
     #[test]
