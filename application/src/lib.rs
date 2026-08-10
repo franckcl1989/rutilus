@@ -43,13 +43,15 @@ pub use capability_query::{
     EndpointCapabilityQueryError, StoredCapability,
 };
 pub use center::{
-    AdmissionRejection, AdmissionVerdict, BindOutcome, CenterBindingFlow,
-    CenterBindingFlowError, CenterBindingRepository, CenterFrameConsumer, CenterInboundEngine,
-    CenterInboundEngineError, CenterInboundOptions, CenterInboundSession, CenterPresence,
+    AdmissionRejection, AdmissionVerdict, BindOutcome, CenterBindingFlow, CenterBindingFlowError,
+    CenterBindingRepository, CenterContentConsumer, CenterEndpointProjection, CenterFrameConsumer,
+    CenterInboundEngine, CenterInboundEngineError, CenterInboundOptions, CenterInboundSession,
+    CenterPresence, CenterProjection, CenterProjectionError, CenterProjectionRepository,
     CenterSessionAdmission, CenterSessionAdmissionError, CenterSessionRegistry,
-    CenterSessionRegistryError, CenterTrustAnchor, IdentityValidationError, InstanceRepository,
-    IssuedSiteCertificate, RegisteredSite, ResolvedSite, SiteCertificateIssuer, SiteIdentity,
-    validate_bound_identity,
+    CenterSessionRegistryError, CenterTrustAnchor, CenterTrustMode, EndpointProjectionWrite,
+    IdentityValidationError, InstanceRepository, IssuedSiteCertificate, ProjectionIgnoreReason,
+    ProjectionWriteOutcome, RegisteredSite, ResolvedSite, ResourceProjectionWrite,
+    SiteCertificateIssuer, SiteIdentity, validate_bound_identity,
 };
 pub use center_sync::{
     CenterCursor, CenterEventTail, CenterInbox, CenterOutbox, CenterSync, CenterSyncError,

@@ -1,16 +1,18 @@
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, CenterBindingRepository, CredentialInventoryRepository,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryItemError,
-    EndpointInventoryRepository, EndpointRefreshRepository, InboxInsertOutcome,
-    InstanceRepository, ResourceObservation, StoredCapability,
+    CapabilitySnapshotRepository, CenterBindingRepository, CenterProjectionRepository,
+    CredentialInventoryRepository, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryItemError, EndpointInventoryRepository, EndpointProjectionWrite,
+    EndpointRefreshRepository, InboxInsertOutcome, InstanceRepository, ProjectionWriteOutcome,
+    ResourceObservation, ResourceProjectionWrite, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
 use rutilus_domain::{
-    AuditEvent, BatchOperation, BatchOperationId, BindingCode, CenterBinding, CenterBindingId,
-    CertificateFingerprint, Credential, Endpoint, EndpointCapabilityObservation, EndpointId,
-    Event, EventId, FailureKind, InboxEntry, InboxEvent, InstanceId, Operation, OperationId,
-    OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot, SiteInstance, SyncCursor,
+    Artifact, AuditEvent, BatchOperation, BatchOperationId, BindingCode, CenterBinding,
+    CenterBindingId, CertificateFingerprint, Credential, Endpoint, EndpointCapabilityObservation,
+    EndpointId, Event, EventId, FailureKind, InboxEntry, InboxEvent, InstanceId, Operation,
+    OperationId, OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot, SiteInstance,
+    SyncCursor,
 };
 use rutilus_domain::{ArtifactId, ArtifactState, SyncStream};
 use rutilus_operation_engine::{
@@ -22,11 +24,11 @@ use time::OffsetDateTime;
 
 use crate::{
     ArtifactRepositoryError, AuditRepositoryError, CenterBindingRepositoryError,
-    CenterInboxRepositoryError, CenterOutboxRepositoryError, CreateInboxOutcome,
-    CredentialRepositoryError, EndpointCapabilityRepositoryError, EndpointRepositoryError,
-    EventRepositoryError, InstanceRepositoryError, NewResourceSnapshot, OperationRepositoryError,
-    RemoteTaskRepositoryError, ResourceSnapshotRepositoryError, SqliteStore,
-    SyncCursorRepositoryError,
+    CenterInboxRepositoryError, CenterOutboxRepositoryError, CenterProjectionRepositoryError,
+    CreateInboxOutcome, CredentialRepositoryError, EndpointCapabilityRepositoryError,
+    EndpointRepositoryError, EventRepositoryError, InstanceRepositoryError, NewResourceSnapshot,
+    OperationRepositoryError, RemoteTaskRepositoryError, ResourceSnapshotRepositoryError,
+    SqliteStore, SyncCursorRepositoryError,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -490,6 +492,99 @@ impl CenterBindingRepository for SqliteStore {
         Box::pin(async move {
             SqliteStore::find_binding_by_site_fingerprint(self, site_fingerprint).await
         })
+    }
+}
+
+impl CenterProjectionRepository for SqliteStore {
+    type Error = CenterProjectionRepositoryError;
+
+    fn upsert_endpoint<'a>(
+        &'a self,
+        projection: &'a EndpointProjectionWrite,
+        site: InstanceId,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<ProjectionWriteOutcome, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::upsert_endpoint_projection(self, projection, site, now).await
+        })
+    }
+
+    fn delete_endpoint(
+        &self,
+        endpoint_id: EndpointId,
+        site: InstanceId,
+    ) -> BoundaryFuture<'_, Result<ProjectionWriteOutcome, Self::Error>> {
+        Box::pin(
+            async move { SqliteStore::delete_endpoint_projection(self, endpoint_id, site).await },
+        )
+    }
+
+    fn upsert_resource<'a>(
+        &'a self,
+        projection: &'a ResourceProjectionWrite,
+        site: InstanceId,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<ProjectionWriteOutcome, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::upsert_resource_projection(self, projection, site, now).await
+        })
+    }
+
+    fn delete_resource(
+        &self,
+        endpoint_id: EndpointId,
+        odata_id: &str,
+        site: InstanceId,
+    ) -> BoundaryFuture<'_, Result<ProjectionWriteOutcome, Self::Error>> {
+        let odata_id = odata_id.to_owned();
+        Box::pin(async move {
+            SqliteStore::delete_resource_projection(self, endpoint_id, &odata_id, site).await
+        })
+    }
+
+    fn upsert_event<'a>(
+        &'a self,
+        event: &'a Event,
+        site: InstanceId,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::append_center_event(self, event, site)
+                .await
+                .map_err(CenterProjectionRepositoryError::Event)
+        })
+    }
+
+    fn declare_artifact<'a>(
+        &'a self,
+        artifact: &'a Artifact,
+        site: InstanceId,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::declare_center_artifact(self, artifact, site)
+                .await
+                .map_err(CenterProjectionRepositoryError::Artifact)
+        })
+    }
+
+    fn find_endpoint_projection(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BoundaryFuture<
+        '_,
+        Result<Option<rutilus_application::CenterEndpointProjection>, Self::Error>,
+    > {
+        Box::pin(async move { SqliteStore::find_endpoint_projection(self, endpoint_id).await })
+    }
+
+    fn has_resource(
+        &self,
+        endpoint_id: EndpointId,
+        odata_id: &str,
+    ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+        let odata_id = odata_id.to_owned();
+        Box::pin(
+            async move { SqliteStore::has_resource_projection(self, endpoint_id, &odata_id).await },
+        )
     }
 }
 

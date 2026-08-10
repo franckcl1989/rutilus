@@ -1394,6 +1394,7 @@ where
                 target: String::new(),
                 occurred_at_unix: event.event_timestamp().unix_timestamp(),
                 payload_json: Vec::new(),
+                endpoint_id: event.endpoint_id().to_string(),
             })
             .collect();
         self.enqueue_outbox_entry(EnvelopeMessage::EventBatch(EventBatch { events: records }))

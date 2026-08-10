@@ -16,14 +16,21 @@
 //! - [`session`] — the inbound session admission, the per-site online
 //!   registry, and the inbound connection engine (§15.4 acknowledgements
 //!   and the durable outbox flush).
+//! - [`projection`] — the center views of the §15.5 site reports.
 
 mod binding;
+mod projection;
 mod session;
 
 pub use binding::{
     BindOutcome, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
     CenterTrustAnchor, IdentityValidationError, InstanceRepository, IssuedSiteCertificate,
     RegisteredSite, SiteCertificateIssuer, SiteIdentity, validate_bound_identity,
+};
+pub use projection::{
+    CenterContentConsumer, CenterEndpointProjection, CenterProjection, CenterProjectionError,
+    CenterProjectionRepository, CenterTrustMode, EndpointProjectionWrite, ProjectionIgnoreReason,
+    ProjectionWriteOutcome, ResourceProjectionWrite,
 };
 pub use session::{
     AdmissionRejection, AdmissionVerdict, CenterFrameConsumer, CenterInboundEngine,

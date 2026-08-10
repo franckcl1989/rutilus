@@ -21,6 +21,7 @@ mod bootstrap_repository;
 mod center_binding_repository;
 mod center_inbox_repository;
 mod center_outbox_repository;
+mod center_projection_repository;
 #[cfg(test)]
 mod center_side_integration;
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub use center_inbox_repository::{
 pub use center_outbox_repository::{
     AckOutcome, CenterOutboxRepositoryError, StoredCenterOutboxError,
 };
+pub use center_projection_repository::CenterProjectionRepositoryError;
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };

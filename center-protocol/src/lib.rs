@@ -179,6 +179,7 @@ mod tests {
                 target: String::from("/redfish/v1/Systems/1"),
                 occurred_at_unix: 1_700_000_020,
                 payload_json: b"{\"message\":\"rebooted\"}".to_vec(),
+                endpoint_id: String::from("endpoint-1"),
             }],
         }
     }

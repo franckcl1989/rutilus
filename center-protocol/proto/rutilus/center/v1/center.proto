@@ -240,6 +240,10 @@ message EventRecord {
   // The raw event JSON document; stored as bytes so an invalid UTF-8
   // payload never breaks the wire.
   bytes payload_json = 6;
+
+  // The stable `EndpointId` of the endpoint that reported the event: the
+  // center attributes the record to the endpoint (§14.4 记录事件来源).
+  string endpoint_id = 7;
 }
 
 // Severity of one event. Maps one-to-one to `rutilus_domain::EventSeverity`.
