@@ -53,6 +53,7 @@ uuid = { workspace = true, features = ["v7"] }
 webbrowser.workspace = true
 
 [dev-dependencies]
+rutilus-test-support.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -83,6 +83,18 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # Mock Center (0.7.0 S9)
+//!
+//! The scripted [`MockCenter`] serves the site-to-center protocol surface
+//! (design §15): a loopback mTLS listener with its own CA, the
+//! `Hello`/`NegotiationResult` negotiation, and the binary-frame WebSocket
+//! transport. Its [`MockCenterScript`] decides how the negotiation answers
+//! (admit, or refuse with the `not-bound` reason), queues scripted replies
+//! (operation offers, heartbeats, explicit acks), and records every
+//! received frame. The app crate's interop test
+//! (`app/tests/mock_center_client.rs`) drives the real [`CenterClient`]
+//! against the mock — the mock never depends on the app crate.
+//!
 //! # Why not `nv-redfish-bmc-mock`
 //!
 //! Design section 19.1 keeps the upstream `nv-redfish-bmc-mock` (an in-process
@@ -94,8 +106,13 @@
 
 #![forbid(unsafe_code)]
 
-mod mock_bmc;
+pub mod mock_bmc;
+pub mod mock_center;
 
 pub use mock_bmc::{
     MockBmc, MockBmcError, MockProfile, MockTlsIdentity, MockTlsIdentityError, RequestRecord,
+};
+pub use mock_center::{
+    MockCenter, MockCenterError, MockCenterOptions, MockCenterTls, MockCenterTlsError,
+    MockSiteIdentity, ScriptedAdmission, ScriptedReply,
 };
