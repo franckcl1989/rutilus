@@ -43,9 +43,13 @@ pub use capability_query::{
     EndpointCapabilityQueryError, StoredCapability,
 };
 pub use center::{
-    BindOutcome, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
-    CenterTrustAnchor, IdentityValidationError, InstanceRepository, IssuedSiteCertificate,
-    RegisteredSite, SiteCertificateIssuer, SiteIdentity, validate_bound_identity,
+    AdmissionRejection, AdmissionVerdict, BindOutcome, CenterBindingFlow,
+    CenterBindingFlowError, CenterBindingRepository, CenterFrameConsumer, CenterInboundEngine,
+    CenterInboundEngineError, CenterInboundOptions, CenterInboundSession, CenterPresence,
+    CenterSessionAdmission, CenterSessionAdmissionError, CenterSessionRegistry,
+    CenterSessionRegistryError, CenterTrustAnchor, IdentityValidationError, InstanceRepository,
+    IssuedSiteCertificate, RegisteredSite, ResolvedSite, SiteCertificateIssuer, SiteIdentity,
+    validate_bound_identity,
 };
 pub use center_sync::{
     CenterCursor, CenterEventTail, CenterInbox, CenterOutbox, CenterSync, CenterSyncError,

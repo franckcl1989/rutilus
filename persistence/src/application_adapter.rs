@@ -1,17 +1,18 @@
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, CredentialInventoryRepository, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
-    EndpointRefreshRepository, InboxInsertOutcome, ResourceObservation, StoredCapability,
+    CapabilitySnapshotRepository, CenterBindingRepository, CredentialInventoryRepository,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryItemError,
+    EndpointInventoryRepository, EndpointRefreshRepository, InboxInsertOutcome,
+    InstanceRepository, ResourceObservation, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
-use rutilus_domain::{ArtifactId, ArtifactState, SyncStream};
 use rutilus_domain::{
-    AuditEvent, BatchOperation, BatchOperationId, Credential, Endpoint,
-    EndpointCapabilityObservation, EndpointId, Event, EventId, FailureKind, InboxEntry, InboxEvent,
-    InstanceId, Operation, OperationId, OperationState, OutboxEntry, OutboxEntryId,
-    ResourceSnapshot, SyncCursor,
+    AuditEvent, BatchOperation, BatchOperationId, BindingCode, CenterBinding, CenterBindingId,
+    CertificateFingerprint, Credential, Endpoint, EndpointCapabilityObservation, EndpointId,
+    Event, EventId, FailureKind, InboxEntry, InboxEvent, InstanceId, Operation, OperationId,
+    OperationState, OutboxEntry, OutboxEntryId, ResourceSnapshot, SiteInstance, SyncCursor,
 };
+use rutilus_domain::{ArtifactId, ArtifactState, SyncStream};
 use rutilus_operation_engine::{
     BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, OperationStore, RemoteTask,
     RemoteTaskState, RemoteTaskStore,
@@ -20,11 +21,12 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    ArtifactRepositoryError, AuditRepositoryError, CenterInboxRepositoryError,
-    CenterOutboxRepositoryError, CreateInboxOutcome, CredentialRepositoryError,
-    EndpointCapabilityRepositoryError, EndpointRepositoryError, EventRepositoryError,
-    NewResourceSnapshot, OperationRepositoryError, RemoteTaskRepositoryError,
-    ResourceSnapshotRepositoryError, SqliteStore, SyncCursorRepositoryError,
+    ArtifactRepositoryError, AuditRepositoryError, CenterBindingRepositoryError,
+    CenterInboxRepositoryError, CenterOutboxRepositoryError, CreateInboxOutcome,
+    CredentialRepositoryError, EndpointCapabilityRepositoryError, EndpointRepositoryError,
+    EventRepositoryError, InstanceRepositoryError, NewResourceSnapshot, OperationRepositoryError,
+    RemoteTaskRepositoryError, ResourceSnapshotRepositoryError, SqliteStore,
+    SyncCursorRepositoryError,
 };
 
 /// Defensive upper bound for one credential inventory projection.
@@ -427,6 +429,66 @@ impl rutilus_application::CenterOutbox for SqliteStore {
             SqliteStore::ack_outbox_entry(self, entry_id, acked_at)
                 .await
                 .map(|_| ())
+        })
+    }
+}
+
+impl InstanceRepository for SqliteStore {
+    type Error = InstanceRepositoryError;
+
+    fn create_instance<'a>(
+        &'a self,
+        instance: &'a SiteInstance,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::create_instance(self, instance).await })
+    }
+
+    fn find_instance(
+        &self,
+        instance_id: InstanceId,
+    ) -> BoundaryFuture<'_, Result<Option<SiteInstance>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_instance(self, instance_id).await })
+    }
+}
+
+impl CenterBindingRepository for SqliteStore {
+    type Error = CenterBindingRepositoryError;
+
+    fn create_binding<'a>(
+        &'a self,
+        binding: &'a CenterBinding,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move { SqliteStore::create_binding(self, binding).await })
+    }
+
+    fn find_pending_binding_by_code_hash(
+        &self,
+        code_hash: &[u8; 32],
+    ) -> BoundaryFuture<'_, Result<Option<CenterBinding>, Self::Error>> {
+        let code_hash = *code_hash;
+        Box::pin(
+            async move { SqliteStore::find_pending_binding_by_code_hash(self, &code_hash).await },
+        )
+    }
+
+    fn bind_with_code<'a>(
+        &'a self,
+        binding_id: CenterBindingId,
+        code: &'a BindingCode,
+        site_cert_fingerprint: Option<CertificateFingerprint>,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::bind_with_code(self, binding_id, code, site_cert_fingerprint, now).await
+        })
+    }
+
+    fn find_binding_by_site_fingerprint(
+        &self,
+        site_fingerprint: CertificateFingerprint,
+    ) -> BoundaryFuture<'_, Result<Option<CenterBinding>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::find_binding_by_site_fingerprint(self, site_fingerprint).await
         })
     }
 }

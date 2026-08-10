@@ -22,6 +22,8 @@ mod center_binding_repository;
 mod center_inbox_repository;
 mod center_outbox_repository;
 #[cfg(test)]
+mod center_side_integration;
+#[cfg(test)]
 mod center_sync_integration;
 mod credential_repository;
 mod endpoint_capability_repository;

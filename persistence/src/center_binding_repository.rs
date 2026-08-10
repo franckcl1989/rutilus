@@ -223,6 +223,36 @@ impl SqliteStore {
             .map_err(CenterBindingRepositoryError::Database)
     }
 
+    /// Reads the most recent binding recorded for one site identity
+    /// fingerprint.
+    ///
+    /// This is the session-admission lookup of the S5 slice: the center
+    /// resolves a presented client certificate by the site-identity
+    /// fingerprint bound into its private-arc extension. A revoked binding
+    /// stays stored as history, and a re-bound site records a newer row
+    /// with the same fingerprint, so the lookup returns the latest row and
+    /// the caller decides by its state (the S3b cross-validation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterBindingRepositoryError::Corrupt`] when the stored row
+    /// violates domain invariants.
+    pub async fn find_binding_by_site_fingerprint(
+        &self,
+        site_fingerprint: CertificateFingerprint,
+    ) -> Result<Option<CenterBinding>, CenterBindingRepositoryError> {
+        let Some(model) = center_binding::Entity::find()
+            .filter(center_binding::Column::SiteCertFingerprint.eq(site_fingerprint.to_string()))
+            .order_by_desc(center_binding::Column::CreatedAt)
+            .one(&self.database)
+            .await
+            .map_err(CenterBindingRepositoryError::Database)?
+        else {
+            return Ok(None);
+        };
+        map_stored_binding(CenterBindingId::from_uuid(model.id), &model).map(Some)
+    }
+
     /// Revokes a binding (design D6).
     ///
     /// The conditional update makes the write idempotent: a binding that is
