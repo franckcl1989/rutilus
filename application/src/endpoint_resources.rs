@@ -832,6 +832,21 @@ where
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
         ResourceFeature::NetworkAdapters => project_network_adapter(snapshot, payload)?,
+        ResourceFeature::NetworkDeviceFunctions
+        | ResourceFeature::PowerEquipment
+        | ResourceFeature::PowerSupplies
+        | ResourceFeature::EnvironmentMetrics => {
+            // The typed projections of the `NetworkDeviceFunction`,
+            // `PowerEquipment`, `PowerSupply`, and `EnvironmentMetrics`
+            // documents land with the resource-details slice; these arms keep
+            // the compiled families' snapshots countable and storable, and
+            // report the missing projection as a controlled error instead of
+            // panicking.
+            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
+                resource_id: snapshot.resource_id(),
+                feature: snapshot.feature(),
+            });
+        }
         ResourceFeature::EthernetInterfaces => project_ethernet_interface(snapshot, payload)?,
         ResourceFeature::Accounts => project_account(snapshot, payload)?,
         ResourceFeature::Bios => project_bios(snapshot, payload)?,

@@ -144,6 +144,12 @@ pub enum ResourceFeature {
     /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
     NetworkAdapters,
+    /// The §2.1 `network-device-functions` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface. The
+    /// family reads the `NetworkDeviceFunction` collection behind each
+    /// decoded `NetworkAdapter` member's `NetworkDeviceFunctions` navigation.
+    NetworkDeviceFunctions,
     /// The §2.1 `ethernet-interfaces` feature, added as a typed resource
     /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
     /// product code so both inventories address the same wire surface.
@@ -168,6 +174,18 @@ pub enum ResourceFeature {
     /// snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
     Power,
+    /// The §2.1 `power-equipment` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface. The family
+    /// reads the root-level `PowerEquipment` service document and the
+    /// `PowerDistribution` members of its `PowerShelves` collection.
+    PowerEquipment,
+    /// The §2.1 `power-supplies` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface. The family
+    /// reads the `PowerSupply` members of the `PowerSupplies` collection
+    /// behind each decoded Chassis member's `PowerSubsystem` navigation.
+    PowerSupplies,
     /// The §2.1 `thermal` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code
     /// so both inventories address the same wire surface.
@@ -180,6 +198,12 @@ pub enum ResourceFeature {
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code
     /// so both inventories address the same wire surface.
     Controls,
+    /// The §2.1 `environment-metrics` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface. The
+    /// family reads the `EnvironmentMetrics` singleton behind each decoded
+    /// Chassis member's `EnvironmentMetrics` navigation.
+    EnvironmentMetrics,
     /// The §2.1 `log-services` feature, added as a typed resource family in
     /// the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
@@ -274,15 +298,19 @@ impl ResourceFeature {
             Self::Memory => "memory",
             Self::Storages => "storages",
             Self::NetworkAdapters => "network-adapters",
+            Self::NetworkDeviceFunctions => "network-device-functions",
             Self::EthernetInterfaces => "ethernet-interfaces",
             Self::Accounts => "accounts",
             Self::Bios => "bios",
             Self::BootOptions => "boot-options",
             Self::SecureBoot => "secure-boot",
             Self::Power => "power",
+            Self::PowerEquipment => "power-equipment",
+            Self::PowerSupplies => "power-supplies",
             Self::Thermal => "thermal",
             Self::Sensors => "sensors",
             Self::Controls => "controls",
+            Self::EnvironmentMetrics => "environment-metrics",
             Self::LogServices => "log-services",
             Self::ManagerNetworkProtocol => "manager-network-protocol",
             Self::HostInterfaces => "host-interfaces",
@@ -326,15 +354,19 @@ impl FromStr for ResourceFeature {
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
             "network-adapters" => Ok(Self::NetworkAdapters),
+            "network-device-functions" => Ok(Self::NetworkDeviceFunctions),
             "ethernet-interfaces" => Ok(Self::EthernetInterfaces),
             "accounts" => Ok(Self::Accounts),
             "bios" => Ok(Self::Bios),
             "boot-options" => Ok(Self::BootOptions),
             "secure-boot" => Ok(Self::SecureBoot),
             "power" => Ok(Self::Power),
+            "power-equipment" => Ok(Self::PowerEquipment),
+            "power-supplies" => Ok(Self::PowerSupplies),
             "thermal" => Ok(Self::Thermal),
             "sensors" => Ok(Self::Sensors),
             "controls" => Ok(Self::Controls),
+            "environment-metrics" => Ok(Self::EnvironmentMetrics),
             "log-services" => Ok(Self::LogServices),
             "manager-network-protocol" => Ok(Self::ManagerNetworkProtocol),
             "host-interfaces" => Ok(Self::HostInterfaces),
@@ -898,15 +930,19 @@ mod tests {
             ResourceFeature::Memory,
             ResourceFeature::Storages,
             ResourceFeature::NetworkAdapters,
+            ResourceFeature::NetworkDeviceFunctions,
             ResourceFeature::EthernetInterfaces,
             ResourceFeature::Accounts,
             ResourceFeature::Bios,
             ResourceFeature::BootOptions,
             ResourceFeature::SecureBoot,
             ResourceFeature::Power,
+            ResourceFeature::PowerEquipment,
+            ResourceFeature::PowerSupplies,
             ResourceFeature::Thermal,
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
+            ResourceFeature::EnvironmentMetrics,
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
@@ -952,6 +988,10 @@ mod tests {
                 EndpointCapability::NetworkAdapters,
             ),
             (
+                ResourceFeature::NetworkDeviceFunctions,
+                EndpointCapability::NetworkDeviceFunctions,
+            ),
+            (
                 ResourceFeature::EthernetInterfaces,
                 EndpointCapability::EthernetInterfaces,
             ),
@@ -966,9 +1006,21 @@ mod tests {
             // §2.1 codes that the ledger already persists, so the feature
             // and capability inventories cannot drift on the wire.
             (ResourceFeature::Power, EndpointCapability::Power),
+            (
+                ResourceFeature::PowerEquipment,
+                EndpointCapability::PowerEquipment,
+            ),
+            (
+                ResourceFeature::PowerSupplies,
+                EndpointCapability::PowerSupplies,
+            ),
             (ResourceFeature::Thermal, EndpointCapability::Thermal),
             (ResourceFeature::Sensors, EndpointCapability::Sensors),
             (ResourceFeature::Controls, EndpointCapability::Controls),
+            (
+                ResourceFeature::EnvironmentMetrics,
+                EndpointCapability::EnvironmentMetrics,
+            ),
             // The 0.2 Manager-facing families reuse the §2.1 codes the
             // ledger already persists for `log-services`,
             // `manager-network-protocol`, and `host-interfaces`, so the
@@ -1337,6 +1389,10 @@ mod tests {
             "Memory",
             "storage",
             "network-adapter",
+            "network-device-function",
+            "network-device-functions/",
+            "networkdevicefunctions",
+            "NetworkDeviceFunctions",
             "ethernet-interface",
             "storages/",
             "network-adapters/",
@@ -1360,9 +1416,14 @@ mod tests {
             "powers",
             "power/",
             "Power",
-            "power-equipment",
-            "power-supplies",
+            "power-equipments",
+            "power-equipment/",
+            "powerequipment",
+            "PowerEquipment",
             "power-supply",
+            "power-supplies/",
+            "powersupplies",
+            "PowerSupplies",
             "thermals",
             "thermal/",
             "Thermal",
@@ -1373,7 +1434,10 @@ mod tests {
             "control",
             "controls/",
             "Controls",
-            "environment-metrics",
+            "environment-metric",
+            "environment-metrics/",
+            "environmentmetrics",
+            "EnvironmentMetrics",
             "log-service",
             "log-services/",
             "logservice",

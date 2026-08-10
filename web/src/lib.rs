@@ -2555,15 +2555,19 @@ fn project_enrollment(
             | ResourceFeature::Memory
             | ResourceFeature::Storages
             | ResourceFeature::NetworkAdapters
+            | ResourceFeature::NetworkDeviceFunctions
             | ResourceFeature::EthernetInterfaces
             | ResourceFeature::Accounts
             | ResourceFeature::Bios
             | ResourceFeature::BootOptions
             | ResourceFeature::SecureBoot
             | ResourceFeature::Power
+            | ResourceFeature::PowerEquipment
+            | ResourceFeature::PowerSupplies
             | ResourceFeature::Thermal
             | ResourceFeature::Sensors
             | ResourceFeature::Controls
+            | ResourceFeature::EnvironmentMetrics
             | ResourceFeature::LogServices
             | ResourceFeature::ManagerNetworkProtocol
             | ResourceFeature::HostInterfaces
