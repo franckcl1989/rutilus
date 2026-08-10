@@ -4473,6 +4473,583 @@ impl AssignRoleRequest {
     }
 }
 
+/// The lifecycle phase of one site-to-center binding (design D2, D6).
+///
+/// The wire values are the domain's stable snake-case codes; the raw binding
+/// code itself never travels on this wire — it is shown to the operator
+/// exactly once at registration ([`CenterBindingRegisterResponse`]) and only
+/// the state (and timestamps) are exposed afterwards.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CenterBindingStateResponse {
+    /// The site registered and a one-time binding code is outstanding.
+    Pending,
+    /// The site presented the code and the center recorded the binding.
+    Bound,
+    /// The binding was revoked; the site must re-register to bind again.
+    Revoked,
+}
+
+/// One registered site in the center's §15.5 site view.
+///
+/// The view projects the registered instance, its binding phase, its online
+/// presence (one live §15.1 connection), the projected endpoint count, and
+/// the newest reported refresh generation as the last-refresh watermark.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterSiteResponse {
+    site_id: Uuid,
+    display_name: String,
+    binding: Option<CenterBindingStateResponse>,
+    online: bool,
+    endpoint_count: u64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    last_refresh_at: Option<OffsetDateTime>,
+}
+
+impl CenterSiteResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        site_id: Uuid,
+        display_name: String,
+        binding: Option<CenterBindingStateResponse>,
+        online: bool,
+        endpoint_count: u64,
+        last_refresh_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            site_id,
+            display_name,
+            binding,
+            online,
+            endpoint_count,
+            last_refresh_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Uuid {
+        self.site_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> Option<CenterBindingStateResponse> {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn online(&self) -> bool {
+        self.online
+    }
+
+    #[must_use]
+    pub const fn endpoint_count(&self) -> u64 {
+        self.endpoint_count
+    }
+
+    #[must_use]
+    pub const fn last_refresh_at(&self) -> Option<OffsetDateTime> {
+        self.last_refresh_at
+    }
+}
+
+/// The center's §15.5 site list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterSitesResponse {
+    sites: Vec<CenterSiteResponse>,
+}
+
+impl CenterSitesResponse {
+    #[must_use]
+    pub const fn new(sites: Vec<CenterSiteResponse>) -> Self {
+        Self { sites }
+    }
+
+    #[must_use]
+    pub fn sites(&self) -> &[CenterSiteResponse] {
+        &self.sites
+    }
+}
+
+/// One site-to-center binding record as the center exposes it.
+///
+/// The one-time code is deliberately absent: it is shown exactly once, in the
+/// registration acknowledgement ([`CenterBindingRegisterResponse`]), and
+/// never again — not even its hash, which stays a persistence-internal fact.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterBindingResponse {
+    binding_id: Uuid,
+    site_id: Uuid,
+    state: CenterBindingStateResponse,
+    center_url: String,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    bound_at: Option<OffsetDateTime>,
+}
+
+impl CenterBindingResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        binding_id: Uuid,
+        site_id: Uuid,
+        state: CenterBindingStateResponse,
+        center_url: String,
+        created_at: OffsetDateTime,
+        expires_at: Option<OffsetDateTime>,
+        bound_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            binding_id,
+            site_id,
+            state,
+            center_url,
+            created_at,
+            expires_at,
+            bound_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn binding_id(&self) -> Uuid {
+        self.binding_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Uuid {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> CenterBindingStateResponse {
+        self.state
+    }
+
+    #[must_use]
+    pub fn center_url(&self) -> &str {
+        &self.center_url
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<OffsetDateTime> {
+        self.expires_at
+    }
+
+    #[must_use]
+    pub const fn bound_at(&self) -> Option<OffsetDateTime> {
+        self.bound_at
+    }
+}
+
+/// Validated-by-the-server input for registering one site (design D2): the
+/// display name the center shows and the URL the site must connect to.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterBindingRegisterRequest {
+    display_name: String,
+    center_url: String,
+}
+
+impl CenterBindingRegisterRequest {
+    #[must_use]
+    pub const fn new(display_name: String, center_url: String) -> Self {
+        Self {
+            display_name,
+            center_url,
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub fn center_url(&self) -> &str {
+        &self.center_url
+    }
+}
+
+/// The one-time acknowledgement of a site registration (design D2).
+///
+/// The raw binding code travels exactly once, here: the operator hands it to
+/// the site, and no later response ever repeats it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterBindingRegisterResponse {
+    site_id: Uuid,
+    binding_id: Uuid,
+    code: String,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+}
+
+impl CenterBindingRegisterResponse {
+    #[must_use]
+    pub const fn new(
+        site_id: Uuid,
+        binding_id: Uuid,
+        code: String,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            site_id,
+            binding_id,
+            code,
+            expires_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Uuid {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn binding_id(&self) -> Uuid {
+        self.binding_id
+    }
+
+    /// The one-time binding code; never repeated by any later response.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// When the outstanding code stops being usable (D2 TTL).
+    #[must_use]
+    pub const fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+}
+
+/// Input for revoking the active binding of one site (design D2).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterBindingRevokeRequest {
+    site_id: Uuid,
+}
+
+impl CenterBindingRevokeRequest {
+    #[must_use]
+    pub const fn new(site_id: Uuid) -> Self {
+        Self { site_id }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Uuid {
+        self.site_id
+    }
+}
+
+/// One projected remote endpoint of the center's §15.5 endpoint view.
+///
+/// The view aggregates the site-reported summary: the endpoint identity and
+/// display name, its active address, the trust decision, the refresh
+/// generation watermark, and the health cut — never credentials, sessions,
+/// or certificate material (§15.5).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterEndpointViewResponse {
+    site_id: Option<Uuid>,
+    endpoint_id: Uuid,
+    display_name: String,
+    address: String,
+    health: String,
+    refresh_generation: u64,
+}
+
+impl CenterEndpointViewResponse {
+    #[must_use]
+    pub const fn new(
+        site_id: Option<Uuid>,
+        endpoint_id: Uuid,
+        display_name: String,
+        address: String,
+        health: String,
+        refresh_generation: u64,
+    ) -> Self {
+        Self {
+            site_id,
+            endpoint_id,
+            display_name,
+            address,
+            health,
+            refresh_generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<Uuid> {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub fn health(&self) -> &str {
+        &self.health
+    }
+
+    #[must_use]
+    pub const fn refresh_generation(&self) -> u64 {
+        self.refresh_generation
+    }
+}
+
+/// The center's §15.5 aggregated endpoint view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterEndpointViewListResponse {
+    endpoints: Vec<CenterEndpointViewResponse>,
+}
+
+impl CenterEndpointViewListResponse {
+    #[must_use]
+    pub const fn new(endpoints: Vec<CenterEndpointViewResponse>) -> Self {
+        Self { endpoints }
+    }
+
+    #[must_use]
+    pub fn endpoints(&self) -> &[CenterEndpointViewResponse] {
+        &self.endpoints
+    }
+}
+
+/// One center-dispatched operation in the center's tracking view (§15.6).
+///
+/// The offer facts the operation record does not persist — the target, the
+/// actor context, and the offer expiry — come from the durable §15.6 offer
+/// envelope, so they are `None` for an operation whose offer is not on
+/// record. The wire carries the typed command, never a URL, method, headers,
+/// or body.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterOperationResponse {
+    operation_id: Uuid,
+    site_id: Option<Uuid>,
+    endpoint_id: Uuid,
+    command: RedfishCommand,
+    #[serde(default)]
+    target: Option<String>,
+    state: OperationStateResponse,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    ttl_expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl CenterOperationResponse {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        operation_id: Uuid,
+        site_id: Option<Uuid>,
+        endpoint_id: Uuid,
+        command: RedfishCommand,
+        target: Option<String>,
+        state: OperationStateResponse,
+        actor: Option<String>,
+        ttl_expires_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            operation_id,
+            site_id,
+            endpoint_id,
+            command,
+            target,
+            state,
+            actor,
+            ttl_expires_at,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<Uuid> {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    /// The §15.6 target of the offer, when the offer is on record.
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> OperationStateResponse {
+        self.state
+    }
+
+    /// The actor context of the offer, when the offer is on record.
+    #[must_use]
+    pub fn actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+
+    /// When the outstanding offer stops being actionable (§15.6).
+    #[must_use]
+    pub const fn ttl_expires_at(&self) -> Option<OffsetDateTime> {
+        self.ttl_expires_at
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// The center's §15.6 operation tracking view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterOperationListResponse {
+    operations: Vec<CenterOperationResponse>,
+}
+
+impl CenterOperationListResponse {
+    #[must_use]
+    pub const fn new(operations: Vec<CenterOperationResponse>) -> Self {
+        Self { operations }
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[CenterOperationResponse] {
+        &self.operations
+    }
+}
+
+/// The §15.6 center operation submission: the typed command, the target, and
+/// the site it is addressed to — and nothing else.
+///
+/// The wire shape is the §15.6 red line: no URL, no HTTP method, no headers,
+/// no JSON body, no script. The center never executes operations; the site
+/// re-checks its endpoint, capability, credential, and target state and only
+/// an explicit `Accepted` transfers execution responsibility.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterOperationSubmitRequest {
+    site_id: Uuid,
+    endpoint_id: Uuid,
+    target: String,
+    command: RedfishCommand,
+}
+
+impl CenterOperationSubmitRequest {
+    #[must_use]
+    pub const fn new(
+        site_id: Uuid,
+        endpoint_id: Uuid,
+        target: String,
+        command: RedfishCommand,
+    ) -> Self {
+        Self {
+            site_id,
+            endpoint_id,
+            target,
+            command,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Uuid {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> Uuid {
+        self.endpoint_id
+    }
+
+    /// The Redfish target of the operation.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// The typed write command of the operation (§7.5).
+    #[must_use]
+    pub const fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+}
+
+/// The acknowledgement of one dispatched center operation (§15.6): the
+/// stable operation id and the moment the offer stops being actionable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterOperationSubmitResponse {
+    operation_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    ttl_expires_at: OffsetDateTime,
+}
+
+impl CenterOperationSubmitResponse {
+    #[must_use]
+    pub const fn new(operation_id: Uuid, ttl_expires_at: OffsetDateTime) -> Self {
+        Self {
+            operation_id,
+            ttl_expires_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn ttl_expires_at(&self) -> OffsetDateTime {
+        self.ttl_expires_at
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU64};
@@ -9957,6 +10534,306 @@ mod tests {
             }))
             .is_err(),
             "an invalid session id must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn center_site_view_contract_carries_binding_online_and_refresh_facts()
+    -> Result<(), Box<dyn Error>> {
+        let site_id = uuid!("01989abc-def0-7abc-8def-0123456789ce");
+        let last_refresh_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let response = CenterSiteResponse::new(
+            site_id,
+            "Site One".to_owned(),
+            Some(CenterBindingStateResponse::Bound),
+            true,
+            3,
+            Some(last_refresh_at),
+        );
+        let list = CenterSitesResponse::new(vec![response.clone()]);
+        let encoded = serde_json::to_value(&list)?;
+
+        assert_eq!(
+            encoded,
+            json!({
+                "sites": [
+                    {
+                        "site_id": site_id,
+                        "display_name": "Site One",
+                        "binding": "bound",
+                        "online": true,
+                        "endpoint_count": 3,
+                        "last_refresh_at": "2026-08-05T10:11:12Z"
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterSitesResponse>(encoded)?,
+            list
+        );
+        assert_eq!(
+            list.sites()[0].binding(),
+            Some(CenterBindingStateResponse::Bound)
+        );
+        assert!(list.sites()[0].online());
+        assert_eq!(list.sites()[0].endpoint_count(), 3);
+
+        // A site without a binding serializes the absent facts as null.
+        let unbound = CenterSiteResponse::new(site_id, "Site Two".to_owned(), None, false, 0, None);
+        assert_eq!(
+            serde_json::to_value(&unbound)?,
+            json!({
+                "site_id": site_id,
+                "display_name": "Site Two",
+                "binding": null,
+                "online": false,
+                "endpoint_count": 0,
+                "last_refresh_at": null
+            })
+        );
+        // The strict contract refuses unknown fields.
+        assert!(
+            serde_json::from_value::<CenterSiteResponse>(json!({
+                "site_id": site_id,
+                "display_name": "Site One",
+                "binding": "bound",
+                "online": true,
+                "endpoint_count": 3,
+                "secret": "must-not-travel"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_binding_contract_shows_the_code_exactly_once() -> Result<(), Box<dyn Error>> {
+        let site_id = uuid!("01989abc-def0-7abc-8def-0123456789ce");
+        let binding_id = uuid!("11989abc-def0-7abc-8def-0123456789ce");
+        let now = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+
+        // The registration request carries the display name and center URL.
+        let request = CenterBindingRegisterRequest::new(
+            "Site One".to_owned(),
+            "https://center.example:8443".to_owned(),
+        );
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "display_name": "Site One",
+                "center_url": "https://center.example:8443"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterBindingRegisterRequest>(serde_json::to_value(
+                &request
+            )?)?,
+            request
+        );
+
+        // The acknowledgement shows the raw code once.
+        let registered = CenterBindingRegisterResponse::new(
+            site_id,
+            binding_id,
+            "23456789ABCDEFGHJKLM".to_owned(),
+            now,
+        );
+        assert_eq!(
+            serde_json::to_value(&registered)?,
+            json!({
+                "site_id": site_id,
+                "binding_id": binding_id,
+                "code": "23456789ABCDEFGHJKLM",
+                "expires_at": "2026-08-05T10:11:12Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterBindingRegisterResponse>(serde_json::to_value(
+                &registered
+            )?)?,
+            registered
+        );
+
+        // The binding record exposes state and timestamps only — never the
+        // code and not even its hash.
+        let binding = CenterBindingResponse::new(
+            binding_id,
+            site_id,
+            CenterBindingStateResponse::Pending,
+            "https://center.example:8443".to_owned(),
+            now,
+            Some(now),
+            None,
+        );
+        let binding_json = serde_json::to_value(&binding)?;
+        assert_eq!(
+            binding_json,
+            json!({
+                "binding_id": binding_id,
+                "site_id": site_id,
+                "state": "pending",
+                "center_url": "https://center.example:8443",
+                "created_at": "2026-08-05T10:11:12Z",
+                "expires_at": "2026-08-05T10:11:12Z",
+                "bound_at": null
+            })
+        );
+        assert!(
+            !serde_json::to_string(&binding)?.contains("23456789ABCDEFGHJKLM"),
+            "the binding view must not carry the one-time code"
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterBindingResponse>(binding_json)?,
+            binding
+        );
+
+        // The revoke request names the site.
+        let revoke = CenterBindingRevokeRequest::new(site_id);
+        assert_eq!(
+            serde_json::to_value(&revoke)?,
+            json!({ "site_id": site_id })
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterBindingRevokeRequest>(serde_json::to_value(&revoke)?)?,
+            revoke
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_endpoint_view_projects_the_site_reported_summary() -> Result<(), Box<dyn Error>> {
+        let site_id = uuid!("01989abc-def0-7abc-8def-0123456789ce");
+        let endpoint_id = uuid!("21989abc-def0-7abc-8def-0123456789ce");
+        let view = CenterEndpointViewResponse::new(
+            Some(site_id),
+            endpoint_id,
+            "Rack A BMC".to_owned(),
+            "https://192.0.2.10/".to_owned(),
+            "ok".to_owned(),
+            7,
+        );
+        let list = CenterEndpointViewListResponse::new(vec![view.clone()]);
+        let encoded = serde_json::to_value(&list)?;
+
+        assert_eq!(
+            encoded,
+            json!({
+                "endpoints": [
+                    {
+                        "site_id": site_id,
+                        "endpoint_id": endpoint_id,
+                        "display_name": "Rack A BMC",
+                        "address": "https://192.0.2.10/",
+                        "health": "ok",
+                        "refresh_generation": 7
+                    }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterEndpointViewListResponse>(encoded)?,
+            list
+        );
+        assert_eq!(list.endpoints()[0].site_id(), Some(site_id));
+        assert_eq!(list.endpoints()[0].health(), "ok");
+        assert_eq!(list.endpoints()[0].refresh_generation(), 7);
+        assert!(
+            serde_json::from_value::<CenterEndpointViewResponse>(json!({
+                "site_id": site_id,
+                "endpoint_id": endpoint_id,
+                "display_name": "Rack A BMC",
+                "address": "https://192.0.2.10/",
+                "health": "ok",
+                "refresh_generation": 7,
+                "credential_id": "must-not-travel"
+            }))
+            .is_err(),
+            "the §15.5 view must not accept credential material"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_operation_submit_contract_carries_exactly_the_s15_6_set() -> Result<(), Box<dyn Error>> {
+        let site_id = uuid!("01989abc-def0-7abc-8def-0123456789ce");
+        let endpoint_id = uuid!("31989abc-def0-7abc-8def-0123456789ce");
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+        let request = CenterOperationSubmitRequest::new(
+            site_id,
+            endpoint_id,
+            "/redfish/v1/Systems/1".to_owned(),
+            command.clone(),
+        );
+        let encoded = serde_json::to_value(&request)?;
+
+        // The wire shape is exactly the §15.6 set: the typed command, the
+        // target, and the site — and nothing else. No URL, no HTTP method,
+        // no headers, no JSON body, no script.
+        assert_eq!(request.site_id(), site_id);
+        assert_eq!(request.endpoint_id(), endpoint_id);
+        assert_eq!(request.target(), "/redfish/v1/Systems/1");
+        assert_eq!(request.command(), &command);
+        let shape = encoded
+            .as_object()
+            .ok_or("the request must serialize as an object")?;
+        assert_eq!(
+            shape
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["site_id", "endpoint_id", "target", "command",])
+        );
+        assert!(
+            !serde_json::to_string(&request)?.contains("url")
+                && !serde_json::to_string(&request)?.contains("method")
+                && !serde_json::to_string(&request)?.contains("headers")
+                && !serde_json::to_string(&request)?.contains("body")
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterOperationSubmitRequest>(encoded)?,
+            request
+        );
+        // A submission that smuggles an HTTP body is refused by the strict
+        // contract.
+        let mut smuggled = serde_json::to_value(&request)?;
+        smuggled.as_object_mut().ok_or("object")?.insert(
+            "body".to_owned(),
+            json!({ "reset_type": "GracefulShutdown" }),
+        );
+        assert!(serde_json::from_value::<CenterOperationSubmitRequest>(smuggled).is_err());
+
+        // The operation view carries the tracking facts and the typed
+        // command.
+        let created_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let operation = CenterOperationResponse::new(
+            uuid!("41989abc-def0-7abc-8def-0123456789ce"),
+            Some(site_id),
+            endpoint_id,
+            command,
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationStateResponse::Queued,
+            Some("admin".to_owned()),
+            Some(created_at),
+            created_at,
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterOperationResponse>(serde_json::to_value(&operation)?)?,
+            operation
+        );
+        assert_eq!(operation.state(), OperationStateResponse::Queued);
+        assert_eq!(operation.target(), Some("/redfish/v1/Systems/1"));
+
+        let acknowledgement = CenterOperationSubmitResponse::new(
+            uuid!("41989abc-def0-7abc-8def-0123456789ce"),
+            created_at,
+        );
+        assert_eq!(
+            serde_json::from_value::<CenterOperationSubmitResponse>(serde_json::to_value(
+                &acknowledgement
+            )?)?,
+            acknowledgement
         );
         Ok(())
     }
