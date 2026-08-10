@@ -160,6 +160,7 @@ use nv_redfish::{
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
         control::Control as ControlSchema,
         control_collection::ControlCollection as ControlCollectionSchema,
+        environment_metrics::EnvironmentMetrics as EnvironmentMetricsSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
         ethernet_interface_collection::EthernetInterfaceCollection as EthernetInterfaceCollectionSchema,
         event::EventRecord as EventRecordSchema,
@@ -181,8 +182,16 @@ use nv_redfish::{
         metric_report_collection::MetricReportCollection as MetricReportCollectionSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
+        network_device_function::NetworkDeviceFunction as NetworkDeviceFunctionSchema,
+        network_device_function_collection::NetworkDeviceFunctionCollection as NetworkDeviceFunctionCollectionSchema,
         pcie_device::PcieDevice as PcieDeviceSchema,
         power::Power as PowerSchema,
+        power_distribution::PowerDistribution as PowerDistributionSchema,
+        power_distribution_collection::PowerDistributionCollection as PowerDistributionCollectionSchema,
+        power_equipment::PowerEquipment as PowerEquipmentSchema,
+        power_subsystem::PowerSubsystem as PowerSubsystemSchema,
+        power_supply::PowerSupply as PowerSupplySchema,
+        power_supply_collection::PowerSupplyCollection as PowerSupplyCollectionSchema,
         processor::Processor as ProcessorSchema,
         processor_collection::ProcessorCollection as ProcessorCollectionSchema,
         resource::Health as HealthSchema,
@@ -1278,6 +1287,45 @@ async fn read_authenticated_core_resources(
     resources.extend(read_event_service_resources(bmc, root, identity, trust).await?);
     resources.extend(read_telemetry_service_resources(bmc, root, identity, trust).await?);
     resources.extend(read_task_service_resources(bmc, root, identity, trust).await?);
+    resources.extend(read_power_equipment_resources(bmc, root, identity, trust).await?);
+    Ok(resources)
+}
+
+/// Reads the root-level `PowerEquipment` service document and its
+/// `PowerShelves` collection members, so the 0.2 `power-equipment` family
+/// follows its root service through the same typed navigation.
+///
+/// A missing `PowerEquipment` link leaves the whole family absent without an
+/// error ("资源存在才呈现"); a failed `PowerEquipment` document aborts the read
+/// with the existing classified error semantics, while the `PowerShelves`
+/// collection and its members keep the per-collection and per-member skip
+/// semantics of every other family.
+async fn read_power_equipment_resources(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(power_equipment) = root.root.power_equipment.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(equipment) = fetch_member(power_equipment, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let mut resources = Vec::new();
+    if let Some(projection) = member_projection(power_equipment_projection(&equipment))? {
+        resources.push(projection);
+    }
+    resources.extend(
+        read_collection_resources(
+            equipment.power_shelves.as_ref(),
+            bmc,
+            identity,
+            trust,
+            power_distribution_projection,
+        )
+        .await?,
+    );
     Ok(resources)
 }
 
@@ -1386,10 +1434,13 @@ async fn read_systems_resources(
 }
 
 /// Reads the Chassis collection and, for every decoded Chassis member, its
-/// `NetworkAdapters` collection plus the `Power` and `Thermal` telemetry
-/// singletons, the `Sensors` and `Controls` telemetry collections, and the
-/// `Assembly` document, so the 0.2 telemetry and assembly surfaces follow
-/// their parent through the same typed navigation.
+/// `NetworkAdapters` collection (with the `NetworkDeviceFunctions` behind
+/// each adapter), the `Power` and `Thermal` telemetry singletons, the
+/// `Sensors` and `Controls` telemetry collections, the `Assembly` document,
+/// the `EnvironmentMetrics` singleton, and the `PowerSupplies` collection
+/// behind the `PowerSubsystem`, so the 0.2 telemetry, assembly, and
+/// equipment surfaces follow their parent through the same typed
+/// navigation.
 ///
 /// A missing Chassis link leaves the whole family absent without an error; a
 /// failed Chassis collection document aborts the read with the existing
@@ -1418,14 +1469,8 @@ async fn read_chassis_resources(
         };
         resources.push(projection);
         resources.extend(
-            read_collection_resources(
-                chassis.network_adapters.as_ref(),
-                bmc,
-                identity,
-                trust,
-                network_adapter_projection,
-            )
-            .await?,
+            read_network_adapter_resources(chassis.network_adapters.as_ref(), bmc, identity, trust)
+                .await?,
         );
         resources.extend(
             read_singleton_resources(
@@ -1469,6 +1514,100 @@ async fn read_chassis_resources(
         );
         resources.extend(
             read_assembly_resources(chassis.assembly.as_ref(), bmc, identity, trust).await?,
+        );
+        resources.extend(
+            read_singleton_resources(
+                chassis.environment_metrics.as_ref(),
+                bmc,
+                identity,
+                trust,
+                environment_metrics_projection,
+            )
+            .await?,
+        );
+        resources.extend(
+            read_power_supply_resources(chassis.power_subsystem.as_ref(), bmc, identity, trust)
+                .await?,
+        );
+    }
+    Ok(resources)
+}
+
+/// Reads the `PowerSupply` members of the `PowerSupplies` collection behind
+/// the Chassis member's `PowerSubsystem` navigation, so the 0.2
+/// `power-supplies` family follows its parent through the same typed
+/// navigation.
+///
+/// A missing `PowerSubsystem` or `PowerSupplies` link leaves the family
+/// absent without an error; a failed `PowerSubsystem` document aborts the
+/// read with the existing classified error semantics, while the collection
+/// and its members keep the per-collection and per-member skip semantics of
+/// every other family.
+async fn read_power_supply_resources(
+    power_subsystem: Option<&NavProperty<PowerSubsystemSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(power_subsystem) = power_subsystem else {
+        return Ok(Vec::new());
+    };
+    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    read_collection_resources(
+        subsystem.power_supplies.as_ref(),
+        bmc,
+        identity,
+        trust,
+        power_supply_projection,
+    )
+    .await
+}
+
+/// Reads the Chassis member's `NetworkAdapters` collection and, for every
+/// decoded adapter member, its `NetworkDeviceFunctions` collection, so the
+/// 0.2 `network-adapters` and `network-device-functions` families follow
+/// their parent through the same typed navigation.
+///
+/// The two families share one collection fetch: the adapters collection is
+/// the adapter family's whole surface and the functions family's entry
+/// point, so reading it twice would double the adapter traffic on every
+/// refresh. A missing `NetworkAdapters` link leaves both families absent
+/// without an error ("资源存在才呈现"); a failed adapters collection document
+/// aborts the read with the existing classified error semantics, while each
+/// adapter member and its functions collection keep the per-member and
+/// per-collection skip semantics of every other family.
+async fn read_network_adapter_resources(
+    network_adapters: Option<&NavProperty<NetworkAdapterCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(network_adapters) = network_adapters else {
+        return Ok(Vec::new());
+    };
+    let collection = network_adapters
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in collection.members() {
+        let Some(adapter) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(network_adapter_projection(&adapter))? {
+            resources.push(projection);
+        }
+        resources.extend(
+            read_collection_resources(
+                adapter.network_device_functions.as_ref(),
+                bmc,
+                identity,
+                trust,
+                network_device_function_projection,
+            )
+            .await?,
         );
     }
     Ok(resources)
@@ -2810,6 +2949,30 @@ impl MemberCollection for StorageCollectionSchema {
 
 impl MemberCollection for NetworkAdapterCollectionSchema {
     type Member = NetworkAdapterSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for NetworkDeviceFunctionCollectionSchema {
+    type Member = NetworkDeviceFunctionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for PowerDistributionCollectionSchema {
+    type Member = PowerDistributionSchema;
+
+    fn members(&self) -> &[NavProperty<Self::Member>] {
+        &self.members
+    }
+}
+
+impl MemberCollection for PowerSupplyCollectionSchema {
+    type Member = PowerSupplySchema;
 
     fn members(&self) -> &[NavProperty<Self::Member>] {
         &self.members
@@ -6838,6 +7001,174 @@ struct ControlPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.2.0 `power-equipment` root document projection.
+///
+/// The field set is exactly the `PowerEquipmentPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The
+/// `PowerEquipment` service document declares `Status` beside its common
+/// identity fields; the collection navigations stay out of the strictly
+/// projectable field set because the members carry the equipment data.
+#[derive(Serialize)]
+struct PowerEquipmentPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `power-equipment` `PowerShelves` member projection.
+///
+/// The field set is exactly the `PowerDistributionPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. Fields are the
+/// direct `EquipmentType` (required by the schema), the hardware identity
+/// properties, and the `Status` property of the `PowerDistribution` schema.
+#[derive(Serialize)]
+struct PowerDistributionPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "EquipmentType")]
+    equipment_type: nv_redfish::schema::power_distribution::PowerEquipmentType,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "Version", skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(rename = "FirmwareVersion", skip_serializing_if = "Option::is_none")]
+    firmware_version: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `power-supplies` family member projection.
+///
+/// The field set is exactly the `PowerSupplyPayload` the application boundary
+/// decodes with `deny_unknown_fields`, so an extra field here would make
+/// every stored snapshot unreadable at projection time. Fields are the direct
+/// `PowerSupplyType`, `PowerCapacityWatts`, hardware identity, and `Status`
+/// properties of the `PowerSupply` schema; the input-range and output-rail
+/// bags stay out of this strictly projectable field set.
+#[derive(Serialize)]
+struct PowerSupplyPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "PowerSupplyType", skip_serializing_if = "Option::is_none")]
+    power_supply_type: Option<nv_redfish::schema::power_supply::PowerSupplyType>,
+    #[serde(rename = "PowerCapacityWatts", skip_serializing_if = "Option::is_none")]
+    power_capacity_watts: Option<f64>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "FirmwareVersion", skip_serializing_if = "Option::is_none")]
+    firmware_version: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// The §0.2.0 `network-device-functions` family member projection.
+///
+/// The field set is exactly the `NetworkDeviceFunctionPayload` the
+/// application boundary decodes with `deny_unknown_fields`, so an extra field
+/// here would make every stored snapshot unreadable at projection time.
+/// Fields are the direct `NetDevFuncType`, `DeviceEnabled`, and `Status`
+/// properties of the `NetworkDeviceFunction` schema; the protocol-specific
+/// configuration bags (`Ethernet`, `iSCSIBoot`, `FibreChannel`, ...) stay out
+/// of this strictly projectable field set.
+#[derive(Serialize)]
+struct NetworkDeviceFunctionPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "NetDevFuncType", skip_serializing_if = "Option::is_none")]
+    net_dev_func_type: Option<nv_redfish::schema::network_device_function::NetworkDeviceTechnology>,
+    #[serde(rename = "DeviceEnabled", skip_serializing_if = "Option::is_none")]
+    device_enabled: Option<bool>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<ResourceStatusPayload>,
+}
+
+/// One embedded sensor excerpt of the §0.2.0 `environment-metrics` document.
+///
+/// The `EnvironmentMetrics` schema embeds each measurement as an excerpt
+/// carrying the `DataSourceUri` link to its backing `Sensor` resource and the
+/// current `Reading` value, so the projection keeps exactly those two fields:
+/// the console renders the reading without re-parsing text and the snapshot
+/// names the sensor that sourced it.
+#[derive(Serialize)]
+struct EnvironmentMetricsReadingPayload {
+    #[serde(rename = "DataSourceUri", skip_serializing_if = "Option::is_none")]
+    data_source_uri: Option<String>,
+    #[serde(rename = "Reading", skip_serializing_if = "Option::is_none")]
+    reading: Option<f64>,
+}
+
+/// The embedded power-limit control excerpt of the §0.2.0
+/// `environment-metrics` document.
+///
+/// `PowerLimitWatts` embeds a `Control` excerpt instead of a sensor excerpt,
+/// so the projection carries its `DataSourceUri` link and `SetPoint` reading
+/// exactly like the sensor excerpts carry theirs.
+#[derive(Serialize)]
+struct EnvironmentMetricsControlPayload {
+    #[serde(rename = "DataSourceUri", skip_serializing_if = "Option::is_none")]
+    data_source_uri: Option<String>,
+    #[serde(rename = "SetPoint", skip_serializing_if = "Option::is_none")]
+    set_point: Option<f64>,
+}
+
+/// The §0.2.0 `environment-metrics` singleton projection.
+///
+/// The field set is exactly the `EnvironmentMetricsPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. Every embedded
+/// measurement the schema declares is projected through its excerpt reading
+/// shape; the schema declares no `Status` property, so this family carries no
+/// status field.
+#[derive(Serialize)]
+struct EnvironmentMetricsPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "TemperatureCelsius", skip_serializing_if = "Option::is_none")]
+    temperature_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "HumidityPercent", skip_serializing_if = "Option::is_none")]
+    humidity_percent: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "FanSpeedsPercent", skip_serializing_if = "Option::is_none")]
+    fan_speeds_percent: Option<Vec<EnvironmentMetricsReadingPayload>>,
+    #[serde(rename = "PowerWatts", skip_serializing_if = "Option::is_none")]
+    power_watts: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "EnergykWh", skip_serializing_if = "Option::is_none")]
+    energyk_wh: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "PowerLoadPercent", skip_serializing_if = "Option::is_none")]
+    power_load_percent: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "PowerLimitWatts", skip_serializing_if = "Option::is_none")]
+    power_limit_watts: Option<EnvironmentMetricsControlPayload>,
+    #[serde(rename = "DewPointCelsius", skip_serializing_if = "Option::is_none")]
+    dew_point_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "AbsoluteHumidity", skip_serializing_if = "Option::is_none")]
+    absolute_humidity: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "EnergyJoules", skip_serializing_if = "Option::is_none")]
+    energy_joules: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(
+        rename = "AmbientTemperatureCelsius",
+        skip_serializing_if = "Option::is_none"
+    )]
+    ambient_temperature_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "Voltage", skip_serializing_if = "Option::is_none")]
+    voltage: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "CurrentAmps", skip_serializing_if = "Option::is_none")]
+    current_amps: Option<EnvironmentMetricsReadingPayload>,
+}
+
 fn service_root_projection(
     root: &ServiceRoot<UpstreamBmc>,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -7934,6 +8265,173 @@ fn control_projection(
         control.etag(),
         &payload,
     )
+}
+
+fn power_equipment_projection(
+    equipment: &PowerEquipmentSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = PowerEquipmentPayload {
+        resource: CommonResourcePayload::from_schema_base(&equipment.base),
+        status: equipment
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::PowerEquipment,
+        equipment.odata_id(),
+        equipment.etag(),
+        &payload,
+    )
+}
+
+fn power_distribution_projection(
+    distribution: &PowerDistributionSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = PowerDistributionPayload {
+        resource: CommonResourcePayload::from_schema_base(&distribution.base),
+        equipment_type: distribution.equipment_type,
+        manufacturer: optional_nullable_text(distribution.manufacturer.as_ref()),
+        model: optional_nullable_text(distribution.model.as_ref()),
+        part_number: optional_nullable_text(distribution.part_number.as_ref()),
+        serial_number: optional_nullable_text(distribution.serial_number.as_ref()),
+        version: optional_nullable_text(distribution.version.as_ref()),
+        firmware_version: distribution.firmware_version.clone(),
+        status: distribution
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::PowerEquipment,
+        distribution.odata_id(),
+        distribution.etag(),
+        &payload,
+    )
+}
+
+fn power_supply_projection(
+    supply: &PowerSupplySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = PowerSupplyPayload {
+        resource: CommonResourcePayload::from_schema_base(&supply.base),
+        power_supply_type: supply.power_supply_type.as_ref().copied().flatten(),
+        power_capacity_watts: supply.power_capacity_watts.as_ref().copied().flatten(),
+        manufacturer: optional_nullable_text(supply.manufacturer.as_ref()),
+        model: optional_nullable_text(supply.model.as_ref()),
+        firmware_version: optional_nullable_text(supply.firmware_version.as_ref()),
+        serial_number: optional_nullable_text(supply.serial_number.as_ref()),
+        part_number: optional_nullable_text(supply.part_number.as_ref()),
+        status: supply
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::PowerSupplies,
+        supply.odata_id(),
+        supply.etag(),
+        &payload,
+    )
+}
+
+fn network_device_function_projection(
+    function: &NetworkDeviceFunctionSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = NetworkDeviceFunctionPayload {
+        resource: CommonResourcePayload::from_schema_base(&function.base),
+        net_dev_func_type: function.net_dev_func_type.as_ref().copied().flatten(),
+        device_enabled: function.device_enabled.as_ref().copied().flatten(),
+        status: function
+            .status
+            .as_ref()
+            .map(ResourceStatusPayload::from_status),
+    };
+    build_core_projection(
+        ResourceFeature::NetworkDeviceFunctions,
+        function.odata_id(),
+        function.etag(),
+        &payload,
+    )
+}
+
+fn environment_metrics_projection(
+    metrics: &EnvironmentMetricsSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = EnvironmentMetricsPayload {
+        resource: CommonResourcePayload::from_schema_base(&metrics.base),
+        temperature_celsius: metrics.temperature_celsius.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        humidity_percent: metrics.humidity_percent.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        fan_speeds_percent: metrics.fan_speeds_percent.as_ref().map(|excerpts| {
+            excerpts
+                .iter()
+                .map(|excerpt| {
+                    environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+                })
+                .collect::<Vec<_>>()
+        }),
+        power_watts: metrics.power_watts.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        energyk_wh: metrics.energyk_wh.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        power_load_percent: metrics.power_load_percent.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        power_limit_watts: metrics.power_limit_watts.as_ref().map(|excerpt| {
+            EnvironmentMetricsControlPayload {
+                data_source_uri: optional_nullable_text(excerpt.data_source_uri.as_ref()),
+                set_point: excerpt.set_point.as_ref().copied().flatten(),
+            }
+        }),
+        dew_point_celsius: metrics.dew_point_celsius.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        absolute_humidity: metrics.absolute_humidity.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        energy_joules: metrics.energy_joules.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        ambient_temperature_celsius: metrics.ambient_temperature_celsius.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        voltage: metrics.voltage.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+        current_amps: metrics.current_amps.as_ref().map(|excerpt| {
+            environment_reading(excerpt.data_source_uri.as_ref(), excerpt.reading.as_ref())
+        }),
+    };
+    build_core_projection(
+        ResourceFeature::EnvironmentMetrics,
+        metrics.odata_id(),
+        metrics.etag(),
+        &payload,
+    )
+}
+
+/// Projects one embedded sensor excerpt of the `EnvironmentMetrics` document
+/// onto its reading shape.
+///
+/// Every excerpt type of the compiled schema (`SensorExcerpt`,
+/// `SensorExcerptFanArray`, `SensorExcerptPower`, `SensorExcerptEnergykWh`,
+/// `SensorExcerptVoltage`, `SensorExcerptCurrent`) carries the same
+/// `DataSourceUri` and `Reading` fields, so one field-level function covers
+/// the whole family without coupling the call sites to a shared trait.
+fn environment_reading(
+    data_source_uri: Option<&Option<String>>,
+    reading: Option<&Option<f64>>,
+) -> EnvironmentMetricsReadingPayload {
+    EnvironmentMetricsReadingPayload {
+        data_source_uri: optional_nullable_text(data_source_uri),
+        reading: reading.copied().flatten(),
+    }
 }
 
 fn optional_nullable_text(value: Option<&Option<String>>) -> Option<String> {
@@ -10728,6 +11226,51 @@ mod tests {
         "Name":"Power Equipment"
     }"#;
 
+    /// The `PowerEquipment` service document advertising its `PowerShelves`
+    /// collection, so the `power-equipment` family read exercises the
+    /// collection member fetch and projection.
+    const POWER_EQUIPMENT_WITH_SHELVES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/PowerEquipment",
+        "@odata.etag":"W/\"power-equipment-1\"",
+        "Id":"PowerEquipment",
+        "Name":"Power Equipment",
+        "Description":"Managed power equipment",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "PowerShelves":{"@odata.id":"/redfish/v1/PowerEquipment/PowerShelves"}
+    }"#;
+
+    /// The `PowerShelves` collection with one member, so the
+    /// `power-equipment` family read exercises its member fetch and
+    /// projection.
+    const POWER_SHELVES_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#PowerDistributionCollection.PowerDistributionCollection",
+        "@odata.id":"/redfish/v1/PowerEquipment/PowerShelves",
+        "Name":"Power Shelf Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/PowerEquipment/PowerShelves/1"}
+        ]
+    }"##;
+
+    /// The full `PowerDistribution` power-shelf member projection with every
+    /// optional contract field populated; the circuit, outlet, and sensor
+    /// navigations are decoded but stay outside the projection contract.
+    const POWER_SHELF_ONE_BODY: &str = r##"{
+        "@odata.type":"#PowerDistribution.v1_2_0.PowerDistribution",
+        "@odata.id":"/redfish/v1/PowerEquipment/PowerShelves/1",
+        "@odata.etag":"W/\"power-shelf-1\"",
+        "Id":"1",
+        "Name":"Power Shelf One",
+        "Description":"Rack power shelf",
+        "EquipmentType":"PowerShelf",
+        "Manufacturer":"Rutilus Test",
+        "Model":"PDU-30K",
+        "PartNumber":"PDU-PART-1",
+        "SerialNumber":"PDU-1",
+        "Version":"2.0",
+        "FirmwareVersion":"3.1.4",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
     const BIOS_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/Systems/1/Bios",
         "Id":"Bios",
@@ -10763,6 +11306,24 @@ mod tests {
         "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
         "Managers":{"@odata.id":"/redfish/v1/Managers"},
         "AccountService":{"@odata.id":"/redfish/v1/AccountService"}
+    }"#;
+
+    /// A Service Root that also advertises the 0.2 `power-equipment` service
+    /// through the root-level `PowerEquipment` link.
+    const CORE_WITH_POWER_EQUIPMENT_ROOT_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "PowerEquipment":{"@odata.id":"/redfish/v1/PowerEquipment"}
     }"#;
 
     /// The `AccountService` document that advertises the `Accounts`
@@ -11855,6 +12416,22 @@ mod tests {
         "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"}
     }"#;
 
+    /// A Chassis member that advertises the 0.2 `EnvironmentMetrics`
+    /// singleton, the `PowerSubsystem` with its `PowerSupplies` collection,
+    /// and the `NetworkAdapters` surface with its `NetworkDeviceFunctions`
+    /// collection, so the four new families follow their parent through the
+    /// same typed navigation.
+    const CHASSIS_WITH_POWER_AND_NETWORK_SURFACE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"},
+        "NetworkAdapters":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters"},
+        "EnvironmentMetrics":{"@odata.id":"/redfish/v1/Chassis/1/EnvironmentMetrics"}
+    }"#;
+
     /// The full `Power` singleton projection: the `PowerControl` member is
     /// embedded with its capacity reading, while `Voltages`, `PowerSupplies`,
     /// and `Redundancy` stay linked only, so the projection must keep every
@@ -12029,6 +12606,109 @@ mod tests {
         "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions",
         "Name":"Network Device Function Collection",
         "Members":[]
+    }"##;
+
+    /// The `NetworkDeviceFunction` collection with one member, so the
+    /// `network-device-functions` family read exercises its member fetch and
+    /// projection.
+    const NETWORK_DEVICE_FUNCTIONS_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#NetworkDeviceFunctionCollection.NetworkDeviceFunctionCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions",
+        "Name":"Network Device Function Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1"}
+        ]
+    }"##;
+
+    /// The full `NetworkDeviceFunction` member projection with every optional
+    /// contract field populated; the protocol-specific configuration bags are
+    /// decoded but stay outside the projection contract.
+    const NETWORK_DEVICE_FUNCTION_ONE_BODY: &str = r##"{
+        "@odata.type":"#NetworkDeviceFunction.v1_5_0.NetworkDeviceFunction",
+        "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+        "@odata.etag":"W/\"ndf-1\"",
+        "Id":"1",
+        "Name":"Adapter One Function One",
+        "Description":"First network device function",
+        "NetDevFuncType":"Ethernet",
+        "DeviceEnabled":true,
+        "NetDevFuncCapabilities":["Ethernet"],
+        "Ethernet":{"MACAddress":"AA:BB:CC:DD:EE:01","MTUSize":1500},
+        "BootMode":"PXE",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// The `PowerSupply` collection with one member, so the `power-supplies`
+    /// family read exercises its member fetch and projection.
+    const POWER_SUPPLIES_WITH_MEMBERS_BODY: &str = r##"{
+        "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "Name":"Power Supply Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"}
+        ]
+    }"##;
+
+    /// The full `PowerSupply` member projection with every optional contract
+    /// field populated; the input-range and output-rail bags are decoded but
+    /// stay outside the projection contract.
+    const POWER_SUPPLY_ONE_BODY: &str = r##"{
+        "@odata.type":"#PowerSupply.v1_5_0.PowerSupply",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "@odata.etag":"W/\"power-supply-1\"",
+        "Id":"1",
+        "Name":"Power Supply One",
+        "Description":"Chassis power supply",
+        "PowerSupplyType":"AC",
+        "PowerCapacityWatts":1600,
+        "Manufacturer":"Rutilus Test",
+        "Model":"PSU-1600",
+        "FirmwareVersion":"1.0.0",
+        "SerialNumber":"PSU-1",
+        "PartNumber":"PSU-PART-1",
+        "HotPluggable":true,
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"##;
+
+    /// The `EnvironmentMetrics` singleton with the embedded readings the
+    /// `environment-metrics` family projects: each measurement carries its
+    /// `DataSourceUri` link and current `Reading`, and `PowerLimitWatts`
+    /// embeds its control `SetPoint` instead of a sensor reading.
+    const ENVIRONMENT_METRICS_BODY: &str = r##"{
+        "@odata.type":"#EnvironmentMetrics.v1_1_0.EnvironmentMetrics",
+        "@odata.id":"/redfish/v1/Chassis/1/EnvironmentMetrics",
+        "@odata.etag":"W/\"env-metrics-1\"",
+        "Id":"EnvironmentMetrics",
+        "Name":"Environment Metrics",
+        "Description":"Chassis environment readings",
+        "TemperatureCelsius":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Sensors/InletTemp",
+            "Reading":27.5
+        },
+        "HumidityPercent":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Sensors/InletHumidity",
+            "Reading":45.0
+        },
+        "FanSpeedsPercent":[
+            {"DataSourceUri":"/redfish/v1/Chassis/1/Sensors/Fan1","Reading":55.0},
+            {"DataSourceUri":"/redfish/v1/Chassis/1/Sensors/Fan2","Reading":60.0}
+        ],
+        "PowerWatts":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Sensors/TotalPower",
+            "Reading":320.0
+        },
+        "EnergykWh":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Sensors/TotalEnergy",
+            "Reading":1234.5
+        },
+        "PowerLoadPercent":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Sensors/PowerLoad",
+            "Reading":40.0
+        },
+        "PowerLimitWatts":{
+            "DataSourceUri":"/redfish/v1/Chassis/1/Controls/PowerLimit",
+            "SetPoint":1800
+        }
     }"##;
 
     const ETHERNET_INTERFACES_BODY: &str = r##"{
@@ -12835,6 +13515,40 @@ mod tests {
         "/redfish/v1/Chassis/1/Controls/2",
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for the 0.2 `power-equipment`, `power-supplies`,
+    /// `network-device-functions`, and `environment-metrics` families: the
+    /// chassis member's `NetworkAdapters` collection is fetched once for the
+    /// `network-adapters` family, its member's `NetworkDeviceFunctions`
+    /// collection is read right behind the member, the `PowerSubsystem`
+    /// document precedes its `PowerSupplies` members, the `EnvironmentMetrics`
+    /// singleton follows the chassis member, and the root `PowerEquipment`
+    /// service document precedes its `PowerShelves` members at the end of the
+    /// read.
+    const POWER_AND_ENVIRONMENT_FAMILY_REQUEST_PATHS: [&str; 22] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/NetworkAdapters",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions",
+        "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+        "/redfish/v1/Chassis/1/EnvironmentMetrics",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/PowerEquipment",
+        "/redfish/v1/PowerEquipment/PowerShelves",
+        "/redfish/v1/PowerEquipment/PowerShelves/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -18241,6 +18955,202 @@ mod tests {
             &failing_member.finish_all().await?,
             &ACCOUNT_MEMBER_SKIP_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_power_equipment_power_supplies_network_functions_and_environment_metrics()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_WITH_POWER_EQUIPMENT_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_POWER_AND_NETWORK_SURFACE_BODY),
+                ("200 OK", NETWORK_ADAPTERS_BODY),
+                ("200 OK", NETWORK_ADAPTER_BODY),
+                ("200 OK", NETWORK_DEVICE_FUNCTIONS_WITH_MEMBERS_BODY),
+                ("200 OK", NETWORK_DEVICE_FUNCTION_ONE_BODY),
+                ("200 OK", ENVIRONMENT_METRICS_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_WITH_MEMBERS_BODY),
+                ("200 OK", POWER_SUPPLY_ONE_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+                ("200 OK", POWER_EQUIPMENT_WITH_SHELVES_BODY),
+                ("200 OK", POWER_SHELVES_WITH_MEMBERS_BODY),
+                ("200 OK", POWER_SHELF_ONE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The chassis member carries one adapter (projected by the
+        // network-adapters family), the EnvironmentMetrics singleton, one
+        // PowerSupply member, and one NetworkDeviceFunction member; the root
+        // advertises the PowerEquipment service with one power-shelf member.
+        // The adapter collection is fetched once and serves both the adapter
+        // family and the functions behind its members.
+        assert_eq!(resources.len(), 10);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::NetworkAdapters,
+                ResourceFeature::NetworkDeviceFunctions,
+                ResourceFeature::EnvironmentMetrics,
+                ResourceFeature::PowerSupplies,
+                ResourceFeature::Managers,
+                ResourceFeature::PowerEquipment,
+                ResourceFeature::PowerEquipment,
+            ]
+        );
+        // The adapter member carries no fixture ETag, so its identity is
+        // asserted directly instead of through the ETag-bearing helper.
+        assert_eq!(
+            resources[3].odata_id().as_str(),
+            "/redfish/v1/Chassis/1/NetworkAdapters/1"
+        );
+        assert_network_device_function_projection(&resources[4])?;
+        assert_environment_metrics_projection(&resources[5])?;
+        assert_power_supply_projection(&resources[6])?;
+        assert_power_equipment_projection(&resources[8])?;
+        assert_power_shelf_projection(&resources[9])?;
+        assert_session_requests(
+            &server.finish_all().await?,
+            &POWER_AND_ENVIRONMENT_FAMILY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    /// Asserts the `PowerEquipment` service document projection carries only
+    /// the common fields and its `Status`, with the collection navigation
+    /// staying out of the snapshot.
+    fn assert_power_equipment_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/PowerEquipment",
+            "W/\"power-equipment-1\"",
+            "Id",
+            "PowerEquipment",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("PowerShelves"), None);
+        Ok(())
+    }
+
+    /// Asserts the power-shelf member projection carries its `EquipmentType`
+    /// and hardware identity exactly as published.
+    fn assert_power_shelf_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/PowerEquipment/PowerShelves/1",
+            "W/\"power-shelf-1\"",
+            "EquipmentType",
+            "PowerShelf",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["Manufacturer"], "Rutilus Test");
+        assert_eq!(payload["FirmwareVersion"], "3.1.4");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("PowerSupplies"), None);
+        Ok(())
+    }
+
+    /// Asserts the `PowerSupply` member projection carries its type, capacity,
+    /// hardware identity, and status exactly as published, with the
+    /// input-range and output-rail bags staying out of the snapshot.
+    fn assert_power_supply_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+            "W/\"power-supply-1\"",
+            "PowerSupplyType",
+            "AC",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["PowerCapacityWatts"], 1600.0);
+        assert_eq!(payload["Manufacturer"], "Rutilus Test");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("InputRanges"), None);
+        assert_eq!(payload.get("OutputRails"), None);
+        Ok(())
+    }
+
+    /// Asserts the `NetworkDeviceFunction` member projection carries its
+    /// function type and enable flag exactly as published, with the
+    /// protocol-specific configuration bags staying out of the snapshot.
+    fn assert_network_device_function_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+            "W/\"ndf-1\"",
+            "NetDevFuncType",
+            "Ethernet",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["DeviceEnabled"], true);
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_eq!(payload.get("Ethernet"), None);
+        Ok(())
+    }
+
+    /// Asserts the `EnvironmentMetrics` singleton projection carries every
+    /// embedded measurement through its excerpt reading shape: the readings
+    /// and their `DataSourceUri` links, the fan-speed array, and the control
+    /// `SetPoint` of `PowerLimitWatts`.
+    fn assert_environment_metrics_projection(
+        projection: &CoreResourceProjection,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_projection(
+            projection,
+            "/redfish/v1/Chassis/1/EnvironmentMetrics",
+            "W/\"env-metrics-1\"",
+            "Id",
+            "EnvironmentMetrics",
+        )?;
+        let payload: serde_json::Value = serde_json::from_str(projection.payload().as_str())?;
+        assert_eq!(payload["TemperatureCelsius"]["Reading"], 27.5);
+        assert_eq!(
+            payload["TemperatureCelsius"]["DataSourceUri"],
+            "/redfish/v1/Chassis/1/Sensors/InletTemp"
+        );
+        assert_eq!(payload["HumidityPercent"]["Reading"], 45.0);
+        assert_eq!(payload["FanSpeedsPercent"][0]["Reading"], 55.0);
+        assert_eq!(payload["FanSpeedsPercent"][1]["Reading"], 60.0);
+        assert_eq!(payload["PowerWatts"]["Reading"], 320.0);
+        assert_eq!(payload["EnergykWh"]["Reading"], 1234.5);
+        assert_eq!(payload["PowerLoadPercent"]["Reading"], 40.0);
+        assert_eq!(payload["PowerLimitWatts"]["SetPoint"], 1800.0);
+        assert_eq!(
+            payload["PowerLimitWatts"]["DataSourceUri"],
+            "/redfish/v1/Chassis/1/Controls/PowerLimit"
+        );
         Ok(())
     }
 
