@@ -82,6 +82,11 @@ stable_audit_codes! {
         ManageUsers => "manage-users",
         ManageBackups => "manage-backups",
         ManageSiteSettings => "manage-site-settings",
+        // The 0.7.0 center console permissions (audit follow-up F3): binding
+        // management (register/revoke — Administrator only, §16.1) and
+        // center operation dispatch (Administrator and Operator).
+        ManageCenterBindings => "manage-center-bindings",
+        DispatchCenterOperations => "dispatch-center-operations",
         // The authentication lifecycle permission behind sign-in, sign-out,
         // and password changes (§16.2): those actions are authorized by
         // presenting valid credentials, not by a product role, and the
@@ -114,6 +119,15 @@ stable_audit_codes! {
         ManageTotp => "manage-totp",
         ManageBackups => "manage-backups",
         ManageSettings => "manage-settings",
+        // The 0.7.0 center console actions (audit follow-up F3): registering
+        // one site's binding (which issues the one-time binding code),
+        // revoking one site's binding, and dispatching one §15.6 operation
+        // offer to a bound site. The dispatch is a separate action from the
+        // edge's `ExecuteOperation` because the center never executes
+        // anything — it offers, and the site decides (§15.6).
+        RegisterSiteBinding => "register-site-binding",
+        RevokeSiteBinding => "revoke-site-binding",
+        DispatchCenterOperation => "dispatch-center-operation",
     }
 }
 
@@ -222,6 +236,13 @@ stable_audit_codes! {
         SnapshotPersistenceFailed => "snapshot-persistence-failed",
         CsvInvalid => "csv-invalid",
         EndpointImportRowFailed => "endpoint-import-row-failed",
+        // The 0.7.0 center console failures (audit follow-up F3): a center
+        // write could not be completed because the center store failed, and
+        // a §15.6 dispatch was refused by the center (unknown endpoint,
+        // endpoint outside the site, unknown target, undecodable command,
+        // or the persisted role re-check).
+        CenterStoreFailed => "center-store-failed",
+        CenterRequestRefused => "center-request-refused",
         // A sign-in attempt failed: an unknown or disabled principal, a
         // wrong password, a wrong or replayed TOTP code, or a rate-limited
         // refusal (§16.2 "登录失败限速").
@@ -552,6 +573,29 @@ impl AuditOperationContext {
                     AuditParameterSummary::EndpointRefresh,
                     ProductPermission::ManageSiteSettings,
                     AuditAction::ManageSettings,
+                ) | (
+                    // The 0.7.0 center console binding management (audit
+                    // follow-up F3): registering one site issues its
+                    // one-time binding code, revoking one site's binding
+                    // ends its access — both are center-wide actions with
+                    // no endpoint target and no Redfish operation.
+                    AuditTarget::Product,
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::ManageCenterBindings,
+                    AuditAction::RegisterSiteBinding | AuditAction::RevokeSiteBinding,
+                ) | (
+                    // The §15.6 center dispatch: the offer targets the
+                    // projected endpoint that receives the command on the
+                    // site, exactly like the edge's `ExecuteOperation`
+                    // targets the managed endpoint. The parameter summary
+                    // stays the closest legal shape — the center dispatches
+                    // a typed command and the summary vocabulary is
+                    // projected per-variant by the persistence crate, which
+                    // is not extended here.
+                    AuditTarget::Endpoint(_),
+                    AuditParameterSummary::EndpointRefresh,
+                    ProductPermission::DispatchCenterOperations,
+                    AuditAction::DispatchCenterOperation,
                 )
             ),
             // Every §7.5 write family and the §13.6 remote-task polling is

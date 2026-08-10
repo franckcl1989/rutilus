@@ -67,14 +67,16 @@ use rutilus_application::{
     TelemetryRepository, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
+    Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
+    AuditFailureVerification, AuditOperationContext, AuditOperationId, AuditParameterSummary,
+    AuditRedfishOperation, AuditSequence, AuditTarget, BatchOperation, BatchOperationId,
     BatchOperationState, BatchOutcomeCounts, CapabilityClassification, CapabilityState,
     CenterBindingId, CenterBindingState, CertificateFingerprintParseError, Credential,
     CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
     EndpointDisplayName, EndpointId, Event, Group, GroupId, GroupName, InstanceId, Operation,
-    OperationId, OperationSource, OperationState, OperationTarget, PrincipalId, RedfishCommand,
-    ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot, Tag, TagName, TargetId,
-    TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
+    OperationId, OperationSource, OperationState, OperationTarget, PrincipalId, ProductPermission,
+    RedfishCommand, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot, Tag, TagName,
+    TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
 use time::OffsetDateTime;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -3167,13 +3169,17 @@ where
 /// Registers one site and returns its one-time binding code (design D2).
 ///
 /// The raw code is shown exactly once in the response — no later view of the
-/// binding ever repeats it.
+/// binding ever repeats it. The write is audited (§16.3, audit follow-up
+/// F3): issuing a binding code is the security-relevant act that admits a
+/// site into the center, so the record names the acting principal, the
+/// Center origin, the `ManageCenterBindings` permission, and the result.
 async fn register_center_site<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
     Json(request): Json<CenterBindingRegisterRequest>,
 ) -> Response
 where
-    Services: CenterServices,
+    Services: CenterServices + AuditEventWriter,
     Time: Clock,
 {
     let Ok(display_name) = EndpointDisplayName::parse(request.display_name()) else {
@@ -3188,35 +3194,158 @@ where
         .register_center_site(display_name.as_str(), request.center_url(), now)
         .await
     {
-        Ok(registered) => json_ok(Json(CenterBindingRegisterResponse::new(
-            registered.site_id().into_uuid(),
-            registered.binding_id().into_uuid(),
-            registered.code().to_owned(),
-            registered.expires_at(),
-        ))),
-        Err(_) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+        Ok(registered) => {
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Product,
+                ProductPermission::ManageCenterBindings,
+                AuditAction::RegisterSiteBinding,
+                CenterWriteOutcome::Succeeded,
+                now,
+            )
+            .await;
+            json_ok(Json(CenterBindingRegisterResponse::new(
+                registered.site_id().into_uuid(),
+                registered.binding_id().into_uuid(),
+                registered.code().to_owned(),
+                registered.expires_at(),
+            )))
+        }
+        Err(_) => {
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Product,
+                ProductPermission::ManageCenterBindings,
+                AuditAction::RegisterSiteBinding,
+                CenterWriteOutcome::StoreFailed,
+                now,
+            )
+            .await;
+            uncached_status(StatusCode::SERVICE_UNAVAILABLE)
+        }
     }
 }
 
 /// Revokes the active binding of one site (design D2); a site whose binding
-/// is already revoked is reported as revoked.
+/// is already revoked is reported as revoked. The write is audited (§16.3,
+/// audit follow-up F3): revoking a binding ends a site's admission, so the
+/// record names the acting principal, the Center origin, the
+/// `ManageCenterBindings` permission, and the result.
 async fn revoke_center_binding<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
     Json(request): Json<CenterBindingRevokeRequest>,
 ) -> Response
 where
-    Services: CenterServices,
+    Services: CenterServices + AuditEventWriter,
     Time: Clock,
 {
     let site = InstanceId::from_uuid(request.site_id());
-    match state
-        .services
-        .revoke_center_binding(site, state.clock.now())
-        .await
-    {
-        Ok(()) => no_content(),
-        Err(_) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+    let now = state.clock.now();
+    match state.services.revoke_center_binding(site, now).await {
+        Ok(()) => {
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Product,
+                ProductPermission::ManageCenterBindings,
+                AuditAction::RevokeSiteBinding,
+                CenterWriteOutcome::Succeeded,
+                now,
+            )
+            .await;
+            no_content()
+        }
+        Err(_) => {
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Product,
+                ProductPermission::ManageCenterBindings,
+                AuditAction::RevokeSiteBinding,
+                CenterWriteOutcome::StoreFailed,
+                now,
+            )
+            .await;
+            uncached_status(StatusCode::SERVICE_UNAVAILABLE)
+        }
     }
+}
+
+/// The result of one audited center console write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CenterWriteOutcome {
+    /// The write completed.
+    Succeeded,
+    /// The center store failed the write.
+    StoreFailed,
+    /// The center refused the write (a §15.6 dispatch refusal).
+    Refused,
+}
+
+/// Appends the `started` and terminal events of one audited center console
+/// write (§16.3, audit follow-up F3): who, the Center origin, the target,
+/// the parameter summary, the permission checked, the action, and the
+/// result.
+///
+/// An audit append failure never fails the request — exactly like the
+/// authentication lifecycle's `record_outcome`: the audit trail is a
+/// best-effort side effect on the web layer, and the request verdict stays
+/// the boundary's.
+#[allow(clippy::too_many_arguments)]
+async fn record_center_write<Services, Gateway, Time>(
+    state: &WebState<Services, Gateway, Time>,
+    context: &AuthContext,
+    target: AuditTarget,
+    permission: ProductPermission,
+    action: AuditAction,
+    outcome: CenterWriteOutcome,
+    now: OffsetDateTime,
+) where
+    Services: AuditEventWriter,
+    Time: Clock,
+{
+    let Ok(context) = AuditOperationContext::try_new_with_actor_principal(
+        AuditOperationId::generate(),
+        context.actor(),
+        state.origin,
+        target,
+        AuditParameterSummary::EndpointRefresh,
+        permission,
+        action,
+        AuditRedfishOperation::None,
+        context.actor_principal_id(),
+    ) else {
+        return;
+    };
+    let started = AuditEvent::started(context.clone(), now);
+    let _ = state.services.append_audit_event(&started).await;
+    let Ok(sequence) = AuditSequence::FIRST.next() else {
+        return;
+    };
+    let terminal = match outcome {
+        CenterWriteOutcome::Succeeded => AuditEvent::succeeded(context, sequence, now),
+        CenterWriteOutcome::StoreFailed => AuditEvent::failed(
+            context,
+            sequence,
+            AuditFailure::CenterStoreFailed,
+            AuditFailureVerification::Inconclusive,
+            now,
+        ),
+        CenterWriteOutcome::Refused => AuditEvent::failed(
+            context,
+            sequence,
+            AuditFailure::CenterRequestRefused,
+            AuditFailureVerification::Rejected,
+            now,
+        ),
+    };
+    let Ok(terminal) = terminal else {
+        return;
+    };
+    let _ = state.services.append_audit_event(&terminal).await;
 }
 
 /// Lists the center's aggregated endpoint view (§15.5), optionally narrowed
@@ -3311,14 +3440,17 @@ where
 ///
 /// The acting principal's role and D3 site scope are the handler gate; the
 /// dispatch use case re-checks the same rule against the persisted
-/// assignment.
+/// assignment. The dispatch is audited (§16.3, audit follow-up F3): the
+/// record names the acting principal, the Center origin, the projected
+/// endpoint target, the `DispatchCenterOperations` permission, and the
+/// result — dispatched, refused by the center, or failed in the store.
 async fn submit_center_operation<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: Extension<AuthContext>,
     Json(request): Json<CenterOperationSubmitRequest>,
 ) -> Response
 where
-    Services: CenterServices,
+    Services: CenterServices + AuditEventWriter,
     Time: Clock,
 {
     let Some(actor) = context.actor_principal_id() else {
@@ -3341,23 +3473,43 @@ where
         );
     };
     let endpoint = EndpointId::from_uuid(request.endpoint_id());
+    let now = state.clock.now();
     match state
         .services
-        .dispatch_center_operation(
-            site,
-            endpoint,
-            &target,
-            request.command(),
-            actor,
-            state.clock.now(),
-        )
+        .dispatch_center_operation(site, endpoint, &target, request.command(), actor, now)
         .await
     {
-        Ok(dispatched) => json_ok(Json(CenterOperationSubmitResponse::new(
-            dispatched.operation_id().into_uuid(),
-            dispatched.ttl_expires_at(),
-        ))),
-        Err(refusal) => center_dispatch_refusal_response(&refusal),
+        Ok(dispatched) => {
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Endpoint(endpoint),
+                ProductPermission::DispatchCenterOperations,
+                AuditAction::DispatchCenterOperation,
+                CenterWriteOutcome::Succeeded,
+                now,
+            )
+            .await;
+            json_ok(Json(CenterOperationSubmitResponse::new(
+                dispatched.operation_id().into_uuid(),
+                dispatched.ttl_expires_at(),
+            )))
+        }
+        Err(refusal) => {
+            // A refusal is a verdict, not a store failure: the record shows
+            // the dispatch was attempted and refused by the center.
+            record_center_write(
+                &state,
+                &context,
+                AuditTarget::Endpoint(endpoint),
+                ProductPermission::DispatchCenterOperations,
+                AuditAction::DispatchCenterOperation,
+                CenterWriteOutcome::Refused,
+                now,
+            )
+            .await;
+            center_dispatch_refusal_response(&refusal)
+        }
     }
 }
 
@@ -8212,10 +8364,21 @@ mod tests {
 
         fn append_audit_event<'a>(
             &'a self,
-            _event: &'a AuditEvent,
+            event: &'a AuditEvent,
         ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
             let working = self.refresh_working;
-            Box::pin(async move { if working { Ok(()) } else { Err(MockWriteError) } })
+            let recorder = self.center_state.audit.clone();
+            Box::pin(async move {
+                if !working {
+                    return Err(MockWriteError);
+                }
+                if let Some(recorder) = recorder {
+                    if let Ok(mut events) = recorder.lock() {
+                        events.push(event.clone());
+                    }
+                }
+                Ok(())
+            })
         }
     }
 
@@ -9081,6 +9244,9 @@ mod tests {
         dispatched: Arc<Mutex<Vec<DispatchedSubmission>>>,
         /// When armed, every center boundary fails (the 503 verdicts).
         fail: bool,
+        /// When armed, the appended audit events are recorded here (audit
+        /// follow-up F3 assertions).
+        audit: Option<Arc<Mutex<Vec<AuditEvent>>>>,
     }
 
     impl CenterTestState {
@@ -10082,6 +10248,182 @@ mod tests {
             operations[0]["site_id"].is_string(),
             "the visible row must carry its site association"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_write_routes_record_audit_events() -> Result<(), Box<dyn Error>> {
+        // Audit follow-up F3: every center write — register, revoke, and
+        // dispatch — appends the §16.3 start/terminal pair naming the
+        // acting principal, the Center origin, the permission, and the
+        // result. The dispatch requires a signed-in principal, so the test
+        // runs guarded with an Administrator session.
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let mut state = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        state.audit = Some(Arc::clone(&audit));
+        let center_router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                auth_state: auth.clone(),
+                center_state: state.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) =
+            sign_in_center(&center_router, &auth, "admin", "admin-password").await?;
+        // The sign-in itself appends login audit events; the recorder
+        // starts clean for the write-route assertions.
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        // Register one site: started + succeeded with the binding action.
+        // Each audit assertion runs in a scoped block, so the recorder
+        // guard is dropped before the next request (the handler appends to
+        // the same mutex).
+        let response = center_router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(
+                        r#"{"display_name": "Site One", "center_url": "center.example:8443"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "register must append start + terminal");
+            assert_eq!(events[0].outcome().kind().as_str(), "started");
+            assert_eq!(events[1].outcome().kind().as_str(), "succeeded");
+            assert_eq!(
+                events[0].context().action().as_str(),
+                "register-site-binding"
+            );
+            assert_eq!(events[0].context().origin().as_str(), "center");
+            assert_eq!(
+                events[0].context().permission().as_str(),
+                "manage-center-bindings"
+            );
+            events.clear();
+        }
+
+        // Revoke one site: started + succeeded with the revoke action.
+        let site = InstanceId::generate();
+        let response = center_router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings/revoke")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!(
+                        r#"{{"site_id": "{}"}}"#,
+                        site.into_uuid()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        {
+            let mut events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "revoke must append start + terminal");
+            assert_eq!(
+                events[0].context().action().as_str(),
+                "revoke-site-binding"
+            );
+            events.clear();
+        }
+
+        // Dispatch one operation: started + succeeded with the dispatch
+        // action and the endpoint target.
+        let endpoint = EndpointId::generate();
+        let response = center_router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!(
+                        r#"{{"site_id": "{}", "endpoint_id": "{}", "target": "/redfish/v1/Systems/1", "command": {{"System": {{"Reset": "PowerCycle"}}}}}}"#,
+                        site.into_uuid(),
+                        endpoint.into_uuid()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "dispatch must append start + terminal");
+            assert_eq!(
+                events[0].context().action().as_str(),
+                "dispatch-center-operation"
+            );
+            assert_eq!(
+                events[0].context().permission().as_str(),
+                "dispatch-center-operations"
+            );
+            assert_eq!(
+                events[0].context().target().kind(),
+                rutilus_domain::AuditTarget::Endpoint(endpoint).kind()
+            );
+            events.clear();
+        }
+
+        // A refused dispatch records the refusal as the terminal event.
+        let failing = CenterTestState {
+            fail: true,
+            ..state.clone()
+        };
+        let failing_router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                auth_state: auth.clone(),
+                center_state: failing,
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) =
+            sign_in_center(&failing_router, &auth, "admin", "admin-password").await?;
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+        let response = failing_router
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!(
+                        r#"{{"site_id": "{}", "endpoint_id": "{}", "target": "/redfish/v1/Systems/1", "command": {{"System": {{"Reset": "PowerCycle"}}}}}}"#,
+                        site.into_uuid(),
+                        endpoint.into_uuid()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        {
+            let mut events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "a refused dispatch must still audit");
+            assert_eq!(events[1].outcome().kind().as_str(), "failed");
+        }
         Ok(())
     }
 
