@@ -35,8 +35,8 @@ use rustls::{
 };
 use rutilus_center_protocol::{
     CENTER_PROTOCOL_VERSION, Envelope, EnvelopeMessage, FrameError, Heartbeat, Hello,
-    NV_REDFISH_BASELINE, NegotiationResult, SITE_HEARTBEAT_INTERVAL, SITE_RECONNECT_AFTER,
-    capability_ledger_hash, encode_frame,
+    NV_REDFISH_BASELINE, NegotiationReason, NegotiationResult, SITE_HEARTBEAT_INTERVAL,
+    SITE_RECONNECT_AFTER, capability_ledger_hash, encode_frame,
 };
 use rutilus_domain::{CertificateFingerprint, InstanceId};
 use thiserror::Error;
@@ -491,6 +491,12 @@ impl CenterLink {
         self.acked_sequence = envelope.sequence;
         if accepted {
             Ok(())
+        } else if reason == NegotiationReason::NotBound.as_str() {
+            // The admission refusal (audit follow-up F4): the center says
+            // the site's binding is not in force. It is classified before
+            // the generic rejection so the sync engine can converge the
+            // site instead of retrying forever.
+            Err(CenterClientError::NotBound)
         } else {
             Err(CenterClientError::NegotiationRejected { reason })
         }
@@ -534,6 +540,12 @@ pub enum CenterClientError {
     ExpectedNegotiationResult,
     #[error("the center rejected the connection: {reason}")]
     NegotiationRejected { reason: String },
+    /// The center answered the `Hello` with the `not-bound` admission
+    /// refusal (audit follow-up F4): the site's binding is not in force on
+    /// the center, so the sync engine converges the site instead of
+    /// retrying forever.
+    #[error("the center refused the connection: the site binding is not in force")]
+    NotBound,
     #[error("a frame could not be decoded: {0}")]
     Frame(#[from] FrameError),
     #[error("the WebSocket transport failed: {source}")]

@@ -26,7 +26,8 @@ use std::{
 use axum::serve::ListenerExt as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rutilus_application::{
-    CenterSync, CenterSyncOptions, Clock, CoreResourceReader, RedfishDiscovery, TlsIdentityProbe,
+    CenterSync, CenterSyncError, CenterSyncOptions, Clock, CoreResourceReader, RedfishDiscovery,
+    TlsIdentityProbe,
 };
 use rutilus_domain::{
     AuditActor, CenterBinding, CenterBindingState, CertificateFingerprint, DeploymentPosture,
@@ -923,12 +924,17 @@ pub struct CenterSyncRuntimeOptions {
     /// How often the runtime re-reads the site's binding while the sync
     /// engine runs.
     pub binding_poll_interval: Duration,
+    /// The engine's own timing bounds, including the `not-bound`
+    /// convergence count (audit follow-up F4). Tests shorten the reconnect
+    /// backoff and the refusal count instead of the production values.
+    pub engine: CenterSyncOptions,
 }
 
 impl Default for CenterSyncRuntimeOptions {
     fn default() -> Self {
         Self {
             binding_poll_interval: BINDING_POLL_INTERVAL,
+            engine: CenterSyncOptions::default(),
         }
     }
 }
@@ -1058,6 +1064,136 @@ pub(crate) async fn assemble_center_sync(
     Ok(Some(bundle))
 }
 
+/// The outcome of one local unbind (audit follow-up F4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnbindOutcome {
+    /// The site's binding was revoked and its center material removed.
+    Unbound,
+    /// The site had no binding in force; nothing changed.
+    AlreadyUnbound,
+}
+
+/// A controlled failure while unbinding the site from its center (audit
+/// follow-up F4).
+#[derive(Debug, Error)]
+pub enum UnbindError {
+    /// The instance could not be opened (including "another process owns
+    /// the instance" — the unbind is an offline command like backup).
+    #[error("failed to open the site instance: {0}")]
+    Open(#[source] StandaloneInstanceError),
+    /// The instance repository failed; carries its own error.
+    #[error("the instance repository failed: {0}")]
+    Instance(#[source] InstanceRepositoryError),
+    /// The binding repository failed; carries its own error.
+    #[error("the binding repository failed: {0}")]
+    Binding(#[source] CenterBindingRepositoryError),
+    /// One center material file could not be removed.
+    #[error("failed to remove the center material at {path}: {source}")]
+    RemoveMaterial {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The instance could not be closed after the unbind.
+    #[error("failed to close the site instance: {0}")]
+    Close(#[source] StandaloneInstanceCloseError),
+    /// The unbind and the instance close both failed.
+    #[error("the unbind failed ({run}) and the instance close failed ({close})")]
+    RunAndClose {
+        run: Box<Self>,
+        close: StandaloneInstanceCloseError,
+    },
+}
+
+/// Revokes the site's local center binding and removes its center material
+/// (audit follow-up F4): the offline operator path that ends the site's
+/// center relationship without the center.
+///
+/// The command opens the instance like every offline command (backup,
+/// restore), so it refuses to run while the site console owns the runtime
+/// lock. A site without a binding row, or with an already-revoked binding,
+/// reports [`UnbindOutcome::AlreadyUnbound`] without touching the material
+/// — the unbind is idempotent.
+///
+/// The running site converges through the engine instead: the center's
+/// `not-bound` refusal revokes the local row and stops the engine, and the
+/// CLI unbind exists for the operator who ends the relationship locally.
+///
+/// # Errors
+///
+/// Returns [`UnbindError`] when the instance cannot be opened or closed,
+/// a repository fails, or one material file cannot be removed.
+pub async fn unbind_from_center(
+    paths: &RuntimePaths,
+    unlock: Option<&StandaloneUnlock>,
+) -> Result<UnbindOutcome, UnbindError> {
+    let instance = if let Some(passphrase) = unlock {
+        StandaloneInstance::open(paths, passphrase)
+            .await
+            .map_err(UnbindError::Open)?
+    } else {
+        let store = SystemSecretStore::new();
+        StandaloneInstance::open_system(paths, &store)
+            .await
+            .map_err(UnbindError::Open)?
+    };
+    let run_result = async {
+        let state = instance.state();
+        let instances = state
+            .store
+            .list_instances()
+            .await
+            .map_err(UnbindError::Instance)?;
+        let Some(instance_row) = instances
+            .into_iter()
+            .find(|instance| instance.kind() == InstanceKind::Site)
+        else {
+            // The site's own identity row does not exist; it was never bound.
+            return Ok(UnbindOutcome::AlreadyUnbound);
+        };
+        let Some(binding) = state
+            .store
+            .find_binding_by_site(instance_row.id())
+            .await
+            .map_err(UnbindError::Binding)?
+        else {
+            return Ok(UnbindOutcome::AlreadyUnbound);
+        };
+        if binding.state() == CenterBindingState::Revoked {
+            return Ok(UnbindOutcome::AlreadyUnbound);
+        }
+        state
+            .store
+            .revoke_binding(binding.id())
+            .await
+            .map_err(UnbindError::Binding)?;
+        for file in [
+            SITE_CLIENT_CERT_FILE,
+            SITE_CLIENT_KEY_FILE,
+            CENTER_CA_CERT_FILE,
+            CENTER_PIN_FILE,
+        ] {
+            let path = paths.tls_directory().join(file);
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|source| UnbindError::RemoveMaterial { path, source })?;
+            }
+        }
+        Ok(UnbindOutcome::Unbound)
+    }
+    .await;
+    let close_result = instance.close().await;
+    match (run_result, close_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(source), Ok(())) => Err(source),
+        (Ok(_), Err(close)) => Err(UnbindError::Close(close)),
+        (Err(run), Err(close)) => Err(UnbindError::RunAndClose {
+            run: Box::new(run),
+            close,
+        }),
+    }
+}
+
 /// Loads and validates the four material files of one bound site.
 fn load_bundle_material(
     paths: &RuntimePaths,
@@ -1174,7 +1310,7 @@ async fn run_center_sync_task(
         &state.store,
         SystemClock,
         bundle.instance().id(),
-        CenterSyncOptions::default(),
+        options.engine,
     );
     let poll = options.binding_poll_interval;
     let binding_site = bundle.instance().id();
@@ -1191,8 +1327,29 @@ async fn run_center_sync_task(
             }
         })
         .await;
-    if let Err(error) = outcome {
-        eprintln!("the center sync engine stopped with an error: {error}");
+    match outcome {
+        Ok(()) => {}
+        Err(CenterSyncError::NotBound) => {
+            // Audit follow-up F4: the center consistently refused the site
+            // as `not-bound` — its binding is not in force on the center
+            // (revoked or re-bound there). The engine already stopped; the
+            // local binding row is revoked so the site converges: a later
+            // restart stays local-only, exactly like a locally revoked
+            // binding. The material files are left in place (harmless; a
+            // future bind overwrites them).
+            eprintln!(
+                "the center refused the site as not bound; revoking the local binding"
+            );
+            let Ok(Some(binding)) = store.find_binding_by_site(binding_site).await else {
+                return;
+            };
+            if let Err(error) = store.revoke_binding(binding.id()).await {
+                eprintln!("failed to revoke the local binding: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("the center sync engine stopped with an error: {error}");
+        }
     }
 }
 
@@ -1220,8 +1377,11 @@ mod tests {
     use rutilus_platform::{RuntimeLock, RuntimePaths};
     use rutilus_security::MasterKey;
 
+    use rutilus_application::CenterSessionAdmission;
+    use tokio::net::TcpListener;
+
     use super::*;
-    use crate::CenterCa;
+    use crate::{CenterAcceptor, CenterAcceptorOptions, CenterCa};
 
     fn parse_listen(value: &str) -> Result<ListenAddress, ListenAddressError> {
         ListenAddress::parse(value)
@@ -1726,6 +1886,7 @@ mod tests {
             .ok_or("a bound site must assemble a bundle")?;
         let options = CenterSyncRuntimeOptions {
             binding_poll_interval: Duration::from_millis(20),
+            ..CenterSyncRuntimeOptions::default()
         };
 
         // The engine stops on the stop signal (the center at 127.0.0.1:1
@@ -1747,6 +1908,205 @@ mod tests {
             .await
             .map_err(|_| io::Error::other("the engine did not stop after the revocation"))??;
         let _ = revoke_signal;
+        Ok(())
+    }
+
+    /// Seeds one bound site whose binding names the given center address
+    /// and whose material pins the given center server fingerprint (audit
+    /// follow-up F4 — the convergence test needs a real, reachable center,
+    /// so the pin must be the acceptor's actual fingerprint).
+    async fn seed_bound_site_to_center(
+        store: &SqliteStore,
+        paths: &RuntimePaths,
+        center_address: &str,
+        center_fingerprint: CertificateFingerprint,
+    ) -> Result<(InstanceId, CenterBindingId, CertificateFingerprint), Box<dyn Error>> {
+        let now = OffsetDateTime::now_utc();
+        let instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        store.create_instance(&instance).await?;
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x42; 32]);
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            center_address.to_owned(),
+            instance.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        binding.bind(Some(site_fingerprint), now)?;
+        let binding_id = binding.id();
+        store.create_binding(&binding).await?;
+        let ca = CenterCa::generate_or_load(paths)?;
+        let issued = ca.issue_site_certificate(instance.id(), site_fingerprint)?;
+        let (cert_pem, key_pem) = issued.pem_pair();
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_CERT_FILE), cert_pem)?;
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_KEY_FILE), key_pem)?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_CA_CERT_FILE),
+            pem_encode("CERTIFICATE", ca.certificate().as_ref()),
+        )?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_PIN_FILE),
+            center_fingerprint.to_string(),
+        )?;
+        Ok((instance.id(), binding_id, site_fingerprint))
+    }
+
+    #[tokio::test]
+    async fn the_unbind_command_revokes_the_binding_and_removes_the_material()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up F4: the offline operator path ends the site's
+        // center relationship — the local binding row is revoked and the
+        // four delivered material files are removed; an already-unbound
+        // site reports idempotently.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = StandaloneUnlock::existing(SecretString::from(
+            "correct local unlock phrase".to_owned(),
+        ))?;
+        crate::initialize_standalone(&paths, &unlock).await?;
+        {
+            let instance = StandaloneInstance::open(&paths, &unlock).await?;
+            let (_, _, _) =
+                seed_bound_site(&instance.state().store, &paths).await?;
+            instance.close().await?;
+        }
+        assert!(paths.tls_directory().join(SITE_CLIENT_CERT_FILE).is_file());
+        assert!(paths.tls_directory().join(CENTER_PIN_FILE).is_file());
+
+        assert_eq!(
+            unbind_from_center(&paths, Some(&unlock)).await?,
+            UnbindOutcome::Unbound
+        );
+        for file in [
+            SITE_CLIENT_CERT_FILE,
+            SITE_CLIENT_KEY_FILE,
+            CENTER_CA_CERT_FILE,
+            CENTER_PIN_FILE,
+        ] {
+            assert!(
+                !paths.tls_directory().join(file).exists(),
+                "the unbind must remove {file}"
+            );
+        }
+        // The unbind is idempotent: a second run reports already unbound.
+        assert_eq!(
+            unbind_from_center(&paths, Some(&unlock)).await?,
+            UnbindOutcome::AlreadyUnbound
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_not_bound_refusal_from_the_center_converges_the_local_binding()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up F4: the center revoked the binding on its side;
+        // the site's next connection is answered with the `not-bound`
+        // negotiation refusal, and after the configured number of
+        // consecutive refusals the site revokes its local row and the
+        // engine stops — the center-revocation convergence path.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("site"))?;
+        let center_paths = RuntimePaths::from_root(directory.path().join("center"))?;
+
+        // The center side: an acceptor whose admission refuses the site
+        // because its binding is revoked there.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+        let ca = Arc::new(CenterCa::generate_or_load(&paths)?);
+        let acceptor = CenterAcceptor::bind_with_ca(
+            &paths,
+            &listen,
+            ca,
+            CenterAcceptorOptions {
+                handshake_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(5),
+            },
+        )
+        .await?;
+        // The address and the pin material are captured before the
+        // acceptor moves into the accept task.
+        let acceptor_address = acceptor.address().to_string();
+        let acceptor_fingerprint = acceptor.server_fingerprint();
+        let center_state = test_state(&center_paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let center_instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        center_state.store.create_instance(&center_instance).await?;
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x42; 32]);
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut revoked = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            acceptor_address.clone(),
+            center_instance.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        revoked.bind(Some(site_fingerprint), now)?;
+        revoked.revoke()?;
+        center_state.store.create_binding(&revoked).await?;
+        let center_state_for_accept = Arc::clone(&center_state);
+        let accept_task = tokio::spawn(async move {
+            let mut acceptor = acceptor;
+            let admission = CenterSessionAdmission::new(&center_state_for_accept.store);
+            loop {
+                // Every connection here is refused with the `not-bound`
+                // answer; the loop keeps accepting the site's retries.
+                let _ = acceptor.accept_with_admission(&admission).await;
+            }
+        });
+
+        // The site side: a bound local row and the delivered material,
+        // pinned to the acceptor's real fingerprint.
+        let state = test_state(&paths).await?;
+        let (site_id, _, _) = seed_bound_site_to_center(
+            &state.store,
+            &paths,
+            &acceptor_address,
+            acceptor_fingerprint,
+        )
+        .await?;
+        let bundle = assemble_center_sync(&state.store, &paths)
+            .await?
+            .ok_or("a bound site must assemble a bundle")?;
+        let options = CenterSyncRuntimeOptions {
+            binding_poll_interval: Duration::from_millis(20),
+            engine: CenterSyncOptions {
+                heartbeat_interval: Duration::from_millis(20),
+                reconnect_after: Duration::from_millis(50),
+                flush_limit: 64,
+                event_batch_limit: 256,
+                artifact_chunk_bytes: 64,
+                not_bound_abort_after: Some(2),
+            },
+        };
+        let (_stop_signal, stop_watch) = scheduler::StopSignal::new();
+        let task = spawn_center_sync(bundle, Arc::clone(&state), stop_watch, options);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .map_err(|_| io::Error::other("the engine did not converge in time"))??;
+
+        // The engine stopped on its own and the local row converged.
+        let local = state
+            .store
+            .find_binding_by_site(site_id)
+            .await?
+            .ok_or("the local binding row must remain")?;
+        assert_eq!(local.state(), CenterBindingState::Revoked);
+        accept_task.abort();
         Ok(())
     }
 }

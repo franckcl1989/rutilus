@@ -34,11 +34,16 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{SinkExt as _, StreamExt as _};
 use rustls::{RootCertStore, pki_types::CertificateDer, server::WebPkiClientVerifier};
+use rutilus_application::{
+    AdmissionRejection, AdmissionVerdict, BoundaryFuture, CenterSessionAdmission,
+    CenterSessionAdmissionError, ResolvedSite, SiteIdentity,
+};
 use rutilus_center_protocol::{
-    CENTER_DISCONNECT_AFTER, Envelope, EnvelopeMessage, FrameError, NegotiationDecision,
+    CENTER_DISCONNECT_AFTER, Envelope, EnvelopeMessage, FrameError, Hello, NegotiationDecision,
     NegotiationReason, NegotiationResult, encode_frame, negotiate,
 };
 use rutilus_domain::{CertificateFingerprint, InstanceId};
+use rutilus_persistence::{CenterBindingRepositoryError, SqliteStore};
 use rutilus_platform::RuntimePaths;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -212,10 +217,14 @@ impl CenterAcceptor {
         self.ca.issue_site_certificate(site, site_fingerprint)
     }
 
-    /// Accepts one connection: the mTLS handshake, the WebSocket upgrade,
-    /// and the `Hello`/`NegotiationResult` negotiation, in that order. The
-    /// returned connection is ready for the frame loop and carries the
-    /// site's certificate identity.
+    /// Accepts one connection without an admission check: the mTLS
+    /// handshake, the WebSocket upgrade, and the `Hello`/`NegotiationResult`
+    /// negotiation, in that order. The returned connection is ready for the
+    /// frame loop and carries the site's certificate identity.
+    ///
+    /// This is the raw accept used by the connection-level tests; the
+    /// production accept loop uses [`Self::accept_with_admission`], so a
+    /// site whose binding is not in force is refused at negotiation time.
     ///
     /// # Errors
     ///
@@ -224,6 +233,46 @@ impl CenterAcceptor {
     /// rejected negotiation. A rejected site still receives its
     /// `NegotiationResult` before the connection closes.
     pub async fn accept(&mut self) -> Result<CenterConnection, CenterAcceptError> {
+        let mut connection = self.handshake().await?;
+        connection.complete_negotiation().await?;
+        Ok(connection)
+    }
+
+    /// Accepts one connection under the admission decision (audit follow-up
+    /// F4): the mTLS handshake and the WebSocket upgrade, then the
+    /// negotiation, whose `Hello` answer carries the admission verdict.
+    ///
+    /// An admitted site receives `NegotiationResult { accepted: true }`
+    /// and the returned connection carries its resolved site. A refused
+    /// site receives `NegotiationResult { accepted: false, reason:
+    /// "not-bound" }` — the doc-sanctioned extensible reason code, never a
+    /// wire change — before the connection closes, so the site learns that
+    /// its binding is not in force and converges instead of retrying
+    /// forever. An admission lookup failure refuses the connection without
+    /// an answer: a broken center must not converge the site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterAcceptError`] for a failed handshake, a missing or
+    /// unreadable client certificate, a non-`Hello` first frame, a rejected
+    /// negotiation, an admission refusal, or an admission lookup failure.
+    pub async fn accept_with_admission<A: CenterAdmissionResolver + ?Sized>(
+        &mut self,
+        admission: &A,
+    ) -> Result<AcceptedCenterConnection, CenterAcceptError> {
+        let mut connection = self.handshake().await?;
+        let site = connection
+            .complete_negotiation_with_admission(admission)
+            .await?;
+        Ok(AcceptedCenterConnection {
+            connection,
+            site,
+        })
+    }
+
+    /// The common handshake of both accept paths: the mTLS handshake, the
+    /// WebSocket upgrade, and the identity parse, in that order.
+    async fn handshake(&mut self) -> Result<CenterConnection, CenterAcceptError> {
         let (stream, address) = self
             .listener
             .accept()
@@ -248,16 +297,77 @@ impl CenterAcceptor {
             timeout: self.options.handshake_timeout,
         })?
         .map_err(|error| CenterAcceptError::WebSocket(Box::new(error)))?;
-        let mut connection = CenterConnection {
+        Ok(CenterConnection {
             identity,
             ws,
             next_sequence: 1,
             acked_sequence: 0,
             address,
             options: self.options,
-        };
-        connection.complete_negotiation().await?;
-        Ok(connection)
+        })
+    }
+}
+
+/// Resolves one presented client identity to its admission verdict, so the
+/// accept path can answer a refused site at negotiation time (audit
+/// follow-up F4).
+///
+/// The production resolver is the S5 [`CenterSessionAdmission`] over the
+/// instance store; the trait keeps the acceptor free of the store type.
+pub trait CenterAdmissionResolver: Send + Sync {
+    /// Resolves the presented identity to its admission verdict.
+    fn resolve(
+        &self,
+        identity: &ClientIdentity,
+    ) -> BoundaryFuture<
+        '_,
+        Result<AdmissionVerdict, CenterSessionAdmissionError<CenterBindingRepositoryError>>,
+    >;
+}
+
+impl CenterAdmissionResolver for CenterSessionAdmission<&SqliteStore> {
+    fn resolve(
+        &self,
+        identity: &ClientIdentity,
+    ) -> BoundaryFuture<
+        '_,
+        Result<AdmissionVerdict, CenterSessionAdmissionError<CenterBindingRepositoryError>>,
+    > {
+        // The identity parts are copied into an owned `SiteIdentity` before
+        // the future, so the future never borrows the connection.
+        let site_identity = SiteIdentity::from_parts(
+            identity.fingerprint(),
+            identity.subject().map(str::to_owned),
+            identity.bound_site_fingerprint(),
+        );
+        Box::pin(async move { self.resolve(&site_identity).await })
+    }
+}
+
+/// One accepted connection and its admission decision (audit follow-up F4).
+#[derive(Debug)]
+pub struct AcceptedCenterConnection {
+    connection: CenterConnection,
+    site: ResolvedSite,
+}
+
+impl AcceptedCenterConnection {
+    /// The negotiated connection, ready for the frame loop.
+    #[must_use]
+    pub const fn connection(&self) -> &CenterConnection {
+        &self.connection
+    }
+
+    /// The resolved site of the admitted connection.
+    #[must_use]
+    pub const fn site(&self) -> &ResolvedSite {
+        &self.site
+    }
+
+    /// Consumes the accepted connection into its parts.
+    #[must_use]
+    pub fn into_parts(self) -> (CenterConnection, ResolvedSite) {
+        (self.connection, self.site)
     }
 }
 
@@ -479,28 +589,82 @@ impl CenterConnection {
         }
     }
 
+    /// The connection-establishment negotiation under the admission
+    /// decision (audit follow-up F4): the first frame must be a `Hello`,
+    /// and every `Hello` receives a `NegotiationResult` — an acceptance, a
+    /// protocol-level rejection, or the `not-bound` admission refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterAcceptError::AdmissionRejected`] when the admission
+    /// refuses the site (the site received its `not-bound` answer), and
+    /// [`CenterAcceptError::AdmissionLookup`] when the admission cannot be
+    /// resolved (the connection is refused without an answer).
+    async fn complete_negotiation_with_admission<A: CenterAdmissionResolver + ?Sized>(
+        &mut self,
+        admission: &A,
+    ) -> Result<ResolvedSite, CenterAcceptError> {
+        let hello = self.receive_hello().await?;
+        match negotiate(&hello) {
+            NegotiationDecision::Compatible => {
+                // The admission runs before the acceptance answer: only a
+                // site whose binding is in force is accepted; a refused
+                // site learns the `not-bound` reason instead of being
+                // accepted and dropped after the negotiation.
+                match admission.resolve(&self.identity).await {
+                    Ok(AdmissionVerdict::Admitted(site)) => {
+                        self.send(EnvelopeMessage::NegotiationResult(NegotiationResult {
+                            accepted: true,
+                            reason: String::new(),
+                        }))
+                        .await
+                        .map_err(CenterAcceptError::NegotiationReply)?;
+                        Ok(site)
+                    }
+                    Ok(AdmissionVerdict::Rejected { reason }) => {
+                        // The refusal answer is best-effort, exactly like
+                        // the protocol-level rejection: the site must learn
+                        // that its binding is not in force, but a failing
+                        // transport must not mask the refusal itself.
+                        let _ = self
+                            .send(EnvelopeMessage::NegotiationResult(NegotiationResult {
+                                accepted: false,
+                                reason: NegotiationReason::NotBound.as_str().to_owned(),
+                            }))
+                            .await;
+                        Err(CenterAcceptError::AdmissionRejected { reason })
+                    }
+                    Err(source) => {
+                        // The admission lookup failed: the center cannot
+                        // verify the site, so the connection is refused
+                        // without an answer — a transient verdict, never a
+                        // `not-bound` one, because a broken center must not
+                        // converge the site's binding.
+                        Err(CenterAcceptError::AdmissionLookup { source })
+                    }
+                }
+            }
+            NegotiationDecision::Rejected { reason } => {
+                // The rejection answer is best-effort: the site must learn
+                // why it cannot join, but a failing transport must not mask
+                // the rejection itself.
+                let _ = self
+                    .send(EnvelopeMessage::NegotiationResult(NegotiationResult {
+                        accepted: false,
+                        reason: reason.as_str().to_owned(),
+                    }))
+                    .await;
+                Err(CenterAcceptError::NegotiationRejected { reason })
+            }
+        }
+    }
+
     /// The connection-establishment negotiation (§15.3): the first frame
     /// must be a `Hello`, and every `Hello` receives a `NegotiationResult`
     /// — an acceptance, or the stable reason code of the first failed
     /// check.
     async fn complete_negotiation(&mut self) -> Result<(), CenterAcceptError> {
-        let first = tokio::time::timeout(self.options.handshake_timeout, self.ws.next())
-            .await
-            .map_err(|_| CenterAcceptError::HelloTimeout {
-                timeout: self.options.handshake_timeout,
-            })?
-            .ok_or(CenterAcceptError::Closed)?
-            .map_err(|error| CenterAcceptError::Transport(Box::new(error)))?;
-        let envelope = match inbound_frame(first).map_err(CenterAcceptError::Frame)? {
-            InboundFrame::Envelope(envelope) => envelope,
-            InboundFrame::Control => return Err(CenterAcceptError::ExpectedHello),
-            InboundFrame::Closed => return Err(CenterAcceptError::Closed),
-            InboundFrame::ProtocolViolation => return Err(CenterAcceptError::ProtocolViolation),
-        };
-        let Some(EnvelopeMessage::Hello(hello)) = envelope.message else {
-            return Err(CenterAcceptError::ExpectedHello);
-        };
-        self.acked_sequence = envelope.sequence;
+        let hello = self.receive_hello().await?;
         match negotiate(&hello) {
             NegotiationDecision::Compatible => {
                 self.send(EnvelopeMessage::NegotiationResult(NegotiationResult {
@@ -524,6 +688,29 @@ impl CenterConnection {
                 Err(CenterAcceptError::NegotiationRejected { reason })
             }
         }
+    }
+
+    /// Receives the first frame of one connection and validates it as a
+    /// `Hello` (§15.3), recording its sequence as the peer's watermark.
+    async fn receive_hello(&mut self) -> Result<Hello, CenterAcceptError> {
+        let first = tokio::time::timeout(self.options.handshake_timeout, self.ws.next())
+            .await
+            .map_err(|_| CenterAcceptError::HelloTimeout {
+                timeout: self.options.handshake_timeout,
+            })?
+            .ok_or(CenterAcceptError::Closed)?
+            .map_err(|error| CenterAcceptError::Transport(Box::new(error)))?;
+        let envelope = match inbound_frame(first).map_err(CenterAcceptError::Frame)? {
+            InboundFrame::Envelope(envelope) => envelope,
+            InboundFrame::Control => return Err(CenterAcceptError::ExpectedHello),
+            InboundFrame::Closed => return Err(CenterAcceptError::Closed),
+            InboundFrame::ProtocolViolation => return Err(CenterAcceptError::ProtocolViolation),
+        };
+        let Some(EnvelopeMessage::Hello(hello)) = envelope.message else {
+            return Err(CenterAcceptError::ExpectedHello);
+        };
+        self.acked_sequence = envelope.sequence;
+        Ok(hello)
     }
 }
 
@@ -682,6 +869,18 @@ pub enum CenterAcceptError {
     NegotiationRejected { reason: NegotiationReason },
     #[error("failed to answer the Hello: {0}")]
     NegotiationReply(#[from] CenterConnectionError),
+    /// The admission refused the site (audit follow-up F4): the site
+    /// received its `not-bound` `NegotiationResult` before the connection
+    /// closed, so it can converge instead of retrying forever.
+    #[error("admission refused the site: {reason}")]
+    AdmissionRejected { reason: AdmissionRejection },
+    /// The admission lookup failed; the connection is refused without an
+    /// answer (a transient verdict, never a `not-bound` one — a broken
+    /// center must not converge the site's binding).
+    #[error("the admission lookup failed: {source}")]
+    AdmissionLookup {
+        source: CenterSessionAdmissionError<CenterBindingRepositoryError>,
+    },
 }
 
 /// A controlled failure on one established center connection.

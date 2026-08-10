@@ -362,6 +362,15 @@ pub struct CenterSyncOptions {
     pub event_batch_limit: u64,
     /// The chunk size of one center artifact transfer.
     pub artifact_chunk_bytes: usize,
+    /// How many consecutive `not-bound` connect refusals end the engine
+    /// (audit follow-up F4).
+    ///
+    /// The center answers the `Hello` of a site whose binding is not in
+    /// force with the `not-bound` reason; after this many consecutive such
+    /// refusals the engine returns [`CenterSyncError::NotBound`] and the
+    /// runtime converges the site's local binding. `None` disables the
+    /// convergence (the engine retries forever, the historical behavior).
+    pub not_bound_abort_after: Option<u64>,
 }
 
 impl Default for CenterSyncOptions {
@@ -372,6 +381,10 @@ impl Default for CenterSyncOptions {
             flush_limit: 64,
             event_batch_limit: 256,
             artifact_chunk_bytes: CENTER_ARTIFACT_CHUNK_BYTES,
+            // Three consecutive refusals: one transient drop is absorbed by
+            // the backoff, two still fit a flaky transport, three mean the
+            // center consistently says the site is not bound.
+            not_bound_abort_after: Some(3),
         }
     }
 }
@@ -490,12 +503,39 @@ where
         Stop: Future<Output = ()> + Send,
     {
         tokio::pin!(stop);
+        // The consecutive `not-bound` refusal count (audit follow-up F4):
+        // only consecutive refusals converge — a successful connection or
+        // any other failure resets the count, because the convergence
+        // verdict is the center consistently saying the site is not bound.
+        let mut consecutive_not_bound: u64 = 0;
         loop {
             let session = tokio::select! {
                 () = stop.as_mut() => return Ok(()),
                 result = self.transport.connect() => match result {
-                    Ok(session) => session,
+                    Ok(session) => {
+                        consecutive_not_bound = 0;
+                        session
+                    }
                     Err(error) => {
+                        if self.transport.is_not_bound(&error) {
+                            consecutive_not_bound += 1;
+                            if let Some(limit) = self.options.not_bound_abort_after
+                                && consecutive_not_bound >= limit
+                            {
+                                // The center consistently refuses the site
+                                // as not bound: its binding is not in force
+                                // on the center (revoked or re-bound), so
+                                // retrying is futile. The runtime converges
+                                // the local binding on this return.
+                                eprintln!(
+                                    "the center refused the connection {consecutive_not_bound} \
+                                     times as not bound; the site's binding is not in force"
+                                );
+                                return Err(CenterSyncError::NotBound);
+                            }
+                        } else {
+                            consecutive_not_bound = 0;
+                        }
                         // §15.3: a center without a common protocol version
                         // rejects the negotiation, and an unreachable center
                         // fails the attempt — either way the site keeps
@@ -1673,6 +1713,13 @@ pub enum CenterSyncError<
         #[source]
         source: std::io::Error,
     },
+    /// The center refused the connection as `not-bound` the configured
+    /// number of consecutive times (audit follow-up F4): the site's binding
+    /// is not in force on the center, so the engine stops instead of
+    /// retrying forever, and the runtime converges the site's local binding
+    /// on this return.
+    #[error("the center refused the connection as not bound")]
+    NotBound,
 }
 
 /// Why a stored sync cursor value cannot be interpreted.
@@ -2451,6 +2498,7 @@ mod tests {
             flush_limit: 64,
             event_batch_limit: 256,
             artifact_chunk_bytes: CENTER_ARTIFACT_CHUNK_BYTES,
+            not_bound_abort_after: None,
         }
     }
 

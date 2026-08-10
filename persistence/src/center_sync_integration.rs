@@ -115,6 +115,7 @@ fn engine_options() -> CenterSyncOptions {
         flush_limit: 64,
         event_batch_limit: 256,
         artifact_chunk_bytes: 1024 * 1024,
+        not_bound_abort_after: None,
     }
 }
 

@@ -53,6 +53,19 @@ pub trait CenterTransport: Send + Sync {
     /// including a center that rejects the negotiation with its stable
     /// reason code.
     fn connect(&self) -> BoundaryFuture<'_, Result<Self::Session, Self::Error>>;
+
+    /// Reports whether one connect failure is the center's `not-bound`
+    /// admission refusal (audit follow-up F4).
+    ///
+    /// The default treats no failure as an admission refusal, so a
+    /// transport that never classifies its errors keeps the historical
+    /// behavior: every connect failure is transient and the §15.4 backoff
+    /// retries it. A transport that knows the `not-bound` reason code
+    /// overrides this, and the engine uses the classification to converge
+    /// the site after the center revoked its binding.
+    fn is_not_bound(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 impl<Transport> CenterTransport for &Transport
@@ -64,6 +77,10 @@ where
 
     fn connect(&self) -> BoundaryFuture<'_, Result<Self::Session, Self::Error>> {
         Transport::connect(*self)
+    }
+
+    fn is_not_bound(&self, error: &Self::Error) -> bool {
+        Transport::is_not_bound(*self, error)
     }
 }
 

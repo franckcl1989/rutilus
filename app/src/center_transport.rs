@@ -20,6 +20,13 @@ impl CenterTransport for CenterClientConfig {
     fn connect(&self) -> BoundaryFuture<'_, Result<Self::Session, Self::Error>> {
         Box::pin(async move { self.connect().await.map(CenterLinkSession) })
     }
+
+    fn is_not_bound(&self, error: &Self::Error) -> bool {
+        // The client classifies the `not-bound` admission refusal at
+        // negotiation time (audit follow-up F4); every other failure stays
+        // transient.
+        matches!(error, CenterClientError::NotBound)
+    }
 }
 
 /// One established site-to-center connection presented as the application's

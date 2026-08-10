@@ -23,8 +23,9 @@ pub use backup::{
     BackupError, BackupKeyUnlock, BackupOutcome, RestoreOutcome, create_backup, restore_backup,
 };
 pub use center_acceptor::{
-    CenterAcceptError, CenterAcceptor, CenterAcceptorError, CenterAcceptorOptions,
-    CenterConnection, CenterConnectionError, ClientIdentity,
+    AcceptedCenterConnection, CenterAcceptError, CenterAcceptor, CenterAcceptorError,
+    CenterAcceptorOptions, CenterAdmissionResolver, CenterConnection, CenterConnectionError,
+    ClientIdentity,
 };
 pub use center_ca::{CenterCa, CenterCaError, SiteClientCertificate};
 pub use center_client::{CenterClientConfig, CenterClientError, CenterClientOptions, CenterLink};
@@ -46,8 +47,8 @@ pub use onboarding_runtime::{
 };
 pub use site_runtime::{
     ListenAddress, ListenAddressError, SiteBinding, SiteConfigError, SiteInstallError,
-    SiteRunError, SiteRunOptions, SiteTls, SiteTlsError, has_system_master_key,
-    rewrap_to_system_unlock, run_site,
+    SiteRunError, SiteRunOptions, SiteTls, SiteTlsError, UnbindError, UnbindOutcome,
+    has_system_master_key, rewrap_to_system_unlock, run_site, unbind_from_center,
 };
 pub use standalone_runtime::{
     StandaloneBinding, StandaloneExecutionError, StandaloneInstance, StandaloneInstanceCloseError,

@@ -53,6 +53,18 @@ enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    /// Remove the site's center binding and material (offline).
+    ///
+    /// The running site also converges on its own: a center that refuses
+    /// the site's connection as not bound revokes the local binding and
+    /// stops the sync engine (0.7.0 F4). This command is the operator path
+    /// that ends the center relationship without the center; like backup,
+    /// it refuses to run while the site console owns the instance.
+    Unbind {
+        /// Use the data directory beside the executable.
+        #[arg(long)]
+        portable: bool,
+    },
     /// Self-check the data directory, database, master key, service, and TLS.
     Doctor {
         /// Use the data directory beside the executable.
@@ -188,6 +200,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         } => run(portable, no_open, posture).await?,
         Command::Service { command } => service(command).await?,
         Command::Backup { command } => backup(command).await?,
+        Command::Unbind { portable } => unbind(portable).await?,
         Command::Doctor { portable } => doctor(portable).await?,
         Command::Licenses => print_licenses(),
         Command::Version => print_version(),
@@ -217,6 +230,30 @@ async fn backup(command: BackupCommand) -> Result<(), Box<dyn Error>> {
                 outcome.restored_entries(),
                 outcome.pending_migrations()
             );
+        }
+    }
+    Ok(())
+}
+
+/// The unbind command (0.7.0 F4): the offline operator path that ends the
+/// site's center relationship, mirroring the backup commands' unlock
+/// discipline and refusing to run while the site console owns the
+/// instance.
+async fn unbind(portable: bool) -> Result<(), Box<dyn Error>> {
+    let paths = resolve_location(portable)?;
+    let unlock = if has_system_master_key(&paths) {
+        None
+    } else {
+        let terminal = Term::stderr();
+        let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
+        Some(StandaloneUnlock::existing(passphrase)?)
+    };
+    match rutilus::unbind_from_center(&paths, unlock.as_ref()).await? {
+        rutilus::UnbindOutcome::Unbound => {
+            println!("The site's center binding was revoked and its center material removed.");
+        }
+        rutilus::UnbindOutcome::AlreadyUnbound => {
+            println!("The site has no center binding in force; nothing changed.");
         }
     }
     Ok(())

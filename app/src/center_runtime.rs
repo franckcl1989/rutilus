@@ -44,11 +44,11 @@ use std::{
 };
 
 use rutilus_application::{
-    AdmissionVerdict, BoundaryFuture, CenterBindingFlow, CenterBindingFlowError,
-    CenterBindingRepository, CenterDispatchError, CenterFrameProcessor, CenterInboundEngine,
-    CenterInboundOptions, CenterInboundSession, CenterOperationDispatch, CenterOperationRequest,
+    BoundaryFuture, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
+    CenterDispatchError, CenterFrameProcessor, CenterInboundEngine, CenterInboundOptions,
+    CenterInboundSession, CenterOperationDispatch, CenterOperationRequest,
     CenterOperationTracking, CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock,
-    InstanceRepository, IssuedSiteCertificate, OperationStore, SiteCertificateIssuer, SiteIdentity,
+    InstanceRepository, IssuedSiteCertificate, OperationStore, SiteCertificateIssuer,
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
@@ -68,10 +68,11 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    CenterAcceptor, CenterAcceptorError, CenterAcceptorOptions, CenterCa, CenterCaError,
-    CenterConnection, CenterConnectionError, ListenAddress, SiteBinding, SiteRunError,
-    SiteRunOptions, StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError,
-    StandaloneUnlock, SystemClock, scheduler, standalone_runtime::StandaloneState,
+    AcceptedCenterConnection, CenterAcceptError, CenterAcceptor, CenterAcceptorError,
+    CenterAcceptorOptions, CenterCa, CenterCaError, CenterConnection, CenterConnectionError,
+    ListenAddress, SiteBinding, SiteRunError, SiteRunOptions, StandaloneInstance,
+    StandaloneInstanceCloseError, StandaloneInstanceError, StandaloneUnlock, SystemClock,
+    scheduler, standalone_runtime::StandaloneState,
 };
 use rutilus_infra_redfish::RedfishGateway;
 
@@ -728,6 +729,10 @@ fn center_banner(console_url: &str, acceptor: &CenterAcceptor) -> String {
 /// The center's inbound accept loop: one admission and engine task per
 /// accepted connection, until the stop watch fires, then every in-flight
 /// connection is joined.
+///
+/// The admission is resolved inside the accept (audit follow-up F4): a
+/// refused site receives its `not-bound` `NegotiationResult` at negotiation
+/// time, so it converges its local binding instead of retrying forever.
 async fn run_center_accept_loop(
     mut stop: scheduler::StopWatch,
     state: Arc<StandaloneState>,
@@ -735,17 +740,26 @@ async fn run_center_accept_loop(
 ) {
     let mut acceptor = acceptor;
     let mut connections = Vec::new();
+    // One admission resolver shared by every accept: it reads the store,
+    // which the accept loop owns for its whole lifetime.
+    let admission = CenterSessionAdmission::new(&state.store);
     loop {
         tokio::select! {
             () = stop.stopped() => break,
-            accepted = acceptor.accept() => {
+            accepted = acceptor.accept_with_admission(&admission) => {
                 match accepted {
-                    Ok(connection) => {
+                    Ok(accepted) => {
                         connections.push(tokio::spawn(run_center_connection(
                             Arc::clone(&state),
-                            connection,
+                            accepted,
                             stop.clone(),
                         )));
+                    }
+                    Err(CenterAcceptError::AdmissionRejected { reason }) => {
+                        // The site received its `not-bound` answer already;
+                        // one refused site is one client's problem and the
+                        // listener keeps accepting (§15.7 local autonomy).
+                        eprintln!("center refused the connection: {reason}");
                     }
                     Err(error) => {
                         // One failed handshake is one client's problem; the
@@ -761,48 +775,25 @@ async fn run_center_accept_loop(
     }
 }
 
-/// Runs one accepted inbound connection: the S5 admission resolution, the
-/// online-registry registration, and the §15.4 inbound engine loop.
+/// Runs one accepted, admitted inbound connection: the online-registry
+/// registration and the §15.4 inbound engine loop.
 ///
-/// The connection task owns its Arc clones of the instance state, so every
-/// repository reference is built inside the task; the engine observes the
-/// shared stop watch and the registry removes the site on every exit.
+/// The admission decision was resolved inside the accept (audit follow-up
+/// F4), so the task starts from the resolved site. The connection task
+/// owns its Arc clones of the instance state, so every repository
+/// reference is built inside the task; the engine observes the shared stop
+/// watch and the registry removes the site on every exit.
 async fn run_center_connection(
     state: Arc<StandaloneState>,
-    connection: CenterConnection,
+    accepted: AcceptedCenterConnection,
     stop: scheduler::StopWatch,
 ) {
+    let (connection, site) = accepted.into_parts();
     let store = &state.store;
-    let admission = CenterSessionAdmission::new(store);
     let processor = CenterFrameProcessor::new(
         CenterProjection::new(store, store),
         CenterOperationTracking::new(store, store),
     );
-    let identity = connection.identity();
-    let site_identity = SiteIdentity::from_parts(
-        identity.fingerprint(),
-        identity.subject().map(str::to_owned),
-        identity.bound_site_fingerprint(),
-    );
-    let verdict = match admission.resolve(&site_identity).await {
-        Ok(verdict) => verdict,
-        Err(error) => {
-            eprintln!("center admission lookup failed: {error}");
-            return;
-        }
-    };
-    let site = match verdict {
-        AdmissionVerdict::Admitted(site) => site,
-        AdmissionVerdict::Rejected { reason } => {
-            // §15.1: only bound sites may connect; the refusal is logged
-            // with the stable reason (the S3b cross-validation verdict).
-            eprintln!(
-                "center refused the connection from {}: {reason}",
-                identity.fingerprint()
-            );
-            return;
-        }
-    };
     if let Err(error) = state
         .registry
         .mark_connected(site.clone(), SystemClock.now())
