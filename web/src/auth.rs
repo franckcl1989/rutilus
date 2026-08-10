@@ -775,10 +775,18 @@ const ROUTE_TABLE: &[(Method, &str, RouteAccess)] = &[
     ),
 ];
 
-/// Resolves the authorization of one request path.
-fn route_access(method: &Method, path: &str) -> RouteAccess {
+/// Resolves the authorization of one request path under one console scope.
+///
+/// The center management entries of [`ROUTE_TABLE`] exist only on the Center
+/// console (audit follow-up F2): an Edge console does not register the
+/// `/api/v1/center/*` routes, so its authorization table must not name them
+/// either — the surface is absent in both the router and the middleware.
+fn route_access(method: &Method, path: &str, scope: crate::ConsoleScope) -> RouteAccess {
     for (route_method, pattern, access) in ROUTE_TABLE {
         if route_method != method {
+            continue;
+        }
+        if pattern.starts_with(CENTER_SURFACE_PREFIX) && scope != crate::ConsoleScope::Center {
             continue;
         }
         let matches = if let Some(prefix) = pattern.strip_suffix('*') {
@@ -794,6 +802,9 @@ fn route_access(method: &Method, path: &str) -> RouteAccess {
     // public: the console must load before a session exists.
     RouteAccess::Public
 }
+
+/// The shared prefix of every center management route.
+const CENTER_SURFACE_PREFIX: &str = "/api/v1/center";
 
 /// The per-request authentication state shared with the handlers.
 #[derive(Clone, Debug)]
@@ -896,7 +907,11 @@ where
     Services: AuditEventWriter + AuthServices,
     Time: Clock,
 {
-    let access = route_access(request.method(), request.uri().path());
+    let access = route_access(
+        request.method(),
+        request.uri().path(),
+        crate::ConsoleScope::of(state.origin),
+    );
     let guarded = state.auth.policy().is_guarded();
     let (uri, headers) = (request.uri().clone(), request.headers().clone());
 
@@ -2121,40 +2136,50 @@ mod tests {
         assert!(!RoleMask::ADMINISTRATOR_OR_OPERATOR.allows(Role::Viewer));
     }
 
+    /// The authorization verdict of one path on the Edge console surface.
+    fn edge_access(method: &Method, path: &str) -> RouteAccess {
+        route_access(method, path, crate::ConsoleScope::Edge)
+    }
+
+    /// The authorization verdict of one path on the Center console surface.
+    fn center_access(method: &Method, path: &str) -> RouteAccess {
+        route_access(method, path, crate::ConsoleScope::Center)
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn route_table_pins_the_authorization_matrix() {
         // Public sign-in surface.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/health"),
+            edge_access(&Method::GET, "/api/v1/health"),
             RouteAccess::Public
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/auth/login"),
+            edge_access(&Method::POST, "/api/v1/auth/login"),
             RouteAccess::Public
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/auth/bootstrap"),
+            edge_access(&Method::POST, "/api/v1/auth/bootstrap"),
             RouteAccess::Public
         );
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/auth/me"),
+            edge_access(&Method::GET, "/api/v1/auth/me"),
             RouteAccess::Public
         );
         // Static assets and the fallback stay public.
-        assert_eq!(route_access(&Method::GET, "/app.css"), RouteAccess::Public);
-        assert_eq!(route_access(&Method::GET, "/missing"), RouteAccess::Public);
+        assert_eq!(edge_access(&Method::GET, "/app.css"), RouteAccess::Public);
+        assert_eq!(edge_access(&Method::GET, "/missing"), RouteAccess::Public);
 
         // Every-role reads.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/endpoints"),
+            edge_access(&Method::GET, "/api/v1/endpoints"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/endpoints/6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f/resources"
             ),
@@ -2164,14 +2189,14 @@ mod tests {
             }
         );
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/operations"),
+            edge_access(&Method::GET, "/api/v1/operations"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/operations/77f4e8c1-91a0-4b3e-8a5d-000000000001"
             ),
@@ -2181,14 +2206,14 @@ mod tests {
             }
         );
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/batches"),
+            edge_access(&Method::GET, "/api/v1/batches"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/batches/77f4e8c1-91a0-4b3e-8a5d-000000000002"
             ),
@@ -2199,7 +2224,7 @@ mod tests {
         );
         // Administrator+Operator writes.
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/operations"),
+            edge_access(&Method::POST, "/api/v1/operations"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_OR_OPERATOR,
                 mutation: true
@@ -2208,14 +2233,14 @@ mod tests {
         // Artifact reads are every role; the upload, chunk, and finalize
         // writes are Administrator+Operator with the CSRF requirement.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/artifacts"),
+            edge_access(&Method::GET, "/api/v1/artifacts"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/artifacts/77f4e8c1-91a0-4b3e-8a5d-000000000003"
             ),
@@ -2225,14 +2250,14 @@ mod tests {
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/artifacts"),
+            edge_access(&Method::POST, "/api/v1/artifacts"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_OR_OPERATOR,
                 mutation: true
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::POST,
                 "/api/v1/artifacts/77f4e8c1-91a0-4b3e-8a5d-000000000003/chunks"
             ),
@@ -2242,7 +2267,7 @@ mod tests {
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::POST,
                 "/api/v1/artifacts/77f4e8c1-91a0-4b3e-8a5d-000000000003/finalize"
             ),
@@ -2253,28 +2278,28 @@ mod tests {
         );
         // Administrator-only surfaces.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/credentials"),
+            edge_access(&Method::GET, "/api/v1/credentials"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/credentials"),
+            edge_access(&Method::POST, "/api/v1/credentials"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: true
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/endpoints/trust"),
+            edge_access(&Method::POST, "/api/v1/endpoints/trust"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: true
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::POST,
                 "/api/v1/endpoints/trust/9f3d1c2a-3b6e-4f8a-9c1d-000000000001/expect"
             ),
@@ -2285,14 +2310,14 @@ mod tests {
         );
         // The address-specific POSTs precede the enrollment route.
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/endpoints/refresh"),
+            edge_access(&Method::POST, "/api/v1/endpoints/refresh"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: true
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/endpoints"),
+            edge_access(&Method::POST, "/api/v1/endpoints"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: true
@@ -2301,14 +2326,14 @@ mod tests {
         // Group and telemetry reads are every role, including the
         // parameterized details.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/groups"),
+            edge_access(&Method::GET, "/api/v1/groups"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/groups/77f4e8c1-91a0-4b3e-8a5d-000000000004"
             ),
@@ -2318,14 +2343,14 @@ mod tests {
             }
         );
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/telemetry"),
+            edge_access(&Method::GET, "/api/v1/telemetry"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(
+            edge_access(
                 &Method::GET,
                 "/api/v1/telemetry/77f4e8c1-91a0-4b3e-8a5d-000000000005/samples"
             ),
@@ -2336,23 +2361,57 @@ mod tests {
         );
         // The administration surface requires a session in every mode.
         assert_eq!(
-            route_access(&Method::GET, "/api/v1/admin/users"),
+            edge_access(&Method::GET, "/api/v1/admin/users"),
             RouteAccess::Always {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: false
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/admin/users/some-uuid/state"),
+            edge_access(&Method::POST, "/api/v1/admin/users/some-uuid/state"),
             RouteAccess::Always {
                 roles: RoleMask::ADMINISTRATOR_ONLY,
                 mutation: true
             }
         );
         assert_eq!(
-            route_access(&Method::POST, "/api/v1/auth/logout"),
+            edge_access(&Method::POST, "/api/v1/auth/logout"),
             RouteAccess::Always {
                 roles: RoleMask::ANY,
+                mutation: true
+            }
+        );
+
+        // The center management surface is Center-only (audit follow-up
+        // F2): on an Edge console the routes are not registered, so the
+        // authorization table treats the paths as public fallback paths —
+        // they resolve to the static-asset 404, never to a handler.
+        assert_eq!(
+            edge_access(&Method::GET, "/api/v1/center/sites"),
+            RouteAccess::Public
+        );
+        assert_eq!(
+            edge_access(&Method::POST, "/api/v1/center/operations"),
+            RouteAccess::Public
+        );
+        assert_eq!(
+            center_access(&Method::GET, "/api/v1/center/sites"),
+            RouteAccess::GuardedOnly {
+                roles: RoleMask::ANY,
+                mutation: false
+            }
+        );
+        assert_eq!(
+            center_access(&Method::POST, "/api/v1/center/bindings"),
+            RouteAccess::GuardedOnly {
+                roles: RoleMask::ADMINISTRATOR_ONLY,
+                mutation: true
+            }
+        );
+        assert_eq!(
+            center_access(&Method::POST, "/api/v1/center/operations"),
+            RouteAccess::GuardedOnly {
+                roles: RoleMask::ADMINISTRATOR_OR_OPERATOR,
                 mutation: true
             }
         );

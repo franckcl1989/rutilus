@@ -543,6 +543,7 @@ impl SiteBinding {
     /// Returns an I/O error if the bound listener fails while serving.
     pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
+        posture: DeploymentPosture,
         policy: AuthPolicy,
         services: Arc<Services>,
         gateway: Arc<Gateway>,
@@ -556,10 +557,14 @@ impl SiteBinding {
         Shutdown: Future<Output = ()> + Send + 'static,
     {
         let url = self.url();
+        // The posture decides the console route surface (audit follow-up
+        // F2): the Site posture serves the Edge surface, and the Center
+        // posture serves the aggregation surface — one listener type, two
+        // surfaces.
         let router = router_with_auth(
             WebProductInfo::new(env!("CARGO_PKG_VERSION"), NV_REDFISH_DEVELOPMENT_BASELINE),
             AuditActor::LocalOperator,
-            DeploymentPosture::Site,
+            posture,
             policy,
             services,
             gateway,
@@ -713,6 +718,7 @@ where
             gateway,
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
+                    DeploymentPosture::Site,
                     policy,
                     services_for_server,
                     gateway_for_server,

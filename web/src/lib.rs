@@ -627,6 +627,39 @@ pub trait CenterServices: Send + Sync {
     ) -> BoundaryFuture<'_, Result<DispatchedCenterOperation, CenterOperationRefusal>>;
 }
 
+/// The console route surface of one deployment posture (audit follow-up
+/// F2 — the posture surfaces must not bleed into each other).
+///
+/// The Edge postures (Standalone/Site) serve every local-management route
+/// and none of the `/api/v1/center/*` management surface — the site console
+/// must never dispatch center operations or manage center bindings. The
+/// Center posture serves the authentication, administration, audit, and
+/// center aggregation surface and none of the direct-BMC routes — an
+/// administrator on the center console cannot enroll endpoints, manage
+/// credentials, or reach any route that talks to a BMC (§15.1 — the center
+/// never enters the customer network; 0.7.0 acceptance "Center 不连接
+/// BMC"). The scope is a property of the running posture, never of the
+/// request, so the two routers are assembled by [`router_with_auth`] from
+/// the posture the runtime serves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsoleScope {
+    /// The Standalone and Site postures: the full local-management surface.
+    Edge,
+    /// The Center posture: aggregation and administration only.
+    Center,
+}
+
+impl ConsoleScope {
+    /// The console scope of one running posture.
+    #[must_use]
+    pub const fn of(origin: DeploymentPosture) -> Self {
+        match origin {
+            DeploymentPosture::Standalone | DeploymentPosture::Site => Self::Edge,
+            DeploymentPosture::Center => Self::Center,
+        }
+    }
+}
+
 pub(crate) struct WebState<Services, Gateway, Time> {
     pub(crate) product: WebProductInfo,
     pub(crate) actor: AuditActor,
@@ -666,8 +699,11 @@ where
 /// runtime and a future Site listener use [`router_with_auth`] to enforce
 /// the §16.2 session model.
 ///
-/// The function is a declarative route table; the line count grows with the
-/// product surface, so the lint is not a signal here.
+/// The route surface follows the running posture ([`ConsoleScope`], audit
+/// follow-up F2): the Edge postures get the full local-management surface
+/// without the `/api/v1/center/*` management routes, and the Center posture
+/// gets the aggregation and administration surface without any direct-BMC
+/// route.
 #[allow(clippy::too_many_lines)]
 pub fn router<Services, Gateway, Time>(
     product: WebProductInfo,
@@ -693,7 +729,9 @@ where
     )
 }
 
-/// Builds the local Web application under one §16.2 session policy.
+/// Builds the local Web application under one §16.2 session policy and the
+/// route surface of the running posture ([`ConsoleScope`], audit follow-up
+/// F2).
 ///
 /// The session middleware runs on every route: in `Open` mode it only
 /// resolves the unauthenticated actor, while `Guarded` (and an armed
@@ -702,8 +740,12 @@ where
 /// boundaries are composed from the same injected services bundle as the
 /// product boundaries.
 ///
-/// The function is a declarative route table; the line count grows with the
-/// product surface, so the lint is not a signal here.
+/// The posture decides the assembled surface, and the service bound stays
+/// the union of both surfaces because the runtimes inject one services
+/// bundle. The posture builders themselves — [`edge_router_with_auth`] and
+/// [`center_router_with_auth`] — carry only the boundaries their surface
+/// needs, so a center router cannot be assembled over edge-only services
+/// and vice versa.
 #[allow(clippy::too_many_lines)]
 pub fn router_with_auth<Services, Gateway, Time>(
     product: WebProductInfo,
@@ -719,6 +761,43 @@ where
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
+    match ConsoleScope::of(origin) {
+        ConsoleScope::Edge => {
+            edge_router_with_auth(product, actor, origin, policy, services, gateway, clock)
+        }
+        ConsoleScope::Center => {
+            center_router_with_auth(product, actor, origin, policy, services, gateway, clock)
+        }
+    }
+}
+
+/// The Edge route surface (audit follow-up F2): every local-management
+/// route, and no `/api/v1/center/*` route.
+///
+/// The bound is [`ProductServices`] — every boundary the local-management
+/// surface composes — plus [`AuthServices`]. [`CenterServices`] is
+/// deliberately absent: an Edge console cannot be assembled over a
+/// center-only services bundle, and its route table never registers the
+/// center management surface the S6/S7 dispatcher would otherwise silently
+/// drop.
+///
+/// The function is a declarative route table; the line count grows with the
+/// product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
+fn edge_router_with_auth<Services, Gateway, Time>(
+    product: WebProductInfo,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+    policy: AuthPolicy,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
+) -> Router
+where
+    Services: ProductServices + AuthServices + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
+{
     let state = WebState {
         product,
         actor,
@@ -728,7 +807,7 @@ where
         gateway,
         clock,
     };
-    Router::new()
+    let router = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/about", get(about::<Services, Gateway, Time>))
         .route(
@@ -863,6 +942,92 @@ where
             delete(remove_tag::<Services, Gateway, Time>),
         )
         .route(
+            "/api/v1/auth/login",
+            post(auth::login::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/logout",
+            post(auth::logout::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/bootstrap",
+            post(auth::bootstrap_complete::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/auth/password",
+            post(auth::change_password::<Services, Gateway, Time>),
+        )
+        .route("/api/v1/auth/me", get(auth::me::<Services, Gateway, Time>))
+        .route(
+            "/api/v1/admin/sessions",
+            get(auth::list_sessions::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/sessions",
+            post(auth::revoke_session::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users",
+            get(auth::list_users::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users",
+            post(auth::create_user::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users/{principal_id}/state",
+            post(auth::set_user_state::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/admin/users/{principal_id}/role",
+            post(auth::assign_user_role::<Services, Gateway, Time>),
+        );
+    finish_console_surface(router, state)
+}
+
+/// The Center route surface (audit follow-up F2): the authentication,
+/// administration, audit, and center aggregation routes — and nothing that
+/// talks to a BMC.
+///
+/// The bound is [`CenterServices`] — the §15.5/§15.6 aggregation boundary —
+/// plus [`AuthServices`], [`AuditEventWriter`], and [`AuditEventQuery`].
+/// Every edge boundary is deliberately absent: a center console cannot
+/// enroll an endpoint, manage credentials, refresh a BMC, or read
+/// telemetry, because no route of the surface composes those boundaries
+/// (§15.1 — the center never enters the customer network; 0.7.0 acceptance
+/// "Center 不连接 BMC").
+///
+/// The function is a declarative route table; the line count grows with the
+/// product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
+fn center_router_with_auth<Services, Gateway, Time>(
+    product: WebProductInfo,
+    actor: AuditActor,
+    origin: DeploymentPosture,
+    policy: AuthPolicy,
+    services: Arc<Services>,
+    gateway: Arc<Gateway>,
+    clock: Time,
+) -> Router
+where
+    Services: CenterServices + AuthServices + AuditEventWriter + AuditEventQuery + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
+{
+    let state = WebState {
+        product,
+        actor,
+        origin,
+        auth: auth::AuthState::new(policy),
+        services,
+        gateway,
+        clock,
+    };
+    let router = Router::new()
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/about", get(about::<Services, Gateway, Time>))
+        .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
+        .route(
             "/api/v1/center/sites",
             get(center_sites::<Services, Gateway, Time>),
         )
@@ -926,7 +1091,28 @@ where
         .route(
             "/api/v1/admin/users/{principal_id}/role",
             post(auth::assign_user_role::<Services, Gateway, Time>),
-        )
+        );
+    finish_console_surface(router, state)
+}
+
+/// The shared router tail: the SPA fallback, the state, the session
+/// middleware, and the security headers. The header and middleware stack is
+/// identical for both postures, so the two route tables share one tail.
+///
+/// The router arrives with its state type already fixed by the handler
+/// extractors (`State<WebState<..>>`), and the tail re-states it exactly
+/// like the pre-F2 route table did; the name is the "console surface" both
+/// postures share, never the Edge surface only.
+fn finish_console_surface<Services, Gateway, Time>(
+    router: Router<WebState<Services, Gateway, Time>>,
+    state: WebState<Services, Gateway, Time>,
+) -> Router
+where
+    Services: AuthServices + AuditEventWriter + Send + Sync + 'static,
+    Gateway: Send + Sync + 'static,
+    Time: Clock + Clone + Send + Sync + 'static,
+{
+    router
         .fallback(static_asset)
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -3106,7 +3292,11 @@ where
     let visible = operations
         .into_iter()
         .filter(|operation| {
-            operation.site_id().is_none_or(|site| {
+            // An operation without a site association is a broken row; like
+            // the endpoint projection, only a site-associated operation is
+            // ever shown — a scoped role must never see a row that has no
+            // site ownership to check it against (audit follow-up F1).
+            operation.site_id().is_some_and(|site| {
                 auth::view_scope_allows(context.role(), context.assignment_site_id(), site)
             })
         })
@@ -9733,6 +9923,165 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(state.revoked_owned()?, vec![site]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_console_never_registers_direct_bmc_routes() -> Result<(), Box<dyn Error>>
+    {
+        // Audit follow-up F2: the Center posture serves the aggregation
+        // surface only — every route that would enroll, refresh, or manage
+        // a BMC directly is absent, so an administrator on the center
+        // console cannot reach a single direct-BMC operation (§15.1, 0.7.0
+        // acceptance "Center 不连接 BMC").
+        let router = test_center_router(CenterTestState::default());
+        for path in [
+            "/api/v1/endpoints",
+            "/api/v1/endpoints/6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f/resources",
+            "/api/v1/credentials",
+            "/api/v1/operations",
+            "/api/v1/batches",
+            "/api/v1/artifacts",
+            "/api/v1/groups",
+            "/api/v1/tags",
+            "/api/v1/events",
+            "/api/v1/telemetry",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "the center console must not register {path}"
+            );
+        }
+        // The write surface is absent too: enrollment, trust, refresh,
+        // credential creation, and operation submission do not exist on the
+        // center console.
+        for (path, body) in [
+            ("/api/v1/endpoints", r#"{}"#),
+            ("/api/v1/endpoints/trust", r#"{}"#),
+            ("/api/v1/endpoints/refresh", r#"{}"#),
+            ("/api/v1/credentials", r#"{}"#),
+            ("/api/v1/operations", r#"{}"#),
+            ("/api/v1/artifacts", r#"{}"#),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "the center console must not register POST {path}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_edge_console_never_registers_the_center_management_routes()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up F2: the Edge postures serve the local-management
+        // surface only — the center binding, dispatch, and site-view routes
+        // are absent, so a site console cannot manage center bindings or
+        // dispatch center operations, and the S6/S7 dispatcher is never
+        // silently dropped on the edge.
+        let router = test_router();
+        for path in [
+            "/api/v1/center/sites",
+            "/api/v1/center/endpoints",
+            "/api/v1/center/operations",
+            "/api/v1/center/bindings",
+            "/api/v1/center/bindings/revoke",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "the edge console must not register {path}"
+            );
+        }
+        for path in [
+            "/api/v1/center/bindings",
+            "/api/v1/center/bindings/revoke",
+            "/api/v1/center/operations",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{}"#))?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "the edge console must not register POST {path}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_operation_view_hides_rows_without_a_site_association()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up F1: an operation without a site association is a
+        // broken row and is never shown — a scoped role must not see a row
+        // that has no site ownership to check it against, mirroring the
+        // endpoint projection.
+        let state = CenterTestState::default();
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+        let created = OffsetDateTime::UNIX_EPOCH;
+        state.seed_operation(CenterOperationView::new(
+            OperationId::generate(),
+            Some(site),
+            endpoint,
+            command.clone(),
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationState::Queued,
+            Some("admin".to_owned()),
+            Some(created + Duration::minutes(15)),
+            created,
+        ))?;
+        state.seed_operation(CenterOperationView::new(
+            OperationId::generate(),
+            None,
+            endpoint,
+            command,
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationState::Queued,
+            Some("admin".to_owned()),
+            Some(created + Duration::minutes(15)),
+            created,
+        ))?;
+        let router = test_center_router(state);
+
+        let response = router
+            .oneshot(Request::get("/api/v1/center/operations").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let operations = body["operations"]
+            .as_array()
+            .ok_or("operations must be an array")?;
+        assert_eq!(operations.len(), 1, "the site-less row must be hidden");
+        assert!(
+            operations[0]["site_id"].is_string(),
+            "the visible row must carry its site association"
+        );
         Ok(())
     }
 

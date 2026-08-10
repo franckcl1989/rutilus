@@ -52,8 +52,8 @@ use rutilus_application::{
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
-    CertificateFingerprint, EndpointId, InstanceId, InstanceKind, OperationId, PrincipalId,
-    RedfishCommand, ResourceODataId,
+    CertificateFingerprint, DeploymentPosture, EndpointId, InstanceId, InstanceKind, OperationId,
+    PrincipalId, RedfishCommand, ResourceODataId,
 };
 use rutilus_persistence::{
     CenterBindingRepositoryError, CenterOutboxRepositoryError, CenterProjectionRepositoryError,
@@ -677,10 +677,17 @@ where
         }
     };
     let services = Arc::clone(&state);
-    let server = binding.serve_until(policy, services, gateway, SystemClock, async move {
-        let mut stop = stop_watch;
-        stop.stopped().await;
-    });
+    let server = binding.serve_until(
+        DeploymentPosture::Center,
+        policy,
+        services,
+        gateway,
+        SystemClock,
+        async move {
+            let mut stop = stop_watch;
+            stop.stopped().await;
+        },
+    );
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => {

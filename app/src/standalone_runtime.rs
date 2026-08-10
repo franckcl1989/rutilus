@@ -1399,6 +1399,7 @@ impl StandaloneBinding {
     pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
         options: StandaloneRunOptions,
+        posture: DeploymentPosture,
         policy: AuthPolicy,
         services: Arc<Services>,
         gateway: Arc<Gateway>,
@@ -1421,7 +1422,7 @@ impl StandaloneBinding {
             router_with_auth(
                 WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
                 AuditActor::LocalOperator,
-                DeploymentPosture::Standalone,
+                posture,
                 policy,
                 services,
                 gateway,
@@ -1488,6 +1489,7 @@ where
     // path arms the policy from its bootstrap state.
     let server = binding.serve_until(
         options,
+        DeploymentPosture::Standalone,
         AuthPolicy::Open,
         services,
         gateway,
@@ -1549,6 +1551,7 @@ pub async fn run_initialized_standalone(
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
                     options,
+                    DeploymentPosture::Standalone,
                     policy,
                     services_for_server,
                     gateway_for_server,
@@ -2134,6 +2137,7 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let server = tokio::spawn(binding.serve_until(
             StandaloneRunOptions::new(false),
+            DeploymentPosture::Standalone,
             AuthPolicy::Open,
             Arc::clone(&instance.state),
             Arc::new(UnavailableGateway),
