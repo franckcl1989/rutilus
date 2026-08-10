@@ -246,6 +246,7 @@ async fn product_users_constraints_and_cascades_hold() -> Result<(), Box<dyn Err
         role: Set(String::from("administrator")),
         assigned_by: Set(Some(assigner_id)),
         assigned_at: Set(now),
+        site_id: Set(None),
     }
     .insert(&database)
     .await?;
@@ -254,6 +255,7 @@ async fn product_users_constraints_and_cascades_hold() -> Result<(), Box<dyn Err
         role: Set(String::from("superuser")),
         assigned_by: Set(None),
         assigned_at: Set(now),
+        site_id: Set(None),
     }
     .insert(&database)
     .await;

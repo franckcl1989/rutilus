@@ -182,6 +182,9 @@ async fn verify_resource_snapshot_constraints(
         display_name: Set(String::from("Snapshot BMC")),
         created_at: Set(now),
         updated_at: Set(now),
+        site_id: Set(None),
+        refresh_generation: Set(0),
+        health: Set(String::from("unknown")),
     }
     .insert(database)
     .await?;
@@ -402,6 +405,9 @@ async fn verify_endpoint_constraints(
         display_name: Set(String::from("Rack A BMC")),
         created_at: Set(now),
         updated_at: Set(now),
+        site_id: Set(None),
+        refresh_generation: Set(0),
+        health: Set(String::from("unknown")),
     }
     .insert(database)
     .await?;

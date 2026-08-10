@@ -7559,7 +7559,7 @@ mod tests {
             Box::pin(async move {
                 let inner = inner.lock().map_err(|_| MockWriteError)?;
                 Ok(inner.roles.get(&principal_id).copied().map(|role| {
-                    RoleAssignment::new(principal_id, role, None, OffsetDateTime::now_utc())
+                    RoleAssignment::new(principal_id, role, None, OffsetDateTime::now_utc(), None)
                 }))
             })
         }
@@ -7573,7 +7573,13 @@ mod tests {
                     .roles
                     .iter()
                     .map(|(principal_id, role)| {
-                        RoleAssignment::new(*principal_id, *role, None, OffsetDateTime::now_utc())
+                        RoleAssignment::new(
+                            *principal_id,
+                            *role,
+                            None,
+                            OffsetDateTime::now_utc(),
+                            None,
+                        )
                     })
                     .collect())
             })

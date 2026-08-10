@@ -212,6 +212,7 @@ async fn seed_bootstrap_administrator(store: &SqliteStore) -> Result<(), Initial
             Role::Administrator,
             None,
             now,
+            None,
         ))
         .await
         .map_err(InitializationError::SeedPrincipal)?;
@@ -408,6 +409,7 @@ mod tests {
                 Role::Administrator,
                 None,
                 now,
+                None,
             ))
             .await?;
 

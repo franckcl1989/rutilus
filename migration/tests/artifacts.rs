@@ -50,6 +50,7 @@ async fn verify_artifact_constraints(
         uploaded_bytes: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
+        site_id: Set(None),
     }
     .insert(database)
     .await?;
@@ -77,6 +78,7 @@ async fn verify_artifact_constraints(
             uploaded_bytes: Set(1024),
             created_at: Set(now),
             updated_at: Set(now),
+            site_id: Set(None),
         }
         .insert(database)
         .await?;
@@ -93,6 +95,7 @@ async fn verify_artifact_constraints(
         uploaded_bytes: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
+        site_id: Set(None),
     }
     .insert(database)
     .await;

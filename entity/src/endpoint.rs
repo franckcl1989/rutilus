@@ -8,6 +8,15 @@ pub struct Model {
     pub display_name: String,
     pub created_at: TimeDateTimeWithTimeZone,
     pub updated_at: TimeDateTimeWithTimeZone,
+    /// The owning site of a center-side endpoint projection (§15.5); `NULL`
+    /// on a site database, where every endpoint is local.
+    pub site_id: Option<Uuid>,
+    /// The site's refresh-generation watermark of the projection; `0` on a
+    /// site database.
+    pub refresh_generation: i64,
+    /// The health cut of the projection (`ok`/`unknown`); `unknown` on a
+    /// site database.
+    pub health: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

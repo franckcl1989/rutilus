@@ -21,7 +21,7 @@ use std::{error::Error, fmt, str::FromStr};
 
 use time::OffsetDateTime;
 
-use crate::{BootstrapCodeId, PrincipalId};
+use crate::{BootstrapCodeId, InstanceId, PrincipalId};
 
 /// The longest principal name the product records, matching the
 /// `principals.name` column width (64).
@@ -346,12 +346,17 @@ impl Error for RoleParseError {}
 /// optional principal id — a bootstrap-created assignment has no assigner —
 /// and the database preserves the assigner as `SET NULL` when that principal
 /// is later deleted, so the assignment fact never vanishes with its author.
+///
+/// A center role can be scoped to one site (D3: the `site_id` column). A
+/// `site_id` of `None` is the global assignment — the role applies to every
+/// site; a scoped assignment applies only to the named site (§16.1).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoleAssignment {
     principal_id: PrincipalId,
     role: Role,
     assigned_by: Option<PrincipalId>,
     assigned_at: OffsetDateTime,
+    site_id: Option<InstanceId>,
 }
 
 impl RoleAssignment {
@@ -361,12 +366,14 @@ impl RoleAssignment {
         role: Role,
         assigned_by: Option<PrincipalId>,
         assigned_at: OffsetDateTime,
+        site_id: Option<InstanceId>,
     ) -> Self {
         Self {
             principal_id,
             role,
             assigned_by,
             assigned_at,
+            site_id,
         }
     }
 
@@ -388,6 +395,13 @@ impl RoleAssignment {
     #[must_use]
     pub const fn assigned_at(&self) -> OffsetDateTime {
         self.assigned_at
+    }
+
+    /// The site this assignment is scoped to (D3, §16.1); `None` is the
+    /// global assignment.
+    #[must_use]
+    pub const fn site_id(&self) -> Option<InstanceId> {
+        self.site_id
     }
 }
 
@@ -614,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn role_assignment_carries_role_assigner_and_time() {
+    fn role_assignment_carries_role_assigner_time_and_site_scope() {
         let assigned_by = PrincipalId::generate();
         let assigned_at = OffsetDateTime::now_utc();
         let assignment = RoleAssignment::new(
@@ -622,14 +636,32 @@ mod tests {
             Role::Operator,
             Some(assigned_by),
             assigned_at,
+            None,
         );
 
         assert_eq!(assignment.role(), Role::Operator);
         assert_eq!(assignment.assigned_by(), Some(assigned_by));
         assert_eq!(assignment.assigned_at(), assigned_at);
+        assert_eq!(assignment.site_id(), None);
+        // A D3 site-scoped assignment names exactly one site.
+        let site = InstanceId::generate();
+        let scoped = RoleAssignment::new(
+            PrincipalId::generate(),
+            Role::Viewer,
+            None,
+            assigned_at,
+            Some(site),
+        );
+        assert_eq!(scoped.site_id(), Some(site));
         assert_eq!(
-            RoleAssignment::new(PrincipalId::generate(), Role::Viewer, None, assigned_at,)
-                .assigned_by(),
+            RoleAssignment::new(
+                PrincipalId::generate(),
+                Role::Viewer,
+                None,
+                assigned_at,
+                None
+            )
+            .assigned_by(),
             None
         );
     }

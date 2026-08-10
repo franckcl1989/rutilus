@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use rutilus_domain::{
     EndpointId, Event, EventId, EventSeverity, EventSeverityParseError, EventTimelineError,
-    MessageId, MessageIdError,
+    InstanceId, MessageId, MessageIdError,
 };
 use rutilus_entity::event;
 use sea_orm::sea_query::ExprTrait;
@@ -43,7 +43,7 @@ impl SqliteStore {
             .acquire()
             .await
             .map_err(EventRepositoryError::Coordinate)?;
-        let result = event::Entity::insert(project_event(event))
+        let result = event::Entity::insert(project_event(event, None))
             .on_conflict_do_nothing_on([event::Column::EndpointId, event::Column::DedupKey])
             .exec(&self.database)
             .await
@@ -53,6 +53,40 @@ impl SqliteStore {
             // the first row is authoritative and never rewritten. `Empty`
             // cannot occur for a single-model insert and exists only for the
             // iterator API; naming it keeps the match exhaustive.
+            TryInsertResult::Inserted(_) | TryInsertResult::Conflicted | TryInsertResult::Empty => {
+            }
+        }
+        Ok(())
+    }
+
+    /// Persists one site-reported event (§15.5), deduplicated, with the
+    /// reporting site recorded.
+    ///
+    /// Mirrors [`Self::append_event`] — the same §14.4 dedup, the same
+    /// at-least-once absorption of a re-delivered record — with the
+    /// `site_id` column set so the center-side event row names its site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventRepositoryError`] when write coordination fails or
+    /// `SQLite` rejects the append for a reason other than the dedup
+    /// conflict.
+    pub async fn append_center_event(
+        &self,
+        event: &Event,
+        site: InstanceId,
+    ) -> Result<(), EventRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(EventRepositoryError::Coordinate)?;
+        let result = event::Entity::insert(project_event(event, Some(site)))
+            .on_conflict_do_nothing_on([event::Column::EndpointId, event::Column::DedupKey])
+            .exec(&self.database)
+            .await
+            .map_err(EventRepositoryError::Database)?;
+        match result {
             TryInsertResult::Inserted(_) | TryInsertResult::Conflicted | TryInsertResult::Empty => {
             }
         }
@@ -168,7 +202,7 @@ impl SqliteStore {
     }
 }
 
-fn project_event(event: &Event) -> event::ActiveModel {
+fn project_event(event: &Event, site: Option<InstanceId>) -> event::ActiveModel {
     event::ActiveModel {
         id: Set(event.id().into_uuid()),
         endpoint_id: Set(event.endpoint_id().into_uuid()),
@@ -178,6 +212,7 @@ fn project_event(event: &Event) -> event::ActiveModel {
         event_timestamp: Set(event.event_timestamp()),
         observed_at: Set(event.observed_at()),
         dedup_key: Set(event.dedup_key().to_owned()),
+        site_id: Set(site.map(InstanceId::into_uuid)),
     }
 }
 
@@ -486,6 +521,7 @@ mod tests {
                 "{message_id}\u{1F}{}",
                 observed_at + Duration::SECOND
             )),
+            site_id: Set(None),
         }
         .insert(&store.database)
         .await?;

@@ -183,6 +183,9 @@ where
         display_name: Set(domain.display_name().to_string()),
         created_at: Set(domain.created_at()),
         updated_at: Set(domain.updated_at()),
+        site_id: Set(None),
+        refresh_generation: Set(0),
+        health: Set(String::from("unknown")),
     }
     .insert(database)
     .await

@@ -646,6 +646,9 @@ mod tests {
             display_name: Set(String::from("Capability test endpoint")),
             created_at: Set(created_at),
             updated_at: Set(created_at),
+            site_id: Set(None),
+            refresh_generation: Set(0),
+            health: Set(String::from("unknown")),
         }
         .insert(&store.database)
         .await?;

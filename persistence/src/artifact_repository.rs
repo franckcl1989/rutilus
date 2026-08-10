@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactName, ArtifactNameError, ArtifactRestoreError, ArtifactState,
-    ArtifactStateParseError, Sha256Hex, Sha256HexParseError,
+    ArtifactStateParseError, InstanceId, Sha256Hex, Sha256HexParseError,
 };
 use rutilus_entity::artifact;
 use sea_orm::{
@@ -81,6 +81,71 @@ impl SqliteStore {
             uploaded_bytes: Set(stored_integer(artifact.uploaded_bytes())?),
             created_at: Set(artifact.created_at()),
             updated_at: Set(artifact.updated_at()),
+            site_id: Set(None),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(ArtifactRepositoryError::Database)?;
+        transaction
+            .commit()
+            .await
+            .map_err(ArtifactRepositoryError::Database)?;
+        Ok(())
+    }
+
+    /// Declares one site-reported artifact manifest (§15.5) under the
+    /// site's own artifact id, with the reporting site recorded.
+    ///
+    /// Mirrors [`Self::create_artifact`] — the same at-least-once
+    /// no-op for a re-declared identity — with the `site_id` column set so
+    /// the center-side artifact row names its site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactRepositoryError`] when write coordination fails, a
+    /// value cannot be stored in the `SQLite` `INTEGER` range, the
+    /// transaction cannot commit, or a stored row violates an aggregate
+    /// invariant.
+    pub async fn declare_center_artifact(
+        &self,
+        artifact: &Artifact,
+        site: InstanceId,
+    ) -> Result<(), ArtifactRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(ArtifactRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(ArtifactRepositoryError::Database)?;
+        let artifact_id = artifact.id();
+        if artifact::Entity::find_by_id(artifact_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(ArtifactRepositoryError::Database)?
+            .is_some()
+        {
+            // The stored row is authoritative and must not be rewritten
+            // (the create_artifact contract).
+            transaction
+                .commit()
+                .await
+                .map_err(ArtifactRepositoryError::Database)?;
+            return Ok(());
+        }
+        artifact::ActiveModel {
+            id: Set(artifact_id.into_uuid()),
+            name: Set(artifact.name().to_string()),
+            size_bytes: Set(stored_integer(artifact.size_bytes())?),
+            sha256: Set(artifact.sha256().as_str().to_owned()),
+            state: Set(artifact.state().as_str().to_owned()),
+            uploaded_bytes: Set(stored_integer(artifact.uploaded_bytes())?),
+            created_at: Set(artifact.created_at()),
+            updated_at: Set(artifact.updated_at()),
+            site_id: Set(Some(site.into_uuid())),
         }
         .insert(&transaction)
         .await
@@ -980,6 +1045,7 @@ mod tests {
             uploaded_bytes: Set(uploaded_bytes),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
+            site_id: Set(None),
         }
         .insert(&store.database)
         .await?;

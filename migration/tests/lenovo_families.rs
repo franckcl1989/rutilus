@@ -184,13 +184,14 @@ async fn lenovo_family_migration_extends_the_feature_allow_list() -> Result<(), 
         .filter(resource::Column::Feature.eq("lenovo-security-service"))
         .exec(&database)
         .await?;
-    // Down three migrations only: `down(None)` would unwind the whole
+    // Down five migrations only: `down(None)` would unwind the whole
     // history and drop the `resources` table the assertions below seed into,
     // while this test only needs the Lenovo follow-up undone. The audit
-    // execute-operation migration (000008) and the center tables migration
-    // (000009) registered above it unwind first, so the restore lands on the
-    // exact 000003-with-000001 allow-list the test asserts.
-    Migrator::down(&database, Some(3)).await?;
+    // execute-operation migration (000008), the center tables migration
+    // (000009), and the two 0.7.0 center site-scoping migrations
+    // (000010/000011) registered above it unwind first, so the restore
+    // lands on the exact 000003-with-000001 allow-list the test asserts.
+    Migrator::down(&database, Some(5)).await?;
     assert!(
         seed_resource(
             &database,
@@ -232,6 +233,9 @@ async fn seed_endpoint(
         display_name: Set(String::from("Lenovo BMC")),
         created_at: Set(now),
         updated_at: Set(now),
+        site_id: Set(None),
+        refresh_generation: Set(0),
+        health: Set(String::from("unknown")),
     }
     .insert(database)
     .await?;

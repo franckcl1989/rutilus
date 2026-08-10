@@ -1694,6 +1694,7 @@ where
         domain_role(request.role()),
         context.actor_principal_id(),
         now,
+        None,
     );
     if state.services.assign_role(&assignment).await.is_err() {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1808,6 +1809,7 @@ where
         domain_role(request.role()),
         context.actor_principal_id(),
         now,
+        None,
     );
     if state.services.assign_role(&assignment).await.is_err() {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);

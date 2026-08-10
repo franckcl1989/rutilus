@@ -60,6 +60,7 @@ async fn verify_event_constraints(
         event_timestamp: Set(event_timestamp),
         observed_at: Set(now),
         dedup_key: Set(dedup_key.clone()),
+        site_id: Set(None),
     }
     .insert(database)
     .await?;
@@ -87,6 +88,7 @@ async fn verify_event_constraints(
             event_timestamp: Set(event_timestamp),
             observed_at: Set(now),
             dedup_key: Set(format!("ResourceEvent.1.0.LanResetType\u{1F}{severity}")),
+            site_id: Set(None),
         }
         .insert(database)
         .await?;
@@ -105,6 +107,7 @@ async fn verify_event_constraints(
         dedup_key: Set(String::from(
             "Alert.1.0.PowerSupplyFailure\u{1F}informational",
         )),
+        site_id: Set(None),
     }
     .insert(database)
     .await;
@@ -122,6 +125,7 @@ async fn verify_event_constraints(
         event_timestamp: Set(event_timestamp),
         observed_at: Set(now),
         dedup_key: Set(dedup_key.clone()),
+        site_id: Set(None),
     }
     .insert(database)
     .await;
@@ -139,6 +143,7 @@ async fn verify_event_constraints(
         event_timestamp: Set(event_timestamp),
         observed_at: Set(now),
         dedup_key: Set(dedup_key.clone()),
+        site_id: Set(None),
     }
     .insert(database)
     .await;
@@ -158,6 +163,7 @@ async fn verify_event_constraints(
         dedup_key: Set(String::from(
             "ResourceEvent.1.0.LanResetType\u{1F}1773973891234567890",
         )),
+        site_id: Set(None),
     }
     .insert(database)
     .await;

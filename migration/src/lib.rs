@@ -21,6 +21,8 @@ mod m20260807_000006_lenovo_families;
 mod m20260807_000007_audit_action_shapes;
 mod m20260807_000008_audit_execute_operation;
 mod m20260807_000009_center_tables;
+mod m20260810_000001_center_data_sites;
+mod m20260810_000002_center_role_sites;
 
 pub struct Migrator;
 
@@ -47,6 +49,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000006_lenovo_families::Migration),
             Box::new(m20260807_000008_audit_execute_operation::Migration),
             Box::new(m20260807_000009_center_tables::Migration),
+            Box::new(m20260810_000001_center_data_sites::Migration),
+            Box::new(m20260810_000002_center_role_sites::Migration),
         ]
     }
 }

@@ -36,6 +36,9 @@ pub struct Model {
     /// When progress or state last changed; `created_at` until the first
     /// write.
     pub updated_at: TimeDateTimeWithTimeZone,
+    /// The reporting site of a center-side artifact row (§15.5); `NULL` on
+    /// a site database, where every artifact is local.
+    pub site_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

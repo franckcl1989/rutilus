@@ -183,6 +183,9 @@ impl SqliteStore {
                 .assigned_by()
                 .map(rutilus_domain::PrincipalId::into_uuid)),
             assigned_at: Set(assignment.assigned_at()),
+            site_id: Set(assignment
+                .site_id()
+                .map(rutilus_domain::InstanceId::into_uuid)),
         };
         // One role per principal: the primary key conflict replaces the
         // stored assignment, never duplicates it.
@@ -320,6 +323,7 @@ fn map_stored_assignment(
             .assigned_by
             .map(rutilus_domain::PrincipalId::from_uuid),
         model.assigned_at,
+        model.site_id.map(rutilus_domain::InstanceId::from_uuid),
     ))
 }
 
@@ -520,7 +524,7 @@ mod tests {
         store.create_principal(&root).await?;
         store.create_principal(&admin).await?;
 
-        let first = RoleAssignment::new(admin.id(), Role::Operator, Some(root.id()), base);
+        let first = RoleAssignment::new(admin.id(), Role::Operator, Some(root.id()), base, None);
         store.assign_role(&first).await?;
         assert_eq!(store.find_role_assignment(admin.id()).await?, Some(first));
 
@@ -530,6 +534,7 @@ mod tests {
             Role::Administrator,
             Some(root.id()),
             base + Duration::SECOND,
+            None,
         );
         store.assign_role(&second).await?;
         assert_eq!(
@@ -558,6 +563,7 @@ mod tests {
             role: Set(String::from("superuser")),
             assigned_by: Set(None),
             assigned_at: Set(base),
+            site_id: Set(None),
         }
         .insert(&store.database)
         .await;
@@ -569,6 +575,7 @@ mod tests {
                 Role::Administrator,
                 None,
                 base + Duration::SECOND,
+                None,
             )]
         );
 

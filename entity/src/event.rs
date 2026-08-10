@@ -44,6 +44,10 @@ pub struct Model {
     pub observed_at: TimeDateTimeWithTimeZone,
     /// The dedup key: `message_id` + `event_timestamp`, unique per endpoint.
     pub dedup_key: String,
+    /// The reporting site of a center-side event row (§15.5); `NULL` on a
+    /// site database, where every event is local. Like `endpoint_id`, the
+    /// column has no foreign key: the event record outlives its source.
+    pub site_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
