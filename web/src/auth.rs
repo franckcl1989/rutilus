@@ -56,7 +56,7 @@ use rutilus_application::{AuditEventWriter, BoundaryFuture, Clock};
 use rutilus_domain::{
     Argon2IdHash, AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
     AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
-    AuditRedfishOperation, AuditSequence, AuditTarget, BootstrapCode, BootstrapCodeId,
+    AuditRedfishOperation, AuditSequence, AuditTarget, BootstrapCode, BootstrapCodeId, InstanceId,
     PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState, ProductPermission,
     Role, RoleAssignment, Session, SessionId, TOTP_SECRET_LENGTH, TotpAuthenticator,
     TotpAuthenticatorError,
@@ -157,12 +157,16 @@ impl AuthGate {
 /// extension: in `Open` mode the actor is the router's injected actor, in
 /// guarded mode it is the session's principal (`actor = user` with the
 /// principal id), so audit events always name who actually acted (§16.3).
+/// The role and its D3 site scope (the `role_assignments.site_id` column)
+/// ride along for the §16.1 authorization judgments — the center console
+/// routes apply the site scope to every view and write.
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     actor: AuditActor,
     actor_principal_id: Option<PrincipalId>,
     session_id: Option<SessionId>,
     role: Option<Role>,
+    assignment_site_id: Option<InstanceId>,
 }
 
 impl AuthContext {
@@ -174,6 +178,7 @@ impl AuthContext {
             actor_principal_id: None,
             session_id: None,
             role: None,
+            assignment_site_id: None,
         }
     }
 
@@ -196,6 +201,54 @@ impl AuthContext {
     pub const fn role(&self) -> Option<Role> {
         self.role
     }
+
+    /// The D3 site scope of the acting principal's role assignment (§16.1 —
+    /// a center role can be limited to one site). `None` is either an
+    /// unscoped (global) assignment or an unauthenticated context.
+    #[must_use]
+    pub const fn assignment_site_id(&self) -> Option<InstanceId> {
+        self.assignment_site_id
+    }
+}
+
+/// The §16.1/D3 site-scope judgment of the center views: may the acting role
+/// (with its assignment scope) see the given site?
+///
+/// The `Administrator` sees every site. The `Operator` and the `Viewer` see
+/// every site under an unscoped assignment and exactly the assigned site
+/// under a scoped one (D3: the `role_assignments.site_id` column); an
+/// unauthenticated context (the open test routers) is treated as the
+/// unscoped `Viewer`.
+#[must_use]
+pub(crate) fn view_scope_allows(
+    role: Option<Role>,
+    assignment_site: Option<InstanceId>,
+    site: InstanceId,
+) -> bool {
+    match role {
+        Some(Role::Administrator) => true,
+        Some(Role::Operator | Role::Viewer) | None => {
+            assignment_site.is_none() || assignment_site == Some(site)
+        }
+    }
+}
+
+/// The §16.1/D3 dispatch judgment of the center console: may the acting role
+/// dispatch an operation to the given site?
+///
+/// The judgment mirrors the application's [`rutilus_application::allows_dispatch`]
+/// exactly — the `Administrator` is global, the `Operator` global or scoped,
+/// and the `Viewer` (and any unauthenticated context) never dispatches. The
+/// application dispatch use case re-checks the same rule against the
+/// persisted role assignment, so the handler gate and the use case cannot
+/// drift apart.
+#[must_use]
+pub(crate) fn dispatch_scope_allows(
+    role: Option<Role>,
+    assignment_site: Option<InstanceId>,
+    site: InstanceId,
+) -> bool {
+    role.is_some_and(|role| rutilus_application::allows_dispatch(role, assignment_site, site))
 }
 
 /// The authentication boundaries implemented by the embedding runtime.
@@ -690,6 +743,36 @@ const ROUTE_TABLE: &[(Method, &str, RouteAccess)] = &[
             mutation: false,
         },
     ),
+    // The center console surface (§15.5, §15.6, §21 0.7.0): the site,
+    // endpoint, and operation views are every role — the handlers apply the
+    // D3 site scope of the actor's assignment to every listed row. Binding
+    // management is Administrator only (§16.1 管理中心绑定); center
+    // operation submission is Administrator and Operator, and the handler
+    // applies the same site scope to the target site.
+    (
+        Method::GET,
+        "/api/v1/center*",
+        RouteAccess::GuardedOnly {
+            roles: RoleMask::ANY,
+            mutation: false,
+        },
+    ),
+    (
+        Method::POST,
+        "/api/v1/center/bindings*",
+        RouteAccess::GuardedOnly {
+            roles: RoleMask::ADMINISTRATOR_ONLY,
+            mutation: true,
+        },
+    ),
+    (
+        Method::POST,
+        "/api/v1/center/operations",
+        RouteAccess::GuardedOnly {
+            roles: RoleMask::ADMINISTRATOR_OR_OPERATOR,
+            mutation: true,
+        },
+    ),
 ];
 
 /// Resolves the authorization of one request path.
@@ -905,12 +988,14 @@ where
     if principal.state() != PrincipalState::Enabled {
         return None;
     }
-    let role = state
+    let (role, assignment_site_id) = state
         .services
         .find_role_assignment(session.principal_id())
         .await
         .ok()?
-        .map(|assignment| assignment.role());
+        .map_or((None, None), |assignment| {
+            (Some(assignment.role()), assignment.site_id())
+        });
     // Activity advances the persisted last-use time at most once per
     // minute, keeping the request path write-free on a busy console. The
     // expiry itself is absolute: `expires_at` is fixed at sign-in plus
@@ -925,6 +1010,7 @@ where
             actor_principal_id: Some(session.principal_id()),
             session_id: Some(session.id()),
             role,
+            assignment_site_id,
         },
         session,
         cookie,

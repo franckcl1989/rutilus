@@ -203,6 +203,38 @@ impl SqliteStore {
             .collect()
     }
 
+    /// Lists every outbox entry of one instance, oldest first — the §15.6
+    /// offer scan of the center's operation tracking view.
+    ///
+    /// The center's durable outbox holds exactly the §15.6 operation offers,
+    /// acknowledged or not, so the scan rebuilds the offer facts — the
+    /// target, the actor context, and the offer expiry — that the tracking
+    /// operation record does not persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterOutboxRepositoryError::Corrupt`] when any stored row
+    /// violates domain invariants.
+    pub async fn list_outbox_entries(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<Vec<OutboxEntry>, CenterOutboxRepositoryError> {
+        let models = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .order_by_asc(center_outbox::Column::Sequence)
+            .order_by_asc(center_outbox::Column::Id)
+            .all(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        models
+            .iter()
+            .map(|model| {
+                let entry_id = OutboxEntryId::from_uuid(model.id);
+                map_stored_outbox_entry(entry_id, model)
+            })
+            .collect()
+    }
+
     /// Acknowledges one outbound envelope (design §17, D4).
     ///
     /// The conditional update makes the write idempotent: only a `pending`

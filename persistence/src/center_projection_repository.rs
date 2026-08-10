@@ -24,9 +24,10 @@ use rutilus_application::{
 use rutilus_domain::{EndpointId, InstanceId};
 use rutilus_entity::{endpoint, endpoint_address, endpoint_trust, resource, resource_snapshot};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, Set, SqlErr,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
+    Set, SqlErr, TransactionTrait,
 };
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -433,6 +434,158 @@ impl SqliteStore {
             .await
             .map_err(CenterProjectionRepositoryError::Database)?
             .is_some())
+    }
+
+    /// Lists the projected endpoints of one site — or of every site when
+    /// `site` is `None` — with their active addresses (§15.5 endpoint
+    /// view).
+    ///
+    /// The view is the center's read of the site reports: identity, display
+    /// name, active address, health cut, and the refresh-generation
+    /// watermark. Rows without a site association (never expected on the
+    /// center database) are listed only by the unscoped query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterProjectionRepositoryError::Database`] when a query
+    /// fails.
+    pub async fn list_projected_endpoints(
+        &self,
+        site: Option<InstanceId>,
+    ) -> Result<Vec<ProjectedEndpointSummary>, CenterProjectionRepositoryError> {
+        let mut models = endpoint::Entity::find();
+        if let Some(site) = site {
+            models = models.filter(endpoint::Column::SiteId.eq(site.into_uuid()));
+        }
+        let models = models
+            .order_by_asc(endpoint::Column::DisplayName)
+            .order_by_asc(endpoint::Column::Id)
+            .all(&self.database)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?;
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        let endpoint_ids = models.iter().map(|model| model.id).collect::<HashSet<_>>();
+        let addresses = endpoint_address::Entity::find()
+            .filter(endpoint_address::Column::IsActive.eq(true))
+            .filter(endpoint_address::Column::EndpointId.is_in(endpoint_ids))
+            .all(&self.database)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?;
+        let addresses = addresses
+            .into_iter()
+            .map(|model| (model.endpoint_id, model.address))
+            .collect::<HashMap<_, _>>();
+        Ok(models
+            .into_iter()
+            .map(|model| {
+                ProjectedEndpointSummary::new(
+                    EndpointId::from_uuid(model.id),
+                    model.site_id.map(InstanceId::from_uuid),
+                    model.display_name,
+                    addresses.get(&model.id).cloned().unwrap_or_default(),
+                    model.health,
+                    u64::try_from(model.refresh_generation).unwrap_or(u64::MAX),
+                )
+            })
+            .collect())
+    }
+
+    /// The projection summary of one site: the projected endpoint count and
+    /// the newest projection write time (§15.5 site view — the
+    /// last-refresh watermark).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterProjectionRepositoryError::Database`] when a query
+    /// fails.
+    pub async fn center_site_projection_summary(
+        &self,
+        site: InstanceId,
+    ) -> Result<(u64, Option<OffsetDateTime>), CenterProjectionRepositoryError> {
+        let rows = endpoint::Entity::find()
+            .filter(endpoint::Column::SiteId.eq(site.into_uuid()))
+            .all(&self.database)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?;
+        let count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        let last_refresh_at = rows
+            .into_iter()
+            .map(|row| row.updated_at)
+            .max()
+            .map(|value| OffsetDateTime::from_unix_timestamp(value.unix_timestamp()))
+            .transpose()
+            .map_err(|_| {
+                CenterProjectionRepositoryError::Database(DbErr::Custom(
+                    "a stored projection timestamp cannot be re-read".to_owned(),
+                ))
+            })?;
+        Ok((count, last_refresh_at))
+    }
+}
+
+/// One projected endpoint row of the center's §15.5 view: the identity, the
+/// owning site, the active address, the health cut, and the refresh
+/// watermark.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedEndpointSummary {
+    endpoint_id: EndpointId,
+    site_id: Option<InstanceId>,
+    display_name: String,
+    address: String,
+    health: String,
+    refresh_generation: u64,
+}
+
+impl ProjectedEndpointSummary {
+    #[must_use]
+    pub const fn new(
+        endpoint_id: EndpointId,
+        site_id: Option<InstanceId>,
+        display_name: String,
+        address: String,
+        health: String,
+        refresh_generation: u64,
+    ) -> Self {
+        Self {
+            endpoint_id,
+            site_id,
+            display_name,
+            address,
+            health,
+            refresh_generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<InstanceId> {
+        self.site_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub fn health(&self) -> &str {
+        &self.health
+    }
+
+    #[must_use]
+    pub const fn refresh_generation(&self) -> u64 {
+        self.refresh_generation
     }
 }
 

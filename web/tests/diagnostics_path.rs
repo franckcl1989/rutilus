@@ -25,12 +25,16 @@ use rutilus_application::{
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
     CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event, Operation, OperationId,
-    OperationState, RefreshGeneration, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId,
-    ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, SeriesKey, TelemetrySample,
-    TelemetrySeries, TelemetrySeriesId, TlsCertificate, TlsTrust,
+    EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event, InstanceId, Operation,
+    OperationId, OperationState, PrincipalId, RedfishCommand, RefreshGeneration, ResourceEtag,
+    ResourceFeature, ResourceId, ResourceODataId, ResourceODataType, ResourceSnapshot,
+    ResourceSnapshotPayload, SeriesKey, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+    TlsCertificate, TlsTrust,
 };
-use rutilus_web::{WebProductInfo, router};
+use rutilus_web::{
+    CenterEndpointView, CenterOperationRefusal, CenterOperationView, CenterServices,
+    CenterSiteView, DispatchedCenterOperation, RegisteredCenterSite, WebProductInfo, router,
+};
 use secrecy::SecretString;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -1013,5 +1017,59 @@ impl rutilus_web::AuthServices for MockServices {
         let mut hash = [0_u8; 32];
         hash[..wire.len().min(32)].copy_from_slice(wire.as_bytes());
         hash
+    }
+}
+
+/// The unavailable center-view boundary: every center route of this test
+/// bench answers the store verdict, exactly like the unconfigured product
+/// boundaries.
+impl CenterServices for MockServices {
+    type Error = MockError;
+
+    fn list_center_sites(&self) -> BoundaryFuture<'_, Result<Vec<CenterSiteView>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_center_endpoints(
+        &self,
+        _site: Option<InstanceId>,
+    ) -> BoundaryFuture<'_, Result<Vec<CenterEndpointView>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn list_center_operations(
+        &self,
+        _site: Option<InstanceId>,
+    ) -> BoundaryFuture<'_, Result<Vec<CenterOperationView>, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn register_center_site(
+        &self,
+        _display_name: &str,
+        _center_url: &str,
+        _now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<RegisteredCenterSite, Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn revoke_center_binding(
+        &self,
+        _site: InstanceId,
+        _now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
+    fn dispatch_center_operation(
+        &self,
+        _site: InstanceId,
+        _endpoint: EndpointId,
+        _target: &ResourceODataId,
+        _command: &RedfishCommand,
+        _actor: PrincipalId,
+        _now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<DispatchedCenterOperation, CenterOperationRefusal>> {
+        Box::pin(async { Err(CenterOperationRefusal::Store) })
     }
 }

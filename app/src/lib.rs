@@ -4,6 +4,7 @@ mod backup;
 mod center_acceptor;
 mod center_ca;
 mod center_client;
+mod center_runtime;
 mod center_transport;
 mod center_ws;
 mod doctor;

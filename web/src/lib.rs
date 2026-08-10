@@ -21,7 +21,11 @@ use rutilus_api::{
     AuditTargetResponse, BatchDetailResponse, BatchListResponse, BatchOperationResponse,
     BatchOperationStateResponse, BatchOutcomeCountsResponse, BatchRefreshResponse,
     BatchSummaryResponse, BeginEndpointTrustRequest, CapabilityClassificationResponse,
-    CapabilityEntryResponse, CapabilityStateResponse, ConfirmEndpointTrustRequest,
+    CapabilityEntryResponse, CapabilityStateResponse, CenterBindingRegisterRequest,
+    CenterBindingRegisterResponse, CenterBindingRevokeRequest, CenterBindingStateResponse,
+    CenterEndpointViewListResponse, CenterEndpointViewResponse, CenterOperationListResponse,
+    CenterOperationResponse, CenterOperationSubmitRequest, CenterOperationSubmitResponse,
+    CenterSiteResponse, CenterSitesResponse, ConfirmEndpointTrustRequest,
     CoreResourceCommonResponse, CoreResourceCountsResponse, CoreResourceDetailsResponse,
     CoreResourceResponse, CoreResourceSourceResponse, CreateArtifactRequest,
     CreateCredentialRequest, CreateGroupRequest, CreateOperationRequest,
@@ -65,12 +69,14 @@ use rutilus_application::{
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
     BatchOperationState, BatchOutcomeCounts, CapabilityClassification, CapabilityState,
-    CertificateFingerprintParseError, Credential, CredentialId, CredentialName, CredentialUsername,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointDisplayName, EndpointId, Event, Group,
-    GroupId, GroupName, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-    ResourceFeature, ResourceId, ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample,
-    TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
+    CenterBindingId, CenterBindingState, CertificateFingerprintParseError, Credential,
+    CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
+    EndpointDisplayName, EndpointId, Event, Group, GroupId, GroupName, InstanceId, Operation,
+    OperationId, OperationSource, OperationState, OperationTarget, PrincipalId, RedfishCommand,
+    ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot, Tag, TagName, TargetId,
+    TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
 };
+use time::OffsetDateTime;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 mod auth;
@@ -229,6 +235,398 @@ impl<T> ProductServices for T where
 {
 }
 
+/// One registered site in the web console's center view (§15.5, 0.7.0 S6).
+///
+/// The view carries the registered instance, its binding phase, its online
+/// presence (one live §15.1 connection), the projected endpoint count, and
+/// the newest reported refresh generation as the last-refresh watermark.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CenterSiteView {
+    site_id: InstanceId,
+    display_name: String,
+    binding: Option<CenterBindingState>,
+    online: bool,
+    endpoint_count: u64,
+    last_refresh_at: Option<OffsetDateTime>,
+}
+
+impl CenterSiteView {
+    #[must_use]
+    pub const fn new(
+        site_id: InstanceId,
+        display_name: String,
+        binding: Option<CenterBindingState>,
+        online: bool,
+        endpoint_count: u64,
+        last_refresh_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            site_id,
+            display_name,
+            binding,
+            online,
+            endpoint_count,
+            last_refresh_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> InstanceId {
+        self.site_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> Option<CenterBindingState> {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn online(&self) -> bool {
+        self.online
+    }
+
+    #[must_use]
+    pub const fn endpoint_count(&self) -> u64 {
+        self.endpoint_count
+    }
+
+    #[must_use]
+    pub const fn last_refresh_at(&self) -> Option<OffsetDateTime> {
+        self.last_refresh_at
+    }
+}
+
+/// One projected remote endpoint of the web console's center view (§15.5).
+///
+/// The summary the site reported: the identity, the display name, the
+/// address, the refresh generation watermark, and the health cut — never
+/// credentials, sessions, or certificate material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CenterEndpointView {
+    site_id: Option<InstanceId>,
+    endpoint_id: EndpointId,
+    display_name: String,
+    address: String,
+    health: String,
+    refresh_generation: u64,
+}
+
+impl CenterEndpointView {
+    #[must_use]
+    pub const fn new(
+        site_id: Option<InstanceId>,
+        endpoint_id: EndpointId,
+        display_name: String,
+        address: String,
+        health: String,
+        refresh_generation: u64,
+    ) -> Self {
+        Self {
+            site_id,
+            endpoint_id,
+            display_name,
+            address,
+            health,
+            refresh_generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<InstanceId> {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub fn health(&self) -> &str {
+        &self.health
+    }
+
+    #[must_use]
+    pub const fn refresh_generation(&self) -> u64 {
+        self.refresh_generation
+    }
+}
+
+/// One center-dispatched operation of the web console's tracking view
+/// (§15.6).
+///
+/// The offer facts the operation record does not persist — the target, the
+/// actor context, and the offer expiry — come from the durable §15.6 offer
+/// envelope, so they are `None` for an operation whose offer is not on
+/// record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CenterOperationView {
+    operation_id: OperationId,
+    site_id: Option<InstanceId>,
+    endpoint_id: EndpointId,
+    command: RedfishCommand,
+    target: Option<String>,
+    state: OperationState,
+    actor: Option<String>,
+    ttl_expires_at: Option<OffsetDateTime>,
+    created_at: OffsetDateTime,
+}
+
+impl CenterOperationView {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        operation_id: OperationId,
+        site_id: Option<InstanceId>,
+        endpoint_id: EndpointId,
+        command: RedfishCommand,
+        target: Option<String>,
+        state: OperationState,
+        actor: Option<String>,
+        ttl_expires_at: Option<OffsetDateTime>,
+        created_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            operation_id,
+            site_id,
+            endpoint_id,
+            command,
+            target,
+            state,
+            actor,
+            ttl_expires_at,
+            created_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> Option<InstanceId> {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    #[must_use]
+    pub fn command(&self) -> &RedfishCommand {
+        &self.command
+    }
+
+    /// The §15.6 target of the offer, when the offer is on record.
+    #[must_use]
+    pub fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> OperationState {
+        self.state
+    }
+
+    /// The actor context of the offer, when the offer is on record.
+    #[must_use]
+    pub fn actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+
+    /// When the outstanding offer stops being actionable (§15.6).
+    #[must_use]
+    pub const fn ttl_expires_at(&self) -> Option<OffsetDateTime> {
+        self.ttl_expires_at
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
+}
+
+/// One registered site and its one-time binding code (design D2).
+///
+/// The raw code is shown to the operator exactly once; no later response
+/// repeats it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredCenterSite {
+    site_id: InstanceId,
+    binding_id: CenterBindingId,
+    code: String,
+    expires_at: OffsetDateTime,
+}
+
+impl RegisteredCenterSite {
+    #[must_use]
+    pub const fn new(
+        site_id: InstanceId,
+        binding_id: CenterBindingId,
+        code: String,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            site_id,
+            binding_id,
+            code,
+            expires_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn site_id(&self) -> InstanceId {
+        self.site_id
+    }
+
+    #[must_use]
+    pub const fn binding_id(&self) -> CenterBindingId {
+        self.binding_id
+    }
+
+    /// The one-time binding code; never repeated by any later response.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+}
+
+/// One dispatched center operation (§15.6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchedCenterOperation {
+    operation_id: OperationId,
+    ttl_expires_at: OffsetDateTime,
+}
+
+impl DispatchedCenterOperation {
+    #[must_use]
+    pub const fn new(operation_id: OperationId, ttl_expires_at: OffsetDateTime) -> Self {
+        Self {
+            operation_id,
+            ttl_expires_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[must_use]
+    pub const fn ttl_expires_at(&self) -> OffsetDateTime {
+        self.ttl_expires_at
+    }
+}
+
+/// Why a center operation submission was refused.
+///
+/// The verdicts mirror the application dispatch use case's judgments so the
+/// console maps each refusal to its HTTP verdict; the boundary failure is
+/// collapsed into [`Self::Store`] with the runtime's error chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CenterOperationRefusal {
+    /// The acting principal is not authorized to dispatch to the target site
+    /// (§16.1, D3).
+    NotAuthorized,
+    /// The endpoint is not in the center's projection.
+    UnknownEndpoint { endpoint_id: EndpointId },
+    /// The endpoint belongs to a different site; the offer would be dropped
+    /// by the addressed site (§15.6).
+    EndpointNotInSite {
+        endpoint_id: EndpointId,
+        site_id: InstanceId,
+    },
+    /// The target is not part of the endpoint's projected resources.
+    UnknownTarget {
+        endpoint_id: EndpointId,
+        target: String,
+    },
+    /// The typed command could not be serialized into its wire payload.
+    CommandSerialization,
+    /// The center store failed.
+    Store,
+}
+
+/// The center-view boundary of the web console (design §15.5, §15.6, 0.7.0
+/// S6).
+///
+/// The center runtime implements the boundary over its store, the online
+/// session registry, and the §15.6 use cases — the Web crate stays free of
+/// persistence and security internals exactly like the product-service
+/// boundaries. The view values are the web console's read model of the
+/// center; the runtime assembles them from the registered instances, the
+/// bindings, the projections, and the durable §15.6 offers.
+pub trait CenterServices: Send + Sync {
+    /// The boundary's controlled failure type.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Lists every registered site with its binding, presence, and endpoint
+    /// summary (§15.5).
+    fn list_center_sites(&self) -> BoundaryFuture<'_, Result<Vec<CenterSiteView>, Self::Error>>;
+
+    /// Lists the projected endpoints of one site, or of every site when
+    /// `site` is `None` (§15.5 endpoint summary).
+    fn list_center_endpoints(
+        &self,
+        site: Option<InstanceId>,
+    ) -> BoundaryFuture<'_, Result<Vec<CenterEndpointView>, Self::Error>>;
+
+    /// Lists the center-dispatched operations of one site, or of every site
+    /// when `site` is `None` (§15.6 tracking view).
+    fn list_center_operations(
+        &self,
+        site: Option<InstanceId>,
+    ) -> BoundaryFuture<'_, Result<Vec<CenterOperationView>, Self::Error>>;
+
+    /// Registers one site and returns its one-time binding code (design D2).
+    fn register_center_site(
+        &self,
+        display_name: &str,
+        center_url: &str,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<RegisteredCenterSite, Self::Error>>;
+
+    /// Revokes the active binding of one site (design D2).
+    fn revoke_center_binding(
+        &self,
+        site: InstanceId,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
+
+    /// Dispatches one §15.6 operation offer to a bound site.
+    fn dispatch_center_operation(
+        &self,
+        site: InstanceId,
+        endpoint: EndpointId,
+        target: &ResourceODataId,
+        command: &RedfishCommand,
+        actor: PrincipalId,
+        now: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<DispatchedCenterOperation, CenterOperationRefusal>>;
+}
+
 pub(crate) struct WebState<Services, Gateway, Time> {
     pub(crate) product: WebProductInfo,
     pub(crate) actor: AuditActor,
@@ -280,7 +678,7 @@ pub fn router<Services, Gateway, Time>(
     clock: Time,
 ) -> Router
 where
-    Services: ProductServices + AuthServices + 'static,
+    Services: ProductServices + AuthServices + CenterServices + 'static,
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
@@ -317,7 +715,7 @@ pub fn router_with_auth<Services, Gateway, Time>(
     clock: Time,
 ) -> Router
 where
-    Services: ProductServices + AuthServices + 'static,
+    Services: ProductServices + AuthServices + CenterServices + 'static,
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
@@ -463,6 +861,30 @@ where
         .route(
             "/api/v1/endpoints/{endpoint_id}/tags/{tag_name}",
             delete(remove_tag::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/sites",
+            get(center_sites::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/bindings",
+            post(register_center_site::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/bindings/revoke",
+            post(revoke_center_binding::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/endpoints",
+            get(center_endpoints::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/operations",
+            get(center_operations::<Services, Gateway, Time>),
+        )
+        .route(
+            "/api/v1/center/operations",
+            post(submit_center_operation::<Services, Gateway, Time>),
         )
         .route(
             "/api/v1/auth/login",
@@ -2533,6 +2955,310 @@ where
     }
 }
 
+/// Lists the registered sites of the center's §15.5 site view, filtered by
+/// the acting principal's D3 site scope (§16.1 — a scoped role sees exactly
+/// its assigned site).
+async fn center_sites<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
+) -> Response
+where
+    Services: CenterServices,
+{
+    let Ok(sites) = state.services.list_center_sites().await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let visible = sites
+        .into_iter()
+        .filter(|site| {
+            auth::view_scope_allows(context.role(), context.assignment_site_id(), site.site_id())
+        })
+        .map(|site| project_center_site(&site))
+        .collect();
+    json_ok(Json(CenterSitesResponse::new(visible)))
+}
+
+/// Registers one site and returns its one-time binding code (design D2).
+///
+/// The raw code is shown exactly once in the response — no later view of the
+/// binding ever repeats it.
+async fn register_center_site<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CenterBindingRegisterRequest>,
+) -> Response
+where
+    Services: CenterServices,
+    Time: Clock,
+{
+    let Ok(display_name) = EndpointDisplayName::parse(request.display_name()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "site display name is invalid".to_owned(),
+        );
+    };
+    let now = state.clock.now();
+    match state
+        .services
+        .register_center_site(display_name.as_str(), request.center_url(), now)
+        .await
+    {
+        Ok(registered) => json_ok(Json(CenterBindingRegisterResponse::new(
+            registered.site_id().into_uuid(),
+            registered.binding_id().into_uuid(),
+            registered.code().to_owned(),
+            registered.expires_at(),
+        ))),
+        Err(_) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Revokes the active binding of one site (design D2); a site whose binding
+/// is already revoked is reported as revoked.
+async fn revoke_center_binding<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    Json(request): Json<CenterBindingRevokeRequest>,
+) -> Response
+where
+    Services: CenterServices,
+    Time: Clock,
+{
+    let site = InstanceId::from_uuid(request.site_id());
+    match state
+        .services
+        .revoke_center_binding(site, state.clock.now())
+        .await
+    {
+        Ok(()) => no_content(),
+        Err(_) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Lists the center's aggregated endpoint view (§15.5), optionally narrowed
+/// to one site by the `site_id` query, and filtered by the acting
+/// principal's D3 site scope.
+async fn center_endpoints<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
+    uri: Uri,
+) -> Response
+where
+    Services: CenterServices,
+{
+    let Ok(site_filter) = parse_center_site_filter(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "site id filter is invalid".to_owned(),
+        );
+    };
+    if site_filter.is_some_and(|site| {
+        !auth::view_scope_allows(context.role(), context.assignment_site_id(), site)
+    }) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "this role cannot view the requested site".to_owned(),
+        );
+    }
+    let Ok(endpoints) = state.services.list_center_endpoints(site_filter).await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let visible = endpoints
+        .into_iter()
+        .filter(|endpoint| {
+            // A projection without a site association is a broken row; only
+            // a site-associated projection is ever shown.
+            endpoint.site_id().is_some_and(|site| {
+                auth::view_scope_allows(context.role(), context.assignment_site_id(), site)
+            })
+        })
+        .map(|endpoint| project_center_endpoint(&endpoint))
+        .collect();
+    json_ok(Json(CenterEndpointViewListResponse::new(visible)))
+}
+
+/// Lists the center's operation tracking view (§15.6), optionally narrowed
+/// to one site by the `site_id` query, and filtered by the acting
+/// principal's D3 site scope.
+async fn center_operations<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
+    uri: Uri,
+) -> Response
+where
+    Services: CenterServices,
+{
+    let Ok(site_filter) = parse_center_site_filter(uri.query()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "site id filter is invalid".to_owned(),
+        );
+    };
+    if site_filter.is_some_and(|site| {
+        !auth::view_scope_allows(context.role(), context.assignment_site_id(), site)
+    }) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "this role cannot view the requested site".to_owned(),
+        );
+    }
+    let Ok(operations) = state.services.list_center_operations(site_filter).await else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let visible = operations
+        .into_iter()
+        .filter(|operation| {
+            operation.site_id().is_none_or(|site| {
+                auth::view_scope_allows(context.role(), context.assignment_site_id(), site)
+            })
+        })
+        .map(|operation| project_center_operation(&operation))
+        .collect();
+    json_ok(Json(CenterOperationListResponse::new(visible)))
+}
+
+/// Submits one §15.6 center operation: the typed command, the target, and
+/// the site — and nothing else (§15.6 — no URL, no HTTP method, no headers,
+/// no body).
+///
+/// The acting principal's role and D3 site scope are the handler gate; the
+/// dispatch use case re-checks the same rule against the persisted
+/// assignment.
+async fn submit_center_operation<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: Extension<AuthContext>,
+    Json(request): Json<CenterOperationSubmitRequest>,
+) -> Response
+where
+    Services: CenterServices,
+    Time: Clock,
+{
+    let Some(actor) = context.actor_principal_id() else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "a signed-in principal is required to dispatch center operations".to_owned(),
+        );
+    };
+    let site = InstanceId::from_uuid(request.site_id());
+    if !auth::dispatch_scope_allows(context.role(), context.assignment_site_id(), site) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "this role cannot dispatch to the requested site".to_owned(),
+        );
+    }
+    let Ok(target) = ResourceODataId::parse(request.target()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "operation target is invalid".to_owned(),
+        );
+    };
+    let endpoint = EndpointId::from_uuid(request.endpoint_id());
+    match state
+        .services
+        .dispatch_center_operation(
+            site,
+            endpoint,
+            &target,
+            request.command(),
+            actor,
+            state.clock.now(),
+        )
+        .await
+    {
+        Ok(dispatched) => json_ok(Json(CenterOperationSubmitResponse::new(
+            dispatched.operation_id().into_uuid(),
+            dispatched.ttl_expires_at(),
+        ))),
+        Err(refusal) => center_dispatch_refusal_response(&refusal),
+    }
+}
+
+/// Maps one center dispatch refusal to its HTTP verdict.
+fn center_dispatch_refusal_response(refusal: &CenterOperationRefusal) -> Response {
+    let (status, message) = match refusal {
+        CenterOperationRefusal::NotAuthorized => (
+            StatusCode::FORBIDDEN,
+            "this role cannot dispatch to the requested site",
+        ),
+        CenterOperationRefusal::UnknownEndpoint { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the endpoint is not in the center's projection",
+        ),
+        CenterOperationRefusal::EndpointNotInSite { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the endpoint does not belong to the requested site",
+        ),
+        CenterOperationRefusal::UnknownTarget { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the target is not part of the endpoint's projection",
+        ),
+        CenterOperationRefusal::CommandSerialization => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the operation command could not be serialized",
+        ),
+        CenterOperationRefusal::Store => {
+            (StatusCode::SERVICE_UNAVAILABLE, "the center store failed")
+        }
+    };
+    json_error(status, message.to_owned())
+}
+
+/// Projects one registered site onto its console wire shape (§15.5).
+fn project_center_site(site: &CenterSiteView) -> CenterSiteResponse {
+    CenterSiteResponse::new(
+        site.site_id().into_uuid(),
+        site.display_name().to_owned(),
+        site.binding().map(project_center_binding_state),
+        site.online(),
+        site.endpoint_count(),
+        site.last_refresh_at(),
+    )
+}
+
+fn project_center_binding_state(state: CenterBindingState) -> CenterBindingStateResponse {
+    match state {
+        CenterBindingState::Pending => CenterBindingStateResponse::Pending,
+        CenterBindingState::Bound => CenterBindingStateResponse::Bound,
+        CenterBindingState::Revoked => CenterBindingStateResponse::Revoked,
+    }
+}
+
+/// Projects one projected endpoint onto its console wire shape (§15.5).
+fn project_center_endpoint(endpoint: &CenterEndpointView) -> CenterEndpointViewResponse {
+    CenterEndpointViewResponse::new(
+        endpoint.site_id().map(InstanceId::into_uuid),
+        endpoint.endpoint_id().into_uuid(),
+        endpoint.display_name().to_owned(),
+        endpoint.address().to_owned(),
+        endpoint.health().to_owned(),
+        endpoint.refresh_generation(),
+    )
+}
+
+/// Projects one center operation onto its console wire shape (§15.6).
+fn project_center_operation(operation: &CenterOperationView) -> CenterOperationResponse {
+    CenterOperationResponse::new(
+        operation.operation_id().into_uuid(),
+        operation.site_id().map(InstanceId::into_uuid),
+        operation.endpoint_id().into_uuid(),
+        operation.command().clone(),
+        operation.target().map(str::to_owned),
+        project_operation_state(operation.state()),
+        operation.actor().map(str::to_owned),
+        operation.ttl_expires_at(),
+        operation.created_at(),
+    )
+}
+
+/// Parses the optional `site_id` query filter of the center views.
+fn parse_center_site_filter(query: Option<&str>) -> Result<Option<InstanceId>, ()> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let Some(value) = query.strip_prefix("site_id=") else {
+        return Err(());
+    };
+    value.parse::<InstanceId>().map(Some).map_err(|_| ())
+}
+
 /// Maps one group-workflow failure to its HTTP status and console message.
 fn group_error_response<GroupError, EndpointError>(
     error: &GroupManagementError<GroupError, EndpointError>,
@@ -4364,6 +5090,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 auth_state: AuthTestState::default(),
+                center_state: CenterTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: false }),
             FixedClock,
@@ -4383,6 +5110,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 auth_state: AuthTestState::default(),
+                center_state: CenterTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: false }),
             FixedClock,
@@ -4403,6 +5131,7 @@ mod tests {
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: false,
                 auth_state: AuthTestState::default(),
+                center_state: CenterTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: false }),
             FixedClock,
@@ -4423,6 +5152,7 @@ mod tests {
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: true,
                 auth_state: AuthTestState::default(),
+                center_state: CenterTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: true }),
             FixedClock,
@@ -7030,6 +7760,11 @@ mod tests {
         /// "nothing found"), while the guarded tests populate it through
         /// `AuthTestState`.
         auth_state: AuthTestState,
+        /// The in-memory center-view state behind the center console tests:
+        /// the default bundle answers "no registered sites" (every existing
+        /// test's expectation), while the center tests seed the views and
+        /// record every mutation through `CenterTestState`.
+        center_state: CenterTestState,
     }
 
     /// In-memory batch store for the §13.7 route tests.
@@ -7310,6 +8045,10 @@ mod tests {
     struct AuthTestInner {
         principals: Vec<Principal>,
         roles: HashMap<PrincipalId, Role>,
+        /// The D3 site scope of one role assignment (`None` is the global
+        /// assignment); the center scope tests seed it through
+        /// `seed_scoped_principal`.
+        role_sites: HashMap<PrincipalId, Option<InstanceId>>,
         passwords: HashMap<PrincipalId, PasswordCredential>,
         sessions: Vec<Session>,
         bootstrap_code: Option<BootstrapCode>,
@@ -7327,6 +8066,25 @@ mod tests {
             };
             let principal = Principal::new(PrincipalId::generate(), name, now);
             inner.roles.insert(principal.id(), role);
+            inner
+                .passwords
+                .insert(principal.id(), deterministic_credential(password, now));
+            inner.principals.push(principal);
+        }
+
+        /// Seeds one principal with a D3 site-scoped role assignment (§16.1
+        /// — a center role can be limited to one site).
+        fn seed_scoped_principal(&self, name: &str, password: &str, role: Role, site: InstanceId) {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            let now = OffsetDateTime::now_utc();
+            let Ok(name) = PrincipalName::parse(name) else {
+                return;
+            };
+            let principal = Principal::new(PrincipalId::generate(), name, now);
+            inner.roles.insert(principal.id(), role);
+            inner.role_sites.insert(principal.id(), Some(site));
             inner
                 .passwords
                 .insert(principal.id(), deterministic_credential(password, now));
@@ -7548,6 +8306,9 @@ mod tests {
                 inner
                     .roles
                     .insert(assignment.principal_id(), assignment.role());
+                inner
+                    .role_sites
+                    .insert(assignment.principal_id(), assignment.site_id());
                 Ok(())
             })
         }
@@ -7559,7 +8320,13 @@ mod tests {
             Box::pin(async move {
                 let inner = inner.lock().map_err(|_| MockWriteError)?;
                 Ok(inner.roles.get(&principal_id).copied().map(|role| {
-                    RoleAssignment::new(principal_id, role, None, OffsetDateTime::now_utc(), None)
+                    RoleAssignment::new(
+                        principal_id,
+                        role,
+                        None,
+                        OffsetDateTime::now_utc(),
+                        inner.role_sites.get(&principal_id).copied().flatten(),
+                    )
                 }))
             })
         }
@@ -8099,6 +8866,252 @@ mod tests {
         }
     }
 
+    /// The in-memory center-view state behind the center console tests.
+    ///
+    /// The bundle answers the seeded views and records every mutation, so the
+    /// route tests assert the wire shapes and the site-scope filtering
+    /// against a deterministic center.
+    /// One recorded center operation submission (§15.6).
+    #[derive(Clone, Debug)]
+    struct DispatchedSubmission {
+        site: InstanceId,
+        endpoint: EndpointId,
+        target: String,
+        command: RedfishCommand,
+        actor: PrincipalId,
+    }
+
+    #[derive(Clone, Default)]
+    struct CenterTestState {
+        sites: Arc<Mutex<Vec<CenterSiteView>>>,
+        endpoints: Arc<Mutex<Vec<CenterEndpointView>>>,
+        operations: Arc<Mutex<Vec<CenterOperationView>>>,
+        registered: Arc<Mutex<Vec<(String, String)>>>,
+        revoked: Arc<Mutex<Vec<InstanceId>>>,
+        dispatched: Arc<Mutex<Vec<DispatchedSubmission>>>,
+        /// When armed, every center boundary fails (the 503 verdicts).
+        fail: bool,
+    }
+
+    impl CenterTestState {
+        fn seed_site(&self, site: CenterSiteView) -> Result<(), MockWriteError> {
+            self.sites.lock().map_err(|_| MockWriteError)?.push(site);
+            Ok(())
+        }
+
+        fn seed_endpoint(&self, endpoint: CenterEndpointView) -> Result<(), MockWriteError> {
+            self.endpoints
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .push(endpoint);
+            Ok(())
+        }
+
+        fn seed_operation(&self, operation: CenterOperationView) -> Result<(), MockWriteError> {
+            self.operations
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .push(operation);
+            Ok(())
+        }
+
+        fn registered_owned(&self) -> Result<Vec<(String, String)>, MockWriteError> {
+            Ok(self.registered.lock().map_err(|_| MockWriteError)?.clone())
+        }
+
+        fn revoked_owned(&self) -> Result<Vec<InstanceId>, MockWriteError> {
+            Ok(self.revoked.lock().map_err(|_| MockWriteError)?.clone())
+        }
+
+        fn dispatched_owned(&self) -> Result<Vec<DispatchedSubmission>, MockWriteError> {
+            Ok(self.dispatched.lock().map_err(|_| MockWriteError)?.clone())
+        }
+    }
+
+    impl CenterServices for UnavailableWriteServices {
+        type Error = MockWriteError;
+
+        fn list_center_sites(
+            &self,
+        ) -> BoundaryFuture<'_, Result<Vec<CenterSiteView>, Self::Error>> {
+            let state = self.center_state.clone();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(state.sites.lock().map_err(|_| MockWriteError)?.clone())
+            })
+        }
+
+        fn list_center_endpoints(
+            &self,
+            site: Option<InstanceId>,
+        ) -> BoundaryFuture<'_, Result<Vec<CenterEndpointView>, Self::Error>> {
+            let state = self.center_state.clone();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(state
+                    .endpoints
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .iter()
+                    .filter(|endpoint| site.is_none_or(|site| endpoint.site_id() == Some(site)))
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn list_center_operations(
+            &self,
+            site: Option<InstanceId>,
+        ) -> BoundaryFuture<'_, Result<Vec<CenterOperationView>, Self::Error>> {
+            let state = self.center_state.clone();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(state
+                    .operations
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .iter()
+                    .filter(|operation| site.is_none_or(|site| operation.site_id() == Some(site)))
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn register_center_site(
+            &self,
+            display_name: &str,
+            center_url: &str,
+            now: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<RegisteredCenterSite, Self::Error>> {
+            let state = self.center_state.clone();
+            let display_name = display_name.to_owned();
+            let center_url = center_url.to_owned();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(MockWriteError);
+                }
+                state
+                    .registered
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .push((display_name, center_url));
+                Ok(RegisteredCenterSite::new(
+                    InstanceId::generate(),
+                    CenterBindingId::generate(),
+                    "23456789ABCDEFGHJKLM".to_owned(),
+                    now,
+                ))
+            })
+        }
+
+        fn revoke_center_binding(
+            &self,
+            site: InstanceId,
+            _now: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            let state = self.center_state.clone();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(MockWriteError);
+                }
+                state.revoked.lock().map_err(|_| MockWriteError)?.push(site);
+                Ok(())
+            })
+        }
+
+        fn dispatch_center_operation(
+            &self,
+            site: InstanceId,
+            endpoint: EndpointId,
+            target: &ResourceODataId,
+            command: &RedfishCommand,
+            actor: PrincipalId,
+            now: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<DispatchedCenterOperation, CenterOperationRefusal>> {
+            let state = self.center_state.clone();
+            let target = target.to_string();
+            let command = command.clone();
+            Box::pin(async move {
+                if state.fail {
+                    return Err(CenterOperationRefusal::Store);
+                }
+                state
+                    .dispatched
+                    .lock()
+                    .map_err(|_| CenterOperationRefusal::Store)?
+                    .push(DispatchedSubmission {
+                        site,
+                        endpoint,
+                        target,
+                        command,
+                        actor,
+                    });
+                Ok(DispatchedCenterOperation::new(
+                    OperationId::generate(),
+                    now + Duration::minutes(15),
+                ))
+            })
+        }
+    }
+
+    /// Builds the router over a services bundle armed with the center-view
+    /// test state — the center console routes' test bench.
+    fn test_center_router(center_state: CenterTestState) -> Router {
+        router(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: false,
+                auth_state: AuthTestState::default(),
+                center_state,
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        )
+    }
+
+    /// Builds the guarded router over one center-view state and one
+    /// authentication state, for the site-scope permission tests.
+    fn test_center_router_with_auth(
+        auth_state: AuthTestState,
+        center_state: CenterTestState,
+    ) -> Router {
+        router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Center,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: false,
+                auth_state,
+                center_state,
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        )
+    }
+
+    /// One seeded registered site view.
+    fn center_site_view(
+        site_id: InstanceId,
+        binding: Option<CenterBindingState>,
+    ) -> CenterSiteView {
+        CenterSiteView::new(site_id, format!("Site {site_id}"), binding, false, 0, None)
+    }
+
     #[test]
     fn diagnostics_projection_maps_a_corrupt_stored_payload_to_an_internal_fault()
     -> Result<(), Box<dyn Error>> {
@@ -8169,6 +9182,7 @@ mod tests {
                 managed_endpoints: None,
                 refresh_working: false,
                 auth_state,
+                center_state: CenterTestState::default(),
             }),
             Arc::new(UnavailableGateway { working: false }),
             clock,
@@ -8611,5 +9625,478 @@ mod tests {
         assert_eq!(session.expires_at(), started_at + Duration::hours(8));
         assert!(session.last_used_at() > started_at);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_sites_route_projects_the_s15_5_site_view() -> Result<(), Box<dyn Error>> {
+        let state = CenterTestState::default();
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        state.seed_site(center_site_view(site_a, Some(CenterBindingState::Bound)))?;
+        let last_refresh = OffsetDateTime::UNIX_EPOCH + Duration::SECOND;
+        state.seed_site(CenterSiteView::new(
+            site_b,
+            "Site B".to_owned(),
+            Some(CenterBindingState::Pending),
+            true,
+            3,
+            Some(last_refresh),
+        ))?;
+        let router = test_center_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/v1/center/sites").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, must-revalidate"))
+        );
+        let body = json_body(response).await?;
+        let sites = body["sites"].as_array().ok_or("sites must be an array")?;
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0]["site_id"], site_a.to_string());
+        assert_eq!(sites[0]["display_name"], format!("Site {site_a}"));
+        assert_eq!(sites[0]["binding"], "bound");
+        assert_eq!(sites[0]["online"], false);
+        assert_eq!(sites[1]["site_id"], site_b.to_string());
+        assert_eq!(sites[1]["binding"], "pending");
+        assert_eq!(sites[1]["online"], true);
+        assert_eq!(sites[1]["endpoint_count"], 3);
+        assert_eq!(sites[1]["last_refresh_at"], "1970-01-01T00:00:01Z");
+
+        // A failing center boundary answers 503.
+        let response = test_center_router(CenterTestState {
+            fail: true,
+            ..CenterTestState::default()
+        })
+        .oneshot(Request::get("/api/v1/center/sites").body(Body::empty())?)
+        .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_binding_routes_generate_the_one_time_code_and_revoke() -> Result<(), Box<dyn Error>>
+    {
+        let state = CenterTestState::default();
+        let router = test_center_router(state.clone());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"display_name": "Site One", "center_url": "center.example:8443"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(body["code"], "23456789ABCDEFGHJKLM");
+        assert!(body["site_id"].is_string());
+        assert!(body["binding_id"].is_string());
+        assert_eq!(body["expires_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(
+            state.registered_owned()?,
+            vec![("Site One".to_owned(), "center.example:8443".to_owned())]
+        );
+
+        // An invalid display name is refused before the boundary.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"display_name": "   ", "center_url": "center.example:8443"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.registered_owned()?.len(), 1);
+
+        // The revoke route records the site and answers 204.
+        let site = InstanceId::generate();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings/revoke")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"site_id": "{}"}}"#,
+                        site.into_uuid()
+                    )))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(state.revoked_owned()?, vec![site]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_endpoint_and_operation_views_project_the_aggregated_summary()
+    -> Result<(), Box<dyn Error>> {
+        let state = CenterTestState::default();
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        state.seed_endpoint(CenterEndpointView::new(
+            Some(site),
+            endpoint,
+            "Rack A BMC".to_owned(),
+            "https://192.0.2.10/".to_owned(),
+            "ok".to_owned(),
+            7,
+        ))?;
+        let command = RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown));
+        let created = OffsetDateTime::UNIX_EPOCH;
+        state.seed_operation(CenterOperationView::new(
+            OperationId::generate(),
+            Some(site),
+            endpoint,
+            command,
+            Some("/redfish/v1/Systems/1".to_owned()),
+            OperationState::Queued,
+            Some("admin".to_owned()),
+            Some(created + Duration::minutes(15)),
+            created,
+        ))?;
+        let router = test_center_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/v1/center/endpoints").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let endpoints = body["endpoints"]
+            .as_array()
+            .ok_or("endpoints must be an array")?;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0]["site_id"], site.to_string());
+        assert_eq!(endpoints[0]["endpoint_id"], endpoint.to_string());
+        assert_eq!(endpoints[0]["display_name"], "Rack A BMC");
+        assert_eq!(endpoints[0]["address"], "https://192.0.2.10/");
+        assert_eq!(endpoints[0]["health"], "ok");
+        assert_eq!(endpoints[0]["refresh_generation"], 7);
+
+        // The site_id query narrows the projection.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/center/endpoints?site_id={}",
+                    InstanceId::generate().into_uuid()
+                ))
+                .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await?["endpoints"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/v1/center/operations").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let operations = body["operations"]
+            .as_array()
+            .ok_or("operations must be an array")?;
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0]["site_id"], site.to_string());
+        assert_eq!(operations[0]["endpoint_id"], endpoint.to_string());
+        assert_eq!(operations[0]["target"], "/redfish/v1/Systems/1");
+        assert_eq!(operations[0]["state"], "queued");
+        assert_eq!(operations[0]["actor"], "admin");
+        assert_eq!(operations[0]["ttl_expires_at"], "1970-01-01T00:15:00Z");
+        assert_eq!(operations[0]["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(
+            operations[0]["command"]["System"]["Reset"],
+            "GracefulShutdown"
+        );
+
+        // An invalid site filter is a bad request.
+        let response = router
+            .oneshot(
+                Request::get("/api/v1/center/operations?site_id=not-a-uuid").body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_operation_submission_route_carries_exactly_the_s15_6_set()
+    -> Result<(), Box<dyn Error>> {
+        // A signed-in Administrator backs the submission: the dispatch
+        // judgment requires a principal (§16.1), and the open routers have
+        // none.
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let state = CenterTestState::default();
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let router = test_center_router_with_auth(auth.clone(), state.clone());
+        let (cookie, csrf) = sign_in_center(&router, &auth, "admin", "admin-password").await?;
+        let submit = |body: String| {
+            let router = router.clone();
+            let cookie = cookie.clone();
+            let csrf = csrf.clone();
+            async move {
+                let request = Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .header("cookie", &cookie)
+                    .body(Body::from(body))
+                    .map_err(Box::<dyn Error>::from)?;
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .map_err(Box::<dyn Error>::from)?;
+                Ok::<Response, Box<dyn Error>>(response)
+            }
+        };
+
+        let body = serde_json::to_string(&json!({
+            "site_id": site.into_uuid(),
+            "endpoint_id": endpoint.into_uuid(),
+            "target": "/redfish/v1/Systems/1",
+            "command": { "System": { "Reset": "GracefulShutdown" } }
+        }))?;
+        let response = submit(body.clone()).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let acknowledgement = json_body(response).await?;
+        assert!(acknowledgement["operation_id"].is_string());
+        assert_eq!(acknowledgement["ttl_expires_at"], "1970-01-01T00:15:00Z");
+        let dispatched = state.dispatched_owned()?;
+        assert_eq!(dispatched.len(), 1);
+        let record = &dispatched[0];
+        assert_eq!(record.site, site);
+        assert_eq!(record.endpoint, endpoint);
+        assert_eq!(record.target, "/redfish/v1/Systems/1");
+        assert!(matches!(
+            &record.command,
+            RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown))
+        ));
+        assert_eq!(record.actor.to_string().len(), 36);
+
+        // A smuggled HTTP body is refused by the strict wire contract.
+        let smuggled = serde_json::to_string(&json!({
+            "site_id": site.into_uuid(),
+            "endpoint_id": endpoint.into_uuid(),
+            "target": "/redfish/v1/Systems/1",
+            "command": { "System": { "Reset": "GracefulShutdown" } },
+            "url": "https://bmc.example/redfish/v1/Systems/1",
+            "method": "POST",
+            "headers": {},
+            "body": {}
+        }))?;
+        let response = submit(smuggled).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a submission that smuggles an HTTP body is refused by the strict wire contract"
+        );
+
+        // An invalid target is refused before the boundary.
+        let invalid_target = serde_json::to_string(&json!({
+            "site_id": site.into_uuid(),
+            "endpoint_id": endpoint.into_uuid(),
+            "target": "not an odata id with control\x01chars",
+            "command": { "System": { "Reset": "GracefulShutdown" } }
+        }))?;
+        let response = submit(invalid_target).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// Signs in through the route and returns the session cookie and the
+    /// CSRF token of the response (the guarded center routers).
+    async fn sign_in_center(
+        router: &Router,
+        _state: &AuthTestState,
+        username: &str,
+        password: &str,
+    ) -> Result<(String, String), Box<dyn Error>> {
+        sign_in(router, username, password).await
+    }
+
+    #[tokio::test]
+    async fn the_center_views_apply_the_d3_site_scope_of_the_role_assignment()
+    -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        auth.seed_scoped_principal("operator", "operator-password", Role::Operator, site_a);
+        let state = CenterTestState::default();
+        state.seed_site(center_site_view(site_a, Some(CenterBindingState::Bound)))?;
+        state.seed_site(center_site_view(site_b, Some(CenterBindingState::Bound)))?;
+        let router = test_center_router_with_auth(auth.clone(), state);
+
+        // The global Administrator sees every site.
+        let (admin_cookie, _) = sign_in_center(&router, &auth, "admin", "admin-password").await?;
+        let response = fetch_center_sites(&router, &admin_cookie).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        assert_eq!(
+            body["sites"].as_array().map(Vec::len),
+            Some(2),
+            "the Administrator is global"
+        );
+
+        // The site-scoped Operator sees exactly the assigned site.
+        let (operator_cookie, _) =
+            sign_in_center(&router, &auth, "operator", "operator-password").await?;
+        let response = fetch_center_sites(&router, &operator_cookie).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let sites = body["sites"].as_array().ok_or("sites must be an array")?;
+        assert_eq!(
+            sites.len(),
+            1,
+            "a scoped role sees exactly its assigned site"
+        );
+        assert_eq!(sites[0]["site_id"], site_a.to_string());
+
+        // The scoped Operator cannot request another site's view explicitly.
+        let response = fetch_center_sites_filtered(&router, &operator_cookie, site_b).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_center_mutation_routes_enforce_the_role_and_the_site_scope()
+    -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let site_a = InstanceId::generate();
+        let site_b = InstanceId::generate();
+        auth.seed_scoped_principal("operator", "operator-password", Role::Operator, site_a);
+        auth.seed_scoped_principal("viewer", "viewer-password", Role::Viewer, site_a);
+        let state = CenterTestState::default();
+        let router = test_center_router_with_auth(auth.clone(), state);
+
+        // The binding surface is Administrator only.
+        let (operator_cookie, operator_csrf) =
+            sign_in_center(&router, &auth, "operator", "operator-password").await?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/bindings")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &operator_csrf)
+                    .header("cookie", &operator_cookie)
+                    .body(Body::from(
+                        r#"{"display_name": "Site One", "center_url": "center.example:8443"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the binding surface is Administrator only"
+        );
+
+        // An Operator may submit to the assigned site...
+        let body = serde_json::to_string(&json!({
+            "site_id": site_a.into_uuid(),
+            "endpoint_id": EndpointId::generate().into_uuid(),
+            "target": "/redfish/v1/Systems/1",
+            "command": { "System": { "Reset": "GracefulShutdown" } }
+        }))?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &operator_csrf)
+                    .header("cookie", &operator_cookie)
+                    .body(Body::from(body.clone()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // ...but not to another site (D3).
+        let out_of_scope = serde_json::to_string(&json!({
+            "site_id": site_b.into_uuid(),
+            "endpoint_id": EndpointId::generate().into_uuid(),
+            "target": "/redfish/v1/Systems/1",
+            "command": { "System": { "Reset": "GracefulShutdown" } }
+        }))?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &operator_csrf)
+                    .header("cookie", &operator_cookie)
+                    .body(Body::from(out_of_scope))?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a scoped Operator cannot dispatch outside the assigned site"
+        );
+
+        // The Viewer never dispatches, even inside its scope.
+        let (viewer_cookie, viewer_csrf) =
+            sign_in_center(&router, &auth, "viewer", "viewer-password").await?;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/center/operations")
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &viewer_csrf)
+                    .header("cookie", &viewer_cookie)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    /// Fetches the center site list under one session cookie.
+    async fn fetch_center_sites(router: &Router, cookie: &str) -> Result<Response, Box<dyn Error>> {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/center/sites")
+                    .header("cookie", cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response)
+    }
+
+    /// Fetches the center site list narrowed to one site under one session
+    /// cookie — the endpoint/operation site-filter read uses the same
+    /// handler judgment, so this one path pins the verdict.
+    async fn fetch_center_sites_filtered(
+        router: &Router,
+        cookie: &str,
+        site: InstanceId,
+    ) -> Result<Response, Box<dyn Error>> {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/center/endpoints?site_id={}",
+                    site.into_uuid()
+                ))
+                .header("cookie", cookie)
+                .body(Body::empty())?,
+            )
+            .await?;
+        Ok(response)
     }
 }

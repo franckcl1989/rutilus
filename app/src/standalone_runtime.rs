@@ -12,13 +12,14 @@ use std::{
 
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialCreationRepository,
-    CredentialInventoryRepository, CredentialResolver, CredentialSecretProtector,
-    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryRepository,
-    EndpointRefreshRepository, EventIngestion, EventRepository, EventStream, EventStreamPull,
-    GroupRepository, MetricReportSnapshotReader, OperationExecutor, ProtectedCredentialCreation,
-    RedfishDiscovery, ResolvedCredential, ResourceObservation, StoredCapability, TagRepository,
-    TaskMonitor, TelemetryRepository, TelemetrySampler, TlsIdentityProbe,
+    CapabilitySnapshotRepository, CenterSessionRegistry, Clock, CoreResourceReader,
+    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
+    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
+    EndpointInventoryRepository, EndpointRefreshRepository, EventIngestion, EventRepository,
+    EventStream, EventStreamPull, GroupRepository, MetricReportSnapshotReader, OperationExecutor,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
+    StoredCapability, TagRepository, TaskMonitor, TelemetryRepository, TelemetrySampler,
+    TlsIdentityProbe,
 };
 use rutilus_domain::{
     Argon2IdHash, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BootstrapCode,
@@ -56,8 +57,8 @@ use rutilus_security::{
     recover_master_key_system, verify_code, verify_password,
 };
 use rutilus_web::{
-    AuditEventQuery, AuthGate, AuthPolicy, AuthServices, IssuedSessionTokens, ProductServices,
-    WebProductInfo, router_with_auth,
+    AuditEventQuery, AuthGate, AuthPolicy, AuthServices, CenterServices, IssuedSessionTokens,
+    ProductServices, WebProductInfo, router_with_auth,
 };
 use secrecy::{SecretBox, SecretString};
 use thiserror::Error;
@@ -107,11 +108,20 @@ pub struct StandaloneInstance {
 
 /// The authenticated runtime state shared with the Site posture's server
 /// and background tasks (crate-internal: only the instance hands it out).
+///
+/// The `registry` tracks the online §15.1 connections of the center
+/// posture; the Edge postures never touch it, and the center runtime shares
+/// one registry between its accept loop and its web console services.
 pub(crate) struct StandaloneState {
-    store: SqliteStore,
+    pub(crate) store: SqliteStore,
     master_key: MasterKey,
     _runtime_lock: RuntimeLock,
     audit_tail: Arc<Mutex<VecDeque<AuditEvent>>>,
+    pub(crate) registry: Arc<CenterSessionRegistry>,
+    /// The center certificate-issuer adapter of the center posture; the
+    /// Edge postures keep the empty slot, and the center runtime arms it at
+    /// startup (the center binding surface is refused without it).
+    pub(crate) center_issuer: Mutex<Option<super::center_runtime::CenterCaIssuer>>,
 }
 
 impl EndpointInventoryRepository for StandaloneState {
@@ -1271,6 +1281,8 @@ impl StandaloneInstance {
                 master_key,
                 _runtime_lock: runtime_lock,
                 audit_tail: Arc::new(Mutex::new(VecDeque::new())),
+                registry: Arc::new(CenterSessionRegistry::new()),
+                center_issuer: Mutex::new(None),
             }),
         })
     }
@@ -1303,6 +1315,8 @@ impl StandaloneInstance {
             master_key: _,
             _runtime_lock,
             audit_tail: _,
+            registry: _,
+            center_issuer: _,
         } = state;
         store
             .close()
@@ -1392,7 +1406,7 @@ impl StandaloneBinding {
         shutdown: Shutdown,
     ) -> io::Result<()>
     where
-        Services: ProductServices + AuthServices + 'static,
+        Services: ProductServices + AuthServices + CenterServices + 'static,
         Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
         Time: Clock + Clone + 'static,
         Shutdown: Future<Output = ()> + Send + 'static,
@@ -1464,7 +1478,7 @@ pub async fn run_standalone<Services, Gateway, Time>(
     clock: Time,
 ) -> Result<(), StandaloneRunError>
 where
-    Services: ProductServices + AuthServices + 'static,
+    Services: ProductServices + AuthServices + CenterServices + 'static,
     Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
     Time: Clock + Clone + 'static,
 {
@@ -2222,6 +2236,8 @@ mod tests {
             master_key,
             _runtime_lock: runtime_lock,
             audit_tail: _,
+            registry: _,
+            center_issuer: _,
         } = state;
         store.close().await?;
         drop((master_key, runtime_lock));

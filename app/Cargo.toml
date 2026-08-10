@@ -43,6 +43,7 @@ rutilus-operation-engine.workspace = true
 rutilus-persistence.workspace = true
 rutilus-platform.workspace = true
 rutilus-security.workspace = true
+serde_json.workspace = true
 rutilus-web.workspace = true
 secrecy.workspace = true
 thiserror.workspace = true

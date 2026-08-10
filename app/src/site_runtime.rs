@@ -33,7 +33,9 @@ use rutilus_platform::{
     SystemSecretStore, SystemSecretStoreError,
 };
 use rutilus_security::{RewrapError, RewrappedMasterKey, UnlockSource, rewrap_master_key};
-use rutilus_web::{AuthPolicy, AuthServices, ProductServices, WebProductInfo, router_with_auth};
+use rutilus_web::{
+    AuthPolicy, AuthServices, CenterServices, ProductServices, WebProductInfo, router_with_auth,
+};
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -542,7 +544,7 @@ impl SiteBinding {
         shutdown: Shutdown,
     ) -> io::Result<()>
     where
-        Services: ProductServices + AuthServices + 'static,
+        Services: ProductServices + AuthServices + CenterServices + 'static,
         Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
         Time: Clock + Clone + 'static,
         Shutdown: Future<Output = ()> + Send + 'static,

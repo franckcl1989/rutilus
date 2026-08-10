@@ -61,7 +61,7 @@ pub use center_inbox_repository::{
 pub use center_outbox_repository::{
     AckOutcome, CenterOutboxRepositoryError, StoredCenterOutboxError,
 };
-pub use center_projection_repository::CenterProjectionRepositoryError;
+pub use center_projection_repository::{CenterProjectionRepositoryError, ProjectedEndpointSummary};
 pub use credential_repository::{
     CredentialRepositoryError, NewCredential, StoredCredential, StoredCredentialError,
 };
