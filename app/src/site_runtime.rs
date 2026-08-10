@@ -1337,9 +1337,7 @@ async fn run_center_sync_task(
             // restart stays local-only, exactly like a locally revoked
             // binding. The material files are left in place (harmless; a
             // future bind overwrites them).
-            eprintln!(
-                "the center refused the site as not bound; revoking the local binding"
-            );
+            eprintln!("the center refused the site as not bound; revoking the local binding");
             let Ok(Some(binding)) = store.find_binding_by_site(binding_site).await else {
                 return;
             };
@@ -1973,8 +1971,7 @@ mod tests {
         crate::initialize_standalone(&paths, &unlock).await?;
         {
             let instance = StandaloneInstance::open(&paths, &unlock).await?;
-            let (_, _, _) =
-                seed_bound_site(&instance.state().store, &paths).await?;
+            let (_, _, _) = seed_bound_site(&instance.state().store, &paths).await?;
             instance.close().await?;
         }
         assert!(paths.tls_directory().join(SITE_CLIENT_CERT_FILE).is_file());

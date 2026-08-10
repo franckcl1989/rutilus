@@ -264,10 +264,7 @@ impl CenterAcceptor {
         let site = connection
             .complete_negotiation_with_admission(admission)
             .await?;
-        Ok(AcceptedCenterConnection {
-            connection,
-            site,
-        })
+        Ok(AcceptedCenterConnection { connection, site })
     }
 
     /// The common handshake of both accept paths: the mTLS handshake, the

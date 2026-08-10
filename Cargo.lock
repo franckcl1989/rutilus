@@ -3591,6 +3591,7 @@ dependencies = [
  "rutilus-persistence",
  "rutilus-platform",
  "rutilus-security",
+ "rutilus-test-support",
  "rutilus-web",
  "secrecy",
  "serde_json",
@@ -3782,8 +3783,11 @@ dependencies = [
 name = "rutilus-test-support"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
+ "futures",
  "rcgen",
+ "rutilus-center-protocol",
  "rutilus-domain",
  "rutilus-infra-redfish",
  "secrecy",
@@ -3792,6 +3796,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]

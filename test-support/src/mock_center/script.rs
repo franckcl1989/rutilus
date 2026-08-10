@@ -19,19 +19,14 @@ use std::{
 use rutilus_center_protocol::{Envelope, EnvelopeMessage};
 
 /// How the mock center's negotiation answers one `Hello`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ScriptedAdmission {
     /// Answer `NegotiationResult { accepted: true }`.
+    #[default]
     Admit,
     /// Answer `NegotiationResult { accepted: false, reason: "not-bound" }`
     /// — the audit follow-up F4 convergence path.
     RefuseNotBound,
-}
-
-impl Default for ScriptedAdmission {
-    fn default() -> Self {
-        Self::Admit
-    }
 }
 
 /// One scripted reply to a received content frame.

@@ -3189,42 +3189,39 @@ where
         );
     };
     let now = state.clock.now();
-    match state
+    if let Ok(registered) = state
         .services
         .register_center_site(display_name.as_str(), request.center_url(), now)
         .await
     {
-        Ok(registered) => {
-            record_center_write(
-                &state,
-                &context,
-                AuditTarget::Product,
-                ProductPermission::ManageCenterBindings,
-                AuditAction::RegisterSiteBinding,
-                CenterWriteOutcome::Succeeded,
-                now,
-            )
-            .await;
-            json_ok(Json(CenterBindingRegisterResponse::new(
-                registered.site_id().into_uuid(),
-                registered.binding_id().into_uuid(),
-                registered.code().to_owned(),
-                registered.expires_at(),
-            )))
-        }
-        Err(_) => {
-            record_center_write(
-                &state,
-                &context,
-                AuditTarget::Product,
-                ProductPermission::ManageCenterBindings,
-                AuditAction::RegisterSiteBinding,
-                CenterWriteOutcome::StoreFailed,
-                now,
-            )
-            .await;
-            uncached_status(StatusCode::SERVICE_UNAVAILABLE)
-        }
+        record_center_write(
+            &state,
+            &context,
+            AuditTarget::Product,
+            ProductPermission::ManageCenterBindings,
+            AuditAction::RegisterSiteBinding,
+            CenterWriteOutcome::Succeeded,
+            now,
+        )
+        .await;
+        json_ok(Json(CenterBindingRegisterResponse::new(
+            registered.site_id().into_uuid(),
+            registered.binding_id().into_uuid(),
+            registered.code().to_owned(),
+            registered.expires_at(),
+        )))
+    } else {
+        record_center_write(
+            &state,
+            &context,
+            AuditTarget::Product,
+            ProductPermission::ManageCenterBindings,
+            AuditAction::RegisterSiteBinding,
+            CenterWriteOutcome::StoreFailed,
+            now,
+        )
+        .await;
+        uncached_status(StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
@@ -3244,33 +3241,35 @@ where
 {
     let site = InstanceId::from_uuid(request.site_id());
     let now = state.clock.now();
-    match state.services.revoke_center_binding(site, now).await {
-        Ok(()) => {
-            record_center_write(
-                &state,
-                &context,
-                AuditTarget::Product,
-                ProductPermission::ManageCenterBindings,
-                AuditAction::RevokeSiteBinding,
-                CenterWriteOutcome::Succeeded,
-                now,
-            )
-            .await;
-            no_content()
-        }
-        Err(_) => {
-            record_center_write(
-                &state,
-                &context,
-                AuditTarget::Product,
-                ProductPermission::ManageCenterBindings,
-                AuditAction::RevokeSiteBinding,
-                CenterWriteOutcome::StoreFailed,
-                now,
-            )
-            .await;
-            uncached_status(StatusCode::SERVICE_UNAVAILABLE)
-        }
+    if state
+        .services
+        .revoke_center_binding(site, now)
+        .await
+        .is_ok()
+    {
+        record_center_write(
+            &state,
+            &context,
+            AuditTarget::Product,
+            ProductPermission::ManageCenterBindings,
+            AuditAction::RevokeSiteBinding,
+            CenterWriteOutcome::Succeeded,
+            now,
+        )
+        .await;
+        no_content()
+    } else {
+        record_center_write(
+            &state,
+            &context,
+            AuditTarget::Product,
+            ProductPermission::ManageCenterBindings,
+            AuditAction::RevokeSiteBinding,
+            CenterWriteOutcome::StoreFailed,
+            now,
+        )
+        .await;
+        uncached_status(StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
@@ -8372,10 +8371,10 @@ mod tests {
                 if !working {
                     return Err(MockWriteError);
                 }
-                if let Some(recorder) = recorder {
-                    if let Ok(mut events) = recorder.lock() {
-                        events.push(event.clone());
-                    }
+                if let Some(recorder) = recorder
+                    && let Ok(mut events) = recorder.lock()
+                {
+                    events.push(event.clone());
                 }
                 Ok(())
             })
@@ -10093,8 +10092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_center_console_never_registers_direct_bmc_routes() -> Result<(), Box<dyn Error>>
-    {
+    async fn the_center_console_never_registers_direct_bmc_routes() -> Result<(), Box<dyn Error>> {
         // Audit follow-up F2: the Center posture serves the aggregation
         // surface only — every route that would enroll, refresh, or manage
         // a BMC directly is absent, so an administrator on the center
@@ -10127,12 +10125,12 @@ mod tests {
         // credential creation, and operation submission do not exist on the
         // center console.
         for (path, body) in [
-            ("/api/v1/endpoints", r#"{}"#),
-            ("/api/v1/endpoints/trust", r#"{}"#),
-            ("/api/v1/endpoints/refresh", r#"{}"#),
-            ("/api/v1/credentials", r#"{}"#),
-            ("/api/v1/operations", r#"{}"#),
-            ("/api/v1/artifacts", r#"{}"#),
+            ("/api/v1/endpoints", "{}"),
+            ("/api/v1/endpoints/trust", "{}"),
+            ("/api/v1/endpoints/refresh", "{}"),
+            ("/api/v1/credentials", "{}"),
+            ("/api/v1/operations", "{}"),
+            ("/api/v1/artifacts", "{}"),
         ] {
             let response = router
                 .clone()
@@ -10187,7 +10185,7 @@ mod tests {
                 .oneshot(
                     Request::post(path)
                         .header("content-type", "application/json")
-                        .body(Body::from(r#"{}"#))?,
+                        .body(Body::from("{}"))?,
                 )
                 .await?;
             assert_eq!(
@@ -10252,6 +10250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn the_center_write_routes_record_audit_events() -> Result<(), Box<dyn Error>> {
         // Audit follow-up F3: every center write — register, revoke, and
         // dispatch — appends the §16.3 start/terminal pair naming the
@@ -10338,10 +10337,7 @@ mod tests {
         {
             let mut events = audit.lock().map_err(|_| MockWriteError)?;
             assert_eq!(events.len(), 2, "revoke must append start + terminal");
-            assert_eq!(
-                events[0].context().action().as_str(),
-                "revoke-site-binding"
-            );
+            assert_eq!(events[0].context().action().as_str(), "revoke-site-binding");
             events.clear();
         }
 
@@ -10420,7 +10416,7 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         {
-            let mut events = audit.lock().map_err(|_| MockWriteError)?;
+            let events = audit.lock().map_err(|_| MockWriteError)?;
             assert_eq!(events.len(), 2, "a refused dispatch must still audit");
             assert_eq!(events[1].outcome().kind().as_str(), "failed");
         }

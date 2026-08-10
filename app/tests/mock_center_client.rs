@@ -112,9 +112,8 @@ async fn the_mock_center_not_bound_refusal_classifies_on_the_real_client()
 
     // The client classifies the mock's `not-bound` answer into its own
     // NotBound error — the audit follow-up F4 convergence signal.
-    let error = match config.connect().await {
-        Ok(_) => return Err("the refusal must fail".into()),
-        Err(error) => error,
+    let Err(error) = config.connect().await else {
+        return Err("the refusal must fail".into());
     };
     assert!(
         matches!(error, CenterClientError::NotBound),

@@ -204,9 +204,9 @@ async fn run_accept_loop(center: MockCenter) {
     let options = center.options;
     loop {
         let accepted = center.listener.accept().await;
-        let (stream, _address) = match accepted {
-            Ok(accepted) => accepted,
-            Err(_) => return, // The listener itself failed; the mock is over.
+        let Ok((stream, _address)) = accepted else {
+            // The listener itself failed; the mock is over.
+            return;
         };
         let tls = center.tls.clone();
         let script = Arc::clone(&center.script);
@@ -237,6 +237,7 @@ async fn run_connection(
         options.handshake_timeout,
         tokio_tungstenite::accept_hdr_async(
             tls_stream,
+            #[allow(clippy::result_large_err)]
             |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
              mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                 // The real center only upgrades the §15.2 path; a
@@ -250,7 +251,7 @@ async fn run_connection(
                     *response.status_mut() =
                         tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
                     Err(tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::from(
-                        response.map(|_| None),
+                        response.map(|()| None),
                     ))
                 }
             },
@@ -379,7 +380,10 @@ mod tests {
             pki_types::{CertificateDer, PrivateKeyDer, ServerName},
         },
     };
-    use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message, client::IntoClientRequest as _},
+    };
 
     use super::*;
     use crate::mock_center::script::ScriptedAdmission;
@@ -422,7 +426,6 @@ mod tests {
         let stream = TcpStream::connect(address).await?;
         let server_name = ServerName::try_from("localhost")?;
         let tls = connector.connect(server_name, stream).await?;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
         let request = format!("wss://localhost:{}{}", address.port(), CENTER_WS_PATH)
             .into_client_request()?;
         let (ws, _response) =
@@ -551,7 +554,6 @@ mod tests {
         let stream = TcpStream::connect(address).await?;
         let server_name = ServerName::try_from("localhost")?;
         let tls = connector.connect(server_name, stream).await?;
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
         let request = format!("wss://localhost:{}{}", address.port(), CENTER_WS_PATH)
             .into_client_request()?;
         let (mut ws, _) = tokio_tungstenite::client_async_with_config(request, tls, None).await?;

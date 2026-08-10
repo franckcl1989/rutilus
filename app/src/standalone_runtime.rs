@@ -1396,6 +1396,7 @@ impl StandaloneBinding {
     /// # Errors
     ///
     /// Returns an I/O error if the bound listener fails while serving.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
         options: StandaloneRunOptions,
