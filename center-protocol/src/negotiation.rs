@@ -9,7 +9,9 @@
 //!
 //! The rejection reasons are the stable reason codes of the
 //! [`NegotiationResult`] message: `protocol-mismatch`, `baseline-mismatch`,
-//! and `ledger-mismatch`.
+//! `ledger-mismatch`, and `not-bound` (the 0.7.0 admission refusal — the
+//! center answers the `Hello` of a site whose binding is no longer in
+//! force with this reason instead of closing the connection silently).
 
 use std::{error::Error, fmt, str::FromStr};
 
@@ -37,6 +39,11 @@ pub enum NegotiationReason {
     BaselineMismatch,
     /// `capability_ledger_hash` differs from [`capability_ledger_hash`].
     LedgerMismatch,
+    /// The site's binding is not in force on the center: it was revoked,
+    /// re-bound, or never recorded (0.7.0 admission refusal, audit
+    /// follow-up F4). The protocol message contract allows new reason
+    /// codes, so this is a vocabulary addition, never a wire change.
+    NotBound,
 }
 
 impl NegotiationReason {
@@ -48,6 +55,7 @@ impl NegotiationReason {
             Self::ProtocolMismatch => "protocol-mismatch",
             Self::BaselineMismatch => "baseline-mismatch",
             Self::LedgerMismatch => "ledger-mismatch",
+            Self::NotBound => "not-bound",
         }
     }
 }
@@ -66,6 +74,7 @@ impl FromStr for NegotiationReason {
             "protocol-mismatch" => Ok(Self::ProtocolMismatch),
             "baseline-mismatch" => Ok(Self::BaselineMismatch),
             "ledger-mismatch" => Ok(Self::LedgerMismatch),
+            "not-bound" => Ok(Self::NotBound),
             _ => Err(NegotiationReasonParseError),
         }
     }
@@ -261,6 +270,7 @@ mod tests {
             NegotiationReason::ProtocolMismatch,
             NegotiationReason::BaselineMismatch,
             NegotiationReason::LedgerMismatch,
+            NegotiationReason::NotBound,
         ] {
             assert_eq!(reason.to_string().parse(), Ok(reason));
         }
