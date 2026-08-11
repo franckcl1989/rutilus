@@ -19,3 +19,10 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# getrandom is never referenced from code: the direct dependency exists only
+# to enable the `wasm_js` backend on the unified getrandom 0.4.3 (pulled in
+# by uuid's rng-getrandom feature), which hard-errors on wasm32-unknown-unknown
+# otherwise -- and api is compiled for wasm32 by the UI crate.
+ignored = ["getrandom"]

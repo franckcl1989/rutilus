@@ -25,3 +25,9 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# serde is consumed by the prost-generated types through the build.rs
+# type_attribute derive; the generated code lives in OUT_DIR, so machete's
+# source scan cannot see the usage.
+ignored = ["serde"]

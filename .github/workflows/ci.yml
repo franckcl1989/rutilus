@@ -5,11 +5,11 @@
 #   cargo fmt --check
 #   cargo clippy --workspace --all-targets --all-features
 #   cargo test
-#   cargo nextest            <- not enabled yet (see inline comments)
-#   cargo llvm-cov           <- not enabled yet (see inline comments)
+#   cargo nextest
+#   cargo llvm-cov
 #   cargo deny
 #   cargo audit              <- advisory scan already covered by cargo deny
-#   cargo machete            <- not enabled yet (see inline comments)
+#   cargo machete
 #   跨平台 Build             <- 3-OS matrix + wasm32 UI artifact
 #   Migration Test
 #   Capability Ledger Check
@@ -66,6 +66,16 @@ jobs:
       # and ~/.cargo; keyed by toolchain + Cargo.lock.
       - uses: swatinem/rust-cache@v2
 
+      # §19.4 gate tools: the nextest runner, the llvm-cov coverage driver,
+      # and the machete unused-dependency scan. Prebuilt binaries pinned to
+      # the versions verified locally (2026-08-12); only the default job
+      # runs the gates they serve.
+      - name: Install gate tools
+        if: matrix.is_default
+        uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-nextest@0.9.140,cargo-llvm-cov@0.8.7,cargo-machete@0.9.2
+
       # §19.4: cargo fmt --check
       - name: Format
         run: cargo fmt --check
@@ -89,14 +99,30 @@ jobs:
         if: ${{ !matrix.is_default }}
         run: cargo check --locked --workspace --all-targets
 
-      # §19.4: cargo nextest — NOT enabled yet. The repo has no nextest
-      # configuration and this gate has not been verified on the workspace.
-      # Enable once adopted:
-      #   run: cargo nextest run --workspace --locked
+      # §19.4: cargo nextest. The same workspace suite on the nextest runner
+      # (per-test process isolation and leak detection); --locked pins the
+      # committed Cargo.lock, and the runner binary comes from the install
+      # step above. --test-threads 4 bounds the runner's parallelism: at the
+      # default per-CPU concurrency the suite's HTTPS mock-server churn
+      # exhausts Windows' ephemeral socket pool (WSA 10055, verified
+      # 2026-08-12 on a 32-core machine); 4 is deterministic there and on CI,
+      # where the gate only ever runs on ubuntu-latest anyway.
+      - name: Test (nextest)
+        if: matrix.is_default
+        run: cargo nextest run --locked --workspace --test-threads 4
 
-      # §19.4: cargo llvm-cov — NOT enabled yet. No coverage config or
-      # baseline exists in the repo. Enable once a coverage threshold is set:
-      #   run: cargo llvm-cov --workspace --locked
+      # §19.4: cargo llvm-cov. Line coverage of the whole workspace with the
+      # threshold set at 80% against the 90.14% measured locally on
+      # 2026-08-12 (margin for platform variance: Windows-only cfg code is
+      # not compiled on the ubuntu runner). The trailing `-- --test-threads 4`
+      # bounds the test run exactly like the nextest gate above, for the same
+      # mock-timeout determinism reason. llvm-tools-preview provides the
+      # llvm-profdata/llvm-cov binaries cargo-llvm-cov drives.
+      - name: Coverage (llvm-cov)
+        if: matrix.is_default
+        run: |
+          rustup component add llvm-tools-preview
+          cargo llvm-cov --locked --workspace --fail-under-lines 80 -- --test-threads 4
 
       # §19.4: cargo deny. Official cargo-deny action (pinned to the version
       # verified locally against deny.toml: `cargo deny check` -> all of
@@ -116,9 +142,13 @@ jobs:
       # list), so audit is a later standalone gate. Enable with:
       #   run: cargo audit
 
-      # §19.4: cargo machete — NOT enabled yet. No machete.toml exists in the
-      # repo. Enable once the crate is adopted:
-      #   run: cargo machete
+      # §19.4: cargo machete. Zero unused dependencies; the three entries in
+      # the per-crate [package.metadata.cargo-machete] sections (api getrandom,
+      # app rustls-webpki, center-protocol serde) are false positives, each
+      # documented at the ignore site.
+      - name: Unused deps check (machete)
+        if: matrix.is_default
+        run: cargo machete
 
       # §19.4: 跨平台 Build — wasm32 UI artifact. Commands mirror ui/README.md;
       # wasm-bindgen-cli must stay at 0.2.126, the exact workspace
