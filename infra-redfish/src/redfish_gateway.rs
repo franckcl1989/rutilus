@@ -30318,6 +30318,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifies_a_dropped_multipart_upload_connection_as_result_unknown()
+    -> Result<(), Box<dyn Error>> {
+        // The multipart POST's connection drops before any response byte (an
+        // empty scripted response): a large upload interrupted mid-flight
+        // leaves the write's outcome unprovable — the BMC may have received
+        // and applied the image — so the error classifies as outcome-unknown
+        // (§13.5), exactly like a dropped command write.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            CORE_WITH_UPDATE_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            Vec::new(),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_update(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                firmware_artifact(),
+                None,
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(accepted) => {
+                return Err(format!("a dropped upload must fail, got {accepted:?}").into());
+            }
+        };
+        assert!(
+            error.outcome_is_unknown(),
+            "the interrupted upload may already have been applied: {error}"
+        );
+        // The multipart request itself was captured before the connection
+        // dropped, proving the upload was actually dispatched.
+        let requests = server.finish_all().await?;
+        assert_update_write_requests(&requests, &MULTIPART_UPDATE_REQUEST_PATHS)?;
+        assert_multipart_write_request(
+            &requests[5],
+            "/redfish/v1/UpdateService/MultipartUpdate",
+            "firmware-2026.bin",
+            b"rutilus fixture firmware image",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn surfaces_a_multipart_upload_acceptance_as_an_async_task() -> Result<(), Box<dyn Error>>
     {
         let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
