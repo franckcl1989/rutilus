@@ -840,10 +840,10 @@ mod tests {
         AccountCommand, AccountId, AccountPassword, AccountUserName, ArtifactId, BatchOperation,
         BatchOperationId, BootCommand, BootSource, BootSourceOverrideEnabled,
         BootSourceOverrideMode, ChassisCommand, CreateAccount, CreateSubscription, EndpointId,
-        EventCommand, EventDestinationProtocol, EventSubscriptionError, EventType, FailureKind,
-        ManagerCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile, RedfishCommand,
-        ResetKeysType, ResetType, RoleId, SecureBootCommand, SetBootSourceOverride, StartUpdate,
-        SystemCommand, TargetId, UpdateAccountPassword, UpdateCommand,
+        EventCommand, EventDestinationProtocol, EventType, FailureKind, ManagerCommand,
+        NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile, RedfishCommand, ResetKeysType,
+        ResetType, RoleId, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+        TargetId, UpdateAccountPassword, UpdateCommand,
     };
     use rutilus_entity::{batch_operation, operation, operation_target};
     use rutilus_operation_engine::OperationEngine;
@@ -1395,7 +1395,7 @@ mod tests {
     async fn refuses_command_json_this_build_cannot_deserialize() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let now = OffsetDateTime::now_utc();
-        // A deferred family (design section 7.5: `Account`, `Bios`, `Storage`,
+        // A deferred family (design section 7.5: `Bios`, `Storage`,
         // `Telemetry`; `Oem` is compiled in this build, so an unknown OEM face
         // is rejected by the domain instead) and a truncated document are both
         // written directly, bypassing the repository's serializer — exactly
@@ -2255,9 +2255,16 @@ mod tests {
 
     /// One representative command per §7.5 family, mirroring the domain's
     /// exhaustive family list so a newly added family cannot hide from
-    /// persistence tests.
-    fn all_commands() -> Result<Vec<RedfishCommand>, EventSubscriptionError> {
+    /// persistence tests. The `Account` family carries a §10 secret (the
+    /// `AccountPassword` of `CreateAccount`), so its round trip also proves
+    /// the at-rest envelope survives the most sensitive payload.
+    fn all_commands() -> Result<Vec<RedfishCommand>, Box<dyn Error>> {
         Ok(vec![
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("correct-horse-battery-staple".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
             one_command(),
             RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
             RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
