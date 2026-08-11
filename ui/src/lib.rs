@@ -26,14 +26,14 @@ use rutilus_api::{
     EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, EraseToken, EraseType,
     EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
     GroupResponse, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS,
-    MAX_ROLE_ID_CHARS, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
-    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
-    OperationSourceResponse, OperationStateResponse, ProfileFile, ProfileId, RedfishCommand,
-    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse, RoleId,
-    RoleResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
-    TagListResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
-    TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse, UpdateAccount,
-    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    MAX_ROLE_ID_CHARS, ManagerCommand, MetricReportMetric, MetricValueResponse,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OemCommand, OperationResponse, OperationSourceResponse, OperationStateResponse, ProfileFile,
+    ProfileId, RedfishCommand, ResetKeysType, ResetType, ResourceDiagnosticsResponse,
+    ResourceStatusResponse, RoleId, RoleResponse, SecureBootCommand, SetBootSourceOverride,
+    StartUpdate, SystemCommand, TagListResponse, TelemetryCommand, TelemetrySampleListResponse,
+    TelemetrySampleResponse, TelemetrySeriesResponse, TlsTrustModeResponse, TokenData, TokenType,
+    UiLocationResponse, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -4497,13 +4497,20 @@ enum CommandFamilyView {
     BootOverride,
     SecureBoot,
     EventSubscription,
+    Telemetry,
     FirmwareUpdate,
     Oem,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl CommandFamilyView {
-    /// Every family in §7.5 order, so the form cannot miss a variant.
+    /// Every family the operation form offers, in §7.5 order, so the form
+    /// cannot miss a variant it supports.
+    ///
+    /// [`Self::Telemetry`] is deliberately absent: the telemetry write form
+    /// is a later milestone, and the operation card of a persisted telemetry
+    /// command renders through [`wire_command_summary`] with the family
+    /// label alone.
     const ALL: [Self; 9] = [
         Self::Account,
         Self::SystemReset,
@@ -4527,6 +4534,7 @@ impl CommandFamilyView {
             Self::BootOverride => "boot",
             Self::SecureBoot => "secure-boot",
             Self::EventSubscription => "event",
+            Self::Telemetry => "telemetry",
             Self::FirmwareUpdate => "update",
             Self::Oem => "oem",
         }
@@ -4543,6 +4551,7 @@ impl CommandFamilyView {
             Self::BootOverride => "Boot source override",
             Self::SecureBoot => "Secure Boot",
             Self::EventSubscription => "Event subscription",
+            Self::Telemetry => "Telemetry",
             Self::FirmwareUpdate => "Firmware update",
             Self::Oem => "OEM (NVIDIA)",
         }
@@ -5685,6 +5694,7 @@ impl OperationFormDraft {
                     | CommandFamilyView::BootOverride
                     | CommandFamilyView::SecureBoot
                     | CommandFamilyView::EventSubscription
+                    | CommandFamilyView::Telemetry
                     | CommandFamilyView::FirmwareUpdate
                     | CommandFamilyView::Oem => {
                         // Refused rather than fabricated: the reset arm only
@@ -5759,6 +5769,13 @@ impl OperationFormDraft {
                     }
                 }
             }
+            // The telemetry write form is a later milestone: the family
+            // vocabulary knows the §7.5 family (the card of a persisted
+            // telemetry command renders through `wire_command_summary`), but
+            // the form cannot build a telemetry draft yet, so the attempt is
+            // refused rather than fabricated — the same rule as the reset
+            // arm's inner family match.
+            CommandFamilyView::Telemetry => Err(OperationFormError::FamilyRequired),
             CommandFamilyView::FirmwareUpdate => {
                 Ok(OperationCommandDraft::Update(self.update_draft()?))
             }
@@ -7320,6 +7337,56 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                 payload: format!("Delete · {}", deletion.subscription_id()),
             }
         }
+        RedfishCommand::Telemetry(telemetry) => CommandSummaryProjection {
+            family: CommandFamilyView::Telemetry.label(),
+            payload: match telemetry {
+                TelemetryCommand::SetEnabled { enabled } => format!("Set enabled · {enabled}"),
+                TelemetryCommand::CreateMetricDefinition(create) => format!(
+                    "Metric definition · Create · {} · {}",
+                    create.metric_type(),
+                    create.units()
+                ),
+                TelemetryCommand::UpdateMetricDefinition(update) => format!(
+                    "Metric definition · Update · {} · {} · {}",
+                    update.metric_definition_id(),
+                    update.metric_type(),
+                    update.units()
+                ),
+                TelemetryCommand::DeleteMetricDefinition(deletion) => {
+                    format!(
+                        "Metric definition · Delete · {}",
+                        deletion.metric_definition_id()
+                    )
+                }
+                TelemetryCommand::CreateMetricReportDefinition(create) => format!(
+                    "Report definition · Create · {} · {}",
+                    create.metric_report_definition_type(),
+                    create
+                        .metrics()
+                        .iter()
+                        .map(MetricReportMetric::metric_id)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                TelemetryCommand::UpdateMetricReportDefinition(update) => format!(
+                    "Report definition · Update · {} · {} · {}",
+                    update.metric_report_definition_id(),
+                    update.metric_report_definition_type(),
+                    update
+                        .metrics()
+                        .iter()
+                        .map(MetricReportMetric::metric_id)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                TelemetryCommand::DeleteMetricReportDefinition(deletion) => format!(
+                    "Report definition · Delete · {}",
+                    deletion.metric_report_definition_id()
+                ),
+            },
+        },
         RedfishCommand::Update(UpdateCommand::StartUpdate(payload)) => {
             // The artifact id renders in the same short form as the form
             // preview and the artifact card, so the card of a submitted
@@ -22991,6 +23058,7 @@ mod tests {
                 "event",
                 "Event subscription",
             ),
+            (CommandFamilyView::Telemetry, "telemetry", "Telemetry"),
             (
                 CommandFamilyView::FirmwareUpdate,
                 "update",
@@ -23002,7 +23070,10 @@ mod tests {
             assert_eq!(family.label(), label);
         }
         // The family codes are the §7.5 wire contract; the families that
-        // still have no form surface must not be claimed by one.
+        // still have no form surface must not be claimed by one. `Telemetry`
+        // has a label and a code (the card of a persisted telemetry command
+        // renders through `wire_command_summary`) but no form surface yet, so
+        // `ALL` — the form's family picker — stays at nine entries.
         assert_eq!(CommandFamilyView::ALL.len(), 9);
     }
 
@@ -24597,6 +24668,78 @@ mod tests {
                 json!({ "Event": { "DeleteSubscription": { "subscription_id": "Sub-1" } } }),
                 "Event subscription",
                 "Delete · Sub-1",
+            ),
+            (
+                json!({ "Telemetry": { "SetEnabled": { "enabled": true } } }),
+                "Telemetry",
+                "Set enabled · true",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "CreateMetricDefinition": { "metric_type": "Gauge", "units": "W" }
+                    }
+                }),
+                "Telemetry",
+                "Metric definition · Create · Gauge · W",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "UpdateMetricDefinition": {
+                            "metric_definition_id": "PowerMetric",
+                            "metric_type": "Counter",
+                            "units": "W"
+                        }
+                    }
+                }),
+                "Telemetry",
+                "Metric definition · Update · PowerMetric · Counter · W",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "DeleteMetricDefinition": { "metric_definition_id": "PowerMetric" }
+                    }
+                }),
+                "Telemetry",
+                "Metric definition · Delete · PowerMetric",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "CreateMetricReportDefinition": {
+                            "metric_report_definition_type": "OnRequest",
+                            "metrics": [{ "metric_id": "PowerMetric" }]
+                        }
+                    }
+                }),
+                "Telemetry",
+                "Report definition · Create · OnRequest · PowerMetric",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "UpdateMetricReportDefinition": {
+                            "metric_report_definition_id": "PowerReport",
+                            "metric_report_definition_type": "OnChange",
+                            "metrics": [{ "metric_id": "PowerMetric" }]
+                        }
+                    }
+                }),
+                "Telemetry",
+                "Report definition · Update · PowerReport · OnChange · PowerMetric",
+            ),
+            (
+                json!({
+                    "Telemetry": {
+                        "DeleteMetricReportDefinition": {
+                            "metric_report_definition_id": "PowerReport"
+                        }
+                    }
+                }),
+                "Telemetry",
+                "Report definition · Delete · PowerReport",
             ),
             (
                 json!({

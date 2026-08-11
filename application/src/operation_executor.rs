@@ -41,7 +41,7 @@ use rutilus_domain::{
     CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
     EventCommand, FailureKind, ManagerCommand, OemCommand, Operation, OperationEvent, OperationId,
     OperationState, ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand,
-    UpdateCommand,
+    TelemetryCommand, UpdateCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
@@ -1243,6 +1243,32 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
         RedfishCommand::Event(EventCommand::DeleteSubscription(_)) => {
             AuditRedfishOperation::DeleteEventSubscription
         }
+        // The seven telemetry writes are audited separately because their
+        // accountability differs: enabling or disabling the telemetry
+        // service, creating, updating, or deleting a metric definition, and
+        // creating, updating, or deleting a metric report definition are
+        // materially different actions (§16.3 granularity decision).
+        RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { .. }) => {
+            AuditRedfishOperation::SetTelemetryEnabled
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(_)) => {
+            AuditRedfishOperation::CreateMetricDefinition
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(_)) => {
+            AuditRedfishOperation::UpdateMetricDefinition
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(_)) => {
+            AuditRedfishOperation::DeleteMetricDefinition
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(_)) => {
+            AuditRedfishOperation::CreateMetricReportDefinition
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(_)) => {
+            AuditRedfishOperation::UpdateMetricReportDefinition
+        }
+        RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(_)) => {
+            AuditRedfishOperation::DeleteMetricReportDefinition
+        }
         RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
             AuditRedfishOperation::UpdateFirmware
         }
@@ -1279,6 +1305,9 @@ pub(crate) fn required_capability(command: &RedfishCommand) -> EndpointCapabilit
         RedfishCommand::Chassis(_) => EndpointCapability::Chassis,
         RedfishCommand::SecureBoot(_) => EndpointCapability::SecureBoot,
         RedfishCommand::Event(_) => EndpointCapability::EventService,
+        // Telemetry writes target the BMC's `TelemetryService` (§14.4), so
+        // they require the telemetry-service capability.
+        RedfishCommand::Telemetry(_) => EndpointCapability::TelemetryService,
         // A firmware update targets the BMC's UpdateService (§14.3), so the
         // update command requires the update-service capability.
         RedfishCommand::Update(_) => EndpointCapability::UpdateService,
@@ -1585,13 +1614,17 @@ mod tests {
         AccountCommand, AccountId, AccountPassword, AccountUserName, Artifact, ArtifactName,
         ArtifactState, AuditOutcomeKind, AuditVerification, BootCommand, BootSource,
         BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState, ChassisCommand,
-        CreateAccount, CreateSubscription, CredentialId, DeleteAccount, DeleteSubscription,
-        Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        EventCommand, EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+        CreateAccount, CreateMetricDefinition, CreateMetricReportDefinition, CreateSubscription,
+        CredentialId, DeleteAccount, DeleteMetricDefinition, DeleteMetricReportDefinition,
+        DeleteSubscription, Endpoint, EndpointAddress, EndpointCapabilityObservation,
+        EndpointDisplayName, EndpointId, EventCommand, EventDestinationProtocol, EventType,
+        ManagerCommand, MetricDefinitionId, MetricReportDefinitionId, MetricReportDefinitionType,
+        MetricReportMetric, MetricType, MetricUnits, NvidiaDebugTokenCommand,
         NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OperationSource,
         OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, RoleId, SecureBootCommand,
-        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
-        TlsTrust, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TelemetryCommand,
+        TlsCertificate, TlsTrust, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName,
+        UpdateCommand, UpdateMetricDefinition, UpdateMetricReportDefinition,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
@@ -4265,17 +4298,18 @@ mod tests {
     // enumeration tests.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn command_audit_operations_pin_the_eighteen_write_families() -> Result<(), Box<dyn Error>>
-    {
+    async fn command_audit_operations_pin_the_twenty_five_write_families()
+    -> Result<(), Box<dyn Error>> {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
         // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another, one OEM
         // face ↔ another) fails here instead of reaching the audit log. The
         // five account writes are pinned separately because their
-        // accountability differs (§16.3), and the three OEM faces are pinned
-        // separately for the same reason (§11.5).
-        let pairs: [(&RedfishCommand, AuditRedfishOperation); 18] = [
+        // accountability differs (§16.3), the seven telemetry writes are
+        // pinned separately for the same reason (§14.4), and the three OEM
+        // faces are pinned separately for the same reason (§11.5).
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 25] = [
             (
                 &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
                     AccountUserName::parse("jane")?,
@@ -4368,6 +4402,63 @@ mod tests {
                 AuditRedfishOperation::DeleteEventSubscription,
             ),
             (
+                &RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: false }),
+                AuditRedfishOperation::SetTelemetryEnabled,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                    CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+                )),
+                AuditRedfishOperation::CreateMetricDefinition,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("PowerMetric")?,
+                        MetricType::Counter,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+                AuditRedfishOperation::UpdateMetricDefinition,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+                )),
+                AuditRedfishOperation::DeleteMetricDefinition,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                    CreateMetricReportDefinition::try_new(
+                        MetricReportDefinitionType::OnRequest,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    )?,
+                )),
+                AuditRedfishOperation::CreateMetricReportDefinition,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                    UpdateMetricReportDefinition::new(
+                        MetricReportDefinitionId::parse("PowerReport")?,
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    ),
+                )),
+                AuditRedfishOperation::UpdateMetricReportDefinition,
+            ),
+            (
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse(
+                        "PowerReport",
+                    )?),
+                )),
+                AuditRedfishOperation::DeleteMetricReportDefinition,
+            ),
+            (
                 &RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
                     ArtifactId::generate(),
                     None,
@@ -4453,6 +4544,56 @@ mod tests {
             required_capability(&command),
             EndpointCapability::UpdateService
         );
+    }
+
+    #[test]
+    fn telemetry_commands_require_the_telemetry_service_capability() -> Result<(), Box<dyn Error>> {
+        // Every telemetry write targets the BMC's `TelemetryService` (§14.4),
+        // so each of the seven commands must require the same §2.1
+        // telemetry-service capability.
+        for command in [
+            RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                UpdateMetricDefinition::new(
+                    MetricDefinitionId::parse("PowerMetric")?,
+                    MetricType::Counter,
+                    MetricUnits::parse("W")?,
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                CreateMetricReportDefinition::try_new(
+                    MetricReportDefinitionType::Periodic,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                )?,
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                UpdateMetricReportDefinition::new(
+                    MetricReportDefinitionId::parse("PowerReport")?,
+                    MetricReportDefinitionType::OnChange,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("PowerReport")?),
+            )),
+        ] {
+            assert_eq!(
+                required_capability(&command),
+                EndpointCapability::TelemetryService,
+                "every telemetry write must require the telemetry-service capability"
+            );
+        }
+        Ok(())
     }
 
     #[test]

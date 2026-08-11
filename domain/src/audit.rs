@@ -165,6 +165,13 @@ stable_audit_codes! {
     /// password, renaming it, and deleting it are materially different
     /// security-relevant actions an audit reader must not conflate — the
     /// same granularity decision that keeps the Secure Boot writes separate.
+    ///
+    /// The seven telemetry writes are separate for the same reason: enabling
+    /// or disabling the telemetry service, creating, updating, or deleting a
+    /// metric definition, and creating, updating, or deleting a metric report
+    /// definition are materially different actions an audit reader must not
+    /// conflate — the same granularity decision that keeps the account writes
+    /// separate.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
@@ -183,6 +190,13 @@ stable_audit_codes! {
         SecureBootResetKeys => "secure-boot-reset-keys",
         CreateEventSubscription => "create-event-subscription",
         DeleteEventSubscription => "delete-event-subscription",
+        SetTelemetryEnabled => "set-telemetry-enabled",
+        CreateMetricDefinition => "create-metric-definition",
+        UpdateMetricDefinition => "update-metric-definition",
+        DeleteMetricDefinition => "delete-metric-definition",
+        CreateMetricReportDefinition => "create-metric-report-definition",
+        UpdateMetricReportDefinition => "update-metric-report-definition",
+        DeleteMetricReportDefinition => "delete-metric-report-definition",
         UpdateFirmware => "update-firmware",
         OemSystemConfigProfile => "oem-system-config-profile",
         OemDebugToken => "oem-debug-token",
@@ -630,6 +644,13 @@ impl AuditOperationContext {
             | AuditRedfishOperation::SecureBootResetKeys
             | AuditRedfishOperation::CreateEventSubscription
             | AuditRedfishOperation::DeleteEventSubscription
+            | AuditRedfishOperation::SetTelemetryEnabled
+            | AuditRedfishOperation::CreateMetricDefinition
+            | AuditRedfishOperation::UpdateMetricDefinition
+            | AuditRedfishOperation::DeleteMetricDefinition
+            | AuditRedfishOperation::CreateMetricReportDefinition
+            | AuditRedfishOperation::UpdateMetricReportDefinition
+            | AuditRedfishOperation::DeleteMetricReportDefinition
             | AuditRedfishOperation::UpdateFirmware
             | AuditRedfishOperation::OemSystemConfigProfile
             | AuditRedfishOperation::OemDebugToken
@@ -1077,6 +1098,13 @@ mod tests {
             AuditRedfishOperation::SecureBootResetKeys,
             AuditRedfishOperation::CreateEventSubscription,
             AuditRedfishOperation::DeleteEventSubscription,
+            AuditRedfishOperation::SetTelemetryEnabled,
+            AuditRedfishOperation::CreateMetricDefinition,
+            AuditRedfishOperation::UpdateMetricDefinition,
+            AuditRedfishOperation::DeleteMetricDefinition,
+            AuditRedfishOperation::CreateMetricReportDefinition,
+            AuditRedfishOperation::UpdateMetricReportDefinition,
+            AuditRedfishOperation::DeleteMetricReportDefinition,
             AuditRedfishOperation::UpdateFirmware,
             AuditRedfishOperation::OemSystemConfigProfile,
             AuditRedfishOperation::OemDebugToken,
@@ -1169,6 +1197,34 @@ mod tests {
             (
                 AuditRedfishOperation::DeleteEventSubscription,
                 "delete-event-subscription",
+            ),
+            (
+                AuditRedfishOperation::SetTelemetryEnabled,
+                "set-telemetry-enabled",
+            ),
+            (
+                AuditRedfishOperation::CreateMetricDefinition,
+                "create-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::UpdateMetricDefinition,
+                "update-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::DeleteMetricDefinition,
+                "delete-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::CreateMetricReportDefinition,
+                "create-metric-report-definition",
+            ),
+            (
+                AuditRedfishOperation::UpdateMetricReportDefinition,
+                "update-metric-report-definition",
+            ),
+            (
+                AuditRedfishOperation::DeleteMetricReportDefinition,
+                "delete-metric-report-definition",
             ),
             (AuditRedfishOperation::PollRemoteTask, "poll-remote-task"),
         ] {
@@ -1524,7 +1580,7 @@ mod tests {
     ///
     /// Kept next to [`AuditOperationContext::try_new`]'s exhaustive check so
     /// the two lists stay reviewable together.
-    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 15] = [
+    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 22] = [
         AuditRedfishOperation::CreateAccount,
         AuditRedfishOperation::UpdateAccount,
         AuditRedfishOperation::UpdateAccountPassword,
@@ -1539,6 +1595,13 @@ mod tests {
         AuditRedfishOperation::SecureBootResetKeys,
         AuditRedfishOperation::CreateEventSubscription,
         AuditRedfishOperation::DeleteEventSubscription,
+        AuditRedfishOperation::SetTelemetryEnabled,
+        AuditRedfishOperation::CreateMetricDefinition,
+        AuditRedfishOperation::UpdateMetricDefinition,
+        AuditRedfishOperation::DeleteMetricDefinition,
+        AuditRedfishOperation::CreateMetricReportDefinition,
+        AuditRedfishOperation::UpdateMetricReportDefinition,
+        AuditRedfishOperation::DeleteMetricReportDefinition,
         AuditRedfishOperation::PollRemoteTask,
     ];
 

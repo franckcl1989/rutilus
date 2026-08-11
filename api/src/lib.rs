@@ -9,13 +9,18 @@ use std::{fmt, num::NonZeroU64};
 pub use rutilus_domain::{
     AccountCommand, AccountId, AccountPassword, AccountUserName, BootCommand, BootSource,
     BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateAccount,
-    CreateSubscription, DeleteAccount, DeleteSubscription, EraseToken, EraseType, EventCommand,
-    EventDestinationProtocol, EventType, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS,
-    MAX_ACCOUNT_USER_NAME_CHARS, MAX_ROLE_ID_CHARS, ManagerCommand, NvidiaDebugTokenCommand,
+    CreateMetricDefinition, CreateMetricReportDefinition, CreateSubscription, DeleteAccount,
+    DeleteMetricDefinition, DeleteMetricReportDefinition, DeleteSubscription, EraseToken,
+    EraseType, EventCommand, EventDestinationProtocol, EventType, MAX_ACCOUNT_ID_CHARS,
+    MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS, MAX_METRIC_DEFINITION_ID_CHARS,
+    MAX_METRIC_REPORT_DEFINITION_ID_CHARS, MAX_METRIC_UNITS_CHARS, MAX_ROLE_ID_CHARS,
+    ManagerCommand, MetricDefinitionId, MetricReportDefinitionId, MetricReportDefinitionType,
+    MetricReportMetric, MetricType, MetricUnits, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
     ProfileId, RedfishCommand, ResetKeysType, ResetType, RoleId, SecureBootCommand,
-    SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType, UpdateAccount,
-    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, TelemetryCommand, TokenData, TokenType,
+    UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    UpdateMetricDefinition, UpdateMetricReportDefinition,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
