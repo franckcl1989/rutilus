@@ -86,13 +86,15 @@ pub use password::{
     PasswordCredentialError,
 };
 pub use redfish_command::{
-    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
-    CreateSubscription, DeleteSubscription, EraseToken, EraseType, EventCommand,
-    EventDestinationProtocol, EventSubscriptionError, EventType, ManagerCommand,
-    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
-    OemCommand, ProfileFile, ProfileId, RedfishCommand, ResetKeysType, ResetType,
-    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType,
-    UpdateCommand,
+    AccountCommand, AccountId, AccountIdError, AccountPassword, AccountPasswordError,
+    AccountUserName, AccountUserNameError, BootCommand, BootSource, BootSourceOverrideEnabled,
+    BootSourceOverrideMode, ChassisCommand, CreateAccount, CreateSubscription, DeleteAccount,
+    DeleteSubscription, EraseToken, EraseType, EventCommand, EventDestinationProtocol,
+    EventSubscriptionError, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
+    ProfileId, RedfishCommand, ResetKeysType, ResetType, RoleId, RoleIdError, SecureBootCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType, UpdateAccount,
+    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 pub use resource_snapshot::{
     RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError, ResourceFeature,

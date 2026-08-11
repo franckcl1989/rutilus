@@ -159,10 +159,21 @@ stable_audit_codes! {
     /// [`UpdateCommand::StartUpdate`](crate::UpdateCommand::StartUpdate)
     /// write family, so an audit reader can distinguish a firmware submission
     /// from every other §7.5 write.
+    ///
+    /// The five account writes are separate because their accountability
+    /// differs: creating an account, changing its role, changing its
+    /// password, renaming it, and deleting it are materially different
+    /// security-relevant actions an audit reader must not conflate — the
+    /// same granularity decision that keeps the Secure Boot writes separate.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
         ReadCoreResources => "read-core-resources",
+        CreateAccount => "create-account",
+        UpdateAccount => "update-account",
+        UpdateAccountPassword => "update-account-password",
+        UpdateAccountUserName => "update-account-user-name",
+        DeleteAccount => "delete-account",
         ResetSystem => "reset-system",
         ResetManager => "reset-manager",
         ResetChassis => "reset-chassis",
@@ -494,7 +505,11 @@ impl AuditOperationContext {
     /// Returns [`AuditOperationContextError`] when the target, parameter
     /// summary, permission, typed Redfish operation, or the actor's
     /// principal identity does not match the product action.
-    #[allow(clippy::too_many_arguments)]
+    //
+    // The consistency matrix grows with the §7.5 operation vocabulary, so
+    // the line budget is exceeded by the family count, not by a design
+    // choice; the lint is scoped here like the argument count above.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn try_new_with_actor_principal(
         operation_id: AuditOperationId,
         actor: AuditActor,
@@ -601,7 +616,12 @@ impl AuditOperationContext {
             // Every §7.5 write family and the §13.6 remote-task polling is
             // the execution of one persisted operation against the managed
             // endpoint that receives the request.
-            AuditRedfishOperation::ResetSystem
+            AuditRedfishOperation::CreateAccount
+            | AuditRedfishOperation::UpdateAccount
+            | AuditRedfishOperation::UpdateAccountPassword
+            | AuditRedfishOperation::UpdateAccountUserName
+            | AuditRedfishOperation::DeleteAccount
+            | AuditRedfishOperation::ResetSystem
             | AuditRedfishOperation::ResetManager
             | AuditRedfishOperation::ResetChassis
             | AuditRedfishOperation::SetBootSourceOverride
@@ -1043,6 +1063,11 @@ mod tests {
             AuditRedfishOperation::None,
             AuditRedfishOperation::ProbeCoreCapabilities,
             AuditRedfishOperation::ReadCoreResources,
+            AuditRedfishOperation::CreateAccount,
+            AuditRedfishOperation::UpdateAccount,
+            AuditRedfishOperation::UpdateAccountPassword,
+            AuditRedfishOperation::UpdateAccountUserName,
+            AuditRedfishOperation::DeleteAccount,
             AuditRedfishOperation::ResetSystem,
             AuditRedfishOperation::ResetManager,
             AuditRedfishOperation::ResetChassis,
@@ -1107,6 +1132,17 @@ mod tests {
         // added for operation execution are pinned as exact literals — the
         // same contract the §7.5 command vocabulary pins.
         for (operation, expected) in [
+            (AuditRedfishOperation::CreateAccount, "create-account"),
+            (AuditRedfishOperation::UpdateAccount, "update-account"),
+            (
+                AuditRedfishOperation::UpdateAccountPassword,
+                "update-account-password",
+            ),
+            (
+                AuditRedfishOperation::UpdateAccountUserName,
+                "update-account-user-name",
+            ),
+            (AuditRedfishOperation::DeleteAccount, "delete-account"),
             (AuditRedfishOperation::ResetSystem, "reset-system"),
             (AuditRedfishOperation::ResetManager, "reset-manager"),
             (AuditRedfishOperation::ResetChassis, "reset-chassis"),
@@ -1488,7 +1524,12 @@ mod tests {
     ///
     /// Kept next to [`AuditOperationContext::try_new`]'s exhaustive check so
     /// the two lists stay reviewable together.
-    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 10] = [
+    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 15] = [
+        AuditRedfishOperation::CreateAccount,
+        AuditRedfishOperation::UpdateAccount,
+        AuditRedfishOperation::UpdateAccountPassword,
+        AuditRedfishOperation::UpdateAccountUserName,
+        AuditRedfishOperation::DeleteAccount,
         AuditRedfishOperation::ResetSystem,
         AuditRedfishOperation::ResetManager,
         AuditRedfishOperation::ResetChassis,
