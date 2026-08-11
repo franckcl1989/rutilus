@@ -165,6 +165,16 @@ stable_audit_codes! {
     /// password, renaming it, and deleting it are materially different
     /// security-relevant actions an audit reader must not conflate — the
     /// same granularity decision that keeps the Secure Boot writes separate.
+    ///
+    /// `ManagerResetToDefaults` is separate from `ResetManager` for the same
+    /// reason the three reset families are separate: a factory-defaults
+    /// wipe is materially different from a restart, and an audit reader
+    /// must not conflate them. `PowerSupplyReset` names the power-supply
+    /// reset behind the `Chassis` family. `LogClear` names the log-service
+    /// clear, `ControlUpdate` the control write, and `UpdateServicePatch`
+    /// the `UpdateService` property patch — the patch is separate from
+    /// `UpdateFirmware` because patching the service configuration and
+    /// submitting firmware are materially different actions.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
@@ -176,14 +186,19 @@ stable_audit_codes! {
         DeleteAccount => "delete-account",
         ResetSystem => "reset-system",
         ResetManager => "reset-manager",
+        ManagerResetToDefaults => "manager-reset-to-defaults",
         ResetChassis => "reset-chassis",
+        PowerSupplyReset => "power-supply-reset",
         SetBootSourceOverride => "set-boot-source-override",
         SecureBootEnable => "secure-boot-enable",
         SecureBootDisable => "secure-boot-disable",
         SecureBootResetKeys => "secure-boot-reset-keys",
         CreateEventSubscription => "create-event-subscription",
         DeleteEventSubscription => "delete-event-subscription",
+        LogClear => "log-clear",
+        ControlUpdate => "control-update",
         UpdateFirmware => "update-firmware",
+        UpdateServicePatch => "update-service-patch",
         OemSystemConfigProfile => "oem-system-config-profile",
         OemDebugToken => "oem-debug-token",
         OemPowerSmoothing => "oem-power-smoothing",
@@ -623,14 +638,19 @@ impl AuditOperationContext {
             | AuditRedfishOperation::DeleteAccount
             | AuditRedfishOperation::ResetSystem
             | AuditRedfishOperation::ResetManager
+            | AuditRedfishOperation::ManagerResetToDefaults
             | AuditRedfishOperation::ResetChassis
+            | AuditRedfishOperation::PowerSupplyReset
             | AuditRedfishOperation::SetBootSourceOverride
             | AuditRedfishOperation::SecureBootEnable
             | AuditRedfishOperation::SecureBootDisable
             | AuditRedfishOperation::SecureBootResetKeys
             | AuditRedfishOperation::CreateEventSubscription
             | AuditRedfishOperation::DeleteEventSubscription
+            | AuditRedfishOperation::LogClear
+            | AuditRedfishOperation::ControlUpdate
             | AuditRedfishOperation::UpdateFirmware
+            | AuditRedfishOperation::UpdateServicePatch
             | AuditRedfishOperation::OemSystemConfigProfile
             | AuditRedfishOperation::OemDebugToken
             | AuditRedfishOperation::OemPowerSmoothing
@@ -1070,14 +1090,19 @@ mod tests {
             AuditRedfishOperation::DeleteAccount,
             AuditRedfishOperation::ResetSystem,
             AuditRedfishOperation::ResetManager,
+            AuditRedfishOperation::ManagerResetToDefaults,
             AuditRedfishOperation::ResetChassis,
+            AuditRedfishOperation::PowerSupplyReset,
             AuditRedfishOperation::SetBootSourceOverride,
             AuditRedfishOperation::SecureBootEnable,
             AuditRedfishOperation::SecureBootDisable,
             AuditRedfishOperation::SecureBootResetKeys,
             AuditRedfishOperation::CreateEventSubscription,
             AuditRedfishOperation::DeleteEventSubscription,
+            AuditRedfishOperation::LogClear,
+            AuditRedfishOperation::ControlUpdate,
             AuditRedfishOperation::UpdateFirmware,
+            AuditRedfishOperation::UpdateServicePatch,
             AuditRedfishOperation::OemSystemConfigProfile,
             AuditRedfishOperation::OemDebugToken,
             AuditRedfishOperation::OemPowerSmoothing,
@@ -1145,7 +1170,15 @@ mod tests {
             (AuditRedfishOperation::DeleteAccount, "delete-account"),
             (AuditRedfishOperation::ResetSystem, "reset-system"),
             (AuditRedfishOperation::ResetManager, "reset-manager"),
+            (
+                AuditRedfishOperation::ManagerResetToDefaults,
+                "manager-reset-to-defaults",
+            ),
             (AuditRedfishOperation::ResetChassis, "reset-chassis"),
+            (
+                AuditRedfishOperation::PowerSupplyReset,
+                "power-supply-reset",
+            ),
             (
                 AuditRedfishOperation::SetBootSourceOverride,
                 "set-boot-source-override",
@@ -1169,6 +1202,12 @@ mod tests {
             (
                 AuditRedfishOperation::DeleteEventSubscription,
                 "delete-event-subscription",
+            ),
+            (AuditRedfishOperation::LogClear, "log-clear"),
+            (AuditRedfishOperation::ControlUpdate, "control-update"),
+            (
+                AuditRedfishOperation::UpdateServicePatch,
+                "update-service-patch",
             ),
             (AuditRedfishOperation::PollRemoteTask, "poll-remote-task"),
         ] {
@@ -1524,7 +1563,7 @@ mod tests {
     ///
     /// Kept next to [`AuditOperationContext::try_new`]'s exhaustive check so
     /// the two lists stay reviewable together.
-    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 15] = [
+    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 20] = [
         AuditRedfishOperation::CreateAccount,
         AuditRedfishOperation::UpdateAccount,
         AuditRedfishOperation::UpdateAccountPassword,
@@ -1532,13 +1571,18 @@ mod tests {
         AuditRedfishOperation::DeleteAccount,
         AuditRedfishOperation::ResetSystem,
         AuditRedfishOperation::ResetManager,
+        AuditRedfishOperation::ManagerResetToDefaults,
         AuditRedfishOperation::ResetChassis,
+        AuditRedfishOperation::PowerSupplyReset,
         AuditRedfishOperation::SetBootSourceOverride,
         AuditRedfishOperation::SecureBootEnable,
         AuditRedfishOperation::SecureBootDisable,
         AuditRedfishOperation::SecureBootResetKeys,
         AuditRedfishOperation::CreateEventSubscription,
         AuditRedfishOperation::DeleteEventSubscription,
+        AuditRedfishOperation::LogClear,
+        AuditRedfishOperation::ControlUpdate,
+        AuditRedfishOperation::UpdateServicePatch,
         AuditRedfishOperation::PollRemoteTask,
     ];
 

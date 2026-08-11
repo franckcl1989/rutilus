@@ -170,6 +170,7 @@ use nv_redfish::{
         },
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
         control::Control as ControlSchema,
+        control::ControlUpdate as ControlUpdateSchema,
         control_collection::ControlCollection as ControlCollectionSchema,
         environment_metrics::EnvironmentMetrics as EnvironmentMetricsSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
@@ -223,6 +224,7 @@ use nv_redfish::{
         thermal::Thermal as ThermalSchema,
         update_service::UpdateParametersUpdate as MultipartUpdateParameters,
         update_service::UpdateService as UpdateServiceSchema,
+        update_service::UpdateServiceUpdate as UpdateServiceUpdateSchema,
     },
     session_service::{Session, SessionCreate},
 };
@@ -238,16 +240,18 @@ use rustls::{
 };
 use rutilus_domain::{
     AccountCommand, AccountId, BootCommand, BootSource, BootSourceOverrideEnabled,
-    BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, CreateAccount,
-    CreateSubscription, CredentialUsername, DeleteAccount, DeleteSubscription, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
-    EventDestinationProtocol, EventId, EventSeverity, EventType, ManagerCommand, MessageId,
-    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
-    OemCommand, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
+    BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, ClearLog,
+    ControlCommand, ControlId, CreateAccount, CreateSubscription, CredentialUsername,
+    DeleteAccount, DeleteSubscription, EndpointAddress, EndpointCapability,
+    EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
+    EventDestinationProtocol, EventId, EventSeverity, EventType, LogCommand, LogServiceId,
+    ManagerCommand, ManagerResetToDefaultsType, MessageId, NvidiaDebugTokenCommand,
+    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, PowerSupplyId,
+    PowerSupplyReset, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
     ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError, SecureBootCommand, SetBootSourceOverride, SystemCommand,
     TlsIdentityChanged, TlsTrust, TokenType, UpdateAccount, UpdateAccountPassword,
-    UpdateAccountUserName,
+    UpdateAccountUserName, UpdateCommand, UpdateControl, UpdatePatch,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -3647,8 +3651,14 @@ async fn execute_authenticated_command(
         RedfishCommand::Manager(ManagerCommand::Reset(reset_type)) => {
             execute_manager_reset(bmc, root, identity, trust, *reset_type).await
         }
+        RedfishCommand::Manager(ManagerCommand::ResetToDefaults(reset_type)) => {
+            execute_manager_reset_to_defaults(bmc, root, identity, trust, *reset_type).await
+        }
         RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => {
             execute_chassis_reset(bmc, root, identity, trust, *reset_type).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(payload)) => {
+            execute_power_supply_reset(bmc, root, identity, trust, payload).await
         }
         RedfishCommand::Boot(BootCommand::SetBootSourceOverride(override_value)) => {
             execute_boot_override(bmc, root, identity, trust, override_value).await
@@ -3668,18 +3678,29 @@ async fn execute_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             execute_delete_subscription(bmc, root, identity, trust, payload).await
         }
-        // The Update family is deliberately dispatched through the dedicated
-        // `UpdateExecutor` boundary, never this one: the typed command
-        // carries only the database-serializable artifact id, while the
-        // upload needs the resolved artifact bytes, which the application
+        RedfishCommand::Log(LogCommand::ClearLog(payload)) => {
+            execute_log_clear(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Control(ControlCommand::Update(payload)) => {
+            execute_control_update(bmc, root, identity, trust, payload).await
+        }
+        // The `StartUpdate` variant is deliberately dispatched through the
+        // dedicated `UpdateExecutor` boundary, never this one: the typed
+        // command carries only the database-serializable artifact id, while
+        // the upload needs the resolved artifact bytes, which the application
         // resolves from the artifact store at execution time (§13.3 step 4,
         // §14.3). Reaching this arm means the caller misrouted the command
         // through the wrong boundary; the refusal is provable (no write is
         // ever sent) and the payload is rejected because it cannot be
-        // executed through this boundary.
-        RedfishCommand::Update(_) => Err(CommandExecutionError::Rejected(
-            CommandRejection::InvalidCommandPayload,
-        )),
+        // executed through this boundary. The `Patch` variant is an ordinary
+        // property PATCH of the `UpdateService` document — no artifact bytes
+        // are involved — so it dispatches through this boundary.
+        RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => Err(
+            CommandExecutionError::Rejected(CommandRejection::InvalidCommandPayload),
+        ),
+        RedfishCommand::Update(UpdateCommand::Patch(payload)) => {
+            execute_update_service_patch(bmc, root, identity, trust, payload).await
+        }
         RedfishCommand::Oem(oem) => {
             execute_nvidia_oem_command(bmc, root, identity, trust, oem).await
         }
@@ -4718,6 +4739,567 @@ async fn execute_chassis_reset(
     outcome_from_modification(response)
 }
 
+/// Executes a `Manager` reset-to-defaults through the decoded
+/// `#Manager.ResetToDefaults` action.
+///
+/// The navigation is exactly [`execute_manager_reset`]'s: the endpoint's
+/// first manager member and its decoded actions, with the compiled
+/// `ManagerResetToDefaultsAction` parameter type carrying the CSDL
+/// `ResetToDefaultsType` member mapped from the domain enum.
+async fn execute_manager_reset_to_defaults(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    reset_type: ManagerResetToDefaultsType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(manager) =
+        first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = manager
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset_to_defaults.as_ref())
+    else {
+        // §13.3 step 2: the decoded manager does not advertise the
+        // ResetToDefaults action, so the command is provably unsupported on
+        // this endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::manager::ManagerResetToDefaultsAction {
+        reset_type: Some(map_manager_reset_to_defaults_type(reset_type)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::manager::ManagerResetToDefaultsAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Maps the domain reset-to-defaults scope onto the compiled CSDL member.
+fn map_manager_reset_to_defaults_type(
+    reset_type: ManagerResetToDefaultsType,
+) -> nv_redfish::schema::manager::ResetToDefaultsType {
+    match reset_type {
+        ManagerResetToDefaultsType::ResetAll => {
+            nv_redfish::schema::manager::ResetToDefaultsType::ResetAll
+        }
+        ManagerResetToDefaultsType::PreserveNetworkAndUsers => {
+            nv_redfish::schema::manager::ResetToDefaultsType::PreserveNetworkAndUsers
+        }
+        ManagerResetToDefaultsType::PreserveNetwork => {
+            nv_redfish::schema::manager::ResetToDefaultsType::PreserveNetwork
+        }
+    }
+}
+
+/// Executes a power supply reset through the decoded `#PowerSupply.Reset`
+/// action.
+///
+/// The navigation mirrors the §3.1 `power-supplies` read slice: the
+/// endpoint's first chassis member, its `PowerSubsystem` document, and the
+/// `PowerSupplies` members (the same `Chassis::power_supplies` path the
+/// typed wrapper follows). The target member is the one named by the
+/// payload id — matched by the `@odata.id` tail segment, the only stable
+/// identity of a `ReferenceableMember` — or the collection's first member,
+/// the endpoint-scoped write rule of the reset families. The action is
+/// invoked through the `Bmc::action` typed API with the compiled
+/// `PowerSupplyResetAction` parameter type; the CSDL `ResetType` parameter
+/// stays `None`, which the service answers with the documented
+/// `GracefulRestart` default (see the [`PowerSupplyReset`] payload doc).
+async fn execute_power_supply_reset(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &PowerSupplyReset,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(power_supplies) = power_supplies_of_chassis(&chassis, bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let power_supply = match payload.power_supply_id() {
+        Some(id) => find_power_supply(&power_supplies, id),
+        None => power_supplies.first(),
+    };
+    let Some(power_supply) = power_supply else {
+        // A named member that is absent from the decoded collection is the
+        // same provable refusal as the account member writes: the BMC cannot
+        // apply the write to a power supply it does not serve. An empty
+        // collection (first-member default) means the family is not
+        // advertised ("资源存在才呈现").
+        return Err(CommandExecutionError::Rejected(
+            if payload.power_supply_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let Some(action) = power_supply
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset.as_ref())
+    else {
+        // §13.3 step 2: the decoded power supply does not advertise the
+        // Reset action, so the command is provably unsupported on this
+        // endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::power_supply::PowerSupplyResetAction { reset_type: None };
+    let response = match bmc
+        .action::<nv_redfish::schema::power_supply::PowerSupplyResetAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the `PowerSupply` members behind one decoded Chassis's
+/// `PowerSubsystem` navigation; a missing `PowerSubsystem` or
+/// `PowerSupplies` link is `None`.
+///
+/// This is the write twin of the §3.1 read slice's
+/// [`read_power_supply_resources`] navigation — the same
+/// `Chassis::power_supplies` path the typed wrapper follows — with the
+/// write's strict member fetch: a member that cannot be fetched is a
+/// preparation failure, never a skip.
+async fn power_supplies_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<PowerSupplySchema>>>, CommandExecutionError> {
+    let Some(power_subsystem) = chassis.power_subsystem.as_ref() else {
+        return Ok(None);
+    };
+    let subsystem = power_subsystem
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let Some(power_supplies) = subsystem.power_supplies.as_ref() else {
+        return Ok(None);
+    };
+    let collection = power_supplies
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members().len());
+    for power_supply in collection.members() {
+        members.push(
+            power_supply
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Finds one decoded `PowerSupply` member by its `@odata.id` tail segment —
+/// the same identity the domain [`PowerSupplyId`] validates.
+fn find_power_supply<'a>(
+    power_supplies: &'a [Arc<PowerSupplySchema>],
+    power_supply_id: &PowerSupplyId,
+) -> Option<&'a Arc<PowerSupplySchema>> {
+    power_supplies.iter().find(|power_supply| {
+        power_supply.odata_id().last_segment() == Some(power_supply_id.as_str())
+    })
+}
+
+/// Executes a log clear through the decoded `#LogService.ClearLog` action.
+///
+/// The target log service resolution follows the §3.1 `log-services` read
+/// slice, which exposes log services under the manager: a named id is
+/// matched against the manager's `LogServices` collection members, and the
+/// first-member default takes the manager's first log service — the BMC's
+/// own logs (event log, SEL) are the product's primary surface — falling
+/// back to the chassis's first log service when the manager advertises
+/// none (a chassis can host its own log services; the fallback keeps the
+/// command expressible on endpoints whose manager carries no logs). The
+/// operator-supplied `LogEntriesETag` precondition is passed through
+/// unchanged; the gateway never invents one.
+async fn execute_log_clear(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &ClearLog,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(log_service) =
+        resolve_log_service(bmc, root, identity, trust, payload.log_service_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            if payload.log_service_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let Some(action) = log_service
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.clear_log.as_ref())
+    else {
+        // §13.3 step 2: the decoded log service does not advertise the
+        // ClearLog action, so the command is provably unsupported on this
+        // endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::log_service::LogServiceClearLogAction {
+        log_entries_etag: payload.etag().map(str::to_owned),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::log_service::LogServiceClearLogAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Resolves the target `LogService` of a log clear: the member named by the
+/// id from the manager's `LogServices` collection, or the manager's first
+/// member with the chassis's first member as fallback; a target the
+/// endpoint cannot serve is `None`.
+async fn resolve_log_service(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    log_service_id: Option<&LogServiceId>,
+) -> Result<Option<Arc<LogServiceSchema>>, CommandExecutionError> {
+    let Some(manager) =
+        first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Ok(None);
+    };
+    let manager_log_services =
+        log_services_of_document(manager.log_services.as_ref(), bmc, identity, trust).await?;
+    if let Some(id) = log_service_id {
+        return Ok(find_log_service(&manager_log_services, id).cloned());
+    }
+    if let Some(first) = manager_log_services.first() {
+        return Ok(Some(first.clone()));
+    }
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Ok(None);
+    };
+    let chassis_log_services =
+        log_services_of_document(chassis.log_services.as_ref(), bmc, identity, trust).await?;
+    Ok(chassis_log_services.first().cloned())
+}
+
+/// Fetches the `LogService` members behind one decoded document's
+/// `LogServices` navigation; a missing link is `None`.
+async fn log_services_of_document(
+    log_services: Option<&NavProperty<LogServiceCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<Arc<LogServiceSchema>>, CommandExecutionError> {
+    let Some(log_services) = log_services else {
+        return Ok(Vec::new());
+    };
+    let collection = log_services
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(members)
+}
+
+/// Finds one decoded `LogService` member by its Redfish `Id`.
+fn find_log_service<'a>(
+    log_services: &'a [Arc<LogServiceSchema>],
+    log_service_id: &LogServiceId,
+) -> Option<&'a Arc<LogServiceSchema>> {
+    log_services
+        .iter()
+        .find(|log_service| log_service.base.id == log_service_id.as_str())
+}
+
+/// Executes a control update as a typed `SetPoint` property `PATCH` of the
+/// decoded `Control` resource.
+///
+/// The target resolution follows the §3.1 `controls` read slice: a named id
+/// is matched against the chassis's `Controls` collection members, and the
+/// first-member default takes the chassis's environment power limit control
+/// — the `Control` behind `EnvironmentMetrics.PowerLimitWatts`, the
+/// product's primary control surface — falling back to the first `Controls`
+/// member when the environment metrics expose none. The body is the
+/// compiled `ControlUpdate` type carrying only `SetPoint`, the complete
+/// intent of the domain payload (§7.1), and the write passes the decoded
+/// document's etag for optimistic concurrency exactly like the account
+/// member updates.
+async fn execute_control_update(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateControl,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(set_point) = payload.set_point() else {
+        // The first-cut payload's only settable member is the set point, so
+        // a payload without one would be an empty PATCH: provably a no-op,
+        // rejected before any network work (§7.1, §13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        ));
+    };
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(control) =
+        resolve_control(&chassis, bmc, identity, trust, payload.control_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            if payload.control_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let update = ControlUpdateSchema::builder()
+        .with_set_point(set_point)
+        .build();
+    let response = match bmc
+        .update::<ControlUpdateSchema, NavProperty<ControlSchema>>(
+            control.odata_id(),
+            control.etag(),
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Resolves the target `Control` of a control update: the member named by
+/// the id from the chassis's `Controls` collection, or the environment
+/// power limit control with the first `Controls` member as fallback; a
+/// target the endpoint cannot serve is `None`.
+async fn resolve_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    control_id: Option<&ControlId>,
+) -> Result<Option<Arc<ControlSchema>>, CommandExecutionError> {
+    if let Some(id) = control_id {
+        let Some(controls) = controls_of_chassis(chassis, bmc, identity, trust).await? else {
+            return Ok(None);
+        };
+        return Ok(find_control(&controls, id).cloned());
+    }
+    if let Some(control) = environment_power_limit_control(chassis, bmc, identity, trust).await? {
+        return Ok(Some(control));
+    }
+    let Some(controls) = controls_of_chassis(chassis, bmc, identity, trust).await? else {
+        return Ok(None);
+    };
+    Ok(controls.first().cloned())
+}
+
+/// Fetches the `Control` members behind one decoded Chassis's `Controls`
+/// navigation; a missing link is `None`.
+async fn controls_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<ControlSchema>>>, CommandExecutionError> {
+    let Some(controls) = chassis.controls.as_ref() else {
+        return Ok(None);
+    };
+    let collection = controls
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Fetches the environment power limit `Control` behind one decoded
+/// Chassis's `EnvironmentMetrics.PowerLimitWatts` data source; `None` when
+/// the metrics link, the `PowerLimitWatts` excerpt, or its data source URI
+/// is absent.
+///
+/// This mirrors `nv-redfish`'s `Chassis::environment_power_limit_control`
+/// exactly: the decoded metrics excerpt's `DataSourceUri` is resolved as a
+/// typed reference — the endpoint's own URI structure is never guessed
+/// (§11.1).
+async fn environment_power_limit_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<ControlSchema>>, CommandExecutionError> {
+    let Some(environment_metrics) = chassis.environment_metrics.as_ref() else {
+        return Ok(None);
+    };
+    let metrics = environment_metrics
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let Some(uri) = metrics
+        .power_limit_watts
+        .as_ref()
+        .and_then(|control| control.data_source_uri.as_ref())
+        .and_then(Option::as_deref)
+    else {
+        return Ok(None);
+    };
+    let control_ref = NavProperty::<ControlSchema>::new_reference(ODataId::from(uri.to_owned()));
+    control_ref
+        .get(bmc)
+        .await
+        .map(Some)
+        .map_err(|source| command_preparation_error(source, identity, trust))
+}
+
+/// Finds one decoded `Control` member by its Redfish `Id`.
+fn find_control<'a>(
+    controls: &'a [Arc<ControlSchema>],
+    control_id: &ControlId,
+) -> Option<&'a Arc<ControlSchema>> {
+    controls
+        .iter()
+        .find(|control| control.base.id == control_id.as_str())
+}
+
+/// Executes an `UpdateService` property patch as a typed `PATCH` of the
+/// decoded `UpdateService` document.
+///
+/// The body is the compiled `UpdateServiceUpdate` type carrying only the
+/// domain payload's members (`ServiceEnabled`, `HttpPushUriTargets`), and
+/// the write passes the decoded document's etag for optimistic concurrency
+/// exactly like the control update. The endpoint's own `UpdateService`
+/// navigation is used (§11.1), the same document the §14.3 upload flow
+/// reads.
+async fn execute_update_service_patch(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdatePatch,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    if payload.service_enabled().is_none() && payload.targets().is_none() {
+        // Neither member of the first-cut patch is set: the PATCH body would
+        // be empty, provably a no-op, rejected before any network work
+        // (§7.1, §13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        ));
+    }
+    let Some(update_service) = update_service_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let mut update = UpdateServiceUpdateSchema::builder();
+    if let Some(service_enabled) = payload.service_enabled() {
+        update = update.with_service_enabled(service_enabled);
+    }
+    if let Some(targets) = payload.targets() {
+        update = update.with_http_push_uri_targets(targets.to_vec());
+    }
+    let update = update.build();
+    let response = match bmc
+        .update::<UpdateServiceUpdateSchema, NavProperty<UpdateServiceSchema>>(
+            update_service.odata_id(),
+            update_service.etag(),
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
 /// Executes a boot source override as a typed `Boot` property `PATCH`.
 ///
 /// The update carries the three CSDL properties
@@ -5368,11 +5950,18 @@ async fn verify_authenticated_command(
         | RedfishCommand::Boot(BootCommand::SetBootSourceOverride(_)) => {
             verify_system_readable(bmc, root, identity, trust).await
         }
-        RedfishCommand::Manager(ManagerCommand::Reset(_)) => {
-            verify_manager_readable(bmc, root, identity, trust).await
-        }
+        // The manager Reset and ResetToDefaults families verify by
+        // re-reading the endpoint's first manager ("accepted" semantics).
+        RedfishCommand::Manager(command) => match command {
+            ManagerCommand::Reset(_) | ManagerCommand::ResetToDefaults(_) => {
+                verify_manager_readable(bmc, root, identity, trust).await
+            }
+        },
         RedfishCommand::Chassis(ChassisCommand::Reset(_)) => {
             verify_chassis_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(payload)) => {
+            verify_power_supply_readable(bmc, root, identity, trust, payload).await
         }
         RedfishCommand::SecureBoot(_) => {
             verify_secure_boot_readable(bmc, root, identity, trust).await
@@ -5383,13 +5972,26 @@ async fn verify_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             verify_subscription_deleted(bmc, root, identity, trust, payload).await
         }
-        // §14.3 update verification: the complete `SoftwareInventory` family
-        // must re-read without error. The application contract for this
-        // family records a provably absent inventory surface as `Mismatched`
-        // (the update did not leave the expected result) instead of the
-        // reset families' `CapabilityUnavailable` error — see the
-        // `CommandVerifier` contract doc.
-        RedfishCommand::Update(_) => verify_authenticated_update(bmc, root, identity, trust).await,
+        RedfishCommand::Log(LogCommand::ClearLog(payload)) => {
+            verify_log_service_readable(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Control(ControlCommand::Update(payload)) => {
+            verify_control_readable(bmc, root, identity, trust, payload).await
+        }
+        // §14.3 update verification for the upload family: the complete
+        // `SoftwareInventory` family must re-read without error. The
+        // application contract for this family records a provably absent
+        // inventory surface as `Mismatched` (the update did not leave the
+        // expected result) instead of the reset families'
+        // `CapabilityUnavailable` error — see the `CommandVerifier` contract
+        // doc. The `Patch` variant verifies by re-reading the patched
+        // `UpdateService` document itself.
+        RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
+            verify_authenticated_update(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Update(UpdateCommand::Patch(_)) => {
+            verify_update_service_readable(bmc, root, identity, trust).await
+        }
         RedfishCommand::Oem(oem) => verify_nvidia_oem_target(bmc, root, identity, trust, oem).await,
     }
 }
@@ -5625,6 +6227,305 @@ async fn verify_chassis_readable(
     match verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await? {
         Some(_) => Ok(CommandVerificationOutcome::Confirmed),
         None => Err(CommandVerificationError::CapabilityUnavailable),
+    }
+}
+
+/// "Accepted" verification of a power supply reset: the target power supply
+/// must re-read without error through the same Chassis → `PowerSubsystem` →
+/// `PowerSupplies` navigation the write used.
+///
+/// The physical effect is deliberately not asserted (see
+/// [`RedfishGateway::verify_command`]). An absent `PowerSubsystem` or
+/// `PowerSupplies` surface is [`CommandVerificationError::CapabilityUnavailable`]
+/// exactly like the reset families; a member named by the payload id that
+/// vanished from the re-read collection is the provably absent expected
+/// result, so it is [`CommandVerificationOutcome::Mismatched`] — the
+/// account-member precedent.
+async fn verify_power_supply_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &PowerSupplyReset,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let Some(power_supplies) =
+        verify_power_supplies_of_chassis(&chassis, bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    match payload.power_supply_id() {
+        Some(id) => {
+            let found = find_power_supply(&power_supplies, id);
+            Ok(if found.is_some() {
+                CommandVerificationOutcome::Confirmed
+            } else {
+                CommandVerificationOutcome::Mismatched
+            })
+        }
+        None => {
+            if power_supplies.is_empty() {
+                Err(CommandVerificationError::CapabilityUnavailable)
+            } else {
+                Ok(CommandVerificationOutcome::Confirmed)
+            }
+        }
+    }
+}
+
+/// Re-reads the `PowerSupply` members behind one decoded Chassis's
+/// `PowerSubsystem` navigation for verification, with every failure mapped
+/// onto the verification error contract.
+async fn verify_power_supplies_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<PowerSupplySchema>>>, CommandVerificationError> {
+    let Some(power_subsystem) = chassis.power_subsystem.as_ref() else {
+        return Ok(None);
+    };
+    let subsystem = power_subsystem
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(power_supplies) = subsystem.power_supplies.as_ref() else {
+        return Ok(None);
+    };
+    let collection = power_supplies
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members().len());
+    for power_supply in collection.members() {
+        members.push(
+            power_supply
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// "Accepted" verification of a log clear: the target log service must
+/// re-read without error through the same manager-first, chassis-fallback
+/// resolution the write used.
+///
+/// The physical effect (the entries are gone) is deliberately not asserted:
+/// clearing the log of a BMC that asynchronously re-logs is not a
+/// deterministic post-condition (see [`RedfishGateway::verify_command`]). An
+/// absent log-service surface is [`CommandVerificationError::CapabilityUnavailable`]
+/// exactly like the reset families; a member named by the payload id that
+/// vanished from the re-read collection is the provably absent expected
+/// result, so it is [`CommandVerificationOutcome::Mismatched`] — the
+/// account-member precedent.
+async fn verify_log_service_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &ClearLog,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(manager) =
+        verify_first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let manager_log_services =
+        verify_log_services_of_document(manager.log_services.as_ref(), bmc, identity, trust)
+            .await?;
+    if let Some(id) = payload.log_service_id() {
+        return Ok(if find_log_service(&manager_log_services, id).is_some() {
+            CommandVerificationOutcome::Confirmed
+        } else {
+            CommandVerificationOutcome::Mismatched
+        });
+    }
+    if manager_log_services.is_empty() {
+        // The manager advertises no log services: the chassis fallback of
+        // the write resolution, exactly like `resolve_log_service`.
+    } else {
+        return Ok(CommandVerificationOutcome::Confirmed);
+    }
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let chassis_log_services =
+        verify_log_services_of_document(chassis.log_services.as_ref(), bmc, identity, trust)
+            .await?;
+    if chassis_log_services.is_empty() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `LogService` members behind one decoded document's
+/// `LogServices` navigation for verification.
+async fn verify_log_services_of_document(
+    log_services: Option<&NavProperty<LogServiceCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<Arc<LogServiceSchema>>, CommandVerificationError> {
+    let Some(log_services) = log_services else {
+        return Ok(Vec::new());
+    };
+    let collection = log_services
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(members)
+}
+
+/// "Accepted" verification of a control update: the target control must
+/// re-read without error through the same id-first,
+/// environment-power-limit-second, first-member-fallback resolution the
+/// write used.
+///
+/// The physical effect (the set point changed) is deliberately not asserted:
+/// the decoded `Control` re-read carries the service's applied set point,
+/// which may legitimately differ from the requested value while the control
+/// loop settles (see [`RedfishGateway::verify_command`]). An absent controls
+/// surface is [`CommandVerificationError::CapabilityUnavailable`] exactly
+/// like the reset families; a member named by the payload id that vanished
+/// from the re-read collection is the provably absent expected result, so
+/// it is [`CommandVerificationOutcome::Mismatched`] — the account-member
+/// precedent.
+async fn verify_control_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateControl,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    if let Some(id) = payload.control_id() {
+        let Some(controls) = verify_controls_of_chassis(&chassis, bmc, identity, trust).await?
+        else {
+            return Err(CommandVerificationError::CapabilityUnavailable);
+        };
+        return Ok(if find_control(&controls, id).is_some() {
+            CommandVerificationOutcome::Confirmed
+        } else {
+            CommandVerificationOutcome::Mismatched
+        });
+    }
+    if verify_environment_power_limit_control(&chassis, bmc, identity, trust)
+        .await?
+        .is_some()
+    {
+        return Ok(CommandVerificationOutcome::Confirmed);
+    }
+    let Some(controls) = verify_controls_of_chassis(&chassis, bmc, identity, trust).await? else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    if controls.is_empty() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `Control` members behind one decoded Chassis's `Controls`
+/// navigation for verification.
+async fn verify_controls_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<ControlSchema>>>, CommandVerificationError> {
+    let Some(controls) = chassis.controls.as_ref() else {
+        return Ok(None);
+    };
+    let collection = controls
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Re-reads the environment power limit `Control` for verification.
+async fn verify_environment_power_limit_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<ControlSchema>>, CommandVerificationError> {
+    let Some(environment_metrics) = chassis.environment_metrics.as_ref() else {
+        return Ok(None);
+    };
+    let metrics = environment_metrics
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(uri) = metrics
+        .power_limit_watts
+        .as_ref()
+        .and_then(|control| control.data_source_uri.as_ref())
+        .and_then(Option::as_deref)
+    else {
+        return Ok(None);
+    };
+    let control_ref = NavProperty::<ControlSchema>::new_reference(ODataId::from(uri.to_owned()));
+    control_ref
+        .get(bmc)
+        .await
+        .map(Some)
+        .map_err(|source| command_verification_read_error(source, identity, trust))
+}
+
+/// "Accepted" verification of an `UpdateService` property patch: the
+/// patched `UpdateService` document must re-read without error through the
+/// root navigation the write used.
+///
+/// The physical effect is deliberately not asserted: a `ServiceEnabled`
+/// toggle or a target-list change is read back exactly as the BMC applies
+/// it, and the re-read success is the honest "accepted" check of the reset
+/// families. A vanished document — the root link is gone or the document
+/// answers `404` — proves the service surface is absent after the accepted
+/// write, so it is [`CommandVerificationOutcome::Mismatched`], the same
+/// provable-absence contract the §14.3 family keeps for its inventory
+/// re-read.
+async fn verify_update_service_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(update_service) = root.root.update_service.as_ref() else {
+        return Ok(CommandVerificationOutcome::Mismatched);
+    };
+    match update_service.get(bmc).await {
+        Ok(_service) => Ok(CommandVerificationOutcome::Confirmed),
+        Err(source) => classify_update_surface_fetch(source, identity, trust),
     }
 }
 
@@ -20424,6 +21325,189 @@ mod tests {
         }
     }"##;
 
+    /// A Manager document that advertises the `#Manager.ResetToDefaults`
+    /// action, for the reset-to-defaults write tests.
+    const COMMAND_MANAGER_WITH_RESET_TO_DEFAULTS_ACTION_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Actions":{
+            "#Manager.ResetToDefaults":{"target":"/redfish/v1/Managers/1/Actions/Manager.ResetToDefaults"}
+        }
+    }"##;
+
+    /// A Manager document that advertises the `LogServices` collection, for
+    /// the log-service write tests.
+    const COMMAND_MANAGER_WITH_LOG_SERVICES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"}
+    }"#;
+
+    /// The `LogServices` collection for the manager write tests: one `Log1`
+    /// member in reference form.
+    const COMMAND_LOG_SERVICES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#LogServiceCollection.LogServiceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices",
+        "Name":"Log Service Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Managers/1/LogServices/Log1"}]
+    }"##;
+
+    /// An empty `LogServices` collection, for the vanished-member
+    /// verification case.
+    const EMPTY_LOG_SERVICES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#LogServiceCollection.LogServiceCollection",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices",
+        "Name":"Log Service Collection",
+        "Members":[]
+    }"##;
+
+    /// The `Log1` log service for the manager write tests: advertises the
+    /// `#LogService.ClearLog` action.
+    const COMMAND_LOG_SERVICE_BODY: &str = r##"{
+        "@odata.type":"#LogService.v1_2_0.LogService",
+        "@odata.id":"/redfish/v1/Managers/1/LogServices/Log1",
+        "Id":"Log1",
+        "Name":"Event Log",
+        "Actions":{
+            "#LogService.ClearLog":{"target":"/redfish/v1/Managers/1/LogServices/Log1/Actions/LogService.ClearLog"}
+        }
+    }"##;
+
+    /// A Chassis document that advertises the `LogServices` collection, for
+    /// the log-service chassis-fallback write tests.
+    const COMMAND_CHASSIS_WITH_LOG_SERVICES_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "LogServices":{"@odata.id":"/redfish/v1/Chassis/1/LogServices"}
+    }"#;
+
+    /// The `LogServices` collection for the chassis fallback tests: one
+    /// `Log1` member in reference form.
+    const COMMAND_CHASSIS_LOG_SERVICES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#LogServiceCollection.LogServiceCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/LogServices",
+        "Name":"Log Service Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1/LogServices/Log1"}]
+    }"##;
+
+    /// The `Log1` log service of the chassis fallback tests: advertises the
+    /// `#LogService.ClearLog` action.
+    const COMMAND_CHASSIS_LOG_SERVICE_BODY: &str = r##"{
+        "@odata.type":"#LogService.v1_2_0.LogService",
+        "@odata.id":"/redfish/v1/Chassis/1/LogServices/Log1",
+        "Id":"Log1",
+        "Name":"Chassis Log",
+        "Actions":{
+            "#LogService.ClearLog":{"target":"/redfish/v1/Chassis/1/LogServices/Log1/Actions/LogService.ClearLog"}
+        }
+    }"##;
+
+    /// A Chassis document that advertises the `PowerSubsystem` navigation,
+    /// for the power-supply write tests.
+    const COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"}
+    }"#;
+
+    /// The `PowerSubsystem` document for write tests: advertises the
+    /// `PowerSupplies` collection.
+    const COMMAND_POWER_SUBSYSTEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem",
+        "Id":"PowerSubsystem",
+        "Name":"Power Subsystem",
+        "PowerSupplies":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies"}
+    }"#;
+
+    /// The `PowerSupplies` collection for write tests: one `1` member in
+    /// reference form.
+    const COMMAND_POWER_SUPPLIES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "Name":"Power Supplies",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"}]
+    }"##;
+
+    /// An empty `PowerSupplies` collection, for the vanished-member
+    /// verification case.
+    const EMPTY_POWER_SUPPLIES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "Name":"Power Supplies",
+        "Members":[]
+    }"##;
+
+    /// The power supply member for write tests: advertises the
+    /// `#PowerSupply.Reset` action.
+    const COMMAND_POWER_SUPPLY_BODY: &str = r##"{
+        "@odata.type":"#PowerSupply.v1_5_0.PowerSupply",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "Id":"1",
+        "MemberId":"1",
+        "Name":"Power Supply 1",
+        "Actions":{
+            "#PowerSupply.Reset":{"target":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Actions/PowerSupply.Reset"}
+        }
+    }"##;
+
+    /// A Chassis document that advertises the `Controls` collection and the
+    /// `EnvironmentMetrics` navigation, for the control write tests.
+    const COMMAND_CHASSIS_WITH_CONTROLS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+        "EnvironmentMetrics":{"@odata.id":"/redfish/v1/Chassis/1/EnvironmentMetrics"}
+    }"#;
+
+    /// The `Controls` collection for write tests: one `power-limit` member
+    /// in reference form.
+    const COMMAND_CONTROLS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#ControlCollection.ControlCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls",
+        "Name":"Control Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1/Controls/power-limit"}]
+    }"##;
+
+    /// An empty `Controls` collection, for the vanished-member verification
+    /// case.
+    const EMPTY_CONTROLS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#ControlCollection.ControlCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls",
+        "Name":"Control Collection",
+        "Members":[]
+    }"##;
+
+    /// The `power-limit` control for write tests.
+    const COMMAND_CONTROL_BODY: &str = r##"{
+        "@odata.type":"#Control.v1_5_0.Control",
+        "@odata.id":"/redfish/v1/Chassis/1/Controls/power-limit",
+        "@odata.etag":"W/\"control-1\"",
+        "Id":"power-limit",
+        "Name":"Power Limit",
+        "ControlType":"Power",
+        "SetPoint":700.0
+    }"##;
+
+    /// An `EnvironmentMetrics` document whose `PowerLimitWatts` excerpt
+    /// points at the `power-limit` control, for the environment-power-limit
+    /// target selection.
+    const COMMAND_ENVIRONMENT_METRICS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/EnvironmentMetrics",
+        "Id":"EnvironmentMetrics",
+        "Name":"Environment Metrics",
+        "PowerLimitWatts":{"DataSourceUri":"/redfish/v1/Chassis/1/Controls/power-limit"}
+    }"#;
+
     /// The `SecureBoot` document for write tests: advertises the
     /// `#SecureBoot.ResetKeys` action.
     const COMMAND_SECURE_BOOT_BODY: &str = r##"{
@@ -20580,6 +21664,173 @@ mod tests {
         "/redfish/v1/Systems",
         "/redfish/v1/Systems/1",
         "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one manager reset-to-defaults: identical to the
+    /// manager reset except that the write is the decoded
+    /// `#Manager.ResetToDefaults` action target.
+    const MANAGER_RESET_TO_DEFAULTS_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Actions/Manager.ResetToDefaults",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one power supply reset: the Session lifecycle
+    /// around the chassis, the `PowerSubsystem` document, the `PowerSupplies`
+    /// collection, the member, and the action requests.
+    const POWER_SUPPLY_RESET_REQUEST_PATHS: [&str; 11] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Actions/PowerSupply.Reset",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one log clear: the Session lifecycle around the
+    /// manager, its `LogServices` collection, the member, and the action
+    /// requests.
+    const LOG_CLEAR_REQUEST_PATHS: [&str; 10] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/LogServices",
+        "/redfish/v1/Managers/1/LogServices/Log1",
+        "/redfish/v1/Managers/1/LogServices/Log1/Actions/LogService.ClearLog",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one log clear through the chassis fallback: the
+    /// manager is read first and advertises no `LogServices`, so the chassis
+    /// supplies the target.
+    const LOG_CLEAR_CHASSIS_FALLBACK_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/LogServices",
+        "/redfish/v1/Chassis/1/LogServices/Log1",
+        "/redfish/v1/Chassis/1/LogServices/Log1/Actions/LogService.ClearLog",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one control update through the environment power
+    /// limit control: the Session lifecycle around the chassis, the
+    /// `EnvironmentMetrics` document, the data-source control fetch, and the
+    /// `PATCH` of that control.
+    const CONTROL_UPDATE_ENV_LIMIT_REQUEST_PATHS: [&str; 10] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/EnvironmentMetrics",
+        "/redfish/v1/Chassis/1/Controls/power-limit",
+        "/redfish/v1/Chassis/1/Controls/power-limit",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one control update by id: the Session lifecycle
+    /// around the chassis, the `Controls` collection, the member fetch, and
+    /// the `PATCH` of that member.
+    const CONTROL_UPDATE_BY_ID_REQUEST_PATHS: [&str; 10] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/Controls",
+        "/redfish/v1/Chassis/1/Controls/power-limit",
+        "/redfish/v1/Chassis/1/Controls/power-limit",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one `UpdateService` property patch: the Session
+    /// lifecycle around the document and the typed `PATCH` of the document
+    /// itself.
+    const UPDATE_SERVICE_PATCH_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/UpdateService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one power supply verification re-read: the
+    /// Session lifecycle around the chassis, `PowerSubsystem`, the
+    /// `PowerSupplies` collection, and the target member.
+    const POWER_SUPPLY_VERIFY_REQUEST_PATHS: [&str; 10] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one log-service verification re-read: the
+    /// Session lifecycle around the manager, its `LogServices` collection,
+    /// and the target member.
+    const LOG_CLEAR_VERIFY_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/LogServices",
+        "/redfish/v1/Managers/1/LogServices/Log1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one control verification re-read through the
+    /// environment power limit control.
+    const CONTROL_VERIFY_ENV_LIMIT_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/EnvironmentMetrics",
+        "/redfish/v1/Chassis/1/Controls/power-limit",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one `UpdateService` patch verification re-read:
+    /// the Session lifecycle around the document read.
+    const UPDATE_SERVICE_PATCH_VERIFY_REQUEST_PATHS: [&str; 6] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/UpdateService",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -20925,6 +22176,342 @@ mod tests {
             "POST",
             r#"{"ResetType":"ForceOff"}"#,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_manager_reset_to_defaults_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_TO_DEFAULTS_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                    ManagerResetToDefaultsType::ResetAll,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &MANAGER_RESET_TO_DEFAULTS_REQUEST_PATHS,
+            "POST",
+            r#"{"ResetType":"ResetAll"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_power_supply_reset_through_the_typed_action_api() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLY_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        // The first-member default: no power supply id is supplied, so the
+        // endpoint's first `PowerSupplies` member is the target.
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    None,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &POWER_SUPPLY_RESET_REQUEST_PATHS,
+            "POST",
+            // The CSDL `ResetType` parameter is absent: the service answers
+            // with the documented `GracefulRestart` default.
+            "{}",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_power_supply_reset_by_id_through_the_typed_action_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLY_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        // The member is matched by its `@odata.id` tail segment, the only
+        // stable identity of a `ReferenceableMember`.
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    Some(PowerSupplyId::parse("1")?),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &POWER_SUPPLY_RESET_REQUEST_PATHS,
+            "POST",
+            "{}",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_log_clear_through_the_typed_action_api() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_LOG_SERVICES_BODY),
+                ("200 OK", COMMAND_LOG_SERVICES_COLLECTION_BODY),
+                ("200 OK", COMMAND_LOG_SERVICE_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        // The member is matched by its Redfish `Id`, and the operator's
+        // `LogEntriesETag` precondition is passed through unchanged.
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                    Some(LogServiceId::parse("Log1")?),
+                    Some(r#"W/"log-1""#.to_owned()),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &LOG_CLEAR_REQUEST_PATHS,
+            "POST",
+            r#"{"LogEntriesETag":"W/\"log-1\""}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_log_clear_through_the_chassis_log_services_fallback()
+    -> Result<(), Box<dyn Error>> {
+        // The manager advertises no `LogServices`, so the first-member
+        // default resolves through the chassis fallback.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_LOG_SERVICES_BODY),
+                ("200 OK", COMMAND_CHASSIS_LOG_SERVICES_COLLECTION_BODY),
+                ("200 OK", COMMAND_CHASSIS_LOG_SERVICE_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &LOG_CLEAR_CHASSIS_FALLBACK_REQUEST_PATHS,
+            "POST",
+            "{}",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_control_update_through_the_environment_power_limit_control()
+    -> Result<(), Box<dyn Error>> {
+        // Without a control id, the environment power limit control — the
+        // `Control` behind `EnvironmentMetrics.PowerLimitWatts` — is the
+        // preferred target. The data-source control document is fetched
+        // before the `PATCH`, so its body is scripted before the write
+        // response.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_CONTROLS_BODY),
+                ("200 OK", COMMAND_ENVIRONMENT_METRICS_BODY),
+                ("200 OK", COMMAND_CONTROL_BODY),
+            ],
+            http_response("200 OK", COMMAND_CONTROL_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &CONTROL_UPDATE_ENV_LIMIT_REQUEST_PATHS,
+            "PATCH",
+            r#"{"SetPoint":700.0}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_control_update_by_id_through_the_typed_patch_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_CONTROLS_BODY),
+                ("200 OK", COMMAND_CONTROLS_COLLECTION_BODY),
+                ("200 OK", COMMAND_CONTROL_BODY),
+            ],
+            http_response("200 OK", COMMAND_CONTROL_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    Some(ControlId::parse("power-limit")?),
+                    Some(700.0),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        let requests = server.finish_all().await?;
+        assert_command_requests(
+            &requests,
+            &CONTROL_UPDATE_BY_ID_REQUEST_PATHS,
+            "PATCH",
+            r#"{"SetPoint":700.0}"#,
+        )?;
+        // The decoded document's etag is passed for optimistic concurrency,
+        // exactly like the account member updates.
+        let write = std::str::from_utf8(&requests[8])?;
+        assert_eq!(request_header(write, "if-match"), Some(r#"W/"control-1""#));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_update_service_patch_through_the_typed_patch_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            http_response("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(
+                    Some(true),
+                    Some(vec!["/redfish/v1/Systems/1".to_owned()]),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        let requests = server.finish_all().await?;
+        assert_command_requests(
+            &requests,
+            &UPDATE_SERVICE_PATCH_REQUEST_PATHS,
+            "PATCH",
+            r#"{"ServiceEnabled":true,"HttpPushUriTargets":["/redfish/v1/Systems/1"]}"#,
+        )?;
+        let write = std::str::from_utf8(&requests[5])?;
+        assert_eq!(
+            request_header(write, "if-match"),
+            Some(r#"W/"update-service-1""#)
+        );
         Ok(())
     }
 
@@ -21525,6 +23112,405 @@ mod tests {
                     && !request.starts_with(b"DELETE /redfish/v1/AccountService/Accounts/ghost")
             }));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_manager_reset_to_defaults_when_the_action_is_not_advertised()
+    -> Result<(), Box<dyn Error>> {
+        // The capability check rejects the command after the member fetch:
+        // the decoded manager advertises only `#Manager.Reset`, never
+        // `#Manager.ResetToDefaults`.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                    ManagerResetToDefaultsType::ResetAll,
+                )),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        // The capability check stops the sequence before any write request.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/Managers/1/Actions/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_power_supply_reset_when_the_power_subsystem_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The decoded chassis advertises no `PowerSubsystem`, so the family
+        // is not served on this endpoint ("资源存在才呈现").
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_RESET_ACTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    None,
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|request| {
+            !request.starts_with(b"POST /redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_power_supply_reset_when_the_named_member_does_not_exist()
+    -> Result<(), Box<dyn Error>> {
+        // The named power supply is absent from the decoded collection, so
+        // the write is refused after the member reads, before any write
+        // request — the account-member precedent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUBSYSTEM_BODY),
+                ("200 OK", EMPTY_POWER_SUPPLIES_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    Some(PowerSupplyId::parse("ghost")?),
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::RefusedByBmc
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 9);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/Chassis/1/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_log_clear_when_no_log_services_are_advertised() -> Result<(), Box<dyn Error>> {
+        // Neither the manager nor the chassis advertises a `LogServices`
+        // collection, so the family is not served on this endpoint.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_RESET_ACTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        // Both the manager and the chassis are read before the refusal.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 9);
+        assert!(requests.iter().all(|request| {
+            !request.starts_with(b"POST /redfish/v1/Managers/1/LogServices/")
+                && !request.starts_with(b"POST /redfish/v1/Chassis/1/LogServices/")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_log_clear_when_the_named_log_service_does_not_exist()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_LOG_SERVICES_BODY),
+                ("200 OK", EMPTY_LOG_SERVICES_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                    Some(LogServiceId::parse("ghost")?),
+                    None,
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::RefusedByBmc
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 8);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/Managers/1/LogServices/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_control_update_without_a_set_point() -> Result<(), Box<dyn Error>> {
+        // A control update without a set point would be an empty PATCH: a
+        // provable no-op, rejected before any network work (§7.1, §13.5).
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            FULL_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(None, None))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload
+            ))
+        ));
+        // Only the Session lifecycle requests were made.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_control_update_when_the_controls_surface_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The decoded chassis advertises neither `Controls` nor
+        // `EnvironmentMetrics`, so no control target exists on this
+        // endpoint.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_RESET_ACTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"PATCH /redfish/v1/Chassis/1/"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_service_patch_with_no_members() -> Result<(), Box<dyn Error>> {
+        // A patch carrying neither member would be an empty PATCH: a
+        // provable no-op, rejected before any network work (§7.1, §13.5).
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            FULL_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(None, None))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::InvalidCommandPayload
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_service_patch_when_the_update_service_link_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            CORE_SERVICE_ROOT_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"PATCH /redfish/v1/UpdateService"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_update_service_patch_when_the_bmc_refuses() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+            http_response("400 Bad Request", "{}"),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::RefusedByBmc
+            ))
+        ));
         Ok(())
     }
 
@@ -23462,6 +25448,24 @@ mod tests {
                 ("200 OK", COMMAND_MANAGER_WITH_RESET_ACTION_BODY),
             ),
             (
+                // The reset-to-defaults family verifies exactly like the
+                // manager reset: the first manager must re-read without
+                // error ("accepted" semantics).
+                RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                    ManagerResetToDefaultsType::PreserveNetwork,
+                )),
+                [
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/Managers",
+                    "/redfish/v1/Managers/1",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+                ("200 OK", COMMAND_MANAGER_WITH_RESET_TO_DEFAULTS_ACTION_BODY),
+            ),
+            (
                 RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
                 [
                     "/redfish/v1",
@@ -23501,6 +25505,281 @@ mod tests {
             assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
             assert_verification_requests(&server.finish_all().await?, &paths)?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_power_supply_reset_by_re_reading_the_target() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", COMMAND_POWER_SUPPLY_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    Some(PowerSupplyId::parse("1")?),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &POWER_SUPPLY_VERIFY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_power_supply_reset_as_mismatched_when_the_named_member_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read `PowerSupplies` collection no longer contains the
+        // member named by the payload id: the expected result is provably
+        // absent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_POWER_SUBSYSTEM_BODY),
+                ("200 OK", COMMAND_POWER_SUBSYSTEM_BODY),
+                ("200 OK", EMPTY_POWER_SUPPLIES_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    Some(PowerSupplyId::parse("1")?),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        // The absent member is proven from the collection alone: no member
+        // fetch happens.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_log_clear_by_re_reading_the_log_service() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_LOG_SERVICES_BODY),
+                ("200 OK", COMMAND_LOG_SERVICES_COLLECTION_BODY),
+                ("200 OK", COMMAND_LOG_SERVICE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                    Some(LogServiceId::parse("Log1")?),
+                    None,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(&server.finish_all().await?, &LOG_CLEAR_VERIFY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_log_clear_as_mismatched_when_the_named_log_service_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read `LogServices` collection no longer contains the member
+        // named by the payload id: the expected result is provably absent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_MANAGER_WITH_LOG_SERVICES_BODY),
+                ("200 OK", EMPTY_LOG_SERVICES_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                    Some(LogServiceId::parse("Log1")?),
+                    None,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_control_update_by_re_reading_the_target() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_CONTROLS_BODY),
+                ("200 OK", COMMAND_ENVIRONMENT_METRICS_BODY),
+                ("200 OK", COMMAND_CONTROL_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &CONTROL_VERIFY_ENV_LIMIT_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_control_update_as_mismatched_when_the_named_control_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read `Controls` collection no longer contains the member
+        // named by the payload id: the expected result is provably absent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", COMMAND_CHASSIS_WITH_CONTROLS_BODY),
+                ("200 OK", EMPTY_CONTROLS_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    Some(ControlId::parse("power-limit")?),
+                    Some(700.0),
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_service_patch_by_re_reading_the_document() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", UPDATE_SERVICE_WITH_UPLOAD_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &UPDATE_SERVICE_PATCH_VERIFY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_update_service_patch_as_mismatched_when_the_document_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        // The root no longer advertises the `UpdateService` link: the
+        // patched document is provably absent, the §14.3 family's
+        // provable-absence contract.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(false), None))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 5);
         Ok(())
     }
 

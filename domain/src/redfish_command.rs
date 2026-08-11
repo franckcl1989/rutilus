@@ -678,6 +678,347 @@ impl fmt::Display for AccountIdError {
 
 impl Error for AccountIdError {}
 
+/// The maximum length of one power supply id in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `PowerSupply` id (a
+/// `ReferenceableMember`, so the id is only ever the `@odata.id` tail
+/// segment), so the bound is the same product decision as
+/// [`MAX_ACCOUNT_ID_CHARS`]: an id is a short stable label, and the
+/// product's own bounds stay generous enough for every id a BMC can
+/// reasonably serve.
+pub const MAX_POWER_SUPPLY_ID_CHARS: usize = 128;
+
+/// The maximum length of one log service id in Unicode scalar values.
+///
+/// The same product bound as [`MAX_ACCOUNT_ID_CHARS`], for the same reason:
+/// a `LogService` `Id` is a short stable label (for example `Journal` or
+/// `SEL`), never a path.
+pub const MAX_LOG_SERVICE_ID_CHARS: usize = 128;
+
+/// The maximum length of one control id in Unicode scalar values.
+///
+/// The same product bound as [`MAX_ACCOUNT_ID_CHARS`], for the same reason:
+/// a `Control` `Id` is a short stable label (for example `PowerLimit`),
+/// never a path.
+pub const MAX_CONTROL_ID_CHARS: usize = 128;
+
+/// The Redfish id of one `PowerSupply` collection member.
+///
+/// A `PowerSupply` is a `ReferenceableMember`: the CSDL gives it no `Id`
+/// property, so the only stable identity is the `@odata.id` tail segment —
+/// the same identity the verification re-read matches against. The
+/// validation is the exact `AccountId` rule: one plain URI path segment of
+/// ASCII alphanumerics, `-`, and `_`, which excludes the separators and
+/// escape characters (`/`, `\`, `?`, `#`, `%`) and the dot segments (`.`,
+/// `..`) that could redirect a constructed URI outside the collection, and
+/// excludes whitespace and control characters that could smuggle request
+/// structure.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PowerSupplyId(String);
+
+impl PowerSupplyId {
+    /// Validates a power supply id as a single safe URI path segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PowerSupplyIdError`] for an empty id, a character outside
+    /// the safe-segment charset, or an id longer than
+    /// [`MAX_POWER_SUPPLY_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, PowerSupplyIdError> {
+        if value.is_empty() {
+            return Err(PowerSupplyIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(PowerSupplyIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_POWER_SUPPLY_ID_CHARS {
+            return Err(PowerSupplyIdError::TooLong {
+                actual,
+                maximum: MAX_POWER_SUPPLY_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the power supply id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PowerSupplyId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for PowerSupplyId {
+    type Err = PowerSupplyIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for PowerSupplyId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PowerSupplyId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a power supply id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerSupplyIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for PowerSupplyIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("power supply id cannot be empty"),
+            Self::UnsafeCharacter => formatter
+                .write_str("power supply id can only contain ASCII letters, digits, '-', and '_'"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "power supply id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for PowerSupplyIdError {}
+
+/// The Redfish `Id` of one `LogService` collection member.
+///
+/// The id is the last path segment of the log service's `@odata.id` — the
+/// same identity the verification re-read matches against — so only one
+/// plain segment may participate: the charset is ASCII alphanumerics, `-`,
+/// and `_`, exactly like [`AccountId`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LogServiceId(String);
+
+impl LogServiceId {
+    /// Validates a log service id as a single safe URI path segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogServiceIdError`] for an empty id, a character outside
+    /// the safe-segment charset, or an id longer than
+    /// [`MAX_LOG_SERVICE_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, LogServiceIdError> {
+        if value.is_empty() {
+            return Err(LogServiceIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(LogServiceIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_LOG_SERVICE_ID_CHARS {
+            return Err(LogServiceIdError::TooLong {
+                actual,
+                maximum: MAX_LOG_SERVICE_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the log service id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LogServiceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for LogServiceId {
+    type Err = LogServiceIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for LogServiceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogServiceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a log service id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogServiceIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for LogServiceIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("log service id cannot be empty"),
+            Self::UnsafeCharacter => formatter
+                .write_str("log service id can only contain ASCII letters, digits, '-', and '_'"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "log service id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for LogServiceIdError {}
+
+/// The Redfish `Id` of one `Control` collection member.
+///
+/// The id is the `Id` property of the decoded `Control` resource — the same
+/// identity the verification re-read matches against — so only one plain
+/// segment may participate: the charset is ASCII alphanumerics, `-`, and
+/// `_`, exactly like [`AccountId`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ControlId(String);
+
+impl ControlId {
+    /// Validates a control id as a single safe URI path segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlIdError`] for an empty id, a character outside the
+    /// safe-segment charset, or an id longer than [`MAX_CONTROL_ID_CHARS`]
+    /// Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, ControlIdError> {
+        if value.is_empty() {
+            return Err(ControlIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(ControlIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_CONTROL_ID_CHARS {
+            return Err(ControlIdError::TooLong {
+                actual,
+                maximum: MAX_CONTROL_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the control id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ControlId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for ControlId {
+    type Err = ControlIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for ControlId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a control id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for ControlIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("control id cannot be empty"),
+            Self::UnsafeCharacter => formatter
+                .write_str("control id can only contain ASCII letters, digits, '-', and '_'"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "control id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for ControlIdError {}
+
 /// The `UserName` of one `ManagerAccount` (the CSDL `UserName` property, an
 /// `Edm.String` marked `Nullable=false`).
 ///
@@ -1247,6 +1588,233 @@ impl StartUpdate {
     }
 }
 
+/// The reset-to-defaults scope of [`ManagerCommand::ResetToDefaults`].
+///
+/// The member set follows `nv-redfish-schema` 0.13.0's `Manager_v1.xml`
+/// `ResetToDefaultsType` enum (compiled upstream as the argument of the
+/// `#Manager.ResetToDefaults` action).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum ManagerResetToDefaultsType {
+    /// Resets all settings to factory defaults.
+    ResetAll,
+    /// Resets all settings except network and local usernames/passwords to
+    /// factory defaults.
+    PreserveNetworkAndUsers,
+    /// Resets all settings except network settings to factory defaults.
+    PreserveNetwork,
+}
+
+impl ManagerResetToDefaultsType {
+    /// Returns the exact CSDL member name, which is also the serde wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResetAll => "ResetAll",
+            Self::PreserveNetworkAndUsers => "PreserveNetworkAndUsers",
+            Self::PreserveNetwork => "PreserveNetwork",
+        }
+    }
+}
+
+impl fmt::Display for ManagerResetToDefaultsType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The payload of [`ChassisCommand::PowerSupplyReset`].
+///
+/// `power_supply_id` names one `PowerSupply` of the chassis's `PowerSupplies`
+/// collection by its `@odata.id` tail segment; `None` selects the first
+/// member, the endpoint-scoped write rule of the reset families. The CSDL
+/// `#PowerSupply.Reset` `ResetType` parameter is optional ("the service can
+/// accept a request without the parameter and shall perform a
+/// `GracefulRestart`"), and the first-cut product command always uses that
+/// default — a power supply reset is a graceful restart, and the gateway
+/// never invents a reset type.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerSupplyReset {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    power_supply_id: Option<PowerSupplyId>,
+}
+
+impl PowerSupplyReset {
+    /// Constructs one power supply reset with the optional member id.
+    #[must_use]
+    pub const fn new(power_supply_id: Option<PowerSupplyId>) -> Self {
+        Self { power_supply_id }
+    }
+
+    /// Returns the id of the power supply to reset; `None` selects the
+    /// collection's first member.
+    #[must_use]
+    pub const fn power_supply_id(&self) -> Option<&PowerSupplyId> {
+        self.power_supply_id.as_ref()
+    }
+}
+
+/// The payload of [`LogCommand::ClearLog`].
+///
+/// `log_service_id` names one `LogService` by its Redfish `Id`; `None`
+/// selects the manager's first log service (and the chassis's first when the
+/// manager has none — see the gateway dispatch doc for the decision).
+/// `etag` is the operator-supplied `LogEntriesETag` precondition of the CSDL
+/// `#LogService.ClearLog` action: when present it is passed through
+/// unchanged and the BMC rejects the request with `428 Precondition Required`
+/// when it does not match the current `ETag` of the log entry collection.
+/// The gateway never invents an etag.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearLog {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_service_id: Option<LogServiceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+}
+
+impl ClearLog {
+    /// Constructs one log clear with the optional member id and optional
+    /// `LogEntriesETag` precondition.
+    #[must_use]
+    pub const fn new(log_service_id: Option<LogServiceId>, etag: Option<String>) -> Self {
+        Self {
+            log_service_id,
+            etag,
+        }
+    }
+
+    /// Returns the id of the log service to clear; `None` selects the
+    /// endpoint's first log service.
+    #[must_use]
+    pub const fn log_service_id(&self) -> Option<&LogServiceId> {
+        self.log_service_id.as_ref()
+    }
+
+    /// Returns the operator-supplied `LogEntriesETag` precondition, when one
+    /// was provided.
+    #[must_use]
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+}
+
+/// The payload of [`ControlCommand::Update`].
+///
+/// `control_id` names one `Control` by its Redfish `Id`; `None` selects the
+/// chassis's environment power limit control when one is advertised and its
+/// first `Controls` member otherwise. `set_point` mirrors the CSDL `SetPoint`
+/// property of the compiled `ControlUpdate` type and stays optional for the
+/// PATCH-diff semantics of that type; the gateway rejects an update that
+/// carries no set point before any write is dispatched, because an empty
+/// PATCH cannot be a command intent (§7.1) — the same no-op guard the
+/// `Update` family's patch keeps. The CSDL `ControlUpdate` member set
+/// (`ControlMode`, `SettingMin`/`SettingMax`, `DeadBand`,
+/// `ControlDelaySeconds`, `ControlLoop`, `Location`) stays out of the
+/// first-cut projection until a product flow needs one of those members.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateControl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_id: Option<ControlId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    set_point: Option<f64>,
+}
+
+impl UpdateControl {
+    /// Constructs one control update with the optional member id and the
+    /// optional set point.
+    #[must_use]
+    pub const fn new(control_id: Option<ControlId>, set_point: Option<f64>) -> Self {
+        Self {
+            control_id,
+            set_point,
+        }
+    }
+
+    /// Returns the id of the control to update; `None` selects the
+    /// environment power limit control, or the first `Controls` member.
+    #[must_use]
+    pub const fn control_id(&self) -> Option<&ControlId> {
+        self.control_id.as_ref()
+    }
+
+    /// Returns the set point to apply (CSDL `SetPoint`), in the control's
+    /// `SetPointUnits`.
+    #[must_use]
+    pub const fn set_point(&self) -> Option<f64> {
+        self.set_point
+    }
+}
+
+// `f64` cannot derive `Eq`, and the whole command tree (`RedfishCommand`,
+// `Operation`, `BatchOperation`) is `Eq` for persistence round-trip
+// comparisons, so the payload compares its set points with `total_cmp` —
+// the one `Eq`-honest total order for floats, where `NaN == NaN`. Derived
+// `PartialEq` would be inconsistent with the `Eq` the rest of the tree
+// declares.
+impl PartialEq for UpdateControl {
+    fn eq(&self, other: &Self) -> bool {
+        self.control_id == other.control_id
+            && match (self.set_point, other.set_point) {
+                (Some(left), Some(right)) => left.total_cmp(&right).is_eq(),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            }
+    }
+}
+
+impl Eq for UpdateControl {}
+
+/// The payload of [`UpdateCommand::Patch`].
+///
+/// The two fields mirror the CSDL `UpdateServiceUpdate` member set compiled
+/// by `nv-redfish-schema` 0.13.0 and stay optional for the PATCH-diff
+/// semantics of that type; the gateway rejects a patch that carries neither
+/// field before any write is dispatched, because an empty PATCH cannot be a
+/// command intent (§7.1). `service_enabled` mirrors the CSDL
+/// `ServiceEnabled` master switch of the `UpdateService`; `targets` mirrors
+/// the CSDL `HttpPushUriTargets` list of URIs the next push update applies
+/// to — the same §14.3 push surface [`StartUpdate`]'s `push_uri` selects the
+/// submission method on. The remaining `UpdateServiceUpdate` members
+/// (`HttpPushUriOptionsBusy`, `HttpPushUriOptions`, `HttpPushUriTargetsBusy`,
+/// `VerifyRemoteServerCertificate`, `VerifyRemoteServerSSHKey`) are
+/// operational or security internals the first-cut product flow does not
+/// set.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    targets: Option<Vec<String>>,
+}
+
+impl UpdatePatch {
+    /// Constructs one `UpdateService` patch with the optional enable switch
+    /// and optional push-update target URIs.
+    #[must_use]
+    pub const fn new(service_enabled: Option<bool>, targets: Option<Vec<String>>) -> Self {
+        Self {
+            service_enabled,
+            targets,
+        }
+    }
+
+    /// Returns the `ServiceEnabled` switch to apply, when one was supplied.
+    #[must_use]
+    pub const fn service_enabled(&self) -> Option<bool> {
+        self.service_enabled
+    }
+
+    /// Returns the `HttpPushUriTargets` URIs to apply, when any were
+    /// supplied.
+    #[must_use]
+    pub fn targets(&self) -> Option<&[String]> {
+        self.targets.as_deref()
+    }
+}
+
 /// Commands against a system (`ComputerSystem`) resource (§7.5).
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum SystemCommand {
@@ -1259,6 +1827,8 @@ pub enum SystemCommand {
 pub enum ManagerCommand {
     /// Resets the manager.
     Reset(ResetType),
+    /// Resets the manager's settings to their factory defaults.
+    ResetToDefaults(ManagerResetToDefaultsType),
 }
 
 /// Commands against a chassis (`Chassis`) resource (§7.5).
@@ -1266,6 +1836,33 @@ pub enum ManagerCommand {
 pub enum ChassisCommand {
     /// Resets the chassis.
     Reset(ResetType),
+    /// Resets one power supply of the chassis's `PowerSupplies` collection.
+    PowerSupplyReset(PowerSupplyReset),
+}
+
+/// Commands against the log services of an endpoint (§7.5, §3.1
+/// `log-services`).
+///
+/// Redfish models logs as `LogService` resources under a manager's (or a
+/// chassis's) `LogServices` collection; see
+/// [`crate::ResourceFeature::LogServices`] for the matching read surface.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum LogCommand {
+    /// Clears all entries of one log service.
+    ClearLog(ClearLog),
+}
+
+/// Commands against the control resources of a chassis (§7.5, §3.1
+/// `controls`).
+///
+/// Redfish models control points (for example a power limit) as `Control`
+/// resources under a chassis's `Controls` collection or behind its
+/// `EnvironmentMetrics`; see [`crate::ResourceFeature::Controls`] for the
+/// matching read surface.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum ControlCommand {
+    /// Updates one control.
+    Update(UpdateControl),
 }
 
 /// Commands against a system's boot configuration (§7.5).
@@ -1328,11 +1925,16 @@ pub enum AccountCommand {
 ///
 /// Redfish models firmware updates through the `UpdateService`; see
 /// [`crate::ResourceFeature::SoftwareInventory`] for the matching read
-/// surface.
+/// surface. [`Self::StartUpdate`] dispatches through the dedicated
+/// artifact-upload boundary (`UpdateExecutor`), while [`Self::Patch`] is an
+/// ordinary property PATCH of the `UpdateService` document and dispatches
+/// through the normal command boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum UpdateCommand {
     /// Starts a firmware update with one previously uploaded, ready artifact.
     StartUpdate(StartUpdate),
+    /// Patches the `UpdateService` document's operator-facing properties.
+    Patch(UpdatePatch),
 }
 
 /// The debug token type requested by the [`NvidiaDebugTokenCommand`] actions.
@@ -1697,6 +2299,14 @@ pub enum OemCommand {
 /// The `Oem` family is no longer deferred either: upstream NVIDIA typed
 /// actions are compiled in (see [`OemCommand`]), and the remaining vendors'
 /// OEM write surfaces land as their actions get compiled.
+///
+/// The `Log` and `Control` families are compiled: log-service writes
+/// (`ClearLog`) and control writes (`Update`) map onto the §3.1
+/// `log-services` and `controls` product surfaces, which the read slice
+/// already exposes through [`crate::ResourceFeature::LogServices`] and
+/// [`crate::ResourceFeature::Controls`]. The two families are independent
+/// types because they target different CSDL resources whose member sets
+/// diverge, exactly like the three reset families.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum RedfishCommand {
     /// A command against the account service.
@@ -1713,6 +2323,10 @@ pub enum RedfishCommand {
     SecureBoot(SecureBootCommand),
     /// A command against the event service.
     Event(EventCommand),
+    /// A command against a log service.
+    Log(LogCommand),
+    /// A command against a control resource.
+    Control(ControlCommand),
     /// A command against the update service.
     Update(UpdateCommand),
     /// A command against a compiled vendor OEM surface (§11.5).
@@ -1742,6 +2356,8 @@ impl RedfishCommand {
             Self::Boot(_) => "boot",
             Self::SecureBoot(_) => "secure-boot",
             Self::Event(_) => "event",
+            Self::Log(_) => "log",
+            Self::Control(_) => "control",
             Self::Update(_) => "update",
             Self::Oem(_) => "oem",
         }
@@ -1779,6 +2395,21 @@ mod tests {
         (ResetType::Pause, "Pause"),
         (ResetType::Resume, "Resume"),
         (ResetType::FullPowerCycle, "FullPowerCycle"),
+    ];
+
+    /// The exact `ManagerResetToDefaultsType` member set of
+    /// `nv-redfish-schema` 0.13.0 `Manager_v1.xml` (compiled upstream as
+    /// `nv_redfish::schema::manager::ResetToDefaultsType`).
+    const MANAGER_RESET_TO_DEFAULTS_TYPE_MEMBERS: [(ManagerResetToDefaultsType, &str); 3] = [
+        (ManagerResetToDefaultsType::ResetAll, "ResetAll"),
+        (
+            ManagerResetToDefaultsType::PreserveNetworkAndUsers,
+            "PreserveNetworkAndUsers",
+        ),
+        (
+            ManagerResetToDefaultsType::PreserveNetwork,
+            "PreserveNetwork",
+        ),
     ];
 
     /// The exact `BootSource` member set of `nv-redfish-schema` 0.13.0
@@ -1924,6 +2555,11 @@ mod tests {
     }
 
     #[test]
+    fn manager_reset_to_defaults_type_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
+        assert_csdl_member_set(&MANAGER_RESET_TO_DEFAULTS_TYPE_MEMBERS)
+    }
+
+    #[test]
     fn boot_source_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
         assert_csdl_member_set(&BOOT_SOURCE_MEMBERS)
     }
@@ -1965,7 +2601,7 @@ mod tests {
 
     /// One representative command per family with its expected family code.
     ///
-    /// The nine entries are the exhaustive §7.5 family list for this
+    /// The eleven entries are the exhaustive §7.5 family list for this
     /// iteration; adding a family must add an entry here or the
     /// exhaustiveness tests fail.
     fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, Box<dyn Error>> {
@@ -1989,6 +2625,17 @@ mod tests {
             (
                 RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
                 "chassis",
+            ),
+            (
+                RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+                "log",
+            ),
+            (
+                RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+                "control",
             ),
             (
                 RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
@@ -2051,7 +2698,7 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            9,
+            11,
             "add the new family to `all_families` when a variant is added"
         );
         // The deferred §7.5 families must not be claimed by an existing code.
@@ -2077,6 +2724,8 @@ mod tests {
                 RedfishCommand::Boot(_) => "boot",
                 RedfishCommand::SecureBoot(_) => "secure-boot",
                 RedfishCommand::Event(_) => "event",
+                RedfishCommand::Log(_) => "log",
+                RedfishCommand::Control(_) => "control",
                 RedfishCommand::Update(_) => "update",
                 RedfishCommand::Oem(_) => "oem",
             };
@@ -2182,6 +2831,60 @@ mod tests {
             (
                 RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
                 r#"{"Chassis":{"Reset":"ForceOff"}}"#,
+            ),
+            (
+                RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                    ManagerResetToDefaultsType::ResetAll,
+                )),
+                r#"{"Manager":{"ResetToDefaults":"ResetAll"}}"#,
+            ),
+            (
+                RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    Some(PowerSupplyId::parse("psu-1")?),
+                ))),
+                r#"{"Chassis":{"PowerSupplyReset":{"power_supply_id":"psu-1"}}}"#,
+            ),
+            (
+                RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    None,
+                ))),
+                r#"{"Chassis":{"PowerSupplyReset":{}}}"#,
+            ),
+            (
+                RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                    Some(LogServiceId::parse("Journal")?),
+                    Some(r#"W/"log-1""#.to_owned()),
+                ))),
+                r#"{"Log":{"ClearLog":{"log_service_id":"Journal","etag":"W/\"log-1\""}}}"#,
+            ),
+            (
+                RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+                r#"{"Log":{"ClearLog":{}}}"#,
+            ),
+            (
+                RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+                r#"{"Control":{"Update":{"set_point":700.0}}}"#,
+            ),
+            (
+                RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    Some(ControlId::parse("power-limit")?),
+                    Some(700.0),
+                ))),
+                r#"{"Control":{"Update":{"control_id":"power-limit","set_point":700.0}}}"#,
+            ),
+            (
+                RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(
+                    Some(true),
+                    Some(vec!["/redfish/v1/Systems/1".to_owned()]),
+                ))),
+                r#"{"Update":{"Patch":{"service_enabled":true,"targets":["/redfish/v1/Systems/1"]}}}"#,
+            ),
+            (
+                RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+                r#"{"Update":{"Patch":{"service_enabled":true}}}"#,
             ),
             (
                 RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
@@ -2757,6 +3460,235 @@ mod tests {
             let json = serde_json::to_string(&command)?;
             assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn action_family_commands_round_trip_per_operation() -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                ManagerResetToDefaultsType::PreserveNetwork,
+            )),
+            RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                Some(PowerSupplyId::parse("psu-2")?),
+            ))),
+            RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(
+                Some(LogServiceId::parse("SEL")?),
+                Some("W/\"sel-7\"".to_owned()),
+            ))),
+            RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                Some(ControlId::parse("power-limit")?),
+                Some(750.5),
+            ))),
+            RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(
+                Some(false),
+                Some(vec!["/redfish/v1/Systems/1".to_owned()]),
+            ))),
+        ] {
+            let json = serde_json::to_string(&command)?;
+            assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resource_ids_are_safe_single_path_segments() -> Result<(), Box<dyn Error>> {
+        for valid in ["admin", "user-1", "jane_doe", "A1b2C3"] {
+            let id = PowerSupplyId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<PowerSupplyId>()?, id);
+            let id = LogServiceId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<LogServiceId>()?, id);
+            let id = ControlId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<ControlId>()?, id);
+        }
+        for invalid in ["..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"] {
+            assert_eq!(
+                PowerSupplyId::parse(invalid),
+                Err(PowerSupplyIdError::UnsafeCharacter),
+                "power supply id {invalid:?} must be rejected"
+            );
+            assert_eq!(
+                LogServiceId::parse(invalid),
+                Err(LogServiceIdError::UnsafeCharacter),
+                "log service id {invalid:?} must be rejected"
+            );
+            assert_eq!(
+                ControlId::parse(invalid),
+                Err(ControlIdError::UnsafeCharacter),
+                "control id {invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(PowerSupplyId::parse(""), Err(PowerSupplyIdError::Empty));
+        assert_eq!(LogServiceId::parse(""), Err(LogServiceIdError::Empty));
+        assert_eq!(ControlId::parse(""), Err(ControlIdError::Empty));
+        let long = "x".repeat(MAX_POWER_SUPPLY_ID_CHARS + 1);
+        assert_eq!(
+            PowerSupplyId::parse(&long),
+            Err(PowerSupplyIdError::TooLong {
+                actual: MAX_POWER_SUPPLY_ID_CHARS + 1,
+                maximum: MAX_POWER_SUPPLY_ID_CHARS
+            })
+        );
+        let long = "x".repeat(MAX_LOG_SERVICE_ID_CHARS + 1);
+        assert_eq!(
+            LogServiceId::parse(&long),
+            Err(LogServiceIdError::TooLong {
+                actual: MAX_LOG_SERVICE_ID_CHARS + 1,
+                maximum: MAX_LOG_SERVICE_ID_CHARS
+            })
+        );
+        let long = "x".repeat(MAX_CONTROL_ID_CHARS + 1);
+        assert_eq!(
+            ControlId::parse(&long),
+            Err(ControlIdError::TooLong {
+                actual: MAX_CONTROL_ID_CHARS + 1,
+                maximum: MAX_CONTROL_ID_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn power_supply_reset_payload_round_trips_and_denies_unknown_fields()
+    -> Result<(), Box<dyn Error>> {
+        let reset = PowerSupplyReset::new(Some(PowerSupplyId::parse("psu-1")?));
+        assert_eq!(
+            reset.power_supply_id().map(PowerSupplyId::as_str),
+            Some("psu-1")
+        );
+
+        let json = serde_json::to_string(&reset)?;
+        assert_eq!(json, r#"{"power_supply_id":"psu-1"}"#);
+        assert_eq!(serde_json::from_str::<PowerSupplyReset>(&json)?, reset);
+        assert!(
+            serde_json::from_str::<PowerSupplyReset>(r#"{"power_supply_id":"psu-1","force":true}"#)
+                .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        // The first-member default stays absent from the wire form and
+        // deserializes back as `None`.
+        let default = PowerSupplyReset::new(None);
+        assert_eq!(default.power_supply_id(), None);
+        let default_json = serde_json::to_string(&default)?;
+        assert_eq!(default_json, "{}");
+        assert_eq!(
+            serde_json::from_str::<PowerSupplyReset>(&default_json)?,
+            default
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clear_log_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let clear = ClearLog::new(
+            Some(LogServiceId::parse("Journal")?),
+            Some(r#"W/"log-1""#.to_owned()),
+        );
+        assert_eq!(
+            clear.log_service_id().map(LogServiceId::as_str),
+            Some("Journal")
+        );
+        assert_eq!(clear.etag(), Some(r#"W/"log-1""#));
+
+        let json = serde_json::to_string(&clear)?;
+        assert_eq!(json, r#"{"log_service_id":"Journal","etag":"W/\"log-1\""}"#);
+        assert_eq!(serde_json::from_str::<ClearLog>(&json)?, clear);
+        assert!(
+            serde_json::from_str::<ClearLog>(
+                r#"{"log_service_id":"Journal","etag":"W/\"log-1\"","scope":"all"}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        // Both optional fields stay absent from the wire form when unset.
+        let default = ClearLog::new(None, None);
+        assert_eq!(default.log_service_id(), None);
+        assert_eq!(default.etag(), None);
+        let default_json = serde_json::to_string(&default)?;
+        assert_eq!(default_json, "{}");
+        assert_eq!(serde_json::from_str::<ClearLog>(&default_json)?, default);
+        Ok(())
+    }
+
+    #[test]
+    fn update_control_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>>
+    {
+        let update = UpdateControl::new(Some(ControlId::parse("power-limit")?), Some(700.0));
+        assert_eq!(
+            update.control_id().map(ControlId::as_str),
+            Some("power-limit")
+        );
+        assert_eq!(update.set_point(), Some(700.0));
+
+        let json = serde_json::to_string(&update)?;
+        assert_eq!(json, r#"{"control_id":"power-limit","set_point":700.0}"#);
+        assert_eq!(serde_json::from_str::<UpdateControl>(&json)?, update);
+        assert!(
+            serde_json::from_str::<UpdateControl>(
+                r#"{"control_id":"power-limit","set_point":700.0,"units":"W"}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        // The environment-power-limit default stays absent from the wire form.
+        let default = UpdateControl::new(None, Some(700.0));
+        assert_eq!(default.control_id(), None);
+        let default_json = serde_json::to_string(&default)?;
+        assert_eq!(default_json, r#"{"set_point":700.0}"#);
+        assert_eq!(
+            serde_json::from_str::<UpdateControl>(&default_json)?,
+            default
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_patch_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let patch = UpdatePatch::new(Some(true), Some(vec!["/redfish/v1/Systems/1".to_owned()]));
+        assert_eq!(patch.service_enabled(), Some(true));
+        assert_eq!(
+            patch.targets(),
+            Some(&["/redfish/v1/Systems/1".to_owned()][..])
+        );
+
+        let json = serde_json::to_string(&patch)?;
+        assert_eq!(
+            json,
+            r#"{"service_enabled":true,"targets":["/redfish/v1/Systems/1"]}"#
+        );
+        assert_eq!(serde_json::from_str::<UpdatePatch>(&json)?, patch);
+        assert!(
+            serde_json::from_str::<UpdatePatch>(
+                r#"{"service_enabled":true,"targets":["/redfish/v1/Systems/1"],"proxy":"x"}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        // Each optional field stays absent from the wire form when unset.
+        let targets_only = UpdatePatch::new(None, Some(vec!["/redfish/v1/Systems/1".to_owned()]));
+        assert_eq!(targets_only.service_enabled(), None);
+        let targets_json = serde_json::to_string(&targets_only)?;
+        assert_eq!(targets_json, r#"{"targets":["/redfish/v1/Systems/1"]}"#);
+        assert_eq!(
+            serde_json::from_str::<UpdatePatch>(&targets_json)?,
+            targets_only
+        );
+
+        let enabled_only = UpdatePatch::new(Some(false), None);
+        assert_eq!(enabled_only.targets(), None);
+        let enabled_json = serde_json::to_string(&enabled_only)?;
+        assert_eq!(enabled_json, r#"{"service_enabled":false}"#);
+        assert_eq!(
+            serde_json::from_str::<UpdatePatch>(&enabled_json)?,
+            enabled_only
+        );
         Ok(())
     }
 }

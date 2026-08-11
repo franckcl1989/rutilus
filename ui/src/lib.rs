@@ -15,17 +15,18 @@ use rutilus_api::{
     BatchRefreshResponse, BatchSummaryResponse, BootCommand, BootSource, BootSourceOverrideEnabled,
     BootSourceOverrideMode, CapabilityEntryResponse, CapabilityStateResponse,
     CenterBindingStateResponse, CenterEndpointViewResponse, CenterOperationResponse,
-    CenterSiteResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
-    CreateAccount, CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse,
-    DeleteAccount, DeleteSubscription, EndpointCapabilityInventoryResponse,
-    EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
-    EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointRefreshResultResponse,
-    EndpointRefreshStatusResponse, EndpointResourceInventoryResponse,
-    EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest,
-    EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, EraseToken, EraseType,
-    EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
-    GroupResponse, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS,
+    CenterSiteResponse, ChassisCommand, ControlCommand, CoreResourceDetailsResponse,
+    CoreResourceResponse, CreateAccount, CreateSubscription, CredentialInventoryResponse,
+    CredentialSummaryResponse, DeleteAccount, DeleteSubscription,
+    EndpointCapabilityInventoryResponse, EndpointCsvImportResponse, EndpointCsvImportRowResponse,
+    EndpointCsvImportRowStatusResponse, EndpointEnrollmentResponse, EndpointInventoryResponse,
+    EndpointRefreshResultResponse, EndpointRefreshStatusResponse,
+    EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse, EndpointSummaryResponse,
+    EndpointTrustChallengeResponse, EndpointTrustChallengeStateResponse,
+    EndpointTrustExpectationRequest, EnvironmentMetricsControlResponse,
+    EnvironmentMetricsReadingResponse, EraseToken, EraseType, EventCommand,
+    EventDestinationProtocol, EventListResponse, EventResponse, EventType, GroupResponse,
+    LogCommand, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS,
     MAX_ROLE_ID_CHARS, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
     OperationSourceResponse, OperationStateResponse, ProfileFile, ProfileId, RedfishCommand,
@@ -7269,10 +7270,25 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             family: ResetResourceView::Manager.label(),
             payload: reset_type.to_string(),
         },
+        RedfishCommand::Manager(ManagerCommand::ResetToDefaults(kind)) => {
+            CommandSummaryProjection {
+                family: ResetResourceView::Manager.label(),
+                payload: format!("Reset to defaults · {kind}"),
+            }
+        }
         RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => CommandSummaryProjection {
             family: ResetResourceView::Chassis.label(),
             payload: reset_type.to_string(),
         },
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(payload)) => {
+            CommandSummaryProjection {
+                family: ResetResourceView::Chassis.label(),
+                payload: match payload.power_supply_id() {
+                    Some(id) => format!("Power supply reset · {id}"),
+                    None => "Power supply reset · first member".to_owned(),
+                },
+            }
+        }
         RedfishCommand::Boot(BootCommand::SetBootSourceOverride(override_value)) => {
             CommandSummaryProjection {
                 family: CommandFamilyView::BootOverride.label(),
@@ -7320,6 +7336,24 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                 payload: format!("Delete · {}", deletion.subscription_id()),
             }
         }
+        // The log-service and control families have no operation form yet
+        // (the §0.8.0 action surface lands the write path first), so their
+        // cards render static family labels instead of a `CommandFamilyView`
+        // variant that no form could produce.
+        RedfishCommand::Log(LogCommand::ClearLog(payload)) => CommandSummaryProjection {
+            family: "Log service",
+            payload: match payload.log_service_id() {
+                Some(id) => format!("Clear · {id}"),
+                None => "Clear · first log service".to_owned(),
+            },
+        },
+        RedfishCommand::Control(ControlCommand::Update(payload)) => CommandSummaryProjection {
+            family: "Control",
+            payload: match payload.set_point() {
+                Some(set_point) => format!("Set point · {set_point}"),
+                None => "Set point".to_owned(),
+            },
+        },
         RedfishCommand::Update(UpdateCommand::StartUpdate(payload)) => {
             // The artifact id renders in the same short form as the form
             // preview and the artifact card, so the card of a submitted
@@ -7332,6 +7366,20 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             CommandSummaryProjection {
                 family: CommandFamilyView::FirmwareUpdate.label(),
                 payload: payload_text,
+            }
+        }
+        RedfishCommand::Update(UpdateCommand::Patch(payload)) => {
+            let members = match (payload.service_enabled(), payload.targets()) {
+                (Some(enabled), Some(targets)) => {
+                    format!("enabled={enabled}, targets={}", targets.join(", "))
+                }
+                (Some(enabled), None) => format!("enabled={enabled}"),
+                (None, Some(targets)) => format!("targets={}", targets.join(", ")),
+                (None, None) => "no members".to_owned(),
+            };
+            CommandSummaryProjection {
+                family: CommandFamilyView::FirmwareUpdate.label(),
+                payload: format!("Patch · {members}"),
             }
         }
         RedfishCommand::Oem(oem) => CommandSummaryProjection {
@@ -24090,6 +24138,58 @@ mod tests {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;
             let summary = wire_command_summary(&command);
             assert_eq!(summary.family, "Firmware update");
+            assert_eq!(summary.payload, payload);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wire_command_summaries_render_the_action_families() -> Result<(), Box<dyn Error>> {
+        for (wire, family, payload) in [
+            (
+                json!({"Manager": {"ResetToDefaults": "ResetAll"}}),
+                "Manager reset",
+                "Reset to defaults · ResetAll",
+            ),
+            (
+                json!({"Chassis": {"PowerSupplyReset": {"power_supply_id": "psu-1"}}}),
+                "Chassis reset",
+                "Power supply reset · psu-1",
+            ),
+            (
+                json!({"Chassis": {"PowerSupplyReset": {}}}),
+                "Chassis reset",
+                "Power supply reset · first member",
+            ),
+            (
+                json!({"Log": {"ClearLog": {"log_service_id": "Log1"}}}),
+                "Log service",
+                "Clear · Log1",
+            ),
+            (
+                json!({"Log": {"ClearLog": {}}}),
+                "Log service",
+                "Clear · first log service",
+            ),
+            (
+                json!({"Control": {"Update": {"set_point": 700.0}}}),
+                "Control",
+                "Set point · 700",
+            ),
+            (
+                json!({"Update": {"Patch": {"service_enabled": true, "targets": ["/redfish/v1/Systems/1"]}}}),
+                "Firmware update",
+                "Patch · enabled=true, targets=/redfish/v1/Systems/1",
+            ),
+            (
+                json!({"Update": {"Patch": {"service_enabled": false}}}),
+                "Firmware update",
+                "Patch · enabled=false",
+            ),
+        ] {
+            let command = serde_json::from_value::<RedfishCommand>(wire)?;
+            let summary = wire_command_summary(&command);
+            assert_eq!(summary.family, family);
             assert_eq!(summary.payload, payload);
         }
         Ok(())
