@@ -615,13 +615,13 @@ fn platform_service_status() -> Result<ServiceStatus, ServiceStatusError> {
 fn run_activation_command(program: &str, args: &[String]) {
     match std::process::Command::new(program).args(args).output() {
         Ok(output) if output.status.success() => {}
-        Ok(output) => eprintln!(
+        Ok(output) => tracing::error!(
             "{program} {} failed (status {:?}): {}",
             args.join(" "),
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(source) => eprintln!("could not invoke {program}: {source}"),
+        Err(source) => tracing::error!("could not invoke {program}: {source}"),
     }
 }
 

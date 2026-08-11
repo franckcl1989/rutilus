@@ -625,7 +625,7 @@ impl axum::serve::Listener for TlsListener {
             let (stream, address) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    eprintln!("Site accept failed: {error}");
+                    tracing::error!("Site accept failed: {error}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -633,12 +633,12 @@ impl axum::serve::Listener for TlsListener {
             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, self.acceptor.accept(stream)).await {
                 Ok(Ok(stream)) => return (stream, address),
                 Ok(Err(error)) => {
-                    eprintln!("Site TLS handshake failed from {address}: {error}");
+                    tracing::error!("Site TLS handshake failed from {address}: {error}");
                 }
                 Err(_) => {
                     // Dropping the timed-out future closes the stalled
                     // connection, so the accept loop proceeds.
-                    eprintln!("Site TLS handshake timed out from {address}");
+                    tracing::error!("Site TLS handshake timed out from {address}");
                 }
             }
         }
@@ -694,7 +694,7 @@ where
     let center_sync = match assemble_center_sync(&services_for_server.store, paths).await {
         Ok(bundle) => bundle,
         Err(error) => {
-            eprintln!("the site's center material is broken: {error}");
+            tracing::error!("the site's center material is broken: {error}");
             None
         }
     };
@@ -1320,9 +1320,7 @@ async fn run_center_sync_task(
             tokio::select! {
                 () = stop.stopped() => {}
                 () = binding_revoked(store, binding_site, poll) => {
-                    eprintln!(
-                        "the site's center binding was revoked; stopping the center sync"
-                    );
+                    tracing::warn!("the site's center binding was revoked; stopping the center sync");
                 }
             }
         })
@@ -1337,16 +1335,16 @@ async fn run_center_sync_task(
             // restart stays local-only, exactly like a locally revoked
             // binding. The material files are left in place (harmless; a
             // future bind overwrites them).
-            eprintln!("the center refused the site as not bound; revoking the local binding");
+            tracing::warn!("the center refused the site as not bound; revoking the local binding");
             let Ok(Some(binding)) = store.find_binding_by_site(binding_site).await else {
                 return;
             };
             if let Err(error) = store.revoke_binding(binding.id()).await {
-                eprintln!("failed to revoke the local binding: {error}");
+                tracing::error!("failed to revoke the local binding: {error}");
             }
         }
         Err(error) => {
-            eprintln!("the center sync engine stopped with an error: {error}");
+            tracing::error!("the center sync engine stopped with an error: {error}");
         }
     }
 }

@@ -234,6 +234,16 @@ pub const THIRD_PARTY_LICENSES: &[ThirdPartyLicense] = &[
         license: "MIT",
     },
     ThirdPartyLicense {
+        name: "tracing",
+        version: "0.1.44",
+        license: "MIT OR Apache-2.0",
+    },
+    ThirdPartyLicense {
+        name: "tracing-subscriber",
+        version: "0.3.23",
+        license: "MIT OR Apache-2.0",
+    },
+    ThirdPartyLicense {
         name: "url",
         version: "2.5.8",
         license: "MIT OR Apache-2.0",

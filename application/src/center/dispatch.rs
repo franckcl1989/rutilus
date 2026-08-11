@@ -480,11 +480,11 @@ where
                 // A reply with an unparseable operation id cannot be
                 // recorded; it is logged and absorbed so a corrupt frame
                 // never ends the connection.
-                eprintln!("site {site}: dropping a reply with an unparseable operation id");
+                tracing::warn!("site {site}: dropping a reply with an unparseable operation id");
                 return Ok(());
             };
             let Some(target) = reply_target(envelope.message.as_ref()) else {
-                eprintln!("site {site}: dropping a reply with an unknown operation state");
+                tracing::warn!("site {site}: dropping a reply with an unknown operation state");
                 return Ok(());
             };
             let Some(mut operation) = self
@@ -496,7 +496,7 @@ where
                 // A reply for an operation the center has no record of (a
                 // restore that predates the offer, a manual DB change) is
                 // absorbed: the connection must survive it.
-                eprintln!(
+                tracing::warn!(
                     "site {site}: absorbing a reply for the unknown operation {operation_id}"
                 );
                 return Ok(());
@@ -561,7 +561,7 @@ where
             match self.inbox.advance(operation_id, *event).await {
                 Ok(()) => {}
                 Err(source) => {
-                    eprintln!(
+                    tracing::warn!(
                         "site {site}: the receipt of operation {operation_id} did not advance to \
                          {event}: {source}"
                     );

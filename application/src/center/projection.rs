@@ -661,7 +661,7 @@ where
         for record in &batch.events {
             match decode_event(record, now) {
                 Err(reason) => {
-                    eprintln!(
+                    tracing::error!(
                         "site {}: skipping event record {}: {reason}",
                         site.instance_id(),
                         record.event_id
@@ -874,7 +874,7 @@ where
         now: OffsetDateTime,
         reason: &str,
     ) -> Result<(), ProjectionErrorOf<Store, Cursor>> {
-        eprintln!(
+        tracing::warn!(
             "site {}: skipped frame {sequence} of the {stream} stream: {reason}",
             site.instance_id()
         );
@@ -891,7 +891,7 @@ where
         now: OffsetDateTime,
     ) -> Result<(), ProjectionErrorOf<Store, Cursor>> {
         if let ProjectionWriteOutcome::Ignored { reason } = outcome {
-            eprintln!(
+            tracing::warn!(
                 "site {}: absorbed frame {sequence} of the {stream} stream: {reason:?}",
                 site.instance_id()
             );
@@ -920,7 +920,7 @@ where
             // A stored cursor a manual DB change or a partial restore left
             // unparseable must not wedge the stream: log it, process the
             // frame, and let the cursor write at the end heal the row.
-            eprintln!(
+            tracing::warn!(
                 "site {}: resetting the {stream} stream cursor: the stored value is not a sequence",
                 site.instance_id()
             );

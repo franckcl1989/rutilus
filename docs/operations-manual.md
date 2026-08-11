@@ -231,12 +231,17 @@ rutilus doctor [--portable]
 
 ### 8.1 日志与诊断现状（如实）
 
-- **当前产品没有统一日志设施**：设计文档 §6.2 选型清单中的 `tracing` + `tracing-subscriber` 尚未进入 workspace
-  （根 `Cargo.toml` 的 `[workspace.dependencies]` 中不存在 tracing）；
-- 运行中的操作性失败目前通过标准错误输出（`eprintln!`）记录（例如事件监听器、遥测采样循环、服务激活命令失败，
-  见 `app/src/event_listener.rs`、`app/src/telemetry_sampler.rs`、`platform/src/service.rs`）；
-- 代码注释明确将统一日志设施列为后续迭代（"once the product has a log facility"）；
-- 因此生产排查目前依赖：控制台/服务管理器捕获的标准输出与标准错误、审计记录（界面 Audit 视图）、
+- **统一日志设施已引入（最小可用版）**：设计文档 §6.2 选型清单中的 `tracing` + `tracing-subscriber` 已进入
+  workspace（根 `Cargo.toml` 的 `[workspace.dependencies]`）；app 二进制在启动时初始化 `fmt` subscriber，
+  输出到 stderr，过滤级别来自 `RUST_LOG`（未设置或非法时默认 `info`，例如 `RUST_LOG=debug rutilus run`）；
+- 运行中的操作性失败现经 `tracing::error!` / `tracing::warn!` 记录（事件监听器、遥测采样循环、调度循环、
+  中心同步引擎、服务激活命令失败等，见 `app/src/event_listener.rs`、`app/src/telemetry_sampler.rs`、
+  `application/src/center_sync.rs`、`platform/src/service.rs`）；
+- **CLI 用户可见输出仍走 stdout `println!`**（init 向导、backup 结果、doctor 报告、console 横幅、
+  bootstrap code 显示），与 stderr 诊断分离（§7.6 用户信息与诊断信息分离）；
+- 测试基础设施与测试内诊断（`test-support` mock、`mock-bmc` 工具、`infra-redfish` 测试）仍用
+  `eprintln!`/`println!`（测试上下文无 subscriber）；
+- 因此生产排查目前依赖：stderr 诊断日志（`RUST_LOG` 可调级别）、审计记录（界面 Audit 视图）、
   端点级 Advanced Diagnostics 与 Capabilities 页面。
 
 ## 九、性能与容量现状（如实）

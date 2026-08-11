@@ -48,11 +48,10 @@
 //!
 //! One endpoint's listener failing never touches the others: each task owns
 //! its stream, its sink calls, and its status row, and the loop never panics
-//! (every fallible call is recorded through `eprintln!`, the crate's
+//! (every fallible call is recorded through `tracing::error!`, the crate's
 //! operational-failure precedent). A failed event record does not kill the
 //! stream either: the failure is recorded and the next event is consumed —
-//! the SSE connection stays healthy, and a later iteration can add buffering
-//! once the product has a log facility.
+//! the SSE connection stays healthy, and a later iteration can add buffering.
 
 use std::{
     collections::HashMap,
@@ -266,7 +265,7 @@ impl EventListeners {
     pub(crate) async fn drain_all(self) {
         for task in self.tasks {
             if let Err(join_error) = task.await {
-                eprintln!("event listener task failed: {join_error}");
+                tracing::error!("event listener task failed: {join_error}");
             }
         }
         for (endpoint_id, status) in self
@@ -276,7 +275,7 @@ impl EventListeners {
             .iter()
         {
             if let ListenerStatus::Failed { reason } = status {
-                eprintln!("event listening failed for endpoint {endpoint_id}: {reason}");
+                tracing::error!("event listening failed for endpoint {endpoint_id}: {reason}");
             }
         }
     }
@@ -313,7 +312,7 @@ enum ReconnectOutcome {
 /// One endpoint's listener loop: open, consume, record, reconnect.
 ///
 /// The loop never returns an error and never panics: every fallible call is
-/// recorded through `eprintln!` and either isolated to one event or one
+/// recorded through `tracing::error!` and either isolated to one event or one
 /// reconnect attempt. It exits only on the stop signal (after the in-flight
 /// event finishes) or on a terminal give-up after
 /// [`ReconnectPolicy::max_attempts`] consecutive failures.
@@ -339,7 +338,9 @@ async fn run_endpoint_stream<Stream, Sink>(
         } {
             Ok(stream) => stream,
             Err(error) => {
-                eprintln!("could not open the event stream of endpoint {endpoint_id}: {error}");
+                tracing::error!(
+                    "could not open the event stream of endpoint {endpoint_id}: {error}"
+                );
                 match reconnect_wait(
                     &mut stop,
                     endpoint_id,
@@ -378,14 +379,14 @@ async fn run_endpoint_stream<Stream, Sink>(
                     // is fully recorded (§7.8 structured drain).
                     consecutive_failures = 0;
                     if let Err(error) = sink.ingest(&event).await {
-                        eprintln!(
+                        tracing::error!(
                             "event for endpoint {endpoint_id} could not be recorded: {error}"
                         );
                     }
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    eprintln!("event stream of endpoint {endpoint_id} failed: {error}");
+                    tracing::error!("event stream of endpoint {endpoint_id} failed: {error}");
                     break;
                 }
             }
@@ -436,7 +437,7 @@ async fn reconnect_wait(
                     reason: reason.clone(),
                 },
             );
-        eprintln!("giving up on the event stream of endpoint {endpoint_id}: {reason}");
+        tracing::error!("giving up on the event stream of endpoint {endpoint_id}: {reason}");
         return ReconnectOutcome::GiveUp;
     }
     let delay = policy.delay(*consecutive_failures);

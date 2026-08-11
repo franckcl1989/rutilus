@@ -671,7 +671,7 @@ where
         Ok(true) => rutilus_web::AuthPolicy::PendingBootstrap(rutilus_web::AuthGate::open()),
         Ok(false) => rutilus_web::AuthPolicy::Guarded,
         Err(error) => {
-            eprintln!(
+            tracing::error!(
                 "could not read the bootstrap-code state for the first-run gate, starting guarded: {error}"
             );
             rutilus_web::AuthPolicy::Guarded
@@ -759,12 +759,12 @@ async fn run_center_accept_loop(
                         // The site received its `not-bound` answer already;
                         // one refused site is one client's problem and the
                         // listener keeps accepting (§15.7 local autonomy).
-                        eprintln!("center refused the connection: {reason}");
+                        tracing::warn!("center refused the connection: {reason}");
                     }
                     Err(error) => {
                         // One failed handshake is one client's problem; the
                         // listener keeps accepting (§15.7 local autonomy).
-                        eprintln!("center accept failed: {error}");
+                        tracing::error!("center accept failed: {error}");
                     }
                 }
             }
@@ -798,7 +798,7 @@ async fn run_center_connection(
         .registry
         .mark_connected(site.clone(), SystemClock.now())
     {
-        eprintln!(
+        tracing::warn!(
             "center refused a second connection for site {}: {error}",
             site.instance_id()
         );
@@ -820,7 +820,7 @@ async fn run_center_connection(
         })
         .await
     {
-        eprintln!(
+        tracing::error!(
             "site {} center connection ended: {error}",
             site.instance_id()
         );

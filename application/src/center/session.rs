@@ -610,7 +610,7 @@ where
                             true
                         }
                         None => {
-                            eprintln!(
+                            tracing::warn!(
                                 "site {}: center frame {} carries no message",
                                 self.site.instance_id(),
                                 envelope.sequence
@@ -682,7 +682,7 @@ where
                     // deliberate). The per-row skip here survives only for
                     // legacy plaintext rows whose JSON no longer parses:
                     // log it, skip it, and deliver the rest of the queue.
-                    eprintln!(
+                    tracing::error!(
                         "site {}: skipping outbox entry {} with a corrupt payload: {source}",
                         self.site.instance_id(),
                         entry.id()
@@ -691,7 +691,7 @@ where
                 }
             };
             let Ok(wire_sequence) = u64::try_from(entry.sequence()) else {
-                eprintln!(
+                tracing::error!(
                     "site {}: skipping outbox entry {} with an unwireable sequence {}",
                     self.site.instance_id(),
                     entry.id(),
@@ -703,7 +703,7 @@ where
                 // An outbox row without a message cannot be delivered; like
                 // a malformed legacy plaintext payload, it is logged and
                 // skipped so one row never wedges the whole flush.
-                eprintln!(
+                tracing::error!(
                     "site {}: skipping outbox entry {} with an empty envelope",
                     self.site.instance_id(),
                     entry.id()

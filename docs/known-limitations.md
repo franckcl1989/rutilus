@@ -91,7 +91,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | 遥测保留期不可配置 | 7 天是产品常量（`TELEMETRY_RETENTION`）；"历史保留周期可配置"（§14.4）尚未实现为设置项，代码注释明确是 later iteration | `app/src/telemetry_sampler.rs` |
 | 事件监听器失败后不自动恢复 | 连续 10 次重连失败（预算约 4 分钟）后端点监听器标记 Failed 并退出；周期性重新拉起是 later iteration | `app/src/event_listener.rs` |
 | 事件监听按启动扫描拉起 | 启动时枚举全部端点拉起 SSE 监听；登记端点时懒启动是 later iteration | 同上 |
-| 无统一日志设施 | 设计 §6.2 的 `tracing` 未进入 workspace；运行失败经 stderr（`eprintln!`）记录；统一日志设施为后续迭代 | 根 `Cargo.toml`；`app/src/event_listener.rs` 注释 |
+| 日志设施范围受限 | 设计 §6.2 的 `tracing` + `tracing-subscriber` 已进入 workspace；app/application/platform 的运行诊断经 `tracing::error!`/`warn!` 记录，由 app 二进制在启动时初始化 stderr subscriber（`RUST_LOG` 过滤，默认 `info`）；**CLI 用户可见输出**（init 向导、backup 结果、doctor 报告、console 横幅、bootstrap code）仍为 `println!`（§7.6 用户信息与诊断信息分离），测试基础设施与测试内诊断（`test-support` mock、`infra-redfish` 测试）仍用 `eprintln!`（无 subscriber 上下文）；未使用 span/`#[instrument]`、无结构化 JSON 输出 | 根 `Cargo.toml`；`app/src/main.rs`；`app/src/event_listener.rs` 注释 |
 | `cargo audit` 独立门禁未启用 | advisory 扫描已由 `cargo deny check` 覆盖；独立 audit 门禁为后续工作 | `.github/workflows/ci.yml` 注释 |
 | CI 与发布目标差异 | CI 当前编译验证 linux-gnu / windows-msvc / darwin（x86_64）+ wasm32；musl、aarch64、ARM64、macOS Universal 2 合并构建尚未在 CI 验证 | `.github/workflows/ci.yml`；`deny.toml` |
 | 产品版本号 | crates.io workspace 版本仍为 `0.1.0`（`rutilus version` 输出），里程碑编号（0.1.0→0.8.0）独立于版本号；发布前需要统一版本策略 | 根 `Cargo.toml` |
@@ -110,7 +110,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | §19.1 Fixture 测试（真实响应 fixture 目录） | 尚未建立 |
 | §19.1 Physical Device Test（五厂商真实设备认证矩阵） | 尚未达成 |
 | §0.9.0 性能容量测试与真实容量建议 | 尚未执行/发布 |
-| §6.2 tracing 日志选型 | 尚未引入 workspace |
+| §6.2 tracing 日志选型 | 已引入（app 诊断日志 + `RUST_LOG` 过滤的 stderr subscriber）；用户可见输出仍为 `println!`，测试/工具输出仍为 `eprintln!`（见 §七"日志设施范围受限"）；span/`#[instrument]` 与结构化输出为后续迭代 |
 | §14.4 遥测保留周期可配置 | 尚未实现（产品常量） |
 | §12.4 诊断中的解码错误路径 / ExtendedInfo 展示 | 解码失败的成员在刷新时跳过、不留下记录，诊断视图不显示（`application/src/resource_diagnostics.rs`）——与 §12.4"允许查看解码错误路径"的设计表述存在实现差异，属 0.9.0 待办 |
 

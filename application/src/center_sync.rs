@@ -527,7 +527,7 @@ where
                                 // on the center (revoked or re-bound), so
                                 // retrying is futile. The runtime converges
                                 // the local binding on this return.
-                                eprintln!(
+                                tracing::error!(
                                     "the center refused the connection {consecutive_not_bound} \
                                      times as not bound; the site's binding is not in force"
                                 );
@@ -540,7 +540,7 @@ where
                         // rejects the negotiation, and an unreachable center
                         // fails the attempt — either way the site keeps
                         // running locally and retries after the backoff.
-                        eprintln!(
+                        tracing::warn!(
                             "center connection failed: {error}; keeping the site local and \
                              retrying in {:?}",
                             self.options.reconnect_after
@@ -557,7 +557,7 @@ where
             match outcome {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "center connection ended: {error}; reconnecting in {:?}",
                         self.options.reconnect_after
                     );
@@ -698,7 +698,7 @@ where
                     // pending and every flush re-logs it until an operator
                     // repairs or clears it (a future migration could add a
                     // failed state).
-                    eprintln!(
+                    tracing::error!(
                         "site {}: skipping outbox entry {} with a corrupt payload: {source}",
                         self.instance_id,
                         entry.id()
@@ -707,7 +707,7 @@ where
                 }
             };
             let Ok(wire_sequence) = u64::try_from(entry.sequence()) else {
-                eprintln!(
+                tracing::error!(
                     "site {}: skipping outbox entry {} with an unwireable sequence {}",
                     self.instance_id,
                     entry.id(),
@@ -773,21 +773,22 @@ where
         // offer addressed to another site or carrying unparseable ids cannot
         // be recorded and is dropped with a log instead of being guessed at.
         if offer.site_id != self.instance_id.to_string() {
-            eprintln!(
+            tracing::warn!(
                 "site {}: dropping an operation offer for site {}",
-                self.instance_id, offer.site_id
+                self.instance_id,
+                offer.site_id
             );
             return Ok(OfferOutcome::Dropped);
         }
         let Ok(operation_id) = offer.operation_id.parse::<OperationId>() else {
-            eprintln!(
+            tracing::warn!(
                 "site {}: dropping an offer with an unparseable operation id",
                 self.instance_id
             );
             return Ok(OfferOutcome::Dropped);
         };
         let Ok(endpoint_id) = offer.endpoint_id.parse::<EndpointId>() else {
-            eprintln!(
+            tracing::warn!(
                 "site {}: dropping an offer with an unparseable endpoint id",
                 self.instance_id
             );
@@ -1204,7 +1205,7 @@ where
                     // restore left unparseable must not wedge the sync loop:
                     // log it and re-report the current projections. The
                     // report's cursor write at the end heals the row.
-                    eprintln!(
+                    tracing::warn!(
                         "site {}: resetting the {} stream cursor: {source}",
                         self.instance_id,
                         SyncStream::Endpoint
@@ -1375,7 +1376,7 @@ where
                 // left unparseable must not wedge the sync loop: log it and
                 // re-report the bounded tail. The report's cursor write at
                 // the end heals the row.
-                eprintln!(
+                tracing::warn!(
                     "site {}: resetting the event stream cursor: the stored value is not an event id",
                     self.instance_id
                 );
@@ -1402,9 +1403,10 @@ where
                 // The bounded history evicted the anchor (§14.4) or a manual
                 // DB change removed it: reset the stream to the bounded tail
                 // instead of failing the connection on every attempt.
-                eprintln!(
+                tracing::warn!(
                     "site {}: resetting the event stream cursor: the anchor {} is no longer stored",
-                    self.instance_id, anchor
+                    self.instance_id,
+                    anchor
                 );
                 let events = self
                     .events
@@ -1483,7 +1485,7 @@ where
                 // left unparseable must not wedge the sync loop: log it and
                 // re-distribute the ready set. The report's cursor write at
                 // the end heals the row.
-                eprintln!(
+                tracing::warn!(
                     "site {}: resetting the artifact stream cursor: the stored value is not an artifact id",
                     self.instance_id
                 );
@@ -1504,7 +1506,7 @@ where
                 // The anchor artifact is gone (a manual DB change or a
                 // partial restore): reset the stream and re-distribute the
                 // ready set; the report's cursor write heals the row.
-                eprintln!(
+                tracing::warn!(
                     "site {}: resetting the artifact stream cursor: the anchor artifact is no longer stored",
                     self.instance_id
                 );
@@ -1596,15 +1598,17 @@ where
         match envelope.message {
             Some(EnvelopeMessage::Heartbeat(_)) => {}
             Some(message) => {
-                eprintln!(
+                tracing::warn!(
                     "site {}: center frame {} carries an unhandled message: {message:?}",
-                    self.instance_id, envelope.sequence
+                    self.instance_id,
+                    envelope.sequence
                 );
             }
             None => {
-                eprintln!(
+                tracing::warn!(
                     "site {}: center frame {} carries no message",
-                    self.instance_id, envelope.sequence
+                    self.instance_id,
+                    envelope.sequence
                 );
             }
         }

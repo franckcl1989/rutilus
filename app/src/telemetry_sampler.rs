@@ -42,10 +42,10 @@
 //! # Failure isolation
 //!
 //! One endpoint's failed sampling never touches the others: each failure is
-//! recorded through `eprintln!` (the crate's operational-failure precedent)
-//! and the next endpoint runs. Only a sweep-level failure (the endpoint
-//! listing) aborts the tick, and the loop retries it on the next tick. The
-//! loop itself never panics: every fallible call is handled.
+//! recorded through `tracing::error!` (the crate's operational-failure
+//! precedent) and the next endpoint runs. Only a sweep-level failure (the
+//! endpoint listing) aborts the tick, and the loop retries it on the next
+//! tick. The loop itself never panics: every fallible call is handled.
 
 use std::{error::Error, time::Duration};
 
@@ -221,17 +221,17 @@ async fn run_tick<Driver, Lister>(
     let endpoints = match lister.list_enrolled_endpoints().await {
         Ok(endpoints) => endpoints,
         Err(error) => {
-            eprintln!("telemetry sampling sweep could not list enrolled endpoints: {error}");
+            tracing::error!("telemetry sampling sweep could not list enrolled endpoints: {error}");
             return;
         }
     };
     for endpoint_id in endpoints {
         if let Err(error) = driver.sample_endpoint(endpoint_id, now).await {
-            eprintln!("telemetry sampling failed for endpoint {endpoint_id}: {error}");
+            tracing::error!("telemetry sampling failed for endpoint {endpoint_id}: {error}");
         }
     }
     if let Err(error) = driver.prune_history(retention).await {
-        eprintln!("telemetry history pruning failed: {error}");
+        tracing::error!("telemetry history pruning failed: {error}");
     }
 }
 
