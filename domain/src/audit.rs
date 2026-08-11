@@ -175,6 +175,13 @@ stable_audit_codes! {
     /// the `UpdateService` property patch — the patch is separate from
     /// `UpdateFirmware` because patching the service configuration and
     /// submitting firmware are materially different actions.
+    ///
+    /// The seven telemetry writes are separate for the same reason: enabling
+    /// or disabling the telemetry service, creating, updating, or deleting a
+    /// metric definition, and creating, updating, or deleting a metric report
+    /// definition are materially different actions an audit reader must not
+    /// conflate — the same granularity decision that keeps the account writes
+    /// separate.
     pub enum AuditRedfishOperation for "Redfish operation" {
         None => "none",
         ProbeCoreCapabilities => "probe-core-capabilities",
@@ -197,6 +204,13 @@ stable_audit_codes! {
         DeleteEventSubscription => "delete-event-subscription",
         LogClear => "log-clear",
         ControlUpdate => "control-update",
+        SetTelemetryEnabled => "set-telemetry-enabled",
+        CreateMetricDefinition => "create-metric-definition",
+        UpdateMetricDefinition => "update-metric-definition",
+        DeleteMetricDefinition => "delete-metric-definition",
+        CreateMetricReportDefinition => "create-metric-report-definition",
+        UpdateMetricReportDefinition => "update-metric-report-definition",
+        DeleteMetricReportDefinition => "delete-metric-report-definition",
         UpdateFirmware => "update-firmware",
         UpdateServicePatch => "update-service-patch",
         OemSystemConfigProfile => "oem-system-config-profile",
@@ -649,6 +663,13 @@ impl AuditOperationContext {
             | AuditRedfishOperation::DeleteEventSubscription
             | AuditRedfishOperation::LogClear
             | AuditRedfishOperation::ControlUpdate
+            | AuditRedfishOperation::SetTelemetryEnabled
+            | AuditRedfishOperation::CreateMetricDefinition
+            | AuditRedfishOperation::UpdateMetricDefinition
+            | AuditRedfishOperation::DeleteMetricDefinition
+            | AuditRedfishOperation::CreateMetricReportDefinition
+            | AuditRedfishOperation::UpdateMetricReportDefinition
+            | AuditRedfishOperation::DeleteMetricReportDefinition
             | AuditRedfishOperation::UpdateFirmware
             | AuditRedfishOperation::UpdateServicePatch
             | AuditRedfishOperation::OemSystemConfigProfile
@@ -1048,6 +1069,9 @@ impl Error for AuditEventError {}
 mod tests {
     use super::*;
 
+    // The pinned vocabulary pairs grow with every added operation code, so
+    // the line-count lint is scoped here like the family enumeration tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn stable_vocabularies_round_trip_without_dynamic_text() {
         assert_codes(&[
@@ -1101,6 +1125,13 @@ mod tests {
             AuditRedfishOperation::DeleteEventSubscription,
             AuditRedfishOperation::LogClear,
             AuditRedfishOperation::ControlUpdate,
+            AuditRedfishOperation::SetTelemetryEnabled,
+            AuditRedfishOperation::CreateMetricDefinition,
+            AuditRedfishOperation::UpdateMetricDefinition,
+            AuditRedfishOperation::DeleteMetricDefinition,
+            AuditRedfishOperation::CreateMetricReportDefinition,
+            AuditRedfishOperation::UpdateMetricReportDefinition,
+            AuditRedfishOperation::DeleteMetricReportDefinition,
             AuditRedfishOperation::UpdateFirmware,
             AuditRedfishOperation::UpdateServicePatch,
             AuditRedfishOperation::OemSystemConfigProfile,
@@ -1205,6 +1236,34 @@ mod tests {
             ),
             (AuditRedfishOperation::LogClear, "log-clear"),
             (AuditRedfishOperation::ControlUpdate, "control-update"),
+            (
+                AuditRedfishOperation::SetTelemetryEnabled,
+                "set-telemetry-enabled",
+            ),
+            (
+                AuditRedfishOperation::CreateMetricDefinition,
+                "create-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::UpdateMetricDefinition,
+                "update-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::DeleteMetricDefinition,
+                "delete-metric-definition",
+            ),
+            (
+                AuditRedfishOperation::CreateMetricReportDefinition,
+                "create-metric-report-definition",
+            ),
+            (
+                AuditRedfishOperation::UpdateMetricReportDefinition,
+                "update-metric-report-definition",
+            ),
+            (
+                AuditRedfishOperation::DeleteMetricReportDefinition,
+                "delete-metric-report-definition",
+            ),
             (
                 AuditRedfishOperation::UpdateServicePatch,
                 "update-service-patch",
@@ -1563,7 +1622,7 @@ mod tests {
     ///
     /// Kept next to [`AuditOperationContext::try_new`]'s exhaustive check so
     /// the two lists stay reviewable together.
-    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 20] = [
+    const EXECUTE_OPERATIONS: [AuditRedfishOperation; 27] = [
         AuditRedfishOperation::CreateAccount,
         AuditRedfishOperation::UpdateAccount,
         AuditRedfishOperation::UpdateAccountPassword,
@@ -1582,6 +1641,13 @@ mod tests {
         AuditRedfishOperation::DeleteEventSubscription,
         AuditRedfishOperation::LogClear,
         AuditRedfishOperation::ControlUpdate,
+        AuditRedfishOperation::SetTelemetryEnabled,
+        AuditRedfishOperation::CreateMetricDefinition,
+        AuditRedfishOperation::UpdateMetricDefinition,
+        AuditRedfishOperation::DeleteMetricDefinition,
+        AuditRedfishOperation::CreateMetricReportDefinition,
+        AuditRedfishOperation::UpdateMetricReportDefinition,
+        AuditRedfishOperation::DeleteMetricReportDefinition,
         AuditRedfishOperation::UpdateServicePatch,
         AuditRedfishOperation::PollRemoteTask,
     ];

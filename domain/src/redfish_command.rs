@@ -1896,6 +1896,762 @@ pub enum EventCommand {
     DeleteSubscription(DeleteSubscription),
 }
 
+/// The type of one metric definition (the CSDL `MetricDefinition` `MetricType`
+/// property).
+///
+/// The member set follows `nv-redfish-schema` 0.13.0's `MetricDefinition_v1.xml`
+/// `MetricType` enum (compiled upstream as
+/// `nv_redfish::schema::metric_definition::MetricType`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum MetricType {
+    /// The metric is numeric; the metric value is any real number.
+    Numeric,
+    /// The metric is discrete; the possible values are listed in the CSDL
+    /// `DiscreteValues` property.
+    Discrete,
+    /// The metric is a gauge: a real number that stays at its extrema until
+    /// the reading falls within them.
+    Gauge,
+    /// The metric is a counter: a non-negative integer that increases
+    /// monotonically and resets to zero at its maximum.
+    Counter,
+    /// The metric is a countdown: a non-negative integer that decreases
+    /// monotonically and resets at its minimum.
+    Countdown,
+    /// The metric is a non-discrete string.
+    String,
+}
+
+impl MetricType {
+    /// Returns the exact CSDL member name, which is also the serde wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Numeric => "Numeric",
+            Self::Discrete => "Discrete",
+            Self::Gauge => "Gauge",
+            Self::Counter => "Counter",
+            Self::Countdown => "Countdown",
+            Self::String => "String",
+        }
+    }
+}
+
+impl fmt::Display for MetricType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// When a metric report is generated (the CSDL `MetricReportDefinition`
+/// `MetricReportDefinitionType` property).
+///
+/// The member set follows `nv-redfish-schema` 0.13.0's
+/// `MetricReportDefinition_v1.xml` `MetricReportDefinitionType` enum.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+pub enum MetricReportDefinitionType {
+    /// The report is generated at a periodic interval, specified by the CSDL
+    /// `Schedule` property.
+    Periodic,
+    /// The report is generated when any of the collected metric values
+    /// change.
+    OnChange,
+    /// The report is generated when an HTTP `GET` is performed on the report.
+    OnRequest,
+}
+
+impl MetricReportDefinitionType {
+    /// Returns the exact CSDL member name, which is also the serde wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Periodic => "Periodic",
+            Self::OnChange => "OnChange",
+            Self::OnRequest => "OnRequest",
+        }
+    }
+}
+
+impl fmt::Display for MetricReportDefinitionType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The maximum length of one metric definition id in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `MetricDefinition` `Id` property, so the
+/// bound is a product decision with the same reasoning as
+/// [`MAX_ACCOUNT_ID_CHARS`]: an id is a short stable label, and the bound
+/// stays generous enough for every id a BMC can reasonably serve.
+pub const MAX_METRIC_DEFINITION_ID_CHARS: usize = 128;
+
+/// The maximum length of one metric report definition id in Unicode scalar
+/// values.
+///
+/// The CSDL defines no bound on the `MetricReportDefinition` `Id` property,
+/// so the bound is the same product decision as
+/// [`MAX_METRIC_DEFINITION_ID_CHARS`].
+pub const MAX_METRIC_REPORT_DEFINITION_ID_CHARS: usize = 128;
+
+/// The maximum length of one metric units value in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `MetricDefinition` `Units` property (an
+/// `Edm.String`), so the bound is a product decision sized to the unit
+/// strings of the Unified Code for Units of Measure the CSDL references
+/// (short labels such as `W` and `Cel`).
+pub const MAX_METRIC_UNITS_CHARS: usize = 128;
+
+/// The Redfish `Id` of one `MetricDefinition` collection member.
+///
+/// The id is the last path segment of the member's `@odata.id` — the same
+/// identity the verification re-read matches against — so only one plain
+/// segment may participate: the charset is ASCII alphanumerics, `-`, and `_`,
+/// which excludes the separators and escape characters (`/`, `\`, `?`, `#`,
+/// `%`) and the dot segments (`.`, `..`) that could redirect a constructed
+/// URI outside the collection, and excludes whitespace and control characters
+/// that could smuggle request structure. This is the exact rule
+/// [`AccountId`] applies to account ids.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MetricDefinitionId(String);
+
+impl MetricDefinitionId {
+    /// Validates a metric definition id as a single safe URI path segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricDefinitionIdError`] for an empty id, a character
+    /// outside the safe-segment charset, or an id longer than
+    /// [`MAX_METRIC_DEFINITION_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, MetricDefinitionIdError> {
+        if value.is_empty() {
+            return Err(MetricDefinitionIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(MetricDefinitionIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_METRIC_DEFINITION_ID_CHARS {
+            return Err(MetricDefinitionIdError::TooLong {
+                actual,
+                maximum: MAX_METRIC_DEFINITION_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the metric definition id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MetricDefinitionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for MetricDefinitionId {
+    type Err = MetricDefinitionIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for MetricDefinitionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MetricDefinitionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a metric definition id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricDefinitionIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for MetricDefinitionIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("metric definition id cannot be empty"),
+            Self::UnsafeCharacter => formatter.write_str(
+                "metric definition id can only contain ASCII letters, digits, '-', and '_'",
+            ),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "metric definition id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for MetricDefinitionIdError {}
+
+/// The Redfish `Id` of one `MetricReportDefinition` collection member.
+///
+/// The id is the last path segment of the member's `@odata.id`, validated as
+/// a single safe URI path segment exactly like [`MetricDefinitionId`]: the
+/// same charset rule applies because the id is joined onto a decoded
+/// collection URI the same way.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MetricReportDefinitionId(String);
+
+impl MetricReportDefinitionId {
+    /// Validates a metric report definition id as a single safe URI path
+    /// segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricReportDefinitionIdError`] for an empty id, a character
+    /// outside the safe-segment charset, or an id longer than
+    /// [`MAX_METRIC_REPORT_DEFINITION_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, MetricReportDefinitionIdError> {
+        if value.is_empty() {
+            return Err(MetricReportDefinitionIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(MetricReportDefinitionIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_METRIC_REPORT_DEFINITION_ID_CHARS {
+            return Err(MetricReportDefinitionIdError::TooLong {
+                actual,
+                maximum: MAX_METRIC_REPORT_DEFINITION_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the metric report definition id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MetricReportDefinitionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for MetricReportDefinitionId {
+    type Err = MetricReportDefinitionIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for MetricReportDefinitionId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MetricReportDefinitionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a metric report definition id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricReportDefinitionIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for MetricReportDefinitionIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("metric report definition id cannot be empty"),
+            Self::UnsafeCharacter => formatter.write_str(
+                "metric report definition id can only contain ASCII letters, digits, '-', and '_'",
+            ),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "metric report definition id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for MetricReportDefinitionIdError {}
+
+/// The `Units` of one metric definition (the CSDL `MetricDefinition` `Units`
+/// property, an `Edm.String`).
+///
+/// The validation mirrors [`RoleId`]: the value is a short unit-of-measure
+/// label sent to the BMC's telemetry service, so the same bounds apply.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MetricUnits(String);
+
+impl MetricUnits {
+    /// Validates a metric units value without changing significant
+    /// whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricUnitsError`] for an empty value, a control character,
+    /// or a value longer than [`MAX_METRIC_UNITS_CHARS`] Unicode scalar
+    /// values.
+    pub fn parse(value: &str) -> Result<Self, MetricUnitsError> {
+        if value.trim().is_empty() {
+            return Err(MetricUnitsError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(MetricUnitsError::ControlCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_METRIC_UNITS_CHARS {
+            return Err(MetricUnitsError::TooLong {
+                actual,
+                maximum: MAX_METRIC_UNITS_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the units value as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MetricUnits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for MetricUnits {
+    type Err = MetricUnitsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for MetricUnits {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MetricUnits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a metric units value cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricUnitsError {
+    /// The units value is empty.
+    Empty,
+    /// The units value contains a control character.
+    ControlCharacter,
+    /// The units value is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for MetricUnitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("metric units cannot be empty"),
+            Self::ControlCharacter => {
+                formatter.write_str("metric units cannot contain control characters")
+            }
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "metric units has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for MetricUnitsError {}
+
+/// The payload of [`TelemetryCommand::CreateMetricDefinition`].
+///
+/// The two fields mirror the CSDL `MetricDefinition` create properties
+/// `MetricType` and `Units` (`MetricDefinition_v1.xml`). The CSDL marks every
+/// create property optional — nothing is `Redfish.RequiredOnCreate` — so the
+/// first-cut typed projection keeps the minimal meaningful subset: the type
+/// and the unit of measure identify the metric, while `MetricDataType`,
+/// `Calculable`, `IsLinear`, `MetricProperties`, `SensingInterval`,
+/// `DiscreteValues`, and `CalculationTimeInterval` stay out because a metric
+/// definition that names no type or units cannot be expressed, and a product
+/// command is the complete intent (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMetricDefinition {
+    metric_type: MetricType,
+    units: MetricUnits,
+}
+
+impl CreateMetricDefinition {
+    /// Constructs one metric definition creation with the metric type and
+    /// units.
+    #[must_use]
+    pub const fn new(metric_type: MetricType, units: MetricUnits) -> Self {
+        Self { metric_type, units }
+    }
+
+    /// Returns the type of the metric to create.
+    #[must_use]
+    pub const fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
+
+    /// Returns the units of the metric to create.
+    #[must_use]
+    pub const fn units(&self) -> &MetricUnits {
+        &self.units
+    }
+}
+
+/// The payload of [`TelemetryCommand::UpdateMetricDefinition`].
+///
+/// `metric_definition_id` names the existing `MetricDefinition` by its Redfish
+/// `Id`, and `metric_type` and `units` are the properties the definition must
+/// be changed to. The update is the complete intent: a change with an open
+/// target or an open type or units cannot be expressed (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMetricDefinition {
+    metric_definition_id: MetricDefinitionId,
+    metric_type: MetricType,
+    units: MetricUnits,
+}
+
+impl UpdateMetricDefinition {
+    /// Constructs one update of an existing metric definition.
+    #[must_use]
+    pub const fn new(
+        metric_definition_id: MetricDefinitionId,
+        metric_type: MetricType,
+        units: MetricUnits,
+    ) -> Self {
+        Self {
+            metric_definition_id,
+            metric_type,
+            units,
+        }
+    }
+
+    /// Returns the id of the metric definition to update.
+    #[must_use]
+    pub const fn metric_definition_id(&self) -> &MetricDefinitionId {
+        &self.metric_definition_id
+    }
+
+    /// Returns the type the metric definition is changed to.
+    #[must_use]
+    pub const fn metric_type(&self) -> MetricType {
+        self.metric_type
+    }
+
+    /// Returns the units the metric definition is changed to.
+    #[must_use]
+    pub const fn units(&self) -> &MetricUnits {
+        &self.units
+    }
+}
+
+/// The payload of [`TelemetryCommand::DeleteMetricDefinition`].
+///
+/// `metric_definition_id` names the existing `MetricDefinition` by its Redfish
+/// `Id`, the same identity the verification re-read matches against.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteMetricDefinition {
+    metric_definition_id: MetricDefinitionId,
+}
+
+impl DeleteMetricDefinition {
+    /// Constructs a metric definition deletion for one existing definition.
+    #[must_use]
+    pub const fn new(metric_definition_id: MetricDefinitionId) -> Self {
+        Self {
+            metric_definition_id,
+        }
+    }
+
+    /// Returns the id of the metric definition to delete.
+    #[must_use]
+    pub const fn metric_definition_id(&self) -> &MetricDefinitionId {
+        &self.metric_definition_id
+    }
+}
+
+/// One metric entry of a metric report definition (the CSDL
+/// `MetricReportDefinition` `Metrics` array element).
+///
+/// `metric_id` names the `MetricDefinition` whose values the report collects:
+/// the CSDL defines `MetricId` as "the value of the `Id` property of the
+/// `MetricDefinition` resource that contains the metric properties to include
+/// in the metric report", so the entry carries the same
+/// [`MetricDefinitionId`] identity as the `MetricDefinitions` collection
+/// members. The entry's other CSDL properties (`MetricProperties`,
+/// `CollectionFunction`, `CollectionDuration`, `CollectionTimeScope`) stay out
+/// of the first-cut typed projection: the product's sampler reads the
+/// collected values from the generated `MetricReport` itself, so an entry
+/// naming the definition is the minimal meaningful form.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricReportMetric {
+    metric_id: MetricDefinitionId,
+}
+
+impl MetricReportMetric {
+    /// Constructs one report entry for the named metric definition.
+    #[must_use]
+    pub const fn new(metric_id: MetricDefinitionId) -> Self {
+        Self { metric_id }
+    }
+
+    /// Returns the id of the metric definition this entry collects.
+    #[must_use]
+    pub const fn metric_id(&self) -> &MetricDefinitionId {
+        &self.metric_id
+    }
+}
+
+/// The payload of [`TelemetryCommand::CreateMetricReportDefinition`].
+///
+/// `metric_report_definition_type` mirrors the CSDL
+/// `MetricReportDefinitionType` property and `metrics` the `Metrics` array
+/// (`MetricReportDefinition_v1.xml`). The CSDL marks every create property
+/// optional — nothing is `Redfish.RequiredOnCreate` — so the first-cut typed
+/// projection keeps the minimal meaningful subset: the generation cadence and
+/// the collected definitions, while `Schedule`, `ReportActions`,
+/// `ReportUpdates`, `Wildcards`, `MetricProperties`,
+/// `SuppressRepeatedMetricValue`, `MetricReportHeartbeatInterval`,
+/// `MetricReportDefinitionEnabled`, `Links`, and `ReportTimespan` stay out
+/// because a definition that names no cadence or no metric cannot be
+/// expressed, and a product command is the complete intent (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMetricReportDefinition {
+    metric_report_definition_type: MetricReportDefinitionType,
+    metrics: Vec<MetricReportMetric>,
+}
+
+impl CreateMetricReportDefinition {
+    /// Constructs a metric report definition creation, rejecting empty metric
+    /// sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricReportDefinitionError::EmptyMetrics`] when no metric is
+    /// requested.
+    pub fn try_new(
+        metric_report_definition_type: MetricReportDefinitionType,
+        metrics: Vec<MetricReportMetric>,
+    ) -> Result<Self, MetricReportDefinitionError> {
+        if metrics.is_empty() {
+            return Err(MetricReportDefinitionError::EmptyMetrics);
+        }
+        Ok(Self {
+            metric_report_definition_type,
+            metrics,
+        })
+    }
+
+    /// Returns the generation cadence of the report definition.
+    #[must_use]
+    pub const fn metric_report_definition_type(&self) -> MetricReportDefinitionType {
+        self.metric_report_definition_type
+    }
+
+    /// Returns the metrics the report definition collects.
+    #[must_use]
+    pub fn metrics(&self) -> &[MetricReportMetric] {
+        self.metrics.as_slice()
+    }
+}
+
+/// Why a metric report definition request cannot be represented safely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetricReportDefinitionError {
+    /// A report definition must collect at least one metric.
+    EmptyMetrics,
+}
+
+impl fmt::Display for MetricReportDefinitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyMetrics => {
+                formatter.write_str("a metric report definition must collect at least one metric")
+            }
+        }
+    }
+}
+
+impl Error for MetricReportDefinitionError {}
+
+/// The payload of [`TelemetryCommand::UpdateMetricReportDefinition`].
+///
+/// `metric_report_definition_id` names the existing `MetricReportDefinition`
+/// by its Redfish `Id`, and `metric_report_definition_type` and `metrics` are
+/// the properties the definition must be changed to. The update is the
+/// complete intent: a change with an open target, cadence, or metric set
+/// cannot be expressed (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMetricReportDefinition {
+    metric_report_definition_id: MetricReportDefinitionId,
+    metric_report_definition_type: MetricReportDefinitionType,
+    metrics: Vec<MetricReportMetric>,
+}
+
+impl UpdateMetricReportDefinition {
+    /// Constructs one update of an existing metric report definition.
+    #[must_use]
+    pub fn new(
+        metric_report_definition_id: MetricReportDefinitionId,
+        metric_report_definition_type: MetricReportDefinitionType,
+        metrics: Vec<MetricReportMetric>,
+    ) -> Self {
+        Self {
+            metric_report_definition_id,
+            metric_report_definition_type,
+            metrics,
+        }
+    }
+
+    /// Returns the id of the metric report definition to update.
+    #[must_use]
+    pub const fn metric_report_definition_id(&self) -> &MetricReportDefinitionId {
+        &self.metric_report_definition_id
+    }
+
+    /// Returns the cadence the definition is changed to.
+    #[must_use]
+    pub const fn metric_report_definition_type(&self) -> MetricReportDefinitionType {
+        self.metric_report_definition_type
+    }
+
+    /// Returns the metric set the definition is changed to.
+    #[must_use]
+    pub fn metrics(&self) -> &[MetricReportMetric] {
+        self.metrics.as_slice()
+    }
+}
+
+/// The payload of [`TelemetryCommand::DeleteMetricReportDefinition`].
+///
+/// `metric_report_definition_id` names the existing `MetricReportDefinition`
+/// by its Redfish `Id`, the same identity the verification re-read matches
+/// against.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteMetricReportDefinition {
+    metric_report_definition_id: MetricReportDefinitionId,
+}
+
+impl DeleteMetricReportDefinition {
+    /// Constructs a metric report definition deletion for one existing
+    /// definition.
+    #[must_use]
+    pub const fn new(metric_report_definition_id: MetricReportDefinitionId) -> Self {
+        Self {
+            metric_report_definition_id,
+        }
+    }
+
+    /// Returns the id of the metric report definition to delete.
+    #[must_use]
+    pub const fn metric_report_definition_id(&self) -> &MetricReportDefinitionId {
+        &self.metric_report_definition_id
+    }
+}
+
+/// Commands against the telemetry service (§7.5, §14.4).
+///
+/// Redfish models telemetry as the `TelemetryService` with its
+/// `MetricDefinitions` and `MetricReportDefinitions` collections; see
+/// [`crate::ResourceFeature::MetricReport`] for the matching read surface.
+/// The seven writes mirror the typed `nv-redfish` 0.13.0 telemetry API
+/// (`TelemetryService::set_enabled`, `TelemetryService::create_metric_definition`,
+/// `MetricDefinition::update`/`delete`, `TelemetryService::create_metric_report_definition`,
+/// and `MetricReportDefinition::update`/`delete`) one-to-one, so the gateway
+/// maps the domain payloads onto the compiled
+/// `TelemetryServiceUpdate`/`MetricDefinitionCreate`/`MetricDefinitionUpdate`/
+/// `MetricReportDefinitionCreate`/`MetricReportDefinitionUpdate` types without
+/// inventing a wire shape (§7.4).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum TelemetryCommand {
+    /// Enables or disables the endpoint's telemetry service (the CSDL
+    /// `ServiceEnabled` property).
+    SetEnabled {
+        /// Whether the service must be enabled.
+        enabled: bool,
+    },
+    /// Creates one metric definition with a type and units.
+    CreateMetricDefinition(CreateMetricDefinition),
+    /// Updates the type and units of one existing metric definition.
+    UpdateMetricDefinition(UpdateMetricDefinition),
+    /// Deletes one existing metric definition.
+    DeleteMetricDefinition(DeleteMetricDefinition),
+    /// Creates one metric report definition with a generation cadence and
+    /// metric set.
+    CreateMetricReportDefinition(CreateMetricReportDefinition),
+    /// Updates the cadence and metric set of one existing metric report
+    /// definition.
+    UpdateMetricReportDefinition(UpdateMetricReportDefinition),
+    /// Deletes one existing metric report definition.
+    DeleteMetricReportDefinition(DeleteMetricReportDefinition),
+}
+
 /// Commands against the account service (§7.5).
 ///
 /// Redfish models accounts as `ManagerAccount` resources under the
@@ -2286,8 +3042,6 @@ pub enum OemCommand {
 ///   exists.
 /// - `Storage` — storage writes (volume and `RAID` operations) have no
 ///   first-cut product flow.
-/// - `Telemetry` — telemetry writes (metric report subscription lifecycle)
-///   build on the event-service surface and land with it.
 ///
 /// The `Account` family is no longer deferred: account writes carry
 /// passwords, which are §10 secrets handled by the secret infrastructure
@@ -2295,6 +3049,10 @@ pub enum OemCommand {
 /// [`AccountPassword`] (a zeroizing `SecretString` with a redacted `Debug`),
 /// and the §10 at-rest encryption of the persisted command column is the
 /// persistence crate's concern, exactly like the endpoint credential.
+///
+/// The `Telemetry` family is no longer deferred either: telemetry writes
+/// (service enablement and the metric report definition lifecycle) build on
+/// the event-service surface and landed with it (see [`TelemetryCommand`]).
 ///
 /// The `Oem` family is no longer deferred either: upstream NVIDIA typed
 /// actions are compiled in (see [`OemCommand`]), and the remaining vendors'
@@ -2327,6 +3085,8 @@ pub enum RedfishCommand {
     Log(LogCommand),
     /// A command against a control resource.
     Control(ControlCommand),
+    /// A command against the telemetry service (§14.4).
+    Telemetry(TelemetryCommand),
     /// A command against the update service.
     Update(UpdateCommand),
     /// A command against a compiled vendor OEM surface (§11.5).
@@ -2337,11 +3097,12 @@ impl RedfishCommand {
     /// Returns the stable product code of the command family.
     ///
     /// The codes are the wire contract used by persistence and protocols and
-    /// never change across milestones. The `event` code is deliberately
-    /// narrower than the §2.1 `event-service` capability code: the capability
-    /// covers the whole event-service surface, while the command family
-    /// covers only the write operations — the same narrowing as the
-    /// subsidiary read families of [`crate::ResourceFeature`].
+    /// never change across milestones. The `event` and `telemetry` codes are
+    /// deliberately narrower than the §2.1 `event-service` and
+    /// `telemetry-service` capability codes: the capabilities cover the whole
+    /// service surfaces, while the command families cover only the write
+    /// operations — the same narrowing as the subsidiary read families of
+    /// [`crate::ResourceFeature`].
     ///
     /// There is no `FromStr` counterpart: a code alone cannot reconstruct a
     /// command because every family payload is required, so the serde
@@ -2358,6 +3119,7 @@ impl RedfishCommand {
             Self::Event(_) => "event",
             Self::Log(_) => "log",
             Self::Control(_) => "control",
+            Self::Telemetry(_) => "telemetry",
             Self::Update(_) => "update",
             Self::Oem(_) => "oem",
         }
@@ -2524,6 +3286,25 @@ mod tests {
         (EraseType::TokenType, "TokenType"),
     ];
 
+    /// The exact `MetricType` member set of `nv-redfish-schema` 0.13.0
+    /// `MetricDefinition_v1.xml`.
+    const METRIC_TYPE_MEMBERS: [(MetricType, &str); 6] = [
+        (MetricType::Numeric, "Numeric"),
+        (MetricType::Discrete, "Discrete"),
+        (MetricType::Gauge, "Gauge"),
+        (MetricType::Counter, "Counter"),
+        (MetricType::Countdown, "Countdown"),
+        (MetricType::String, "String"),
+    ];
+
+    /// The exact `MetricReportDefinitionType` member set of
+    /// `nv-redfish-schema` 0.13.0 `MetricReportDefinition_v1.xml`.
+    const METRIC_REPORT_DEFINITION_TYPE_MEMBERS: [(MetricReportDefinitionType, &str); 3] = [
+        (MetricReportDefinitionType::Periodic, "Periodic"),
+        (MetricReportDefinitionType::OnChange, "OnChange"),
+        (MetricReportDefinitionType::OnRequest, "OnRequest"),
+    ];
+
     /// Asserts that every member serializes to exactly its CSDL wire name,
     /// deserializes back from it, and that unknown member names are rejected.
     fn assert_csdl_member_set<T>(members: &[(T, &str)]) -> Result<(), Box<dyn Error>>
@@ -2599,9 +3380,19 @@ mod tests {
         assert_csdl_member_set(&ERASE_TYPE_MEMBERS)
     }
 
+    #[test]
+    fn metric_type_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
+        assert_csdl_member_set(&METRIC_TYPE_MEMBERS)
+    }
+
+    #[test]
+    fn metric_report_definition_type_members_follow_the_csdl() -> Result<(), Box<dyn Error>> {
+        assert_csdl_member_set(&METRIC_REPORT_DEFINITION_TYPE_MEMBERS)
+    }
+
     /// One representative command per family with its expected family code.
     ///
-    /// The eleven entries are the exhaustive §7.5 family list for this
+    /// The twelve entries are the exhaustive §7.5 family list for this
     /// iteration; adding a family must add an entry here or the
     /// exhaustiveness tests fail.
     fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, Box<dyn Error>> {
@@ -2664,6 +3455,10 @@ mod tests {
                 "event",
             ),
             (
+                RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+                "telemetry",
+            ),
+            (
                 RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
                     ArtifactId::generate(),
                     None,
@@ -2698,11 +3493,11 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            11,
+            12,
             "add the new family to `all_families` when a variant is added"
         );
         // The deferred §7.5 families must not be claimed by an existing code.
-        for deferred in ["bios", "storage", "telemetry"] {
+        for deferred in ["bios", "storage"] {
             assert!(
                 !seen.contains(&deferred),
                 "the deferred family code {deferred} must not be claimed"
@@ -2726,6 +3521,7 @@ mod tests {
                 RedfishCommand::Event(_) => "event",
                 RedfishCommand::Log(_) => "log",
                 RedfishCommand::Control(_) => "control",
+                RedfishCommand::Telemetry(_) => "telemetry",
                 RedfishCommand::Update(_) => "update",
                 RedfishCommand::Oem(_) => "oem",
             };
@@ -2748,13 +3544,22 @@ mod tests {
         for unknown in [
             r#"{"Bios":{"SetAttributes":{}}}"#,
             r#"{"Storage":{"Format":{}}}"#,
-            r#"{"Telemetry":{"SubmitTestMetricReport":{}}}"#,
         ] {
             assert!(
                 serde_json::from_str::<RedfishCommand>(unknown).is_err(),
                 "{unknown} must not deserialize as a command"
             );
         }
+        // The `Telemetry` family is compiled, but an unknown write under it
+        // stays rejected, so the wire contract cannot drift into accepting an
+        // operation no payload can fill.
+        assert!(
+            serde_json::from_str::<RedfishCommand>(
+                r#"{"Telemetry":{"SubmitTestMetricReport":{}}}"#
+            )
+            .is_err(),
+            "an unknown telemetry write must not deserialize as a command"
+        );
         // The `Oem` family is compiled, but an unknown vendor face under it
         // stays rejected, so the wire contract cannot drift into accepting a
         // face no payload can fill.
@@ -2911,6 +3716,63 @@ mod tests {
                     )?,
                 )),
                 r#"{"Event":{"CreateSubscription":{"destination":"https://example.com/hook","protocol":"Redfish","event_types":["Alert"]}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+                r#"{"Telemetry":{"SetEnabled":{"enabled":true}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                    CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+                )),
+                r#"{"Telemetry":{"CreateMetricDefinition":{"metric_type":"Gauge","units":"W"}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("PowerMetric")?,
+                        MetricType::Counter,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+                r#"{"Telemetry":{"UpdateMetricDefinition":{"metric_definition_id":"PowerMetric","metric_type":"Counter","units":"W"}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+                )),
+                r#"{"Telemetry":{"DeleteMetricDefinition":{"metric_definition_id":"PowerMetric"}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                    CreateMetricReportDefinition::try_new(
+                        MetricReportDefinitionType::OnRequest,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    )?,
+                )),
+                r#"{"Telemetry":{"CreateMetricReportDefinition":{"metric_report_definition_type":"OnRequest","metrics":[{"metric_id":"PowerMetric"}]}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                    UpdateMetricReportDefinition::new(
+                        MetricReportDefinitionId::parse("PowerReport")?,
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    ),
+                )),
+                r#"{"Telemetry":{"UpdateMetricReportDefinition":{"metric_report_definition_id":"PowerReport","metric_report_definition_type":"OnChange","metrics":[{"metric_id":"PowerMetric"}]}}}"#,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse(
+                        "PowerReport",
+                    )?),
+                )),
+                r#"{"Telemetry":{"DeleteMetricReportDefinition":{"metric_report_definition_id":"PowerReport"}}}"#,
             ),
             (
                 RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
@@ -3484,6 +4346,297 @@ mod tests {
                 Some(false),
                 Some(vec!["/redfish/v1/Systems/1".to_owned()]),
             ))),
+        ] {
+            let json = serde_json::to_string(&command)?;
+            assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metric_definition_ids_are_safe_single_path_segments() -> Result<(), Box<dyn Error>> {
+        for valid in ["PowerMetric", "metric-1", "temp_sensor", "A1b2C3"] {
+            let id = MetricDefinitionId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<MetricDefinitionId>()?, id);
+        }
+        for invalid in ["..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"] {
+            assert_eq!(
+                MetricDefinitionId::parse(invalid),
+                Err(MetricDefinitionIdError::UnsafeCharacter),
+                "metric definition id {invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            MetricDefinitionId::parse(""),
+            Err(MetricDefinitionIdError::Empty)
+        );
+        let long = "x".repeat(MAX_METRIC_DEFINITION_ID_CHARS + 1);
+        assert_eq!(
+            MetricDefinitionId::parse(&long),
+            Err(MetricDefinitionIdError::TooLong {
+                actual: MAX_METRIC_DEFINITION_ID_CHARS + 1,
+                maximum: MAX_METRIC_DEFINITION_ID_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metric_report_definition_ids_are_safe_single_path_segments() -> Result<(), Box<dyn Error>> {
+        for valid in ["PowerReport", "report-1", "thermal_metrics", "B2c3D4"] {
+            let id = MetricReportDefinitionId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<MetricReportDefinitionId>()?, id);
+        }
+        for invalid in ["..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"] {
+            assert_eq!(
+                MetricReportDefinitionId::parse(invalid),
+                Err(MetricReportDefinitionIdError::UnsafeCharacter),
+                "metric report definition id {invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            MetricReportDefinitionId::parse(""),
+            Err(MetricReportDefinitionIdError::Empty)
+        );
+        let long = "x".repeat(MAX_METRIC_REPORT_DEFINITION_ID_CHARS + 1);
+        assert_eq!(
+            MetricReportDefinitionId::parse(&long),
+            Err(MetricReportDefinitionIdError::TooLong {
+                actual: MAX_METRIC_REPORT_DEFINITION_ID_CHARS + 1,
+                maximum: MAX_METRIC_REPORT_DEFINITION_ID_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metric_units_reject_empty_control_and_oversized_values() -> Result<(), Box<dyn Error>> {
+        for valid in ["W", "Cel", "percent", "A1"] {
+            let units = MetricUnits::parse(valid)?;
+            assert_eq!(units.as_str(), valid);
+            assert_eq!(units.to_string().parse::<MetricUnits>(), Ok(units));
+        }
+        assert_eq!(MetricUnits::parse(""), Err(MetricUnitsError::Empty));
+        assert_eq!(MetricUnits::parse("  "), Err(MetricUnitsError::Empty));
+        assert_eq!(
+            MetricUnits::parse("W\n"),
+            Err(MetricUnitsError::ControlCharacter)
+        );
+        let long = "x".repeat(MAX_METRIC_UNITS_CHARS + 1);
+        assert_eq!(
+            MetricUnits::parse(&long),
+            Err(MetricUnitsError::TooLong {
+                actual: MAX_METRIC_UNITS_CHARS + 1,
+                maximum: MAX_METRIC_UNITS_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metric_definition_payloads_round_trip_and_deny_unknown_fields() -> Result<(), Box<dyn Error>>
+    {
+        let create = CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?);
+        assert_eq!(create.metric_type(), MetricType::Gauge);
+        assert_eq!(create.units().as_str(), "W");
+        let json = serde_json::to_string(&create)?;
+        assert_eq!(json, r#"{"metric_type":"Gauge","units":"W"}"#);
+        assert_eq!(
+            serde_json::from_str::<CreateMetricDefinition>(&json)?,
+            create
+        );
+        assert!(
+            serde_json::from_str::<CreateMetricDefinition>(
+                r#"{"metric_type":"Gauge","units":"W","data_type":"Decimal"}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let update = UpdateMetricDefinition::new(
+            MetricDefinitionId::parse("PowerMetric")?,
+            MetricType::Counter,
+            MetricUnits::parse("W")?,
+        );
+        assert_eq!(update.metric_definition_id().as_str(), "PowerMetric");
+        assert_eq!(update.metric_type(), MetricType::Counter);
+        assert_eq!(update.units().as_str(), "W");
+        let json = serde_json::to_string(&update)?;
+        assert_eq!(
+            json,
+            r#"{"metric_definition_id":"PowerMetric","metric_type":"Counter","units":"W"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<UpdateMetricDefinition>(&json)?,
+            update
+        );
+        assert!(
+            serde_json::from_str::<UpdateMetricDefinition>(
+                r#"{"metric_definition_id":"PowerMetric","metric_type":"Counter","units":"W","linear":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let deletion = DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?);
+        assert_eq!(deletion.metric_definition_id().as_str(), "PowerMetric");
+        let json = serde_json::to_string(&deletion)?;
+        assert_eq!(json, r#"{"metric_definition_id":"PowerMetric"}"#);
+        assert_eq!(
+            serde_json::from_str::<DeleteMetricDefinition>(&json)?,
+            deletion
+        );
+        assert!(
+            serde_json::from_str::<DeleteMetricDefinition>(
+                r#"{"metric_definition_id":"PowerMetric","force":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metric_report_definition_payloads_round_trip_and_deny_unknown_fields()
+    -> Result<(), Box<dyn Error>> {
+        // A definition that collects nothing can never produce a report, so
+        // the empty metric set is rejected at construction exactly like an
+        // empty event-type set on a subscription.
+        assert_eq!(
+            CreateMetricReportDefinition::try_new(
+                MetricReportDefinitionType::OnRequest,
+                Vec::new()
+            ),
+            Err(MetricReportDefinitionError::EmptyMetrics)
+        );
+
+        let create = CreateMetricReportDefinition::try_new(
+            MetricReportDefinitionType::OnRequest,
+            vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                "PowerMetric",
+            )?)],
+        )?;
+        assert_eq!(
+            create.metric_report_definition_type(),
+            MetricReportDefinitionType::OnRequest
+        );
+        assert_eq!(create.metrics().len(), 1);
+        assert_eq!(create.metrics()[0].metric_id().as_str(), "PowerMetric");
+        let json = serde_json::to_string(&create)?;
+        assert_eq!(
+            json,
+            r#"{"metric_report_definition_type":"OnRequest","metrics":[{"metric_id":"PowerMetric"}]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CreateMetricReportDefinition>(&json)?,
+            create
+        );
+        assert!(
+            serde_json::from_str::<CreateMetricReportDefinition>(
+                r#"{"metric_report_definition_type":"OnRequest","metrics":[{"metric_id":"PowerMetric"}],"schedule":{}}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<MetricReportMetric>(
+                r#"{"metric_id":"PowerMetric","properties":[]}"#
+            )
+            .is_err(),
+            "unknown entry fields must be rejected"
+        );
+
+        let update = UpdateMetricReportDefinition::new(
+            MetricReportDefinitionId::parse("PowerReport")?,
+            MetricReportDefinitionType::OnChange,
+            vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                "PowerMetric",
+            )?)],
+        );
+        assert_eq!(update.metric_report_definition_id().as_str(), "PowerReport");
+        assert_eq!(
+            update.metric_report_definition_type(),
+            MetricReportDefinitionType::OnChange
+        );
+        assert_eq!(update.metrics().len(), 1);
+        let json = serde_json::to_string(&update)?;
+        assert_eq!(
+            json,
+            r#"{"metric_report_definition_id":"PowerReport","metric_report_definition_type":"OnChange","metrics":[{"metric_id":"PowerMetric"}]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<UpdateMetricReportDefinition>(&json)?,
+            update
+        );
+        assert!(
+            serde_json::from_str::<UpdateMetricReportDefinition>(
+                r#"{"metric_report_definition_id":"PowerReport","metric_report_definition_type":"OnChange","metrics":[{"metric_id":"PowerMetric"}],"enabled":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let deletion =
+            DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("PowerReport")?);
+        assert_eq!(
+            deletion.metric_report_definition_id().as_str(),
+            "PowerReport"
+        );
+        let json = serde_json::to_string(&deletion)?;
+        assert_eq!(json, r#"{"metric_report_definition_id":"PowerReport"}"#);
+        assert_eq!(
+            serde_json::from_str::<DeleteMetricReportDefinition>(&json)?,
+            deletion
+        );
+        assert!(
+            serde_json::from_str::<DeleteMetricReportDefinition>(
+                r#"{"metric_report_definition_id":"PowerReport","cascade":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_commands_round_trip_per_operation() -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: false }),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                UpdateMetricDefinition::new(
+                    MetricDefinitionId::parse("PowerMetric")?,
+                    MetricType::Counter,
+                    MetricUnits::parse("W")?,
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                CreateMetricReportDefinition::try_new(
+                    MetricReportDefinitionType::Periodic,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                )?,
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                UpdateMetricReportDefinition::new(
+                    MetricReportDefinitionId::parse("PowerReport")?,
+                    MetricReportDefinitionType::OnChange,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("PowerReport")?),
+            )),
         ] {
             let json = serde_json::to_string(&command)?;
             assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);

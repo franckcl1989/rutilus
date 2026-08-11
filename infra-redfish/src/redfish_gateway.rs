@@ -189,9 +189,12 @@ use nv_redfish::{
         memory::Memory as MemorySchema,
         memory_collection::MemoryCollection as MemoryCollectionSchema,
         metric_definition::MetricDefinition as MetricDefinitionSchema,
+        metric_definition::MetricType as MetricTypeSchema,
         metric_definition_collection::MetricDefinitionCollection as MetricDefinitionCollectionSchema,
         metric_report::MetricReport as MetricReportSchema,
         metric_report_collection::MetricReportCollection as MetricReportCollectionSchema,
+        metric_report_definition::Metric as MetricSchema,
+        metric_report_definition::MetricUpdate as MetricUpdateSchema,
         network_adapter::NetworkAdapter as NetworkAdapterSchema,
         network_adapter_collection::NetworkAdapterCollection as NetworkAdapterCollectionSchema,
         network_device_function::NetworkDeviceFunction as NetworkDeviceFunctionSchema,
@@ -227,6 +230,23 @@ use nv_redfish::{
         update_service::UpdateServiceUpdate as UpdateServiceUpdateSchema,
     },
     session_service::{Session, SessionCreate},
+    // The §0.8.0 telemetry write family dispatches through the typed
+    // telemetry API (`TelemetryService`/`MetricDefinition`/
+    // `MetricReportDefinition` wrappers with the compiled
+    // `MetricDefinitionCreate`/`MetricDefinitionUpdate`/
+    // `MetricReportDefinitionCreate`/`MetricReportDefinitionUpdate`
+    // payloads), the same high-level surface `ServiceRoot::telemetry_service`
+    // exposes — never a hand-written telemetry request (§7.4).
+    telemetry_service::{
+        MetricDefinition as MetricDefinitionWrapper,
+        MetricDefinitionCreate as MetricDefinitionCreateSchema,
+        MetricDefinitionUpdate as MetricDefinitionUpdateSchema,
+        MetricReportDefinition as MetricReportDefinitionWrapper,
+        MetricReportDefinitionCreate as MetricReportDefinitionCreateSchema,
+        MetricReportDefinitionType as MetricReportDefinitionTypeSchema,
+        MetricReportDefinitionUpdate as MetricReportDefinitionUpdateSchema,
+        TelemetryService as TelemetryServiceWrapper,
+    },
 };
 use reqwest::{Client as ReqwestClient, StatusCode, redirect::Policy as RedirectPolicy};
 use rustls::{
@@ -241,17 +261,20 @@ use rustls::{
 use rutilus_domain::{
     AccountCommand, AccountId, BootCommand, BootSource, BootSourceOverrideEnabled,
     BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, ClearLog,
-    ControlCommand, ControlId, CreateAccount, CreateSubscription, CredentialUsername,
-    DeleteAccount, DeleteSubscription, EndpointAddress, EndpointCapability,
+    ControlCommand, ControlId, CreateAccount, CreateMetricDefinition, CreateMetricReportDefinition,
+    CreateSubscription, CredentialUsername, DeleteAccount, DeleteMetricDefinition,
+    DeleteMetricReportDefinition, DeleteSubscription, EndpointAddress, EndpointCapability,
     EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
     EventDestinationProtocol, EventId, EventSeverity, EventType, LogCommand, LogServiceId,
-    ManagerCommand, ManagerResetToDefaultsType, MessageId, NvidiaDebugTokenCommand,
-    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, PowerSupplyId,
-    PowerSupplyReset, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
-    ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
-    ResourceSnapshotPayloadError, SecureBootCommand, SetBootSourceOverride, SystemCommand,
-    TlsIdentityChanged, TlsTrust, TokenType, UpdateAccount, UpdateAccountPassword,
-    UpdateAccountUserName, UpdateCommand, UpdateControl, UpdatePatch,
+    ManagerCommand, ManagerResetToDefaultsType, MessageId, MetricDefinitionId,
+    MetricReportDefinitionId, MetricReportDefinitionType, MetricReportMetric, MetricType,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OemCommand, PowerSupplyId, PowerSupplyReset, RedfishCommand, ResetKeysType, ResetType,
+    ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
+    ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
+    SetBootSourceOverride, SystemCommand, TelemetryCommand, TlsIdentityChanged, TlsTrust,
+    TokenType, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    UpdateControl, UpdateMetricDefinition, UpdateMetricReportDefinition, UpdatePatch,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -504,7 +527,13 @@ impl RedfishGateway {
     ///   shape onto the decoded `Subscriptions` link, and
     ///   `DeleteSubscription` deletes the link URI extended by the typed
     ///   subscription id (the one URI the command payload contributes; the
-    ///   product never accepts BMC URLs from outside, §15.6).
+    ///   product never accepts BMC URLs from outside, §15.6);
+    /// - `Telemetry` dispatches through the typed `nv-redfish` telemetry API
+    ///   (§14.4): `set_enabled` patches the `ServiceEnabled` property,
+    ///   `CreateMetricDefinition`/`CreateMetricReportDefinition` post the
+    ///   typed CSDL create shapes onto the decoded collections, and the
+    ///   update/delete writes target the decoded collection members resolved
+    ///   by their Redfish `Id`.
     ///
     /// The transient Session lifecycle is identical to the read surfaces: a
     /// Session is established when usable, every member fetch and the write
@@ -687,6 +716,11 @@ impl RedfishGateway {
     /// - `Event` `DeleteSubscription` — the subscription id must be absent
     ///   from the re-read collection (matched by the member `@odata.id` tail
     ///   segment, the same identity the deletion payload uses).
+    /// - `Telemetry` — the re-read `TelemetryService` document must carry
+    ///   the requested `ServiceEnabled` value, collection creates must
+    ///   re-read with a member matching the posted properties, member
+    ///   updates must re-read with the requested properties, and deletions
+    ///   must re-read without the deleted member (§14.4).
     /// - Reset, Boot, and Secure Boot commands — "accepted" verification:
     ///   the target resource must re-read without error, and the verifier
     ///   returns `Confirmed` without asserting the physical effect (power
@@ -3684,6 +3718,9 @@ async fn execute_authenticated_command(
         RedfishCommand::Control(ControlCommand::Update(payload)) => {
             execute_control_update(bmc, root, identity, trust, payload).await
         }
+        RedfishCommand::Telemetry(telemetry) => {
+            execute_telemetry_command(root, identity, trust, telemetry).await
+        }
         // The `StartUpdate` variant is deliberately dispatched through the
         // dedicated `UpdateExecutor` boundary, never this one: the typed
         // command carries only the database-serializable artifact id, while
@@ -5841,6 +5878,396 @@ async fn find_account(
         .find(|account| account.raw().base.id == account_id.as_str()))
 }
 
+/// Executes one telemetry command through the typed `nv-redfish` telemetry
+/// API (§13.3 step 7): the `TelemetryService` wrapper's `set_enabled`,
+/// `create_metric_definition`, and `create_metric_report_definition` helpers
+/// and the `MetricDefinition`/`MetricReportDefinition` wrappers'
+/// `update`/`delete` helpers — never a hand-written telemetry request
+/// (§7.4).
+async fn execute_telemetry_command(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    telemetry: &TelemetryCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    match telemetry {
+        TelemetryCommand::SetEnabled { enabled } => {
+            execute_set_telemetry_enabled(root, identity, trust, *enabled).await
+        }
+        TelemetryCommand::CreateMetricDefinition(payload) => {
+            execute_create_metric_definition(root, identity, trust, payload).await
+        }
+        TelemetryCommand::UpdateMetricDefinition(payload) => {
+            execute_update_metric_definition(root, identity, trust, payload).await
+        }
+        TelemetryCommand::DeleteMetricDefinition(payload) => {
+            execute_delete_metric_definition(root, identity, trust, payload).await
+        }
+        TelemetryCommand::CreateMetricReportDefinition(payload) => {
+            execute_create_metric_report_definition(root, identity, trust, payload).await
+        }
+        TelemetryCommand::UpdateMetricReportDefinition(payload) => {
+            execute_update_metric_report_definition(root, identity, trust, payload).await
+        }
+        TelemetryCommand::DeleteMetricReportDefinition(payload) => {
+            execute_delete_metric_report_definition(root, identity, trust, payload).await
+        }
+    }
+}
+
+/// Executes a telemetry service enablement through
+/// `TelemetryService::set_enabled`, the typed helper of the `nv-redfish`
+/// telemetry API (a `PATCH` of the `ServiceEnabled` property).
+async fn execute_set_telemetry_enabled(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    enabled: bool,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let response = match service.set_enabled(enabled).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric definition creation as a typed `POST` to the decoded
+/// `MetricDefinitions` collection.
+///
+/// The create body is the compiled `MetricDefinitionCreate` type with the
+/// two first-cut properties (`MetricType`, `Units`) projected from the
+/// domain payload; every other optional create property stays `None`, so
+/// the wire payload is exactly the product's first-cut metric definition
+/// shape. §13.3 step 2: a missing `MetricDefinitions` link rejects the
+/// create before any write is sent.
+async fn execute_create_metric_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateMetricDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    if service.raw().metric_definitions.is_none() {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    }
+    let create = MetricDefinitionCreateSchema::builder()
+        .with_metric_type(map_metric_type(payload.metric_type()))
+        .with_units(payload.units().as_str().to_owned())
+        .build();
+    let response = match service.create_metric_definition(&create).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric definition update as a typed `PATCH` of the `MetricType`
+/// and `Units` properties.
+///
+/// The target definition is resolved from the decoded `MetricDefinitions`
+/// collection by its Redfish `Id` — the same identity the verification
+/// re-read matches — and the update body is the compiled
+/// `MetricDefinitionUpdate` type carrying exactly the complete intent of the
+/// domain payload (§7.1).
+async fn execute_update_metric_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateMetricDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(definition) =
+        find_metric_definition(&service, identity, trust, payload.metric_definition_id()).await?
+    else {
+        // The named definition is not part of the endpoint's telemetry
+        // surface: the BMC provably cannot apply the write, so the refusal
+        // is provable (§13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let update = MetricDefinitionUpdateSchema::builder()
+        .with_metric_type(map_metric_type(payload.metric_type()))
+        .with_units(payload.units().as_str().to_owned())
+        .build();
+    let response = match definition.update(&update).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric definition deletion through `MetricDefinition::delete`,
+/// the typed helper of the `nv-redfish` telemetry API.
+async fn execute_delete_metric_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteMetricDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(definition) =
+        find_metric_definition(&service, identity, trust, payload.metric_definition_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let response = match definition.delete().await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric report definition creation as a typed `POST` to the
+/// decoded `MetricReportDefinitions` collection.
+///
+/// The create body is the compiled `MetricReportDefinitionCreate` type with
+/// the two first-cut properties (`MetricReportDefinitionType`, `Metrics`)
+/// projected from the domain payload; every other optional create property
+/// stays `None`. §13.3 step 2: a missing `MetricReportDefinitions` link
+/// rejects the create before any write is sent.
+async fn execute_create_metric_report_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateMetricReportDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    if service.raw().metric_report_definitions.is_none() {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    }
+    let create = MetricReportDefinitionCreateSchema::builder()
+        .with_metric_report_definition_type(map_metric_report_definition_type(
+            payload.metric_report_definition_type(),
+        ))
+        .with_metrics(metric_updates(payload.metrics()))
+        .build();
+    let response = match service.create_metric_report_definition(&create).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric report definition update as a typed `PATCH` of the
+/// `MetricReportDefinitionType` and `Metrics` properties.
+///
+/// The target definition is resolved from the decoded
+/// `MetricReportDefinitions` collection by its Redfish `Id`, and the update
+/// body is the compiled `MetricReportDefinitionUpdate` type carrying exactly
+/// the complete intent of the domain payload (§7.1).
+async fn execute_update_metric_report_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateMetricReportDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(definition) = find_metric_report_definition(
+        &service,
+        identity,
+        trust,
+        payload.metric_report_definition_id(),
+    )
+    .await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let update = MetricReportDefinitionUpdateSchema::builder()
+        .with_metric_report_definition_type(map_metric_report_definition_type(
+            payload.metric_report_definition_type(),
+        ))
+        .with_metrics(metric_updates(payload.metrics()))
+        .build();
+    let response = match definition.update(&update).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes a metric report definition deletion through
+/// `MetricReportDefinition::delete`, the typed helper of the `nv-redfish`
+/// telemetry API.
+async fn execute_delete_metric_report_definition(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteMetricReportDefinition,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = telemetry_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(definition) = find_metric_report_definition(
+        &service,
+        identity,
+        trust,
+        payload.metric_report_definition_id(),
+    )
+    .await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let response = match definition.delete().await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the typed `TelemetryService` wrapper through the root navigation
+/// property; a missing link is `None`.
+///
+/// The wrapper is the `ServiceRoot::telemetry_service` high-level surface,
+/// so the decoded `TelemetryService` document and the `nv-redfish` quirks
+/// are exactly what the library would apply to any other telemetry client.
+async fn telemetry_service_document(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<TelemetryServiceWrapper<UpstreamBmc>>, CommandExecutionError> {
+    if root.root.telemetry_service.is_none() {
+        return Ok(None);
+    }
+    match root.telemetry_service().await {
+        Ok(service) => Ok(service),
+        Err(source) => Err(classify_command_preparation_error(source, identity, trust)),
+    }
+}
+
+/// Resolves one `MetricDefinition` member by its Redfish `Id` through the
+/// typed `nv-redfish` telemetry API; a member with the id is `None` when it
+/// does not exist on the endpoint.
+async fn find_metric_definition(
+    service: &TelemetryServiceWrapper<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    metric_definition_id: &MetricDefinitionId,
+) -> Result<Option<MetricDefinitionWrapper<UpstreamBmc>>, CommandExecutionError> {
+    let definitions = match service.metric_definitions().await {
+        Ok(definitions) => definitions,
+        Err(source) => {
+            return Err(classify_command_preparation_error(source, identity, trust));
+        }
+    };
+    Ok(definitions
+        .into_iter()
+        .flatten()
+        .find(|definition| definition.raw().base.id == metric_definition_id.as_str()))
+}
+
+/// Resolves one `MetricReportDefinition` member by its Redfish `Id` through
+/// the typed `nv-redfish` telemetry API; a member with the id is `None` when
+/// it does not exist on the endpoint.
+async fn find_metric_report_definition(
+    service: &TelemetryServiceWrapper<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    metric_report_definition_id: &MetricReportDefinitionId,
+) -> Result<Option<MetricReportDefinitionWrapper<UpstreamBmc>>, CommandExecutionError> {
+    let definitions = match service.metric_report_definitions().await {
+        Ok(definitions) => definitions,
+        Err(source) => {
+            return Err(classify_command_preparation_error(source, identity, trust));
+        }
+    };
+    Ok(definitions
+        .into_iter()
+        .flatten()
+        .find(|definition| definition.raw().base.id == metric_report_definition_id.as_str()))
+}
+
+/// Maps the domain `MetricType` projection onto the compiled CSDL `MetricType`
+/// member set. The domain member set is pinned to the CSDL by const tests, so
+/// this match cannot drift silently.
+fn map_metric_type(value: MetricType) -> MetricTypeSchema {
+    match value {
+        MetricType::Numeric => MetricTypeSchema::Numeric,
+        MetricType::Discrete => MetricTypeSchema::Discrete,
+        MetricType::Gauge => MetricTypeSchema::Gauge,
+        MetricType::Counter => MetricTypeSchema::Counter,
+        MetricType::Countdown => MetricTypeSchema::Countdown,
+        MetricType::String => MetricTypeSchema::String,
+    }
+}
+
+/// Maps the domain `MetricReportDefinitionType` projection onto the compiled
+/// CSDL member set. The domain member set is pinned to the CSDL by const
+/// tests, so this match cannot drift silently.
+fn map_metric_report_definition_type(
+    value: MetricReportDefinitionType,
+) -> MetricReportDefinitionTypeSchema {
+    match value {
+        MetricReportDefinitionType::Periodic => MetricReportDefinitionTypeSchema::Periodic,
+        MetricReportDefinitionType::OnChange => MetricReportDefinitionTypeSchema::OnChange,
+        MetricReportDefinitionType::OnRequest => MetricReportDefinitionTypeSchema::OnRequest,
+    }
+}
+
+/// Projects the domain report entries onto the compiled `MetricUpdate`
+/// members of a report definition create or update body.
+fn metric_updates(metrics: &[MetricReportMetric]) -> Vec<MetricUpdateSchema> {
+    metrics
+        .iter()
+        .map(|entry| {
+            MetricUpdateSchema::builder()
+                .with_metric_id(entry.metric_id().as_str().to_owned())
+                .build()
+        })
+        .collect()
+}
+
 /// Fetches the typed `EventService` document through its root navigation
 /// property; a missing link is `None`.
 async fn event_service_document(
@@ -5977,6 +6404,9 @@ async fn verify_authenticated_command(
         }
         RedfishCommand::Control(ControlCommand::Update(payload)) => {
             verify_control_readable(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Telemetry(telemetry) => {
+            verify_telemetry_command(root, identity, trust, telemetry).await
         }
         // §14.3 update verification for the upload family: the complete
         // `SoftwareInventory` family must re-read without error. The
@@ -6738,6 +7168,325 @@ async fn re_read_accounts(
         .all_accounts_data()
         .await
         .map_err(|source| classify_service_root_error(source, identity, trust))?)
+}
+
+/// "Accepted" verification of one telemetry command: the telemetry surface is
+/// re-read through the same typed `nv-redfish` telemetry API the write used,
+/// and the expected result is derived from the command itself (§13.3 steps
+/// 9–10).
+///
+/// - `SetEnabled` — the re-read `TelemetryService` document must carry
+///   `ServiceEnabled` equal to the requested value; an absent or different
+///   value is `Mismatched`.
+/// - `CreateMetricDefinition` — a `MetricDefinitions` member whose
+///   `MetricType` and `Units` match the payload must exist; an absent match
+///   is `Mismatched`.
+/// - `UpdateMetricDefinition` — the member named by the payload id must
+///   exist and carry the requested `MetricType` and `Units`; the re-read
+///   proves the expected definition or the write failed.
+/// - `DeleteMetricDefinition` — the member named by the payload id must be
+///   absent from the re-read collection; a present member is `Mismatched`.
+/// - `CreateMetricReportDefinition` — a `MetricReportDefinitions` member
+///   whose `MetricReportDefinitionType` and metric id sequence match the
+///   payload must exist.
+/// - `UpdateMetricReportDefinition` — the member named by the payload id
+///   must exist and carry the requested `MetricReportDefinitionType` and
+///   metric id sequence.
+/// - `DeleteMetricReportDefinition` — the member named by the payload id
+///   must be absent from the re-read collection.
+async fn verify_telemetry_command(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    telemetry: &TelemetryCommand,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    match telemetry {
+        TelemetryCommand::SetEnabled { enabled } => {
+            verify_telemetry_service_enabled(root, identity, trust, *enabled).await
+        }
+        TelemetryCommand::CreateMetricDefinition(payload) => {
+            verify_metric_definition_created(root, identity, trust, payload).await
+        }
+        TelemetryCommand::UpdateMetricDefinition(payload) => {
+            verify_metric_definition_updated(root, identity, trust, payload).await
+        }
+        TelemetryCommand::DeleteMetricDefinition(payload) => {
+            verify_metric_definition_deleted(root, identity, trust, payload).await
+        }
+        TelemetryCommand::CreateMetricReportDefinition(payload) => {
+            verify_metric_report_definition_created(root, identity, trust, payload).await
+        }
+        TelemetryCommand::UpdateMetricReportDefinition(payload) => {
+            verify_metric_report_definition_updated(root, identity, trust, payload).await
+        }
+        TelemetryCommand::DeleteMetricReportDefinition(payload) => {
+            verify_metric_report_definition_deleted(root, identity, trust, payload).await
+        }
+    }
+}
+
+/// Verifies a telemetry service enablement: the re-read `TelemetryService`
+/// document must carry `ServiceEnabled` equal to the requested value.
+///
+/// An absent or different value is `Mismatched`: the expected result is
+/// provably not there, exactly like the subscription create check.
+async fn verify_telemetry_service_enabled(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    enabled: bool,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let service = re_read_telemetry_service(root, identity, trust).await?;
+    if service.raw().service_enabled == Some(Some(enabled)) {
+        return Ok(CommandVerificationOutcome::Confirmed);
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a metric definition creation: the re-read `MetricDefinitions`
+/// collection must contain a member whose `MetricType` and `Units` match the
+/// command payload.
+///
+/// The typed properties are matched exactly like the subscription create
+/// matches its `Destination`: a member that cannot be fetched makes the
+/// check inconclusive and is an error (never a `Mismatched`), because
+/// skipping it could hide the proof of the write (§13.5).
+async fn verify_metric_definition_created(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateMetricDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_definitions(root, identity, trust).await?;
+    for definition in &definitions {
+        if definition
+            .raw()
+            .metric_type
+            .as_ref()
+            .and_then(Option::as_ref)
+            == Some(&map_metric_type(payload.metric_type()))
+            && definition.raw().units.as_ref().and_then(Option::as_deref)
+                == Some(payload.units().as_str())
+        {
+            return Ok(CommandVerificationOutcome::Confirmed);
+        }
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a metric definition update: the member named by the payload id
+/// must exist and carry the requested `MetricType` and `Units`.
+///
+/// The re-read proves the expected definition or the write failed, exactly
+/// like the account role update check.
+async fn verify_metric_definition_updated(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateMetricDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_definitions(root, identity, trust).await?;
+    for definition in &definitions {
+        if definition.raw().base.id == payload.metric_definition_id().as_str() {
+            return Ok(
+                if definition
+                    .raw()
+                    .metric_type
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    == Some(&map_metric_type(payload.metric_type()))
+                    && definition.raw().units.as_ref().and_then(Option::as_deref)
+                        == Some(payload.units().as_str())
+                {
+                    CommandVerificationOutcome::Confirmed
+                } else {
+                    CommandVerificationOutcome::Mismatched
+                },
+            );
+        }
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a metric definition deletion: the member named by the payload id
+/// must be absent from the re-read `MetricDefinitions` collection.
+///
+/// Members are matched by their Redfish `Id` — the same identity the
+/// deletion payload names. A present member is `Mismatched`.
+async fn verify_metric_definition_deleted(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteMetricDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_definitions(root, identity, trust).await?;
+    for definition in &definitions {
+        if definition.raw().base.id == payload.metric_definition_id().as_str() {
+            return Ok(CommandVerificationOutcome::Mismatched);
+        }
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Verifies a metric report definition creation: the re-read
+/// `MetricReportDefinitions` collection must contain a member whose
+/// `MetricReportDefinitionType` and metric id sequence match the command
+/// payload.
+///
+/// The metric ids are matched in member order — the sequence the create
+/// posted — and a member that cannot be fetched makes the check
+/// inconclusive and is an error, for the same reason as in
+/// [`verify_metric_definition_created`].
+async fn verify_metric_report_definition_created(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateMetricReportDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_report_definitions(root, identity, trust).await?;
+    let expected = payload_metric_ids(payload.metrics());
+    for definition in &definitions {
+        if definition
+            .raw()
+            .metric_report_definition_type
+            .as_ref()
+            .and_then(Option::as_ref)
+            == Some(&map_metric_report_definition_type(
+                payload.metric_report_definition_type(),
+            ))
+            && metric_ids_of(definition.raw().metrics.as_ref()) == expected
+        {
+            return Ok(CommandVerificationOutcome::Confirmed);
+        }
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a metric report definition update: the member named by the
+/// payload id must exist and carry the requested
+/// `MetricReportDefinitionType` and metric id sequence.
+///
+/// The re-read proves the expected definition or the write failed, exactly
+/// like the account role update check.
+async fn verify_metric_report_definition_updated(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateMetricReportDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_report_definitions(root, identity, trust).await?;
+    let expected = payload_metric_ids(payload.metrics());
+    for definition in &definitions {
+        if definition.raw().base.id == payload.metric_report_definition_id().as_str() {
+            return Ok(
+                if definition
+                    .raw()
+                    .metric_report_definition_type
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    == Some(&map_metric_report_definition_type(
+                        payload.metric_report_definition_type(),
+                    ))
+                    && metric_ids_of(definition.raw().metrics.as_ref()) == expected
+                {
+                    CommandVerificationOutcome::Confirmed
+                } else {
+                    CommandVerificationOutcome::Mismatched
+                },
+            );
+        }
+    }
+    Ok(CommandVerificationOutcome::Mismatched)
+}
+
+/// Verifies a metric report definition deletion: the member named by the
+/// payload id must be absent from the re-read `MetricReportDefinitions`
+/// collection.
+///
+/// Members are matched by their Redfish `Id` — the same identity the
+/// deletion payload names. A present member is `Mismatched`.
+async fn verify_metric_report_definition_deleted(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteMetricReportDefinition,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let definitions = re_read_metric_report_definitions(root, identity, trust).await?;
+    for definition in &definitions {
+        if definition.raw().base.id == payload.metric_report_definition_id().as_str() {
+            return Ok(CommandVerificationOutcome::Mismatched);
+        }
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `TelemetryService` document through the typed `nv-redfish`
+/// telemetry API (§11.1: no guessed path).
+async fn re_read_telemetry_service(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<TelemetryServiceWrapper<UpstreamBmc>, CommandVerificationError> {
+    if root.root.telemetry_service.is_none() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    root.telemetry_service()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+        .ok_or(CommandVerificationError::CapabilityUnavailable)
+}
+
+/// Re-reads the `MetricDefinitions` collection through the typed
+/// `nv-redfish` telemetry API, fetching every member strictly (§11.1: no
+/// guessed path).
+async fn re_read_metric_definitions(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<MetricDefinitionWrapper<UpstreamBmc>>, CommandVerificationError> {
+    let service = re_read_telemetry_service(root, identity, trust).await?;
+    service
+        .metric_definitions()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+        .ok_or(CommandVerificationError::CapabilityUnavailable)
+}
+
+/// Re-reads the `MetricReportDefinitions` collection through the typed
+/// `nv-redfish` telemetry API, fetching every member strictly (§11.1: no
+/// guessed path).
+async fn re_read_metric_report_definitions(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<MetricReportDefinitionWrapper<UpstreamBmc>>, CommandVerificationError> {
+    let service = re_read_telemetry_service(root, identity, trust).await?;
+    service
+        .metric_report_definitions()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+        .ok_or(CommandVerificationError::CapabilityUnavailable)
+}
+
+/// The metric ids of one domain report payload entry set, in payload order.
+fn payload_metric_ids(metrics: &[MetricReportMetric]) -> Vec<&str> {
+    metrics
+        .iter()
+        .map(|entry| entry.metric_id().as_str())
+        .collect()
+}
+
+/// The metric ids of one re-read `Metrics` array, in member order; entries
+/// without a metric id are skipped.
+fn metric_ids_of(metrics: Option<&Vec<MetricSchema>>) -> Vec<&str> {
+    metrics
+        .map(|metrics| {
+            metrics
+                .iter()
+                .filter_map(|metric| metric.metric_id.as_ref().and_then(Option::as_deref))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Completes one verification re-read with the transient Session lifecycle.
@@ -11703,8 +12452,8 @@ mod tests {
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
     use rutilus_domain::{
-        AccountPassword, AccountUserName, EraseToken, ProfileFile, ProfileId, RoleId, StartUpdate,
-        TlsCertificate, TlsTrust, TokenData, UpdateCommand,
+        AccountPassword, AccountUserName, EraseToken, MetricUnits, ProfileFile, ProfileId, RoleId,
+        StartUpdate, TlsCertificate, TlsTrust, TokenData, UpdateCommand,
     };
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::{
@@ -12530,6 +13279,27 @@ mod tests {
         "Tasks":{"@odata.id":"/redfish/v1/TaskService"},
         "EventService":{"@odata.id":"/redfish/v1/EventService"},
         "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+        "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+        "PowerEquipment":{"@odata.id":"/redfish/v1/PowerEquipment"}
+    }"#;
+
+    /// The full Service Root without the `TelemetryService` link, as served
+    /// by an endpoint that exposes no telemetry surface.
+    const FULL_SERVICE_ROOT_WITHOUT_TELEMETRY_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
+        "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService"},
+        "EventService":{"@odata.id":"/redfish/v1/EventService"},
         "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
         "PowerEquipment":{"@odata.id":"/redfish/v1/PowerEquipment"}
     }"#;
@@ -21654,6 +22424,154 @@ mod tests {
         "Members":[]
     }"##;
 
+    /// The `TelemetryService` document for write tests: advertises the
+    /// `MetricDefinitions` and `MetricReportDefinitions` collections.
+    const COMMAND_TELEMETRY_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/TelemetryService",
+        "Id":"TelemetryService",
+        "Name":"Telemetry Service",
+        "ServiceEnabled":true,
+        "MetricDefinitions":{"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions"},
+        "MetricReportDefinitions":{"@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions"}
+    }"#;
+
+    /// A `TelemetryService` document that advertises no collections.
+    const COMMAND_TELEMETRY_SERVICE_WITHOUT_COLLECTIONS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/TelemetryService",
+        "Id":"TelemetryService",
+        "Name":"Telemetry Service",
+        "ServiceEnabled":true
+    }"#;
+
+    /// The `MetricDefinitions` collection for write tests: one `PowerMetric`
+    /// member in reference form.
+    const COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+        "Name":"Metric Definition Collection",
+        "Members":[{"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric"}]
+    }"##;
+
+    /// The `MetricDefinitions` collection after a creation: `PowerMetric`
+    /// plus the new `TempMetric` member.
+    const COMMAND_METRIC_DEFINITIONS_COLLECTION_WITH_TEMP_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+        "Name":"Metric Definition Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric"},
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/TempMetric"}
+        ]
+    }"##;
+
+    /// The `PowerMetric` member for write tests; `MetricType` and `Units`
+    /// must stay present to decode.
+    const COMMAND_METRIC_DEFINITION_POWER_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinition.v1_0_0.MetricDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "@odata.etag":"W/\"definition-1\"",
+        "Id":"PowerMetric",
+        "Name":"Power Metric",
+        "MetricType":"Counter",
+        "MetricDataType":"Integer",
+        "Units":"W"
+    }"##;
+
+    /// The `PowerMetric` member after its type was updated to `Gauge`.
+    const COMMAND_METRIC_DEFINITION_POWER_GAUGE_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinition.v1_0_0.MetricDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "@odata.etag":"W/\"definition-2\"",
+        "Id":"PowerMetric",
+        "Name":"Power Metric",
+        "MetricType":"Gauge",
+        "MetricDataType":"Integer",
+        "Units":"W"
+    }"##;
+
+    /// The `201` create response of one new metric definition member.
+    const COMMAND_METRIC_DEFINITION_CREATED_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinition.v1_0_0.MetricDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions/TempMetric",
+        "Id":"TempMetric",
+        "Name":"Temperature Metric",
+        "MetricType":"Gauge",
+        "MetricDataType":"Decimal",
+        "Units":"Cel"
+    }"##;
+
+    /// The `MetricReportDefinitions` collection for write tests: one
+    /// `PowerReport` member in reference form.
+    const COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinitionCollection.MetricReportDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "Name":"Metric Report Definition Collection",
+        "Members":[{"@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport"}]
+    }"##;
+
+    /// The `MetricReportDefinitions` collection after a creation:
+    /// `PowerReport` plus the new `TempReport` member.
+    const COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_WITH_TEMP_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinitionCollection.MetricReportDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "Name":"Metric Report Definition Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport"},
+            {"@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/TempReport"}
+        ]
+    }"##;
+
+    /// The `PowerReport` member for write tests; `MetricReportDefinitionType`
+    /// and `Metrics` must stay present to decode.
+    const COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinition.v1_4_0.MetricReportDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "@odata.etag":"W/\"report-1\"",
+        "Id":"PowerReport",
+        "Name":"Power Report Definition",
+        "MetricReportDefinitionType":"OnRequest",
+        "Metrics":[{"MetricId":"PowerMetric"}]
+    }"##;
+
+    /// The `PowerReport` member after its cadence was changed to `OnChange`.
+    const COMMAND_METRIC_REPORT_DEFINITION_POWER_ON_CHANGE_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinition.v1_4_0.MetricReportDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "@odata.etag":"W/\"report-2\"",
+        "Id":"PowerReport",
+        "Name":"Power Report Definition",
+        "MetricReportDefinitionType":"OnChange",
+        "Metrics":[{"MetricId":"PowerMetric"}]
+    }"##;
+
+    /// The `201` create response of one new metric report definition member.
+    const COMMAND_METRIC_REPORT_DEFINITION_CREATED_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinition.v1_4_0.MetricReportDefinition",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions/TempReport",
+        "Id":"TempReport",
+        "Name":"Temperature Report Definition",
+        "MetricReportDefinitionType":"OnRequest",
+        "Metrics":[{"MetricId":"TempMetric"}]
+    }"##;
+
+    /// An empty `MetricDefinitions` collection, as served after every
+    /// definition was deleted.
+    const EMPTY_METRIC_DEFINITIONS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#MetricDefinitionCollection.MetricDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricDefinitions",
+        "Name":"Metric Definition Collection",
+        "Members":[]
+    }"##;
+
+    /// An empty `MetricReportDefinitions` collection, as served after every
+    /// report definition was deleted.
+    const EMPTY_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#MetricReportDefinitionCollection.MetricReportDefinitionCollection",
+        "@odata.id":"/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "Name":"Metric Report Definition Collection",
+        "Members":[]
+    }"##;
+
     /// The request order of one System/Manager/Chassis reset: the Session
     /// lifecycle around the collection, member, and action requests.
     const RESET_COMMAND_REQUEST_PATHS: [&str; 8] = [
@@ -21959,6 +22877,169 @@ mod tests {
         "/redfish/v1/AccountService/Accounts",
         "/redfish/v1/AccountService/Accounts/admin",
         "/redfish/v1/AccountService/Accounts/jane",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one telemetry `SetEnabled` write: the Session
+    /// lifecycle around the `TelemetryService` document and the typed `PATCH`
+    /// of the document itself.
+    const TELEMETRY_SET_ENABLED_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric definition creation: the Session
+    /// lifecycle around the `TelemetryService` document and the typed `POST`
+    /// onto the `MetricDefinitions` collection. The `201` response body is
+    /// the created member itself, which the typed create helper decodes
+    /// in place (a `NavProperty::Expanded` needs no re-fetch).
+    const METRIC_DEFINITION_CREATE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric definition update or deletion: the
+    /// Session lifecycle around the `TelemetryService` document, the
+    /// `MetricDefinitions` collection, the member fetch, and the typed write
+    /// request against the member.
+    const METRIC_DEFINITION_MEMBER_WRITE_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric report definition creation: identical
+    /// to [`METRIC_DEFINITION_CREATE_REQUEST_PATHS`] over the
+    /// `MetricReportDefinitions` collection.
+    const METRIC_REPORT_DEFINITION_CREATE_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric report definition update or deletion:
+    /// identical to [`METRIC_DEFINITION_MEMBER_WRITE_REQUEST_PATHS`] over
+    /// the `MetricReportDefinitions` collection.
+    const METRIC_REPORT_DEFINITION_MEMBER_WRITE_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one telemetry `SetEnabled` verification re-read:
+    /// the Session lifecycle around the `TelemetryService` document.
+    const TELEMETRY_SERVICE_VERIFY_REQUEST_PATHS: [&str; 6] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric definition verification re-read over
+    /// a one-member collection.
+    const METRIC_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric definition verification re-read over
+    /// a two-member collection (the existing `PowerMetric` plus the created
+    /// `TempMetric`).
+    const METRIC_DEFINITION_VERIFY_TWO_MEMBER_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/TelemetryService/MetricDefinitions/PowerMetric",
+        "/redfish/v1/TelemetryService/MetricDefinitions/TempMetric",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric definition verification re-read over
+    /// an empty collection (no member fetch).
+    const METRIC_DEFINITION_VERIFY_EMPTY_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricDefinitions",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric report definition verification
+    /// re-read over a one-member collection.
+    const METRIC_REPORT_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric report definition verification
+    /// re-read over a two-member collection (the existing `PowerReport` plus
+    /// the created `TempReport`).
+    const METRIC_REPORT_DEFINITION_VERIFY_TWO_MEMBER_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions/PowerReport",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions/TempReport",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one metric report definition verification
+    /// re-read over an empty collection (no member fetch).
+    const METRIC_REPORT_DEFINITION_VERIFY_EMPTY_REQUEST_PATHS: [&str; 7] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TelemetryService",
+        "/redfish/v1/TelemetryService/MetricReportDefinitions",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -22942,6 +24023,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executes_telemetry_set_enabled_through_the_typed_helper() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_TELEMETRY_SERVICE_BODY)],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: false }),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &TELEMETRY_SET_ENABLED_REQUEST_PATHS,
+            "PATCH",
+            r#"{"ServiceEnabled":false}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_definition_creation_through_the_typed_create_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_TELEMETRY_SERVICE_BODY)],
+            http_response("201 Created", COMMAND_METRIC_DEFINITION_CREATED_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                    CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("Cel")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_CREATE_REQUEST_PATHS,
+            "POST",
+            r#"{"MetricType":"Gauge","Units":"Cel"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_definition_update_through_the_typed_update_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("PowerMetric")?,
+                        MetricType::Gauge,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_MEMBER_WRITE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"MetricType":"Gauge","Units":"W"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_definition_deletion_through_the_typed_delete_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_MEMBER_WRITE_REQUEST_PATHS,
+            "DELETE",
+            "",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_report_definition_creation_through_the_typed_create_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_TELEMETRY_SERVICE_BODY)],
+            http_response("201 Created", COMMAND_METRIC_REPORT_DEFINITION_CREATED_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                    CreateMetricReportDefinition::try_new(
+                        MetricReportDefinitionType::OnRequest,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "TempMetric",
+                        )?)],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_CREATE_REQUEST_PATHS,
+            "POST",
+            r#"{"MetricReportDefinitionType":"OnRequest","Metrics":[{"MetricId":"TempMetric"}]}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_report_definition_update_through_the_typed_update_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                    UpdateMetricReportDefinition::new(
+                        MetricReportDefinitionId::parse("PowerReport")?,
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_MEMBER_WRITE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"MetricReportDefinitionType":"OnChange","Metrics":[{"MetricId":"PowerMetric"}]}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_metric_report_definition_deletion_through_the_typed_delete_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse(
+                        "PowerReport",
+                    )?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_MEMBER_WRITE_REQUEST_PATHS,
+            "DELETE",
+            "",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_account_commands_when_the_account_service_is_absent()
     -> Result<(), Box<dyn Error>> {
         for command in [
@@ -23511,6 +24861,232 @@ mod tests {
                 CommandRejection::RefusedByBmc
             ))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_telemetry_commands_when_the_telemetry_service_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                UpdateMetricDefinition::new(
+                    MetricDefinitionId::parse("PowerMetric")?,
+                    MetricType::Gauge,
+                    MetricUnits::parse("W")?,
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                CreateMetricReportDefinition::try_new(
+                    MetricReportDefinitionType::OnRequest,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                )?,
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                UpdateMetricReportDefinition::new(
+                    MetricReportDefinitionId::parse("PowerReport")?,
+                    MetricReportDefinitionType::OnChange,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                ),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("PowerReport")?),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+                FULL_SERVICE_ROOT_WITHOUT_TELEMETRY_SERVICE_BODY,
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable
+                ))
+            ));
+            // The capability check stops the sequence before the telemetry
+            // service fetch: only the Session lifecycle requests were made.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.starts_with(b"GET /redfish/v1/TelemetryService"))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_telemetry_creates_when_the_collections_are_absent()
+    -> Result<(), Box<dyn Error>> {
+        // §13.3 step 2: a `TelemetryService` without the collection links
+        // rejects both creates before any write is sent.
+        for command in [
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                CreateMetricReportDefinition::try_new(
+                    MetricReportDefinitionType::OnRequest,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                )?,
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[("200 OK", COMMAND_TELEMETRY_SERVICE_WITHOUT_COLLECTIONS_BODY)],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable
+                ))
+            ));
+            // The rejection stops the sequence after the telemetry service
+            // fetch: only the Session lifecycle plus the document were read.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 6);
+            assert!(requests.iter().all(|request| {
+                !request.starts_with(b"POST /redfish/v1/TelemetryService/MetricDefinitions")
+                    && !request
+                        .starts_with(b"POST /redfish/v1/TelemetryService/MetricReportDefinitions")
+            }));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_telemetry_member_writes_when_the_member_does_not_exist()
+    -> Result<(), Box<dyn Error>> {
+        // The named definition is absent from the decoded collection, so the
+        // writes are refused after the member reads, before any write
+        // request: the sequence is the Session lifecycle plus the telemetry
+        // service, collection, and member reads. Each command kind reads its
+        // own collection, so the two loops serve their own sequences.
+        for (command, collection, member) in [
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("ghost")?,
+                        MetricType::Gauge,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+                COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY,
+                COMMAND_METRIC_DEFINITION_POWER_BODY,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("ghost")?),
+                )),
+                COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY,
+                COMMAND_METRIC_DEFINITION_POWER_BODY,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                    UpdateMetricReportDefinition::new(
+                        MetricReportDefinitionId::parse("ghost")?,
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    ),
+                )),
+                COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY,
+                COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY,
+            ),
+            (
+                RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("ghost")?),
+                )),
+                COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY,
+                COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY,
+            ),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                    ("200 OK", collection),
+                    ("200 OK", member),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    Err(CommandExecutionError::Rejected(
+                        CommandRejection::RefusedByBmc
+                    ))
+                ),
+                "the absent member must refuse the write, was: {outcome:?}"
+            );
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 8);
+            assert!(requests.iter().all(|request| {
+                !request.starts_with(b"PATCH /redfish/v1/TelemetryService/MetricDefinitions/ghost")
+                    && !request
+                        .starts_with(b"DELETE /redfish/v1/TelemetryService/MetricDefinitions/ghost")
+                    && !request.starts_with(
+                        b"PATCH /redfish/v1/TelemetryService/MetricReportDefinitions/ghost",
+                    )
+                    && !request.starts_with(
+                        b"DELETE /redfish/v1/TelemetryService/MetricReportDefinitions/ghost",
+                    )
+            }));
+        }
         Ok(())
     }
 
@@ -25211,6 +26787,553 @@ mod tests {
         assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
         let requests = server.finish_all().await?;
         assert_eq!(requests.len(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_telemetry_set_enabled_by_re_reading_the_service() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                // The re-read document carries the enabled state the write
+                // requested.
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_WITHOUT_COLLECTIONS_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &TELEMETRY_SERVICE_VERIFY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_telemetry_set_enabled_as_mismatched_when_the_value_differs()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read document still carries `ServiceEnabled: true` while
+        // the write requested `false`: the expected result is provably
+        // absent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_TELEMETRY_SERVICE_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: false }),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &TELEMETRY_SERVICE_VERIFY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_creation_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                (
+                    "200 OK",
+                    COMMAND_METRIC_DEFINITIONS_COLLECTION_WITH_TEMP_BODY,
+                ),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_CREATED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                    CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("Cel")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_TWO_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_update_by_re_reading_the_member()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_GAUGE_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("PowerMetric")?,
+                        MetricType::Gauge,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_deletion_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        // The deleted member is absent from the re-read collection (only the
+        // Session lifecycle and the telemetry service and collection reads
+        // happen: no member fetch is needed to prove the absence).
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", EMPTY_METRIC_DEFINITIONS_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_EMPTY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_creation_as_mismatched_when_the_match_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read collection holds only `PowerMetric` (Counter/W), so no
+        // member matches the created Gauge/Cel definition.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                    CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("Cel")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_update_as_mismatched_when_the_type_is_not_applied()
+    -> Result<(), Box<dyn Error>> {
+        // The member still carries `MetricType: Counter` while the update
+        // requested `Gauge`.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition(
+                    UpdateMetricDefinition::new(
+                        MetricDefinitionId::parse("PowerMetric")?,
+                        MetricType::Gauge,
+                        MetricUnits::parse("W")?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_deletion_as_mismatched_when_the_member_is_still_present()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_DEFINITION_POWER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                    DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_report_definition_creation_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                (
+                    "200 OK",
+                    COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_WITH_TEMP_BODY,
+                ),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_CREATED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                    CreateMetricReportDefinition::try_new(
+                        MetricReportDefinitionType::OnRequest,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "TempMetric",
+                        )?)],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_VERIFY_TWO_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_report_definition_update_by_re_reading_the_member()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+                (
+                    "200 OK",
+                    COMMAND_METRIC_REPORT_DEFINITION_POWER_ON_CHANGE_BODY,
+                ),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition(
+                    UpdateMetricReportDefinition::new(
+                        MetricReportDefinitionId::parse("PowerReport")?,
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "PowerMetric",
+                        )?)],
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_report_definition_deletion_by_re_reading_the_collection()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", EMPTY_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse(
+                        "PowerReport",
+                    )?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_VERIFY_EMPTY_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_report_definition_creation_as_mismatched_when_the_match_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read collection holds only `PowerReport` (OnRequest with
+        // PowerMetric), so no member matches the OnChange/TempMetric report
+        // definition.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                    CreateMetricReportDefinition::try_new(
+                        MetricReportDefinitionType::OnChange,
+                        vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                            "TempMetric",
+                        )?)],
+                    )?,
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_report_definition_deletion_as_mismatched_when_the_member_is_still_present()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_TELEMETRY_SERVICE_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITIONS_COLLECTION_BODY),
+                ("200 OK", COMMAND_METRIC_REPORT_DEFINITION_POWER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                    DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse(
+                        "PowerReport",
+                    )?),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &METRIC_REPORT_DEFINITION_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_metric_definition_commands_as_an_error_when_the_service_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition(
+                CreateMetricDefinition::new(MetricType::Gauge, MetricUnits::parse("W")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition(
+                DeleteMetricDefinition::new(MetricDefinitionId::parse("PowerMetric")?),
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition(
+                CreateMetricReportDefinition::try_new(
+                    MetricReportDefinitionType::OnRequest,
+                    vec![MetricReportMetric::new(MetricDefinitionId::parse(
+                        "PowerMetric",
+                    )?)],
+                )?,
+            )),
+            RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition(
+                DeleteMetricReportDefinition::new(MetricReportDefinitionId::parse("PowerReport")?),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+                FULL_SERVICE_ROOT_WITHOUT_TELEMETRY_SERVICE_BODY,
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                verdict,
+                Err(CommandVerificationError::CapabilityUnavailable)
+            ));
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 5);
+        }
         Ok(())
     }
 
