@@ -10426,6 +10426,19 @@ mod tests {
     /// the mock abandons its script.
     const TEST_SERVER_PEER_TIMEOUT: Duration = Duration::from_mins(1);
 
+    /// The subject alternative names of the scripted servers' leaf
+    /// certificate: the DNS name the certificates have always carried, plus
+    /// the numeric IPv4 loopback the tests connect through.
+    ///
+    /// The endpoint address must be the numeric loopback, never `localhost`:
+    /// Windows can resolve `localhost` to `::1`, which the IPv4-only listener
+    /// refuses, and the refused connection never reaches the accept loop — it
+    /// does not consume a scripted slot, so every later request receives the
+    /// previous scripted document and the session cleanup fails on the wrong
+    /// body. The certificate covers the numeric loopback so the system-CA
+    /// trust path validates it like the hostname it replaces.
+    const TEST_SERVER_CERTIFICATE_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
+
     const SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -19472,7 +19485,14 @@ mod tests {
     #[tokio::test]
     async fn explicit_pin_can_authenticate_a_known_hostname_mismatch() -> Result<(), Box<dyn Error>>
     {
-        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        // The served certificate does not cover the numeric loopback the
+        // test connects through, so the hostname really mismatches; the
+        // pinned identity ignores hostnames and authenticates anyway.
+        let server = TestRedfishServer::start_raw_sequence_for_hosts(
+            vec![http_response("200 OK", SERVICE_ROOT_BODY)],
+            vec![String::from("localhost")],
+        )
+        .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = pinned_trust(&server.certificate)?;
         let address = endpoint_address(server.socket, "127.0.0.1")?;
@@ -19535,7 +19555,14 @@ mod tests {
     #[tokio::test]
     async fn system_ca_retains_hostname_validation_and_sends_no_credentials()
     -> Result<(), Box<dyn Error>> {
-        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        // The shared scripted server's certificate covers the numeric
+        // loopback; this test must see the hostname check fail, so it serves
+        // a certificate that does not cover the address it connects to.
+        let server = TestRedfishServer::start_raw_sequence_for_hosts(
+            vec![http_response("200 OK", SERVICE_ROOT_BODY)],
+            vec![String::from("localhost")],
+        )
+        .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
         let address = endpoint_address(server.socket, "127.0.0.1")?;
@@ -23826,8 +23853,24 @@ mod tests {
         }
 
         async fn start_raw_sequence(responses: Vec<Vec<u8>>) -> Result<Self, Box<dyn Error>> {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed([String::from("localhost")])?;
+            Self::start_raw_sequence_for_hosts(
+                responses,
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect::<Vec<String>>(),
+            )
+            .await
+        }
+
+        /// Starts the scripted server with an explicit certificate subject
+        /// alternative name list, for tests that must provoke a hostname
+        /// mismatch against the served identity.
+        async fn start_raw_sequence_for_hosts(
+            responses: Vec<Vec<u8>>,
+            sans: Vec<String>,
+        ) -> Result<Self, Box<dyn Error>> {
+            let CertifiedKey { cert, signing_key } = generate_simple_self_signed(sans)?;
             let certificate = cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -23846,7 +23889,7 @@ mod tests {
                 stop_receiver,
             ));
             Ok(Self {
-                address: endpoint_address(socket, "localhost")?,
+                address: endpoint_address(socket, "127.0.0.1")?,
                 socket,
                 certificate,
                 task,
@@ -23928,12 +23971,9 @@ mod tests {
                         })??
                     }
                 };
-                let Ok(mut stream) =
-                    timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(accepted.0))
-                        .await
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake")
-                        })?
+                let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(accepted.0))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
                 else {
                     // The connection never carried a request; close it and
                     // accept again for the same scripted slot.
@@ -23992,8 +24032,12 @@ mod tests {
             frames: Vec<Vec<u8>>,
             end: SseEnd,
         ) -> Result<Self, Box<dyn Error>> {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed([String::from("localhost")])?;
+            let CertifiedKey { cert, signing_key } = generate_simple_self_signed(
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect::<Vec<String>>(),
+            )?;
             let certificate = cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -24015,7 +24059,7 @@ mod tests {
                 stop_receiver,
             ));
             Ok(Self {
-                address: endpoint_address(socket, "localhost")?,
+                address: endpoint_address(socket, "127.0.0.1")?,
                 certificate,
                 task,
                 stop,

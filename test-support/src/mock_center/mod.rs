@@ -426,7 +426,7 @@ mod tests {
         let stream = TcpStream::connect(address).await?;
         let server_name = ServerName::try_from("localhost")?;
         let tls = connector.connect(server_name, stream).await?;
-        let request = format!("wss://localhost:{}{}", address.port(), CENTER_WS_PATH)
+        let request = format!("wss://127.0.0.1:{}{}", address.port(), CENTER_WS_PATH)
             .into_client_request()?;
         let (ws, _response) =
             tokio_tungstenite::client_async_with_config(request, tls, None).await?;
@@ -554,7 +554,7 @@ mod tests {
         let stream = TcpStream::connect(address).await?;
         let server_name = ServerName::try_from("localhost")?;
         let tls = connector.connect(server_name, stream).await?;
-        let request = format!("wss://localhost:{}{}", address.port(), CENTER_WS_PATH)
+        let request = format!("wss://127.0.0.1:{}{}", address.port(), CENTER_WS_PATH)
             .into_client_request()?;
         let (mut ws, _) = tokio_tungstenite::client_async_with_config(request, tls, None).await?;
         ws.send(Message::Binary(encode_frame(&Envelope {
