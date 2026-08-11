@@ -3,9 +3,11 @@ use std::{error::Error, fmt, str::FromStr};
 /// A Redfish capability tracked by the capability ledger.
 ///
 /// Each variant maps to one public `nv-redfish` feature. The standard variants
-/// are the complete §2.1 standard-feature inventory (30 entries), declared in
-/// the same order as the design document; the OEM variants are the complete
-/// §2.1 OEM-feature inventory (14 entries) in the compiled-feature order of
+/// are the complete §2.1 standard-feature inventory (30 entries) in
+/// design-document order followed by the three capabilities nv-redfish 0.13.0
+/// adds to the compiled standard surface (`ports`, `bmc-http`,
+/// `update-service-deprecated`, §2.3); the OEM variants are the complete §2.1
+/// OEM-feature inventory (14 entries) in the compiled-feature order of
 /// `COMPILED_OEM_FEATURES`, so the ledger can enumerate every capability the
 /// product may compile. Persisted identity is the `as_str()` product code,
 /// which is stable across milestones: the 0.1 codes ("session-service",
@@ -47,6 +49,25 @@ pub enum EndpointCapability {
     TelemetryService,
     Thermal,
     UpdateService,
+    /// The `ports` standard feature, the 30th member of the `std-redfish`
+    /// capability group that nv-redfish 0.13.0 adds (the 0.12.1 baseline
+    /// compiled only 29). The §3.1 `PCIe 与网络` mapping presents it under the
+    /// Network page: `nv-redfish` navigates the typed `Port` surface from the
+    /// decoded `NetworkAdapter` member, so the §11.3 advertised layer observes
+    /// the adapter's `Ports` link.
+    Ports,
+    /// The `bmc-http` transport feature (§3.1 服务与连接). It is the HTTP
+    /// `Bmc` implementation every gateway connection runs on, so it is
+    /// `Infrastructure`: a transport capability that backs product operations
+    /// instead of presenting data, presented outside the endpoint data pages
+    /// like `SessionService`.
+    BmcHttp,
+    /// The deprecated `HttpPushUri` raw-binary upload surface
+    /// (`update-service-deprecated`). nv-redfish 0.13 keeps it as a
+    /// legacy-compatibility feature (§0.4.0 上游保留的 Legacy Update 兼容), and
+    /// infra-redfish compiles it for the §14.3 update path, so the ledger
+    /// records it as `LegacyCompatibility` under the Update page.
+    UpdateServiceDeprecated,
     /// The §2.1 AMI OEM feature (`oem-ami`). Its advertisement is the `Ami`
     /// namespace key in the `Oem` segment of a decoded resource; the
     /// per-resource extension surfaces (Service Root, `ConfigBMC`) are read
@@ -151,6 +172,9 @@ impl EndpointCapability {
             Self::TelemetryService => "telemetry-service",
             Self::Thermal => "thermal",
             Self::UpdateService => "update-service",
+            Self::Ports => "ports",
+            Self::BmcHttp => "bmc-http",
+            Self::UpdateServiceDeprecated => "update-service-deprecated",
             Self::OemAmi => "oem-ami",
             Self::OemDell => "oem-dell",
             Self::OemDellAttributes => "oem-dell-attributes",
@@ -202,6 +226,9 @@ impl EndpointCapability {
             Self::TelemetryService => "telemetry-service",
             Self::Thermal => "thermal",
             Self::UpdateService => "update-service",
+            Self::Ports => "ports",
+            Self::BmcHttp => "bmc-http",
+            Self::UpdateServiceDeprecated => "update-service-deprecated",
             // OEM product codes are the upstream feature names: the compiled
             // feature set is the contract the 0.8.0 baseline freezes (§2.3),
             // so there is no legacy code to preserve and both inventories must
@@ -235,12 +262,18 @@ impl EndpointCapability {
     /// vendor-namespace data that the compiled feature decodes, and §11.5
     /// forbids private OEM access paths, so an OEM capability is either a
     /// presented surface or `UnsupportedByNvRedfishBaseline` (absent from the
-    /// ledger entirely). No capability is classified as `LegacyCompatibility`
-    /// or `Internal` in the 0.2 ledger.
+    /// ledger entirely). `UpdateServiceDeprecated` is the first
+    /// `LegacyCompatibility` entry: upstream keeps the raw `HttpPushUri`
+    /// upload for legacy device compatibility (§0.4.0), and §14.3 compiles it
+    /// for endpoints that advertise no multipart surface. No capability is
+    /// classified as `Internal` in the 0.2 ledger.
     #[must_use]
     pub const fn classification(self) -> CapabilityClassification {
         match self {
-            Self::SessionService | Self::TaskService => CapabilityClassification::Infrastructure,
+            Self::SessionService | Self::TaskService | Self::BmcHttp => {
+                CapabilityClassification::Infrastructure
+            }
+            Self::UpdateServiceDeprecated => CapabilityClassification::LegacyCompatibility,
             Self::Accounts
             | Self::Assembly
             | Self::Bios
@@ -269,6 +302,7 @@ impl EndpointCapability {
             | Self::TelemetryService
             | Self::Thermal
             | Self::UpdateService
+            | Self::Ports
             | Self::OemAmi
             | Self::OemDell
             | Self::OemDellAttributes
@@ -294,7 +328,11 @@ impl EndpointCapability {
     /// `EnvironmentMetrics` aggregates temperature, fan, and power readings and
     /// is presented with the Sensors measurements page. Manager
     /// network-protocol settings stay on the Managers page (BMC information,
-    /// firmware, and network protocols per §3.1).
+    /// firmware, and network protocols per §3.1). The 0.13.0 additions follow
+    /// the same mapping: `Ports` joins the Network page (`PCIe 与网络`),
+    /// `BmcHttp` stays outside the data pages like `SessionService` (服务与连
+    /// 接), and `UpdateServiceDeprecated` stays on the Update page that already
+    /// presents the legacy upload surface.
     #[must_use]
     pub const fn ui_location(self) -> UiLocation {
         match self {
@@ -310,7 +348,8 @@ impl EndpointCapability {
             Self::EthernetInterfaces
             | Self::HostInterfaces
             | Self::NetworkAdapters
-            | Self::NetworkDeviceFunctions => UiLocation::Network,
+            | Self::NetworkDeviceFunctions
+            | Self::Ports => UiLocation::Network,
             Self::EventService => UiLocation::Events,
             Self::LogServices => UiLocation::Logs,
             Self::ManagerNetworkProtocol | Self::Managers => UiLocation::Managers,
@@ -318,12 +357,12 @@ impl EndpointCapability {
             Self::PcieDevices => UiLocation::Pcie,
             Self::Processors => UiLocation::Processors,
             Self::SecureBoot => UiLocation::SecureBoot,
-            Self::SessionService => UiLocation::Infrastructure,
+            Self::SessionService | Self::BmcHttp => UiLocation::Infrastructure,
             Self::Storages => UiLocation::Storage,
             Self::TaskService => UiLocation::Tasks,
             Self::TelemetryService => UiLocation::Telemetry,
             Self::Thermal => UiLocation::Thermal,
-            Self::UpdateService => UiLocation::Update,
+            Self::UpdateService | Self::UpdateServiceDeprecated => UiLocation::Update,
             Self::Systems => UiLocation::Systems,
             // Every OEM capability is presented on the single §12.2 Oem page:
             // the page is vendor-driven (sections per present namespace), so
@@ -347,17 +386,19 @@ impl EndpointCapability {
     }
 }
 
-/// The complete §2.1 capability inventory: the 30 standard features in
-/// design-document order followed by the 14 OEM features in the compiled
-/// feature order of [`OEM_CAPABILITY_LEDGER_ORDER`].
+/// The complete §2.1 capability inventory: the 33 standard features (the 30
+/// §2.1 entries in design-document order followed by the three capabilities
+/// nv-redfish 0.13.0 adds to the compiled standard surface: `ports`,
+/// `bmc-http`, and `update-service-deprecated`) followed by the 14 OEM
+/// features in the compiled feature order of [`OEM_CAPABILITY_LEDGER_ORDER`].
 ///
 /// This is the canonical enumeration for every ledger projection: the Endpoint
-/// capability page renders exactly these 44 entries, and an entry without a
+/// capability page renders exactly these 47 entries, and an entry without a
 /// persisted observation still appears so the UI can explain why the feature
 /// is missing instead of hiding it. The order must stay aligned with §2.1 and
 /// with the compiled OEM feature order, so queries, persistence round-trips,
 /// and the capability page all enumerate the ledger identically.
-pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 44] = [
+pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 47] = [
     EndpointCapability::Accounts,
     EndpointCapability::Assembly,
     EndpointCapability::Bios,
@@ -388,6 +429,9 @@ pub const CAPABILITY_LEDGER_ORDER: [EndpointCapability; 44] = [
     EndpointCapability::TelemetryService,
     EndpointCapability::Thermal,
     EndpointCapability::UpdateService,
+    EndpointCapability::Ports,
+    EndpointCapability::BmcHttp,
+    EndpointCapability::UpdateServiceDeprecated,
     EndpointCapability::OemAmi,
     EndpointCapability::OemDell,
     EndpointCapability::OemDellAttributes,
@@ -473,6 +517,9 @@ impl FromStr for EndpointCapability {
             "telemetry-service" => Ok(Self::TelemetryService),
             "thermal" => Ok(Self::Thermal),
             "update-service" => Ok(Self::UpdateService),
+            "ports" => Ok(Self::Ports),
+            "bmc-http" => Ok(Self::BmcHttp),
+            "update-service-deprecated" => Ok(Self::UpdateServiceDeprecated),
             "oem-ami" => Ok(Self::OemAmi),
             "oem-dell" => Ok(Self::OemDell),
             "oem-dell-attributes" => Ok(Self::OemDellAttributes),
@@ -756,9 +803,12 @@ mod tests {
     use super::*;
     use crate::resource_snapshot::{ResourceFeature, ResourceFeatureParseError};
 
-    /// The §2.1 standard-feature inventory, in design-document order. The
-    /// ledger must map exactly this set and nothing else.
-    const STANDARD_FEATURES: [&str; 30] = [
+    /// The standard-feature inventory: the §2.1 entries in design-document
+    /// order followed by the three capabilities nv-redfish 0.13.0 adds to the
+    /// compiled standard surface (`ports`, `bmc-http`,
+    /// `update-service-deprecated`). The ledger must map exactly this set and
+    /// nothing else.
+    const STANDARD_FEATURES: [&str; 33] = [
         "accounts",
         "assembly",
         "bios",
@@ -789,6 +839,9 @@ mod tests {
         "telemetry-service",
         "thermal",
         "update-service",
+        "ports",
+        "bmc-http",
+        "update-service-deprecated",
     ];
 
     /// The §2.1 OEM-feature inventory, in the compiled-feature order of the
@@ -853,7 +906,7 @@ mod tests {
 
     #[test]
     fn capability_ledger_covers_every_standard_feature_exactly_once() {
-        assert_eq!(CAPABILITY_LEDGER_ORDER.len(), 44);
+        assert_eq!(CAPABILITY_LEDGER_ORDER.len(), 47);
         let mut upstream_features = Vec::new();
         for capability in CAPABILITY_LEDGER_ORDER {
             let feature = capability.upstream_feature();
@@ -922,15 +975,15 @@ mod tests {
                 "§2.1 OEM feature {feature} has no capability variant"
             );
         }
-        // The full ledger appends the OEM inventory after the 30 standard
+        // The full ledger appends the OEM inventory after the 33 standard
         // entries, so every projection shares one canonical order: the
-        // standard section keeps the §2.1 order and the OEM section follows
-        // the compiled feature order.
+        // standard section keeps the §2.1 order (plus the 0.13.0 additions)
+        // and the OEM section follows the compiled feature order.
         assert_eq!(
-            &CAPABILITY_LEDGER_ORDER[30..],
+            &CAPABILITY_LEDGER_ORDER[33..],
             &OEM_CAPABILITY_LEDGER_ORDER[..]
         );
-        for (capability, feature) in CAPABILITY_LEDGER_ORDER[..30].iter().zip(STANDARD_FEATURES) {
+        for (capability, feature) in CAPABILITY_LEDGER_ORDER[..33].iter().zip(STANDARD_FEATURES) {
             assert_eq!(capability.upstream_feature(), feature);
         }
     }
@@ -958,8 +1011,11 @@ mod tests {
     fn classification_is_stable_and_matches_the_design() {
         for capability in CAPABILITY_LEDGER_ORDER {
             let expected = match capability {
-                EndpointCapability::SessionService | EndpointCapability::TaskService => {
-                    CapabilityClassification::Infrastructure
+                EndpointCapability::SessionService
+                | EndpointCapability::TaskService
+                | EndpointCapability::BmcHttp => CapabilityClassification::Infrastructure,
+                EndpointCapability::UpdateServiceDeprecated => {
+                    CapabilityClassification::LegacyCompatibility
                 }
                 _ => CapabilityClassification::UserFacing,
             };
@@ -967,10 +1023,9 @@ mod tests {
             assert!(
                 !matches!(
                     capability.classification(),
-                    CapabilityClassification::LegacyCompatibility
-                        | CapabilityClassification::Internal
+                    CapabilityClassification::Internal
                 ),
-                "{} must not use a reserved classification in the 0.2 ledger",
+                "{} must not use the reserved Internal classification in the 0.2 ledger",
                 capability.as_str()
             );
         }
@@ -1001,6 +1056,15 @@ mod tests {
         assert_eq!(
             EndpointCapability::TaskService.ui_location(),
             UiLocation::Tasks
+        );
+        assert_eq!(
+            EndpointCapability::BmcHttp.ui_location(),
+            UiLocation::Infrastructure
+        );
+        assert_eq!(EndpointCapability::Ports.ui_location(), UiLocation::Network);
+        assert_eq!(
+            EndpointCapability::UpdateServiceDeprecated.ui_location(),
+            UiLocation::Update
         );
         // Every OEM capability lands on the single §12.2 Oem page.
         for capability in OEM_CAPABILITY_LEDGER_ORDER {
