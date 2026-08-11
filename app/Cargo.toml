@@ -58,3 +58,10 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# rustls-webpki is used only through the fully-qualified extern-prelude path
+# `webpki::` (site_runtime.rs: the EndEntityCert key/certificate match check
+# and the SiteTlsError source), which the machete AST scan does not
+# attribute to the crate.
+ignored = ["rustls-webpki"]
