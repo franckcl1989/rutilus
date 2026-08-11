@@ -88,7 +88,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 
 | 限制 | 说明 | 事实来源 |
 |---|---|---|
-| 遥测保留期不可配置 | 7 天是产品常量（`TELEMETRY_RETENTION`）；"历史保留周期可配置"（§14.4）尚未实现为设置项，代码注释明确是 later iteration | `app/src/telemetry_sampler.rs` |
+| 遥测保留期只能 CLI 配置 | 保留期已可配置：`rutilus run` / `service install` / `service run` 的 `--telemetry-retention-days`（默认 7 天，范围 1–365，`app/src/telemetry_sampler.rs` 的 `TelemetryRetention`）；"设置页"形态的设置面仍是 later iteration | `app/src/telemetry_sampler.rs`；`app/src/main.rs` |
 | 事件监听器失败后不自动恢复 | 连续 10 次重连失败（预算约 4 分钟）后端点监听器标记 Failed 并退出；周期性重新拉起是 later iteration | `app/src/event_listener.rs` |
 | 事件监听按启动扫描拉起 | 启动时枚举全部端点拉起 SSE 监听；登记端点时懒启动是 later iteration | 同上 |
 | 日志设施范围受限 | 设计 §6.2 的 `tracing` + `tracing-subscriber` 已进入 workspace；app/application/platform 的运行诊断经 `tracing::error!`/`warn!` 记录，由 app 二进制在启动时初始化 stderr subscriber（`RUST_LOG` 过滤，默认 `info`）；**CLI 用户可见输出**（init 向导、backup 结果、doctor 报告、console 横幅、bootstrap code）仍为 `println!`（§7.6 用户信息与诊断信息分离），测试基础设施与测试内诊断（`test-support` mock、`infra-redfish` 测试）仍用 `eprintln!`（无 subscriber 上下文）；未使用 span/`#[instrument]`、无结构化 JSON 输出 | 根 `Cargo.toml`；`app/src/main.rs`；`app/src/event_listener.rs` 注释 |
@@ -111,7 +111,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | §19.1 Physical Device Test（五厂商真实设备认证矩阵） | 尚未达成 |
 | §0.9.0 性能容量测试与真实容量建议 | 尚未执行/发布 |
 | §6.2 tracing 日志选型 | 已引入（app 诊断日志 + `RUST_LOG` 过滤的 stderr subscriber）；用户可见输出仍为 `println!`，测试/工具输出仍为 `eprintln!`（见 §七"日志设施范围受限"）；span/`#[instrument]` 与结构化输出为后续迭代 |
-| §14.4 遥测保留周期可配置 | 尚未实现（产品常量） |
+| §14.4 遥测保留周期可配置 | 已实现：`--telemetry-retention-days`（默认 7 天，范围 1–365，`TelemetryRetention` 在边界校验）；设置页形态为后续迭代 |
 | §12.4 诊断中的解码错误路径 / ExtendedInfo 展示 | 解码失败的成员在刷新时跳过、不留下记录，诊断视图不显示（`application/src/resource_diagnostics.rs`）——与 §12.4"允许查看解码错误路径"的设计表述存在实现差异，属 0.9.0 待办 |
 
 > 以上偏差均为当前 master 的真实状态；对应设计条款见仓库根目录

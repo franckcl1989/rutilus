@@ -109,6 +109,18 @@ rutilus run --center --listen 0.0.0.0:8443 --center-listen 0.0.0.0:8444
 - 中心是单活动实例（SQLite），可由 systemd / launchd / Windows Service 拉起；允许冷备或主机级高可用，不提供产品内部多节点集群（§15.7）；
 - 中心不可用只影响集中视图和新中心操作，不影响站点已接受任务和本地管理（§15.7）。
 
+### 4.3 遥测保留期
+
+```text
+rutilus run --telemetry-retention-days 30
+rutilus service install --site --listen 0.0.0.0:8443 --telemetry-retention-days 30
+```
+
+- 本地采样循环（Standalone 与 Site）按 `now - 保留期` 计算 prune 截止，超出即删除（`app/src/telemetry_sampler.rs` 的 `TelemetryRetention`）；
+- 范围 1–365 天，默认 7 天：0 天会在首个采样 tick 清空全部历史，超过 365 天违背 §14.4"有界历史"承诺（非法值在 CLI 解析时拒绝）；
+- Center 没有本地采样循环，忽略该参数；
+- 系统服务安装时传入的参数写入注册的命令行（`--telemetry-retention-days`），服务启动即生效（`platform/src/service.rs` 的 `ServiceArguments`）。
+
 ## 五、中心与站点运维
 
 ### 5.1 连接方向与传输
@@ -264,7 +276,7 @@ rutilus doctor [--portable]
 | 批量刷新目标上限 / 并发 | 128 / 4 | `application/src/batch_refresh.rs` |
 | 同一端点写操作并发 | 1（串行） | §13.7、`operation-engine` |
 | 事件/审计/遥测单次查询上限 | 1000 | `web/src/lib.rs` |
-| 遥测采样周期 / 保留 | 60 秒 / 7 天（产品常量） | `app/src/telemetry_sampler.rs` |
+| 遥测采样周期 / 保留 | 60 秒 / 默认 7 天（`--telemetry-retention-days` 可配置，1–365 天） | `app/src/telemetry_sampler.rs`；`app/src/main.rs` |
 | 制品分块上限 | 4 MiB（base64） | `application/src/artifact_store.rs` |
 | CSV 导入上限 | 1 MiB / 10,000 行 | `application/src/endpoint_csv.rs` |
 | 中心协议帧上限 | 8 MiB | `center-protocol/src/lib.rs` |

@@ -45,6 +45,10 @@ pub struct ServiceArguments {
     cert: Option<String>,
     key: Option<String>,
     center_listen: Option<String>,
+    /// The optional `--telemetry-retention-days` value of the registered
+    /// command line; the CLI validates the window before it reaches the
+    /// platform layer.
+    telemetry_retention_days: Option<u16>,
 }
 
 impl ServiceArguments {
@@ -101,7 +105,19 @@ impl ServiceArguments {
             cert,
             key,
             center_listen,
+            telemetry_retention_days: None,
         })
+    }
+
+    /// Carries the configured telemetry history retention (in days) into
+    /// the registered command line as `--telemetry-retention-days`.
+    ///
+    /// The value is expected to be pre-validated by the CLI (`rutilus run
+    /// --telemetry-retention-days`); the platform layer only serializes it.
+    #[must_use]
+    pub fn with_telemetry_retention_days(mut self, days: u16) -> Self {
+        self.telemetry_retention_days = Some(days);
+        self
     }
 
     #[must_use]
@@ -127,7 +143,8 @@ impl ServiceArguments {
 
     /// The registered argv: `service run --site --listen ADDR [--cert ...]`
     /// for a Site, `service run --center --listen ADDR --center-listen ADDR
-    /// [--cert ...]` for a Center.
+    /// [--cert ...]` for a Center; a configured telemetry retention appends
+    /// `--telemetry-retention-days DAYS`.
     #[must_use]
     pub fn to_argv(&self) -> Vec<String> {
         let posture = if self.center_listen.is_some() {
@@ -151,6 +168,10 @@ impl ServiceArguments {
             argv.push(cert.clone());
             argv.push("--key".to_owned());
             argv.push(key.clone());
+        }
+        if let Some(days) = self.telemetry_retention_days {
+            argv.push("--telemetry-retention-days".to_owned());
+            argv.push(days.to_string());
         }
         argv
     }
@@ -784,6 +805,48 @@ mod tests {
                 "--key",
                 "C:\\Program Files\\rutilus\\site key.pem",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn carries_the_configured_retention_into_every_command_line()
+    -> Result<(), ServiceArgumentsError> {
+        let arguments = arguments()?.with_telemetry_retention_days(30);
+        let executable = PathBuf::from("C:\\Program Files\\rutilus\\rutilus.exe");
+
+        assert_eq!(
+            arguments.to_argv(),
+            vec![
+                "service",
+                "run",
+                "--site",
+                "--listen",
+                "0.0.0.0:8443",
+                "--cert",
+                "C:\\Program Files\\rutilus\\site cert.pem",
+                "--key",
+                "C:\\Program Files\\rutilus\\site key.pem",
+                "--telemetry-retention-days",
+                "30",
+            ]
+        );
+        assert!(
+            arguments
+                .to_windows_command_line(&executable)?
+                .ends_with("--telemetry-retention-days 30")
+        );
+        assert!(
+            arguments
+                .to_systemd_exec_start(&executable)
+                .ends_with("--telemetry-retention-days 30")
+        );
+        assert_eq!(
+            arguments
+                .to_launchd_program_arguments(&executable)
+                .last()
+                .map(String::as_str),
+            Some("30")
         );
         Ok(())
     }

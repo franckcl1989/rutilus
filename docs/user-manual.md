@@ -351,7 +351,7 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 
 - 展示 MetricDefinition 与 MetricReport；支持当前值和有界历史（§14.4）；
 - 采样节奏：每 60 秒一次（`app/src/telemetry_sampler.rs` 的 `TELEMETRY_SAMPLE_INTERVAL`）；
-- 历史保留：**当前为产品常量 7 天**（`TELEMETRY_RETENTION`），设计要求的"保留周期可配置"尚未做成设置项（代码注释明确说明是 later iteration）；
+- 历史保留：**默认 7 天**，可通过 `--telemetry-retention-days` 配置（`rutilus run`、`rutilus service install` / `service run`；范围 1–365 天，`app/src/telemetry_sampler.rs` 的 `TelemetryRetention`）；"设置页"形态的设置面为 later iteration；
 - 遥测查询上限每次 1000 条样本（`TELEMETRY_QUERY_MAX_LIMIT`）；
 - 不把产品变成通用时序数据库。
 
@@ -408,7 +408,7 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 | 命令 | 用途 |
 |---|---|
 | `rutilus init [--portable]` | 初始化受保护的 Standalone 数据目录，打印一次性 Bootstrap Code |
-| `rutilus run [--portable] [--no-open]` | 前台运行 Standalone；`--site --listen HOST:PORT [--cert/--key]` 运行 Site；`--center --listen ... --center-listen ...` 运行 Center |
+| `rutilus run [--portable] [--no-open] [--telemetry-retention-days DAYS]` | 前台运行 Standalone；`--site --listen HOST:PORT [--cert/--key]` 运行 Site；`--center --listen ... --center-listen ...` 运行 Center；`--telemetry-retention-days` 配置遥测历史保留天数（默认 7） |
 | `rutilus service install/uninstall` | 安装/卸载系统服务（Windows SCM、launchd、systemd） |
 | `rutilus backup create [--portable] [--output PATH]` | 创建加密备份包（需实例已停止） |
 | `rutilus backup restore [--portable] PATH` | 离线恢复备份包 |

@@ -53,6 +53,7 @@ use crate::{
     CenterClientConfig, StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError,
     StandaloneRunError, StandaloneUnlock, SystemClock, scheduler,
     standalone_runtime::{StandaloneState, run_background_services},
+    telemetry_sampler::TelemetryRetention,
     tls_material::{
         TlsMaterialError, key_der_bytes, pem_encode, persist_text, read_certificate,
         read_private_key,
@@ -657,6 +658,11 @@ impl axum::serve::Listener for TlsListener {
 /// `unlock` is `Some` for an interactive passphrase unlock and `None` for
 /// the unattended operating-system unlock that services use.
 ///
+/// `retention` is the configured telemetry history window (default seven
+/// days) the background sampling loop prunes with; the CLI's
+/// `--telemetry-retention-days` value reaches the prune verbatim through
+/// this parameter.
+///
 /// # Errors
 ///
 /// Returns [`SiteRunError`] while preserving both server and close failures
@@ -664,6 +670,7 @@ impl axum::serve::Listener for TlsListener {
 pub async fn run_site<Stop>(
     paths: &RuntimePaths,
     options: &SiteRunOptions,
+    retention: TelemetryRetention,
     unlock: Option<&StandaloneUnlock>,
     stop: Stop,
 ) -> Result<(), SiteRunError>
@@ -717,6 +724,7 @@ where
         let services_result = run_background_services(
             instance.state(),
             gateway,
+            retention,
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
                     DeploymentPosture::Site,

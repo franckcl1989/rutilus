@@ -162,4 +162,4 @@
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
 | tracing 深化 | app 诊断日志已引入（§6.2：`tracing` + `tracing-subscriber`，`RUST_LOG` 过滤的 stderr subscriber，见 `docs/operations-manual.md` §8.1）；span/`#[instrument]`、结构化输出、其余诊断点的进一步接入为后续迭代 | `docs/known-limitations.md` §七、§八 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
-| 其他 | 遥测保留期可配置（§14.4）、`cargo audit` 独立门禁、诊断解码错误路径展示（§12.4）、产品版本号统一策略、UI 本地化等 | `docs/known-limitations.md` §七、§八 |
+| 其他 | `cargo audit` 独立门禁、诊断解码错误路径展示（§12.4）、产品版本号统一策略、UI 本地化等 | `docs/known-limitations.md` §七、§八 |

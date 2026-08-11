@@ -6,8 +6,9 @@ use clap::{Args, Parser, Subcommand};
 use console::Term;
 use rutilus::{
     BackupKeyUnlock, CenterRunOptions, ListenAddress, SiteRunOptions, StandaloneRunOptions,
-    StandaloneUnlock, console_stop_signal, has_system_master_key, initialize_standalone,
-    rewrap_to_system_unlock, run_center, run_initialized_standalone, run_site,
+    StandaloneUnlock, TelemetryRetention, console_stop_signal, has_system_master_key,
+    initialize_standalone, rewrap_to_system_unlock, run_center, run_initialized_standalone,
+    run_site,
 };
 use rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE;
 use rutilus_platform::{
@@ -40,6 +41,12 @@ enum Command {
         /// Do not open the system default browser after binding succeeds.
         #[arg(long)]
         no_open: bool,
+        /// Keep each telemetry series' history for this many days
+        /// (default 7; validated 1–365). Applies to the local sampling
+        /// loop of Standalone and Site runs; the Center runs no local
+        /// sampler.
+        #[arg(long, value_name = "DAYS")]
+        telemetry_retention_days: Option<TelemetryRetention>,
         #[command(flatten)]
         posture: Option<PostureArgs>,
     },
@@ -173,6 +180,11 @@ enum ServiceCommand {
     Install {
         #[command(flatten)]
         posture: Option<PostureArgs>,
+        /// Keep each telemetry series' history for this many days
+        /// (default 7; validated 1–365). Written into the registered
+        /// service command line.
+        #[arg(long, value_name = "DAYS")]
+        telemetry_retention_days: Option<TelemetryRetention>,
         /// Portable data directories cannot back a system service.
         #[arg(long, hide = true)]
         portable: bool,
@@ -184,6 +196,12 @@ enum ServiceCommand {
     Run {
         #[command(flatten)]
         posture: Option<PostureArgs>,
+        /// Keep each telemetry series' history for this many days
+        /// (default 7; validated 1–365). Applies to the local sampling
+        /// loop of Standalone and Site runs; the Center runs no local
+        /// sampler.
+        #[arg(long, value_name = "DAYS")]
+        telemetry_retention_days: Option<TelemetryRetention>,
     },
 }
 
@@ -211,8 +229,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Run {
             portable,
             no_open,
+            telemetry_retention_days,
             posture,
-        } => run(portable, no_open, posture).await?,
+        } => run(portable, no_open, telemetry_retention_days, posture).await?,
         Command::Service { command } => service(command).await?,
         Command::Backup { command } => backup(command).await?,
         Command::Unbind { portable } => unbind(portable).await?,
@@ -330,6 +349,7 @@ fn print_licenses() {
 async fn run(
     portable: bool,
     no_open: bool,
+    telemetry_retention_days: Option<TelemetryRetention>,
     posture: Option<PostureArgs>,
 ) -> Result<(), Box<dyn Error>> {
     let location = if portable {
@@ -338,12 +358,18 @@ async fn run(
         DataLocation::Installed
     };
     let paths = location.resolve()?;
+    let retention = telemetry_retention_days.unwrap_or_default();
     let Some(posture) = posture else {
         // The Standalone foreground console.
         let terminal = Term::stderr();
         let passphrase = prompt_secret(&terminal, "Local unlock passphrase: ")?;
         let unlock = StandaloneUnlock::existing(passphrase)?;
-        run_initialized_standalone(&paths, &unlock, StandaloneRunOptions::new(!no_open)).await?;
+        run_initialized_standalone(
+            &paths,
+            &unlock,
+            StandaloneRunOptions::new(!no_open, retention),
+        )
+        .await?;
         return Ok(());
     };
     // The unlock discipline is shared by the Site and Center postures: an
@@ -359,7 +385,14 @@ async fn run(
     match resolve_posture(&posture)? {
         Posture::Site(options) => {
             // The Site foreground console never opens a browser.
-            run_site(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
+            run_site(
+                &paths,
+                &options,
+                retention,
+                unlock.as_ref(),
+                console_stop_signal(),
+            )
+            .await?;
         }
         Posture::Center(options) => {
             run_center(&paths, &options, unlock.as_ref(), console_stop_signal()).await?;
@@ -389,14 +422,21 @@ fn resolve_posture(args: &PostureArgs) -> Result<Posture, rutilus::SiteConfigErr
 
 async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
     match command {
-        ServiceCommand::Install { posture, portable } => {
-            install_service(posture.as_ref(), portable).await?;
+        ServiceCommand::Install {
+            posture,
+            telemetry_retention_days,
+            portable,
+        } => {
+            install_service(posture.as_ref(), portable, telemetry_retention_days).await?;
         }
         ServiceCommand::Uninstall => {
             rutilus_platform::uninstall().map_err(|error| -> Box<dyn Error> { error.into() })?;
             println!("Rutilus service uninstalled");
         }
-        ServiceCommand::Run { posture } => run_service(posture.as_ref()).await?,
+        ServiceCommand::Run {
+            posture,
+            telemetry_retention_days,
+        } => run_service(posture.as_ref(), telemetry_retention_days).await?,
     }
     Ok(())
 }
@@ -405,9 +445,14 @@ async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
 /// instance's master key is re-wrapped to the operating system's secret
 /// store at install time (unless it already is), so the service boots
 /// unattended.
+///
+/// A configured telemetry retention rides into the registered command line
+/// (`--telemetry-retention-days`), so the service honors the operator's
+/// value from its first start.
 async fn install_service(
     posture: Option<&PostureArgs>,
     portable: bool,
+    telemetry_retention_days: Option<TelemetryRetention>,
 ) -> Result<(), Box<dyn Error>> {
     if portable {
         return Err("system services cannot use portable data directories".into());
@@ -438,15 +483,24 @@ async fn install_service(
     }
     let executable = std::env::current_exe()?;
     let arguments = match posture {
-        Posture::Site(options) => ServiceArguments::new(
-            options.listen().to_string(),
-            options
-                .cert()
-                .map(|path| path.to_string_lossy().into_owned()),
-            options
-                .key()
-                .map(|path| path.to_string_lossy().into_owned()),
-        )?,
+        Posture::Site(options) => {
+            let arguments = ServiceArguments::new(
+                options.listen().to_string(),
+                options
+                    .cert()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                options
+                    .key()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            )?;
+            // The site's local sampling loop honors the configured window
+            // from the service's first start; the center runs no sampler.
+            if let Some(retention) = telemetry_retention_days {
+                arguments.with_telemetry_retention_days(retention.days())
+            } else {
+                arguments
+            }
+        }
         Posture::Center(options) => ServiceArguments::for_center(
             options.console().listen().to_string(),
             options.center_listen().to_string(),
@@ -470,10 +524,15 @@ async fn install_service(
 /// and no interactive prompts. On Windows this registers with the SCM and
 /// stops through the SCM stop control; elsewhere the service manager
 /// supervises the same foreground process.
-async fn run_service(posture: Option<&PostureArgs>) -> Result<(), Box<dyn Error>> {
+async fn run_service(
+    posture: Option<&PostureArgs>,
+    telemetry_retention_days: Option<TelemetryRetention>,
+) -> Result<(), Box<dyn Error>> {
     let paths = DataLocation::Installed.resolve()?;
     // The posture is decided before the closure so the service body owns
-    // its resolved options.
+    // its resolved options; the retention is Copy, so the closure captures
+    // it by value.
+    let retention = telemetry_retention_days.unwrap_or_default();
     let posture = match posture {
         Some(args) => resolve_posture(args)?,
         None => {
@@ -490,11 +549,15 @@ async fn run_service(posture: Option<&PostureArgs>) -> Result<(), Box<dyn Error>
             let posture = posture.clone();
             Box::pin(async move {
                 match posture {
-                    Posture::Site(options) => {
-                        run_site(paths, &options, None, service_stop_signal(control.clone()))
-                            .await
-                            .map_err(Into::into)
-                    }
+                    Posture::Site(options) => run_site(
+                        paths,
+                        &options,
+                        retention,
+                        None,
+                        service_stop_signal(control.clone()),
+                    )
+                    .await
+                    .map_err(Into::into),
                     Posture::Center(options) => {
                         run_center(paths, &options, None, service_stop_signal(control.clone()))
                             .await
@@ -508,9 +571,11 @@ async fn run_service(posture: Option<&PostureArgs>) -> Result<(), Box<dyn Error>
     #[cfg(not(windows))]
     {
         match posture {
-            Posture::Site(options) => run_site(&paths, &options, None, console_stop_signal())
-                .await
-                .map_err(Into::into),
+            Posture::Site(options) => {
+                run_site(&paths, &options, retention, None, console_stop_signal())
+                    .await
+                    .map_err(Into::into)
+            }
             Posture::Center(options) => run_center(&paths, &options, None, console_stop_signal())
                 .await
                 .map_err(Into::into),
@@ -610,7 +675,9 @@ fn print_version() {
 mod tests {
     use clap::Parser;
 
-    use super::{BackupCommand, Cli, Command, ListenAddress, PostureArgs, ServiceCommand};
+    use super::{
+        BackupCommand, Cli, Command, ListenAddress, PostureArgs, ServiceCommand, TelemetryRetention,
+    };
 
     #[test]
     fn parses_the_documented_version_subcommand() {
@@ -634,10 +701,79 @@ mod tests {
                 command: Command::Run {
                     portable: true,
                     no_open: true,
+                    telemetry_retention_days: None,
                     posture: None,
                 }
             })
         ));
+    }
+
+    #[test]
+    fn parses_the_telemetry_retention_days_flag() -> Result<(), clap::Error> {
+        let parsed = Cli::try_parse_from([
+            "rutilus",
+            "run",
+            "--portable",
+            "--telemetry-retention-days",
+            "30",
+        ])?;
+
+        let Command::Run {
+            telemetry_retention_days,
+            ..
+        } = parsed.command
+        else {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                "expected the Run subcommand",
+            ));
+        };
+        assert_eq!(
+            telemetry_retention_days,
+            Some(TelemetryRetention::try_new(30).map_err(|error| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+            })?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_telemetry_retention_days() {
+        // The CLI rejects windows that would erase the whole history (0),
+        // unbound the store (366), or are not a whole number of days.
+        for bad in ["0", "366", "abc", "-1"] {
+            assert!(
+                Cli::try_parse_from(["rutilus", "run", "--telemetry-retention-days", bad,])
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "service",
+                "install",
+                "--site",
+                "--listen",
+                "127.0.0.1:8080",
+                "--telemetry-retention-days",
+                "0",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rutilus",
+                "service",
+                "run",
+                "--site",
+                "--listen",
+                "127.0.0.1:8080",
+                "--telemetry-retention-days",
+                "366",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
