@@ -3,7 +3,7 @@
 //!
 //! The gateway-level test is the crate's acceptance proof: it runs the exact
 //! product request sequence (TLS observation, pinned trust, Session
-//! lifecycle, 44-capability probe, typed core resource read, refresh)
+//! lifecycle, 47-capability probe, typed core resource read, refresh)
 //! against a live Mock BMC and asserts shapes, counts, and cleanup.
 
 use std::{error::Error, io};
@@ -28,7 +28,7 @@ const MOCK_USERNAME: &str = "admin";
 const MOCK_PASSWORD: &str = "password";
 
 /// The core 2.1 capabilities the fixture tree must serve as `Supported`.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 24] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -58,12 +58,23 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
     EndpointCapability::EventService,
     EndpointCapability::TelemetryService,
     EndpointCapability::TaskService,
+    // The `bmc-http` transport capability: every probe request runs through
+    // the compiled HTTP transport, so a completed probe observes it
+    // `Supported` without any resource-level probe (§3.1 服务与连接).
+    EndpointCapability::BmcHttp,
 ];
 
 /// Capabilities the fixture deliberately does not serve, which the probe
 /// must report as `NotAdvertised` instead of guessing paths.
-const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 1] =
-    [EndpointCapability::EthernetInterfaces];
+const CAPABILITIES_NOT_ADVERTISED: [EndpointCapability; 3] = [
+    EndpointCapability::EthernetInterfaces,
+    // The mock serves no NetworkAdapters, so no decoded adapter advertises
+    // the `Ports` navigation the `ports` capability observes (§11.3).
+    EndpointCapability::Ports,
+    // The mock's UpdateService document advertises no `HttpPushUri`, so the
+    // deprecated legacy upload surface stays `NotAdvertised` (§0.4.0).
+    EndpointCapability::UpdateServiceDeprecated,
+];
 
 /// The gateway's request count for one complete `read_core_resources` flow:
 /// root, `SessionService`, Sessions collection, Session create, Systems
@@ -649,7 +660,7 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
     let username = CredentialUsername::parse(MOCK_USERNAME)?;
     let password = SecretString::from(MOCK_PASSWORD);
 
-    // The 44-capability probe: exactly the §2.1 inventory in order (30
+    // The 47-capability probe: exactly the §2.1 inventory in order (33
     // standard features followed by the 14 OEM features), with the served
     // surface `Supported`, the unserved standard surface `NotAdvertised`, and
     // every OEM capability `NotAdvertised` (the mock serves no vendor

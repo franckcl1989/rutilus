@@ -3,7 +3,7 @@
 //! Integration tests driving the product `RedfishGateway` against the shared
 //! Mock BMC, proving the §19.1 Mock-BMC test layer through public APIs only:
 //! trust-first onboarding of the mock's self-signed identity, the Service
-//! Root read, the complete 44-capability probe (30 standard §2.1 features and
+//! Root read, the complete 47-capability probe (33 standard §2.1 features and
 //! 14 OEM features), the typed core resource read, the Session create/delete
 //! lifecycle, and the 0.5.0 vendor profiles (the Dell profile's `oem-dell`
 //! probe states and its §11.5 `DellAttributes` snapshot, the NVIDIA
@@ -44,7 +44,7 @@ const MOCK_PASSWORD: &str = "password";
 /// only the inventory count and the core capability states are pinned here;
 /// a fixture change cannot silently shrink the inventory, but a richer mock
 /// does not force this test to know every member-scoped link.
-const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
+const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 24] = [
     EndpointCapability::SessionService,
     EndpointCapability::Systems,
     EndpointCapability::Chassis,
@@ -73,6 +73,10 @@ const CORE_CAPABILITIES_SUPPORTED: [EndpointCapability; 23] = [
     EndpointCapability::EventService,
     EndpointCapability::TelemetryService,
     EndpointCapability::TaskService,
+    // The `bmc-http` transport capability: every probe request runs through
+    // the compiled HTTP transport, so a completed probe observes it
+    // `Supported` without any resource-level probe (§3.1 服务与连接).
+    EndpointCapability::BmcHttp,
 ];
 
 /// Establishes the trust-first onboarding decision for the Mock BMC's
@@ -149,7 +153,7 @@ async fn service_root_read_establishes_pinned_trust_and_reads_summary() -> Resul
 }
 
 #[tokio::test]
-async fn probes_all_forty_four_capabilities_with_core_surface_supported()
+async fn probes_all_forty_seven_capabilities_with_core_surface_supported()
 -> Result<(), Box<dyn Error>> {
     let mock = MockBmc::start().await?;
     let gateway = RedfishGateway::from_system_roots().await?;

@@ -1131,7 +1131,7 @@ mod tests {
         assert_eq!(
             call.observations.len(),
             CAPABILITY_LEDGER_ORDER.len(),
-            "the re-probed snapshot must cover the complete 30-entry §2.1 ledger"
+            "the re-probed snapshot must cover the complete 33-entry §2.1 ledger"
         );
         Ok(())
     }

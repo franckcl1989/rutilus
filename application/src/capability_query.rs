@@ -148,9 +148,10 @@ where
 
     /// Returns `None` for an unknown endpoint and otherwise merges the stored
     /// observations over [`CAPABILITY_LEDGER_ORDER`], so the result always
-    /// contains exactly 44 entries in §2.1 ledger order: the 30 standard
-    /// features in design-document order followed by the 14 OEM features in
-    /// compiled feature order.
+    /// contains exactly 47 entries in §2.1 ledger order: the 33 standard
+    /// features (the 30 §2.1 entries in design-document order plus the 0.13.0
+    /// additions `ports`, `bmc-http`, and `update-service-deprecated`)
+    /// followed by the 14 OEM features in compiled feature order.
     ///
     /// # Errors
     ///
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_observations_still_produces_forty_four_unobserved_entries()
+    async fn no_observations_still_produces_forty_seven_unobserved_entries()
     -> Result<(), Box<dyn Error>> {
         let query = EndpointCapabilityQuery::new(
             MockRepository::Observed(Vec::new()),
@@ -278,7 +279,7 @@ mod tests {
             .await?
             .ok_or("endpoint capabilities are missing")?;
 
-        assert_eq!(entries.len(), 44);
+        assert_eq!(entries.len(), 47);
         assert!(entries.iter().all(|entry| {
             entry.state().is_none()
                 && entry.observed_at().is_none()
@@ -312,7 +313,7 @@ mod tests {
             .await?
             .ok_or("endpoint capabilities are missing")?;
 
-        assert_eq!(entries.len(), 44);
+        assert_eq!(entries.len(), 47);
         for (entry, capability) in entries.iter().zip(CAPABILITY_LEDGER_ORDER) {
             if observed.contains(&capability) {
                 assert_eq!(entry.state(), Some(CapabilityState::Supported));

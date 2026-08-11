@@ -551,16 +551,18 @@ mod tests {
         Ok(())
     }
 
-    /// Every `EndpointCapability` variant of the §2.1 standard-feature
-    /// inventory, each with a deterministic state, so the round-trip proves
-    /// both the capability code and the final state survive persistence.
+    /// Every `EndpointCapability` variant of the standard-feature inventory
+    /// (the 30 §2.1 entries plus the 0.13.0 additions `ports`, `bmc-http`,
+    /// and `update-service-deprecated`), each with a deterministic state, so
+    /// the round-trip proves both the capability code and the final state
+    /// survive persistence.
     ///
     /// The enumeration mirrors the domain's `CAPABILITIES` test constant; when
     /// the compiled ledger grows, both lists must grow together so the
     /// round-trip always covers the complete compiled surface instead of a
     /// hand-picked subset.
     fn all_capabilities() -> Vec<EndpointCapabilityObservation> {
-        const CAPABILITIES: [EndpointCapability; 30] = [
+        const CAPABILITIES: [EndpointCapability; 33] = [
             EndpointCapability::Accounts,
             EndpointCapability::Assembly,
             EndpointCapability::Bios,
@@ -591,6 +593,9 @@ mod tests {
             EndpointCapability::TelemetryService,
             EndpointCapability::Thermal,
             EndpointCapability::UpdateService,
+            EndpointCapability::Ports,
+            EndpointCapability::BmcHttp,
+            EndpointCapability::UpdateServiceDeprecated,
         ];
         const STATES: [CapabilityState; 7] = [
             CapabilityState::Supported,

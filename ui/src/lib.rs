@@ -16789,9 +16789,11 @@ mod tests {
         })
     }
 
-    /// The §2.1 capability ledger in design-document order: product code,
-    /// upstream feature, and wire `ui_location` value of the shared contract.
-    const LEDGER_FIXTURE: [(&str, &str, &str); 30] = [
+    /// The §2.1 capability ledger in design-document order (plus the 0.13.0
+    /// additions `ports`, `bmc-http`, and `update-service-deprecated`):
+    /// product code, upstream feature, and wire `ui_location` value of the
+    /// shared contract.
+    const LEDGER_FIXTURE: [(&str, &str, &str); 33] = [
         ("accounts", "accounts", "accounts"),
         ("assembly", "assembly", "assembly"),
         ("bios", "bios", "bios"),
@@ -16830,13 +16832,23 @@ mod tests {
         ("telemetry-service", "telemetry-service", "telemetry"),
         ("thermal", "thermal", "thermal"),
         ("update-service", "update-service", "update"),
+        ("ports", "ports", "network"),
+        ("bmc-http", "bmc-http", "infrastructure"),
+        (
+            "update-service-deprecated",
+            "update-service-deprecated",
+            "update",
+        ),
     ];
 
     /// Wire classification for one capability code, mirroring the shared
-    /// contract: session and task services are infrastructure.
+    /// contract: session, task, and the `bmc-http` transport are
+    /// infrastructure; the deprecated `HttpPushUri` upload is legacy
+    /// compatibility.
     fn fixture_classification(capability: &str) -> &'static str {
         match capability {
-            "session-service" | "task-service" => "infrastructure",
+            "session-service" | "task-service" | "bmc-http" => "infrastructure",
+            "update-service-deprecated" => "legacy_compatibility",
             _ => "user_facing",
         }
     }
@@ -20325,7 +20337,7 @@ mod tests {
     #[test]
     fn capability_matrix_projection_preserves_ledger_order_and_grouping()
     -> Result<(), Box<dyn Error>> {
-        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let states: [Option<&str>; 33] = [Some("supported"); 33];
         let projection = CapabilityMatrixProjection::from(&capability_inventory(&states)?);
 
         assert_eq!(projection.groups.len(), 22);
@@ -20364,6 +20376,7 @@ mod tests {
                 "host-interfaces",
                 "network-adapters",
                 "network-device-functions",
+                "ports",
             ]
         );
         let power = projection
@@ -20386,7 +20399,7 @@ mod tests {
     #[test]
     fn capability_group_order_follows_ui_location_appearance_not_string_sort()
     -> Result<(), Box<dyn Error>> {
-        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let states: [Option<&str>; 33] = [Some("supported"); 33];
         let projection = CapabilityMatrixProjection::from(&capability_inventory(&states)?);
         let titles = projection
             .groups
@@ -20432,7 +20445,7 @@ mod tests {
     #[test]
     fn capability_none_state_renders_not_observed_without_fabricated_reason()
     -> Result<(), Box<dyn Error>> {
-        let mut states: [Option<&str>; 30] = [None; 30];
+        let mut states: [Option<&str>; 33] = [None; 33];
         states[0] = Some("supported");
         states[1] = Some("read_only");
         states[2] = Some("unauthorized");
@@ -20447,7 +20460,7 @@ mod tests {
             .flat_map(|group| group.entries.iter())
             .collect::<Vec<_>>();
 
-        assert_eq!(entries.len(), 30);
+        assert_eq!(entries.len(), 33);
         let accounts = entries.first().ok_or("accounts entry must exist")?;
         assert_eq!(accounts.state_label, "Supported");
         assert_eq!(
@@ -20512,27 +20525,27 @@ mod tests {
         assert_eq!(empty.groups().len(), 0);
         assert_eq!(empty.failure_message(), "");
 
-        let states: [Option<&str>; 30] = [Some("supported"); 30];
+        let states: [Option<&str>; 33] = [Some("supported"); 33];
         let ready = CapabilityMatrixState::Ready(CapabilityMatrixProjection::from(
             &capability_inventory(&states)?,
         ));
         assert!(!ready.has_empty_matrix());
         assert_eq!(ready.groups().len(), 22);
-        assert_eq!(ready.summary_text(), "30 capabilities across 22 pages");
+        assert_eq!(ready.summary_text(), "33 capabilities across 22 pages");
         assert_eq!(ready.failure_message(), "");
         Ok(())
     }
 
     #[test]
     fn capability_matrix_groups_oem_entries_under_the_oem_page() -> Result<(), Box<dyn Error>> {
-        let standard_states: [Option<&str>; 30] = [None; 30];
+        let standard_states: [Option<&str>; 33] = [None; 33];
         let oem_states: [Option<&str>; 14] = [None; 14];
         let matrix = CapabilityMatrixProjection::from(&capability_inventory_with_oem(
             &standard_states,
             &oem_states,
         )?);
 
-        // The 30 standard entries still group into the same 22 pages; the 14
+        // The 33 standard entries still group into the same 22 pages; the 14
         // OEM entries add exactly one page — the §12.2 OEM page — because
         // they arrive with `ui_location = "oem"`.
         assert_eq!(matrix.groups.len(), 23);
@@ -20575,7 +20588,7 @@ mod tests {
         }
         assert_eq!(
             CapabilityMatrixState::Ready(matrix).summary_text(),
-            "44 capabilities across 23 pages"
+            "47 capabilities across 23 pages"
         );
         Ok(())
     }
@@ -20586,7 +20599,7 @@ mod tests {
         // state semantics stay identical to standard entries, so a compiled
         // but unprobed OEM feature renders "Not compiled" instead of being
         // disguised as supported.
-        let standard_states: [Option<&str>; 30] = [None; 30];
+        let standard_states: [Option<&str>; 33] = [None; 33];
         let oem_states: [Option<&str>; 14] = [
             Some("supported"),
             Some("read_only"),

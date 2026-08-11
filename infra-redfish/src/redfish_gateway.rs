@@ -307,7 +307,7 @@ impl RedfishGateway {
     }
 
     /// Reads the Service Root and probes the complete §2.1 capability surface
-    /// (30 standard and 14 OEM capabilities) through public, typed
+    /// (33 standard and 14 OEM capabilities) through public, typed
     /// `nv-redfish` navigation methods.
     ///
     /// When `SessionService` is usable, the gateway creates an operation-scoped
@@ -375,6 +375,12 @@ impl RedfishGateway {
                 probe_collection(authenticated.root.managers().await, &identity, trust).await?;
             let observations = CapabilityObservations {
                 session: authenticated.session_state,
+                // Every request of this flow ran through the compiled
+                // `HttpBmc` transport (§3.1 服务与连接), so a probe that
+                // completes at all proves the `bmc-http` capability is
+                // compiled and serving; it is `Infrastructure` per §2.4 and
+                // needs no resource-level probe.
+                bmc_http: CapabilityState::Supported,
                 systems: systems.state,
                 chassis: chassis.state,
                 managers: managers.state,
@@ -8812,6 +8818,12 @@ struct RootServiceProbe {
     task_service: CapabilityState,
     telemetry_service: CapabilityState,
     update_service: CapabilityState,
+    /// The deprecated `HttpPushUri` upload surface, decided from the same
+    /// decoded `UpdateService` document: `Supported` when the document
+    /// advertises `HttpPushUri` — the exact gate `nv-redfish` 0.13's own
+    /// `http_push_uri_update` checks — and `NotAdvertised` otherwise, so the
+    /// legacy update capability never needs an extra request (§11.3).
+    update_service_deprecated: CapabilityState,
     power_equipment: CapabilityState,
 }
 
@@ -8836,6 +8848,12 @@ struct ChassisFeatureProbe {
     power_supplies: CapabilityState,
     network_adapters: CapabilityState,
     network_device_functions: CapabilityState,
+    /// The `ports` capability, decided from the adapter documents already
+    /// decoded by [`probe_network_adapters`]: `Supported` when any adapter
+    /// advertises its `Ports` navigation — the exact link `nv-redfish` 0.13
+    /// reads through `NetworkAdapter::ports()` — and `NotAdvertised`
+    /// otherwise, so it never needs an extra request (§11.3).
+    ports: CapabilityState,
     environment_metrics: CapabilityState,
 }
 
@@ -8885,9 +8903,15 @@ struct OemNamespaceProbe {
 const LITEON_CHASSIS_MANUFACTURER: &str = "LITE-ON TECHNOLOGY CORP.";
 
 /// Every probed state grouped by origin, so the §2.1 observation vector can
-/// be assembled exhaustively without a 44-field hand-written tuple.
+/// be assembled exhaustively without a 47-field hand-written tuple.
 struct CapabilityObservations {
     session: CapabilityState,
+    /// The `bmc-http` transport capability: `Supported` whenever the probe
+    /// completes, because every request of this flow runs through the
+    /// compiled `HttpBmc` implementation — the transport demonstrably served
+    /// the connection (Session, Task, and transport capabilities are
+    /// Infrastructure per §2.4).
+    bmc_http: CapabilityState,
     systems: CapabilityState,
     chassis: CapabilityState,
     managers: CapabilityState,
@@ -9001,16 +9025,42 @@ async fn probe_root_services(
     identity: &IdentityMonitor,
     trust: &TlsTrust,
 ) -> Result<RootServiceProbe, RedfishServiceRootError> {
+    let accounts = classify_capability_probe(root.account_service().await, identity, trust)?;
+    let event_service = classify_capability_probe(root.event_service().await, identity, trust)?;
+    let task_service = classify_capability_probe(root.task_service().await, identity, trust)?;
+    let telemetry_service =
+        classify_capability_probe(root.telemetry_service().await, identity, trust)?;
+    // The `update-service` and `update-service-deprecated` states are decided
+    // from one decoded document: the deprecated raw-binary `HttpPushUri`
+    // upload is `Supported` exactly when that document advertises
+    // `HttpPushUri` — the gate `nv-redfish` 0.13's own `http_push_uri_update`
+    // checks before uploading — so the legacy surface mirrors the §11.3
+    // advertised layer without an extra request.
+    let (update_service, update_service_deprecated) = match root.update_service().await {
+        Ok(Some(service)) => (
+            CapabilityState::Supported,
+            if service.raw().http_push_uri.is_some() {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::NotAdvertised
+            },
+        ),
+        Ok(None) => (
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+        ),
+        Err(source) => {
+            let state = classify_capability_error(source, identity, trust)?;
+            (state, state)
+        }
+    };
     Ok(RootServiceProbe {
-        accounts: classify_capability_probe(root.account_service().await, identity, trust)?,
-        event_service: classify_capability_probe(root.event_service().await, identity, trust)?,
-        task_service: classify_capability_probe(root.task_service().await, identity, trust)?,
-        telemetry_service: classify_capability_probe(
-            root.telemetry_service().await,
-            identity,
-            trust,
-        )?,
-        update_service: classify_capability_probe(root.update_service().await, identity, trust)?,
+        accounts,
+        event_service,
+        task_service,
+        telemetry_service,
+        update_service,
+        update_service_deprecated,
         power_equipment: classify_capability_probe(root.power_equipment().await, identity, trust)?,
     })
 }
@@ -9057,6 +9107,22 @@ async fn probe_chassis_features(
         Some(adapters) => probe_adapter_functions(adapters, identity, trust).await?,
         None => network_adapters,
     };
+    // The `ports` capability is decided from the adapter documents the
+    // network-adapters probe already decoded: any adapter advertising its
+    // `Ports` navigation — the link `nv-redfish` 0.13 reads through
+    // `NetworkAdapter::ports()` — makes the capability `Supported`, and an
+    // absent link is `NotAdvertised`, so the §11.3 advertised layer never
+    // costs an extra request (mirroring `probe_nested_presence`).
+    let ports = match &adapter_members {
+        Some(adapters) => {
+            if adapters.iter().any(|adapter| adapter.raw().ports.is_some()) {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::NotAdvertised
+            }
+        }
+        None => network_adapters,
+    };
     Ok(ChassisFeatureProbe {
         assembly: probe_nested(chassis, identity, trust, |chassis| {
             Box::pin(chassis.assembly())
@@ -9081,6 +9147,7 @@ async fn probe_chassis_features(
         power_supplies: probe_power_supplies(chassis, identity, trust).await?,
         network_adapters,
         network_device_functions,
+        ports,
         environment_metrics: probe_nested_presence(chassis, |chassis| {
             chassis.raw().environment_metrics.is_some()
         }),
@@ -9112,15 +9179,17 @@ async fn probe_manager_features(
     })
 }
 
-/// Assembles the §2.1 inventory in design-document order: the 30 standard
-/// capabilities first, then the 14 OEM capabilities in
-/// `COMPILED_OEM_FEATURES` order.
+/// Assembles the §2.1 inventory in design-document order: the 33 standard
+/// capabilities first (the 30 §2.1 features plus the 0.13.0 additions
+/// `ports`, `bmc-http`, and `update-service-deprecated`), then the 14 OEM
+/// capabilities in `COMPILED_OEM_FEATURES` order.
 ///
 /// Every field of [`CapabilityObservations`] maps to exactly one entry, so a
 /// future capability cannot silently drop out of discovery.
 fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityObservation> {
     let CapabilityObservations {
         session,
+        bmc_http,
         systems,
         chassis,
         managers,
@@ -9203,6 +9272,12 @@ fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityO
         ),
         EndpointCapabilityObservation::new(EndpointCapability::Thermal, chassis_features.thermal),
         EndpointCapabilityObservation::new(EndpointCapability::UpdateService, root.update_service),
+        EndpointCapabilityObservation::new(EndpointCapability::Ports, chassis_features.ports),
+        EndpointCapabilityObservation::new(EndpointCapability::BmcHttp, bmc_http),
+        EndpointCapabilityObservation::new(
+            EndpointCapability::UpdateServiceDeprecated,
+            root.update_service_deprecated,
+        ),
     ];
     observations.extend(oem_observations(&oem));
     observations
@@ -9212,7 +9287,7 @@ fn build_observations(states: CapabilityObservations) -> Vec<EndpointCapabilityO
 /// order, mirroring the `COMPILED_OEM_FEATURES` feature order.
 ///
 /// Kept separate from [`build_observations`] so the standard section stays
-/// readable at its full 30-entry length; every field of
+/// readable at its full 33-entry length; every field of
 /// [`OemNamespaceProbe`] maps to exactly one entry, so a future OEM
 /// capability cannot silently drop out of discovery.
 fn oem_observations(oem: &OemNamespaceProbe) -> Vec<EndpointCapabilityObservation> {
@@ -10719,7 +10794,8 @@ mod tests {
     const UPDATE_SERVICE_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/UpdateService",
         "Id":"UpdateService",
-        "Name":"Update Service"
+        "Name":"Update Service",
+        "HttpPushUri":"https://192.0.2.10/upload"
     }"#;
 
     const POWER_EQUIPMENT_BODY: &str = r#"{
@@ -12021,7 +12097,8 @@ mod tests {
         "@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1",
         "Id":"1",
         "Name":"Adapter One",
-        "NetworkDeviceFunctions":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions"}
+        "NetworkDeviceFunctions":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions"},
+        "Ports":{"@odata.id":"/redfish/v1/Chassis/1/NetworkAdapters/1/Ports"}
     }"#;
 
     const NETWORK_DEVICE_FUNCTIONS_BODY: &str = r##"{
@@ -13023,11 +13100,13 @@ mod tests {
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
-    /// The complete §2.1 capability inventory in ledger order (30 standard
-    /// features in design-document order followed by the 14 OEM features in
-    /// the compiled feature order), mirrored from `rutilus_domain` so
-    /// discovery can prove it covers every capability exactly once.
-    const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 44] = [
+    /// The complete §2.1 capability inventory in ledger order (33 standard
+    /// features — the 30 §2.1 entries in design-document order plus the
+    /// 0.13.0 additions `ports`, `bmc-http`, and `update-service-deprecated`
+    /// — followed by the 14 OEM features in the compiled feature order),
+    /// mirrored from `rutilus_domain` so discovery can prove it covers every
+    /// capability exactly once.
+    const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 47] = [
         EndpointCapability::Accounts,
         EndpointCapability::Assembly,
         EndpointCapability::Bios,
@@ -13058,6 +13137,9 @@ mod tests {
         EndpointCapability::TelemetryService,
         EndpointCapability::Thermal,
         EndpointCapability::UpdateService,
+        EndpointCapability::Ports,
+        EndpointCapability::BmcHttp,
+        EndpointCapability::UpdateServiceDeprecated,
         EndpointCapability::OemAmi,
         EndpointCapability::OemDell,
         EndpointCapability::OemDellAttributes,
@@ -13077,9 +13159,15 @@ mod tests {
     /// Builds the exact discovery vector a probe must return for one fixture
     /// class, so every capability test asserts the full §2.1 inventory in
     /// order instead of a hand-written subset.
+    ///
+    /// The 47-entry enumeration exceeds the pedantic line budget because the
+    /// full inventory must stay one readable contract; splitting it would
+    /// duplicate the ordering assertion the probe alignment test proves.
+    #[allow(clippy::too_many_lines)]
     fn expected_capabilities(states: CapabilityObservations) -> Vec<EndpointCapabilityObservation> {
         let CapabilityObservations {
             session,
+            bmc_http,
             systems,
             chassis,
             managers,
@@ -13150,6 +13238,12 @@ mod tests {
             (EndpointCapability::TelemetryService, root.telemetry_service),
             (EndpointCapability::Thermal, chassis_features.thermal),
             (EndpointCapability::UpdateService, root.update_service),
+            (EndpointCapability::Ports, chassis_features.ports),
+            (EndpointCapability::BmcHttp, bmc_http),
+            (
+                EndpointCapability::UpdateServiceDeprecated,
+                root.update_service_deprecated,
+            ),
             (EndpointCapability::OemAmi, oem.ami),
             (EndpointCapability::OemDell, oem.dell),
             (EndpointCapability::OemDellAttributes, oem.dell_attributes),
@@ -13189,6 +13283,10 @@ mod tests {
     ) -> CapabilityObservations {
         CapabilityObservations {
             session,
+            // The fixture probes all complete through the compiled HTTP
+            // transport, so the `bmc-http` transport capability is always
+            // `Supported` on the probe result these fixtures model.
+            bmc_http: CapabilityState::Supported,
             systems: core,
             chassis: core,
             managers: core,
@@ -13198,6 +13296,7 @@ mod tests {
                 task_service: root_services,
                 telemetry_service: root_services,
                 update_service: root_services,
+                update_service_deprecated: root_services,
                 power_equipment: root_services,
             },
             systems_features: SystemFeatureProbe {
@@ -13218,6 +13317,7 @@ mod tests {
                 power_supplies: nested,
                 network_adapters: nested,
                 network_device_functions: nested,
+                ports: nested,
                 environment_metrics: nested,
             },
             manager_features: ManagerFeatureProbe {
@@ -13446,17 +13546,19 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            discovery.capabilities(),
-            expected_capabilities(uniform_group(
-                CapabilityState::NotAdvertised,
-                CapabilityState::NotAdvertised,
-                CapabilityState::NotAdvertised,
-                CapabilityState::NotAdvertised,
-                // The root-only fixture carries no `Oem` segment.
-                CapabilityState::NotAdvertised,
-            ))
+        let mut expected = uniform_group(
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+            CapabilityState::NotAdvertised,
+            // The root-only fixture carries no `Oem` segment.
+            CapabilityState::NotAdvertised,
         );
+        // The probe still completed through the compiled HTTP transport, so
+        // the `bmc-http` transport capability is `Supported` even though the
+        // root advertises no resource surface at all.
+        expected.bmc_http = CapabilityState::Supported;
+        assert_eq!(discovery.capabilities(), expected_capabilities(expected));
         assert_authenticated_requests(&server.finish_all().await?, &["/redfish/v1"])?;
         Ok(())
     }
@@ -13488,6 +13590,8 @@ mod tests {
             discovery.capabilities(),
             expected_capabilities(CapabilityObservations {
                 session: CapabilityState::Unauthorized,
+                // The probe completed through the compiled HTTP transport.
+                bmc_http: CapabilityState::Supported,
                 systems: CapabilityState::SchemaIncompatible,
                 chassis: CapabilityState::TemporarilyUnavailable,
                 managers: CapabilityState::Supported,
@@ -13497,6 +13601,7 @@ mod tests {
                     task_service: CapabilityState::NotAdvertised,
                     telemetry_service: CapabilityState::NotAdvertised,
                     update_service: CapabilityState::NotAdvertised,
+                    update_service_deprecated: CapabilityState::NotAdvertised,
                     power_equipment: CapabilityState::NotAdvertised,
                 },
                 systems_features: SystemFeatureProbe {
@@ -13517,6 +13622,7 @@ mod tests {
                     power_supplies: CapabilityState::TemporarilyUnavailable,
                     network_adapters: CapabilityState::TemporarilyUnavailable,
                     network_device_functions: CapabilityState::TemporarilyUnavailable,
+                    ports: CapabilityState::TemporarilyUnavailable,
                     environment_metrics: CapabilityState::TemporarilyUnavailable,
                 },
                 manager_features: ManagerFeatureProbe {
@@ -13696,6 +13802,8 @@ mod tests {
             discovery.capabilities(),
             expected_capabilities(CapabilityObservations {
                 session: CapabilityState::Supported,
+                // The probe completed through the compiled HTTP transport.
+                bmc_http: CapabilityState::Supported,
                 systems: CapabilityState::Supported,
                 chassis: CapabilityState::Supported,
                 managers: CapabilityState::Supported,
@@ -13705,6 +13813,7 @@ mod tests {
                     task_service: CapabilityState::NotAdvertised,
                     telemetry_service: CapabilityState::NotAdvertised,
                     update_service: CapabilityState::NotAdvertised,
+                    update_service_deprecated: CapabilityState::NotAdvertised,
                     power_equipment: CapabilityState::NotAdvertised,
                 },
                 systems_features: SystemFeatureProbe {
@@ -13725,6 +13834,7 @@ mod tests {
                     power_supplies: CapabilityState::NotAdvertised,
                     network_adapters: CapabilityState::NotAdvertised,
                     network_device_functions: CapabilityState::NotAdvertised,
+                    ports: CapabilityState::NotAdvertised,
                     environment_metrics: CapabilityState::NotAdvertised,
                 },
                 manager_features: ManagerFeatureProbe {

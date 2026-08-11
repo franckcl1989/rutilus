@@ -820,9 +820,13 @@ async fn lists_the_complete_capability_ledger_in_design_order() -> Result<(), Bo
         );
         let classification = if matches!(
             capability,
-            EndpointCapability::SessionService | EndpointCapability::TaskService
+            EndpointCapability::SessionService
+                | EndpointCapability::TaskService
+                | EndpointCapability::BmcHttp
         ) {
             "infrastructure"
+        } else if matches!(capability, EndpointCapability::UpdateServiceDeprecated) {
+            "legacy_compatibility"
         } else {
             "user_facing"
         };
