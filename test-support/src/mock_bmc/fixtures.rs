@@ -34,14 +34,32 @@
 //! swaps the Service Root identity strings ([`SERVICE_ROOT_LENOVO`]), adds
 //! the `Oem.Lenovo` segment to the manager document ([`MANAGER_LENOVO`]),
 //! and serves the §11.5 `SecurityService` document
-//! ([`LENOVO_SECURITY_SERVICE`]); the xFusion and Inspur profiles swap only
+//! ([`LENOVO_SECURITY_SERVICE`]); the AMI profile swaps the Service Root
+//! identity strings ([`SERVICE_ROOT_AMI`]), adds the embedded `Oem.Ami`
+//! segment to the Service Root and the `Oem.Ami` / `ConfigBMC` segment to
+//! the manager document ([`MANAGER_AMI`]), and serves the §11.5
+//! `ConfigBmc` document ([`AMI_CONFIG_BMC`]); the HPE profile swaps the
+//! Service Root identity strings ([`SERVICE_ROOT_HPE`]), adds the embedded
+//! `Oem.Hpe` segment to the Service Root and the embedded `Oem.Hpe` segment
+//! to the manager document ([`MANAGER_HPE`]), and serves no OEM document
+//! (both segments are embedded); the `LiteOn` profile swaps the Service Root
+//! identity strings ([`SERVICE_ROOT_LITEON`]) and the chassis `Manufacturer`
+//! gate value ([`CHASSIS_LITEON`]) and serves the §11.5 `LiteOn` power-supply
+//! chain ([`POWER_SUBSYSTEM`], [`POWER_SUPPLIES_COLLECTION`], and
+//! [`LITEON_POWER_SUPPLY_1`]); the Delta profile swaps the Service Root
+//! identity strings ([`SERVICE_ROOT_DELTA`]), adds the
+//! `Oem.deltaenergysystems` segment to the chassis document
+//! ([`CHASSIS_DELTA`]), and serves the §11.5 Delta power-supply chain
+//! ([`POWER_SUBSYSTEM`], [`POWER_SUPPLIES_COLLECTION`], and
+//! [`DELTA_POWER_SUPPLY_1`]); the xFusion and Inspur profiles swap only
 //! the Service Root identity strings ([`SERVICE_ROOT_XFUSION`],
 //! [`SERVICE_ROOT_INSPUR`]) and serve no `Oem` fixtures at all (the
 //! §21 0.5.0 no-OEM standard-pattern basis), so every document outside the
 //! Service Root stays shared with the default tree; everything else is
-//! shared. [`service_root`], [`manager`], and [`system`] select the
-//! profile-specific documents, and the route table gates the vendor routes
-//! on the profile, so no vendor surface can leak into another profile.
+//! shared. [`service_root`], [`manager`], [`system`], and [`chassis`]
+//! select the profile-specific documents, and the route table gates the
+//! vendor routes on the profile, so no vendor surface can leak into another
+//! profile.
 
 use super::profile::MockProfile;
 
@@ -709,6 +727,325 @@ pub(crate) const DELL_ATTRIBUTES: &str = r#"{
         "ServerName":"rack-1-server-2",
         "BiosVersion":"2.14.2"
     }
+}"#;
+
+/// `GET /redfish/v1` -- the Service Root of the AMI vendor profile.
+///
+/// Only the identity strings and the embedded `Oem.Ami` segment differ from
+/// the default profile: a real AMI `MegaRAC` identifies itself as Vendor
+/// "AMI", carries the `MegaRAC` product name, and publishes the
+/// `AmiServiceRoot` segment with the Redfish Technology Pack version. The
+/// navigation surface is byte-identical to [`SERVICE_ROOT`], and the
+/// `ConfigBMC` surface lives on the manager document, exactly where the
+/// gateway's probe and read look for it.
+pub(crate) const SERVICE_ROOT_AMI: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"AMI",
+    "Product":"MegaRAC SP-X",
+    "Oem":{"Ami":{"RtpVersion":"1.2.3"}},
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1` -- the Service Root of the HPE vendor profile.
+///
+/// Only the identity strings and the embedded `Oem.Hpe` segment differ from
+/// the default profile: a real HPE iLO identifies itself as Vendor "HPE",
+/// carries the `ProLiant` model as the product, and publishes the
+/// `HpeiLoServiceExt` segment with the iLO manager identity. The navigation
+/// surface is byte-identical to [`SERVICE_ROOT`], and the manager `Oem.Hpe`
+/// segment lives on the manager document, exactly where the gateway's probe
+/// and read look for it.
+pub(crate) const SERVICE_ROOT_HPE: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"HPE",
+    "Product":"ProLiant DL380 Gen11",
+    "Oem":{"Hpe":{
+        "Manager":[{"ManagerType":"iLO 5","ManagerFirmwareVersion":"2.44"}]
+    }},
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1` -- the Service Root of the `LiteOn` vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real `LiteOn`
+/// power shelf identifies itself as Vendor "`LiteOn`" with the shelf model as
+/// the product. The `LiteOn` surface is gated by the chassis `Manufacturer`
+/// value instead of a root `Oem` segment (the one `Manufacturer`-gated
+/// surface of the product, exactly like the probe), so no `Oem` segment is
+/// served here; the chassis member carries the gate value and the
+/// `PowerSubsystem` navigation.
+pub(crate) const SERVICE_ROOT_LITEON: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"LiteOn",
+    "Product":"Power Shelf",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1` -- the Service Root of the Delta vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real Delta
+/// Energy Systems power shelf identifies itself as Vendor "DELTA" with the
+/// shelf model as the product. The `deltaenergysystems` namespace key lives
+/// on the chassis member (the document the §11.3 namespace probe decodes),
+/// exactly where the probe and read look for it.
+pub(crate) const SERVICE_ROOT_DELTA: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"DELTA",
+    "Product":"Power Shelf",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the AMI vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the `Oem.Ami` segment that
+/// advertises the AMI OEM namespace and the `ConfigBMC` reference string —
+/// the same `{"Oem":{"Ami":...,"ConfigBMC":"..."}}` shape the upstream
+/// `ConfigBmc` constructor reads (the `ConfigBMC` value is a sibling of the
+/// `Ami` value, both inside the manager's `Oem` bag). The document mirrors
+/// the `MANAGER_WITH_AMI_OEM_BODY` fixture `rutilus-infra-redfish` decodes
+/// in its own AMI tests.
+pub(crate) const MANAGER_AMI: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{
+        "Ami":{"Anything":true},
+        "ConfigBMC":"/redfish/v1/Managers/1/Oem/ConfigBMC"
+    }
+}"#;
+
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the HPE vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the embedded `Oem.Hpe` segment
+/// that advertises the HPE OEM namespace and carries the `HpeiLo` object
+/// with the `VirtualNICEnabled` value. The document mirrors the
+/// `MANAGER_WITH_HPE_OEM_BODY` fixture `rutilus-infra-redfish` decodes in
+/// its own HPE tests.
+pub(crate) const MANAGER_HPE: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{"Hpe":{"VirtualNICEnabled":true}}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/Oem/ConfigBMC` -- the §11.5 AMI `ConfigBmc`
+/// document of the AMI vendor profile, served at the `ConfigBMC` reference
+/// of the manager's `Oem.Ami` segment.
+///
+/// The document mirrors the `AMI_CONFIG_BMC_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own AMI tests: the four BIOS
+/// lockout/lockdown states in their vendor enum spellings, beside the base
+/// `@odata.id` / `@odata.etag` the compiled `ConfigBmc` schema requires.
+pub(crate) const AMI_CONFIG_BMC: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/Oem/ConfigBMC",
+    "@odata.etag":"W/\"ami-config-bmc-1\"",
+    "LockoutHostControl":"Enable",
+    "LockoutBiosVariableWriteMode":"Disable",
+    "LockdownBiosSettingsChange":"Enable",
+    "LockdownBiosUpgradeDowngrade":"Disable"
+}"#;
+
+/// `GET /redfish/v1/Chassis/1` -- the chassis of the `LiteOn` vendor profile.
+///
+/// The one `Manufacturer`-gated surface of the product: the chassis carries
+/// the exact `LITE-ON TECHNOLOGY CORP.` value the §11.3 probe and the §11.5
+/// read both key on (the value no other profile's chassis carries), plus the
+/// `PowerSubsystem` navigation the `LiteOn` read follows. The rest of the
+/// surface is byte-identical to [`CHASSIS`]. The document mirrors the
+/// `CHASSIS_WITH_LITEON_OEM_BODY` fixture `rutilus-infra-redfish` decodes
+/// in its own `LiteOn` tests.
+pub(crate) const CHASSIS_LITEON: &str = r#"{
+    "@odata.id":"/redfish/v1/Chassis/1",
+    "@odata.etag":"W/\"chassis-1\"",
+    "Id":"1",
+    "Name":"Chassis One",
+    "ChassisType":"RackMount",
+    "Manufacturer":"LITE-ON TECHNOLOGY CORP.",
+    "Model":"Power Shelf",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+    "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+    "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+    "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"},
+    "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"}
+}"#;
+
+/// `GET /redfish/v1/Chassis/1` -- the chassis of the Delta vendor profile.
+///
+/// Exactly the default chassis surface plus the `Oem.deltaenergysystems`
+/// segment that advertises the Delta OEM namespace (the key the §11.3
+/// namespace probe reads on the decoded member) and the `PowerSubsystem`
+/// navigation the Delta read follows. The document mirrors the
+/// `CHASSIS_WITH_DELTA_OEM_BODY` fixture `rutilus-infra-redfish` decodes in
+/// its own Delta tests.
+pub(crate) const CHASSIS_DELTA: &str = r#"{
+    "@odata.id":"/redfish/v1/Chassis/1",
+    "@odata.etag":"W/\"chassis-1\"",
+    "Id":"1",
+    "Name":"Chassis One",
+    "ChassisType":"RackMount",
+    "Manufacturer":"DELTA",
+    "Model":"Power Shelf",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "Power":{"@odata.id":"/redfish/v1/Chassis/1/Power"},
+    "Thermal":{"@odata.id":"/redfish/v1/Chassis/1/Thermal"},
+    "Sensors":{"@odata.id":"/redfish/v1/Chassis/1/Sensors"},
+    "Controls":{"@odata.id":"/redfish/v1/Chassis/1/Controls"},
+    "Assembly":{"@odata.id":"/redfish/v1/Chassis/1/Assembly"},
+    "Oem":{"deltaenergysystems":{"Power":true,"FanSpeedTarget":50}},
+    "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"}
+}"#;
+
+/// `GET /redfish/v1/Chassis/1/PowerSubsystem` -- the §11.5 `PowerSubsystem`
+/// document of the `LiteOn` and Delta vendor profiles, served at the chassis's
+/// `PowerSubsystem` navigation.
+///
+/// The document carries the `PowerSupplies` collection link both reads
+/// follow, mirroring the `POWER_SUBSYSTEM_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own tests.
+pub(crate) const POWER_SUBSYSTEM: &str = r#"{
+    "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem",
+    "Id":"PowerSubsystem",
+    "Name":"Power Subsystem",
+    "PowerSupplies":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies"}
+}"#;
+
+/// `GET /redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies` -- the §11.5
+/// power-supply collection of the `LiteOn` and Delta vendor profiles.
+///
+/// The single member document is served to the standard decode (the Delta
+/// read) and re-decoded through the compiled `LiteonPowerSupplyCollection`
+/// type (the `LiteOn` read); the collection shape is the same either way.
+pub(crate) const POWER_SUPPLIES_COLLECTION: &str = r##"{
+    "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+    "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+    "Name":"Power Supply Collection",
+    "Members":[{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"}]
+}"##;
+
+/// `GET /redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1` -- the §11.5
+/// `LiteOn` power supply of the `LiteOn` vendor profile.
+///
+/// The document mirrors the `LITEON_POWER_SUPPLY_1_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own `LiteOn` tests: the typed
+/// `LiteonPowerSupply` identity fields the family projects.
+pub(crate) const LITEON_POWER_SUPPLY_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+    "@odata.etag":"W/\"liteon-psu-1\"",
+    "Id":"1",
+    "Name":"Power Supply 1",
+    "Description":"LiteOn power supply",
+    "PowerSupplyType":"AC",
+    "PowerCapacityWatts":2200,
+    "Manufacturer":"LITE-ON TECHNOLOGY CORP.",
+    "Model":"PS-2200",
+    "FirmwareVersion":"1.02",
+    "SerialNumber":"LN1234",
+    "PartNumber":"LTP-2200",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+}"#;
+
+/// `GET /redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1` -- the §11.5
+/// Delta power supply of the Delta vendor profile.
+///
+/// The document mirrors the `DELTA_POWER_SUPPLY_1_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own Delta tests: the standard
+/// supply identity plus the `Oem.deltaenergysystems` extension with the
+/// `Power` flag and `FanSpeedTarget` value.
+pub(crate) const DELTA_POWER_SUPPLY_1: &str = r#"{
+    "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+    "@odata.etag":"W/\"delta-psu-1\"",
+    "Id":"1",
+    "Name":"Power Supply 1",
+    "Description":"Delta power supply",
+    "Oem":{"deltaenergysystems":{"Power":true,"FanSpeedTarget":50}}
 }"#;
 
 /// `GET /redfish/v1/Managers/1` -- the BMC manager of the NVIDIA vendor
@@ -1445,6 +1782,10 @@ pub(crate) fn service_root(profile: MockProfile) -> &'static str {
         MockProfile::Lenovo => SERVICE_ROOT_LENOVO,
         MockProfile::XFusion => SERVICE_ROOT_XFUSION,
         MockProfile::Inspur => SERVICE_ROOT_INSPUR,
+        MockProfile::Ami => SERVICE_ROOT_AMI,
+        MockProfile::Hpe => SERVICE_ROOT_HPE,
+        MockProfile::LiteOn => SERVICE_ROOT_LITEON,
+        MockProfile::Delta => SERVICE_ROOT_DELTA,
     }
 }
 
@@ -1574,8 +1915,13 @@ pub(crate) fn manager(profile: MockProfile) -> &'static str {
     match profile {
         // The default and the xFusion/Inspur no-OEM profiles keep the shared
         // default manager document; the vendor surfaces live on the manager
-        // member only for the profiles that carry an `Oem` namespace.
-        MockProfile::Rutilus | MockProfile::XFusion | MockProfile::Inspur => MANAGER,
+        // member only for the profiles that carry an `Oem` namespace, and the
+        // LiteOn and Delta surfaces live on the chassis member instead.
+        MockProfile::Rutilus
+        | MockProfile::XFusion
+        | MockProfile::Inspur
+        | MockProfile::LiteOn
+        | MockProfile::Delta => MANAGER,
         MockProfile::Dell => MANAGER_DELL,
         // The NVIDIA profile carries the `Oem.Nvidia` segment on both the
         // System member (the system-config-profile chain) and the Manager
@@ -1585,6 +1931,11 @@ pub(crate) fn manager(profile: MockProfile) -> &'static str {
         // member (the `SecurityService` surface); the System member stays
         // the shared default document.
         MockProfile::Lenovo => MANAGER_LENOVO,
+        // The AMI and HPE profiles carry their `Oem` segments on the Manager
+        // member (the `ConfigBMC` reference surface and the `HpeiLo`
+        // segment); the System member stays the shared default document.
+        MockProfile::Ami => MANAGER_AMI,
+        MockProfile::Hpe => MANAGER_HPE,
     }
 }
 
@@ -1595,12 +1946,17 @@ pub(crate) fn manager(profile: MockProfile) -> &'static str {
 /// and navigates the system-config-profile chain.
 pub(crate) fn system(profile: MockProfile) -> &'static str {
     match profile {
-        // The Dell and Lenovo profiles share the default system document:
-        // their OEM surfaces live on the manager member, not the system,
-        // and the xFusion and Inspur profiles serve no OEM surface at all.
+        // The Dell, Lenovo, AMI, HPE, LiteOn, and Delta profiles share the
+        // default system document: their OEM surfaces live on the manager or
+        // chassis member, not the system, and the xFusion and Inspur
+        // profiles serve no OEM surface at all.
         MockProfile::Rutilus
         | MockProfile::Dell
         | MockProfile::Lenovo
+        | MockProfile::Ami
+        | MockProfile::Hpe
+        | MockProfile::LiteOn
+        | MockProfile::Delta
         | MockProfile::XFusion
         | MockProfile::Inspur => SYSTEM,
         MockProfile::Nvidia => SYSTEM_NVIDIA,
@@ -1615,11 +1971,20 @@ pub(crate) fn system(profile: MockProfile) -> &'static str {
 pub(crate) fn chassis(profile: MockProfile) -> &'static str {
     match profile {
         MockProfile::Nvidia => CHASSIS_NVIDIA,
+        // The LiteOn profile carries the `Manufacturer` gate value plus the
+        // `PowerSubsystem` navigation on the chassis member (the one
+        // `Manufacturer`-gated surface of the product), and the Delta
+        // profile carries the `Oem.deltaenergysystems` segment plus the
+        // `PowerSubsystem` navigation on the chassis member.
+        MockProfile::LiteOn => CHASSIS_LITEON,
+        MockProfile::Delta => CHASSIS_DELTA,
         // The xFusion and Inspur profiles serve no OEM surface, so the
         // chassis stays the shared default document.
         MockProfile::Rutilus
         | MockProfile::Dell
         | MockProfile::Lenovo
+        | MockProfile::Ami
+        | MockProfile::Hpe
         | MockProfile::XFusion
         | MockProfile::Inspur => CHASSIS,
     }

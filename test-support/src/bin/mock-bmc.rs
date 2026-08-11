@@ -28,8 +28,13 @@ struct Cli {
     /// `DellAttributes` surface), `nvidia` (NVIDIA identity plus the §11.5
     /// chains), `lenovo` (Lenovo identity plus the §11.5
     /// `SecurityService` surface), `xfusion` (xFusion identity, no OEM
-    /// surface), or `inspur` (Inspur identity, no OEM surface).
-    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell", "nvidia", "lenovo", "xfusion", "inspur"])]
+    /// surface), `inspur` (Inspur identity, no OEM surface), `ami` (AMI
+    /// identity plus the §11.5 `AmiServiceRoot` and `ConfigBmc` surfaces),
+    /// `hpe` (HPE identity plus the §11.5 `HpeiLoServiceExt` and `HpeiLo`
+    /// segments), `liteon` (`LiteOn` identity plus the §11.5 `LiteOn`
+    /// power-supply chain), or `delta` (Delta identity plus the §11.5 Delta
+    /// power-supply chain).
+    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell", "nvidia", "lenovo", "xfusion", "inspur", "ami", "hpe", "liteon", "delta"])]
     profile: String,
 }
 
@@ -44,6 +49,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "lenovo" => MockProfile::Lenovo,
         "xfusion" => MockProfile::XFusion,
         "inspur" => MockProfile::Inspur,
+        "ami" => MockProfile::Ami,
+        "hpe" => MockProfile::Hpe,
+        "liteon" => MockProfile::LiteOn,
+        "delta" => MockProfile::Delta,
         _ => MockProfile::Rutilus,
     };
     let mock = MockBmc::bind_with_profile(cli.port, profile).await?;

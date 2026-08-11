@@ -330,6 +330,43 @@ pub(crate) fn dispatch(
         {
             json_ok(fixtures::LENOVO_SECURITY_SERVICE)
         }
+        // The §11.5 AMI `ConfigBmc` document is a vendor fixture: it exists
+        // only under the AMI profile, and any other profile must 404 it like
+        // any unserved path instead of leaking a vendor namespace. The
+        // document is reached through the `ConfigBMC` reference of the
+        // manager's `Oem.Ami` segment, so the route mirrors the exact
+        // `@odata.id` value the fixture serves.
+        (HttpMethod::Get, "/redfish/v1/Managers/1/Oem/ConfigBMC")
+            if state.profile() == MockProfile::Ami =>
+        {
+            json_ok(fixtures::AMI_CONFIG_BMC)
+        }
+        // The §11.5 LiteOn and Delta power-supply chains are vendor
+        // fixtures: they exist only under their profiles, and any other
+        // profile must 404 them like any unserved path instead of leaking a
+        // vendor namespace. The chains are reached through the chassis's
+        // `PowerSubsystem` navigation and its `PowerSupplies` collection, so
+        // the routes mirror the exact `@odata.id` values the fixtures serve.
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/PowerSubsystem")
+            if matches!(state.profile(), MockProfile::LiteOn | MockProfile::Delta) =>
+        {
+            json_ok(fixtures::POWER_SUBSYSTEM)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies")
+            if matches!(state.profile(), MockProfile::LiteOn | MockProfile::Delta) =>
+        {
+            json_ok(fixtures::POWER_SUPPLIES_COLLECTION)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1")
+            if state.profile() == MockProfile::LiteOn =>
+        {
+            json_ok(fixtures::LITEON_POWER_SUPPLY_1)
+        }
+        (HttpMethod::Get, "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1")
+            if state.profile() == MockProfile::Delta =>
+        {
+            json_ok(fixtures::DELTA_POWER_SUPPLY_1)
+        }
         (HttpMethod::Get, "/redfish/v1/Managers/1/LogServices") => {
             json_ok(fixtures::LOG_SERVICES_COLLECTION)
         }

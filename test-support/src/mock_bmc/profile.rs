@@ -91,12 +91,45 @@ pub enum MockProfile {
     /// vendor identity. Every document of the tree is shared with the
     /// default profile except the Service Root identity strings.
     Inspur,
+    /// The AMI `MegaRAC` fixture tree: Vendor "AMI" / Product `MegaRAC SP-X`,
+    /// the Service Root advertises `Oem.Ami` (the embedded `AmiServiceRoot`
+    /// segment, which flips the `oem-ami` capability probe to `Supported`),
+    /// `Managers/1` advertises `Oem.Ami` with the `ConfigBMC` reference, and
+    /// the §11.5 `ConfigBmc` document is served at that reference. Every
+    /// other document of the tree is shared with the default profile.
+    Ami,
+    /// The HPE iLO fixture tree: Vendor "HPE" / Product
+    /// `ProLiant DL380 Gen11`, the Service Root advertises `Oem.Hpe` (the
+    /// embedded `HpeiLoServiceExt` segment with the iLO manager identity,
+    /// which flips the `oem-hpe` capability probe to `Supported`), and
+    /// `Managers/1` advertises `Oem.Hpe` (the embedded `HpeiLo` segment).
+    /// Both segments are embedded, so the profile serves no OEM document.
+    /// Every other document of the tree is shared with the default profile.
+    Hpe,
+    /// The `LiteOn` power-shelf fixture tree: the Service Root carries the
+    /// `LiteOn` vendor identity and the `Power Shelf` product, the chassis
+    /// member carries the `Manufacturer` value `LITE-ON TECHNOLOGY CORP.`
+    /// (the one `Manufacturer`-gated surface of the product, which flips the
+    /// `oem-liteon` capability probe to `Supported`), and the §11.5
+    /// `PowerSubsystem` chain is served — the subsystem document, the
+    /// `PowerSupplies` collection re-decoded through the compiled `LiteOn`
+    /// type, and one supply member. Every other document of the tree is
+    /// shared with the default profile.
+    LiteOn,
+    /// The Delta power-shelf fixture tree: Vendor "DELTA" / Product
+    /// `Power Shelf`, the chassis member advertises
+    /// `Oem.deltaenergysystems` (which flips the `oem-delta` capability
+    /// probe to `Supported`), and the §11.5 `PowerSubsystem` chain is
+    /// served — the subsystem document, the `PowerSupplies` collection, and
+    /// one supply member carrying the Delta `Oem` segment. Every other
+    /// document of the tree is shared with the default profile.
+    Delta,
 }
 
 impl MockProfile {
     /// The lowercase profile name, matching the `mock-bmc` `--profile`
     /// values (`rutilus` | `dell` | `nvidia` | `lenovo` | `xfusion` |
-    /// `inspur`).
+    /// `inspur` | `ami` | `hpe` | `liteon` | `delta`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -106,6 +139,10 @@ impl MockProfile {
             Self::Lenovo => "lenovo",
             Self::XFusion => "xfusion",
             Self::Inspur => "inspur",
+            Self::Ami => "ami",
+            Self::Hpe => "hpe",
+            Self::LiteOn => "liteon",
+            Self::Delta => "delta",
         }
     }
 }
