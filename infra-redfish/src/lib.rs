@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 
 mod application_adapter;
 mod redfish_gateway;
+mod release_baseline;
 mod tls_probe;
 
 pub use application_adapter::{
@@ -17,6 +18,15 @@ pub use redfish_gateway::{
     RedfishGateway, RedfishServiceRootError, ServiceRootSummary, TaskMessageObservation,
     TaskObservation, TaskReadError, TlsIdentityStateError, UpdateArtifactUpload,
 };
+pub use release_baseline::{
+    BaselineModule, BaselineModuleClassification, BaselineOperation,
+    FROZEN_UNMAPPED_OPERATION_COUNT, NV_REDFISH_0_13_0_FEATURE_UNIVERSE,
+    NV_REDFISH_RELEASE_BASELINE, NV_REDFISH_RELEASE_BASELINE_VERSION, NvRedfishReleaseBaseline,
+    OperationMapping, REDFISH_COMMAND_FAMILIES, RELEASE_BASELINE_ENABLED_FEATURES,
+    RELEASE_BASELINE_EXPLICIT_FEATURES, RELEASE_BASELINE_LEDGER_HASH, RELEASE_BASELINE_MODULES,
+    RELEASE_BASELINE_OPERATIONS, RELEASE_SCHEMA_VERSIONS, ReleaseSchemaVersions,
+    capability_ledger_hash,
+};
 pub use tls_probe::{
     SystemCaStatus, TlsCertificateObservation, TlsProbe, TlsProbeError, TlsProbeInitError,
 };
@@ -25,7 +35,11 @@ pub use tls_probe::{
 ///
 /// This remains movable until the 0.8.0 capability freeze (§2.3), when the
 /// release baseline pins the crate version, the lockfile, and the complete
-/// capability inventory as a frozen ledger Hash.
+/// capability inventory as a frozen ledger Hash. The frozen record now
+/// exists: [`NV_REDFISH_RELEASE_BASELINE`] pins `0.13.0` (and records the
+/// newer stable `0.14.1` for the freeze review), so a development baseline
+/// that moves past the frozen version is a documented, reviewed decision
+/// instead of a silent drift.
 pub const NV_REDFISH_DEVELOPMENT_BASELINE: &str = "0.13.0";
 
 /// The OEM features linked into the single Rutilus binary.
@@ -89,8 +103,9 @@ impl NvRedfishBaseline {
 /// possibly serve. The 0.2 ledger projects this surface through the domain
 /// capability inventory, so every §2.1 feature is enumerated even before a
 /// probe observes it. Like the domain ledger, this baseline stays movable
-/// during development and becomes the frozen `NvRedfishReleaseBaseline`
-/// (including its ledger Hash) at 0.8.0 (§2.3).
+/// during development; its frozen 0.8.0 form is the release baseline in
+/// [`release_baseline`] ([`NV_REDFISH_RELEASE_BASELINE`], including the
+/// ledger Hash, §2.3).
 pub const COMPILED_NV_REDFISH_BASELINE: NvRedfishBaseline = NvRedfishBaseline {
     version: NV_REDFISH_DEVELOPMENT_BASELINE,
     standard_redfish: true,
