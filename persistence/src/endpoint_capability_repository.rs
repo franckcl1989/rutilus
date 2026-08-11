@@ -552,8 +552,9 @@ mod tests {
     }
 
     /// Every `EndpointCapability` variant of the standard-feature inventory
-    /// (the 30 §2.1 entries plus the 0.13.0 additions `ports`, `bmc-http`,
-    /// and `update-service-deprecated`), each with a deterministic state, so
+    /// (the 30 §2.1 entries plus the 0.13.0 compile-surface additions `ports`,
+    /// `bmc-http`, and `update-service-deprecated`; only `ports` is new in
+    /// 0.13.0), each with a deterministic state, so
     /// the round-trip proves both the capability code and the final state
     /// survive persistence.
     ///

@@ -1834,9 +1834,10 @@ impl CapabilityEntryResponse {
 /// Stable envelope for one endpoint's complete §2.1 capability ledger.
 ///
 /// `entries` always contains all 33 standard capabilities in design-document
-/// order (the 30 §2.1 features plus the 0.13.0 additions `ports`, `bmc-http`,
-/// and `update-service-deprecated`), even when none has been observed yet, so
-/// the UI can show a reason for every feature instead of hiding it.
+/// order (the 30 §2.1 features plus the 0.13.0 compile-surface additions
+/// `ports`, `bmc-http`, and `update-service-deprecated`, of which only `ports`
+/// is new in 0.13.0), even when none has been observed yet, so the UI can
+/// show a reason for every feature instead of hiding it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointCapabilityInventoryResponse {

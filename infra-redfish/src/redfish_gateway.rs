@@ -9180,9 +9180,10 @@ async fn probe_manager_features(
 }
 
 /// Assembles the §2.1 inventory in design-document order: the 33 standard
-/// capabilities first (the 30 §2.1 features plus the 0.13.0 additions
-/// `ports`, `bmc-http`, and `update-service-deprecated`), then the 14 OEM
-/// capabilities in `COMPILED_OEM_FEATURES` order.
+/// capabilities first (the 30 §2.1 features plus the 0.13.0 compile-surface
+/// additions `ports`, `bmc-http`, and `update-service-deprecated`, of which
+/// only `ports` is new in 0.13.0), then the 14 OEM capabilities in
+/// `COMPILED_OEM_FEATURES` order.
 ///
 /// Every field of [`CapabilityObservations`] maps to exactly one entry, so a
 /// future capability cannot silently drop out of discovery.
@@ -13102,8 +13103,9 @@ mod tests {
 
     /// The complete §2.1 capability inventory in ledger order (33 standard
     /// features — the 30 §2.1 entries in design-document order plus the
-    /// 0.13.0 additions `ports`, `bmc-http`, and `update-service-deprecated`
-    /// — followed by the 14 OEM features in the compiled feature order),
+    /// 0.13.0 compile-surface additions `ports`, `bmc-http`, and
+    /// `update-service-deprecated`, of which only `ports` is new in 0.13.0 —
+    /// followed by the 14 OEM features in the compiled feature order),
     /// mirrored from `rutilus_domain` so discovery can prove it covers every
     /// capability exactly once.
     const CAPABILITY_INVENTORY_ORDER: [EndpointCapability; 47] = [

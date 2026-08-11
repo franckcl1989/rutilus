@@ -2661,7 +2661,7 @@ impl CapabilityMatrixState {
         matches!(self, Self::Ready(matrix) if matrix.groups.is_empty())
     }
 
-    /// One-line summary of the loaded matrix, e.g. "30 capabilities across
+    /// One-line summary of the loaded matrix, e.g. "33 capabilities across
     /// 22 pages".
     fn summary_text(&self) -> String {
         match self {
@@ -16790,9 +16790,10 @@ mod tests {
     }
 
     /// The §2.1 capability ledger in design-document order (plus the 0.13.0
-    /// additions `ports`, `bmc-http`, and `update-service-deprecated`):
-    /// product code, upstream feature, and wire `ui_location` value of the
-    /// shared contract.
+    /// compile-surface additions `ports`, `bmc-http`, and
+    /// `update-service-deprecated`; only `ports` is new in 0.13.0): product
+    /// code, upstream feature, and wire `ui_location` value of the shared
+    /// contract.
     const LEDGER_FIXTURE: [(&str, &str, &str); 33] = [
         ("accounts", "accounts", "accounts"),
         ("assembly", "assembly", "assembly"),

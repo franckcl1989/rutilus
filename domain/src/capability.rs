@@ -4,9 +4,9 @@ use std::{error::Error, fmt, str::FromStr};
 ///
 /// Each variant maps to one public `nv-redfish` feature. The standard variants
 /// are the complete §2.1 standard-feature inventory (30 entries) in
-/// design-document order followed by the three capabilities nv-redfish 0.13.0
-/// adds to the compiled standard surface (`ports`, `bmc-http`,
-/// `update-service-deprecated`, §2.3); the OEM variants are the complete §2.1
+/// design-document order followed by the 0.13.0 compile-surface additions
+/// (`ports`, `bmc-http`, `update-service-deprecated`, §2.3; only `ports` is
+/// new in 0.13.0); the OEM variants are the complete §2.1
 /// OEM-feature inventory (14 entries) in the compiled-feature order of
 /// `COMPILED_OEM_FEATURES`, so the ledger can enumerate every capability the
 /// product may compile. Persisted identity is the `as_str()` product code,
@@ -328,11 +328,11 @@ impl EndpointCapability {
     /// `EnvironmentMetrics` aggregates temperature, fan, and power readings and
     /// is presented with the Sensors measurements page. Manager
     /// network-protocol settings stay on the Managers page (BMC information,
-    /// firmware, and network protocols per §3.1). The 0.13.0 additions follow
-    /// the same mapping: `Ports` joins the Network page (`PCIe 与网络`),
-    /// `BmcHttp` stays outside the data pages like `SessionService` (服务与连
-    /// 接), and `UpdateServiceDeprecated` stays on the Update page that already
-    /// presents the legacy upload surface.
+    /// firmware, and network protocols per §3.1). The three compile-surface
+    /// additions follow the same mapping: `Ports` joins the Network page
+    /// (`PCIe 与网络`), `BmcHttp` stays outside the data pages like
+    /// `SessionService` (服务与连接), and `UpdateServiceDeprecated` stays on the
+    /// Update page that already presents the legacy upload surface.
     #[must_use]
     pub const fn ui_location(self) -> UiLocation {
         match self {
@@ -387,10 +387,10 @@ impl EndpointCapability {
 }
 
 /// The complete §2.1 capability inventory: the 33 standard features (the 30
-/// §2.1 entries in design-document order followed by the three capabilities
-/// nv-redfish 0.13.0 adds to the compiled standard surface: `ports`,
-/// `bmc-http`, and `update-service-deprecated`) followed by the 14 OEM
-/// features in the compiled feature order of [`OEM_CAPABILITY_LEDGER_ORDER`].
+/// §2.1 entries in design-document order followed by the 0.13.0 compile-surface
+/// additions `ports`, `bmc-http`, and `update-service-deprecated`, of which
+/// only `ports` is new in 0.13.0) followed by the 14 OEM features in the
+/// compiled feature order of [`OEM_CAPABILITY_LEDGER_ORDER`].
 ///
 /// This is the canonical enumeration for every ledger projection: the Endpoint
 /// capability page renders exactly these 47 entries, and an entry without a
@@ -804,10 +804,9 @@ mod tests {
     use crate::resource_snapshot::{ResourceFeature, ResourceFeatureParseError};
 
     /// The standard-feature inventory: the §2.1 entries in design-document
-    /// order followed by the three capabilities nv-redfish 0.13.0 adds to the
-    /// compiled standard surface (`ports`, `bmc-http`,
-    /// `update-service-deprecated`). The ledger must map exactly this set and
-    /// nothing else.
+    /// order followed by the 0.13.0 compile-surface additions (`ports`,
+    /// `bmc-http`, and `update-service-deprecated`; only `ports` is new in
+    /// 0.13.0). The ledger must map exactly this set and nothing else.
     const STANDARD_FEATURES: [&str; 33] = [
         "accounts",
         "assembly",
@@ -977,7 +976,8 @@ mod tests {
         }
         // The full ledger appends the OEM inventory after the 33 standard
         // entries, so every projection shares one canonical order: the
-        // standard section keeps the §2.1 order (plus the 0.13.0 additions)
+        // standard section keeps the §2.1 order (plus the three compile-surface
+        // additions)
         // and the OEM section follows the compiled feature order.
         assert_eq!(
             &CAPABILITY_LEDGER_ORDER[33..],

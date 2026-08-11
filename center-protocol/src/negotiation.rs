@@ -154,11 +154,11 @@ mod tests {
     /// reviewed and pinned deliberately.
     ///
     /// This value changed on purpose with the 0.8.0 ledger growth: the three
-    /// nv-redfish 0.13.0 additions (`ports`, `bmc-http`,
-    /// `update-service-deprecated`) joined the 30 §2.1 standard entries,
-    /// so the digest moved from the 44-capability value to the 47-capability
-    /// value below. The protocol semantics are unchanged; only the pinned
-    /// ledger contents moved.
+    /// 0.13.0 compile-surface additions (`ports`, `bmc-http`,
+    /// `update-service-deprecated`; only `ports` is new in 0.13.0) joined the
+    /// 30 §2.1 standard entries, so the digest moved from the 44-capability
+    /// value to the 47-capability value below. The protocol semantics are
+    /// unchanged; only the pinned ledger contents moved.
     const GOLDEN_LEDGER_HASH: [u8; 32] = [
         0x84, 0xCA, 0xF5, 0x58, 0xF9, 0xAE, 0x77, 0xEA, 0x9C, 0xD4, 0xC3, 0xE7, 0xA2, 0x27, 0x1D,
         0xE6, 0x3A, 0x65, 0x25, 0x38, 0x81, 0xFD, 0x70, 0xBB, 0x0A, 0xAE, 0x18, 0x5E, 0x23, 0x56,

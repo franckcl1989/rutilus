@@ -150,7 +150,8 @@ where
     /// observations over [`CAPABILITY_LEDGER_ORDER`], so the result always
     /// contains exactly 47 entries in §2.1 ledger order: the 33 standard
     /// features (the 30 §2.1 entries in design-document order plus the 0.13.0
-    /// additions `ports`, `bmc-http`, and `update-service-deprecated`)
+    /// compile-surface additions `ports`, `bmc-http`, and
+    /// `update-service-deprecated`, of which only `ports` is new in 0.13.0)
     /// followed by the 14 OEM features in compiled feature order.
     ///
     /// # Errors
