@@ -890,8 +890,11 @@ impl Error for RoleIdError {}
 /// the command JSON is the §9.4 typed-payload contract shared by persistence
 /// and the center protocol, and the at-rest protection of the command column
 /// is the persistence crate's concern — the same split §10 keeps for the
-/// endpoint credential, whose at-rest encryption lives in the persistence
-/// crate and never in the domain command.
+/// endpoint credential, whose at-rest encryption lives outside the domain
+/// command. Persistence stores every command JSON as an authenticated
+/// `XChaCha20-Poly1305` ciphertext envelope under the instance master key
+/// (bound to the operation identity, `rutilus_security::encrypt_command`),
+/// so the command column never holds this value in the clear.
 ///
 /// `PartialEq`/`Eq` compare the exposed values: command payloads are
 /// compared for round-trip and state equality, never for authentication, so

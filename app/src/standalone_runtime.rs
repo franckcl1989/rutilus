@@ -114,7 +114,10 @@ pub struct StandaloneInstance {
 /// one registry between its accept loop and its web console services.
 pub(crate) struct StandaloneState {
     pub(crate) store: SqliteStore,
-    pub(crate) master_key: MasterKey,
+    /// The instance master key, shared with the store (which holds its `Arc`
+    /// clone for the at-rest command protection), so the secret bytes exist
+    /// in one allocation.
+    pub(crate) master_key: Arc<MasterKey>,
     pub(crate) _runtime_lock: RuntimeLock,
     pub(crate) audit_tail: Arc<Mutex<VecDeque<AuditEvent>>>,
     pub(crate) registry: Arc<CenterSessionRegistry>,
@@ -1272,9 +1275,13 @@ impl StandaloneInstance {
         runtime_lock: RuntimeLock,
         master_key: MasterKey,
     ) -> Result<Self, StandaloneInstanceError> {
-        let store = SqliteStore::open(paths.database_path())
-            .await
-            .map_err(StandaloneInstanceError::OpenStore)?;
+        let master_key = Arc::new(master_key);
+        // The store protects the operation command columns at rest with the
+        // same master key the credential and TOTP paths use.
+        let store =
+            SqliteStore::open_with_command_key(paths.database_path(), Arc::clone(&master_key))
+                .await
+                .map_err(StandaloneInstanceError::OpenStore)?;
         Ok(Self {
             state: Arc::new(StandaloneState {
                 store,

@@ -9,13 +9,18 @@ use sea_orm::entity::prelude::*;
 /// CHECK constraints so the recovery scanner never has to parse a code this
 /// build cannot classify.
 ///
-/// `command` is the serde JSON serialization of the typed domain
-/// `RedfishCommand` — the §9.4 `TypedPayloadJson` rule applied to commands:
-/// it can only ever come from a type successfully serialized, never from
-/// arbitrary hand-written JSON, and the database does not parse the structure.
-/// The repository rehydrates it through the domain type, and a payload no
-/// current build can deserialize is refused as a corrupt aggregate instead of
-/// half-understood.
+/// `command` is the at-rest-protected serialization of the typed domain
+/// `RedfishCommand` — the §9.4 `TypedPayloadJson` rule applied to commands,
+/// encrypted by the repository: the column holds the `RUTC1:`-prefixed
+/// `XChaCha20-Poly1305` ciphertext envelope under the instance master key,
+/// bound to the operation id, so command payloads (which can carry §10
+/// secrets such as an `AccountPassword`) never rest in the clear. Rows
+/// written before at-rest encryption (plain serde JSON) remain readable as
+/// legacy plaintext. It can only ever come from a type successfully
+/// serialized, never from arbitrary hand-written values, and the database
+/// does not parse the structure. The repository rehydrates it through the
+/// domain type, and a payload no current build can deserialize or
+/// authenticate is refused as a corrupt aggregate instead of half-understood.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "operations")]
 pub struct Model {
@@ -23,7 +28,7 @@ pub struct Model {
     pub id: Uuid,
     pub source: String,
     pub state: String,
-    /// The typed write command as serde JSON; see the model-level doc.
+    /// The typed write command, protected at rest; see the model-level doc.
     pub command: String,
     /// The §13.7 batch parent this operation belongs to, when it is a batch
     /// child. Batch children are ordinary single-target operations — the

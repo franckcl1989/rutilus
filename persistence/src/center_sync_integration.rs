@@ -9,7 +9,7 @@
 //! reconnect backoff, stop draining, batch flushing) live in the
 //! application crate against an in-memory outbox.
 
-use std::{error::Error, future::Future, time::Duration};
+use std::{error::Error, future::Future, sync::Arc, time::Duration};
 
 use rutilus_application::{
     BoundaryFuture, CenterSession, CenterSync, CenterSyncOptions, CenterTransport,
@@ -401,7 +401,7 @@ fn offer_for(
 async fn the_engine_accepts_an_offer_against_the_real_store() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::UNIX_EPOCH;
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let store = test_operation_store(&directory).await?;
     let instance_id = InstanceId::generate();
     let site = SiteInstance::new(
         instance_id,
@@ -487,7 +487,7 @@ async fn the_engine_accepts_an_offer_against_the_real_store() -> Result<(), Box<
 async fn a_duplicate_offer_stays_idempotent_against_the_real_store() -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::UNIX_EPOCH;
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let store = test_operation_store(&directory).await?;
     let instance_id = InstanceId::generate();
     let site = SiteInstance::new(
         instance_id,
@@ -688,4 +688,18 @@ where
             }
         }
     }
+}
+
+/// Opens a command-encrypted store for the offer tests: the offer persists
+/// an operation, so the store must carry the command encryption key exactly
+/// like the production runtime's store.
+async fn test_operation_store(
+    directory: &tempfile::TempDir,
+) -> Result<SqliteStore, Box<dyn Error>> {
+    let store = SqliteStore::open_with_command_key(
+        directory.path().join("rutilus.db"),
+        Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32]))),
+    )
+    .await?;
+    Ok(store)
 }

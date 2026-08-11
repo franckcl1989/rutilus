@@ -23,8 +23,12 @@ use rutilus_domain::{
     RoleAssignment, SiteInstance, SystemCommand,
 };
 use rutilus_entity::{artifact, center_inbox, endpoint, event};
+use rutilus_security::MasterKey;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use std::{error::Error, sync::Mutex};
+use std::{
+    error::Error,
+    sync::{Arc, Mutex},
+};
 use time::{Duration, OffsetDateTime};
 
 use crate::SqliteStore;
@@ -73,7 +77,13 @@ impl SiteCertificateIssuer for TestIssuer {
 
 async fn store_with_directory() -> Result<(tempfile::TempDir, SqliteStore), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    // The dispatch tests persist operation commands, so every store in this
+    // module carries the command encryption key like the production runtime.
+    let store = SqliteStore::open_with_command_key(
+        directory.path().join("rutilus.db"),
+        Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32]))),
+    )
+    .await?;
     Ok((directory, store))
 }
 
