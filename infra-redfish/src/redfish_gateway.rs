@@ -42,11 +42,46 @@ use nv_redfish::{
     },
     event_service::EventStreamPayload,
     manager::{Manager, ManagerCollection},
+    // The AMI OEM feature compiles its own generated module tree
+    // (`oem::ami::schema`) exactly like the Dell, Lenovo, NVIDIA, and
+    // Supermicro features. The Service Root's `Oem.Ami` segment decodes
+    // through the `AmiServiceRoot` schema (whose `RtpVersion` names the
+    // Redfish Technology Pack version), and the manager's `Oem.Ami` segment
+    // carries the `ConfigBMC` reference string the read resolves into the
+    // `ConfigBmc` document — the same reference the upstream `ConfigBmc`
+    // wrapper expands. The four lockout/lockdown state enums the document
+    // carries serialize by their vendor-defined wire spellings.
+    oem::ami::schema::ami_manager::{
+        ConfigBmc as AmiConfigBmcSchema,
+        LockdownBiosSettingsChangeState as AmiLockdownBiosSettingsChangeState,
+        LockdownBiosUpgradeDowngradeState as AmiLockdownBiosUpgradeDowngradeState,
+        LockoutBiosVariableWriteMode as AmiLockoutBiosVariableWriteMode,
+        LockoutHostControlState as AmiLockoutHostControlState,
+    },
+    oem::ami::schema::ami_service_root::AmiServiceRoot as AmiServiceRootSchema,
     // The Dell Attributes read surface is the one Dell OEM schema the
     // `oem-dell-attributes` feature compiles; it lives in the Dell OEM
     // feature's own generated module (`oem::dell::schema`), not in the base
     // `schema` module where the standard types are re-exported.
     oem::dell::schema::dell_attributes::DellAttributes as DellAttributesSchema,
+    // The Delta OEM feature compiles its own generated module tree
+    // (`oem::delta::schema`) exactly like the other vendor features. The
+    // power-supply extension decodes through the compiled
+    // `DeltaEnergySystemsPowerSupply` schema, whose `Power` flag and
+    // `FanSpeedTarget` value are the authoritative readings Delta power
+    // shelves publish instead of the standard `PowerState` field.
+    oem::delta::schema::delta_energy_systems_power_supply::PowerSupply as DeltaPowerSupplySchema,
+    // The HPE OEM feature compiles its own generated module tree
+    // (`oem::hpe::schema`) exactly like the other vendor features. The
+    // Service Root's `Oem.Hpe` segment decodes through the
+    // `HpeiLoServiceExt` schema (whose first `Manager` entry carries the
+    // `ManagerType` / `ManagerFirmwareVersion` texts, the first-entry surface
+    // of the upstream `manager_type()` accessor), and the manager's `Oem.Hpe`
+    // segment decodes through the `HpeiLo` schema (whose
+    // `VirtualNICEnabled` boolean names the host-side virtual NIC support
+    // state).
+    oem::hpe::schema::hpei_lo::HpeiLo as HpeManagerSchema,
+    oem::hpe::schema::hpei_lo_service_ext::HpeiLoServiceExt as HpeiLoServiceExtSchema,
     // The Lenovo OEM feature compiles its own generated module tree
     // (`oem::lenovo::schema`) exactly like the Dell, NVIDIA, and Supermicro
     // features. The manager's `Oem.Lenovo` segment decodes through the
@@ -62,6 +97,17 @@ use nv_redfish::{
         LenovoSecurityService as LenovoSecurityServiceSchema,
     },
     oem::lenovo::schema::resource::Resource as LenovoResourceSchema,
+    // The LiteOn OEM feature compiles its own generated module tree
+    // (`oem::liteon::schema`) exactly like the other vendor features. The
+    // `LiteonPowerSupply` entity extends the standard `PowerSupply` schema,
+    // and the family is gated on the chassis `Manufacturer` value
+    // `LITE-ON TECHNOLOGY CORP.` — the exact gate the upstream
+    // `chassis_fetch_links` applies.
+    oem::liteon::schema::liteon_power_supply::LiteonPowerSupply as LiteonPowerSupplySchema,
+    oem::liteon::schema::liteon_power_supply_collection::LiteonPowerSupplyCollection as LiteonPowerSupplyCollectionSchema,
+    oem::liteon::schema::power_supply::PowerSupplyType as LiteonPowerSupplyType,
+    oem::liteon::schema::resource::Health as LiteonHealth,
+    oem::liteon::schema::resource::State as LiteonState,
     // The NVIDIA OEM feature compiles its own generated module tree
     // (`oem::nvidia::schema`) exactly like the Dell and Supermicro features.
     // The system-config-profile family navigates from the ComputerSystem's
@@ -1336,6 +1382,7 @@ async fn read_authenticated_core_resources(
     trust: &TlsTrust,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let mut resources = vec![service_root_projection(root)?];
+    resources.extend(read_root_oem_surfaces(root)?);
     resources.extend(read_systems_resources(bmc, root, identity, trust).await?);
     resources.extend(read_chassis_resources(bmc, root, identity, trust).await?);
     resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
@@ -1586,6 +1633,7 @@ async fn read_chassis_resources(
             read_power_supply_resources(chassis.power_subsystem.as_ref(), bmc, identity, trust)
                 .await?,
         );
+        resources.extend(read_chassis_oem_resources(&chassis, bmc, identity, trust).await?);
     }
     Ok(resources)
 }
@@ -1620,6 +1668,155 @@ async fn read_power_supply_resources(
         power_supply_projection,
     )
     .await
+}
+
+/// Reads the chassis-bound §11.5 OEM surfaces: the `LiteOn` and Delta
+/// power-supply families (§0.5.0).
+///
+/// Both families enter through the decoded Chassis member — the `LiteOn`
+/// family through the one `Manufacturer`-gated surface of the product (the
+/// exact `LITE-ON TECHNOLOGY CORP.` value the §11.3 probe and the upstream
+/// `chassis_fetch_links` gate key on), the Delta family through the
+/// `deltaenergysystems` namespace key of the chassis's `Oem` segment (the
+/// same §11.3 namespace surface the probe decodes). A chassis that
+/// advertises neither surface produces no snapshot and no fabricated
+/// request ("资源存在才呈现"), exactly like every other OEM gate.
+async fn read_chassis_oem_resources(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let mut resources = Vec::new();
+    if chassis
+        .manufacturer
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map(String::as_str)
+        == Some(LITEON_CHASSIS_MANUFACTURER)
+    {
+        resources.extend(read_liteon_power_supply_resources(chassis, bmc, identity, trust).await?);
+    }
+    let advertises_delta = chassis
+        .base
+        .base
+        .oem
+        .as_ref()
+        .is_some_and(|oem| oem.additional_properties.get(DELTA_OEM_KEY).is_some());
+    if advertises_delta {
+        resources.extend(read_delta_power_supply_resources(chassis, bmc, identity, trust).await?);
+    }
+    Ok(resources)
+}
+
+/// Reads the `LiteOn` power supplies of a `LiteOn` chassis (§11.5).
+///
+/// The read mirrors the upstream `chassis_fetch_links` constructor exactly:
+/// the `PowerSubsystem` document is fetched through the chassis's typed
+/// navigation, the `PowerSupplies` collection link is re-navigated through
+/// the compiled `LiteonPowerSupplyCollection` type (which is what makes each
+/// member a typed `LiteonPowerSupply` navigation — the standard collection
+/// type cannot decode the member list for this family), and each member is
+/// fetched through its typed navigation with the member-level skip
+/// semantics of every other family. A missing `PowerSubsystem` or
+/// `PowerSupplies` link leaves the family absent; a failed subsystem or
+/// collection document keeps the classified read-error semantics, exactly
+/// like the standard `power-supplies` family.
+async fn read_liteon_power_supply_resources(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(power_subsystem) = &chassis.power_subsystem else {
+        return Ok(Vec::new());
+    };
+    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let Some(power_supplies) = &subsystem.power_supplies else {
+        return Ok(Vec::new());
+    };
+    let collection = NavProperty::<LiteonPowerSupplyCollectionSchema>::new_reference(
+        power_supplies.odata_id().clone(),
+    )
+    .get(bmc)
+    .await
+    .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in &collection.members {
+        let Some(supply) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        if let Some(projection) = member_projection(liteon_power_supply_projection(&supply))? {
+            resources.push(projection);
+        }
+    }
+    Ok(resources)
+}
+
+/// Reads the Delta power supplies of a Delta power shelf (§11.5).
+///
+/// The `PowerSubsystem` chain is fetched through the same typed navigation
+/// as the standard `power-supplies` family, and each supply member's `Oem`
+/// segment is decoded for the `deltaenergysystems` extension — the same
+/// vendor key and decode the upstream `DeltaPowerSupply` wrapper performs.
+/// A supply without the extension, or with an extension the compiled
+/// `DeltaEnergySystemsPowerSupply` schema rejects, is not a Delta surface
+/// and stays out of the family (one odd member, skipped exactly like an
+/// undecodable one); the family never invents a reading for it.
+async fn read_delta_power_supply_resources(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(power_subsystem) = &chassis.power_subsystem else {
+        return Ok(Vec::new());
+    };
+    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+        return Ok(Vec::new());
+    };
+    let Some(power_supplies) = &subsystem.power_supplies else {
+        return Ok(Vec::new());
+    };
+    let collection = power_supplies
+        .get(bmc)
+        .await
+        .map_err(|source| collection_failure(source, identity, trust))?;
+    let mut resources = Vec::new();
+    for member in collection.members() {
+        let Some(supply) = fetch_member(member, bmc, identity, trust).await? else {
+            continue;
+        };
+        let Some(delta) = decode_delta_segment(&supply) else {
+            continue;
+        };
+        if let Some(projection) = member_projection(delta_power_supply_projection(&supply, &delta))?
+        {
+            resources.push(projection);
+        }
+    }
+    Ok(resources)
+}
+
+/// Decodes one power supply's `Oem.deltaenergysystems` extension, or returns
+/// `None` when the supply carries no Delta extension or the compiled
+/// `DeltaEnergySystemsPowerSupply` schema rejects the value.
+///
+/// The decode is the exact surface of the upstream `DeltaPowerSupply`
+/// wrapper: the vendor key `deltaenergysystems` of the supply's `Oem`
+/// segment, decoded through the compiled schema — never a raw JSON read
+/// (§11.5 two-way rule).
+fn decode_delta_segment(supply: &PowerSupplySchema) -> Option<DeltaPowerSupplySchema> {
+    let oem_value = supply
+        .base
+        .base
+        .oem
+        .as_ref()?
+        .additional_properties
+        .get(DELTA_OEM_KEY)?;
+    serde_json::from_value(oem_value.clone()).ok()
 }
 
 /// Reads the Chassis member's `NetworkAdapters` collection and, for every
@@ -1745,6 +1942,8 @@ async fn read_manager_resources(
         resources.extend(read_manager_supermicro_oem(&manager, bmc, identity, trust).await?);
         resources.extend(read_manager_nvidia_oem(&manager, bmc, identity, trust).await?);
         resources.extend(read_manager_lenovo_oem(&manager, bmc, identity, trust).await?);
+        resources.extend(read_manager_ami_oem(&manager, bmc, identity, trust).await?);
+        resources.extend(read_manager_hpe_oem(&manager)?);
     }
     Ok(resources)
 }
@@ -2068,6 +2267,130 @@ async fn read_manager_lenovo_oem(
         lenovo_security_service_projection,
     )
     .await
+}
+
+/// Reads the AMI `AmiServiceRoot` segment embedded in the Service Root
+/// document (§11.5).
+///
+/// The segment is part of the already-decoded Service Root document, so the
+/// read issues no request: the `Oem.Ami` key is decoded into the compiled
+/// schema exactly like the SMC and Lenovo manager segments, and a segment
+/// the compiled schema rejects is one odd root surface that leaves the AMI
+/// service-root family absent. The snapshot identity is the segment's
+/// location inside the Service Root document (`{root}/Oem/Ami`) — the
+/// segment is part of that document, carries no `@odata.id` of its own (the
+/// compiled `AmiServiceRoot` is a complex type), and the endpoint inventory
+/// keeps one stable identity per snapshot, so the root's own identity is
+/// taken by the Service Root snapshot. The identity is a product storage
+/// key, never a fetch target: the read never issues a request for it (§11.5
+/// forbids fabricating a vendor URL to fetch).
+fn read_root_oem_surfaces(
+    root: &ServiceRoot<UpstreamBmc>,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let oem = root.root.base.base.oem.as_ref();
+    let mut resources = Vec::new();
+    // AMI: the embedded `Oem.Ami` value is vendor-shaped until the compiled
+    // `AmiServiceRoot` schema decodes it; a segment the compiled schema
+    // rejects is one odd root surface and leaves the AMI service-root family
+    // absent, exactly like an undecodable member.
+    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Ami"))
+        && let Ok(segment) = serde_json::from_value::<AmiServiceRootSchema>(value.clone())
+        && let Some(projection) = member_projection(ami_service_root_projection(root, &segment))?
+    {
+        resources.push(projection);
+    }
+    // HPE: the embedded `Oem.Hpe` value carries the `HpeiLoServiceExt`
+    // segment; the same embedded-segment semantics apply.
+    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Hpe"))
+        && let Ok(segment) = serde_json::from_value::<HpeiLoServiceExtSchema>(value.clone())
+        && let Some(projection) = member_projection(hpe_ilo_service_ext_projection(root, &segment))?
+    {
+        resources.push(projection);
+    }
+    Ok(resources)
+}
+
+/// Reads one manager's AMI `ConfigBMC` document (§11.5).
+///
+/// The AMI read mirrors `nv-redfish`'s own `ConfigBmc` constructor: only a
+/// manager document that advertises `Oem.Ami` is probed, the `ConfigBMC`
+/// value of the same segment (a reference string, exactly the shape the
+/// upstream wrapper reads) names the document, and the document is fetched
+/// through that vendor-published reference — never a crafted URL. The
+/// compiled `ConfigBmc` schema implements `EntityTypeRef`, so the fetch goes
+/// through the same typed `NavProperty` navigation every other family uses.
+///
+/// A manager without `Oem.Ami`, or with an `Oem.Ami` segment without a
+/// string `ConfigBMC` reference, produces no snapshot and no fabricated
+/// request; a failed or undecodable document is one odd manager surface and
+/// follows the member-level skip semantics like any other member fetch.
+async fn read_manager_ami_oem(
+    manager: &ManagerSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let oem = manager.base.base.oem.as_ref();
+    let advertises_ami = oem.is_some_and(|oem| oem.additional_properties.get("Ami").is_some());
+    if !advertises_ami {
+        return Ok(Vec::new());
+    }
+    let Some(config_bmc_path) = oem
+        .and_then(|oem| oem.additional_properties.get("ConfigBMC"))
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(Vec::new());
+    };
+    let odata_id = ODataId::from(config_bmc_path.to_string());
+    read_singleton_resources(
+        Some(&NavProperty::<AmiConfigBmcSchema>::new_reference(odata_id)),
+        bmc,
+        identity,
+        trust,
+        ami_config_bmc_projection,
+    )
+    .await
+}
+
+/// Reads one manager's HPE `HpeiLo` segment embedded in the Manager document
+/// (§11.5).
+///
+/// The segment is part of the already-decoded Manager document, so the read
+/// issues no request: the `Oem.Hpe` key is decoded into the compiled
+/// `HpeiLo` schema exactly like the AMI service-root segment, and a segment
+/// the compiled schema rejects is one odd manager surface that leaves the
+/// HPE manager family absent. The snapshot identity is the segment's
+/// location inside the Manager document (`{manager}/Oem/Hpe`) — the segment
+/// is part of that document, carries no `@odata.id` of its own (the compiled
+/// `HpeiLo` is a complex type), and the endpoint inventory keeps one stable
+/// identity per snapshot, so the manager's own identity is taken by the
+/// Manager snapshot. The identity is a product storage key, never a fetch
+/// target.
+fn read_manager_hpe_oem(
+    manager: &ManagerSchema,
+) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    let Some(oem_value) = manager
+        .base
+        .base
+        .oem
+        .as_ref()
+        .and_then(|oem| oem.additional_properties.get("Hpe"))
+    else {
+        return Ok(Vec::new());
+    };
+    let hpe: HpeManagerSchema = match serde_json::from_value(oem_value.clone()) {
+        Ok(segment) => segment,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let odata_id = ODataId::from(format!(
+        "{}/Oem/Hpe",
+        manager.odata_id().to_string().trim_end_matches('/')
+    ));
+    let Some(projection) = member_projection(hpe_manager_projection(&hpe, &odata_id, manager))?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![projection])
 }
 
 /// Decodes one `Oem.Nvidia` segment value into the chain-entry
@@ -9139,6 +9462,156 @@ struct PowerSupplyPayload {
     status: Option<ResourceStatusPayload>,
 }
 
+/// The §0.5.0 AMI `AmiServiceRoot` family projection.
+///
+/// The field set is exactly the `OemAmiServiceRootPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The segment is
+/// part of the Service Root document, so the common identity is the Service
+/// Root's own; the `RtpVersion` value is the compiled `Edm.String` text of
+/// the Redfish Technology Pack version, projected only when the endpoint
+/// published it.
+#[derive(Serialize)]
+struct AmiServiceRootPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "RtpVersion", skip_serializing_if = "Option::is_none")]
+    rtp_version: Option<String>,
+}
+
+/// The §0.5.0 AMI `ConfigBmc` family projection.
+///
+/// The field set is exactly the `OemAmiConfigBmcPayload` the application
+/// boundary decodes with `deny_unknown_fields`, so an extra field here would
+/// make every stored snapshot unreadable at projection time. The compiled
+/// `ConfigBmc` schema models the four BIOS lockout/lockdown states beside
+/// its base `@odata.id` / `@odata.etag`, which stay on the snapshot; each
+/// enum is serialized by its vendor-defined wire spelling (`Enable`,
+/// `Disable`, or `UnsupportedValue` for a value this build cannot classify),
+/// per §12.3. The schema models no `Id` / `Name` / `Description` properties,
+/// so there are no common fields to project — the application boundary
+/// derives the product identity from the snapshot's `@odata.id` instead.
+#[derive(Serialize)]
+struct AmiConfigBmcPayload {
+    #[serde(rename = "LockoutHostControl", skip_serializing_if = "Option::is_none")]
+    lockout_host_control: Option<AmiLockoutHostControlState>,
+    #[serde(
+        rename = "LockoutBiosVariableWriteMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    lockout_bios_variable_write_mode: Option<AmiLockoutBiosVariableWriteMode>,
+    #[serde(
+        rename = "LockdownBiosSettingsChange",
+        skip_serializing_if = "Option::is_none"
+    )]
+    lockdown_bios_settings_change: Option<AmiLockdownBiosSettingsChangeState>,
+    #[serde(
+        rename = "LockdownBiosUpgradeDowngrade",
+        skip_serializing_if = "Option::is_none"
+    )]
+    lockdown_bios_upgrade_downgrade: Option<AmiLockdownBiosUpgradeDowngradeState>,
+}
+
+/// The §0.5.0 HPE `HpeiLoServiceExt` family projection.
+///
+/// The field set is exactly the `OemHpeILoServiceExtPayload` the application
+/// boundary decodes with `deny_unknown_fields`. The segment is part of the
+/// Service Root document, so the common identity is the Service Root's own;
+/// the `ManagerType` / `ManagerFirmwareVersion` texts of the first `Manager`
+/// entry (the first-entry surface of the upstream `manager_type()` accessor)
+/// are projected only when the endpoint published them.
+#[derive(Serialize)]
+struct HpeiLoServiceExtPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "ManagerType", skip_serializing_if = "Option::is_none")]
+    manager_type: Option<String>,
+    #[serde(
+        rename = "ManagerFirmwareVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    manager_firmware_version: Option<String>,
+}
+
+/// The §0.5.0 HPE `HpeiLo` family projection.
+///
+/// The field set is exactly the `OemHpeManagerPayload` the application
+/// boundary decodes with `deny_unknown_fields`. The segment is part of the
+/// Manager document, so the common identity is the Manager's own; the
+/// `VirtualNICEnabled` boolean is projected only when the endpoint
+/// published it.
+#[derive(Serialize)]
+struct HpeManagerPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "VirtualNICEnabled", skip_serializing_if = "Option::is_none")]
+    virtual_nic_enabled: Option<bool>,
+}
+
+/// The §0.5.0 `LiteOn` `LiteonPowerSupply` family projection.
+///
+/// The field set is exactly the `OemLiteOnPowerSupplyPayload` the
+/// application boundary decodes with `deny_unknown_fields`. The compiled
+/// `LiteonPowerSupply` entity extends the standard `PowerSupply` schema
+/// through the `LiteOn` feature's own generated module tree, so the projected
+/// fields are the same typed power-supply identity fields the standard
+/// family projects — the `PowerSupplyType` enum spelling verbatim, the
+/// numeric `PowerCapacityWatts`, the hardware identity texts, and the
+/// `Status` summary — serialized through the `LiteOn` module's own enum types
+/// (whose wire spellings are the standard CSDL spellings).
+#[derive(Serialize)]
+struct LiteOnPowerSupplyPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "PowerSupplyType", skip_serializing_if = "Option::is_none")]
+    power_supply_type: Option<LiteonPowerSupplyType>,
+    #[serde(rename = "PowerCapacityWatts", skip_serializing_if = "Option::is_none")]
+    power_capacity_watts: Option<f64>,
+    #[serde(rename = "Manufacturer", skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model", skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "FirmwareVersion", skip_serializing_if = "Option::is_none")]
+    firmware_version: Option<String>,
+    #[serde(rename = "SerialNumber", skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(rename = "PartNumber", skip_serializing_if = "Option::is_none")]
+    part_number: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none")]
+    status: Option<LiteOnStatusPayload>,
+}
+
+/// The `Status` summary of the §0.5.0 `LiteOn` supply projection, built from
+/// the `LiteOn` module's own compiled `State` / `Health` enums (whose wire
+/// spellings are the standard CSDL spellings).
+#[derive(Serialize)]
+struct LiteOnStatusPayload {
+    #[serde(rename = "State", skip_serializing_if = "Option::is_none")]
+    state: Option<LiteonState>,
+    #[serde(rename = "Health", skip_serializing_if = "Option::is_none")]
+    health: Option<LiteonHealth>,
+    #[serde(rename = "HealthRollup", skip_serializing_if = "Option::is_none")]
+    health_rollup: Option<LiteonHealth>,
+}
+
+/// The §0.5.0 Delta power-supply family projection.
+///
+/// The field set is exactly the `OemDeltaPowerSupplyPayload` the application
+/// boundary decodes with `deny_unknown_fields`. The common identity is the
+/// standard supply's own (the compiled `DeltaEnergySystemsPowerSupply` is an
+/// extension of the supply's `Oem` segment, not a separate document); the
+/// `Power` flag and the numeric `FanSpeedTarget` value are the compiled
+/// extension fields, projected only when the supply published them.
+#[derive(Serialize)]
+struct DeltaPowerSupplyPayload {
+    #[serde(flatten)]
+    resource: CommonResourcePayload,
+    #[serde(rename = "Power", skip_serializing_if = "Option::is_none")]
+    power: Option<bool>,
+    #[serde(rename = "FanSpeedTarget", skip_serializing_if = "Option::is_none")]
+    fan_speed_target: Option<i64>,
+}
+
 /// The §0.2.0 `network-device-functions` family member projection.
 ///
 /// The field set is exactly the `NetworkDeviceFunctionPayload` the
@@ -10398,6 +10871,211 @@ fn power_supply_projection(
     )
 }
 
+/// Projects the embedded AMI `AmiServiceRoot` segment of the Service Root
+/// into the OEM family.
+///
+/// The segment is part of the Service Root document, so the `ETag` is the
+/// Service Root's own (there is no separate document to fetch); the
+/// `@odata.id` is the segment's location inside that document
+/// (`{root}/Oem/Ami`), a product storage key the read never fetches — the
+/// root's own identity is taken by the Service Root snapshot, and the
+/// endpoint inventory keeps one stable identity per snapshot (§11.5 forbids
+/// fabricating a vendor URL to fetch). The `RtpVersion` value is projected
+/// as the compiled `Edm.String` text. The segment is one root surface, so an
+/// unrepresentable identity or payload is skipped by the caller through the
+/// member-level `member_projection` semantics.
+fn ami_service_root_projection(
+    root: &ServiceRoot<UpstreamBmc>,
+    segment: &AmiServiceRootSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = AmiServiceRootPayload {
+        resource: CommonResourcePayload::from_resource(root),
+        rtp_version: segment
+            .rtp_version
+            .as_ref()
+            .and_then(Option::as_ref)
+            .cloned(),
+    };
+    build_core_projection(
+        ResourceFeature::OemAmiServiceRoot,
+        &ODataId::from(format!(
+            "{}/Oem/Ami",
+            root.odata_id().to_string().trim_end_matches('/')
+        )),
+        root.root.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed AMI `ConfigBmc` document into the OEM family.
+///
+/// The `@odata.id` and `ETag` come from the typed schema exactly like every
+/// other family; the four BIOS lockout/lockdown states are serialized by
+/// their vendor-defined wire spellings (`Enable`, `Disable`, or
+/// `UnsupportedValue` for a value this build cannot classify), never
+/// translated, per §12.3. The compiled schema models no `Id` / `Name` /
+/// `Description`, so the product identity is derived from the snapshot's
+/// `@odata.id` by the application boundary. The document is one manager
+/// surface, so an unrepresentable identifier or payload is skipped by the
+/// caller through the member-level `member_projection` semantics.
+fn ami_config_bmc_projection(
+    config_bmc: &AmiConfigBmcSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = AmiConfigBmcPayload {
+        lockout_host_control: config_bmc.lockout_host_control,
+        lockout_bios_variable_write_mode: config_bmc.lockout_bios_variable_write_mode,
+        lockdown_bios_settings_change: config_bmc.lockdown_bios_settings_change,
+        lockdown_bios_upgrade_downgrade: config_bmc.lockdown_bios_upgrade_downgrade,
+    };
+    build_core_projection(
+        ResourceFeature::OemAmiConfigBmc,
+        config_bmc.odata_id(),
+        config_bmc.etag(),
+        &payload,
+    )
+}
+
+/// Projects the embedded HPE `HpeiLoServiceExt` segment of the Service Root
+/// into the OEM family.
+///
+/// The segment is part of the Service Root document, so the `ETag` is the
+/// Service Root's own; the `@odata.id` is the segment's location inside that
+/// document (`{root}/Oem/Hpe`), a product storage key the read never
+/// fetches. The `ManagerType` / `ManagerFirmwareVersion` texts of the first
+/// `Manager` entry — the first-entry surface of the upstream
+/// `manager_type()` accessor — are projected only when the endpoint
+/// published them. The segment is one root surface, so an unrepresentable
+/// identity or payload is skipped by the caller through the member-level
+/// `member_projection` semantics.
+fn hpe_ilo_service_ext_projection(
+    root: &ServiceRoot<UpstreamBmc>,
+    segment: &HpeiLoServiceExtSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let manager = segment.manager.iter().flatten().next();
+    let payload = HpeiLoServiceExtPayload {
+        resource: CommonResourcePayload::from_resource(root),
+        manager_type: manager
+            .and_then(|entry| entry.manager_type.as_ref())
+            .and_then(Option::as_ref)
+            .cloned(),
+        manager_firmware_version: manager
+            .and_then(|entry| entry.manager_firmware_version.as_ref())
+            .and_then(Option::as_ref)
+            .cloned(),
+    };
+    build_core_projection(
+        ResourceFeature::OemHpeILoServiceExt,
+        &ODataId::from(format!(
+            "{}/Oem/Hpe",
+            root.odata_id().to_string().trim_end_matches('/')
+        )),
+        root.root.etag(),
+        &payload,
+    )
+}
+
+/// Projects the embedded HPE `HpeiLo` segment of the Manager document into
+/// the OEM family.
+///
+/// The segment is part of the Manager document, so the common identity and
+/// `ETag` are the Manager's own; the `@odata.id` is the segment's location
+/// inside that document (`{manager}/Oem/Hpe`), a product storage key the
+/// read never fetches. The `VirtualNICEnabled` boolean is projected only
+/// when the endpoint published it. The segment is one manager surface, so an
+/// unrepresentable identity or payload is skipped by the caller through the
+/// member-level `member_projection` semantics.
+fn hpe_manager_projection(
+    hpe: &HpeManagerSchema,
+    odata_id: &ODataId,
+    manager: &ManagerSchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = HpeManagerPayload {
+        resource: CommonResourcePayload::from_schema_base(&manager.base),
+        virtual_nic_enabled: hpe.virtual_nic_enabled,
+    };
+    build_core_projection(
+        ResourceFeature::OemHpeManager,
+        odata_id,
+        manager.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed `LiteOn` `LiteonPowerSupply` document into the OEM
+/// family.
+///
+/// The `@odata.id` and `ETag` come from the typed schema exactly like every
+/// other family; the compiled `LiteonPowerSupply` entity extends the
+/// standard `PowerSupply` schema, so the projected fields are the same typed
+/// power-supply identity fields the standard family projects (`PowerSupplyType`
+/// spelling verbatim per §12.3, numeric `PowerCapacityWatts`, hardware
+/// identity texts, and `Status`). The document is one chain surface, so an
+/// unrepresentable identifier or payload is skipped by the caller through
+/// the member-level `member_projection` semantics.
+fn liteon_power_supply_projection(
+    supply: &LiteonPowerSupplySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    // The LiteOn module tree carries its own `resource::Resource` base, so
+    // the common identity is built field-by-field from the compiled base
+    // instead of the standard `from_schema_base` helper.
+    let payload = LiteOnPowerSupplyPayload {
+        resource: CommonResourcePayload {
+            id: supply.base.id.clone(),
+            name: supply.base.name.clone(),
+            description: supply
+                .base
+                .description
+                .as_ref()
+                .and_then(Option::as_ref)
+                .cloned(),
+        },
+        power_supply_type: supply.power_supply_type.as_ref().copied().flatten(),
+        power_capacity_watts: supply.power_capacity_watts.as_ref().copied().flatten(),
+        manufacturer: optional_nullable_text(supply.manufacturer.as_ref()),
+        model: optional_nullable_text(supply.model.as_ref()),
+        firmware_version: optional_nullable_text(supply.firmware_version.as_ref()),
+        serial_number: optional_nullable_text(supply.serial_number.as_ref()),
+        part_number: optional_nullable_text(supply.part_number.as_ref()),
+        status: supply.status.as_ref().map(|status| LiteOnStatusPayload {
+            state: status.state.as_ref().copied().flatten(),
+            health: status.health.as_ref().copied().flatten(),
+            health_rollup: status.health_rollup.as_ref().copied().flatten(),
+        }),
+    };
+    build_core_projection(
+        ResourceFeature::OemLiteOnPowerSupply,
+        supply.odata_id(),
+        supply.etag(),
+        &payload,
+    )
+}
+
+/// Projects one typed Delta power-supply extension into the OEM family.
+///
+/// The `@odata.id` and `ETag` are the standard supply's own (the compiled
+/// `DeltaEnergySystemsPowerSupply` is an extension of the supply's `Oem`
+/// segment, not a separate document); the `Power` flag and the numeric
+/// `FanSpeedTarget` value are the compiled extension fields, serialized by
+/// their vendor-defined shapes per §12.3. The document is one chain surface,
+/// so an unrepresentable identifier or payload is skipped by the caller
+/// through the member-level `member_projection` semantics.
+fn delta_power_supply_projection(
+    supply: &PowerSupplySchema,
+    delta: &DeltaPowerSupplySchema,
+) -> Result<CoreResourceProjection, CoreResourceReadError> {
+    let payload = DeltaPowerSupplyPayload {
+        resource: CommonResourcePayload::from_schema_base(&supply.base),
+        power: delta.power.flatten(),
+        fan_speed_target: delta.fan_speed_target.flatten(),
+    };
+    build_core_projection(
+        ResourceFeature::OemDeltaPowerSupply,
+        supply.odata_id(),
+        supply.etag(),
+        &payload,
+    )
+}
+
 fn network_device_function_projection(
     function: &NetworkDeviceFunctionSchema,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -11456,6 +12134,15 @@ struct OemNamespaceProbe {
 /// mirrors that exact gate instead of inventing a namespace key the vendor
 /// does not use.
 const LITEON_CHASSIS_MANUFACTURER: &str = "LITE-ON TECHNOLOGY CORP.";
+
+/// The vendor key under which Delta nests its `PowerSupply` OEM extension.
+///
+/// `Delta` is the one compiled vendor whose surface `nv-redfish` 0.13 keys
+/// by the `deltaenergysystems` namespace instead of a vendor-name key
+/// (`oem/delta/power_supply.rs` publishes exactly this `OEM_KEY` constant),
+/// so the probe and the read both mirror that exact key instead of
+/// inventing one the vendor does not use.
+const DELTA_OEM_KEY: &str = "deltaenergysystems";
 
 /// Every probed state grouped by origin, so the §2.1 observation vector can
 /// be assembled exhaustively without a 47-field hand-written tuple.
@@ -12886,6 +13573,252 @@ mod tests {
         "Name":"Lenovo Security Service",
         "Description":"Lenovo security service",
         "Configurator":{"FWRollback":"Enabled"}
+    }"#;
+
+    /// A Service Root whose `Oem` segment embeds the AMI `AmiServiceRoot`
+    /// object: the `RtpVersion` value the AMI service-root family projects.
+    /// The segment is decoded into the compiled `AmiServiceRoot` schema
+    /// exactly like the upstream `AmiServiceRoot::new` decodes it.
+    const ROOT_WITH_AMI_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"AMI",
+        "Product":"MegaRAC SP-X",
+        "Oem":{"Ami":{"RtpVersion":"1.2.3"}},
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    }"#;
+
+    /// A Service Root whose `Oem.Ami` segment cannot be decoded by the
+    /// compiled `AmiServiceRoot` schema: the `Ami` key carries a non-object
+    /// value, so the root segment is one odd root surface and leaves the AMI
+    /// service-root family absent without a request.
+    const ROOT_WITH_UNDECODABLE_AMI_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "Oem":{"Ami":5},
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    }"#;
+
+    /// A Service Root whose `Oem` segment embeds the HPE `HpeiLoServiceExt`
+    /// object: the `Manager` array with the iLO manager identity the HPE
+    /// service-root family projects. The segment is decoded into the
+    /// compiled `HpeiLoServiceExt` schema exactly like the upstream
+    /// `HpeiLoServiceExt::new` decodes it.
+    const ROOT_WITH_HPE_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"HPE",
+        "Product":"ProLiant DL380 Gen11",
+        "Oem":{"Hpe":{
+            "Manager":[{"ManagerType":"iLO 5","ManagerFirmwareVersion":"2.44"}]
+        }},
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    }"#;
+
+    /// A Service Root whose `Oem.Hpe` segment cannot be decoded by the
+    /// compiled `HpeiLoServiceExt` schema: the `Hpe` key carries a non-object
+    /// value, so the root segment is one odd root surface and leaves the HPE
+    /// service-root family absent without a request.
+    const ROOT_WITH_UNDECODABLE_HPE_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "@odata.etag":"W/\"root-1\"",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "Oem":{"Hpe":5},
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"}
+    }"#;
+
+    /// A Manager member whose `Oem.Ami` segment advertises the AMI namespace
+    /// and carries the `ConfigBMC` reference string the AMI read follows —
+    /// the same `{"Oem":{"Ami":...,"ConfigBMC":"..."}}` shape the upstream
+    /// `ConfigBmc::new` constructor reads (the `ConfigBMC` value is a
+    /// sibling of the `Ami` value, both inside the manager's `Oem` bag).
+    const MANAGER_WITH_AMI_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{
+            "Ami":{"Anything":true},
+            "ConfigBMC":"/redfish/v1/Managers/1/Oem/ConfigBMC"
+        }
+    }"#;
+
+    /// A Manager member whose `Oem.Ami` segment advertises the AMI namespace
+    /// but carries no `ConfigBMC` reference: the family stays absent and no
+    /// document request is fabricated.
+    const MANAGER_WITH_AMI_OEM_WITHOUT_CONFIG_BMC_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Ami":{"Anything":true}}
+    }"#;
+
+    /// A Manager member whose `Oem.Ami` segment cannot be decoded (a
+    /// non-object value): one odd manager surface, the AMI config-bmc family
+    /// stays absent and no document request is fabricated.
+    const MANAGER_WITH_UNDECODABLE_AMI_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Ami":5}
+    }"#;
+
+    /// The typed AMI `ConfigBmc` document served at the `ConfigBMC`
+    /// reference, carrying all four BIOS lockout/lockdown states in their
+    /// vendor enum spellings.
+    const AMI_CONFIG_BMC_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1/Oem/ConfigBMC",
+        "@odata.etag":"W/\"ami-config-bmc-1\"",
+        "LockoutHostControl":"Enable",
+        "LockoutBiosVariableWriteMode":"Disable",
+        "LockdownBiosSettingsChange":"Enable",
+        "LockdownBiosUpgradeDowngrade":"Disable"
+    }"#;
+
+    /// A Manager member whose `Oem.Hpe` segment embeds the `HpeiLo` object
+    /// with the `VirtualNICEnabled` value the HPE manager family projects.
+    /// The segment is decoded into the compiled `HpeiLo` schema exactly like
+    /// the upstream `HpeManager::new` decodes it.
+    const MANAGER_WITH_HPE_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Hpe":{"VirtualNICEnabled":true}}
+    }"#;
+
+    /// A Manager member whose `Oem.Hpe` segment cannot be decoded by the
+    /// compiled `HpeiLo` schema: the `Hpe` key carries a non-object value, so
+    /// the segment is one odd manager surface and leaves the HPE manager
+    /// family absent without a request.
+    const MANAGER_WITH_UNDECODABLE_HPE_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Managers/1",
+        "@odata.etag":"W/\"manager-1\"",
+        "Id":"1",
+        "Name":"Manager One",
+        "ManagerType":"BMC",
+        "Oem":{"Hpe":5}
+    }"#;
+
+    /// A Chassis member that carries the exact `LITE-ON TECHNOLOGY CORP.`
+    /// `Manufacturer` gate value and the `PowerSubsystem` navigation the
+    /// `LiteOn` read follows.
+    const CHASSIS_WITH_LITEON_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Manufacturer":"LITE-ON TECHNOLOGY CORP.",
+        "Model":"Power Shelf",
+        "PowerState":"On",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"}
+    }"#;
+
+    /// A Chassis member that advertises the `deltaenergysystems` namespace
+    /// key (the §11.3 gate) and carries the `PowerSubsystem` navigation the
+    /// Delta read follows.
+    const CHASSIS_WITH_DELTA_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1",
+        "@odata.etag":"W/\"chassis-1\"",
+        "Id":"1",
+        "Name":"Chassis One",
+        "ChassisType":"RackMount",
+        "Manufacturer":"DELTA",
+        "Model":"Power Shelf",
+        "PowerState":"On",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+        "Oem":{"deltaenergysystems":{"Power":true,"FanSpeedTarget":50}},
+        "PowerSubsystem":{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem"}
+    }"#;
+
+    /// The power-supply collection with the single member document, served
+    /// to the standard decode (the Delta read) and re-decoded through the
+    /// compiled `LiteonPowerSupplyCollection` type (the `LiteOn` read).
+    const POWER_SUPPLIES_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#PowerSupplyCollection.PowerSupplyCollection",
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "Name":"Power Supply Collection",
+        "Members":[{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"}]
+    }"##;
+
+    /// The typed `LiteOn` supply document carrying the identity fields the
+    /// family projects.
+    const LITEON_POWER_SUPPLY_1_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "@odata.etag":"W/\"liteon-psu-1\"",
+        "Id":"1",
+        "Name":"Power Supply 1",
+        "Description":"LiteOn power supply",
+        "PowerSupplyType":"AC",
+        "PowerCapacityWatts":2200,
+        "Manufacturer":"LITE-ON TECHNOLOGY CORP.",
+        "Model":"PS-2200",
+        "FirmwareVersion":"1.02",
+        "SerialNumber":"LN1234",
+        "PartNumber":"LTP-2200",
+        "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}
+    }"#;
+
+    /// The Delta supply document: the standard supply identity plus the
+    /// `Oem.deltaenergysystems` extension with the `Power` flag and
+    /// `FanSpeedTarget` value.
+    const DELTA_POWER_SUPPLY_1_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "@odata.etag":"W/\"delta-psu-1\"",
+        "Id":"1",
+        "Name":"Power Supply 1",
+        "Description":"Delta power supply",
+        "Oem":{"deltaenergysystems":{"Power":true,"FanSpeedTarget":50}}
+    }"#;
+
+    /// A Delta-chassis supply member that carries no `deltaenergysystems`
+    /// extension: the member is not a Delta surface and stays out of the
+    /// family, one odd member skipped exactly like an undecodable one.
+    const DELTA_POWER_SUPPLY_WITHOUT_OEM_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "@odata.etag":"W/\"delta-psu-1\"",
+        "Id":"1",
+        "Name":"Power Supply 1",
+        "Description":"Delta power supply"
     }"#;
 
     /// The typed NVIDIA `NvidiaPowerComplianceManager` chain-root document,
@@ -15044,6 +15977,75 @@ mod tests {
         "/redfish/v1/Managers",
         "/redfish/v1/Managers/1",
         "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one manager that advertises `Oem.Ami`: the
+    /// `ConfigBMC` document is read right after the manager member, fetched
+    /// through the `ConfigBMC` reference string of the `Oem.Ami` segment,
+    /// exactly like the other manager-bound families.
+    const CORE_RESOURCE_WITH_AMI_CONFIG_BMC_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/Managers/1/Oem/ConfigBMC",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one `LiteOn` chassis: the `PowerSubsystem`
+    /// document, its `PowerSupplies` collection (re-decoded through the
+    /// compiled `LiteonPowerSupplyCollection` type), and the one supply
+    /// member are read right after the chassis member — once for the
+    /// standard `power-supplies` family and once for the `LiteOn` family,
+    /// whose compiled decode target re-navigates the same chain.
+    const CORE_RESOURCE_WITH_LITEON_REQUEST_PATHS: [&str; 17] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order for one Delta power shelf: the `PowerSubsystem`
+    /// document, its `PowerSupplies` collection, and the one supply member
+    /// are read right after the chassis member — once for the standard
+    /// `power-supplies` family and once for the Delta family.
+    const CORE_RESOURCE_WITH_DELTA_REQUEST_PATHS: [&str; 17] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/Systems",
+        "/redfish/v1/Systems/1",
+        "/redfish/v1/Chassis",
+        "/redfish/v1/Chassis/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        "/redfish/v1/Managers",
+        "/redfish/v1/Managers/1",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -18219,6 +19221,576 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_ami_service_root_segment_embedded_in_the_service_root()
+    -> Result<(), Box<dyn Error>> {
+        // The AMI `AmiServiceRoot` segment is embedded in the Service Root
+        // document, so the read issues no request beyond the plain flow: the
+        // segment decodes through the compiled `AmiServiceRoot` schema and
+        // the snapshot identity is the segment's location inside the Service
+        // Root document (`/redfish/v1/Oem/Ami`) — the root's own identity is
+        // taken by the Service Root snapshot.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            ROOT_WITH_AMI_OEM_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        let ami = &resources[1];
+        assert_eq!(ami.feature(), ResourceFeature::OemAmiServiceRoot);
+        assert_eq!(
+            ami.odata_id().as_str(),
+            "/redfish/v1/Oem/Ami",
+            "the embedded segment keeps its location inside the Service Root document"
+        );
+        assert_eq!(ami.etag().map(ResourceEtag::as_str), Some("W/\"root-1\""));
+        let payload: serde_json::Value = serde_json::from_str(ami.payload().as_str())?;
+        assert_eq!(payload["Id"], "RootService");
+        assert_eq!(payload["Name"], "Root Service");
+        assert_eq!(payload["RtpVersion"], "1.2.3");
+        // No AMI request was issued: the embedded segment adds no fetch.
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_without_ami_oem_produces_no_ami_service_root_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        // A Service Root without `Oem.Ami` (the default fixture, or one whose
+        // `Oem.Ami` segment cannot be decoded) stays untouched: no AMI
+        // snapshot and no fabricated request.
+        for root_body in [CORE_SERVICE_ROOT_BODY, ROOT_WITH_UNDECODABLE_AMI_OEM_BODY] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                root_body,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", MANAGER_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(
+                resources
+                    .iter()
+                    .all(|resource| resource.feature() != ResourceFeature::OemAmiServiceRoot)
+            );
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_ami_config_bmc_through_the_vendor_reference() -> Result<(), Box<dyn Error>> {
+        // The AMI `ConfigBMC` document is read right after the Manager
+        // member, through the `@odata.id` the manager's `Oem.Ami` segment
+        // publishes as its `ConfigBMC` reference string — the same
+        // vendor-published navigation the upstream `ConfigBmc` wrapper
+        // expands, never a crafted URL.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_AMI_OEM_BODY),
+                ("200 OK", AMI_CONFIG_BMC_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        let config_bmc = &resources[4];
+        assert_eq!(config_bmc.feature(), ResourceFeature::OemAmiConfigBmc);
+        assert_eq!(
+            config_bmc.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/ConfigBMC"
+        );
+        assert_eq!(
+            config_bmc.etag().map(ResourceEtag::as_str),
+            Some("W/\"ami-config-bmc-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(config_bmc.payload().as_str())?;
+        assert_eq!(payload["LockoutHostControl"], "Enable");
+        assert_eq!(payload["LockoutBiosVariableWriteMode"], "Disable");
+        assert_eq!(payload["LockdownBiosSettingsChange"], "Enable");
+        assert_eq!(payload["LockdownBiosUpgradeDowngrade"], "Disable");
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_AMI_CONFIG_BMC_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manager_without_config_bmc_reference_produces_no_ami_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        // A manager with `Oem.Ami` but without the `ConfigBMC` reference
+        // string (including one whose `Oem.Ami` value is not an object — the
+        // read only checks the key presence and the sibling reference, so an
+        // odd segment value leaves the family absent the same way), a manager
+        // with another vendor's `Oem` key, and a manager with no `Oem` at
+        // all all stay untouched: no AMI snapshot and no fabricated request.
+        for manager_body in [
+            MANAGER_BODY,
+            MANAGER_WITH_OTHER_OEM_BODY,
+            MANAGER_WITH_AMI_OEM_WITHOUT_CONFIG_BMC_BODY,
+            MANAGER_WITH_UNDECODABLE_AMI_OEM_BODY,
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                CORE_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", manager_body),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(
+                resources
+                    .iter()
+                    .all(|resource| resource.feature() != ResourceFeature::OemAmiConfigBmc)
+            );
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_hpe_segments_embedded_in_the_root_and_manager_documents()
+    -> Result<(), Box<dyn Error>> {
+        // Both HPE segments are embedded — the `HpeiLoServiceExt` object in
+        // the Service Root's `Oem.Hpe` key and the `HpeiLo` object in the
+        // Manager's `Oem.Hpe` key — so the read issues no request beyond the
+        // plain flow; the snapshot identities are the segments' locations
+        // inside their parent documents.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            ROOT_WITH_HPE_OEM_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_WITH_HPE_OEM_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        let hpe_root = &resources[1];
+        assert_eq!(hpe_root.feature(), ResourceFeature::OemHpeILoServiceExt);
+        assert_eq!(
+            hpe_root.odata_id().as_str(),
+            "/redfish/v1/Oem/Hpe",
+            "the embedded segment keeps its location inside the Service Root document"
+        );
+        assert_eq!(
+            hpe_root.etag().map(ResourceEtag::as_str),
+            Some("W/\"root-1\"")
+        );
+        let root_payload: serde_json::Value = serde_json::from_str(hpe_root.payload().as_str())?;
+        assert_eq!(root_payload["Id"], "RootService");
+        assert_eq!(root_payload["ManagerType"], "iLO 5");
+        assert_eq!(root_payload["ManagerFirmwareVersion"], "2.44");
+        let hpe_manager = &resources[5];
+        assert_eq!(hpe_manager.feature(), ResourceFeature::OemHpeManager);
+        assert_eq!(
+            hpe_manager.odata_id().as_str(),
+            "/redfish/v1/Managers/1/Oem/Hpe",
+            "the embedded segment keeps its location inside the Manager document"
+        );
+        assert_eq!(
+            hpe_manager.etag().map(ResourceEtag::as_str),
+            Some("W/\"manager-1\"")
+        );
+        let manager_payload: serde_json::Value =
+            serde_json::from_str(hpe_manager.payload().as_str())?;
+        assert_eq!(manager_payload["Id"], "1");
+        assert_eq!(manager_payload["Name"], "Manager One");
+        assert_eq!(manager_payload["VirtualNICEnabled"], true);
+        // No HPE request was issued: both segments are embedded.
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_or_manager_without_hpe_oem_produces_no_hpe_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        // A Service Root or Manager without `Oem.Hpe` (including one whose
+        // segment cannot be decoded) stays untouched: no HPE snapshot and no
+        // fabricated request.
+        for (root_body, manager_body) in [
+            (CORE_SERVICE_ROOT_BODY, MANAGER_BODY),
+            (CORE_SERVICE_ROOT_BODY, MANAGER_WITH_OTHER_OEM_BODY),
+            (
+                ROOT_WITH_UNDECODABLE_HPE_OEM_BODY,
+                MANAGER_WITH_UNDECODABLE_HPE_OEM_BODY,
+            ),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                root_body,
+                &[
+                    ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                    ("200 OK", SYSTEM_BODY),
+                    ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                    ("200 OK", CHASSIS_MEMBER_BODY),
+                    ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                    ("200 OK", manager_body),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let resources = gateway
+                .read_core_resources(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                )
+                .await?;
+
+            assert_eq!(resources.len(), 4);
+            assert!(resources.iter().all(|resource| {
+                resource.feature() != ResourceFeature::OemHpeILoServiceExt
+                    && resource.feature() != ResourceFeature::OemHpeManager
+            }));
+            assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_liteon_power_supplies_through_the_manufacturer_gate()
+    -> Result<(), Box<dyn Error>> {
+        // The `LiteOn` family is gated on the chassis `Manufacturer` value:
+        // only a chassis carrying the exact `LITE-ON TECHNOLOGY CORP.` value
+        // is probed, and the `PowerSubsystem` chain is then read through the
+        // compiled `LiteonPowerSupply` navigation exactly like the upstream
+        // `chassis_fetch_links` re-decodes it.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_LITEON_OEM_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", LITEON_POWER_SUPPLY_1_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", LITEON_POWER_SUPPLY_1_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        let supply = &resources[4];
+        assert_eq!(supply.feature(), ResourceFeature::OemLiteOnPowerSupply);
+        assert_eq!(
+            supply.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
+        assert_eq!(
+            supply.etag().map(ResourceEtag::as_str),
+            Some("W/\"liteon-psu-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(supply.payload().as_str())?;
+        assert_eq!(payload["Id"], "1");
+        assert_eq!(payload["Name"], "Power Supply 1");
+        assert_eq!(payload["PowerSupplyType"], "AC");
+        assert_eq!(payload["PowerCapacityWatts"], 2200.0);
+        assert_eq!(payload["Manufacturer"], "LITE-ON TECHNOLOGY CORP.");
+        assert_eq!(payload["Status"]["Health"], "OK");
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_LITEON_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chassis_without_liteon_manufacturer_produces_no_liteon_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        // A chassis carrying any other `Manufacturer` value (including the
+        // shared default value) stays untouched: no `LiteOn` snapshot and no
+        // fabricated request.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemLiteOnPowerSupply)
+        );
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_delta_power_supplies_through_the_oem_segment() -> Result<(), Box<dyn Error>> {
+        // The Delta family is gated on the `deltaenergysystems` namespace key
+        // of the chassis's `Oem` segment (the §11.3 surface), and each supply
+        // member's `Oem` segment is decoded for the extension — the same
+        // vendor key and decode the upstream `DeltaPowerSupply` wrapper
+        // performs.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_DELTA_OEM_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", DELTA_POWER_SUPPLY_1_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", DELTA_POWER_SUPPLY_1_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 6);
+        let supply = &resources[4];
+        assert_eq!(supply.feature(), ResourceFeature::OemDeltaPowerSupply);
+        assert_eq!(
+            supply.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
+        assert_eq!(
+            supply.etag().map(ResourceEtag::as_str),
+            Some("W/\"delta-psu-1\"")
+        );
+        let payload: serde_json::Value = serde_json::from_str(supply.payload().as_str())?;
+        assert_eq!(payload["Id"], "1");
+        assert_eq!(payload["Name"], "Power Supply 1");
+        assert_eq!(payload["Power"], true);
+        assert_eq!(payload["FanSpeedTarget"], 50);
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_DELTA_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_supply_without_extension_stays_out_of_the_family() -> Result<(), Box<dyn Error>>
+    {
+        // A Delta-chassis supply member without the `deltaenergysystems`
+        // extension is not a Delta surface: the member stays out of the
+        // family (one odd member) and the family never invents a reading for
+        // it.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_DELTA_OEM_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", DELTA_POWER_SUPPLY_WITHOUT_OEM_BODY),
+                ("200 OK", POWER_SUBSYSTEM_BODY),
+                ("200 OK", POWER_SUPPLIES_COLLECTION_BODY),
+                ("200 OK", DELTA_POWER_SUPPLY_WITHOUT_OEM_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 5);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemDeltaPowerSupply)
+        );
+        // The chassis advertised the namespace, so the chain was read (once
+        // for the standard family and once for the Delta family) and the one
+        // odd member was skipped.
+        assert_session_requests(
+            &server.finish_all().await?,
+            &CORE_RESOURCE_WITH_DELTA_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chassis_without_delta_namespace_produces_no_delta_snapshots()
+    -> Result<(), Box<dyn Error>> {
+        // A chassis without the `deltaenergysystems` namespace key stays
+        // untouched: no Delta snapshot and no fabricated request.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_MEMBER_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        assert_eq!(resources.len(), 4);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.feature() != ResourceFeature::OemDeltaPowerSupply)
+        );
+        assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn undecodable_lenovo_segment_leaves_the_family_absent() -> Result<(), Box<dyn Error>> {
         // A manager whose `Oem.Lenovo` segment cannot be decoded by the
         // compiled untagged `LenovoManagerSchema` is one odd manager surface:
@@ -18375,6 +19947,60 @@ mod tests {
                 .as_str(),
             r#"{"Id":"SecurityService","Name":"Lenovo Security Service"}"#
         );
+        Ok(())
+    }
+
+    #[test]
+    fn oem_read_projections_keep_the_typed_field_contract() -> Result<(), Box<dyn Error>> {
+        // The compiled schemas are the type boundary: the typed fields are
+        // projected verbatim with the vendor's enum spellings (§12.3), and
+        // absent fields are skipped on the wire instead of coerced.
+        // The AMI `ConfigBmc` schema models no common identity, so the
+        // payload carries only the four lockout/lockdown spellings.
+        let config_bmc: AmiConfigBmcSchema = serde_json::from_str(AMI_CONFIG_BMC_BODY)?;
+        assert_eq!(
+            ami_config_bmc_projection(&config_bmc)?.payload().as_str(),
+            r#"{"LockdownBiosSettingsChange":"Enable","LockdownBiosUpgradeDowngrade":"Disable","LockoutBiosVariableWriteMode":"Disable","LockoutHostControl":"Enable"}"#
+        );
+        let bare_config_bmc: AmiConfigBmcSchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Managers/1/Oem/ConfigBMC","Id":"ConfigBMC"}"#,
+        )?;
+        assert_eq!(
+            ami_config_bmc_projection(&bare_config_bmc)?
+                .payload()
+                .as_str(),
+            "{}"
+        );
+        // The `LiteOn` supply projects the standard power-supply identity
+        // fields through the LiteOn module's own enum types.
+        let liteon: LiteonPowerSupplySchema = serde_json::from_str(LITEON_POWER_SUPPLY_1_BODY)?;
+        assert_eq!(
+            liteon_power_supply_projection(&liteon)?.payload().as_str(),
+            r#"{"Description":"LiteOn power supply","FirmwareVersion":"1.02","Id":"1","Manufacturer":"LITE-ON TECHNOLOGY CORP.","Model":"PS-2200","Name":"Power Supply 1","PartNumber":"LTP-2200","PowerCapacityWatts":2200.0,"PowerSupplyType":"AC","SerialNumber":"LN1234","Status":{"Health":"OK","HealthRollup":"OK","State":"Enabled"}}"#
+        );
+        let bare_liteon: LiteonPowerSupplySchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1","Id":"1","Name":"Power Supply 1"}"#,
+        )?;
+        assert_eq!(
+            liteon_power_supply_projection(&bare_liteon)?
+                .payload()
+                .as_str(),
+            r#"{"Id":"1","Name":"Power Supply 1"}"#
+        );
+        // The Delta extension projects the compiled `Power` / `FanSpeedTarget`
+        // fields beside the standard supply identity.
+        let delta: PowerSupplySchema = serde_json::from_str(DELTA_POWER_SUPPLY_1_BODY)?;
+        let delta_segment = decode_delta_segment(&delta).ok_or("the Delta segment must decode")?;
+        assert_eq!(
+            delta_power_supply_projection(&delta, &delta_segment)?
+                .payload()
+                .as_str(),
+            r#"{"Description":"Delta power supply","FanSpeedTarget":50,"Id":"1","Name":"Power Supply 1","Power":true}"#
+        );
+        let bare_delta: PowerSupplySchema = serde_json::from_str(
+            r#"{"@odata.id":"/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1","Id":"1","Name":"Power Supply 1"}"#,
+        )?;
+        assert!(decode_delta_segment(&bare_delta).is_none());
         Ok(())
     }
 
