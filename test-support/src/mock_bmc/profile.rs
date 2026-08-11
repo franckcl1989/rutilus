@@ -124,12 +124,19 @@ pub enum MockProfile {
     /// one supply member carrying the Delta `Oem` segment. Every other
     /// document of the tree is shared with the default profile.
     Delta,
+    /// The Supermicro fixture tree: Vendor "Supermicro" / Product
+    /// `X11DPH-T`, `Managers/1` advertises `Oem.Supermicro` (which flips the
+    /// `oem-supermicro` capability probe to `Supported`), and the §11.5
+    /// `SysLockdown` and `KcsInterface` documents are served at the embedded
+    /// references of the manager's `Oem.Supermicro` segment. Every other
+    /// document of the tree is shared with the default profile.
+    Supermicro,
 }
 
 impl MockProfile {
     /// The lowercase profile name, matching the `mock-bmc` `--profile`
     /// values (`rutilus` | `dell` | `nvidia` | `lenovo` | `xfusion` |
-    /// `inspur` | `ami` | `hpe` | `liteon` | `delta`).
+    /// `inspur` | `ami` | `hpe` | `liteon` | `delta` | `supermicro`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -143,6 +150,7 @@ impl MockProfile {
             Self::Hpe => "hpe",
             Self::LiteOn => "liteon",
             Self::Delta => "delta",
+            Self::Supermicro => "supermicro",
         }
     }
 }

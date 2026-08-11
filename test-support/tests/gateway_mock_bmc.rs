@@ -687,6 +687,17 @@ const NO_OEM_PROFILES: [(MockProfile, &str, &str); 2] = [
     (MockProfile::Inspur, "Inspur", "NF5280M6"),
 ];
 
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the Supermicro profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides `oem-supermicro` from
+/// the already-decoded manager member and never probes a vendor URL.
+const SUPERMICRO_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the Supermicro profile: the 51 requests of the default profile plus
+/// the two §11.5 `SysLockdown` and `KcsInterface` fetches.
+const SUPERMICRO_RESOURCE_READ_REQUEST_COUNT: u64 = 53;
+
 #[tokio::test]
 async fn dell_profile_probes_oem_dell_supported_with_standard_surface_unchanged()
 -> Result<(), Box<dyn Error>> {
@@ -866,6 +877,207 @@ async fn dell_profile_reads_oem_dell_attributes_snapshot() -> Result<(), Box<dyn
         Some("test-session-token"),
         "the Dell Attributes fetch must authenticate with the Session token"
     );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn supermicro_profile_probes_oem_supermicro_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Supermicro).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile: a vendor profile only swaps the identity
+    // strings and the OEM surface, never the standard tree.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The Supermicro profile advertises exactly the Supermicro namespace: the
+    // decoded manager member carries `Oem.Supermicro`, so `oem-supermicro`
+    // probes `Supported`; no other vendor namespace is served, so every
+    // remaining OEM capability stays `NotAdvertised` (§11.3 advertised
+    // layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemSupermicro => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("Supermicro"),
+        "the probe must carry the Supermicro Service Root identity"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        SUPERMICRO_PROBE_REQUEST_COUNT,
+        "the Supermicro namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete Supermicro read surface is asserted in one test so the request
+// position and the 30-resource order stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint on
+// its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn supermicro_profile_reads_oem_supermicro_documents_snapshot() -> Result<(), Box<dyn Error>>
+{
+    let mock = MockBmc::start_with_profile(MockProfile::Supermicro).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The Supermicro read surface adds exactly the §11.5 `SysLockdown` and
+    // `KcsInterface` snapshots to the default 28-resource tree, in the
+    // documented read order: two manager surfaces projected right after the
+    // manager's `HostInterfaces` member and before the root-level `Accounts`
+    // family.
+    assert_eq!(resources.len(), 30);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::OemSmcSysLockdown,
+            ResourceFeature::OemSmcKcsInterface,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The `SysLockdown` snapshot carries the embedded reference identity and
+    // the enabled state; the `KcsInterface` snapshot carries the vendor's
+    // enum spelling verbatim.
+    let sys_lockdown = &resources[19];
+    assert_eq!(sys_lockdown.feature(), ResourceFeature::OemSmcSysLockdown);
+    assert_eq!(
+        sys_lockdown.odata_id().as_str(),
+        "/redfish/v1/Managers/1/SysLockdown"
+    );
+    assert!(
+        sys_lockdown.etag().is_some(),
+        "{} must carry its upstream ETag",
+        sys_lockdown.odata_id()
+    );
+    let sys_lockdown_payload: serde_json::Value =
+        serde_json::from_str(sys_lockdown.payload().as_str())?;
+    assert_eq!(sys_lockdown_payload["SysLockdownEnabled"], true);
+    let kcs_interface = &resources[20];
+    assert_eq!(kcs_interface.feature(), ResourceFeature::OemSmcKcsInterface);
+    assert_eq!(
+        kcs_interface.odata_id().as_str(),
+        "/redfish/v1/Managers/1/KCSInterface"
+    );
+    assert!(
+        kcs_interface.etag().is_some(),
+        "{} must carry its upstream ETag",
+        kcs_interface.odata_id()
+    );
+    let kcs_interface_payload: serde_json::Value =
+        serde_json::from_str(kcs_interface.payload().as_str())?;
+    assert_eq!(kcs_interface_payload["Privilege"], "Administrator");
+
+    // The gateway fetches the two documents exactly once each, as manager
+    // surfaces right after the `HostInterfaces/1` member, and through the
+    // Session token transport like every other read.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        SUPERMICRO_RESOURCE_READ_REQUEST_COUNT,
+        "the Supermicro read must issue exactly two requests beyond the default flow"
+    );
+    let host_interface_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/HostInterfaces/1")
+        .ok_or_else(|| io::Error::other("HostInterfaces/1 is missing from the request log"))?;
+    let sys_lockdown_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/SysLockdown")
+        .ok_or_else(|| io::Error::other("the SysLockdown fetch is missing from the request log"))?;
+    let kcs_interface_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/KCSInterface")
+        .ok_or_else(|| {
+            io::Error::other("the KcsInterface fetch is missing from the request log")
+        })?;
+    assert_eq!(
+        sys_lockdown_index,
+        host_interface_index + 1,
+        "the SysLockdown fetch must follow the manager's HostInterfaces member"
+    );
+    assert_eq!(
+        kcs_interface_index,
+        sys_lockdown_index + 1,
+        "the KcsInterface fetch must follow the SysLockdown fetch"
+    );
+    for index in [sys_lockdown_index, kcs_interface_index] {
+        assert_eq!(
+            requests[index].header("x-auth-token"),
+            Some("test-session-token"),
+            "the Supermicro fetch at {index} must authenticate with the Session token"
+        );
+    }
     assert_eq!(
         mock.active_sessions(),
         0,
