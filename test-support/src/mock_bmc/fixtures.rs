@@ -1,6 +1,8 @@
 //! Static Redfish JSON documents of the Mock BMC fixture tree.
 //!
-//! Every document mirrors the shapes `rutilus-infra-redfish`'s own tests
+//! Every document is synthetic test data crafted to exercise the product's
+//! typed navigation — never a captured response from a real device. The
+//! fixtures deliberately reuse the shapes `rutilus-infra-redfish`'s own tests
 //! already decode with `nv-redfish` 0.13 (same `@odata.type` versions, same
 //! field sets, same enum spellings), so the mock cannot drift from what the
 //! product actually parses. The tree is deliberately small: one System with

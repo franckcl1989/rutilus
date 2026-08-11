@@ -579,6 +579,176 @@ fn lenovo_profile_swaps_identity_and_serves_security_service_route_only()
 }
 
 #[test]
+fn ami_profile_swaps_identity_and_serves_config_bmc_route_only() -> Result<(), Box<dyn Error>> {
+    // The fixture mapping: the AMI profile swaps the Service Root identity
+    // strings, adds the embedded `Oem.Ami` segment to the Service Root and
+    // the `Oem.Ami` / `ConfigBMC` segment to the manager, and serves the
+    // §11.5 `ConfigBmc` document.
+    let ami_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Ami))?;
+    assert_eq!(ami_root["Vendor"], "AMI");
+    assert_eq!(ami_root["Product"], "MegaRAC SP-X");
+    assert_eq!(ami_root["Oem"]["Ami"]["RtpVersion"], "1.2.3");
+    let ami_manager: serde_json::Value = serde_json::from_str(fixtures::manager(MockProfile::Ami))?;
+    assert_eq!(
+        ami_manager["Oem"]["ConfigBMC"],
+        "/redfish/v1/Managers/1/Oem/ConfigBMC"
+    );
+    // The default profile's manager keeps no `Oem` namespace.
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+
+    // The §11.5 `ConfigBmc` route is served only under the AMI profile.
+    let ami_state = MockState::with_profile(MockProfile::Ami);
+    let config_bmc = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/ConfigBMC",
+        &[],
+        &ami_state,
+    );
+    assert_eq!(config_bmc.status, "200 OK");
+    let config_bmc_body: serde_json::Value = serde_json::from_str(&config_bmc.body)?;
+    assert_eq!(config_bmc_body["LockoutHostControl"], "Enable");
+
+    // Under the default profile the same path is a Redfish-shaped 404, so the
+    // default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    let missing = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/Oem/ConfigBMC",
+        &[],
+        &default_state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
+fn hpe_profile_swaps_identity_and_serves_embedded_segments_only() -> Result<(), Box<dyn Error>> {
+    // The fixture mapping: the HPE profile swaps the Service Root identity
+    // strings and adds the embedded `Oem.Hpe` segments to the Service Root
+    // and the manager; both segments are embedded, so the profile serves no
+    // OEM document.
+    let hpe_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Hpe))?;
+    assert_eq!(hpe_root["Vendor"], "HPE");
+    assert_eq!(hpe_root["Product"], "ProLiant DL380 Gen11");
+    assert_eq!(hpe_root["Oem"]["Hpe"]["Manager"][0]["ManagerType"], "iLO 5");
+    let hpe_manager: serde_json::Value = serde_json::from_str(fixtures::manager(MockProfile::Hpe))?;
+    assert_eq!(hpe_manager["Oem"]["Hpe"]["VirtualNICEnabled"], true);
+    // The default profile's documents keep no `Oem` namespace.
+    let default_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Rutilus))?;
+    assert!(default_root.get("Oem").is_none());
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+
+    // The HPE profile serves no OEM document, so every other profile's
+    // vendor route stays gated like any unserved path.
+    let hpe_state = MockState::with_profile(MockProfile::Hpe);
+    for path in [
+        "/redfish/v1/Managers/1/Oem/ConfigBMC",
+        "/redfish/v1/Managers/1/Oem/Dell/DellAttributes/1",
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+    ] {
+        let missing = route::dispatch(HttpMethod::Get, path, &[], &hpe_state);
+        assert_eq!(missing.status, "404 Not Found", "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn liteon_profile_swaps_identity_and_serves_power_supply_routes_only() -> Result<(), Box<dyn Error>>
+{
+    // The fixture mapping: the `LiteOn` profile swaps the Service Root
+    // identity strings and the chassis `Manufacturer` gate value (the one
+    // `Manufacturer`-gated surface of the product), and serves the §11.5
+    // `PowerSubsystem` power-supply chain.
+    let liteon_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::LiteOn))?;
+    assert_eq!(liteon_root["Vendor"], "LiteOn");
+    assert_eq!(liteon_root["Product"], "Power Shelf");
+    let liteon_chassis: serde_json::Value =
+        serde_json::from_str(fixtures::chassis(MockProfile::LiteOn))?;
+    assert_eq!(liteon_chassis["Manufacturer"], "LITE-ON TECHNOLOGY CORP.");
+    // The default profile's chassis keeps the shared manufacturer value.
+    let default_chassis: serde_json::Value =
+        serde_json::from_str(fixtures::chassis(MockProfile::Rutilus))?;
+    assert_eq!(default_chassis["Manufacturer"], "Rutilus Test");
+
+    // The §11.5 power-supply chain routes are served only under the `LiteOn`
+    // profile.
+    let liteon_state = MockState::with_profile(MockProfile::LiteOn);
+    let supply = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        &[],
+        &liteon_state,
+    );
+    assert_eq!(supply.status, "200 OK");
+    let supply_body: serde_json::Value = serde_json::from_str(&supply.body)?;
+    assert_eq!(supply_body["Manufacturer"], "LITE-ON TECHNOLOGY CORP.");
+
+    // Under the default profile the same paths are Redfish-shaped 404s, so
+    // the default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    for path in [
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+    ] {
+        let missing = route::dispatch(HttpMethod::Get, path, &[], &default_state);
+        assert_eq!(missing.status, "404 Not Found", "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn delta_profile_swaps_identity_and_serves_power_supply_routes_only() -> Result<(), Box<dyn Error>>
+{
+    // The fixture mapping: the Delta profile swaps the Service Root identity
+    // strings, adds the `Oem.deltaenergysystems` segment to the chassis
+    // document, and serves the §11.5 `PowerSubsystem` power-supply chain.
+    let delta_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Delta))?;
+    assert_eq!(delta_root["Vendor"], "DELTA");
+    assert_eq!(delta_root["Product"], "Power Shelf");
+    let delta_chassis: serde_json::Value =
+        serde_json::from_str(fixtures::chassis(MockProfile::Delta))?;
+    assert_eq!(delta_chassis["Oem"]["deltaenergysystems"]["Power"], true);
+    // The default profile's chassis keeps no `Oem` namespace.
+    let default_chassis: serde_json::Value =
+        serde_json::from_str(fixtures::chassis(MockProfile::Rutilus))?;
+    assert!(default_chassis.get("Oem").is_none());
+
+    // The §11.5 power-supply chain routes are served only under the Delta
+    // profile.
+    let delta_state = MockState::with_profile(MockProfile::Delta);
+    let supply = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        &[],
+        &delta_state,
+    );
+    assert_eq!(supply.status, "200 OK");
+    let supply_body: serde_json::Value = serde_json::from_str(&supply.body)?;
+    assert_eq!(supply_body["Oem"]["deltaenergysystems"]["Power"], true);
+
+    // Under the default profile the same paths are Redfish-shaped 404s, so
+    // the default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    for path in [
+        "/redfish/v1/Chassis/1/PowerSubsystem",
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+    ] {
+        let missing = route::dispatch(HttpMethod::Get, path, &[], &default_state);
+        assert_eq!(missing.status, "404 Not Found", "{path}");
+    }
+    Ok(())
+}
+
+#[test]
 fn no_oem_profiles_swap_identity_and_gate_every_vendor_route() -> Result<(), Box<dyn Error>> {
     // The §21 0.5.0 standard-pattern fixture mapping: an xFusion or Inspur
     // profile swaps only the Service Root identity strings, and no document

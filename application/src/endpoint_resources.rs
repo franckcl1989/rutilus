@@ -5402,23 +5402,29 @@ mod tests {
                     generation,
                 )?,
                 // The `LiteOn` supply projects the typed power-supply
-                // identity fields exactly like the standard family.
+                // identity fields exactly like the standard family. The
+                // identity is the synthetic storage key the gateway derives
+                // from the supply document's own URL (the read never fetches
+                // it), so the family stays distinct from the standard
+                // `power-supplies` snapshot of the same supply document.
                 snapshot(
                     endpoint_id,
                     ResourceFeature::OemLiteOnPowerSupply,
-                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
                     r#"{"Id":"1","Name":"Power Supply 1","Description":"LiteOn power supply","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Model":"PS-2200","FirmwareVersion":"1.02","SerialNumber":"LN1234","PartNumber":"LTP-2200","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
                     observed_at,
                     generation,
                 )?,
                 // The Delta supply projects the `deltaenergysystems` flags
-                // beside the common identity fields. (A real shelf is either
-                // `LiteOn` or Delta, so the two supply fixtures use distinct
-                // member paths to keep the inventory identity unique.)
+                // beside the common identity fields. Like the `LiteOn`
+                // family, the identity is the synthetic storage key derived
+                // from the supply document's own URL — both OEM supply
+                // fixtures share the one supply member path, mirroring the
+                // same-document identity uniqueness the keys provide.
                 snapshot(
                     endpoint_id,
                     ResourceFeature::OemDeltaPowerSupply,
-                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2",
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
                     r#"{"Id":"1","Name":"Power Supply 1","Description":"Delta power supply","Power":true,"FanSpeedTarget":50}"#,
                     observed_at,
                     generation,
@@ -5471,7 +5477,7 @@ mod tests {
         );
         let liteon = by_odata_id(
             &result,
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
         )?;
         assert!(matches!(
             liteon.details(),
@@ -5497,7 +5503,7 @@ mod tests {
         ));
         let delta = by_odata_id(
             &result,
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2",
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
         )?;
         assert_eq!(
             delta.details(),
@@ -5521,6 +5527,77 @@ mod tests {
             .iter()
             .find(|resource| resource.odata_id().as_str() == odata_id)
             .ok_or_else(|| format!("the {odata_id} resource must exist").into())
+    }
+
+    #[tokio::test]
+    async fn standard_and_liteon_power_supplies_coexist_in_one_refresh_generation()
+    -> Result<(), Box<dyn Error>> {
+        // A real `LiteOn` chassis refresh projects the standard
+        // `power-supplies` family and the `OemLiteOnPowerSupply` family from
+        // the same supply document: the standard snapshot keeps the supply's
+        // own `@odata.id` and the `LiteOn` snapshot its synthetic storage
+        // key, so the inventory boundary's `DuplicateODataId` check never
+        // fires and both families land in one complete Generation.
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(16)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::Chassis,
+                    "/redfish/v1/Chassis/1",
+                    r#"{"Id":"1","Name":"Chassis One","ChassisType":"RackMount","Manufacturer":"LITE-ON TECHNOLOGY CORP."}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::PowerSupplies,
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                    r#"{"Id":"1","Name":"Power Supply 1","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemLiteOnPowerSupply,
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
+                    r#"{"Id":"1","Name":"Power Supply 1","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 4);
+        let standard = by_odata_id(
+            &result,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        )?;
+        assert_eq!(standard.feature(), ResourceFeature::PowerSupplies);
+        assert_eq!(standard.common().name(), "Power Supply 1");
+        let liteon = by_odata_id(
+            &result,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
+        )?;
+        assert_eq!(liteon.feature(), ResourceFeature::OemLiteOnPowerSupply);
+        assert_eq!(liteon.common().name(), "Power Supply 1");
+        assert_ne!(standard.odata_id(), liteon.odata_id());
+        Ok(())
     }
 
     #[test]

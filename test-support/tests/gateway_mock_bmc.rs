@@ -1556,6 +1556,192 @@ async fn lenovo_profile_reads_lenovo_security_service_snapshot() -> Result<(), B
     Ok(())
 }
 
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the `LiteOn` or Delta profile: the 34 requests of the default
+/// profile plus three for the modern `PowerSubsystem` power-supplies probe
+/// (the subsystem document, the `PowerSupplies` collection, and the one
+/// supply member — the §11.3 probe follows the typed link the profile's
+/// chassis advertises).
+const POWER_SUPPLY_PROFILE_PROBE_REQUEST_COUNT: u64 = 37;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the `LiteOn` or Delta profile: the 51 requests of the default
+/// profile plus six for the `PowerSubsystem` power-supply chain (the
+/// subsystem document, the `PowerSupplies` collection, and the one supply
+/// member, fetched once for the standard `power-supplies` family and once
+/// for the OEM family).
+const POWER_SUPPLY_PROFILE_RESOURCE_READ_REQUEST_COUNT: u64 = 57;
+
+// The complete `LiteOn` read surface is asserted in one test so the request
+// count and the family coexistence stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint
+// on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn liteon_profile_reads_both_power_supply_families_with_distinct_identities()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::LiteOn).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // The `LiteOn` profile advertises exactly the `LiteOn` surface: the
+    // chassis `Manufacturer` gate value flips `oem-liteon` to `Supported`;
+    // no other vendor namespace is served, so every remaining OEM capability
+    // stays `NotAdvertised` (§11.3 advertised layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemLiteOn => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("LiteOn"),
+        "the probe must carry the LiteOn Service Root identity"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        POWER_SUPPLY_PROFILE_PROBE_REQUEST_COUNT,
+        "the power-supplies probe must fetch the subsystem chain exactly once"
+    );
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The read surface adds exactly the two supply snapshots to the default
+    // 28-resource tree: the standard `power-supplies` family and the §11.5
+    // `LiteOn` family project the same supply document, and the `LiteOn`
+    // snapshot carries its synthetic storage key, so both families land in
+    // one inventory without a duplicate `@odata.id` (the failure the A16
+    // audit found on real `LiteOn` shelves).
+    assert_eq!(resources.len(), 30);
+    let standard: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::PowerSupplies)
+        .collect();
+    assert_eq!(standard.len(), 1);
+    assert_eq!(
+        standard[0].odata_id().as_str(),
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+    );
+    let liteon: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::OemLiteOnPowerSupply)
+        .collect();
+    assert_eq!(liteon.len(), 1);
+    assert_eq!(
+        liteon[0].odata_id().as_str(),
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn"
+    );
+    assert_ne!(standard[0].odata_id(), liteon[0].odata_id());
+    let payload: serde_json::Value = serde_json::from_str(liteon[0].payload().as_str())?;
+    assert_eq!(payload["Manufacturer"], "LITE-ON TECHNOLOGY CORP.");
+
+    // The chain is fetched exactly once per family (three requests each),
+    // and the transient Session is deleted before returning.
+    assert_eq!(
+        mock.requests_served(),
+        POWER_SUPPLY_PROFILE_PROBE_REQUEST_COUNT + POWER_SUPPLY_PROFILE_RESOURCE_READ_REQUEST_COUNT,
+        "the LiteOn read must issue exactly six requests beyond the default flow"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delta_profile_reads_both_power_supply_families_with_distinct_identities()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Delta).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // The Delta profile advertises exactly the Delta surface: the chassis
+    // `Oem.deltaenergysystems` namespace key flips `oem-delta` to
+    // `Supported`; no other vendor namespace is served, so every remaining
+    // OEM capability stays `NotAdvertised` (§11.3 advertised layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemDelta => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("DELTA"),
+        "the probe must carry the Delta Service Root identity"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        POWER_SUPPLY_PROFILE_PROBE_REQUEST_COUNT,
+        "the power-supplies probe must fetch the subsystem chain exactly once"
+    );
+
+    let resources = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+
+    // The read surface adds exactly the two supply snapshots to the default
+    // 28-resource tree: the standard `power-supplies` family and the §11.5
+    // Delta family project the same supply document, and the Delta snapshot
+    // carries its synthetic storage key, so both families land in one
+    // inventory without a duplicate `@odata.id` (the failure the A16 audit
+    // found on real Delta power shelves).
+    assert_eq!(resources.len(), 30);
+    let standard: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::PowerSupplies)
+        .collect();
+    assert_eq!(standard.len(), 1);
+    assert_eq!(
+        standard[0].odata_id().as_str(),
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+    );
+    let delta: Vec<&CoreResourceProjection> = resources
+        .iter()
+        .filter(|resource| resource.feature() == ResourceFeature::OemDeltaPowerSupply)
+        .collect();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(
+        delta[0].odata_id().as_str(),
+        "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems"
+    );
+    assert_ne!(standard[0].odata_id(), delta[0].odata_id());
+    let payload: serde_json::Value = serde_json::from_str(delta[0].payload().as_str())?;
+    assert_eq!(payload["Power"], true);
+    assert_eq!(payload["FanSpeedTarget"], 50);
+
+    // The chain is fetched exactly once per family (three requests each),
+    // and the transient Session is deleted before returning.
+    assert_eq!(
+        mock.requests_served(),
+        POWER_SUPPLY_PROFILE_PROBE_REQUEST_COUNT + POWER_SUPPLY_PROFILE_RESOURCE_READ_REQUEST_COUNT,
+        "the Delta read must issue exactly six requests beyond the default flow"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn no_oem_profiles_probe_every_oem_capability_not_advertised() -> Result<(), Box<dyn Error>> {
     for (profile, vendor, product) in NO_OEM_PROFILES {

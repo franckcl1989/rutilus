@@ -6373,8 +6373,9 @@ mod tests {
             true
         );
         // The `LiteOn` supply carries the typed power-supply identity with
-        // the numeric capacity and the `Status` summary.
-        let liteon = by_source("/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1")?;
+        // the numeric capacity and the `Status` summary, under its synthetic
+        // storage key (distinct from the supply document's own identity).
+        let liteon = by_source("/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn")?;
         assert_eq!(
             liteon["resource"]["resource_type"],
             "oem_lite_on_power_supply"
@@ -6385,8 +6386,11 @@ mod tests {
             2200.0
         );
         assert_eq!(liteon["resource"]["details"]["status"]["health"], "OK");
-        // The Delta supply carries the `deltaenergysystems` flags verbatim.
-        let delta = by_source("/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2")?;
+        // The Delta supply carries the `deltaenergysystems` flags verbatim,
+        // under its own synthetic storage key.
+        let delta = by_source(
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
+        )?;
         assert_eq!(delta["resource"]["resource_type"], "oem_delta_power_supply");
         assert_eq!(delta["resource"]["details"]["power"], true);
         assert_eq!(delta["resource"]["details"]["fan_speed_target"], 50);
@@ -7947,11 +7951,12 @@ mod tests {
         .with_odata_type(ResourceODataType::parse("#HpeiLo.v1_0_0.HpeiLo")?)
         .with_etag(ResourceEtag::parse("W/\"manager-1\"")?);
         // The `LiteOn` supply projects the typed power-supply identity
-        // fields exactly like the standard family.
+        // fields exactly like the standard family, under the synthetic
+        // storage key the gateway derives from the supply document's own URL.
         let liteon = resource_snapshot_with_payload(
             endpoint.id(),
             ResourceFeature::OemLiteOnPowerSupply,
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
             r#"{"Id":"1","Name":"Power Supply 1","Description":"LiteOn power supply","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Model":"PS-2200","FirmwareVersion":"1.02","SerialNumber":"LN1234","PartNumber":"LTP-2200","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
             observed_at,
             generation,
@@ -7961,13 +7966,12 @@ mod tests {
         )?)
         .with_etag(ResourceEtag::parse("W/\"liteon-psu-1\"")?);
         // The Delta supply projects the `deltaenergysystems` flags beside
-        // the common identity fields. (A real shelf is either `LiteOn` or
-        // Delta, so the two supply fixtures use distinct member paths to
-        // keep the inventory identity unique.)
+        // the common identity fields, under the synthetic storage key derived
+        // from the same supply document's URL the `LiteOn` family shares.
         let delta = resource_snapshot_with_payload(
             endpoint.id(),
             ResourceFeature::OemDeltaPowerSupply,
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2",
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
             r#"{"Id":"1","Name":"Power Supply 1","Description":"Delta power supply","Power":true,"FanSpeedTarget":50}"#,
             observed_at,
             generation,

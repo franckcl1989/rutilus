@@ -18720,7 +18720,7 @@ mod tests {
         json!({
             "source": {
                 "resource_id": "01989abc-def0-7abc-8def-0123456789ea",
-                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
                 "odata_type": "#LiteonPowerSupply.v1_0_0.LiteonPowerSupply",
                 "etag": "W/\"liteon-psu-1\""
             },
@@ -18753,7 +18753,7 @@ mod tests {
         json!({
             "source": {
                 "resource_id": "01989abc-def0-7abc-8def-0123456789eb",
-                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
                 "odata_type": "#PowerSupply.v1_6_0.PowerSupply",
                 "etag": "W/\"delta-psu-1\""
             },
@@ -22879,11 +22879,13 @@ mod tests {
             label: "Virtual NIC enabled",
             value: "true".to_owned(),
         }));
-        // The `LiteOn` supply card keeps the typed power-supply identity.
+        // The `LiteOn` supply card keeps the typed power-supply identity
+        // under its synthetic storage key (distinct from the supply
+        // document's own identity).
         let liteon = cards
             .iter()
             .find(|card| {
-                card.source == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+                card.source == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn"
                     && card.type_label == "LiteOn Power Supply"
             })
             .ok_or("the LiteOn supply card must exist")?;
@@ -22900,11 +22902,12 @@ mod tests {
             value: "LITE-ON TECHNOLOGY CORP.".to_owned(),
         }));
         // The Delta supply card keeps the `deltaenergysystems` flags
-        // verbatim.
+        // verbatim under its own synthetic storage key.
         let delta = cards
             .iter()
             .find(|card| {
-                card.source == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+                card.source
+                    == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems"
                     && card.type_label == "Delta Power Supply"
             })
             .ok_or("the Delta supply card must exist")?;
