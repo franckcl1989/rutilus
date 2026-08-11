@@ -1220,6 +1220,12 @@ dd {
   font-weight: 650;
 }
 
+.stat-note {
+  color: #8495ad;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
 .overview-blocks {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));

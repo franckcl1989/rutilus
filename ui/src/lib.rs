@@ -4522,10 +4522,6 @@ impl OverviewState {
         matches!(self, Self::Ready(_))
     }
 
-    const fn is_loading(&self) -> bool {
-        matches!(self, Self::Loading)
-    }
-
     const fn is_failed(&self) -> bool {
         matches!(self, Self::Failed)
     }
@@ -4600,14 +4596,6 @@ struct OverviewProjection {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl OverviewProjection {
-    /// The heading fact of the dashboard: how many endpoints are managed.
-    fn endpoints_count_text(&self) -> String {
-        match self.total_endpoints {
-            1 => "1 endpoint".to_owned(),
-            _ => format!("{} endpoints", self.total_endpoints),
-        }
-    }
-
     /// The §14.2 capability-coverage text, absent while no capability entry
     /// has an observed state yet ("supported over observed" is undefined
     /// over zero observations).
@@ -9140,7 +9128,7 @@ mod browser {
         EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointResourceInventoryResponse,
         EndpointTrustChallengeResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
         EventListResponse, GroupListResponse, GroupResponse, LoginRequest, LoginResponse,
-        LogoutRequest, MeResponse, OperationListResponse, PrincipalStateResponse,
+        LogoutRequest, MeResponse, OperationListResponse, OverviewResponse, PrincipalStateResponse,
         RefreshEndpointsRequest, ResourceDiagnosticsResponse, RevokeSessionRequest, RoleResponse,
         SessionAdminResponse, SetPrincipalStateRequest, TagListResponse,
         TelemetrySampleListResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
@@ -9365,17 +9353,18 @@ mod browser {
         OemFaceView, OffsetDateTime, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
         OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
         OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
-        OverviewFilterSelections, RefreshBatchReportProjection, RefreshBatchState, RefreshFailure,
-        ResetKeysTypeView, ResetTypeView, RoleView, SecureBootActionView, TagApplyState,
-        TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
-        TelemetryCardProjection, TelemetryListState, TokenTypeView, TrustChallengeProjection,
-        UpdateArtifactChoice, account_action_key, apply_overview_filters, artifact_chunk_range_at,
-        artifact_upload_status_text, base64_encode, batch_children_projection, build_command,
-        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
-        format_artifact_size, format_observed_at, group_member_choices, group_name_draft_error,
-        health_badge_class, health_choices, health_level_label, oem_action_key,
-        operation_endpoint_choices, percent_encode_path_segment, sha256_hex, tag_draft_error,
-        toggle_set_membership, trust_mode_label, update_artifact_choices, vendor_choices,
+        OverviewFilterSelections, OverviewProjection, OverviewState, RefreshBatchReportProjection,
+        RefreshBatchState, RefreshFailure, ResetKeysTypeView, ResetTypeView, RoleView,
+        SecureBootActionView, TagApplyState, TagCardProjection, TagDraft, TagDraftError,
+        TagInventoryView, TagsListState, TelemetryCardProjection, TelemetryListState,
+        TokenTypeView, TrustChallengeProjection, UpdateArtifactChoice, account_action_key,
+        apply_overview_filters, artifact_chunk_range_at, artifact_upload_status_text,
+        base64_encode, batch_children_projection, build_command, command_summary,
+        diagnostics_optional_text, endpoint_address_draft_error, format_artifact_size,
+        format_observed_at, group_member_choices, group_name_draft_error, health_badge_class,
+        health_choices, health_level_label, oem_action_key, operation_endpoint_choices,
+        percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
+        trust_mode_label, update_artifact_choices, vendor_choices,
     };
 
     /// The first screen decision of the console (§16.2).
@@ -11881,6 +11870,16 @@ mod browser {
                                     }}
                                 </span>
                                 <span class="stat-label">"Firmware members"</span>
+                                <span class="stat-note">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or_else(String::new, |projection| {
+                                                projection.firmware_summary_text()
+                                            })
+                                    }}
+                                </span>
                             </div>
                             <div class="stat-tile">
                                 <span class="stat-value">
@@ -11897,6 +11896,19 @@ mod browser {
                                     }}
                                 </span>
                                 <span class="stat-label">"Capability coverage"</span>
+                                <span class="stat-note">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .and_then(|projection| {
+                                                projection.capability_coverage_text()
+                                            })
+                                            .unwrap_or_else(|| {
+                                                "No capability observations yet".to_owned()
+                                            })
+                                    }}
+                                </span>
                             </div>
                         </div>
                         <div class="overview-blocks">
@@ -21434,12 +21446,10 @@ mod tests {
         let state = OverviewState::Ready(OverviewProjection::from(&overview));
         assert!(state.is_ready());
         assert!(!state.is_failed());
-        assert!(!state.is_loading());
 
         let projection = state
             .projection()
             .ok_or("the ready projection must exist")?;
-        assert_eq!(projection.endpoints_count_text(), "3 endpoints");
         assert_eq!(projection.total_endpoints, 3);
         assert_eq!(projection.with_current_snapshot, 2);
         assert_eq!(projection.awaiting_first_refresh, 1);
@@ -21511,7 +21521,6 @@ mod tests {
             "freshness": []
         }))?;
         let projection = OverviewProjection::from(&empty);
-        assert_eq!(projection.endpoints_count_text(), "0 endpoints");
         assert!(projection.vendors.is_empty());
         assert!(projection.health.is_empty());
         assert!(projection.freshness.is_empty());
@@ -21537,7 +21546,6 @@ mod tests {
             "The overview is temporarily unavailable."
         );
         assert_eq!(OverviewState::Idle.failure_message(), "");
-        assert!(OverviewState::Loading.is_loading());
         assert_eq!(OverviewState::Idle.projection(), None);
         assert_eq!(OverviewState::Failed.projection(), None);
     }
