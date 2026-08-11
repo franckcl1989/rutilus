@@ -10809,6 +10809,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::watch,
         task::JoinHandle,
         time::timeout,
     };
@@ -10831,6 +10832,19 @@ mod tests {
     /// own request timeout — a loud, classified error — always fires before
     /// the mock abandons its script.
     const TEST_SERVER_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+
+    /// The subject alternative names of the scripted servers' leaf
+    /// certificate: the DNS name the certificates have always carried, plus
+    /// the numeric IPv4 loopback the tests connect through.
+    ///
+    /// The endpoint address must be the numeric loopback, never `localhost`:
+    /// Windows can resolve `localhost` to `::1`, which the IPv4-only listener
+    /// refuses, and the refused connection never reaches the accept loop — it
+    /// does not consume a scripted slot, so every later request receives the
+    /// previous scripted document and the session cleanup fails on the wrong
+    /// body. The certificate covers the numeric loopback so the system-CA
+    /// trust path validates it like the hostname it replaces.
+    const TEST_SERVER_CERTIFICATE_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
 
     const SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
@@ -19899,7 +19913,14 @@ mod tests {
     #[tokio::test]
     async fn explicit_pin_can_authenticate_a_known_hostname_mismatch() -> Result<(), Box<dyn Error>>
     {
-        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        // The served certificate does not cover the numeric loopback the
+        // test connects through, so the hostname really mismatches; the
+        // pinned identity ignores hostnames and authenticates anyway.
+        let server = TestRedfishServer::start_raw_sequence_for_hosts(
+            vec![http_response("200 OK", SERVICE_ROOT_BODY)],
+            vec![String::from("localhost")],
+        )
+        .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = pinned_trust(&server.certificate)?;
         let address = endpoint_address(server.socket, "127.0.0.1")?;
@@ -19953,14 +19974,23 @@ mod tests {
                 .into());
             }
         }
-        assert!(server.finish().await?.is_empty());
+        // The server stops the script when the test ends the connection
+        // attempt; the rejected handshake served no request.
+        assert!(server.finish_all().await?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn system_ca_retains_hostname_validation_and_sends_no_credentials()
     -> Result<(), Box<dyn Error>> {
-        let server = TestRedfishServer::start("200 OK", SERVICE_ROOT_BODY).await?;
+        // The shared scripted server's certificate covers the numeric
+        // loopback; this test must see the hostname check fail, so it serves
+        // a certificate that does not cover the address it connects to.
+        let server = TestRedfishServer::start_raw_sequence_for_hosts(
+            vec![http_response("200 OK", SERVICE_ROOT_BODY)],
+            vec![String::from("localhost")],
+        )
+        .await?;
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
         let address = endpoint_address(server.socket, "127.0.0.1")?;
@@ -19978,7 +20008,9 @@ mod tests {
             result,
             Err(RedfishServiceRootError::TlsRejected { .. })
         ));
-        assert!(server.finish().await?.is_empty());
+        // The server stops the script when the test ends the connection
+        // attempt; the rejected handshake served no request.
+        assert!(server.finish_all().await?.is_empty());
         Ok(())
     }
 
@@ -25139,6 +25171,7 @@ mod tests {
         socket: SocketAddr,
         certificate: CertificateDer<'static>,
         task: JoinHandle<Result<Vec<Vec<u8>>, io::Error>>,
+        stop: watch::Sender<bool>,
     }
 
     impl TestRedfishServer {
@@ -25157,8 +25190,24 @@ mod tests {
         }
 
         async fn start_raw_sequence(responses: Vec<Vec<u8>>) -> Result<Self, Box<dyn Error>> {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed([String::from("localhost")])?;
+            Self::start_raw_sequence_for_hosts(
+                responses,
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect::<Vec<String>>(),
+            )
+            .await
+        }
+
+        /// Starts the scripted server with an explicit certificate subject
+        /// alternative name list, for tests that must provoke a hostname
+        /// mismatch against the served identity.
+        async fn start_raw_sequence_for_hosts(
+            responses: Vec<Vec<u8>>,
+            sans: Vec<String>,
+        ) -> Result<Self, Box<dyn Error>> {
+            let CertifiedKey { cert, signing_key } = generate_simple_self_signed(sans)?;
             let certificate = cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -25169,12 +25218,19 @@ mod tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let socket = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
-            let task = tokio::spawn(run_server_sequence(listener, acceptor, responses));
+            let (stop, stop_receiver) = watch::channel(false);
+            let task = tokio::spawn(run_server_sequence(
+                listener,
+                acceptor,
+                responses,
+                stop_receiver,
+            ));
             Ok(Self {
-                address: endpoint_address(socket, "localhost")?,
+                address: endpoint_address(socket, "127.0.0.1")?,
                 socket,
                 certificate,
                 task,
+                stop,
             })
         }
 
@@ -25193,6 +25249,11 @@ mod tests {
         }
 
         async fn finish_all(self) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+            // The stop signal ends a serve loop that is still waiting for a
+            // connection (for example after the client rejected the served
+            // identity); a loop that already served every scripted response
+            // has returned and ignores it.
+            let _ = self.stop.send(true);
             Ok(self.task.await??)
         }
     }
@@ -25227,31 +25288,49 @@ mod tests {
         listener: TcpListener,
         acceptor: TlsAcceptor,
         responses: Vec<Vec<u8>>,
+        stop: watch::Receiver<bool>,
     ) -> Result<Vec<Vec<u8>>, io::Error> {
         let mut requests = Vec::with_capacity(responses.len());
+        let mut stop = stop;
         for response in responses {
-            let (tcp, _) = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
-            let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(tcp))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
-            else {
-                requests.push(Vec::new());
-                continue;
-            };
-            let request = read_request(&mut stream).await?;
-            if response.is_empty() {
-                // An empty response encodes a dropped connection: the
-                // request is captured (so the test can assert it was
-                // attempted) and the connection closes without any response,
-                // which the client observes as a broken connection.
-                requests.push(request);
-                continue;
+            // One scripted response is served to exactly one request. A
+            // connection that dies before its request — the client abandons
+            // the TLS handshake — is dropped without consuming the scripted
+            // slot, so a failed handshake can never shift the response
+            // sequence: the slot waits for the connection that carries its
+            // request instead.
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop.changed() => return Ok(requests),
+                    accepted = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept()) => {
+                        accepted.map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "test TCP accept")
+                        })??
+                    }
+                };
+                let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(accepted.0))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
+                else {
+                    // The connection never carried a request; close it and
+                    // accept again for the same scripted slot.
+                    continue;
+                };
+                let request = read_request(&mut stream).await?;
+                if response.is_empty() {
+                    // An empty response encodes a dropped connection: the
+                    // request is captured (so the test can assert it was
+                    // attempted) and the connection closes without any
+                    // response, which the client observes as a broken
+                    // connection.
+                    requests.push(request);
+                } else {
+                    stream.write_all(&response).await?;
+                    stream.shutdown().await?;
+                    requests.push(request);
+                }
+                break;
             }
-            stream.write_all(&response).await?;
-            stream.shutdown().await?;
-            requests.push(request);
         }
         Ok(requests)
     }
@@ -25280,6 +25359,7 @@ mod tests {
         address: EndpointAddress,
         certificate: CertificateDer<'static>,
         task: JoinHandle<Result<Vec<Vec<u8>>, io::Error>>,
+        stop: watch::Sender<bool>,
     }
 
     impl TestSseServer {
@@ -25289,8 +25369,12 @@ mod tests {
             frames: Vec<Vec<u8>>,
             end: SseEnd,
         ) -> Result<Self, Box<dyn Error>> {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed([String::from("localhost")])?;
+            let CertifiedKey { cert, signing_key } = generate_simple_self_signed(
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect::<Vec<String>>(),
+            )?;
             let certificate = cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -25301,17 +25385,26 @@ mod tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let socket = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
+            let (stop, stop_receiver) = watch::channel(false);
             let task = tokio::spawn(run_sse_server(
-                listener, acceptor, responses, sse_index, frames, end,
+                listener,
+                acceptor,
+                responses,
+                sse_index,
+                frames,
+                end,
+                stop_receiver,
             ));
             Ok(Self {
-                address: endpoint_address(socket, "localhost")?,
+                address: endpoint_address(socket, "127.0.0.1")?,
                 certificate,
                 task,
+                stop,
             })
         }
 
         async fn finish_all(self) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+            let _ = self.stop.send(true);
             Ok(self.task.await??)
         }
     }
@@ -25323,19 +25416,29 @@ mod tests {
         sse_index: usize,
         frames: Vec<Vec<u8>>,
         end: SseEnd,
+        stop: watch::Receiver<bool>,
     ) -> Result<Vec<Vec<u8>>, io::Error> {
         let total_connections = responses.len() + 1;
         let mut responses = responses.into_iter();
         let mut requests = Vec::with_capacity(total_connections);
-        for connection in 0..total_connections {
-            let (tcp, _) = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
-            let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(tcp))
+        let mut stop = stop;
+        let mut connection = 0;
+        while connection < total_connections {
+            // Like `run_server_sequence`, a connection that dies before its
+            // request is dropped without consuming the slot, so the response
+            // plan stays attached to the requests that actually arrived.
+            let accepted = tokio::select! {
+                _ = stop.changed() => return Ok(requests),
+                accepted = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept()) => {
+                    accepted.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??
+                }
+            };
+            let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(accepted.0))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
             else {
-                requests.push(Vec::new());
+                // The connection never carried a request; close it and
+                // accept again for the same scripted slot.
                 continue;
             };
             let request = read_request(&mut stream).await?;
@@ -25357,6 +25460,7 @@ mod tests {
                 stream.write_all(&response).await?;
                 stream.shutdown().await?;
             }
+            connection += 1;
         }
         Ok(requests)
     }
