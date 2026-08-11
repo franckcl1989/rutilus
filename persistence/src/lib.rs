@@ -572,6 +572,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_to_migrate_a_read_only_database_file_without_silent_recreation()
+    -> Result<(), Box<dyn Error>> {
+        // A database file the platform marks read-only cannot be migrated:
+        // the open reports the migration failure as a clear error instead of
+        // silently recreating or truncating the file, and the original file
+        // stays byte-identical on disk. (A read-only file with no pending
+        // migrations opens fine — SQLite degrades to a read-only session and
+        // the store's reads work; the failure boundary is the write the
+        // migration needs.)
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let mut options = sqlite_connect_options(&database_path, SqliteSettings::default());
+        options.sqlx_logging(false);
+        let partial = Database::connect(options).await?;
+        Migrator::up(&partial, Some(1)).await?;
+        partial.close().await?;
+        let original = std::fs::read(&database_path)?;
+        let mut permissions = std::fs::metadata(&database_path)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&database_path, permissions.clone())?;
+
+        let result = SqliteStore::open(&database_path).await;
+
+        // The refusal lands at the first write the migration needs: on
+        // Windows the pre-migration backup copy of a read-only file is
+        // refused (the platform denies reading a read-only attribute file
+        // through the copy path), on Unix the copy succeeds and the migration
+        // itself fails. Both are clear errors — never a silent recreation.
+        assert!(
+            matches!(
+                result,
+                Err(OpenStoreError::CreateMigrationBackup(_) | OpenStoreError::Migrate { .. })
+            ),
+            "a read-only database file must fail before any migration write, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database_path)?,
+            original,
+            "the refused open must never touch the file contents"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_corrupt_database_file_without_silent_recreation()
+    -> Result<(), Box<dyn Error>> {
+        // A file with garbage bytes is not a SQLite database: the open
+        // reports the corruption as a clear error (the read-only migration
+        // inspection cannot even read its schema) instead of silently
+        // recreating the file, and the corrupt file stays byte-identical on
+        // disk so the operator can still recover it.
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let corrupt = b"this is not a sqlite database file........";
+        std::fs::write(&database_path, corrupt)?;
+
+        let result = SqliteStore::open(&database_path).await;
+
+        assert!(
+            matches!(result, Err(OpenStoreError::InspectMigrations { .. })),
+            "a corrupt database file must fail at the migration inspection, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database_path)?,
+            corrupt,
+            "the refused open must never touch the file contents"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bounds_locked_database_waits_with_the_busy_timeout() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let database_path = directory.path().join("rutilus.db");
