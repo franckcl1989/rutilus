@@ -13,6 +13,7 @@
 #   跨平台 Build             <- 3-OS matrix + wasm32 UI artifact
 #   Migration Test
 #   Capability Ledger Check
+#   Release Baseline Check
 #
 # The toolchain comes exclusively from rust-toolchain.toml (channel 1.97.1,
 # components clippy + rustfmt); no version is hard-coded here.
@@ -145,3 +146,15 @@ jobs:
       - name: Capability ledger check
         if: matrix.is_default
         run: cargo test --locked -p rutilus-infra-redfish
+
+      # §2.3: Release Baseline Check. Runs the frozen 0.8.0 release-baseline
+      # gates in infra-redfish/src/release_baseline.rs (the `release_baseline`
+      # test filter): the frozen version must match the pinned manifest and
+      # Cargo.lock, the feature inventory must equal the workspace manifests
+      # bidirectionally, every public module must be classified with a product
+      # decision and match the vendored nv-redfish src/lib.rs, the schema
+      # versions must match Cargo.lock, and the capability-ledger hash
+      # snapshot must equal the §15.3 negotiation golden.
+      - name: Release baseline check
+        if: matrix.is_default
+        run: cargo test --locked -p rutilus-infra-redfish release_baseline
