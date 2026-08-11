@@ -1116,8 +1116,8 @@ impl EventRepository for SharedEventRepository {
 /// `Arc<StandaloneState>` cannot implement the application boundary directly
 /// (the orphan rule), so this crate-local wrapper is the owned role. The
 /// retention-prune summary the store returns is deliberately dropped at the
-/// boundary: the product has no log facility yet, and the loop's failures
-/// are already recorded through `eprintln!`.
+/// boundary: the loop's failures are already recorded through
+/// `tracing::error!`.
 struct SharedTelemetryRepository(Arc<StandaloneState>);
 
 impl TelemetryRepository for SharedTelemetryRepository {
@@ -1654,7 +1654,7 @@ where
             // must not look indistinguishable from an already-claimed
             // instance, or the operator diagnoses a login problem that is
             // actually a storage problem.
-            eprintln!(
+            tracing::error!(
                 "could not read the bootstrap-code state for the first-run gate, starting guarded: {error}"
             );
             AuthPolicy::Guarded
@@ -1707,7 +1707,7 @@ async fn list_enrolled_endpoint_ids(state: &StandaloneState) -> Vec<EndpointId> 
     match EndpointInventoryRepository::list_endpoint_inventory(state).await {
         Ok(items) => items.iter().map(|item| item.endpoint().id()).collect(),
         Err(error) => {
-            eprintln!("could not list enrolled endpoints for event listeners: {error}");
+            tracing::error!("could not list enrolled endpoints for event listeners: {error}");
             Vec::new()
         }
     }
@@ -1948,7 +1948,7 @@ async fn run_operation_scheduler(
 /// follows.
 async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = scheduler.await {
-        eprintln!("The operation scheduling loop failed: {join_error}");
+        tracing::error!("The operation scheduling loop failed: {join_error}");
     }
 }
 
@@ -1960,7 +1960,7 @@ async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
 /// blocker for the `SQLite` close that follows.
 async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = listeners.await {
-        eprintln!("The event listener task failed: {join_error}");
+        tracing::error!("The event listener task failed: {join_error}");
     }
 }
 
@@ -1972,7 +1972,7 @@ async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
 /// blocker for the `SQLite` close that follows.
 async fn drain_sampler(sampler: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = sampler.await {
-        eprintln!("The telemetry sampling task failed: {join_error}");
+        tracing::error!("The telemetry sampling task failed: {join_error}");
     }
 }
 
@@ -1980,8 +1980,8 @@ async fn launch_browser(url: String) {
     let result = tokio::task::spawn_blocking(move || webbrowser::open(&url)).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("Could not open the default browser: {error}"),
-        Err(error) => eprintln!("Browser launch task failed: {error}"),
+        Ok(Err(error)) => tracing::error!("Could not open the default browser: {error}"),
+        Err(error) => tracing::error!("Browser launch task failed: {error}"),
     }
 }
 

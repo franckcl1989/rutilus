@@ -186,7 +186,7 @@ impl CenterClientConfig {
             match self.connect().await {
                 Ok(link) => return Ok(link),
                 Err(error) => {
-                    eprintln!(
+                    tracing::warn!(
                         "center connection failed: {error}; retrying in {SITE_RECONNECT_AFTER:?}"
                     );
                 }

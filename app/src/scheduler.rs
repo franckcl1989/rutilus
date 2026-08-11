@@ -18,11 +18,9 @@
 //! The loop follows the design §7.8 async discipline: it is cancellable
 //! through a [`StopWatch`] (every task has a cancellation token), it never
 //! panics, one failing operation never interrupts the sweep, and it finishes
-//! its in-flight tick before exiting (structured drain). The app has no
-//! logging facility yet — the crate's precedent is `eprintln!` for
-//! operational failures (`standalone_runtime` uses it for browser-launch and
-//! task failures) — so every recorded failure goes there until a real log
-//! facility lands.
+//! its in-flight tick before exiting (structured drain). Every recorded
+//! failure goes through `tracing::error!` (the §6.2 diagnostic log, on the
+//! app binary's RUST_LOG-filtered stderr subscriber).
 //!
 //! Pacing, backoff, bounded retries, and per-endpoint concurrency are
 //! deliberately later iterations: each sweep is a full re-scan of the store,
@@ -275,7 +273,7 @@ pub(crate) async fn run<Store, Executor, Monitor, Time>(
                 if let Err(error) = run_tick(&engine, &executor, &monitor, now).await {
                     // A failed sweep is not fatal: the loop stays alive and
                     // retries the whole sweep on the next tick.
-                    eprintln!("operation scheduling sweep failed: {error}");
+                    tracing::error!("operation scheduling sweep failed: {error}");
                 }
             }
         }
@@ -365,7 +363,7 @@ where
         if let Err(error) = outcome {
             // One failed operation never stops the sweep; the next tick
             // re-lists it and tries again.
-            eprintln!("operation {operation_id} could not be driven: {error}");
+            tracing::error!("operation {operation_id} could not be driven: {error}");
         }
     }
 
@@ -376,7 +374,7 @@ where
     for operation in waiting {
         let operation_id = operation.id();
         if let Err(error) = monitor.poll_operation(operation_id, now).await {
-            eprintln!("operation {operation_id} Task poll failed: {error}");
+            tracing::error!("operation {operation_id} Task poll failed: {error}");
         }
     }
     Ok(())
