@@ -2798,6 +2798,366 @@ impl EventListResponse {
     }
 }
 
+/// The §14.2 homepage aggregate: one server-derived, read-only dashboard
+/// summary of the whole managed fleet.
+///
+/// Every block is derived by the serving process from the same persisted
+/// facts the individual views render — never from new client-side requests —
+/// so one round-trip carries the homepage display list of §14.2: endpoint
+/// counts, vendor and health distribution, firmware inventory summary,
+/// capability coverage, running operations, recent events, and data
+/// staleness. The response is deliberately secret-free and read-only by
+/// construction: it composes existing query boundaries and exposes no write
+/// surface, so the §16.1 Viewer role may read it.
+///
+/// Block semantics (honest derivations, §12.3 unified vocabulary):
+/// - `endpoints` counts the managed endpoints and splits them by whether a
+///   complete resource Generation has been published yet. The product does
+///   not model online/offline/auth-failed reachability (§14.2 lists them as
+///   aspirations), so the snapshot split is the truthful counterpart: an
+///   endpoint with a current snapshot last refreshed successfully, one
+///   awaiting its first refresh has never completed one.
+/// - `vendors` is the §12.3 unified vendor distribution: one count per
+///   distinct Service Root `Vendor` value, with `vendor` absent for
+///   endpoints that have not published one yet (awaiting first refresh).
+/// - `health` is the §12.3 unified health distribution: every endpoint is
+///   bucketed by the worst `Health` of its System, Chassis, and Manager
+///   resources, with `unknown` for endpoints with no observed health.
+/// - `firmware` summarizes the §2.1 `update-service` `SoftwareInventory`
+///   family: how many endpoints published at least one inventory member,
+///   how many members exist across the fleet, and how many distinct
+///   non-empty `Version` values they carry.
+/// - `capabilities` is the §2.4 capability coverage: across every endpoint's
+///   capability ledger, how many entries have an observed final state and
+///   how many of those are `supported`. Entries never probed are not
+///   observed and do not count as supported or unsupported.
+/// - `running_operations` counts persisted operations whose §13.2 state is
+///   still active (queued through verifying), including §13.6 remote Task
+///   monitoring.
+/// - `recent_events` is the bounded newest-first §14.4 event tail the server
+///   keeps (at most [`OVERVIEW_RECENT_EVENTS`]).
+/// - `freshness` is the data-staleness distribution: every endpoint is
+///   bucketed by the age of its last successful refresh at serving time,
+///   with `never_refreshed` for endpoints without any.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewResponse {
+    endpoints: OverviewEndpointCountsResponse,
+    vendors: Vec<OverviewVendorCountResponse>,
+    health: Vec<OverviewHealthCountResponse>,
+    firmware: OverviewFirmwareSummaryResponse,
+    capabilities: OverviewCapabilityCoverageResponse,
+    running_operations: u64,
+    recent_events: Vec<EventResponse>,
+    freshness: Vec<OverviewFreshnessCountResponse>,
+}
+
+impl OverviewResponse {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        endpoints: OverviewEndpointCountsResponse,
+        vendors: Vec<OverviewVendorCountResponse>,
+        health: Vec<OverviewHealthCountResponse>,
+        firmware: OverviewFirmwareSummaryResponse,
+        capabilities: OverviewCapabilityCoverageResponse,
+        running_operations: u64,
+        recent_events: Vec<EventResponse>,
+        freshness: Vec<OverviewFreshnessCountResponse>,
+    ) -> Self {
+        Self {
+            endpoints,
+            vendors,
+            health,
+            firmware,
+            capabilities,
+            running_operations,
+            recent_events,
+            freshness,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoints(&self) -> &OverviewEndpointCountsResponse {
+        &self.endpoints
+    }
+
+    /// Returns the §12.3 vendor distribution in deterministic order: the
+    /// unobserved bucket first (absent `vendor`), then alphabetical.
+    #[must_use]
+    pub fn vendors(&self) -> &[OverviewVendorCountResponse] {
+        &self.vendors
+    }
+
+    /// Returns the §12.3 unified health distribution in deterministic
+    /// worst-first order (critical, warning, ok, unknown).
+    #[must_use]
+    pub fn health(&self) -> &[OverviewHealthCountResponse] {
+        &self.health
+    }
+
+    #[must_use]
+    pub const fn firmware(&self) -> &OverviewFirmwareSummaryResponse {
+        &self.firmware
+    }
+
+    #[must_use]
+    pub const fn capabilities(&self) -> &OverviewCapabilityCoverageResponse {
+        &self.capabilities
+    }
+
+    #[must_use]
+    pub const fn running_operations(&self) -> u64 {
+        self.running_operations
+    }
+
+    #[must_use]
+    pub fn recent_events(&self) -> &[EventResponse] {
+        &self.recent_events
+    }
+
+    /// Returns the staleness distribution in deterministic order: never
+    /// refreshed, then newest-first age buckets.
+    #[must_use]
+    pub fn freshness(&self) -> &[OverviewFreshnessCountResponse] {
+        &self.freshness
+    }
+}
+
+/// The maximum size of the §14.2 homepage recent-event tail.
+pub const OVERVIEW_RECENT_EVENTS: u64 = 5;
+
+/// The §14.2 homepage endpoint-count block.
+///
+/// `total` always equals the sum of the two snapshot buckets; the buckets
+/// split the fleet by whether a complete resource Generation exists (§9.5:
+/// a snapshot is published only by a successful refresh).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewEndpointCountsResponse {
+    total: u64,
+    with_current_snapshot: u64,
+    awaiting_first_refresh: u64,
+}
+
+impl OverviewEndpointCountsResponse {
+    #[must_use]
+    pub const fn new(total: u64, with_current_snapshot: u64, awaiting_first_refresh: u64) -> Self {
+        Self {
+            total,
+            with_current_snapshot,
+            awaiting_first_refresh,
+        }
+    }
+
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    #[must_use]
+    pub const fn with_current_snapshot(&self) -> u64 {
+        self.with_current_snapshot
+    }
+
+    #[must_use]
+    pub const fn awaiting_first_refresh(&self) -> u64 {
+        self.awaiting_first_refresh
+    }
+}
+
+/// One §14.2 homepage vendor-distribution bucket.
+///
+/// `vendor` is absent for endpoints that have not published a Service Root
+/// `Vendor` yet (awaiting first refresh) — the honest "unobserved" bucket
+/// instead of a fabricated vendor name.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewVendorCountResponse {
+    vendor: Option<String>,
+    count: u64,
+}
+
+impl OverviewVendorCountResponse {
+    #[must_use]
+    pub const fn new(vendor: Option<String>, count: u64) -> Self {
+        Self { vendor, count }
+    }
+
+    #[must_use]
+    pub fn vendor(&self) -> Option<&str> {
+        self.vendor.as_deref()
+    }
+
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// One §14.2 homepage health-distribution bucket.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewHealthCountResponse {
+    level: OverviewHealthLevelResponse,
+    count: u64,
+}
+
+impl OverviewHealthCountResponse {
+    #[must_use]
+    pub const fn new(level: OverviewHealthLevelResponse, count: u64) -> Self {
+        Self { level, count }
+    }
+
+    #[must_use]
+    pub const fn level(&self) -> OverviewHealthLevelResponse {
+        self.level
+    }
+
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// The unified §12.3 health level of one endpoint as the §14.2 homepage
+/// aggregate derives it: the worst `Health` of the endpoint's System,
+/// Chassis, and Manager resources, case-insensitively over the Redfish
+/// status vocabulary, with `unknown` when no resource published a health.
+///
+/// The wire values are `snake_case` by console contract.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewHealthLevelResponse {
+    /// No health observed yet — not "healthy".
+    Unknown,
+    Ok,
+    Warning,
+    Critical,
+}
+
+/// The §14.2 homepage firmware-inventory summary over the §2.1
+/// `update-service` `SoftwareInventory` family.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewFirmwareSummaryResponse {
+    endpoints_with_inventory: u64,
+    entries: u64,
+    distinct_versions: u64,
+}
+
+impl OverviewFirmwareSummaryResponse {
+    #[must_use]
+    pub const fn new(
+        endpoints_with_inventory: u64,
+        entries: u64,
+        distinct_versions: u64,
+    ) -> Self {
+        Self {
+            endpoints_with_inventory,
+            entries,
+            distinct_versions,
+        }
+    }
+
+    #[must_use]
+    pub const fn endpoints_with_inventory(&self) -> u64 {
+        self.endpoints_with_inventory
+    }
+
+    #[must_use]
+    pub const fn entries(&self) -> u64 {
+        self.entries
+    }
+
+    /// Returns the count of distinct non-empty `Version` values across the
+    /// fleet's inventory members.
+    #[must_use]
+    pub const fn distinct_versions(&self) -> u64 {
+        self.distinct_versions
+    }
+}
+
+/// The §14.2 homepage capability coverage across every endpoint's §2.4
+/// capability ledger.
+///
+/// An entry whose endpoint never completed a capability probe has no
+/// observed state and is not counted in either field — the coverage is
+/// "supported over observed", never over the full theoretical ledger.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewCapabilityCoverageResponse {
+    observed_entries: u64,
+    supported_entries: u64,
+}
+
+impl OverviewCapabilityCoverageResponse {
+    #[must_use]
+    pub const fn new(observed_entries: u64, supported_entries: u64) -> Self {
+        Self {
+            observed_entries,
+            supported_entries,
+        }
+    }
+
+    #[must_use]
+    pub const fn observed_entries(&self) -> u64 {
+        self.observed_entries
+    }
+
+    #[must_use]
+    pub const fn supported_entries(&self) -> u64 {
+        self.supported_entries
+    }
+}
+
+/// One §14.2 homepage staleness bucket: how many endpoints fall into each
+/// age class of their last successful refresh.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverviewFreshnessCountResponse {
+    bucket: OverviewFreshnessBucketResponse,
+    count: u64,
+}
+
+impl OverviewFreshnessCountResponse {
+    #[must_use]
+    pub const fn new(bucket: OverviewFreshnessBucketResponse, count: u64) -> Self {
+        Self { bucket, count }
+    }
+
+    #[must_use]
+    pub const fn bucket(&self) -> OverviewFreshnessBucketResponse {
+        self.bucket
+    }
+
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// The §14.2 homepage data-staleness age class of one endpoint's last
+/// successful refresh, derived by the server at serving time.
+///
+/// The wire values are `snake_case` by console contract.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewFreshnessBucketResponse {
+    /// No complete refresh has ever succeeded (§9.5).
+    NeverRefreshed,
+    /// The last successful refresh is less than one hour old.
+    WithinOneHour,
+    /// The last successful refresh is at least one hour and less than one
+    /// day old.
+    WithinOneDay,
+    /// The last successful refresh is at least one day and less than seven
+    /// days old.
+    WithinSevenDays,
+    /// The last successful refresh is at least seven days old.
+    OlderThanSevenDays,
+}
+
 /// One telemetry series with the aggregates of the §14.4 current-value
 /// surface.
 ///
@@ -10587,6 +10947,189 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn overview_contract_serializes_every_dashboard_block() -> Result<(), Box<dyn Error>> {
+        let event_timestamp = OffsetDateTime::parse("2026-08-07T03:21:00Z", &Rfc3339)?;
+        let observed_at = OffsetDateTime::parse("2026-08-07T03:21:05Z", &Rfc3339)?;
+        let response = OverviewResponse::new(
+            OverviewEndpointCountsResponse::new(2, 1, 1),
+            vec![
+                OverviewVendorCountResponse::new(None, 1),
+                OverviewVendorCountResponse::new(Some("ACME".to_owned()), 1),
+            ],
+            vec![
+                OverviewHealthCountResponse::new(OverviewHealthLevelResponse::Critical, 0),
+                OverviewHealthCountResponse::new(OverviewHealthLevelResponse::Warning, 0),
+                OverviewHealthCountResponse::new(OverviewHealthLevelResponse::Ok, 1),
+                OverviewHealthCountResponse::new(OverviewHealthLevelResponse::Unknown, 1),
+            ],
+            OverviewFirmwareSummaryResponse::new(1, 2, 2),
+            OverviewCapabilityCoverageResponse::new(60, 55),
+            3,
+            vec![EventResponse::new(
+                uuid!("0198c1ec-7e10-7f5e-8f2a-123456789001"),
+                uuid!("0198c1ec-7e10-7f5e-8f2a-123456789002"),
+                "Alert.1.0.PowerSupplyFailure".to_owned(),
+                "critical".to_owned(),
+                Some("Power supply 1 lost input".to_owned()),
+                event_timestamp,
+                observed_at,
+            )],
+            vec![
+                OverviewFreshnessCountResponse::new(
+                    OverviewFreshnessBucketResponse::NeverRefreshed,
+                    1,
+                ),
+                OverviewFreshnessCountResponse::new(
+                    OverviewFreshnessBucketResponse::WithinOneHour,
+                    1,
+                ),
+                OverviewFreshnessCountResponse::new(
+                    OverviewFreshnessBucketResponse::WithinOneDay,
+                    0,
+                ),
+                OverviewFreshnessCountResponse::new(
+                    OverviewFreshnessBucketResponse::WithinSevenDays,
+                    0,
+                ),
+                OverviewFreshnessCountResponse::new(
+                    OverviewFreshnessBucketResponse::OlderThanSevenDays,
+                    0,
+                ),
+            ],
+        );
+
+        assert_eq!(
+            serde_json::to_value(&response)?,
+            json!({
+                "endpoints": {
+                    "total": 2,
+                    "with_current_snapshot": 1,
+                    "awaiting_first_refresh": 1
+                },
+                "vendors": [
+                    { "vendor": null, "count": 1 },
+                    { "vendor": "ACME", "count": 1 }
+                ],
+                "health": [
+                    { "level": "critical", "count": 0 },
+                    { "level": "warning", "count": 0 },
+                    { "level": "ok", "count": 1 },
+                    { "level": "unknown", "count": 1 }
+                ],
+                "firmware": {
+                    "endpoints_with_inventory": 1,
+                    "entries": 2,
+                    "distinct_versions": 2
+                },
+                "capabilities": {
+                    "observed_entries": 60,
+                    "supported_entries": 55
+                },
+                "running_operations": 3,
+                "recent_events": [{
+                    "id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789001"),
+                    "endpoint_id": uuid!("0198c1ec-7e10-7f5e-8f2a-123456789002"),
+                    "message_id": "Alert.1.0.PowerSupplyFailure",
+                    "severity": "critical",
+                    "message": "Power supply 1 lost input",
+                    "event_timestamp": "2026-08-07T03:21:00Z",
+                    "observed_at": "2026-08-07T03:21:05Z"
+                }],
+                "freshness": [
+                    { "bucket": "never_refreshed", "count": 1 },
+                    { "bucket": "within_one_hour", "count": 1 },
+                    { "bucket": "within_one_day", "count": 0 },
+                    { "bucket": "within_seven_days", "count": 0 },
+                    { "bucket": "older_than_seven_days", "count": 0 }
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<OverviewResponse>(serde_json::to_value(&response)?)?,
+            response
+        );
+        assert_eq!(
+            response.endpoints(),
+            &OverviewEndpointCountsResponse::new(2, 1, 1)
+        );
+        assert_eq!(response.vendors()[1].vendor(), Some("ACME"));
+        assert_eq!(response.vendors()[0].vendor(), None);
+        assert_eq!(
+            response.health()[0].level(),
+            OverviewHealthLevelResponse::Critical
+        );
+        assert_eq!(response.firmware().distinct_versions(), 2);
+        assert_eq!(response.capabilities().supported_entries(), 55);
+        assert_eq!(response.running_operations(), 3);
+        assert_eq!(response.recent_events().len(), 1);
+        assert_eq!(
+            response.freshness()[0].bucket(),
+            OverviewFreshnessBucketResponse::NeverRefreshed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overview_contract_rejects_unknown_fields_and_wire_values() {
+        let envelope = json!({
+            "endpoints": { "total": 1, "with_current_snapshot": 1, "awaiting_first_refresh": 0 },
+            "vendors": [{ "vendor": "ACME", "count": 1 }],
+            "health": [{ "level": "ok", "count": 1 }],
+            "firmware": {
+                "endpoints_with_inventory": 1,
+                "entries": 1,
+                "distinct_versions": 1
+            },
+            "capabilities": { "observed_entries": 1, "supported_entries": 1 },
+            "running_operations": 0,
+            "recent_events": [],
+            "freshness": [{ "bucket": "within_one_hour", "count": 1 }]
+        });
+
+        assert!(serde_json::from_value::<OverviewResponse>(envelope).is_ok());
+        assert!(
+            serde_json::from_value::<OverviewResponse>(json!({
+                "endpoints": { "total": 1, "with_current_snapshot": 1, "awaiting_first_refresh": 0 },
+                "vendors": [{ "vendor": "ACME", "count": 1 }],
+                "health": [{ "level": "ok", "count": 1 }],
+                "firmware": {
+                    "endpoints_with_inventory": 1,
+                    "entries": 1,
+                    "distinct_versions": 1
+                },
+                "capabilities": { "observed_entries": 1, "supported_entries": 1 },
+                "running_operations": 0,
+                "recent_events": [],
+                "freshness": [{ "bucket": "within_one_hour", "count": 1 }],
+                "extra": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OverviewHealthCountResponse>(json!({
+                "level": "degraded",
+                "count": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OverviewFreshnessCountResponse>(json!({
+                "bucket": "within_a_month",
+                "count": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OverviewVendorCountResponse>(json!({
+                "vendor": "ACME",
+                "count": 1,
+                "extra": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]
