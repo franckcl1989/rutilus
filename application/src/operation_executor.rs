@@ -38,10 +38,10 @@ use rutilus_domain::{
     AccountCommand, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOperationId,
     AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
-    CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
-    EventCommand, FailureKind, ManagerCommand, OemCommand, Operation, OperationEvent, OperationId,
-    OperationState, ProductPermission, RedfishCommand, SecureBootCommand, SystemCommand,
-    UpdateCommand,
+    CapabilityState, ChassisCommand, ControlCommand, DeploymentPosture, EndpointCapability,
+    EndpointId, EventCommand, FailureKind, LogCommand, ManagerCommand, OemCommand, Operation,
+    OperationEvent, OperationId, OperationState, ProductPermission, RedfishCommand,
+    SecureBootCommand, SystemCommand, UpdateCommand,
 };
 use rutilus_operation_engine::{
     EngineError, OperationEngine, OperationStore, RemoteTask, RemoteTaskStore,
@@ -1224,7 +1224,15 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
         },
         RedfishCommand::System(SystemCommand::Reset(_)) => AuditRedfishOperation::ResetSystem,
         RedfishCommand::Manager(ManagerCommand::Reset(_)) => AuditRedfishOperation::ResetManager,
+        // A factory-defaults wipe is materially different from a restart, so
+        // the reset-to-defaults command gets its own audit name (§16.3).
+        RedfishCommand::Manager(ManagerCommand::ResetToDefaults(_)) => {
+            AuditRedfishOperation::ManagerResetToDefaults
+        }
         RedfishCommand::Chassis(ChassisCommand::Reset(_)) => AuditRedfishOperation::ResetChassis,
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(_)) => {
+            AuditRedfishOperation::PowerSupplyReset
+        }
         RedfishCommand::Boot(BootCommand::SetBootSourceOverride(_)) => {
             AuditRedfishOperation::SetBootSourceOverride
         }
@@ -1243,8 +1251,16 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
         RedfishCommand::Event(EventCommand::DeleteSubscription(_)) => {
             AuditRedfishOperation::DeleteEventSubscription
         }
+        RedfishCommand::Log(LogCommand::ClearLog(_)) => AuditRedfishOperation::LogClear,
+        RedfishCommand::Control(ControlCommand::Update(_)) => AuditRedfishOperation::ControlUpdate,
         RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
             AuditRedfishOperation::UpdateFirmware
+        }
+        // Patching the `UpdateService` configuration is separate from
+        // submitting firmware: the accountability of a service-configuration
+        // change differs from an artifact upload (§16.3).
+        RedfishCommand::Update(UpdateCommand::Patch(_)) => {
+            AuditRedfishOperation::UpdateServicePatch
         }
         // The three OEM faces are audited separately because their
         // accountability differs: a profile-service write, a debug-token
@@ -1279,6 +1295,12 @@ pub(crate) fn required_capability(command: &RedfishCommand) -> EndpointCapabilit
         RedfishCommand::Chassis(_) => EndpointCapability::Chassis,
         RedfishCommand::SecureBoot(_) => EndpointCapability::SecureBoot,
         RedfishCommand::Event(_) => EndpointCapability::EventService,
+        // A log-service write targets the BMC's `LogService` resources, so
+        // it requires the log-services capability (§2.1, §3.1).
+        RedfishCommand::Log(_) => EndpointCapability::LogServices,
+        // A control write targets the chassis's `Control` resources, so it
+        // requires the controls capability (§2.1, §3.1).
+        RedfishCommand::Control(_) => EndpointCapability::Controls,
         // A firmware update targets the BMC's UpdateService (§14.3), so the
         // update command requires the update-service capability.
         RedfishCommand::Update(_) => EndpointCapability::UpdateService,
@@ -1585,13 +1607,15 @@ mod tests {
         AccountCommand, AccountId, AccountPassword, AccountUserName, Artifact, ArtifactName,
         ArtifactState, AuditOutcomeKind, AuditVerification, BootCommand, BootSource,
         BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState, ChassisCommand,
-        CreateAccount, CreateSubscription, CredentialId, DeleteAccount, DeleteSubscription,
-        Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        EventCommand, EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+        ClearLog, ControlCommand, CreateAccount, CreateSubscription, CredentialId, DeleteAccount,
+        DeleteSubscription, Endpoint, EndpointAddress, EndpointCapabilityObservation,
+        EndpointDisplayName, EndpointId, EventCommand, EventDestinationProtocol, EventType,
+        LogCommand, ManagerCommand, ManagerResetToDefaultsType, NvidiaDebugTokenCommand,
         NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OperationSource,
-        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, RoleId, SecureBootCommand,
-        SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
-        TlsTrust, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+        OperationTarget, PowerSupplyReset, ResetKeysType, ResetType, ResourceSnapshot, RoleId,
+        SecureBootCommand, SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId,
+        TlsCertificate, TlsTrust, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName,
+        UpdateCommand, UpdateControl, UpdatePatch,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
@@ -4260,13 +4284,13 @@ mod tests {
         Ok(())
     }
 
-    // One pair per §7.5 write family; the line count grows with the family
-    // count, so the lint is scoped here like the domain's family
+    // One pair per §7.5 write operation; the line count grows with the
+    // operation count, so the lint is scoped here like the domain's family
     // enumeration tests.
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn command_audit_operations_pin_the_eighteen_write_families() -> Result<(), Box<dyn Error>>
-    {
+    async fn command_audit_operations_pin_the_twenty_three_write_operations()
+    -> Result<(), Box<dyn Error>> {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
@@ -4275,7 +4299,7 @@ mod tests {
         // five account writes are pinned separately because their
         // accountability differs (§16.3), and the three OEM faces are pinned
         // separately for the same reason (§11.5).
-        let pairs: [(&RedfishCommand, AuditRedfishOperation); 18] = [
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 23] = [
             (
                 &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
                     AccountUserName::parse("jane")?,
@@ -4324,8 +4348,20 @@ mod tests {
                 AuditRedfishOperation::ResetManager,
             ),
             (
+                &RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                    ManagerResetToDefaultsType::ResetAll,
+                )),
+                AuditRedfishOperation::ManagerResetToDefaults,
+            ),
+            (
                 &RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::PowerCycle)),
                 AuditRedfishOperation::ResetChassis,
+            ),
+            (
+                &RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                    None,
+                ))),
+                AuditRedfishOperation::PowerSupplyReset,
             ),
             (
                 &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
@@ -4368,11 +4404,26 @@ mod tests {
                 AuditRedfishOperation::DeleteEventSubscription,
             ),
             (
+                &RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+                AuditRedfishOperation::LogClear,
+            ),
+            (
+                &RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+                AuditRedfishOperation::ControlUpdate,
+            ),
+            (
                 &RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
                     ArtifactId::generate(),
                     None,
                 ))),
                 AuditRedfishOperation::UpdateFirmware,
+            ),
+            (
+                &RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+                AuditRedfishOperation::UpdateServicePatch,
             ),
             (
                 &RedfishCommand::Oem(OemCommand::SystemConfigProfile(
@@ -4445,14 +4496,44 @@ mod tests {
 
     #[test]
     fn update_commands_require_the_update_service_capability() {
-        let command = RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
-            ArtifactId::generate(),
-            None,
-        )));
-        assert_eq!(
-            required_capability(&command),
-            EndpointCapability::UpdateService
-        );
+        for command in [
+            RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                ArtifactId::generate(),
+                None,
+            ))),
+            RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+        ] {
+            assert_eq!(
+                required_capability(&command),
+                EndpointCapability::UpdateService
+            );
+        }
+    }
+
+    #[test]
+    fn log_and_control_commands_require_their_own_capability() {
+        // A log-service write targets the BMC's `LogService` resources, and
+        // a control write targets the chassis's `Control` resources, so each
+        // family requires its own §2.1 capability.
+        for (command, expected) in [
+            (
+                RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+                EndpointCapability::LogServices,
+            ),
+            (
+                RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                    None,
+                    Some(700.0),
+                ))),
+                EndpointCapability::Controls,
+            ),
+        ] {
+            assert_eq!(
+                required_capability(&command),
+                expected,
+                "each family must require its own capability"
+            );
+        }
     }
 
     #[test]
