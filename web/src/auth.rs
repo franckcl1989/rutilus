@@ -725,11 +725,19 @@ const ROUTE_TABLE: &[(Method, &str, RouteAccess)] = &[
             mutation: true,
         },
     ),
-    // Events and telemetry are every role. The telemetry wildcard covers
-    // the `{series_id}/samples` read.
+    // Events, telemetry, and the §14.2 homepage overview are every role. The
+    // telemetry wildcard covers the `{series_id}/samples` read.
     (
         Method::GET,
         "/api/v1/events",
+        RouteAccess::GuardedOnly {
+            roles: RoleMask::ANY,
+            mutation: false,
+        },
+    ),
+    (
+        Method::GET,
+        "/api/v1/overview",
         RouteAccess::GuardedOnly {
             roles: RoleMask::ANY,
             mutation: false,
@@ -2354,6 +2362,15 @@ mod tests {
                 &Method::GET,
                 "/api/v1/telemetry/77f4e8c1-91a0-4b3e-8a5d-000000000005/samples"
             ),
+            RouteAccess::GuardedOnly {
+                roles: RoleMask::ANY,
+                mutation: false
+            }
+        );
+        // The §14.2 homepage aggregate is a read: every role, no session in
+        // Open mode.
+        assert_eq!(
+            edge_access(&Method::GET, "/api/v1/overview"),
             RouteAccess::GuardedOnly {
                 roles: RoleMask::ANY,
                 mutation: false
