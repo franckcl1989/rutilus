@@ -37,7 +37,7 @@ pub use tls_probe::{
 /// release baseline pins the crate version, the lockfile, and the complete
 /// capability inventory as a frozen ledger Hash. The frozen record now
 /// exists: [`NV_REDFISH_RELEASE_BASELINE`] pins `0.13.0` (and records the
-/// newer stable `0.14.1` for the freeze review), so a development baseline
+/// newer stable `0.14.2` for the freeze review), so a development baseline
 /// that moves past the frozen version is a documented, reviewed decision
 /// instead of a silent drift.
 pub const NV_REDFISH_DEVELOPMENT_BASELINE: &str = "0.13.0";

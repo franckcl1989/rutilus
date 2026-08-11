@@ -15,10 +15,10 @@
 //! The freeze pins [`NV_REDFISH_RELEASE_BASELINE_VERSION`] = `0.13.0`, the
 //! version the workspace compiles today
 //! ([`crate::NV_REDFISH_DEVELOPMENT_BASELINE`]). The crates.io index known to
-//! this machine also carries `0.14.1` (published 2026-08-07, not yanked) —
+//! this machine also carries `0.14.2` (published 2026-08-10, not yanked) —
 //! a newer stable release that was published after the development baseline
 //! was validated. Per §2.3 the freeze chooses the latest *validated* stable
-//! version, so `0.13.0` stays frozen and the `0.14.1` upgrade decision is
+//! version, so `0.13.0` stays frozen and the `0.14.2` upgrade decision is
 //! recorded in [`NV_REDFISH_KNOWN_NEWER_STABLE_VERSION`] and left to the
 //! freeze review; the record does not assert `DEVELOPMENT == RELEASE` as an
 //! invariant because the development baseline is allowed to move ahead of the
@@ -60,12 +60,12 @@ pub const NV_REDFISH_RELEASE_BASELINE_VERSION: &str = "0.13.0";
 
 /// A newer stable `nv-redfish` release known to the freeze record.
 ///
-/// `0.14.1` was published on 2026-08-07 (after `0.13.0`, 2026-08-04) and is
+/// `0.14.2` was published on 2026-08-10 (after `0.13.0`, 2026-08-04) and is
 /// not yanked. §2.3 freezes the latest *validated* stable version, so the
 /// record keeps `0.13.0` and leaves the upgrade decision to the freeze
 /// review. `None` records that no newer stable release was known when the
 /// record was written.
-pub const NV_REDFISH_KNOWN_NEWER_STABLE_VERSION: Option<&str> = Some("0.14.1");
+pub const NV_REDFISH_KNOWN_NEWER_STABLE_VERSION: Option<&str> = Some("0.14.2");
 
 /// The public `nv-redfish` features explicitly enabled in the workspace
 /// manifests: the 16 features of the root `Cargo.toml` `nv-redfish`
@@ -482,7 +482,7 @@ pub const RELEASE_BASELINE_MODULES: [BaselineModule; 29] = [
         name: "port",
         gating_feature: Some("ports"),
         classification: BaselineModuleClassification::LedgerMapped,
-        decision: "standard surface new in 0.13.0 (absent from the §2.1 0.12.1 inventory): the §0.8.0 ledger must gain the Ports entry — recorded as PENDING_LEDGER_FEATURES until the domain ledger lands it",
+        decision: "§2.1 ports ledger entry (domain EndpointCapability::Ports)",
     },
     BaselineModule {
         name: "power_equipment",
@@ -981,8 +981,8 @@ pub const FROZEN_UNMAPPED_OPERATION_COUNT: usize = 20;
 /// snapshot equals both the freshly computed digest and the golden digest
 /// pinned by `rutilus-center-protocol`'s negotiation tests.
 pub const RELEASE_BASELINE_LEDGER_HASH: [u8; 32] = [
-    0x1C, 0xEB, 0x3C, 0xEB, 0x0D, 0x6E, 0xB4, 0xF2, 0xB7, 0x0B, 0xA2, 0x0C, 0x16, 0x51, 0x66, 0x3A,
-    0xC3, 0x83, 0x21, 0x95, 0xEE, 0x75, 0x63, 0xB6, 0x07, 0x2D, 0x27, 0x2B, 0xF6, 0xBE, 0xE8, 0x0E,
+    0x84, 0xCA, 0xF5, 0x58, 0xF9, 0xAE, 0x77, 0xEA, 0x9C, 0xD4, 0xC3, 0xE7, 0xA2, 0x27, 0x1D, 0xE6,
+    0x3A, 0x65, 0x25, 0x38, 0x81, 0xFD, 0x70, 0xBB, 0x0A, 0xAE, 0x18, 0x5E, 0x23, 0x56, 0xD2, 0x4F,
 ];
 
 /// Computes the §15.3 capability-ledger hash over the current domain ledger.
@@ -1110,18 +1110,22 @@ mod tests {
     /// apart unnoticed: any change on either side fails this test or the
     /// negotiation test.
     const NEGOTIATION_GOLDEN_LEDGER_HASH: [u8; 32] = [
-        0x1C, 0xEB, 0x3C, 0xEB, 0x0D, 0x6E, 0xB4, 0xF2, 0xB7, 0x0B, 0xA2, 0x0C, 0x16, 0x51, 0x66,
-        0x3A, 0xC3, 0x83, 0x21, 0x95, 0xEE, 0x75, 0x63, 0xB6, 0x07, 0x2D, 0x27, 0x2B, 0xF6, 0xBE,
-        0xE8, 0x0E,
+        0x84, 0xCA, 0xF5, 0x58, 0xF9, 0xAE, 0x77, 0xEA, 0x9C, 0xD4, 0xC3, 0xE7, 0xA2, 0x27, 0x1D,
+        0xE6, 0x3A, 0x65, 0x25, 0x38, 0x81, 0xFD, 0x70, 0xBB, 0x0A, 0xAE, 0x18, 0x5E, 0x23, 0x56,
+        0xD2, 0x4F,
     ];
 
     /// The §2.1 standard ledger features that compile through the generated
     /// schema surface instead of a top-level wrapper module (`computer_system::bios`,
     /// `chassis::power`, ...); `environment-metrics` is enabled through
-    /// `controls`/`sensors` and has no module either. The ledger-mapping test
+    /// `controls`/`sensors` and has no module either. `bmc-http` and
+    /// `update-service-deprecated` also have no ledger-mapped module: the
+    /// `bmc_http` re-export is classified Infrastructure (transport, not a
+    /// capability) and the deprecated surface compiles through
+    /// `update_service` with no module of its own. The ledger-mapping test
     /// proves these are exactly the standard ledger features without a
     /// [`BaselineModule`].
-    const LEDGER_FEATURES_WITHOUT_TOP_LEVEL_MODULE: [&str; 12] = [
+    const LEDGER_FEATURES_WITHOUT_TOP_LEVEL_MODULE: [&str; 14] = [
         "bios",
         "boot-options",
         "environment-metrics",
@@ -1134,19 +1138,20 @@ mod tests {
         "secure-boot",
         "storages",
         "thermal",
+        "bmc-http",
+        "update-service-deprecated",
     ];
 
     /// Standard features compiled by the product whose domain-ledger entry is
     /// still pending (§0.8.0: "纳入从 0.12.1 到冻结版本新增的所有公开
     /// feature").
     ///
-    /// `ports` is new in 0.13.0 — the §2.1 inventory was written against
-    /// 0.12.1 and the domain ledger has no `Ports` variant yet. The freeze
-    /// record classifies the module and keeps this list non-empty so the
-    /// 0.8.0 ledger work cannot drop the entry; once the domain ledger lands
-    /// it, the ledger-coverage test fails and the entry must move out of this
-    /// list into the mapped inventory.
-    const PENDING_LEDGER_FEATURES: [&str; 1] = ["ports"];
+    /// `ports` was the last outstanding entry: the 47-record ledger landed it
+    /// as `EndpointCapability::Ports`, so this list is empty. The
+    /// ledger-coverage test proves the pending list equals the ledger gap
+    /// exactly, so a future gap shows up as a failing gate, not a silent
+    /// omission.
+    const PENDING_LEDGER_FEATURES: [&str; 0] = [];
 
     /// Reads one workspace file relative to this crate's manifest.
     fn read_workspace_file(relative: &str) -> Result<String, Box<dyn Error>> {
