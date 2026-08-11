@@ -22031,6 +22031,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verifies_password_change_and_rename_as_mismatched_when_the_member_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read collection no longer contains the member named by the
+        // payload id, so the expected result is provably absent: `Mismatched`,
+        // exactly like the role update's member-absent branch. Both commands
+        // share the empty-collection shape, so one fixture pins both branches.
+        for command in [
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("admin")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("admin")?,
+                    AccountUserName::parse("admin.renamed")?,
+                ),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                    ("200 OK", EMPTY_ACCOUNTS_COLLECTION_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(
+                verdict,
+                CommandVerificationOutcome::Mismatched,
+                "an absent member is the provably absent expected result"
+            );
+            // The absent member proves the outcome from the collection alone:
+            // no member fetch happens, exactly like the deletion confirmation
+            // over the empty collection.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 7);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn verifies_account_deletion_as_mismatched_when_the_member_is_still_present()
     -> Result<(), Box<dyn Error>> {
         // The re-read collection still contains the deleted member, so the
