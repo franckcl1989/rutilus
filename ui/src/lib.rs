@@ -9,27 +9,30 @@ use std::{collections::BTreeSet, fmt};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use rutilus_api::{
-    AboutResponse, ArtifactResponse, ArtifactStateResponse, AuditEventResponse, AuditQueryResponse,
-    BatchDetailResponse, BatchOperationResponse, BatchOperationStateResponse,
-    BatchOutcomeCountsResponse, BatchRefreshResponse, BatchSummaryResponse, BootCommand,
-    BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityEntryResponse,
-    CapabilityStateResponse, CenterBindingStateResponse, CenterEndpointViewResponse,
-    CenterOperationResponse, CenterSiteResponse, ChassisCommand, CoreResourceDetailsResponse,
-    CoreResourceResponse, CreateSubscription, CredentialInventoryResponse,
-    CredentialSummaryResponse, DeleteSubscription, EndpointCapabilityInventoryResponse,
+    AboutResponse, AccountCommand, AccountId, AccountPassword, AccountUserName, ArtifactResponse,
+    ArtifactStateResponse, AuditEventResponse, AuditQueryResponse, BatchDetailResponse,
+    BatchOperationResponse, BatchOperationStateResponse, BatchOutcomeCountsResponse,
+    BatchRefreshResponse, BatchSummaryResponse, BootCommand, BootSource, BootSourceOverrideEnabled,
+    BootSourceOverrideMode, CapabilityEntryResponse, CapabilityStateResponse,
+    CenterBindingStateResponse, CenterEndpointViewResponse, CenterOperationResponse,
+    CenterSiteResponse, ChassisCommand, CoreResourceDetailsResponse, CoreResourceResponse,
+    CreateAccount, CreateSubscription, CredentialInventoryResponse, CredentialSummaryResponse,
+    DeleteAccount, DeleteSubscription, EndpointCapabilityInventoryResponse,
     EndpointCsvImportResponse, EndpointCsvImportRowResponse, EndpointCsvImportRowStatusResponse,
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointRefreshResultResponse,
     EndpointRefreshStatusResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EraseToken, EraseType,
     EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
-    GroupResponse, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
+    GroupResponse, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS,
+    MAX_ROLE_ID_CHARS, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
     OperationSourceResponse, OperationStateResponse, ProfileFile, ProfileId, RedfishCommand,
-    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse, RoleResponse,
-    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TagListResponse,
-    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
-    TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse, UpdateCommand,
+    ResetKeysType, ResetType, ResourceDiagnosticsResponse, ResourceStatusResponse, RoleId,
+    RoleResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+    TagListResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesResponse,
+    TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse, UpdateAccount,
+    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -2438,6 +2441,11 @@ struct CenterOperationDraft {
     endpoint_id: String,
     target: String,
     family: Option<CommandFamilyView>,
+    account_action: Option<AccountActionView>,
+    account_id: String,
+    account_user_name: String,
+    account_password: String,
+    role_id: String,
     reset_type: Option<ResetTypeView>,
     boot_source: Option<BootSourceView>,
     boot_enabled: Option<BootEnabledView>,
@@ -2461,6 +2469,11 @@ impl CenterOperationDraft {
             endpoint_id: String::new(),
             target: String::new(),
             family: None,
+            account_action: None,
+            account_id: String::new(),
+            account_user_name: String::new(),
+            account_password: String::new(),
+            role_id: String::new(),
             reset_type: None,
             boot_source: None,
             boot_enabled: None,
@@ -2500,6 +2513,11 @@ impl CenterOperationDraft {
         let mut form = OperationFormDraft::new();
         form.selected_endpoint_ids = vec![self.endpoint_id.clone()];
         form.family = self.family;
+        form.account_action = self.account_action;
+        form.account_id.clone_from(&self.account_id);
+        form.account_user_name.clone_from(&self.account_user_name);
+        form.account_password.clone_from(&self.account_password);
+        form.role_id.clone_from(&self.role_id);
         form.reset_type = self.reset_type;
         form.boot_source = self.boot_source;
         form.boot_enabled = self.boot_enabled;
@@ -4254,6 +4272,7 @@ impl OperationSourceView {
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandFamilyView {
+    Account,
     SystemReset,
     ManagerReset,
     ChassisReset,
@@ -4267,7 +4286,8 @@ enum CommandFamilyView {
 #[cfg(any(target_arch = "wasm32", test))]
 impl CommandFamilyView {
     /// Every family in §7.5 order, so the form cannot miss a variant.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::Account,
         Self::SystemReset,
         Self::ManagerReset,
         Self::ChassisReset,
@@ -4282,6 +4302,7 @@ impl CommandFamilyView {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Account => "account",
             Self::SystemReset => "system",
             Self::ManagerReset => "manager",
             Self::ChassisReset => "chassis",
@@ -4297,6 +4318,7 @@ impl CommandFamilyView {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Account => "Account",
             Self::SystemReset => "System reset",
             Self::ManagerReset => "Manager reset",
             Self::ChassisReset => "Chassis reset",
@@ -4922,6 +4944,7 @@ impl ResetResourceView {
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OperationCommandDraft {
+    Account(AccountActionDraft),
     Reset {
         family: ResetResourceView,
         reset_type: ResetTypeView,
@@ -4995,6 +5018,73 @@ enum EventActionDraft {
     DeleteSubscription { subscription_id: String },
 }
 
+/// The account-command payload assembled from the operation form.
+///
+/// This is the form-side counterpart of the domain `AccountCommand`: the
+/// same five writes with the same typed parameters. Password fields are
+/// plain strings in the draft (the form never logs them) and become
+/// [`AccountPassword`](rutilus_domain::AccountPassword) secrets in
+/// `build_command`.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AccountActionDraft {
+    /// Creates one account with a user name, password, and role.
+    Create {
+        user_name: String,
+        password: String,
+        role_id: String,
+    },
+    /// Changes the role of one existing account.
+    UpdateRole { account_id: String, role_id: String },
+    /// Changes the password of one existing account.
+    UpdatePassword {
+        account_id: String,
+        password: String,
+    },
+    /// Renames one existing account.
+    UpdateUserName {
+        account_id: String,
+        user_name: String,
+    },
+    /// Deletes one existing account.
+    Delete { account_id: String },
+}
+
+/// One account action selectable in the form.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountActionView {
+    Create,
+    UpdateRole,
+    UpdatePassword,
+    UpdateUserName,
+    Delete,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl AccountActionView {
+    /// Every action in domain order, so the form cannot miss a variant.
+    const ALL: [Self; 5] = [
+        Self::Create,
+        Self::UpdateRole,
+        Self::UpdatePassword,
+        Self::UpdateUserName,
+        Self::Delete,
+    ];
+
+    /// Static English label for one account action.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Create => "Create account",
+            Self::UpdateRole => "Change role",
+            Self::UpdatePassword => "Change password",
+            Self::UpdateUserName => "Rename account",
+            Self::Delete => "Delete account",
+        }
+    }
+}
+
 /// One-line summary of a typed command for the operation card and the form
 /// preview: the family label plus a compact payload description.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -5002,6 +5092,19 @@ enum EventActionDraft {
 struct CommandSummaryProjection {
     family: &'static str,
     payload: String,
+}
+
+/// The stable select key of one account action, so the form options and the
+/// selected value stay one vocabulary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_action_key(action: AccountActionView) -> &'static str {
+    match action {
+        AccountActionView::Create => "create",
+        AccountActionView::UpdateRole => "update-role",
+        AccountActionView::UpdatePassword => "update-password",
+        AccountActionView::UpdateUserName => "update-user-name",
+        AccountActionView::Delete => "delete",
+    }
 }
 
 /// The stable select key of one OEM action, so the form options and the
@@ -5029,6 +5132,10 @@ fn oem_action_key(action: OemActionView) -> &'static str {
 #[cfg(any(target_arch = "wasm32", test))]
 fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection {
     match command {
+        OperationCommandDraft::Account(action) => CommandSummaryProjection {
+            family: CommandFamilyView::Account.label(),
+            payload: account_action_summary(action),
+        },
         OperationCommandDraft::Reset { family, reset_type } => CommandSummaryProjection {
             family: family.label(),
             payload: reset_type.as_str().to_owned(),
@@ -5105,6 +5212,35 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
     }
 }
 
+/// One-line payload summary of an account command draft.
+///
+/// The password fields render as a fixed label, never the entered value —
+/// the form-side mirror of the domain's redacted `Debug`.
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_action_summary(draft: &AccountActionDraft) -> String {
+    match draft {
+        AccountActionDraft::Create {
+            user_name, role_id, ..
+        } => format!("Create · {user_name} · {role_id}"),
+        AccountActionDraft::UpdateRole {
+            account_id,
+            role_id,
+        } => {
+            format!("Change role · {account_id} · {role_id}")
+        }
+        AccountActionDraft::UpdatePassword { account_id, .. } => {
+            format!("Change password · {account_id}")
+        }
+        AccountActionDraft::UpdateUserName {
+            account_id,
+            user_name,
+        } => {
+            format!("Rename · {account_id} · {user_name}")
+        }
+        AccountActionDraft::Delete { account_id } => format!("Delete · {account_id}"),
+    }
+}
+
 /// One-line payload summary of an NVIDIA OEM command draft.
 #[cfg(any(target_arch = "wasm32", test))]
 fn oem_draft_summary(draft: &OemCommandDraft) -> String {
@@ -5143,6 +5279,17 @@ fn oem_draft_summary(draft: &OemCommandDraft) -> String {
 struct OperationFormDraft {
     selected_endpoint_ids: Vec<String>,
     family: Option<CommandFamilyView>,
+    /// The chosen account action.
+    account_action: Option<AccountActionView>,
+    /// The account id argument of the account actions that target an
+    /// existing account.
+    account_id: String,
+    /// The user name argument of the create and rename actions.
+    account_user_name: String,
+    /// The password argument of the create and password-change actions.
+    account_password: String,
+    /// The role id argument of the create and role-change actions.
+    role_id: String,
     reset_type: Option<ResetTypeView>,
     boot_source: Option<BootSourceView>,
     boot_enabled: Option<BootEnabledView>,
@@ -5185,6 +5332,11 @@ impl OperationFormDraft {
         Self {
             selected_endpoint_ids: Vec::new(),
             family: None,
+            account_action: None,
+            account_id: String::new(),
+            account_user_name: String::new(),
+            account_password: String::new(),
+            role_id: String::new(),
             reset_type: None,
             boot_source: None,
             boot_enabled: None,
@@ -5251,6 +5403,56 @@ impl OperationFormDraft {
             return Err(OperationFormError::FamilyRequired);
         };
         match family {
+            CommandFamilyView::Account => {
+                let Some(action) = self.account_action else {
+                    return Err(OperationFormError::AccountActionRequired);
+                };
+                let account_id = self.account_id.trim().to_owned();
+                let user_name = self.account_user_name.trim().to_owned();
+                let password = self.account_password.clone();
+                let role_id = self.role_id.trim().to_owned();
+                let draft = match action {
+                    AccountActionView::Create => {
+                        account_user_name_draft_error(&user_name)?;
+                        account_password_draft_error(&password)?;
+                        role_id_draft_error(&role_id)?;
+                        AccountActionDraft::Create {
+                            user_name,
+                            password,
+                            role_id,
+                        }
+                    }
+                    AccountActionView::UpdateRole => {
+                        account_id_draft_error(&account_id)?;
+                        role_id_draft_error(&role_id)?;
+                        AccountActionDraft::UpdateRole {
+                            account_id,
+                            role_id,
+                        }
+                    }
+                    AccountActionView::UpdatePassword => {
+                        account_id_draft_error(&account_id)?;
+                        account_password_draft_error(&password)?;
+                        AccountActionDraft::UpdatePassword {
+                            account_id,
+                            password,
+                        }
+                    }
+                    AccountActionView::UpdateUserName => {
+                        account_id_draft_error(&account_id)?;
+                        account_user_name_draft_error(&user_name)?;
+                        AccountActionDraft::UpdateUserName {
+                            account_id,
+                            user_name,
+                        }
+                    }
+                    AccountActionView::Delete => {
+                        account_id_draft_error(&account_id)?;
+                        AccountActionDraft::Delete { account_id }
+                    }
+                };
+                Ok(OperationCommandDraft::Account(draft))
+            }
             CommandFamilyView::SystemReset
             | CommandFamilyView::ManagerReset
             | CommandFamilyView::ChassisReset => {
@@ -5261,7 +5463,8 @@ impl OperationFormDraft {
                     CommandFamilyView::SystemReset => ResetResourceView::System,
                     CommandFamilyView::ManagerReset => ResetResourceView::Manager,
                     CommandFamilyView::ChassisReset => ResetResourceView::Chassis,
-                    CommandFamilyView::BootOverride
+                    CommandFamilyView::Account
+                    | CommandFamilyView::BootOverride
                     | CommandFamilyView::SecureBoot
                     | CommandFamilyView::EventSubscription
                     | CommandFamilyView::FirmwareUpdate
@@ -5430,6 +5633,15 @@ impl OperationFormDraft {
 enum OperationFormError {
     EndpointsRequired,
     FamilyRequired,
+    AccountActionRequired,
+    AccountIdRequired,
+    AccountIdInvalid,
+    AccountUserNameRequired,
+    AccountUserNameInvalid,
+    AccountPasswordRequired,
+    AccountPasswordInvalid,
+    RoleIdRequired,
+    RoleIdInvalid,
     ResetTypeRequired,
     BootSourceRequired,
     BootEnabledRequired,
@@ -5460,6 +5672,17 @@ impl OperationFormError {
         match self {
             Self::EndpointsRequired => "Select at least one endpoint.",
             Self::FamilyRequired => "Choose a command family.",
+            Self::AccountActionRequired => "Choose an account action.",
+            Self::AccountIdRequired => "An account ID is required.",
+            Self::AccountIdInvalid => {
+                "The account ID can only contain letters, digits, '-', and '_'."
+            }
+            Self::AccountUserNameRequired => "A user name is required.",
+            Self::AccountUserNameInvalid => "The user name contains unsupported characters.",
+            Self::AccountPasswordRequired => "A password is required.",
+            Self::AccountPasswordInvalid => "The password is too long.",
+            Self::RoleIdRequired => "A role ID is required.",
+            Self::RoleIdInvalid => "The role ID contains unsupported characters.",
             Self::ResetTypeRequired => "Choose a reset type.",
             Self::BootSourceRequired => "Choose a boot source.",
             Self::BootEnabledRequired => "Choose how long the override applies.",
@@ -6473,6 +6696,92 @@ fn domain_event_type(event_type: EventTypeView) -> EventType {
     }
 }
 
+/// Checks one account id draft against the domain [`AccountId`] rules.
+///
+/// The server remains authoritative during submission; this client-side
+/// check only rejects drafts that could never parse as a domain account id
+/// (empty, unsafe segment characters, or over the product bound).
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_id_draft_error(value: &str) -> Result<(), OperationFormError> {
+    if value.is_empty() {
+        return Err(OperationFormError::AccountIdRequired);
+    }
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        && value.chars().count() <= MAX_ACCOUNT_ID_CHARS
+    {
+        Ok(())
+    } else {
+        Err(OperationFormError::AccountIdInvalid)
+    }
+}
+
+/// Checks one account user name draft against the domain
+/// [`AccountUserName`] rules.
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_user_name_draft_error(value: &str) -> Result<(), OperationFormError> {
+    if value.is_empty() {
+        return Err(OperationFormError::AccountUserNameRequired);
+    }
+    if value.chars().any(char::is_control) || value.chars().count() > MAX_ACCOUNT_USER_NAME_CHARS {
+        return Err(OperationFormError::AccountUserNameInvalid);
+    }
+    Ok(())
+}
+
+/// Checks one account password draft against the domain
+/// [`AccountPassword`] rules.
+#[cfg(any(target_arch = "wasm32", test))]
+fn account_password_draft_error(value: &str) -> Result<(), OperationFormError> {
+    if value.is_empty() {
+        return Err(OperationFormError::AccountPasswordRequired);
+    }
+    if value.chars().count() > MAX_ACCOUNT_PASSWORD_CHARS {
+        return Err(OperationFormError::AccountPasswordInvalid);
+    }
+    Ok(())
+}
+
+/// Checks one role id draft against the domain [`RoleId`] rules.
+#[cfg(any(target_arch = "wasm32", test))]
+fn role_id_draft_error(value: &str) -> Result<(), OperationFormError> {
+    if value.is_empty() {
+        return Err(OperationFormError::RoleIdRequired);
+    }
+    if value.chars().any(char::is_control) || value.chars().count() > MAX_ROLE_ID_CHARS {
+        return Err(OperationFormError::RoleIdInvalid);
+    }
+    Ok(())
+}
+
+/// Parses one validated account id draft into the domain newtype.
+///
+/// The `try_build` draft checks already rejected every value that cannot
+/// parse, so a failure here is a form bug, refused without a dispatch.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_account_id(value: &str) -> Result<AccountId, OperationFormError> {
+    AccountId::parse(value).map_err(|_| OperationFormError::AccountIdInvalid)
+}
+
+/// Parses one validated user name draft into the domain newtype.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_account_user_name(value: &str) -> Result<AccountUserName, OperationFormError> {
+    AccountUserName::parse(value).map_err(|_| OperationFormError::AccountUserNameInvalid)
+}
+
+/// Parses one validated password draft into the domain secret newtype.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_account_password(value: &str) -> Result<AccountPassword, OperationFormError> {
+    AccountPassword::parse(value.to_owned()).map_err(|_| OperationFormError::AccountPasswordInvalid)
+}
+
+/// Parses one validated role id draft into the domain newtype.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_role_id(value: &str) -> Result<RoleId, OperationFormError> {
+    RoleId::parse(value).map_err(|_| OperationFormError::RoleIdInvalid)
+}
+
 /// Builds the typed §7.5 command from a validated form draft.
 ///
 /// The command is the domain's own write surface, so the submission carries
@@ -6485,6 +6794,48 @@ fn domain_event_type(event_type: EventTypeView) -> EventType {
 #[allow(clippy::too_many_lines)]
 fn build_command(command: &OperationCommandDraft) -> Result<RedfishCommand, OperationFormError> {
     match command {
+        OperationCommandDraft::Account(action) => {
+            // The form-side strings parse into the domain newtypes; the
+            // `try_build` validation already rejected the empty drafts, so
+            // any parse failure here is a form bug, refused without a
+            // dispatch instead of being fabricated into a command.
+            let command = match action {
+                AccountActionDraft::Create {
+                    user_name,
+                    password,
+                    role_id,
+                } => AccountCommand::CreateAccount(CreateAccount::new(
+                    parse_account_user_name(user_name)?,
+                    parse_account_password(password)?,
+                    parse_role_id(role_id)?,
+                )),
+                AccountActionDraft::UpdateRole {
+                    account_id,
+                    role_id,
+                } => AccountCommand::UpdateAccount(UpdateAccount::new(
+                    parse_account_id(account_id)?,
+                    parse_role_id(role_id)?,
+                )),
+                AccountActionDraft::UpdatePassword {
+                    account_id,
+                    password,
+                } => AccountCommand::UpdateAccountPassword(UpdateAccountPassword::new(
+                    parse_account_id(account_id)?,
+                    parse_account_password(password)?,
+                )),
+                AccountActionDraft::UpdateUserName {
+                    account_id,
+                    user_name,
+                } => AccountCommand::UpdateAccountUserName(UpdateAccountUserName::new(
+                    parse_account_id(account_id)?,
+                    parse_account_user_name(user_name)?,
+                )),
+                AccountActionDraft::Delete { account_id } => {
+                    AccountCommand::DeleteAccount(DeleteAccount::new(parse_account_id(account_id)?))
+                }
+            };
+            Ok(RedfishCommand::Account(command))
+        }
         OperationCommandDraft::Reset { family, reset_type } => {
             let reset_type = domain_reset_type(*reset_type);
             let command = match family {
@@ -6666,6 +7017,32 @@ fn domain_erase_type(value: EraseTypeView) -> EraseType {
 #[allow(clippy::too_many_lines)]
 fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
     match command {
+        RedfishCommand::Account(account) => CommandSummaryProjection {
+            family: CommandFamilyView::Account.label(),
+            // The password fields of a persisted command render as a fixed
+            // label, never the stored value.
+            payload: match account {
+                AccountCommand::CreateAccount(create) => {
+                    format!("Create · {} · {}", create.user_name(), create.role_id())
+                }
+                AccountCommand::UpdateAccount(update) => {
+                    format!(
+                        "Change role · {} · {}",
+                        update.account_id(),
+                        update.role_id()
+                    )
+                }
+                AccountCommand::UpdateAccountPassword(password) => {
+                    format!("Change password · {}", password.account_id())
+                }
+                AccountCommand::UpdateAccountUserName(rename) => {
+                    format!("Rename · {} · {}", rename.account_id(), rename.user_name())
+                }
+                AccountCommand::DeleteAccount(deletion) => {
+                    format!("Delete · {}", deletion.account_id())
+                }
+            },
+        },
         RedfishCommand::System(SystemCommand::Reset(reset_type)) => CommandSummaryProjection {
             family: ResetResourceView::System.label(),
             payload: reset_type.to_string(),
@@ -8183,37 +8560,37 @@ mod browser {
     use wasm_bindgen_futures::{JsFuture, spawn_local};
 
     use super::{
-        ArtifactCardProjection, ArtifactStatusView, ArtifactUploadFailure, ArtifactUploadState,
-        ArtifactsListState, AuditEventCardProjection, AuditListState, BatchCardProjection,
-        BatchChildRowProjection, BatchesListState, BootEnabledView, BootModeView, BootSourceView,
-        CapabilityEntryProjection, CapabilityGroupProjection, CapabilityLoadFailure,
-        CapabilityMatrixProjection, CapabilityMatrixState, CapabilityTargetProjection,
-        CenterBindingStateView, CenterEndpointCardProjection, CenterOperationCardProjection,
-        CenterOperationDraft, CenterOperationDraftError, CenterOperationSubmission,
-        CenterSiteCardProjection, CommandFamilyView, ConsoleLoadFailure, ConsoleLoadState,
-        ConsoleView, CoreResourceCardProjection, CreateCredentialState, CredentialCardProjection,
-        CredentialDraft, CredentialDraftError, CredentialsListState, CsvImportReportProjection,
-        DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
-        DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
-        EnrollmentDraft, EnrollmentDraftError, EraseTypeView, EventActionView, EventCardProjection,
-        EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
-        GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
-        GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState,
-        OEM_UNSUPPORTED_NOTICE, OemActionView, OemFaceView, OffsetDateTime,
-        OnboardingCredentialsState, OnboardingFailure, OnboardingStep, OperationCardProjection,
-        OperationCommandDraft, OperationEndpointChoice, OperationFormDraft, OperationFormError,
-        OperationSubmitState, OperationsListState, OverviewFilterSelections,
-        RefreshBatchReportProjection, RefreshBatchState, RefreshFailure, ResetKeysTypeView,
-        ResetTypeView, RoleView, SecureBootActionView, TagApplyState, TagCardProjection, TagDraft,
-        TagDraftError, TagInventoryView, TagsListState, TelemetryCardProjection,
-        TelemetryListState, TokenTypeView, TrustChallengeProjection, UpdateArtifactChoice,
-        apply_overview_filters, artifact_chunk_range_at, artifact_upload_status_text,
-        base64_encode, batch_children_projection, build_command, command_summary,
-        diagnostics_optional_text, endpoint_address_draft_error, format_artifact_size,
-        format_observed_at, group_member_choices, group_name_draft_error, health_badge_class,
-        health_choices, health_level_label, oem_action_key, operation_endpoint_choices,
-        percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
-        trust_mode_label, update_artifact_choices, vendor_choices,
+        AccountActionView, ArtifactCardProjection, ArtifactStatusView, ArtifactUploadFailure,
+        ArtifactUploadState, ArtifactsListState, AuditEventCardProjection, AuditListState,
+        BatchCardProjection, BatchChildRowProjection, BatchesListState, BootEnabledView,
+        BootModeView, BootSourceView, CapabilityEntryProjection, CapabilityGroupProjection,
+        CapabilityLoadFailure, CapabilityMatrixProjection, CapabilityMatrixState,
+        CapabilityTargetProjection, CenterBindingStateView, CenterEndpointCardProjection,
+        CenterOperationCardProjection, CenterOperationDraft, CenterOperationDraftError,
+        CenterOperationSubmission, CenterSiteCardProjection, CommandFamilyView, ConsoleLoadFailure,
+        ConsoleLoadState, ConsoleView, CoreResourceCardProjection, CreateCredentialState,
+        CredentialCardProjection, CredentialDraft, CredentialDraftError, CredentialsListState,
+        CsvImportReportProjection, DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure,
+        DiagnosticsProjection, DiagnosticsState, DiagnosticsTargetProjection,
+        EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
+        EraseTypeView, EventActionView, EventCardProjection, EventProtocolView, EventTypeView,
+        EventsListState, GroupCardProjection, GroupCreateState, GroupDetailProjection,
+        GroupDetailState, GroupDraft, GroupMemberActionState, GroupNameDraftError, GroupsListState,
+        HealthLevel, ImportFailure, ImportState, OEM_UNSUPPORTED_NOTICE, OemActionView,
+        OemFaceView, OffsetDateTime, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
+        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
+        OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
+        OverviewFilterSelections, RefreshBatchReportProjection, RefreshBatchState, RefreshFailure,
+        ResetKeysTypeView, ResetTypeView, RoleView, SecureBootActionView, TagApplyState,
+        TagCardProjection, TagDraft, TagDraftError, TagInventoryView, TagsListState,
+        TelemetryCardProjection, TelemetryListState, TokenTypeView, TrustChallengeProjection,
+        UpdateArtifactChoice, account_action_key, apply_overview_filters, artifact_chunk_range_at,
+        artifact_upload_status_text, base64_encode, batch_children_projection, build_command,
+        command_summary, diagnostics_optional_text, endpoint_address_draft_error,
+        format_artifact_size, format_observed_at, group_member_choices, group_name_draft_error,
+        health_badge_class, health_choices, health_level_label, oem_action_key,
+        operation_endpoint_choices, percent_encode_path_segment, sha256_hex, tag_draft_error,
+        toggle_set_membership, trust_mode_label, update_artifact_choices, vendor_choices,
     };
 
     /// The first screen decision of the console (§16.2).
@@ -9218,6 +9595,11 @@ mod browser {
                 draft.family = Some(family);
                 // Switching families clears every other family's parameters,
                 // so a later submission can never carry stale selections.
+                draft.account_action = None;
+                draft.account_id = String::new();
+                draft.account_user_name = String::new();
+                draft.account_password = String::new();
+                draft.role_id = String::new();
                 draft.reset_type = None;
                 draft.boot_source = None;
                 draft.boot_enabled = None;
@@ -9763,6 +10145,130 @@ mod browser {
                                     <p class="form-hint">
                                         "Firmware updates dispatch from the site console, which holds the artifact."
                                     </p>
+                                }
+                                    .into_any()
+                            }
+                            Some(CommandFamilyView::Account) => {
+                                view! {
+                                    <div class="form-row">
+                                        <label for="center-op-account-action">"Account action"</label>
+                                        <select
+                                            id="center-op-account-action"
+                                            prop:value=move || {
+                                                draft
+                                                    .get()
+                                                    .account_action
+                                                    .map_or_else(String::new, |action| account_action_key(action).to_owned())
+                                            }
+                                            on:change=move |event| {
+                                                let value = event_target_value(&event);
+                                                let selected = match value.as_str() {
+                                                    "create" => Some(AccountActionView::Create),
+                                                    "update-role" => {
+                                                        Some(AccountActionView::UpdateRole)
+                                                    }
+                                                    "update-password" => {
+                                                        Some(AccountActionView::UpdatePassword)
+                                                    }
+                                                    "update-user-name" => {
+                                                        Some(AccountActionView::UpdateUserName)
+                                                    }
+                                                    "delete" => Some(AccountActionView::Delete),
+                                                    _ => None,
+                                                };
+                                                set_draft.update(|draft| {
+                                                    draft.account_action = selected
+                                                });
+                                                set_draft_error.set(None);
+                                                set_submit_state
+                                                    .set(CenterOperationSubmitState::Idle);
+                                            }
+                                        >
+                                            <option value="">"Choose an action..."</option>
+                                            {AccountActionView::ALL
+                                                .into_iter()
+                                                .map(|action| {
+                                                    let value = account_action_key(action);
+                                                    view! {
+                                                        <option value=value>{action.label()}</option>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </select>
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-account-id">"Account ID"</label>
+                                        <input
+                                            id="center-op-account-id"
+                                            type="text"
+                                            placeholder="admin"
+                                            autocomplete="off"
+                                            prop:value=move || draft.get().account_id
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| {
+                                                    draft.account_id = event_target_value(&event)
+                                                });
+                                                set_draft_error.set(None);
+                                                set_submit_state
+                                                    .set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-account-user-name">"User name"</label>
+                                        <input
+                                            id="center-op-account-user-name"
+                                            type="text"
+                                            placeholder="jane"
+                                            autocomplete="off"
+                                            prop:value=move || draft.get().account_user_name
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| {
+                                                    draft.account_user_name =
+                                                        event_target_value(&event)
+                                                });
+                                                set_draft_error.set(None);
+                                                set_submit_state
+                                                    .set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-account-password">"Password"</label>
+                                        <input
+                                            id="center-op-account-password"
+                                            type="password"
+                                            autocomplete="new-password"
+                                            prop:value=move || draft.get().account_password
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| {
+                                                    draft.account_password =
+                                                        event_target_value(&event)
+                                                });
+                                                set_draft_error.set(None);
+                                                set_submit_state
+                                                    .set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
+                                    <div class="form-row">
+                                        <label for="center-op-account-role">"Role ID"</label>
+                                        <input
+                                            id="center-op-account-role"
+                                            type="text"
+                                            placeholder="Operator"
+                                            autocomplete="off"
+                                            prop:value=move || draft.get().role_id
+                                            on:input=move |event| {
+                                                set_draft.update(|draft| {
+                                                    draft.role_id = event_target_value(&event)
+                                                });
+                                                set_draft_error.set(None);
+                                                set_submit_state
+                                                    .set(CenterOperationSubmitState::Idle);
+                                            }
+                                        />
+                                    </div>
                                 }
                                     .into_any()
                             }
@@ -14553,6 +15059,11 @@ mod browser {
                 draft.family = Some(family);
                 // Switching families clears every other family's parameters,
                 // so a later submission can never carry stale selections.
+                draft.account_action = None;
+                draft.account_id = String::new();
+                draft.account_user_name = String::new();
+                draft.account_password = String::new();
+                draft.role_id = String::new();
                 draft.reset_type = None;
                 draft.boot_source = None;
                 draft.boot_enabled = None;
@@ -14821,6 +15332,40 @@ mod browser {
             set_error.set(None);
             set_submit_state.set(OperationSubmitState::Idle);
         };
+        let on_account_action_change = move |event| {
+            let value = event_target_value(&event);
+            let selected = match value.as_str() {
+                "create" => Some(AccountActionView::Create),
+                "update-role" => Some(AccountActionView::UpdateRole),
+                "update-password" => Some(AccountActionView::UpdatePassword),
+                "update-user-name" => Some(AccountActionView::UpdateUserName),
+                "delete" => Some(AccountActionView::Delete),
+                _ => None,
+            };
+            set_draft.update(|draft| draft.account_action = selected);
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_account_id_input = move |event| {
+            set_draft.update(|draft| draft.account_id = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_account_user_name_input = move |event| {
+            set_draft.update(|draft| draft.account_user_name = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_account_password_input = move |event| {
+            set_draft.update(|draft| draft.account_password = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
+        let on_role_id_input = move |event| {
+            set_draft.update(|draft| draft.role_id = event_target_value(&event));
+            set_error.set(None);
+            set_submit_state.set(OperationSubmitState::Idle);
+        };
         let on_toggle_event_type = Callback::new(move |kind: EventTypeView| {
             set_draft.update(|draft| {
                 if let Some(index) = draft.event_types.iter().position(|t| *t == kind) {
@@ -14947,6 +15492,8 @@ mod browser {
             move || draft.get().event_action == Some(EventActionView::CreateSubscription);
         let is_delete_subscription =
             move || draft.get().event_action == Some(EventActionView::DeleteSubscription);
+        let account_action_selected =
+            move |action: AccountActionView| draft.get().account_action == Some(action);
         let oem_action_selected =
             move |action: OemActionView| draft.get().oem_action == Some(action);
         // The live preview shows exactly what the card of a submitted
@@ -15047,6 +15594,358 @@ mod browser {
                 >
                     {OperationFormError::FamilyRequired.message()}
                 </p>
+
+                <div class="form-field" hidden=move || !family_selected(CommandFamilyView::Account)>
+                    <label for="operation-account-action">"Account action"</label>
+                    <select
+                        id="operation-account-action"
+                        class="form-select"
+                        prop:value=move || {
+                            draft
+                                .get()
+                                .account_action
+                                .map_or_else(String::new, |action| account_action_key(action).to_owned())
+                        }
+                        on:change=on_account_action_change
+                    >
+                        <option value="">"Choose an action"</option>
+                        {AccountActionView::ALL
+                            .into_iter()
+                            .map(|action| {
+                                let value = account_action_key(action);
+                                view! {
+                                    <option value=value>{action.label()}</option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                    <p
+                        class="form-error"
+                        hidden=move || field_error(OperationFormError::AccountActionRequired).is_empty()
+                    >
+                        {OperationFormError::AccountActionRequired.message()}
+                    </p>
+
+                    <div
+                        class="form-panel create-panel"
+                        hidden=move || !account_action_selected(AccountActionView::Create)
+                    >
+                        <div class="form-field">
+                            <label for="operation-account-user-name">"User name"</label>
+                            <input
+                                id="operation-account-user-name"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="jane"
+                                prop:value=move || draft.get().account_user_name
+                                on:input=on_account_user_name_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountUserNameRequired).is_empty()
+                                        && field_error(OperationFormError::AccountUserNameInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountUserNameRequired
+                                            | OperationFormError::AccountUserNameInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-account-password">"Password"</label>
+                            <input
+                                id="operation-account-password"
+                                class="form-input"
+                                type="password"
+                                autocomplete="new-password"
+                                placeholder="••••••••"
+                                prop:value=move || draft.get().account_password
+                                on:input=on_account_password_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountPasswordRequired).is_empty()
+                                        && field_error(OperationFormError::AccountPasswordInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountPasswordRequired
+                                            | OperationFormError::AccountPasswordInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-account-role-id">"Role ID"</label>
+                            <input
+                                id="operation-account-role-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="Operator"
+                                prop:value=move || draft.get().role_id
+                                on:input=on_role_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::RoleIdRequired).is_empty()
+                                        && field_error(OperationFormError::RoleIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::RoleIdRequired
+                                            | OperationFormError::RoleIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div
+                        class="form-panel create-panel"
+                        hidden=move || !account_action_selected(AccountActionView::UpdateRole)
+                    >
+                        <div class="form-field">
+                            <label for="operation-account-id">"Account ID"</label>
+                            <input
+                                id="operation-account-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="admin"
+                                prop:value=move || draft.get().account_id
+                                on:input=on_account_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountIdRequired).is_empty()
+                                        && field_error(OperationFormError::AccountIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountIdRequired
+                                            | OperationFormError::AccountIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-account-role-id">"Role ID"</label>
+                            <input
+                                id="operation-account-role-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="Operator"
+                                prop:value=move || draft.get().role_id
+                                on:input=on_role_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::RoleIdRequired).is_empty()
+                                        && field_error(OperationFormError::RoleIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::RoleIdRequired
+                                            | OperationFormError::RoleIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div
+                        class="form-panel create-panel"
+                        hidden=move || !account_action_selected(AccountActionView::UpdatePassword)
+                    >
+                        <div class="form-field">
+                            <label for="operation-account-id">"Account ID"</label>
+                            <input
+                                id="operation-account-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="admin"
+                                prop:value=move || draft.get().account_id
+                                on:input=on_account_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountIdRequired).is_empty()
+                                        && field_error(OperationFormError::AccountIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountIdRequired
+                                            | OperationFormError::AccountIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-account-password">"New password"</label>
+                            <input
+                                id="operation-account-password"
+                                class="form-input"
+                                type="password"
+                                autocomplete="new-password"
+                                placeholder="••••••••"
+                                prop:value=move || draft.get().account_password
+                                on:input=on_account_password_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountPasswordRequired).is_empty()
+                                        && field_error(OperationFormError::AccountPasswordInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountPasswordRequired
+                                            | OperationFormError::AccountPasswordInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div
+                        class="form-panel create-panel"
+                        hidden=move || !account_action_selected(AccountActionView::UpdateUserName)
+                    >
+                        <div class="form-field">
+                            <label for="operation-account-id">"Account ID"</label>
+                            <input
+                                id="operation-account-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="admin"
+                                prop:value=move || draft.get().account_id
+                                on:input=on_account_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountIdRequired).is_empty()
+                                        && field_error(OperationFormError::AccountIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountIdRequired
+                                            | OperationFormError::AccountIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                        <div class="form-field">
+                            <label for="operation-account-user-name">"New user name"</label>
+                            <input
+                                id="operation-account-user-name"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="admin.renamed"
+                                prop:value=move || draft.get().account_user_name
+                                on:input=on_account_user_name_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountUserNameRequired).is_empty()
+                                        && field_error(OperationFormError::AccountUserNameInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountUserNameRequired
+                                            | OperationFormError::AccountUserNameInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                    </div>
+
+                    <div
+                        class="form-panel create-panel"
+                        hidden=move || !account_action_selected(AccountActionView::Delete)
+                    >
+                        <div class="form-field">
+                            <label for="operation-account-id">"Account ID"</label>
+                            <input
+                                id="operation-account-id"
+                                class="form-input"
+                                type="text"
+                                autocomplete="off"
+                                placeholder="admin"
+                                prop:value=move || draft.get().account_id
+                                on:input=on_account_id_input
+                            />
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    field_error(OperationFormError::AccountIdRequired).is_empty()
+                                        && field_error(OperationFormError::AccountIdInvalid).is_empty()
+                                }
+                            >
+                                {move || {
+                                    match error.get() {
+                                        Some(
+                                            error @ (OperationFormError::AccountIdRequired
+                                            | OperationFormError::AccountIdInvalid),
+                                        ) => error.message(),
+                                        _ => "",
+                                    }
+                                }}
+                            </p>
+                        </div>
+                    </div>
+                </div>
 
                 <div class="form-field" hidden=move || !reset_family_selected()>
                     <label for="operation-reset-type">"Reset type"</label>
@@ -21540,6 +22439,7 @@ mod tests {
         assert_eq!(
             CommandFamilyView::ALL,
             [
+                CommandFamilyView::Account,
                 CommandFamilyView::SystemReset,
                 CommandFamilyView::ManagerReset,
                 CommandFamilyView::ChassisReset,
@@ -21551,6 +22451,7 @@ mod tests {
             ]
         );
         for (family, code, label) in [
+            (CommandFamilyView::Account, "account", "Account"),
             (CommandFamilyView::SystemReset, "system", "System reset"),
             (CommandFamilyView::ManagerReset, "manager", "Manager reset"),
             (CommandFamilyView::ChassisReset, "chassis", "Chassis reset"),
@@ -21577,7 +22478,29 @@ mod tests {
         }
         // The family codes are the §7.5 wire contract; the families that
         // still have no form surface must not be claimed by one.
-        assert_eq!(CommandFamilyView::ALL.len(), 8);
+        assert_eq!(CommandFamilyView::ALL.len(), 9);
+    }
+
+    #[test]
+    fn account_action_vocabulary_covers_every_domain_operation() {
+        let actions = [
+            AccountActionView::Create,
+            AccountActionView::UpdateRole,
+            AccountActionView::UpdatePassword,
+            AccountActionView::UpdateUserName,
+            AccountActionView::Delete,
+        ];
+        assert_eq!(AccountActionView::ALL.len(), actions.len());
+        for (action, (key, label)) in actions.into_iter().zip([
+            ("create", "Create account"),
+            ("update-role", "Change role"),
+            ("update-password", "Change password"),
+            ("update-user-name", "Rename account"),
+            ("delete", "Delete account"),
+        ]) {
+            assert_eq!(account_action_key(action), key);
+            assert_eq!(action.label(), label);
+        }
     }
 
     #[test]
@@ -22031,6 +22954,246 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn account_form_drafts_build_typed_commands_and_reject_incomplete_forms() {
+        let endpoint = "01989abc-def0-7abc-8def-0123456789ae".to_owned();
+
+        // No action chosen is refused before any field is read.
+        let mut draft = OperationFormDraft::new();
+        draft.toggle_endpoint(endpoint.clone());
+        draft.family = Some(CommandFamilyView::Account);
+        assert_eq!(
+            draft.try_build(),
+            Err(OperationFormError::AccountActionRequired)
+        );
+
+        // Create requires the user name, password, and role.
+        draft.account_action = Some(AccountActionView::Create);
+        assert_eq!(
+            draft.try_build(),
+            Err(OperationFormError::AccountUserNameRequired)
+        );
+        draft.account_user_name = "  jane  ".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Err(OperationFormError::AccountPasswordRequired)
+        );
+        draft.account_password = "initial-secret".to_owned();
+        assert_eq!(draft.try_build(), Err(OperationFormError::RoleIdRequired));
+        draft.role_id = " Operator ".to_owned();
+        assert_eq!(
+            draft.try_build(),
+            Ok(OperationCommandDraft::Account(AccountActionDraft::Create {
+                user_name: "jane".to_owned(),
+                password: "initial-secret".to_owned(),
+                role_id: "Operator".to_owned(),
+            }))
+        );
+
+        // The role change requires the account id and the role.
+        let mut role = OperationFormDraft::new();
+        role.toggle_endpoint(endpoint.clone());
+        role.family = Some(CommandFamilyView::Account);
+        role.account_action = Some(AccountActionView::UpdateRole);
+        assert_eq!(role.try_build(), Err(OperationFormError::AccountIdRequired));
+        role.account_id = "admin".to_owned();
+        assert_eq!(role.try_build(), Err(OperationFormError::RoleIdRequired));
+        role.role_id = "Operator".to_owned();
+        assert_eq!(
+            role.try_build(),
+            Ok(OperationCommandDraft::Account(
+                AccountActionDraft::UpdateRole {
+                    account_id: "admin".to_owned(),
+                    role_id: "Operator".to_owned(),
+                }
+            ))
+        );
+
+        // The password change requires the account id and the password.
+        let mut password = OperationFormDraft::new();
+        password.toggle_endpoint(endpoint.clone());
+        password.family = Some(CommandFamilyView::Account);
+        password.account_action = Some(AccountActionView::UpdatePassword);
+        assert_eq!(
+            password.try_build(),
+            Err(OperationFormError::AccountIdRequired)
+        );
+        password.account_id = "admin".to_owned();
+        assert_eq!(
+            password.try_build(),
+            Err(OperationFormError::AccountPasswordRequired)
+        );
+        password.account_password = "new-secret".to_owned();
+        assert_eq!(
+            password.try_build(),
+            Ok(OperationCommandDraft::Account(
+                AccountActionDraft::UpdatePassword {
+                    account_id: "admin".to_owned(),
+                    password: "new-secret".to_owned(),
+                }
+            ))
+        );
+
+        // The rename requires the account id and the user name.
+        let mut rename = OperationFormDraft::new();
+        rename.toggle_endpoint(endpoint.clone());
+        rename.family = Some(CommandFamilyView::Account);
+        rename.account_action = Some(AccountActionView::UpdateUserName);
+        assert_eq!(
+            rename.try_build(),
+            Err(OperationFormError::AccountIdRequired)
+        );
+        rename.account_id = "admin".to_owned();
+        assert_eq!(
+            rename.try_build(),
+            Err(OperationFormError::AccountUserNameRequired)
+        );
+        rename.account_user_name = "admin.renamed".to_owned();
+        assert_eq!(
+            rename.try_build(),
+            Ok(OperationCommandDraft::Account(
+                AccountActionDraft::UpdateUserName {
+                    account_id: "admin".to_owned(),
+                    user_name: "admin.renamed".to_owned(),
+                }
+            ))
+        );
+
+        // The deletion requires only the account id.
+        let mut deletion = OperationFormDraft::new();
+        deletion.toggle_endpoint(endpoint.clone());
+        deletion.family = Some(CommandFamilyView::Account);
+        deletion.account_action = Some(AccountActionView::Delete);
+        assert_eq!(
+            deletion.try_build(),
+            Err(OperationFormError::AccountIdRequired)
+        );
+        deletion.account_id = "admin".to_owned();
+        assert_eq!(
+            deletion.try_build(),
+            Ok(OperationCommandDraft::Account(AccountActionDraft::Delete {
+                account_id: "admin".to_owned(),
+            }))
+        );
+
+        // Domain-visible value rules are checked before submission: an
+        // unsafe account id, control characters, and oversized values.
+        let mut unsafe_id = OperationFormDraft::new();
+        unsafe_id.toggle_endpoint(endpoint.clone());
+        unsafe_id.family = Some(CommandFamilyView::Account);
+        unsafe_id.account_action = Some(AccountActionView::Delete);
+        unsafe_id.account_id = "a/b".to_owned();
+        assert_eq!(
+            unsafe_id.try_build(),
+            Err(OperationFormError::AccountIdInvalid)
+        );
+        let mut control_name = OperationFormDraft::new();
+        control_name.toggle_endpoint(endpoint);
+        control_name.family = Some(CommandFamilyView::Account);
+        control_name.account_action = Some(AccountActionView::Create);
+        control_name.account_user_name = "ja\0ne".to_owned();
+        control_name.account_password = "initial-secret".to_owned();
+        control_name.role_id = "Operator".to_owned();
+        assert_eq!(
+            control_name.try_build(),
+            Err(OperationFormError::AccountUserNameInvalid)
+        );
+    }
+
+    #[test]
+    fn built_account_commands_serialize_to_the_domain_wire_contract() -> Result<(), Box<dyn Error>>
+    {
+        for (draft, golden) in [
+            (
+                OperationCommandDraft::Account(AccountActionDraft::Create {
+                    user_name: "jane".to_owned(),
+                    password: "initial-secret".to_owned(),
+                    role_id: "Operator".to_owned(),
+                }),
+                r#"{"Account":{"CreateAccount":{"user_name":"jane","password":"initial-secret","role_id":"Operator"}}}"#,
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdateRole {
+                    account_id: "admin".to_owned(),
+                    role_id: "Operator".to_owned(),
+                }),
+                r#"{"Account":{"UpdateAccount":{"account_id":"admin","role_id":"Operator"}}}"#,
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdatePassword {
+                    account_id: "admin".to_owned(),
+                    password: "new-secret".to_owned(),
+                }),
+                r#"{"Account":{"UpdateAccountPassword":{"account_id":"admin","password":"new-secret"}}}"#,
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdateUserName {
+                    account_id: "admin".to_owned(),
+                    user_name: "admin.renamed".to_owned(),
+                }),
+                r#"{"Account":{"UpdateAccountUserName":{"account_id":"admin","user_name":"admin.renamed"}}}"#,
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::Delete {
+                    account_id: "admin".to_owned(),
+                }),
+                r#"{"Account":{"DeleteAccount":{"account_id":"admin"}}}"#,
+            ),
+        ] {
+            let command = build_command(&draft).map_err(|error| error.message().to_owned())?;
+            assert_eq!(serde_json::to_string(&command)?, golden);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn account_command_draft_summaries_project_action_and_payload() {
+        for (draft, payload) in [
+            (
+                OperationCommandDraft::Account(AccountActionDraft::Create {
+                    user_name: "jane".to_owned(),
+                    password: "initial-secret".to_owned(),
+                    role_id: "Operator".to_owned(),
+                }),
+                "Create · jane · Operator",
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdateRole {
+                    account_id: "admin".to_owned(),
+                    role_id: "Operator".to_owned(),
+                }),
+                "Change role · admin · Operator",
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdatePassword {
+                    account_id: "admin".to_owned(),
+                    password: "new-secret".to_owned(),
+                }),
+                "Change password · admin",
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::UpdateUserName {
+                    account_id: "admin".to_owned(),
+                    user_name: "admin.renamed".to_owned(),
+                }),
+                "Rename · admin · admin.renamed",
+            ),
+            (
+                OperationCommandDraft::Account(AccountActionDraft::Delete {
+                    account_id: "admin".to_owned(),
+                }),
+                "Delete · admin",
+            ),
+        ] {
+            let summary = command_summary(&draft);
+            assert_eq!(summary.family, "Account");
+            assert_eq!(summary.payload, payload);
+            // The password value never appears in any summary.
+            assert!(!summary.payload.contains("secret"));
+        }
     }
 
     #[test]
