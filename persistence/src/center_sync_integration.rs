@@ -150,7 +150,8 @@ async fn the_engine_flushes_the_real_outbox_and_resumes_from_the_last_ack()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::UNIX_EPOCH;
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let store =
+        SqliteStore::open_with_command_key(directory.path().join("rutilus.db"), test_key()).await?;
     let instance_id = InstanceId::generate();
     let site = SiteInstance::new(
         instance_id,
@@ -256,7 +257,8 @@ async fn the_engine_keeps_running_locally_while_the_center_is_gone() -> Result<(
     // the stop signal.
     let now = OffsetDateTime::UNIX_EPOCH;
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let store =
+        SqliteStore::open_with_command_key(directory.path().join("rutilus.db"), test_key()).await?;
     let instance_id = InstanceId::generate();
     let site = SiteInstance::new(
         instance_id,
@@ -576,7 +578,8 @@ async fn an_evicted_event_anchor_resets_the_real_stream_to_the_bounded_tail()
 -> Result<(), Box<dyn Error>> {
     let now = OffsetDateTime::UNIX_EPOCH;
     let directory = tempfile::tempdir()?;
-    let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+    let store =
+        SqliteStore::open_with_command_key(directory.path().join("rutilus.db"), test_key()).await?;
     let instance_id = InstanceId::generate();
     let site = SiteInstance::new(
         instance_id,
@@ -690,16 +693,19 @@ where
     }
 }
 
+/// The fixed test command key, shared by every keyed store in this module
+/// so a store written and re-read across two opens uses the same key.
+fn test_key() -> Arc<MasterKey> {
+    Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32])))
+}
+
 /// Opens a command-encrypted store for the offer tests: the offer persists
 /// an operation, so the store must carry the command encryption key exactly
 /// like the production runtime's store.
 async fn test_operation_store(
     directory: &tempfile::TempDir,
 ) -> Result<SqliteStore, Box<dyn Error>> {
-    let store = SqliteStore::open_with_command_key(
-        directory.path().join("rutilus.db"),
-        Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32]))),
-    )
-    .await?;
+    let store =
+        SqliteStore::open_with_command_key(directory.path().join("rutilus.db"), test_key()).await?;
     Ok(store)
 }

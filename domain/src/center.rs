@@ -20,7 +20,10 @@
 //! only ever come from a type successfully serialized, never from arbitrary
 //! hand-written JSON, and this crate does not parse the structure (the
 //! protocol crate owns the type, so the payload is carried here as opaque
-//! text exactly like `resource_snapshots.typed_payload_json`).
+//! text exactly like `resource_snapshots.typed_payload_json`). At rest the
+//! persistence layer protects both payload columns with the same
+//! `XChaCha20-Poly1305` command envelope as the operation command columns
+//! (§10), so the domain only ever sees the recovered plaintext.
 
 use std::{error::Error, fmt, str::FromStr};
 

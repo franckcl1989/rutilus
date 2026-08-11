@@ -4,13 +4,16 @@ use sea_orm::entity::prelude::*;
 ///
 /// `sequence` is the envelope's per-instance sequence number (the §15.2
 /// `Envelope.sequence`); the unique `(instance_id, sequence)` index pins the
-/// per-instance monotonicity. `payload_json` holds the serde JSON
-/// serialization of a `center-protocol` `Envelope` — the §9.4
-/// `TypedPayloadJson` rule: the column can only ever hold JSON produced by a
-/// type successfully serialized, never arbitrary hand-written JSON, and the
-/// database does not parse the structure. `state` is the stable
-/// `OutboxEntryState` code (`pending` or `acked`); the migration CHECKs the
-/// allow-list and pins the ack pairing (`acked` rows carry `acked_at`).
+/// per-instance monotonicity. `payload_json` holds the at-rest protection of
+/// the serde JSON serialization of a `center-protocol` `Envelope`: the §9.4
+/// `TypedPayloadJson` rule (the plaintext can only ever come from a type
+/// successfully serialized, never arbitrary hand-written JSON, and the
+/// database does not parse the structure), persisted by the repository as a
+/// `RUTC1:` ciphertext envelope under the instance master key — or as the
+/// legacy plaintext JSON of rows written before at-rest encryption. `state`
+/// is the stable `OutboxEntryState` code (`pending` or `acked`); the
+/// migration CHECKs the allow-list and pins the ack pairing (`acked` rows
+/// carry `acked_at`).
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "center_outbox")]
 pub struct Model {

@@ -1,17 +1,21 @@
-//! XChaCha20-Poly1305 protection of persisted operation command payloads.
+//! XChaCha20-Poly1305 protection of persisted command-bearing payloads.
 //!
 //! The `operations.command` and `batch_operations.command` columns persist
-//! the typed [`rutilus_domain::RedfishCommand`] payloads, which can carry
-//! §10 secrets (the `AccountPassword` of `CreateAccount` and
-//! `UpdateAccountPassword`). Like the endpoint credential of §10, the
-//! command is never stored in the clear: [`encrypt_command`] produces the
-//! whole persisted envelope and [`decrypt_command`] recovers the plaintext,
-//! both under the instance master key with the same `XChaCha20-Poly1305`
+//! the typed [`rutilus_domain::RedfishCommand`] payloads, and the center
+//! queue `center_outbox.payload_json` and `center_inbox.payload_json`
+//! columns persist the `center-protocol` envelopes that carry those commands
+//! inside `OperationOffer` — all of which can hold §10 secrets (the
+//! `AccountPassword` of `CreateAccount` and `UpdateAccountPassword`). Like
+//! the endpoint credential of §10, the operation command columns never hold
+//! this value in the clear, and the center outbox and inbox payloads are
+//! encrypted with the same envelope: [`encrypt_command`] produces the whole
+//! persisted envelope and [`decrypt_command`] recovers the plaintext, both
+//! under the instance master key with the same `XChaCha20-Poly1305`
 //! construction the credential protection uses.
 //!
 //! # The persisted envelope
 //!
-//! The command column is a single `TEXT` column (unlike the credential
+//! The protected columns are single `TEXT` columns (unlike the credential
 //! version rows, which split nonce and ciphertext across two `BLOB`
 //! columns), so the envelope is the version-one marker
 //! [`COMMAND_CIPHER_ENVELOPE_PREFIX`] followed by the standard base64 of the
@@ -29,12 +33,14 @@
 //! # Associated data
 //!
 //! The ciphertext is bound to the 16-byte identity of the persisted row
-//! whose command it protects — the operation id for `operations` rows and
-//! the batch id for `batch_operations` rows — exactly like the credential
-//! ciphertext is bound to its `CredentialId`/`VersionId` pair. The binding
-//! makes a ciphertext copied into any other row (or into the other table)
-//! fail authentication, and it needs nothing beyond the row the reader is
-//! already hydrating.
+//! whose command it protects — the operation id for `operations` rows, the
+//! batch id for `batch_operations` rows, the operation id for
+//! `center_inbox` rows (the idempotency key of §17.5), and the entry id for
+//! `center_outbox` rows, which have no operation column of their own —
+//! exactly like the credential ciphertext is bound to its
+//! `CredentialId`/`VersionId` pair. The binding makes a ciphertext copied
+//! into any other row (or into the other table) fail authentication, and it
+//! needs nothing beyond the row the reader is already hydrating.
 
 use std::{error::Error, fmt};
 
