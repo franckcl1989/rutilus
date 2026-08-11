@@ -137,6 +137,7 @@
 | at-rest 加密 | 命令列 + 中心队列：`operations.command` / `batch_operations.command` / `center_outbox.payload_json` / `center_inbox.payload_json` 用 XChaCha20-Poly1305 信封（`RUTC1:` 前缀版本化，AD 绑定行身份，可区分加密行与历史明文行）保护 | `security/src/command_cipher.rs:1-43` |
 | CI 门禁补全 | nextest（`--test-threads 4`）、llvm-cov（`--fail-under-lines 80`）、machete、deny、clippy `-D warnings`、wasm32 UI 产物 diff、Capability Ledger Check、Release Baseline Check | `.github/workflows/ci.yml:110-193` |
 | 测试基建 | 故障注入与 Supermicro E2E 覆盖落地 | commit 4ad8c4a（`merge: land the fault-injection and supermicro e2e coverage`） |
+| Overview 聚合 | §14.2 首页聚合区块落地：`GET /api/v1/overview` 服务端聚合（api 契约 + application `OverviewQuery` + web 路由），UI 首页仪表盘（Endpoint 计数/厂商分布/健康分布/运行中 Operation/最近事件/固件摘要/能力覆盖/数据陈旧程度），批量刷新与清单刷新后同步重载 | commit 4d1d27c（`feat(ui): render the §14.2 homepage overview dashboard`），链路 commit c3d7198 / e7f8dd4 / 70279c0 |
 
 ## 五、已知边界（冻结时如实记录）
 
@@ -160,6 +161,5 @@
 | 发布构建验证 | musl（x86_64/aarch64）、Windows ARM64、macOS Universal 2 合并构建尚未在 CI 编译验证（CI 当前验证 linux-gnu / windows-msvc / darwin x86_64 + wasm32 UI 产物） | `docs/support-matrix.md` §三；`docs/known-limitations.md` §七 |
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
 | tracing 日志引入 | 设计 §6.2 的 `tracing` 未进入 workspace，运行失败经 stderr（`eprintln!`）记录；统一日志设施为后续迭代 | `docs/known-limitations.md` §七、§八 |
-| Overview 聚合 | §14.2 首页的"运行中 Task、最近事件、固件清单摘要、能力覆盖"等聚合区块尚未以独立首页仪表盘形式实现（能力覆盖可通过每张卡片 Capabilities 页面查看） | `docs/user-manual.md` 205-207 行 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
 | 其他 | 遥测保留期可配置（§14.4）、`cargo audit` 独立门禁、诊断解码错误路径展示（§12.4）、产品版本号统一策略、UI 本地化等 | `docs/known-limitations.md` §七、§八 |

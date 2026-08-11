@@ -188,9 +188,23 @@ Edge 控制台视图（`ui/src/lib.rs` 的 `ConsoleView`，共 17 个视图，�
 
 ### 4.2 多服务器首页（Overview）
 
-Overview 视图即多服务器清单（"Inventory"）：每张端点卡片显示统一健康徽标（Unified endpoint health）、
-信任徽标、快照状态标签（"No resource counts are published until a complete refresh succeeds."）、
+Overview 视图即多服务器首页（"Inventory"）：上方为 §14.2 聚合仪表盘（一次 `GET /api/v1/overview`
+服务端聚合，`web/src/lib.rs` 的 overview 路由），下方为端点清单——每张端点卡片显示统一健康徽标
+（Unified endpoint health）、信任徽标、快照状态标签
+（"No resource counts are published until a complete refresh succeeds."）、
 Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs` 第 11536 行起、第 11910 行附近）。
+
+聚合仪表盘（§14.2"首页显示"列表）展示：
+
+- Endpoint 数量（含当前快照 / 等待首次刷新拆分——产品不建模在线/离线/认证失败可达性，
+  快照拆分是其如实对应）；
+- 厂商分布（§12.3 统一厂商，未发布的端点归入 "Unpublished" 桶）；
+- 健康分布（§12.3 统一健康：System/Chassis/Manager 最差 `Health`）；
+- 运行中 Operation 数（§13.2 活动态：queued 到 verifying，含 §13.6 远程 Task 监控）；
+- 最近事件（服务端保留的最新 5 条，§14.4 原始 `MessageId`/`Severity`）；
+- 固件清单摘要（§2.1 `SoftwareInventory` 成员数、端点数与去重版本数）；
+- 能力覆盖（§2.4 账本中已观测条目的 Supported 占比，未探针条目不计入）；
+- 数据陈旧程度（最近成功刷新时间的年龄分桶：从未刷新 / 1 小时内 / 1 天内 / 7 天内 / 7 天以上）。
 
 已实现的支持能力（§14.2 的"支持"列表）：
 
@@ -202,9 +216,7 @@ Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs` 第
 - 批量类型化操作（见 §五.3）；
 - 端点能力查看（每张卡片的 "View capabilities"）。
 
-如实说明：设计 §14.2"首页显示"列表中的运行中 Task、最近事件、固件清单摘要、能力覆盖等
-聚合区块尚未以独立首页仪表盘形式实现——能力覆盖可通过每张卡片的 Capabilities 页面查看，
-数据陈旧程度以清单头的 "Latest complete Redfish resource generations" 与卡片快照标签呈现。
+聚合仪表盘随清单刷新同步重新加载（"Refresh inventory" 与批量刷新后都会重新拉取）。
 1.0.0 不设计动态规则组和通用查询语言（§14.2）。
 
 ### 4.3 Endpoint 页面（能力驱动呈现）
