@@ -167,6 +167,21 @@ jobs:
           diff -q target/wasm-assets/rutilus_ui.js web/assets/rutilus_ui.js
           diff -q target/wasm-assets/rutilus_ui_bg.wasm web/assets/rutilus_ui_bg.wasm
 
+      # §5.4: Release build — static musl binary. The Linux release target in
+      # the §5.2 platform matrix is x86_64-unknown-linux-musl (static link per
+      # §5.3: no dependency on the host glibc version), which the gnu check
+      # above never exercises: ring and libsqlite3-sys (via sqlx-sqlite)
+      # compile C code with the musl-gcc cross linker, so musl-specific build
+      # errors would pass the gnu gate. `-p rutilus` builds just the app
+      # binary, the only artifact the release ships; --locked pins the
+      # committed Cargo.lock.
+      - name: Build linux release binary (musl static)
+        if: matrix.is_default
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --locked -p rutilus --target x86_64-unknown-linux-musl --release
+
       # §19.4: Migration Test. Also covered by the full workspace test above;
       # kept as an explicit gate for visibility (migration/tests/initial_storage.rs).
       - name: Migration test
