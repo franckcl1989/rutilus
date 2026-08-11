@@ -456,6 +456,79 @@ pub enum CoreResourceDetails {
     /// product identity comes from the payload exactly like every standard
     /// family.
     OemLenovoSecurityService { fw_rollback: Option<String> },
+    /// One §0.5.0 AMI OEM family member: the Service Root's embedded
+    /// `AmiServiceRoot` segment, read through the compiled `oem-ami` surface
+    /// (§11.5 — an OEM surface is projected only when upstream compiles it).
+    /// The segment is part of the Service Root document, so the product
+    /// identity is the Service Root's own; the `RtpVersion` value names the
+    /// Redfish Technology Pack version and is projected only when the
+    /// endpoint published it.
+    OemAmiServiceRoot { rtp_version: Option<String> },
+    /// One §0.5.0 AMI OEM family member: the manager's `ConfigBMC` document,
+    /// read through the compiled `oem-ami` surface (§11.5). The four BIOS
+    /// lockout/lockdown states are the vendor's enum spellings verbatim
+    /// (`Enable`, `Disable`, or `UnsupportedValue` for a value this build
+    /// cannot classify), never translated, per §12.3; the compiled schema
+    /// models no `Id` / `Name` / `Description`, so the product identity is
+    /// derived from the snapshot's `@odata.id` (the Redfish `Id` equals the
+    /// final path segment per DSP0266) and stays out of the wire payload,
+    /// whose field set is exactly what the infra projection wrote.
+    OemAmiConfigBmc {
+        lockout_host_control: Option<String>,
+        lockout_bios_variable_write_mode: Option<String>,
+        lockdown_bios_settings_change: Option<String>,
+        lockdown_bios_upgrade_downgrade: Option<String>,
+    },
+    /// One §0.5.0 HPE OEM family member: the Service Root's embedded
+    /// `HpeiLoServiceExt` segment, read through the compiled `oem-hpe`
+    /// surface (§11.5). The segment is part of the Service Root document, so
+    /// the product identity is the Service Root's own; the `ManagerType` /
+    /// `ManagerFirmwareVersion` values of the first `Manager` entry (the
+    /// first-entry surface of the upstream `manager_type()` accessor) are
+    /// projected only when the endpoint published them.
+    OemHpeILoServiceExt {
+        manager_type: Option<String>,
+        manager_firmware_version: Option<String>,
+    },
+    /// One §0.5.0 HPE OEM family member: the Manager's embedded `HpeiLo`
+    /// segment, read through the compiled `oem-hpe` surface (§11.5). The
+    /// segment is part of the Manager document, so the product identity is
+    /// the Manager's own; the `VirtualNICEnabled` boolean names the
+    /// host-side virtual NIC support state and is projected only when the
+    /// endpoint published it.
+    OemHpeManager { virtual_nic_enabled: Option<bool> },
+    /// One §0.5.0 `LiteOn` OEM family member: one `LiteonPowerSupply` of a
+    /// `LiteOn` chassis, read through the compiled `oem-liteon` surface
+    /// (§11.5 — the family is gated on the chassis `Manufacturer` value
+    /// `LITE-ON TECHNOLOGY CORP.`, the exact gate the upstream
+    /// `chassis_fetch_links` applies). The `PowerSupplyType` value is the
+    /// vendor's enum spelling verbatim per §12.3, the `PowerCapacityWatts`
+    /// value stays numeric, and the compiled base `resource::Resource`
+    /// requires `Id` / `Name`, so the product identity comes from the
+    /// payload exactly like every standard family.
+    OemLiteOnPowerSupply {
+        power_supply_type: Option<String>,
+        power_capacity_watts: Option<f64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        firmware_version: Option<String>,
+        serial_number: Option<String>,
+        part_number: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §0.5.0 Delta OEM family member: one power supply whose `Oem`
+    /// segment carries the `deltaenergysystems` extension, read through the
+    /// compiled `oem-delta` surface (§11.5). The `Power` flag names whether
+    /// the PSU outputs power and the `FanSpeedTarget` value the target fan
+    /// speed — the extension's authoritative readings, which Delta power
+    /// shelves publish instead of the standard `PowerState` field. The
+    /// compiled base `resource::Resource` requires `Id` / `Name`, so the
+    /// product identity comes from the payload exactly like every standard
+    /// family.
+    OemDeltaPowerSupply {
+        power: Option<bool>,
+        fan_speed_target: Option<i64>,
+    },
     Processor {
         processor_type: Option<String>,
         socket: Option<String>,
@@ -931,13 +1004,6 @@ where
         #[source]
         source: serde_json::Error,
     },
-    #[error(
-        "resource {resource_id} has an {feature} snapshot that is not yet projectable in this layer"
-    )]
-    NotYetProjectable {
-        resource_id: ResourceId,
-        feature: ResourceFeature,
-    },
 }
 
 fn project_snapshot<RepositoryError>(
@@ -967,23 +1033,14 @@ where
         ResourceFeature::OemLenovoSecurityService => {
             project_oem_lenovo_security_service(snapshot, payload)?
         }
-        ResourceFeature::OemAmiServiceRoot
-        | ResourceFeature::OemAmiConfigBmc
-        | ResourceFeature::OemHpeILoServiceExt
-        | ResourceFeature::OemHpeManager
-        | ResourceFeature::OemLiteOnPowerSupply
-        | ResourceFeature::OemDeltaPowerSupply => {
-            // The typed projections of the 0.5 OEM read families (`AmiServiceRoot`,
-            // `ConfigBmc`, `HpeiLoServiceExt`, `HpeiLo`, `LiteonPowerSupply`, and
-            // `DeltaPowerSupply`) land with the resource-details slice; the six
-            // families share the single arm because they all keep the compiled
-            // snapshots countable and storable while the details projection stays
-            // deferred, reported as a controlled error instead of panicking.
-            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
-                resource_id: snapshot.resource_id(),
-                feature: snapshot.feature(),
-            });
+        ResourceFeature::OemAmiServiceRoot => project_oem_ami_service_root(snapshot, payload)?,
+        ResourceFeature::OemAmiConfigBmc => project_oem_ami_config_bmc(snapshot, payload)?,
+        ResourceFeature::OemHpeILoServiceExt => project_oem_hpe_ilo_service_ext(snapshot, payload)?,
+        ResourceFeature::OemHpeManager => project_oem_hpe_manager(snapshot, payload)?,
+        ResourceFeature::OemLiteOnPowerSupply => {
+            project_oem_liteon_power_supply(snapshot, payload)?
         }
+        ResourceFeature::OemDeltaPowerSupply => project_oem_delta_power_supply(snapshot, payload)?,
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
@@ -1207,6 +1264,125 @@ where
             fw_rollback: parsed.fw_rollback,
         },
     )
+}
+
+fn project_oem_ami_service_root<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemAmiServiceRootPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemAmiServiceRoot {
+            rtp_version: parsed.rtp_version,
+        }
+    })
+}
+
+fn project_oem_ami_config_bmc<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    // The compiled `ConfigBmc` schema models no `Id` / `Name` /
+    // `Description`, so the payload carries none and the common identity is
+    // derived from the snapshot's `@odata.id` instead.
+    let parsed = deserialize_payload::<OemAmiConfigBmcPayload, RepositoryError>(snapshot, payload)?;
+    Ok((
+        common_from_odata_id(snapshot.odata_id()),
+        CoreResourceDetails::OemAmiConfigBmc {
+            lockout_host_control: parsed.lockout_host_control,
+            lockout_bios_variable_write_mode: parsed.lockout_bios_variable_write_mode,
+            lockdown_bios_settings_change: parsed.lockdown_bios_settings_change,
+            lockdown_bios_upgrade_downgrade: parsed.lockdown_bios_upgrade_downgrade,
+        },
+    ))
+}
+
+fn project_oem_hpe_ilo_service_ext<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemHpeILoServiceExtPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemHpeILoServiceExt {
+            manager_type: parsed.manager_type,
+            manager_firmware_version: parsed.manager_firmware_version,
+        }
+    })
+}
+
+fn project_oem_hpe_manager<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemHpeManagerPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemHpeManager {
+            virtual_nic_enabled: parsed.virtual_nic_enabled,
+        }
+    })
+}
+
+fn project_oem_liteon_power_supply<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemLiteOnPowerSupplyPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemLiteOnPowerSupply {
+            power_supply_type: parsed.power_supply_type,
+            power_capacity_watts: parsed.power_capacity_watts,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            firmware_version: parsed.firmware_version,
+            serial_number: parsed.serial_number,
+            part_number: parsed.part_number,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_oem_delta_power_supply<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<OemDeltaPowerSupplyPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::OemDeltaPowerSupply {
+            power: parsed.power,
+            fan_speed_target: parsed.fan_speed_target,
+        }
+    })
 }
 
 /// Projects one NVIDIA system-config-profile chain snapshot into its details
@@ -2459,6 +2635,181 @@ struct OemLenovoSecurityServicePayload {
     description: Option<String>,
     #[serde(rename = "FWRollback")]
     fw_rollback: Option<String>,
+}
+
+/// The §0.5.0 AMI `AmiServiceRoot` snapshot payload, decoded exactly as the
+/// infra projection wrote it: the Service Root's common identity fields plus
+/// the `RtpVersion` text. `deny_unknown_fields` keeps the snapshot contract
+/// strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemAmiServiceRootPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "RtpVersion")]
+    rtp_version: Option<String>,
+}
+
+impl CommonPayload for OemAmiServiceRootPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §0.5.0 AMI `ConfigBmc` snapshot payload, decoded exactly as the infra
+/// projection wrote it: the four BIOS lockout/lockdown state spellings
+/// verbatim. The compiled schema models no common identity fields, so the
+/// payload carries none — the application boundary derives the product
+/// identity from the snapshot's `@odata.id` instead. `deny_unknown_fields`
+/// keeps the snapshot contract strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemAmiConfigBmcPayload {
+    #[serde(rename = "LockoutHostControl")]
+    lockout_host_control: Option<String>,
+    #[serde(rename = "LockoutBiosVariableWriteMode")]
+    lockout_bios_variable_write_mode: Option<String>,
+    #[serde(rename = "LockdownBiosSettingsChange")]
+    lockdown_bios_settings_change: Option<String>,
+    #[serde(rename = "LockdownBiosUpgradeDowngrade")]
+    lockdown_bios_upgrade_downgrade: Option<String>,
+}
+
+/// The §0.5.0 HPE `HpeiLoServiceExt` snapshot payload, decoded exactly as
+/// the infra projection wrote it: the Service Root's common identity fields
+/// plus the first `Manager` entry's `ManagerType` / `ManagerFirmwareVersion`
+/// texts. `deny_unknown_fields` keeps the snapshot contract strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemHpeILoServiceExtPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "ManagerType")]
+    manager_type: Option<String>,
+    #[serde(rename = "ManagerFirmwareVersion")]
+    manager_firmware_version: Option<String>,
+}
+
+impl CommonPayload for OemHpeILoServiceExtPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §0.5.0 HPE `HpeiLo` snapshot payload, decoded exactly as the infra
+/// projection wrote it: the Manager's common identity fields plus the
+/// `VirtualNICEnabled` boolean. `deny_unknown_fields` keeps the snapshot
+/// contract strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemHpeManagerPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "VirtualNICEnabled")]
+    virtual_nic_enabled: Option<bool>,
+}
+
+impl CommonPayload for OemHpeManagerPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §0.5.0 `LiteOn` `LiteonPowerSupply` snapshot payload, decoded exactly
+/// as the infra projection wrote it: the supply's common identity fields
+/// plus the typed power-supply identity (`PowerSupplyType` spelling
+/// verbatim, numeric `PowerCapacityWatts`, and the `Manufacturer` / `Model`
+/// / `FirmwareVersion` / `SerialNumber` / `PartNumber` texts and `Status`).
+/// `deny_unknown_fields` keeps the snapshot contract strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemLiteOnPowerSupplyPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "PowerSupplyType")]
+    power_supply_type: Option<String>,
+    #[serde(rename = "PowerCapacityWatts")]
+    power_capacity_watts: Option<f64>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "FirmwareVersion")]
+    firmware_version: Option<String>,
+    #[serde(rename = "SerialNumber")]
+    serial_number: Option<String>,
+    #[serde(rename = "PartNumber")]
+    part_number: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for OemLiteOnPowerSupplyPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §0.5.0 Delta power-supply snapshot payload, decoded exactly as the
+/// infra projection wrote it: the supply's common identity fields plus the
+/// `Power` flag and numeric `FanSpeedTarget` value of the
+/// `Oem.deltaenergysystems` extension. `deny_unknown_fields` keeps the
+/// snapshot contract strict.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OemDeltaPowerSupplyPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "Power")]
+    power: Option<bool>,
+    #[serde(rename = "FanSpeedTarget")]
+    fan_speed_target: Option<i64>,
+}
+
+impl CommonPayload for OemDeltaPowerSupplyPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
 }
 
 impl CommonPayload for OemLenovoSecurityServicePayload {
@@ -4981,6 +5332,195 @@ mod tests {
             &CoreResourceDetails::OemLenovoSecurityService { fw_rollback: None }
         );
         Ok(())
+    }
+
+    // The six 0.5 OEM read families are asserted in one test so the full
+    // payload contract stays one surface; the six snapshot fixtures exceed
+    // the pedantic line budget, so the lint is scoped here exactly like the
+    // other fixture-sequence tests.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn projects_the_six_oem_read_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(15)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The AMI service-root segment keeps the Service Root's own
+                // common identity (the segment lives at the `Oem.Ami` key
+                // inside the Service Root document); the `RtpVersion` names
+                // the Redfish Technology Pack version.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemAmiServiceRoot,
+                    "/redfish/v1/Oem/Ami",
+                    r#"{"Id":"RootService","Name":"Root","RtpVersion":"1.2.3"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The AMI `ConfigBmc` schema models no common identity
+                // fields, so the product identity is derived from the
+                // snapshot's `@odata.id` and the payload carries only the
+                // four lockout/lockdown spellings verbatim.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemAmiConfigBmc,
+                    "/redfish/v1/Managers/1/Oem/ConfigBMC",
+                    r#"{"LockoutHostControl":"Enable","LockoutBiosVariableWriteMode":"Disable","LockdownBiosSettingsChange":"Enable","LockdownBiosUpgradeDowngrade":"Disable"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The HPE service-root segment keeps the Service Root's own
+                // common identity plus the first `Manager` entry's texts.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemHpeILoServiceExt,
+                    "/redfish/v1/Oem/Hpe",
+                    r#"{"Id":"RootService","Name":"Root","ManagerType":"iLO 5","ManagerFirmwareVersion":"2.44"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The HPE manager segment keeps the Manager's own common
+                // identity plus the `VirtualNICEnabled` boolean.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemHpeManager,
+                    "/redfish/v1/Managers/1/Oem/Hpe",
+                    r#"{"Id":"1","Name":"Manager One","VirtualNICEnabled":true}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The `LiteOn` supply projects the typed power-supply
+                // identity fields exactly like the standard family.
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemLiteOnPowerSupply,
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                    r#"{"Id":"1","Name":"Power Supply 1","Description":"LiteOn power supply","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Model":"PS-2200","FirmwareVersion":"1.02","SerialNumber":"LN1234","PartNumber":"LTP-2200","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                // The Delta supply projects the `deltaenergysystems` flags
+                // beside the common identity fields. (A real shelf is either
+                // `LiteOn` or Delta, so the two supply fixtures use distinct
+                // member paths to keep the inventory identity unique.)
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::OemDeltaPowerSupply,
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2",
+                    r#"{"Id":"1","Name":"Power Supply 1","Description":"Delta power supply","Power":true,"FanSpeedTarget":50}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.resources().len(), 7);
+        // The inventory orders snapshots by `@odata.id`, so each family is
+        // resolved by its identity instead of its position.
+        let ami_root = by_odata_id(&result, "/redfish/v1/Oem/Ami")?;
+        assert_eq!(ami_root.feature(), ResourceFeature::OemAmiServiceRoot);
+        assert_eq!(ami_root.common().id(), "RootService");
+        assert_eq!(
+            ami_root.details(),
+            &CoreResourceDetails::OemAmiServiceRoot {
+                rtp_version: Some("1.2.3".to_owned()),
+            }
+        );
+        let config_bmc = by_odata_id(&result, "/redfish/v1/Managers/1/Oem/ConfigBMC")?;
+        assert_eq!(
+            config_bmc.details(),
+            &CoreResourceDetails::OemAmiConfigBmc {
+                lockout_host_control: Some("Enable".to_owned()),
+                lockout_bios_variable_write_mode: Some("Disable".to_owned()),
+                lockdown_bios_settings_change: Some("Enable".to_owned()),
+                lockdown_bios_upgrade_downgrade: Some("Disable".to_owned()),
+            }
+        );
+        // The `ConfigBmc` schema models no common identity, so the product
+        // identity derives from the `@odata.id` final segment.
+        assert_eq!(config_bmc.common().id(), "ConfigBMC");
+        let hpe_root = by_odata_id(&result, "/redfish/v1/Oem/Hpe")?;
+        assert_eq!(
+            hpe_root.details(),
+            &CoreResourceDetails::OemHpeILoServiceExt {
+                manager_type: Some("iLO 5".to_owned()),
+                manager_firmware_version: Some("2.44".to_owned()),
+            }
+        );
+        let hpe_manager = by_odata_id(&result, "/redfish/v1/Managers/1/Oem/Hpe")?;
+        assert_eq!(
+            hpe_manager.details(),
+            &CoreResourceDetails::OemHpeManager {
+                virtual_nic_enabled: Some(true),
+            }
+        );
+        let liteon = by_odata_id(
+            &result,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+        )?;
+        assert!(matches!(
+            liteon.details(),
+            CoreResourceDetails::OemLiteOnPowerSupply {
+                power_supply_type: Some(power_supply_type),
+                power_capacity_watts: Some(power_capacity_watts),
+                manufacturer: Some(manufacturer),
+                model: Some(model),
+                firmware_version: Some(firmware_version),
+                serial_number: Some(serial_number),
+                part_number: Some(part_number),
+                status: Some(status),
+            } if power_supply_type == "AC"
+                && (*power_capacity_watts - 2200.0).abs() < f64::EPSILON
+                && manufacturer == "LITE-ON TECHNOLOGY CORP."
+                && model == "PS-2200"
+                && firmware_version == "1.02"
+                && serial_number == "LN1234"
+                && part_number == "LTP-2200"
+                && status.state() == Some("Enabled")
+                && status.health() == Some("OK")
+                && status.health_rollup() == Some("OK")
+        ));
+        let delta = by_odata_id(
+            &result,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/2",
+        )?;
+        assert_eq!(
+            delta.details(),
+            &CoreResourceDetails::OemDeltaPowerSupply {
+                power: Some(true),
+                fan_speed_target: Some(50),
+            }
+        );
+        Ok(())
+    }
+
+    /// Resolves one projected resource by its `@odata.id` for the fixture
+    /// assertions, so the inventory's deterministic `@odata.id` ordering
+    /// never couples the test to a position.
+    fn by_odata_id<'a>(
+        inventory: &'a EndpointResourceInventory,
+        odata_id: &str,
+    ) -> Result<&'a CoreResourceSummary, Box<dyn Error>> {
+        inventory
+            .resources()
+            .iter()
+            .find(|resource| resource.odata_id().as_str() == odata_id)
+            .ok_or_else(|| format!("the {odata_id} resource must exist").into())
     }
 
     #[test]
