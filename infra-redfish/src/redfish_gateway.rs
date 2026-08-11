@@ -10333,6 +10333,22 @@ mod tests {
 
     use super::*;
 
+    /// How long the scripted test servers wait for the next TCP accept, TLS
+    /// handshake, or request read before abandoning the script.
+    ///
+    /// The bound exists so a stalled peer cannot pin a serve-loop task, but
+    /// it must stay strictly above the product client's own request budget
+    /// (`HTTP_REQUEST_TIMEOUT`, 30 s): under a loaded test machine the client
+    /// can stall past a tight bound, the server abandons the script, and
+    /// every remaining scripted document is never served. The read flow skips
+    /// individually failed documents by design, so the truncation then
+    /// surfaces as a silently short resource list (the NVIDIA power-compliance
+    /// chain ending at its six base resources) instead of a transport error.
+    /// The one-minute bound out-waits the client's budget, so the client's
+    /// own request timeout — a loud, classified error — always fires before
+    /// the mock abandons its script.
+    const TEST_SERVER_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+
     const SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -23765,10 +23781,10 @@ mod tests {
     ) -> Result<Vec<Vec<u8>>, io::Error> {
         let mut requests = Vec::with_capacity(responses.len());
         for response in responses {
-            let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+            let (tcp, _) = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept())
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
-            let Ok(mut stream) = timeout(Duration::from_secs(5), acceptor.accept(tcp))
+            let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(tcp))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
             else {
@@ -23863,10 +23879,10 @@ mod tests {
         let mut responses = responses.into_iter();
         let mut requests = Vec::with_capacity(total_connections);
         for connection in 0..total_connections {
-            let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+            let (tcp, _) = timeout(TEST_SERVER_PEER_TIMEOUT, listener.accept())
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TCP accept"))??;
-            let Ok(mut stream) = timeout(Duration::from_secs(5), acceptor.accept(tcp))
+            let Ok(mut stream) = timeout(TEST_SERVER_PEER_TIMEOUT, acceptor.accept(tcp))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test TLS handshake"))?
             else {
@@ -23930,7 +23946,7 @@ mod tests {
             SseEnd::HoldOpen => {
                 let mut chunk = [0_u8; 1024];
                 loop {
-                    let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                    let bytes = timeout(TEST_SERVER_PEER_TIMEOUT, stream.read(&mut chunk))
                         .await
                         .map_err(|_| {
                             io::Error::new(io::ErrorKind::TimedOut, "test SSE hold-open")
@@ -23952,7 +23968,7 @@ mod tests {
         let mut request = Vec::new();
         let mut chunk = [0_u8; 1024];
         let header_end = loop {
-            let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            let bytes = timeout(TEST_SERVER_PEER_TIMEOUT, stream.read(&mut chunk))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test HTTP request"))??;
             if bytes == 0 {
@@ -23983,7 +23999,7 @@ mod tests {
             })
             .unwrap_or(0);
         while request.len() < header_end + content_length {
-            let bytes = timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            let bytes = timeout(TEST_SERVER_PEER_TIMEOUT, stream.read(&mut chunk))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "test HTTP request body"))??;
             if bytes == 0 {
