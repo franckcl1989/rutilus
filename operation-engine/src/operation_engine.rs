@@ -983,6 +983,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_clock_rollback_is_recorded_verbatim_never_fabricated() -> Result<(), Box<dyn Error>>
+    {
+        // The monotonic-clock contract (`create` / `apply` docs: "the domain
+        // trusts `now` without re-checking") says the caller must never move
+        // the clock backwards. Pin what a violated contract looks like: the
+        // engine accepts the regressed instant and persists it verbatim — no
+        // clamping, no fabricated timestamp — so a violating caller's
+        // timeline corruption stays visible in the record instead of being
+        // silently corrected.
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let created_at = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                created_at,
+            )
+            .await?;
+
+        let advanced = engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationStarted,
+                created_at + Duration::SECOND * 10,
+            )
+            .await?;
+        assert_eq!(advanced.state(), OperationState::Validating);
+        assert_eq!(advanced.updated_at(), created_at + Duration::SECOND * 10);
+
+        // The clock rolls back to an instant still after creation: the step
+        // applies and the regressed instant is persisted exactly as given.
+        let rolled_back = engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationPassed,
+                created_at + Duration::SECOND * 5,
+            )
+            .await?;
+        assert_eq!(rolled_back.state(), OperationState::Running);
+        assert_eq!(rolled_back.updated_at(), created_at + Duration::SECOND * 5);
+        assert_eq!(
+            store.steps()?,
+            vec![
+                TransitionStep {
+                    operation_id: created.id(),
+                    new_state: OperationState::Validating,
+                    occurred_at: created_at + Duration::SECOND * 10,
+                },
+                TransitionStep {
+                    operation_id: created.id(),
+                    new_state: OperationState::Running,
+                    occurred_at: created_at + Duration::SECOND * 5,
+                },
+            ],
+            "the regressed occurrence time must be persisted verbatim"
+        );
+
+        // A rollback before the creation instant crosses the timeline
+        // invariant the persistence boundary enforces on rehydration
+        // (`try_from_parts` rejects `updated_at < created_at`): the boundary
+        // refuses it instead of persisting a corrupt row.
+        let before_creation = engine
+            .apply(
+                created.id(),
+                OperationEvent::ExecutionAccepted,
+                created_at - Duration::SECOND,
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("a pre-creation timestamp must be refused"))?;
+        assert!(matches!(before_creation, EngineError::Store(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn recover_pending_lists_only_the_recoverable_states() -> Result<(), Box<dyn Error>> {
         let store = FakeStore::new();
         let engine = OperationEngine::new(&store);

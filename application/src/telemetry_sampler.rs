@@ -641,7 +641,7 @@ mod tests {
         error::Error,
         fmt,
         num::NonZeroU64,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, PoisonError},
     };
 
     use rutilus_domain::{
@@ -1019,6 +1019,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_clock_jump_forward_moves_the_prune_cutoff_forward() -> Result<(), Box<dyn Error>> {
+        // The product clock jumps forward (NTP correction, a missed tick):
+        // the next prune derives its cutoff from the new instant, so the
+        // retention window always starts at the clock's present, never at a
+        // cached past.
+        let clock = MovableClock::at(instant(30));
+        let store = RecordingStore::new();
+        let sampler =
+            TelemetrySampler::new(FakeReader::with_reports(Vec::new()), &store, clock.clone());
+
+        sampler.prune_history(time::Duration::days(7)).await?;
+        clock.move_to(instant(60));
+        sampler.prune_history(time::Duration::days(7)).await?;
+
+        assert_eq!(
+            store.prune_cutoffs(),
+            vec![
+                instant(30) - time::Duration::days(7),
+                instant(60) - time::Duration::days(7),
+            ],
+            "each prune must subtract the retention from the clock instant at that tick"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clock_jump_backward_re_derives_the_cutoff_stably() -> Result<(), Box<dyn Error>> {
+        // The product clock jumps backward (wall-clock drift): the cutoff is
+        // re-derived from the earlier instant — retaining more history than
+        // the forward jump would, never a negative window, never a cached
+        // stale cutoff — so the prune stays a stable function of the clock at
+        // each tick.
+        let clock = MovableClock::at(instant(30));
+        let store = RecordingStore::new();
+        let sampler =
+            TelemetrySampler::new(FakeReader::with_reports(Vec::new()), &store, clock.clone());
+
+        sampler.prune_history(time::Duration::days(7)).await?;
+        clock.move_to(instant(10));
+        sampler.prune_history(time::Duration::days(7)).await?;
+        assert_eq!(
+            store.prune_cutoffs(),
+            vec![
+                instant(30) - time::Duration::days(7),
+                instant(10) - time::Duration::days(7),
+            ],
+            "a backward jump must re-derive the cutoff from the regressed instant"
+        );
+        Ok(())
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockError {
         Store,
@@ -1236,6 +1288,27 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             self.0
+        }
+    }
+
+    /// A clock the test can move between ticks, modeling the product clock
+    /// jumping (NTP correction, wall-clock drift) mid-run.
+    #[derive(Clone, Debug)]
+    struct MovableClock(Arc<Mutex<OffsetDateTime>>);
+
+    impl MovableClock {
+        fn at(now: OffsetDateTime) -> Self {
+            Self(Arc::new(Mutex::new(now)))
+        }
+
+        fn move_to(&self, now: OffsetDateTime) {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = now;
+        }
+    }
+
+    impl Clock for MovableClock {
+        fn now(&self) -> OffsetDateTime {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
 }
