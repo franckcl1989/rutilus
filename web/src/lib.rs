@@ -40,8 +40,12 @@ use rutilus_api::{
     EventListResponse, EventResponse, GroupListResponse, GroupResponse, HealthResponse,
     MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse,
     OperationResponse, OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    RefreshEndpointsRequest, ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse,
-    TagResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
+    OverviewCapabilityCoverageResponse, OverviewEndpointCountsResponse,
+    OverviewFreshnessBucketResponse, OverviewFreshnessCountResponse,
+    OverviewFirmwareSummaryResponse, OverviewHealthCountResponse, OverviewHealthLevelResponse,
+    OverviewResponse, OverviewVendorCountResponse, RefreshEndpointsRequest,
+    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
+    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
     TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
     UiLocationResponse,
 };
@@ -63,10 +67,10 @@ use rutilus_application::{
     EndpointTrustExpectationError, EnrolledEndpoint, EnvironmentMetricsControlSummary,
     EnvironmentMetricsReadingSummary, EventRepository, GroupManagement, GroupManagementError,
     GroupRepository, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
-    OperationStore, OperationSubmission, RedfishDiscovery, ResourceDiagnostics,
-    ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError, ResourceStatusSummary,
-    SubmissionError, TagManagement, TagManagementError, TagRepository, TelemetryRepository,
-    TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    OperationStore, OperationSubmission, OverviewAggregate, OverviewQuery, RedfishDiscovery,
+    ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
+    ResourceStatusSummary, SubmissionError, TagManagement, TagManagementError, TagRepository,
+    TelemetryRepository, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
@@ -819,6 +823,10 @@ where
             get(endpoint_inventory::<Services, Gateway, Time>),
         )
         .route(
+            "/api/v1/overview",
+            get(overview::<Services, Gateway, Time>),
+        )
+        .route(
             "/api/v1/endpoints/{endpoint_id}/resources",
             get(endpoint_resources::<Services, Gateway, Time>),
         )
@@ -1179,6 +1187,48 @@ where
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let mut response = Json(EndpointInventoryResponse::new(endpoints)).into_response();
+    no_store(&mut response);
+    response
+}
+
+/// Serves the §14.2 homepage aggregate: one server-derived, read-only
+/// dashboard summary of the whole managed fleet.
+///
+/// The handler composes the four read-only boundaries the aggregate derives
+/// from and projects the application's [`OverviewAggregate`] exactly like the
+/// single-block handlers project their queries. Any boundary failure reports
+/// the whole dashboard unavailable — the aggregate is fleet-wide and never
+/// degrades into a partial summary. The route is in the §16.1 read surface
+/// (Viewer readable), and the response carries the same `no-store` policy as
+/// every other console read.
+async fn overview<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+) -> Response
+where
+    Services: EndpointInventoryRepository
+        + CapabilityQueryRepository
+        + OperationStore
+        + EventRepository,
+    Time: Clock,
+{
+    // The bounded §14.2 homepage recent-event tail; mirrors
+    // `rutilus_api::OVERVIEW_RECENT_EVENTS`.
+    let Some(recent_events_limit) = NonZeroU64::new(rutilus_api::OVERVIEW_RECENT_EVENTS) else {
+        unreachable!("the recent-events limit constant is positive");
+    };
+    let query = OverviewQuery::new(
+        state.services.as_ref(),
+        state.services.as_ref(),
+        state.services.as_ref(),
+        state.services.as_ref(),
+    );
+    let Ok(aggregate) = query
+        .execute(state.clock.now(), recent_events_limit)
+        .await
+    else {
+        return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut response = Json(project_overview(&aggregate)).into_response();
     no_store(&mut response);
     response
 }
@@ -2718,6 +2768,88 @@ fn project_event(event: &Event) -> EventResponse {
         event.message().map(str::to_owned),
         event.event_timestamp(),
         event.observed_at(),
+    )
+}
+
+/// Projects the §14.2 homepage aggregate onto the wire contract; every block
+/// maps one-to-one so the console never recomputes a server-derived fact.
+fn project_overview(aggregate: &OverviewAggregate) -> OverviewResponse {
+    OverviewResponse::new(
+        project_overview_endpoint_counts(aggregate.endpoints()),
+        aggregate.vendors().iter().map(project_overview_vendor).collect(),
+        aggregate.health().iter().map(project_overview_health).collect(),
+        project_overview_firmware(aggregate.firmware()),
+        project_overview_capabilities(aggregate.capabilities()),
+        aggregate.running_operations(),
+        aggregate.recent_events().iter().map(project_event).collect(),
+        aggregate.freshness().iter().map(project_overview_freshness).collect(),
+    )
+}
+
+fn project_overview_endpoint_counts(
+    counts: &rutilus_application::OverviewEndpointCounts,
+) -> OverviewEndpointCountsResponse {
+    OverviewEndpointCountsResponse::new(
+        counts.total(),
+        counts.with_current_snapshot(),
+        counts.awaiting_first_refresh(),
+    )
+}
+
+fn project_overview_vendor(count: &rutilus_application::OverviewVendorCount) -> OverviewVendorCountResponse {
+    OverviewVendorCountResponse::new(count.vendor().map(str::to_owned), count.count())
+}
+
+fn project_overview_health(count: &rutilus_application::OverviewHealthCount) -> OverviewHealthCountResponse {
+    OverviewHealthCountResponse::new(
+        match count.level() {
+            rutilus_application::OverviewHealthLevel::Unknown => OverviewHealthLevelResponse::Unknown,
+            rutilus_application::OverviewHealthLevel::Ok => OverviewHealthLevelResponse::Ok,
+            rutilus_application::OverviewHealthLevel::Warning => OverviewHealthLevelResponse::Warning,
+            rutilus_application::OverviewHealthLevel::Critical => OverviewHealthLevelResponse::Critical,
+        },
+        count.count(),
+    )
+}
+
+fn project_overview_firmware(
+    summary: &rutilus_application::OverviewFirmwareSummary,
+) -> OverviewFirmwareSummaryResponse {
+    OverviewFirmwareSummaryResponse::new(
+        summary.endpoints_with_inventory(),
+        summary.entries(),
+        summary.distinct_versions(),
+    )
+}
+
+fn project_overview_capabilities(
+    coverage: &rutilus_application::OverviewCapabilityCoverage,
+) -> OverviewCapabilityCoverageResponse {
+    OverviewCapabilityCoverageResponse::new(coverage.observed_entries(), coverage.supported_entries())
+}
+
+fn project_overview_freshness(
+    count: &rutilus_application::OverviewFreshnessCount,
+) -> OverviewFreshnessCountResponse {
+    OverviewFreshnessCountResponse::new(
+        match count.bucket() {
+            rutilus_application::OverviewFreshnessBucket::NeverRefreshed => {
+                OverviewFreshnessBucketResponse::NeverRefreshed
+            }
+            rutilus_application::OverviewFreshnessBucket::WithinOneHour => {
+                OverviewFreshnessBucketResponse::WithinOneHour
+            }
+            rutilus_application::OverviewFreshnessBucket::WithinOneDay => {
+                OverviewFreshnessBucketResponse::WithinOneDay
+            }
+            rutilus_application::OverviewFreshnessBucket::WithinSevenDays => {
+                OverviewFreshnessBucketResponse::WithinSevenDays
+            }
+            rutilus_application::OverviewFreshnessBucket::OlderThanSevenDays => {
+                OverviewFreshnessBucketResponse::OlderThanSevenDays
+            }
+        },
+        count.count(),
     )
 }
 
