@@ -125,11 +125,84 @@ impl MetricValueSummary {
     }
 }
 
+/// One embedded sensor excerpt of a §2.1 `environment-metrics` document.
+///
+/// The `EnvironmentMetrics` schema embeds each measurement as an excerpt
+/// carrying the `DataSourceUri` link to its backing `Sensor` resource and the
+/// current `Reading` value, so the projection keeps exactly those two fields:
+/// the console renders the reading without re-parsing text and the summary
+/// names the sensor that sourced it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentMetricsReadingSummary {
+    data_source_uri: Option<String>,
+    reading: Option<f64>,
+}
+
+impl EnvironmentMetricsReadingSummary {
+    #[must_use]
+    pub const fn new(data_source_uri: Option<String>, reading: Option<f64>) -> Self {
+        Self {
+            data_source_uri,
+            reading,
+        }
+    }
+
+    #[must_use]
+    pub fn data_source_uri(&self) -> Option<&str> {
+        self.data_source_uri.as_deref()
+    }
+
+    #[must_use]
+    pub const fn reading(&self) -> Option<f64> {
+        self.reading
+    }
+}
+
+/// The embedded power-limit control excerpt of a §2.1 `environment-metrics`
+/// document.
+///
+/// `PowerLimitWatts` embeds a `Control` excerpt instead of a sensor excerpt,
+/// so the summary carries its `DataSourceUri` link and `SetPoint` reading
+/// exactly like the sensor excerpts carry theirs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentMetricsControlSummary {
+    data_source_uri: Option<String>,
+    set_point: Option<f64>,
+}
+
+impl EnvironmentMetricsControlSummary {
+    #[must_use]
+    pub const fn new(data_source_uri: Option<String>, set_point: Option<f64>) -> Self {
+        Self {
+            data_source_uri,
+            set_point,
+        }
+    }
+
+    #[must_use]
+    pub fn data_source_uri(&self) -> Option<&str> {
+        self.data_source_uri.as_deref()
+    }
+
+    #[must_use]
+    pub const fn set_point(&self) -> Option<f64> {
+        self.set_point
+    }
+}
+
 /// Feature-specific fields from one public `nv-redfish` typed projection.
 ///
 /// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
 /// carry numeric readings (`f64`, matching the compiled `Edm.Decimal` type
 /// of nv-redfish 0.13), and `f64` cannot implement `Eq`.
+///
+/// The `EnvironmentMetrics` variant is the largest because the schema embeds
+/// thirteen measurements; its field set stays unboxed so the variant mirrors
+/// the wire contract variant field for field (the shared contract keeps the
+/// tagged `details` object flat for the strict `deny_unknown_fields`
+/// boundary), so the size difference stays a deliberate contract property
+/// exactly like the `CoreResourceDetailsResponse` enumeration.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreResourceDetails {
     ServiceRoot {
@@ -412,6 +485,18 @@ pub enum CoreResourceDetails {
         model: Option<String>,
         status: Option<ResourceStatusSummary>,
     },
+    /// One §2.1 `network-device-functions` family member (a
+    /// `NetworkDeviceFunction_v1` member linked from an adapter).
+    /// `net_dev_func_type` stays the `NetworkDeviceTechnology` enumeration
+    /// string so the console renders the function type without re-parsing
+    /// text, and `device_enabled` is the direct `DeviceEnabled` Boolean; the
+    /// protocol-specific configuration bags (`Ethernet`, `iSCSIBoot`,
+    /// `FibreChannel`, ...) stay out of this strictly projectable field set.
+    NetworkDeviceFunction {
+        net_dev_func_type: Option<String>,
+        device_enabled: Option<bool>,
+        status: Option<ResourceStatusSummary>,
+    },
     /// One §2.1 `ethernet-interfaces` family member; `speed_mbps` stays
     /// numeric so the console renders the link speed without re-parsing text.
     EthernetInterface {
@@ -457,6 +542,40 @@ pub enum CoreResourceDetails {
     /// nested `PowerControl`/`PowerSupply` reading arrays, which stay out of
     /// the strictly projectable field set), so the details carry no fields.
     Power {},
+    /// One §2.1 `power-equipment` family member (a `PowerEquipment_v1`
+    /// service document or a `PowerDistribution_v1` member of its
+    /// `PowerShelves` collection; the family shares the single feature code
+    /// because the root document decides whether the family exists at all).
+    /// The root document projects `Status` only; the shelf members add
+    /// `equipment_type` (the `PowerEquipmentType` enumeration string) and the
+    /// hardware identity properties. Every field stays optional so one
+    /// projection covers both payload shapes.
+    PowerEquipment {
+        equipment_type: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        part_number: Option<String>,
+        serial_number: Option<String>,
+        version: Option<String>,
+        firmware_version: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `power-supplies` family member (a `PowerSupply_v1` member of
+    /// the `PowerSupplies` collection). `power_supply_type` stays the
+    /// `PowerSupplyType` enumeration string (`AC`, `DC`, `ACorDC`,
+    /// `DCRegulator`) and `power_capacity_watts` stays numeric, so the
+    /// console renders the supply without re-parsing text; the input-range
+    /// and output-rail bags stay out of this strictly projectable field set.
+    PowerSupply {
+        power_supply_type: Option<String>,
+        power_capacity_watts: Option<f64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        firmware_version: Option<String>,
+        serial_number: Option<String>,
+        part_number: Option<String>,
+        status: Option<ResourceStatusSummary>,
+    },
     /// One §2.1 `thermal` family member (a `Thermal_v1` chassis singleton).
     /// Only the resource-level `Status` is projectable: temperature readings
     /// exist only on nested `Temperatures` members, so they stay out of the
@@ -480,6 +599,26 @@ pub enum CoreResourceDetails {
         control_type: Option<String>,
         set_point: Option<f64>,
         status: Option<ResourceStatusSummary>,
+    },
+    /// One §2.1 `environment-metrics` family member (an
+    /// `EnvironmentMetrics_v1` chassis singleton). Every embedded measurement
+    /// the schema declares is projected through its excerpt reading; the
+    /// schema declares no `Status` property, so this family carries no status
+    /// field.
+    EnvironmentMetrics {
+        temperature_celsius: Option<EnvironmentMetricsReadingSummary>,
+        humidity_percent: Option<EnvironmentMetricsReadingSummary>,
+        fan_speeds_percent: Option<Vec<EnvironmentMetricsReadingSummary>>,
+        power_watts: Option<EnvironmentMetricsReadingSummary>,
+        energyk_wh: Option<EnvironmentMetricsReadingSummary>,
+        power_load_percent: Option<EnvironmentMetricsReadingSummary>,
+        power_limit_watts: Option<EnvironmentMetricsControlSummary>,
+        dew_point_celsius: Option<EnvironmentMetricsReadingSummary>,
+        absolute_humidity: Option<EnvironmentMetricsReadingSummary>,
+        energy_joules: Option<EnvironmentMetricsReadingSummary>,
+        ambient_temperature_celsius: Option<EnvironmentMetricsReadingSummary>,
+        voltage: Option<EnvironmentMetricsReadingSummary>,
+        current_amps: Option<EnvironmentMetricsReadingSummary>,
     },
     /// One §2.1 `log-services` family member (a `LogService_v1` collection
     /// member under the manager). `service_enabled` is the direct
@@ -836,10 +975,10 @@ where
         | ResourceFeature::OemDeltaPowerSupply => {
             // The typed projections of the 0.5 OEM read families (`AmiServiceRoot`,
             // `ConfigBmc`, `HpeiLoServiceExt`, `HpeiLo`, `LiteonPowerSupply`, and
-            // `DeltaPowerSupply`) land with the resource-details slice; these arms
-            // keep the compiled families' snapshots countable and storable, and
-            // report the missing projection as a controlled error instead of
-            // panicking.
+            // `DeltaPowerSupply`) land with the resource-details slice; the six
+            // families share the single arm because they all keep the compiled
+            // snapshots countable and storable while the details projection stays
+            // deferred, reported as a controlled error instead of panicking.
             return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
                 resource_id: snapshot.resource_id(),
                 feature: snapshot.feature(),
@@ -849,21 +988,12 @@ where
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
         ResourceFeature::NetworkAdapters => project_network_adapter(snapshot, payload)?,
-        ResourceFeature::NetworkDeviceFunctions
-        | ResourceFeature::PowerEquipment
-        | ResourceFeature::PowerSupplies
-        | ResourceFeature::EnvironmentMetrics => {
-            // The typed projections of the `NetworkDeviceFunction`,
-            // `PowerEquipment`, `PowerSupply`, and `EnvironmentMetrics`
-            // documents land with the resource-details slice; these arms keep
-            // the compiled families' snapshots countable and storable, and
-            // report the missing projection as a controlled error instead of
-            // panicking.
-            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
-                resource_id: snapshot.resource_id(),
-                feature: snapshot.feature(),
-            });
+        ResourceFeature::NetworkDeviceFunctions => {
+            project_network_device_function(snapshot, payload)?
         }
+        ResourceFeature::PowerEquipment => project_power_equipment(snapshot, payload)?,
+        ResourceFeature::PowerSupplies => project_power_supply(snapshot, payload)?,
+        ResourceFeature::EnvironmentMetrics => project_environment_metrics(snapshot, payload)?,
         ResourceFeature::EthernetInterfaces => project_ethernet_interface(snapshot, payload)?,
         ResourceFeature::Accounts => project_account(snapshot, payload)?,
         ResourceFeature::Bios => project_bios(snapshot, payload)?,
@@ -1505,6 +1635,25 @@ where
     })
 }
 
+fn project_network_device_function<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<NetworkDeviceFunctionPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::NetworkDeviceFunction {
+            net_dev_func_type: parsed.net_dev_func_type,
+            device_enabled: parsed.device_enabled,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
 fn project_ethernet_interface<RepositoryError>(
     snapshot: &ResourceSnapshot,
     payload: &str,
@@ -1613,6 +1762,58 @@ where
     })
 }
 
+fn project_power_equipment<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    // The `PowerEquipment` feature covers both the root service document and
+    // its `PowerShelves` members, so the payload union carries every
+    // optional field of either shape and the root document decodes with the
+    // shelf fields absent.
+    project_typed::<PowerEquipmentPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::PowerEquipment {
+            equipment_type: parsed.equipment_type,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            part_number: parsed.part_number,
+            serial_number: parsed.serial_number,
+            version: parsed.version,
+            firmware_version: parsed.firmware_version,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
+fn project_power_supply<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<PowerSupplyPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::PowerSupply {
+            power_supply_type: parsed.power_supply_type,
+            power_capacity_watts: parsed.power_capacity_watts,
+            manufacturer: parsed.manufacturer,
+            model: parsed.model,
+            firmware_version: parsed.firmware_version,
+            serial_number: parsed.serial_number,
+            part_number: parsed.part_number,
+            status: parsed.status.map(ResourceStatusPayload::into_summary),
+        }
+    })
+}
+
 fn project_thermal<RepositoryError>(
     snapshot: &ResourceSnapshot,
     payload: &str,
@@ -1667,6 +1868,51 @@ where
             status: parsed.status.map(ResourceStatusPayload::into_summary),
         }
     })
+}
+
+fn project_environment_metrics<RepositoryError>(
+    snapshot: &ResourceSnapshot,
+    payload: &str,
+) -> Result<
+    (CoreResourceCommon, CoreResourceDetails),
+    EndpointResourceInventoryQueryError<RepositoryError>,
+>
+where
+    RepositoryError: Error + 'static,
+{
+    project_typed::<EnvironmentMetricsPayload, _, RepositoryError>(snapshot, payload, |parsed| {
+        CoreResourceDetails::EnvironmentMetrics {
+            temperature_celsius: parsed.temperature_celsius.map(into_reading_summary),
+            humidity_percent: parsed.humidity_percent.map(into_reading_summary),
+            fan_speeds_percent: parsed
+                .fan_speeds_percent
+                .map(|speeds| speeds.into_iter().map(into_reading_summary).collect()),
+            power_watts: parsed.power_watts.map(into_reading_summary),
+            energyk_wh: parsed.energyk_wh.map(into_reading_summary),
+            power_load_percent: parsed.power_load_percent.map(into_reading_summary),
+            power_limit_watts: parsed.power_limit_watts.map(into_control_summary),
+            dew_point_celsius: parsed.dew_point_celsius.map(into_reading_summary),
+            absolute_humidity: parsed.absolute_humidity.map(into_reading_summary),
+            energy_joules: parsed.energy_joules.map(into_reading_summary),
+            ambient_temperature_celsius: parsed
+                .ambient_temperature_celsius
+                .map(into_reading_summary),
+            voltage: parsed.voltage.map(into_reading_summary),
+            current_amps: parsed.current_amps.map(into_reading_summary),
+        }
+    })
+}
+
+fn into_reading_summary(
+    parsed: EnvironmentMetricsReadingPayload,
+) -> EnvironmentMetricsReadingSummary {
+    EnvironmentMetricsReadingSummary::new(parsed.data_source_uri, parsed.reading)
+}
+
+fn into_control_summary(
+    parsed: EnvironmentMetricsControlPayload,
+) -> EnvironmentMetricsControlSummary {
+    EnvironmentMetricsControlSummary::new(parsed.data_source_uri, parsed.set_point)
 }
 
 fn project_log_service<RepositoryError>(
@@ -3584,6 +3830,200 @@ struct TaskPayload {
 }
 
 impl CommonPayload for TaskPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §2.1 `network-device-functions` family member payload.
+///
+/// The field set is exactly the `NetworkDeviceFunctionPayload` infra writes,
+/// so an extra field here would make every stored snapshot unreadable at
+/// projection time; `NetDevFuncType` stays the compiled
+/// `NetworkDeviceTechnology` enumeration string.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkDeviceFunctionPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "NetDevFuncType")]
+    net_dev_func_type: Option<String>,
+    #[serde(rename = "DeviceEnabled")]
+    device_enabled: Option<bool>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for NetworkDeviceFunctionPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §2.1 `power-equipment` family member payload.
+///
+/// The family covers both the `PowerEquipment` service document (which
+/// carries `Status` beside its common identity) and its `PowerShelves`
+/// members (which add `EquipmentType` and the hardware identity properties),
+/// so this payload is the union of both infra projections with every
+/// shelf-only field optional: the root document decodes with those fields
+/// absent, and `deny_unknown_fields` keeps the wire shapes honest.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PowerEquipmentPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "EquipmentType")]
+    equipment_type: Option<String>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "PartNumber")]
+    part_number: Option<String>,
+    #[serde(rename = "SerialNumber")]
+    serial_number: Option<String>,
+    #[serde(rename = "Version")]
+    version: Option<String>,
+    #[serde(rename = "FirmwareVersion")]
+    firmware_version: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for PowerEquipmentPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The §2.1 `power-supplies` family member payload.
+///
+/// The field set is exactly the `PowerSupplyPayload` infra writes;
+/// `PowerSupplyType` stays the compiled `PowerSupplyType` enumeration string
+/// and `PowerCapacityWatts` the compiled `Edm.Decimal` reading.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PowerSupplyPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "PowerSupplyType")]
+    power_supply_type: Option<String>,
+    #[serde(rename = "PowerCapacityWatts")]
+    power_capacity_watts: Option<f64>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "Model")]
+    model: Option<String>,
+    #[serde(rename = "FirmwareVersion")]
+    firmware_version: Option<String>,
+    #[serde(rename = "SerialNumber")]
+    serial_number: Option<String>,
+    #[serde(rename = "PartNumber")]
+    part_number: Option<String>,
+    #[serde(rename = "Status")]
+    status: Option<ResourceStatusPayload>,
+}
+
+impl CommonPayload for PowerSupplyPayload {
+    fn common(&self) -> CoreResourceCommon {
+        CoreResourceCommon {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// One embedded sensor excerpt of the §2.1 `environment-metrics` payload.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentMetricsReadingPayload {
+    #[serde(rename = "DataSourceUri")]
+    data_source_uri: Option<String>,
+    #[serde(rename = "Reading")]
+    reading: Option<f64>,
+}
+
+/// The embedded power-limit control excerpt of the §2.1
+/// `environment-metrics` payload.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentMetricsControlPayload {
+    #[serde(rename = "DataSourceUri")]
+    data_source_uri: Option<String>,
+    #[serde(rename = "SetPoint")]
+    set_point: Option<f64>,
+}
+
+/// The §2.1 `environment-metrics` singleton payload.
+///
+/// The field set is exactly the `EnvironmentMetricsPayload` infra writes —
+/// every embedded measurement the schema declares, through its excerpt
+/// reading shape — so an extra field here would make every stored snapshot
+/// unreadable at projection time.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentMetricsPayload {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Description")]
+    description: Option<String>,
+    #[serde(rename = "TemperatureCelsius")]
+    temperature_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "HumidityPercent")]
+    humidity_percent: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "FanSpeedsPercent")]
+    fan_speeds_percent: Option<Vec<EnvironmentMetricsReadingPayload>>,
+    #[serde(rename = "PowerWatts")]
+    power_watts: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "EnergykWh")]
+    energyk_wh: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "PowerLoadPercent")]
+    power_load_percent: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "PowerLimitWatts")]
+    power_limit_watts: Option<EnvironmentMetricsControlPayload>,
+    #[serde(rename = "DewPointCelsius")]
+    dew_point_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "AbsoluteHumidity")]
+    absolute_humidity: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "EnergyJoules")]
+    energy_joules: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "AmbientTemperatureCelsius")]
+    ambient_temperature_celsius: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "Voltage")]
+    voltage: Option<EnvironmentMetricsReadingPayload>,
+    #[serde(rename = "CurrentAmps")]
+    current_amps: Option<EnvironmentMetricsReadingPayload>,
+}
+
+impl CommonPayload for EnvironmentMetricsPayload {
     fn common(&self) -> CoreResourceCommon {
         CoreResourceCommon {
             id: self.id.clone(),

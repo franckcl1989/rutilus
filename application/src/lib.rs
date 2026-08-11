@@ -100,7 +100,8 @@ pub use endpoint_refresh::{
 };
 pub use endpoint_resources::{
     CoreResourceCommon, CoreResourceDetails, CoreResourceSummary, EndpointResourceInventory,
-    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError, MetricValueSummary,
+    EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
+    EnvironmentMetricsControlSummary, EnvironmentMetricsReadingSummary, MetricValueSummary,
     ResourceStatusSummary,
 };
 pub use endpoint_trust::{

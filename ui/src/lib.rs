@@ -593,7 +593,10 @@ fn oem_resource_card(
 /// Projects one resource into its card identity and family facts; the From
 /// implementation stays a thin assembly so the per-family projections remain
 /// readable and individually testable.
+// The dispatcher walks every §2.1 family in one switch; the pedantic line
+// budget is exceeded by the family count, so the lint is scoped here.
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::too_many_lines)]
 fn card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
