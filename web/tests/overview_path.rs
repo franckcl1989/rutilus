@@ -517,7 +517,8 @@ impl rutilus_application::TagRepository for MockServices {
     fn list_by_tag<'a>(
         &'a self,
         _tag_name: &'a rutilus_domain::TagName,
-    ) -> rutilus_application::BoundaryFuture<'a, Result<Vec<rutilus_domain::Tag>, Self::Error>> {
+    ) -> rutilus_application::BoundaryFuture<'a, Result<Vec<rutilus_domain::Tag>, Self::Error>>
+    {
         Box::pin(async { Err(MockError::Persistence) })
     }
 }
@@ -650,9 +651,9 @@ fn system_payload(health: Option<&str>) -> String {
 /// `ReleaseDate` is a required wire property, pinned as null.
 fn software_inventory_payload(version: Option<&str>) -> String {
     match version {
-        Some(version) => format!(
-            r#"{{"Id":"BIOS","Name":"BIOS","Version":"{version}","ReleaseDate":null}}"#
-        ),
+        Some(version) => {
+            format!(r#"{{"Id":"BIOS","Name":"BIOS","Version":"{version}","ReleaseDate":null}}"#)
+        }
         None => r#"{"Id":"BIOS","Name":"BIOS","ReleaseDate":null}"#.to_owned(),
     }
 }
@@ -695,7 +696,10 @@ fn refreshed_item(
             refreshed_at,
         )?);
     }
-    Ok((endpoint.clone(), EndpointInventoryItem::try_new(endpoint, snapshots)?))
+    Ok((
+        endpoint.clone(),
+        EndpointInventoryItem::try_new(endpoint, snapshots)?,
+    ))
 }
 
 /// Builds one persisted operation with the given §13.2 state.
@@ -793,7 +797,10 @@ fn seeded_state() -> Result<Arc<Mutex<MockState>>, Box<dyn Error>> {
             stored_operation(OperationState::Queued)?,
             stored_operation(OperationState::Succeeded)?,
         ],
-        events: vec![recorded_event(current_id, 10)?, recorded_event(stale_id, 20)?],
+        events: vec![
+            recorded_event(current_id, 10)?,
+            recorded_event(stale_id, 20)?,
+        ],
         fail: None,
     }));
     Ok(seeded)
@@ -914,8 +921,8 @@ async fn overview_route_bounds_the_recent_events_tail() -> Result<(), Box<dyn Er
 }
 
 #[tokio::test]
-async fn overview_route_returns_an_empty_dashboard_for_an_empty_fleet()
--> Result<(), Box<dyn Error>> {
+async fn overview_route_returns_an_empty_dashboard_for_an_empty_fleet() -> Result<(), Box<dyn Error>>
+{
     let state = Arc::new(Mutex::new(MockState::default()));
     let router = test_router(MockServices::new(state));
 
@@ -951,8 +958,8 @@ async fn overview_route_returns_an_empty_dashboard_for_an_empty_fleet()
 }
 
 #[tokio::test]
-async fn overview_route_reports_any_boundary_failure_as_unavailable()
--> Result<(), Box<dyn Error>> {
+async fn overview_route_reports_any_boundary_failure_as_unavailable() -> Result<(), Box<dyn Error>>
+{
     for failure in [
         MockFailure::Inventory,
         MockFailure::Capabilities,

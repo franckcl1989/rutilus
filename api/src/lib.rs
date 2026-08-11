@@ -3048,11 +3048,7 @@ pub struct OverviewFirmwareSummaryResponse {
 
 impl OverviewFirmwareSummaryResponse {
     #[must_use]
-    pub const fn new(
-        endpoints_with_inventory: u64,
-        entries: u64,
-        distinct_versions: u64,
-    ) -> Self {
+    pub const fn new(endpoints_with_inventory: u64, entries: u64, distinct_versions: u64) -> Self {
         Self {
             endpoints_with_inventory,
             entries,

@@ -379,12 +379,10 @@ where
         &self,
         now: OffsetDateTime,
         recent_events_limit: NonZeroU64,
-    ) -> Result<OverviewAggregate, OverviewQueryError<
-        Inventory::Error,
-        Capabilities::Error,
-        Operations::Error,
-        Events::Error,
-    >> {
+    ) -> Result<
+        OverviewAggregate,
+        OverviewQueryError<Inventory::Error, Capabilities::Error, Operations::Error, Events::Error>,
+    > {
         let items = EndpointInventoryQuery::new(&self.inventory)
             .execute()
             .await
@@ -404,7 +402,10 @@ where
             let resources = EndpointResourceInventoryQuery::new(&self.inventory, endpoint_id)
                 .execute()
                 .await
-                .map_err(|source| OverviewQueryError::Resources { endpoint_id, source })?
+                .map_err(|source| OverviewQueryError::Resources {
+                    endpoint_id,
+                    source,
+                })?
                 .map(|inventory| inventory.resources().to_vec())
                 .unwrap_or_default();
             fleet.count_resources(&resources);
@@ -481,10 +482,8 @@ impl FleetAccumulator {
             self.endpoints.with_current_snapshot() + u64::from(item.generation().is_some()),
             self.endpoints.awaiting_first_refresh() + u64::from(item.generation().is_none()),
         );
-        self.freshness_counts[usize::from(freshness_bucket(
-            now,
-            item.last_successful_refresh_at(),
-        ))] += 1;
+        self.freshness_counts
+            [usize::from(freshness_bucket(now, item.last_successful_refresh_at()))] += 1;
     }
 
     /// Counts one endpoint's typed resources into the §12.3 vendor/health
@@ -498,8 +497,7 @@ impl FleetAccumulator {
         self.health_counts[usize::from(aggregate_health(resources))] += 1;
         let mut endpoint_has_inventory = false;
         for resource in resources {
-            let CoreResourceDetails::SoftwareInventory { version, .. } = resource.details()
-            else {
+            let CoreResourceDetails::SoftwareInventory { version, .. } = resource.details() else {
                 continue;
             };
             endpoint_has_inventory = true;
@@ -801,9 +799,9 @@ mod tests {
         // (the `Edm.DateTimeOffset` projection), so the fixture pins it as
         // null.
         match version {
-            Some(version) => format!(
-                r#"{{"Id":"BIOS","Name":"BIOS","Version":"{version}","ReleaseDate":null}}"#
-            ),
+            Some(version) => {
+                format!(r#"{{"Id":"BIOS","Name":"BIOS","Version":"{version}","ReleaseDate":null}}"#)
+            }
             None => r#"{"Id":"BIOS","Name":"BIOS","ReleaseDate":null}"#.to_owned(),
         }
     }
@@ -815,7 +813,10 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(endpoint, resources)?)
     }
 
-    fn operation(state: OperationState, created_at: OffsetDateTime) -> Result<Operation, Box<dyn Error>> {
+    fn operation(
+        state: OperationState,
+        created_at: OffsetDateTime,
+    ) -> Result<Operation, Box<dyn Error>> {
         Ok(Operation::try_from_parts(
             OperationId::generate(),
             OperationSource::Standalone,
@@ -830,7 +831,10 @@ mod tests {
         )?)
     }
 
-    fn event(endpoint_id: EndpointId, observed_at: OffsetDateTime) -> Result<Event, Box<dyn Error>> {
+    fn event(
+        endpoint_id: EndpointId,
+        observed_at: OffsetDateTime,
+    ) -> Result<Event, Box<dyn Error>> {
         Ok(Event::new(
             EventId::generate(),
             endpoint_id,
@@ -955,7 +959,8 @@ mod tests {
         fn find_batch(
             &self,
             _batch_id: rutilus_domain::BatchOperationId,
-        ) -> BoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>> {
+        ) -> BoundaryFuture<'_, Result<Option<rutilus_domain::BatchOperation>, Self::Error>>
+        {
             Box::pin(async { Err(MockError) })
         }
 
@@ -1041,9 +1046,7 @@ mod tests {
             snapshots.push(snapshot(
                 endpoint_id,
                 ResourceFeature::SoftwareInventory,
-                &format!(
-                    "/redfish/v1/UpdateService/SoftwareInventory/{offset}"
-                ),
+                &format!("/redfish/v1/UpdateService/SoftwareInventory/{offset}"),
                 &software_inventory(*version),
                 refreshed_at,
             )?);
@@ -1084,12 +1087,18 @@ mod tests {
                     current_id,
                     vec![
                         stored(EndpointCapability::Systems, CapabilityState::Supported),
-                        stored(EndpointCapability::SessionService, CapabilityState::NotAdvertised),
+                        stored(
+                            EndpointCapability::SessionService,
+                            CapabilityState::NotAdvertised,
+                        ),
                     ],
                 ),
                 (
                     stale_id,
-                    vec![stored(EndpointCapability::Managers, CapabilityState::Supported)],
+                    vec![stored(
+                        EndpointCapability::Managers,
+                        CapabilityState::Supported,
+                    )],
                 ),
             ]),
             operations: vec![
@@ -1109,10 +1118,7 @@ mod tests {
             .await
             .map_err(|error| format!("overview query failed: {error}"))?;
 
-        assert_eq!(
-            aggregate.endpoints(),
-            &OverviewEndpointCounts::new(3, 2, 1)
-        );
+        assert_eq!(aggregate.endpoints(), &OverviewEndpointCounts::new(3, 2, 1));
         assert_eq!(
             aggregate.vendors(),
             &[
@@ -1128,10 +1134,7 @@ mod tests {
                 OverviewHealthCount::new(OverviewHealthLevel::Unknown, 1),
             ]
         );
-        assert_eq!(
-            aggregate.firmware(),
-            &OverviewFirmwareSummary::new(2, 3, 2)
-        );
+        assert_eq!(aggregate.firmware(), &OverviewFirmwareSummary::new(2, 3, 2));
         assert_eq!(
             aggregate.capabilities(),
             &OverviewCapabilityCoverage::new(3, 2)
@@ -1183,7 +1186,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_fleet_produces_an_empty_but_consistent_aggregate() -> Result<(), Box<dyn Error>> {
+    async fn empty_fleet_produces_an_empty_but_consistent_aggregate() -> Result<(), Box<dyn Error>>
+    {
         let boundaries = MockBoundaries {
             inventory: Vec::new(),
             capabilities: HashMap::new(),
@@ -1195,11 +1199,11 @@ mod tests {
         assert_eq!(aggregate.endpoints(), &OverviewEndpointCounts::new(0, 0, 0));
         assert!(aggregate.vendors().is_empty());
         assert!(aggregate.health().is_empty());
+        assert_eq!(aggregate.firmware(), &OverviewFirmwareSummary::new(0, 0, 0));
         assert_eq!(
-            aggregate.firmware(),
-            &OverviewFirmwareSummary::new(0, 0, 0)
+            aggregate.capabilities(),
+            &OverviewCapabilityCoverage::new(0, 0)
         );
-        assert_eq!(aggregate.capabilities(), &OverviewCapabilityCoverage::new(0, 0));
         assert_eq!(aggregate.running_operations(), 0);
         assert!(aggregate.recent_events().is_empty());
         assert!(aggregate.freshness().is_empty());
@@ -1228,14 +1232,14 @@ mod tests {
             .await?;
         assert_eq!(
             aggregate.freshness(),
-            &[OverviewFreshnessCount::new(OverviewFreshnessBucket::WithinOneDay, 1)]
+            &[OverviewFreshnessCount::new(
+                OverviewFreshnessBucket::WithinOneDay,
+                1
+            )]
         );
         // A version-less inventory member still counts as an entry and as an
         // endpoint with inventory, but never as a distinct version.
-        assert_eq!(
-            aggregate.firmware(),
-            &OverviewFirmwareSummary::new(1, 1, 0)
-        );
+        assert_eq!(aggregate.firmware(), &OverviewFirmwareSummary::new(1, 1, 0));
         // A System without a Status contributes no health: Unknown.
         assert_eq!(
             aggregate.health(),

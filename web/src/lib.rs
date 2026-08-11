@@ -41,8 +41,8 @@ use rutilus_api::{
     MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse,
     OperationResponse, OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
     OverviewCapabilityCoverageResponse, OverviewEndpointCountsResponse,
-    OverviewFreshnessBucketResponse, OverviewFreshnessCountResponse,
-    OverviewFirmwareSummaryResponse, OverviewHealthCountResponse, OverviewHealthLevelResponse,
+    OverviewFirmwareSummaryResponse, OverviewFreshnessBucketResponse,
+    OverviewFreshnessCountResponse, OverviewHealthCountResponse, OverviewHealthLevelResponse,
     OverviewResponse, OverviewVendorCountResponse, RefreshEndpointsRequest,
     ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
     TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
@@ -822,10 +822,7 @@ where
             "/api/v1/endpoints",
             get(endpoint_inventory::<Services, Gateway, Time>),
         )
-        .route(
-            "/api/v1/overview",
-            get(overview::<Services, Gateway, Time>),
-        )
+        .route("/api/v1/overview", get(overview::<Services, Gateway, Time>))
         .route(
             "/api/v1/endpoints/{endpoint_id}/resources",
             get(endpoint_resources::<Services, Gateway, Time>),
@@ -1205,10 +1202,8 @@ async fn overview<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
 ) -> Response
 where
-    Services: EndpointInventoryRepository
-        + CapabilityQueryRepository
-        + OperationStore
-        + EventRepository,
+    Services:
+        EndpointInventoryRepository + CapabilityQueryRepository + OperationStore + EventRepository,
     Time: Clock,
 {
     // The bounded §14.2 homepage recent-event tail; mirrors
@@ -1222,10 +1217,7 @@ where
         state.services.as_ref(),
         state.services.as_ref(),
     );
-    let Ok(aggregate) = query
-        .execute(state.clock.now(), recent_events_limit)
-        .await
-    else {
+    let Ok(aggregate) = query.execute(state.clock.now(), recent_events_limit).await else {
         return uncached_status(StatusCode::SERVICE_UNAVAILABLE);
     };
     let mut response = Json(project_overview(&aggregate)).into_response();
@@ -2776,13 +2768,29 @@ fn project_event(event: &Event) -> EventResponse {
 fn project_overview(aggregate: &OverviewAggregate) -> OverviewResponse {
     OverviewResponse::new(
         project_overview_endpoint_counts(aggregate.endpoints()),
-        aggregate.vendors().iter().map(project_overview_vendor).collect(),
-        aggregate.health().iter().map(project_overview_health).collect(),
+        aggregate
+            .vendors()
+            .iter()
+            .map(project_overview_vendor)
+            .collect(),
+        aggregate
+            .health()
+            .iter()
+            .map(project_overview_health)
+            .collect(),
         project_overview_firmware(aggregate.firmware()),
         project_overview_capabilities(aggregate.capabilities()),
         aggregate.running_operations(),
-        aggregate.recent_events().iter().map(project_event).collect(),
-        aggregate.freshness().iter().map(project_overview_freshness).collect(),
+        aggregate
+            .recent_events()
+            .iter()
+            .map(project_event)
+            .collect(),
+        aggregate
+            .freshness()
+            .iter()
+            .map(project_overview_freshness)
+            .collect(),
     )
 }
 
@@ -2796,17 +2804,27 @@ fn project_overview_endpoint_counts(
     )
 }
 
-fn project_overview_vendor(count: &rutilus_application::OverviewVendorCount) -> OverviewVendorCountResponse {
+fn project_overview_vendor(
+    count: &rutilus_application::OverviewVendorCount,
+) -> OverviewVendorCountResponse {
     OverviewVendorCountResponse::new(count.vendor().map(str::to_owned), count.count())
 }
 
-fn project_overview_health(count: &rutilus_application::OverviewHealthCount) -> OverviewHealthCountResponse {
+fn project_overview_health(
+    count: &rutilus_application::OverviewHealthCount,
+) -> OverviewHealthCountResponse {
     OverviewHealthCountResponse::new(
         match count.level() {
-            rutilus_application::OverviewHealthLevel::Unknown => OverviewHealthLevelResponse::Unknown,
+            rutilus_application::OverviewHealthLevel::Unknown => {
+                OverviewHealthLevelResponse::Unknown
+            }
             rutilus_application::OverviewHealthLevel::Ok => OverviewHealthLevelResponse::Ok,
-            rutilus_application::OverviewHealthLevel::Warning => OverviewHealthLevelResponse::Warning,
-            rutilus_application::OverviewHealthLevel::Critical => OverviewHealthLevelResponse::Critical,
+            rutilus_application::OverviewHealthLevel::Warning => {
+                OverviewHealthLevelResponse::Warning
+            }
+            rutilus_application::OverviewHealthLevel::Critical => {
+                OverviewHealthLevelResponse::Critical
+            }
         },
         count.count(),
     )
@@ -2825,7 +2843,10 @@ fn project_overview_firmware(
 fn project_overview_capabilities(
     coverage: &rutilus_application::OverviewCapabilityCoverage,
 ) -> OverviewCapabilityCoverageResponse {
-    OverviewCapabilityCoverageResponse::new(coverage.observed_entries(), coverage.supported_entries())
+    OverviewCapabilityCoverageResponse::new(
+        coverage.observed_entries(),
+        coverage.supported_entries(),
+    )
 }
 
 fn project_overview_freshness(

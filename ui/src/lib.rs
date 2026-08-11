@@ -4612,14 +4612,12 @@ impl OverviewProjection {
     /// has an observed state yet ("supported over observed" is undefined
     /// over zero observations).
     fn capability_coverage_text(&self) -> Option<String> {
-        self.capability_coverage
-            .as_ref()
-            .map(|coverage| {
-                format!(
-                    "{} of {} ({}) supported",
-                    coverage.supported_entries, coverage.observed_entries, coverage.percent_text
-                )
-            })
+        self.capability_coverage.as_ref().map(|coverage| {
+            format!(
+                "{} of {} ({}) supported",
+                coverage.supported_entries, coverage.observed_entries, coverage.percent_text
+            )
+        })
     }
 
     /// The §14.2 firmware-summary fact line.
@@ -21438,7 +21436,9 @@ mod tests {
         assert!(!state.is_failed());
         assert!(!state.is_loading());
 
-        let projection = state.projection().ok_or("the ready projection must exist")?;
+        let projection = state
+            .projection()
+            .ok_or("the ready projection must exist")?;
         assert_eq!(projection.endpoints_count_text(), "3 endpoints");
         assert_eq!(projection.total_endpoints, 3);
         assert_eq!(projection.with_current_snapshot, 2);
@@ -21487,8 +21487,8 @@ mod tests {
     }
 
     #[test]
-    fn overview_projection_handles_zero_observations_and_empty_blocks()
-    -> Result<(), Box<dyn Error>> {
+    fn overview_projection_handles_zero_observations_and_empty_blocks() -> Result<(), Box<dyn Error>>
+    {
         let empty = serde_json::from_value::<OverviewResponse>(json!({
             "endpoints": {
                 "total": 0,

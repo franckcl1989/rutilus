@@ -117,10 +117,9 @@ pub use group_management::{GroupManagement, GroupManagementError, GroupRepositor
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
 pub use operation_submission::{OperationSubmission, SubmissionError};
 pub use overview::{
-    OVERVIEW_RECENT_EVENTS, OverviewAggregate, OverviewCapabilityCoverage,
-    OverviewEndpointCounts, OverviewFreshnessBucket, OverviewFreshnessCount, OverviewFirmwareSummary,
-    OverviewHealthCount, OverviewHealthLevel, OverviewQuery, OverviewQueryError,
-    OverviewVendorCount,
+    OVERVIEW_RECENT_EVENTS, OverviewAggregate, OverviewCapabilityCoverage, OverviewEndpointCounts,
+    OverviewFirmwareSummary, OverviewFreshnessBucket, OverviewFreshnessCount, OverviewHealthCount,
+    OverviewHealthLevel, OverviewQuery, OverviewQueryError, OverviewVendorCount,
 };
 pub use resource_diagnostics::{
     ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
