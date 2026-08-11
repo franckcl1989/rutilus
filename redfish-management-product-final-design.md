@@ -67,7 +67,7 @@
 
 ## 2.1 当前事实基线
 
-截至 **2026 年 8 月 4 日**，`nv-redfish` 最新正式版本为 **0.12.1**，发布于 2026 年 7 月 27 日。它是模块化、按 Cargo feature 编译的 Redfish 客户端栈，不启用任何默认 feature；`std-redfish` 提供较广的标准 Redfish Schema 面，OEM 能力则通过独立 feature 启用。
+截至 **2026 年 8 月 4 日**，`nv-redfish` 开发基线（`NvRedfishDevelopmentBaseline`）为 **0.13.0**，发布于 2026 年 8 月 4 日；**0.14.2** 为已知更新正式版本，在 0.8.0 能力冻结评审时评估是否跟进。它是模块化、按 Cargo feature 编译的 Redfish 客户端栈，不启用任何默认 feature；`std-redfish` 提供较广的标准 Redfish Schema 面，OEM 能力则通过独立 feature 启用。
 
 当前标准功能 feature 包括：
 
@@ -79,7 +79,6 @@ boot-options
 chassis
 computer-systems
 controls
-environment-metrics
 ethernet-interfaces
 event-service
 host-interfaces
@@ -90,6 +89,7 @@ memory
 network-adapters
 network-device-functions
 pcie-devices
+ports
 power
 power-equipment
 power-supplies
@@ -104,6 +104,8 @@ thermal
 update-service
 ```
 
+注：`environment-metrics` 不是 `std-redfish` 的独立成员（0.12.1 与 0.13.0 一致），它由 `controls` 与 `sensors` 传递启用，产品仍通过这两个 feature 编译环境指标能力；`ports` 为 0.13.0 新增的 `std-redfish` 成员。
+
 当前 OEM feature 包括：
 
 ```text
@@ -114,11 +116,16 @@ HPE
 Lenovo
 Supermicro
 NVIDIA
-NVIDIA BlueField
-NVIDIA Baseboard
+NVIDIA CPER
+NVIDIA Fabrics
+NVIDIA Power Management
+NVIDIA Profiles
+NVIDIA Security
 LiteOn
 Delta
 ```
+
+注：0.13.0 移除了 0.12.1 的 `oem-nvidia-bluefield` 与 `oem-nvidia-baseboard`，按能力族拆分为 `oem-nvidia-cper`、`oem-nvidia-fabrics`、`oem-nvidia-power-management`、`oem-nvidia-profiles`、`oem-nvidia-security`；`oem-nvidia` 本身覆盖包括 BlueField DPU 在内的全部 NVIDIA 平台。
 
 当前没有：
 
@@ -187,7 +194,7 @@ nv-redfish Bmc trait
 ### 当前开发起点
 
 ```text
-NvRedfishDevelopmentBaseline = 0.12.1
+NvRedfishDevelopmentBaseline = 0.13.0
 ```
 
 ### 0.1.0 至 0.7.0
@@ -338,7 +345,7 @@ Internal
 
 ## 3.3 当前明确不承诺的设备能力
 
-以当前 0.12.1 为起点，以下内容不在正式范围，除非它们在 0.8.0 能力冻结前进入正式 `nv-redfish`：
+以当前 0.13.0 为起点，以下内容不在正式范围，除非它们在 0.8.0 能力冻结前进入正式 `nv-redfish`：
 
 - `VirtualMedia`；
 - `CertificateService`；
@@ -2725,7 +2732,7 @@ Capability Ledger Check
 
 - 升级至当时最新稳定 `nv-redfish`；
 - 重新生成 Capability Ledger；
-- 纳入从 0.12.1 到冻结版本新增的所有公开 feature；
+- 纳入从 0.13.0 到冻结版本新增的所有公开 feature；
 - 纳入新增公开 OEM feature；
 - 完成所有新增类型化操作；
 - 固定 Cargo.lock；
