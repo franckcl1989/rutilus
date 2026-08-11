@@ -122,6 +122,35 @@ pub(crate) const SERVICE_ROOT_DELL: &str = r##"{
     "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
 }"##;
 
+/// `GET /redfish/v1` -- the Service Root of the Supermicro vendor profile.
+///
+/// Only the identity strings differ from the default profile: a real
+/// Supermicro BMC identifies itself as Vendor "Supermicro" and carries the
+/// server model as the product. The navigation surface is byte-identical to
+/// [`SERVICE_ROOT`], and no `Oem` segment is served here because the
+/// Supermicro namespace lives on the manager document, exactly where the
+/// gateway's probe and read look for it.
+pub(crate) const SERVICE_ROOT_SUPERMICRO: &str = r##"{
+    "@odata.id":"/redfish/v1/",
+    "@odata.type":"#ServiceRoot.v1_16_0.ServiceRoot",
+    "@odata.etag":"W/\"root-1\"",
+    "Id":"RootService",
+    "Name":"Root Service",
+    "RedfishVersion":"1.20.0",
+    "Vendor":"Supermicro",
+    "Product":"X11DPH-T",
+    "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+    "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+    "Systems":{"@odata.id":"/redfish/v1/Systems"},
+    "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+    "Managers":{"@odata.id":"/redfish/v1/Managers"},
+    "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+    "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+    "EventService":{"@odata.id":"/redfish/v1/EventService"},
+    "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+    "Tasks":{"@odata.id":"/redfish/v1/TaskService"}
+}"##;
+
 /// `GET /redfish/v1/SessionService` -- the session service, enabled so the
 /// gateway prefers the Session transport over Basic.
 pub(crate) const SESSION_SERVICE: &str = r#"{
@@ -729,6 +758,67 @@ pub(crate) const DELL_ATTRIBUTES: &str = r#"{
         "ServerName":"rack-1-server-2",
         "BiosVersion":"2.14.2"
     }
+}"#;
+
+/// `GET /redfish/v1/Managers/1` -- the BMC manager of the Supermicro vendor
+/// profile.
+///
+/// Exactly the default manager surface plus the `Oem.Supermicro` segment
+/// that advertises the Supermicro OEM namespace: the capability probe
+/// decides `oem-supermicro` from the decoded `Oem` keys (§11.3 advertised
+/// layer) and the gateway's §11.5 read decodes the embedded `SysLockdown`
+/// and `KCSInterface` navigation references, so this one addition switches
+/// both layers on. The document mirrors the
+/// `MANAGER_WITH_SUPERMICRO_OEM_BODY` fixture `rutilus-infra-redfish`
+/// decodes in its own Supermicro tests (reference form, so each leaf is
+/// fetched by its `@odata.id`).
+pub(crate) const MANAGER_SUPERMICRO: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1",
+    "@odata.etag":"W/\"manager-1\"",
+    "Id":"1",
+    "Name":"Manager One",
+    "ManagerType":"BMC",
+    "Manufacturer":"Rutilus Test",
+    "Model":"Model M",
+    "PartNumber":"MGR-PART-1",
+    "SerialNumber":"MGR-1",
+    "FirmwareVersion":"1.2.3",
+    "Version":"4.5.6",
+    "PowerState":"On",
+    "Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"},
+    "HostInterfaces":{"@odata.id":"/redfish/v1/Managers/1/HostInterfaces"},
+    "NetworkProtocol":{"@odata.id":"/redfish/v1/Managers/1/NetworkProtocol"},
+    "LogServices":{"@odata.id":"/redfish/v1/Managers/1/LogServices"},
+    "Oem":{"Supermicro":{
+        "SysLockdown":{"@odata.id":"/redfish/v1/Managers/1/SysLockdown"},
+        "KCSInterface":{"@odata.id":"/redfish/v1/Managers/1/KCSInterface"}
+    }}
+}"#;
+
+/// `GET /redfish/v1/Managers/1/SysLockdown` -- the §11.5 Supermicro
+/// `SysLockdown` document of the Supermicro vendor profile.
+///
+/// The document mirrors the `SUPERMICRO_SYS_LOCKDOWN_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own Supermicro tests: the compiled
+/// schema models only `SysLockdownEnabled` beside the `@odata.id` /
+/// `@odata.etag`, so the fixture deliberately carries no `Id` / `Name` /
+/// `Description`.
+pub(crate) const SUPERMICRO_SYS_LOCKDOWN: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/SysLockdown",
+    "@odata.etag":"W/\"sys-lockdown-1\"",
+    "SysLockdownEnabled":true
+}"#;
+
+/// `GET /redfish/v1/Managers/1/KCSInterface` -- the §11.5 Supermicro
+/// `KcsInterface` document of the Supermicro vendor profile.
+///
+/// The document mirrors the `SUPERMICRO_KCS_INTERFACE_BODY` fixture
+/// `rutilus-infra-redfish` decodes in its own Supermicro tests, carrying the
+/// vendor's enum spelling verbatim.
+pub(crate) const SUPERMICRO_KCS_INTERFACE: &str = r#"{
+    "@odata.id":"/redfish/v1/Managers/1/KCSInterface",
+    "@odata.etag":"W/\"kcs-interface-1\"",
+    "Privilege":"Administrator"
 }"#;
 
 /// `GET /redfish/v1` -- the Service Root of the AMI vendor profile.
@@ -1788,6 +1878,7 @@ pub(crate) fn service_root(profile: MockProfile) -> &'static str {
         MockProfile::Hpe => SERVICE_ROOT_HPE,
         MockProfile::LiteOn => SERVICE_ROOT_LITEON,
         MockProfile::Delta => SERVICE_ROOT_DELTA,
+        MockProfile::Supermicro => SERVICE_ROOT_SUPERMICRO,
     }
 }
 
@@ -1938,6 +2029,9 @@ pub(crate) fn manager(profile: MockProfile) -> &'static str {
         // segment); the System member stays the shared default document.
         MockProfile::Ami => MANAGER_AMI,
         MockProfile::Hpe => MANAGER_HPE,
+        // The Supermicro profile carries the `Oem.Supermicro` segment on the
+        // Manager member (the `SysLockdown` / `KcsInterface` references).
+        MockProfile::Supermicro => MANAGER_SUPERMICRO,
     }
 }
 
@@ -1959,6 +2053,7 @@ pub(crate) fn system(profile: MockProfile) -> &'static str {
         | MockProfile::Hpe
         | MockProfile::LiteOn
         | MockProfile::Delta
+        | MockProfile::Supermicro
         | MockProfile::XFusion
         | MockProfile::Inspur => SYSTEM,
         MockProfile::Nvidia => SYSTEM_NVIDIA,
@@ -1987,6 +2082,7 @@ pub(crate) fn chassis(profile: MockProfile) -> &'static str {
         | MockProfile::Lenovo
         | MockProfile::Ami
         | MockProfile::Hpe
+        | MockProfile::Supermicro
         | MockProfile::XFusion
         | MockProfile::Inspur => CHASSIS,
     }

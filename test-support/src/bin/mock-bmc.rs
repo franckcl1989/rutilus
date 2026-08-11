@@ -32,9 +32,10 @@ struct Cli {
     /// identity plus the §11.5 `AmiServiceRoot` and `ConfigBmc` surfaces),
     /// `hpe` (HPE identity plus the §11.5 `HpeiLoServiceExt` and `HpeiLo`
     /// segments), `liteon` (`LiteOn` identity plus the §11.5 `LiteOn`
-    /// power-supply chain), or `delta` (Delta identity plus the §11.5 Delta
-    /// power-supply chain).
-    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell", "nvidia", "lenovo", "xfusion", "inspur", "ami", "hpe", "liteon", "delta"])]
+    /// power-supply chain), `delta` (Delta identity plus the §11.5 Delta
+    /// power-supply chain), or `supermicro` (Supermicro identity plus the
+    /// §11.5 `SysLockdown` / `KcsInterface` surfaces).
+    #[arg(long, default_value = "rutilus", value_parser = ["rutilus", "dell", "nvidia", "lenovo", "xfusion", "inspur", "ami", "hpe", "liteon", "delta", "supermicro"])]
     profile: String,
 }
 
@@ -53,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "hpe" => MockProfile::Hpe,
         "liteon" => MockProfile::LiteOn,
         "delta" => MockProfile::Delta,
+        "supermicro" => MockProfile::Supermicro,
         _ => MockProfile::Rutilus,
     };
     let mock = MockBmc::bind_with_profile(cli.port, profile).await?;

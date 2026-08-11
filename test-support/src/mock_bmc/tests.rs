@@ -472,6 +472,77 @@ fn dell_profile_swaps_identity_and_serves_attributes_route_only() -> Result<(), 
 }
 
 #[test]
+fn supermicro_profile_swaps_identity_and_serves_oem_documents_only() -> Result<(), Box<dyn Error>> {
+    // The fixture mapping: the Supermicro profile swaps the Service Root
+    // identity strings and adds the manager `Oem.Supermicro` segment with the
+    // two embedded navigation references, while the default profile documents
+    // stay byte-identical (no `Oem` namespace anywhere).
+    let default_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Rutilus))?;
+    assert_eq!(default_root["Vendor"], "Rutilus Test");
+    assert!(default_root.get("Oem").is_none());
+    let supermicro_root: serde_json::Value =
+        serde_json::from_str(fixtures::service_root(MockProfile::Supermicro))?;
+    assert_eq!(supermicro_root["Vendor"], "Supermicro");
+    assert_eq!(supermicro_root["Product"], "X11DPH-T");
+    let default_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Rutilus))?;
+    assert!(default_manager.get("Oem").is_none());
+    let supermicro_manager: serde_json::Value =
+        serde_json::from_str(fixtures::manager(MockProfile::Supermicro))?;
+    assert!(supermicro_manager["Oem"]["Supermicro"].is_object());
+    assert_eq!(
+        supermicro_manager["Oem"]["Supermicro"]["SysLockdown"]["@odata.id"],
+        "/redfish/v1/Managers/1/SysLockdown"
+    );
+    assert_eq!(
+        supermicro_manager["Oem"]["Supermicro"]["KCSInterface"]["@odata.id"],
+        "/redfish/v1/Managers/1/KCSInterface"
+    );
+
+    // The §11.5 Supermicro documents are served only under the Supermicro
+    // profile.
+    let supermicro_state = MockState::with_profile(MockProfile::Supermicro);
+    let sys_lockdown = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/SysLockdown",
+        &[],
+        &supermicro_state,
+    );
+    assert_eq!(sys_lockdown.status, "200 OK");
+    let sys_lockdown_body: serde_json::Value = serde_json::from_str(&sys_lockdown.body)?;
+    assert_eq!(sys_lockdown_body["SysLockdownEnabled"], true);
+    let kcs_interface = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/KCSInterface",
+        &[],
+        &supermicro_state,
+    );
+    assert_eq!(kcs_interface.status, "200 OK");
+    let kcs_interface_body: serde_json::Value = serde_json::from_str(&kcs_interface.body)?;
+    assert_eq!(kcs_interface_body["Privilege"], "Administrator");
+
+    // Under the default profile the same paths are Redfish-shaped 404s, so
+    // the default tree cannot leak a vendor namespace.
+    let default_state = MockState::new();
+    let missing = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/SysLockdown",
+        &[],
+        &default_state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    let missing_kcs = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/Managers/1/KCSInterface",
+        &[],
+        &default_state,
+    );
+    assert_eq!(missing_kcs.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
 fn nvidia_profile_swaps_identity_and_serves_power_chain_routes_only() -> Result<(), Box<dyn Error>>
 {
     // The fixture mapping: the NVIDIA profile swaps the Service Root

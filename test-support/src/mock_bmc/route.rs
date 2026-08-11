@@ -319,6 +319,21 @@ pub(crate) fn dispatch(
         {
             json_ok(fixtures::DELL_ATTRIBUTES)
         }
+        // The §11.5 Supermicro `SysLockdown` and `KcsInterface` documents are
+        // vendor fixtures: they exist only under the Supermicro profile, at
+        // the embedded references of the manager's `Oem.Supermicro` segment,
+        // and any other profile must 404 them like any unserved path instead
+        // of leaking a vendor namespace.
+        (HttpMethod::Get, "/redfish/v1/Managers/1/SysLockdown")
+            if state.profile() == MockProfile::Supermicro =>
+        {
+            json_ok(fixtures::SUPERMICRO_SYS_LOCKDOWN)
+        }
+        (HttpMethod::Get, "/redfish/v1/Managers/1/KCSInterface")
+            if state.profile() == MockProfile::Supermicro =>
+        {
+            json_ok(fixtures::SUPERMICRO_KCS_INTERFACE)
+        }
         // The §11.5 Lenovo `SecurityService` document is a vendor fixture: it
         // exists only under the Lenovo profile, and any other profile must
         // 404 it like any unserved path instead of leaking a vendor
