@@ -29,7 +29,7 @@
 //! The 0.8.0 acceptance criterion requires `未映射公开操作 = 0` (no public
 //! operation without a product mapping). At this point in the 0.8.0 work the
 //! parallel write-surface work items are still implementing several families
-//! (account, control, log clear, telemetry CRUD, ...), so this gate runs in
+//! (control, log clear, telemetry CRUD, ...), so this gate runs in
 //! **audit mode**: the operation inventory lists every upstream typed write
 //! operation with an explicit status, and the gate asserts the inventory is
 //! internally consistent and that the unmapped count equals the frozen
@@ -404,7 +404,7 @@ pub const RELEASE_BASELINE_MODULES: [BaselineModule; 29] = [
         name: "account",
         gating_feature: Some("accounts"),
         classification: BaselineModuleClassification::LedgerMapped,
-        decision: "§2.1 accounts ledger entry; writes deferred with the secret-handling iteration (§7.5)",
+        decision: "§2.1 accounts ledger entry; the write family lands through the typed account API (§7.5)",
     },
     BaselineModule {
         name: "chassis",
@@ -628,7 +628,8 @@ impl BaselineOperation {
 /// here so the operation inventory can reference them without constructing
 /// command values. The domain crate pins these codes itself; a new family
 /// must be added to both places.
-pub const REDFISH_COMMAND_FAMILIES: [&str; 8] = [
+pub const REDFISH_COMMAND_FAMILIES: [&str; 9] = [
+    "account",
     "system",
     "manager",
     "chassis",
@@ -657,36 +658,36 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "account.create",
         upstream_surface: "account::AccountCollection::create_account",
         feature: "accounts",
-        mapping: OperationMapping::Unmapped,
-        note: "account writes carry passwords (§10 secrets) and land with the secret-handling iteration (§7.5)",
+        mapping: OperationMapping::Mapped { command: "account" },
+        note: "RedfishCommand::Account(AccountCommand::CreateAccount)",
     },
     BaselineOperation {
         code: "account.update",
         upstream_surface: "account::Account::update",
         feature: "accounts",
-        mapping: OperationMapping::Unmapped,
-        note: "deferred with the §7.5 Account family",
+        mapping: OperationMapping::Mapped { command: "account" },
+        note: "RedfishCommand::Account(AccountCommand::UpdateAccount)",
     },
     BaselineOperation {
         code: "account.update-password",
         upstream_surface: "account::Account::update_password",
         feature: "accounts",
-        mapping: OperationMapping::Unmapped,
-        note: "deferred with the §7.5 Account family",
+        mapping: OperationMapping::Mapped { command: "account" },
+        note: "RedfishCommand::Account(AccountCommand::UpdateAccountPassword)",
     },
     BaselineOperation {
         code: "account.update-user-name",
         upstream_surface: "account::Account::update_user_name",
         feature: "accounts",
-        mapping: OperationMapping::Unmapped,
-        note: "deferred with the §7.5 Account family",
+        mapping: OperationMapping::Mapped { command: "account" },
+        note: "RedfishCommand::Account(AccountCommand::UpdateAccountUserName)",
     },
     BaselineOperation {
         code: "account.delete",
         upstream_surface: "account::Account::delete",
         feature: "accounts",
-        mapping: OperationMapping::Unmapped,
-        note: "deferred with the §7.5 Account family",
+        mapping: OperationMapping::Mapped { command: "account" },
+        note: "RedfishCommand::Account(AccountCommand::DeleteAccount)",
     },
     BaselineOperation {
         code: "control.update",
@@ -970,7 +971,7 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
 /// gate asserts the inventory reports exactly this documented count so the
 /// record cannot grow silently. The count matches the `Unmapped` entries of
 /// [`RELEASE_BASELINE_OPERATIONS`].
-pub const FROZEN_UNMAPPED_OPERATION_COUNT: usize = 20;
+pub const FROZEN_UNMAPPED_OPERATION_COUNT: usize = 15;
 
 /// The frozen capability-ledger hash snapshot (§2.3 "能力账本 Hash").
 ///
