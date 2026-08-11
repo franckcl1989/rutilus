@@ -159,7 +159,7 @@
 | 容量测试 | 最低验证规模：单 Site 200 Endpoint、单 Center 100 Site、中心汇总 5,000 Endpoint；测试后发布真实容量建议（当前为测试目标，不是已实测能力） | 设计文档 §0.9.0（2800-2810）；`docs/known-limitations.md` §六 |
 | 发布构建验证 | musl（x86_64/aarch64）、Windows ARM64、macOS Universal 2 合并构建尚未在 CI 编译验证（CI 当前验证 linux-gnu / windows-msvc / darwin x86_64 + wasm32 UI 产物） | `docs/support-matrix.md` §三；`docs/known-limitations.md` §七 |
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
-| tracing 日志引入 | 设计 §6.2 的 `tracing` 未进入 workspace，运行失败经 stderr（`eprintln!`）记录；统一日志设施为后续迭代 | `docs/known-limitations.md` §七、§八 |
+| tracing 深化 | app 诊断日志已引入（§6.2：`tracing` + `tracing-subscriber`，`RUST_LOG` 过滤的 stderr subscriber，见 `docs/operations-manual.md` §8.1）；span/`#[instrument]`、结构化输出、其余诊断点的进一步接入为后续迭代 | `docs/known-limitations.md` §七、§八 |
 | Overview 聚合 | §14.2 首页的"运行中 Task、最近事件、固件清单摘要、能力覆盖"等聚合区块尚未以独立首页仪表盘形式实现（能力覆盖可通过每张卡片 Capabilities 页面查看） | `docs/user-manual.md` 205-207 行 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
 | 其他 | 遥测保留期可配置（§14.4）、`cargo audit` 独立门禁、诊断解码错误路径展示（§12.4）、产品版本号统一策略、UI 本地化等 | `docs/known-limitations.md` §七、§八 |
