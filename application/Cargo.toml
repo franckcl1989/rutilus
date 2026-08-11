@@ -20,6 +20,9 @@ sha2.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["serde-well-known"] }
 tokio.workspace = true
+# §6.2 diagnostic logging: the center-sync engine records operational
+# failures and absorbed protocol anomalies through tracing::error!/warn!.
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
