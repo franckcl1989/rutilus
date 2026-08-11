@@ -343,6 +343,13 @@ type UpstreamServiceRootError = nv_redfish::Error<UpstreamBmc>;
 #[derive(Clone, Debug)]
 pub struct RedfishGateway {
     tls: TlsProbe,
+    /// The per-request budget of every authenticated HTTP request the
+    /// gateway issues. Production constructs the gateway through
+    /// [`Self::from_system_roots`], which pins the production
+    /// [`HTTP_REQUEST_TIMEOUT`] (30 s); tests that must provoke a slow BMC
+    /// construct the gateway with a shortened budget instead, so the failure
+    /// is the client's own request timeout — never a real 30 s wait.
+    request_timeout: Duration,
 }
 
 impl RedfishGateway {
@@ -356,6 +363,7 @@ impl RedfishGateway {
     pub async fn from_system_roots() -> Result<Self, TlsProbeInitError> {
         Ok(Self {
             tls: TlsProbe::from_system_roots().await?,
+            request_timeout: HTTP_REQUEST_TIMEOUT,
         })
     }
 
@@ -1098,7 +1106,7 @@ impl RedfishGateway {
             .no_proxy()
             .https_only(true)
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .timeout(HTTP_REQUEST_TIMEOUT)
+            .timeout(self.request_timeout)
             .pool_max_idle_per_host(0)
             .user_agent(USER_AGENT)
             .build()
@@ -13205,6 +13213,17 @@ mod tests {
     /// trust path validates it like the hostname it replaces.
     const TEST_SERVER_CERTIFICATE_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
 
+    /// The per-request budget of the slow-BMC gateway construction, far below
+    /// the production [`HTTP_REQUEST_TIMEOUT`] (30 s): a scripted delay
+    /// decides the timeout in CI instead of a real 30 s wait.
+    const SLOW_BMC_REQUEST_BUDGET: Duration = Duration::from_millis(500);
+
+    /// The scripted delay of one slow document, far above the injected
+    /// request budget so the client's own timeout — never the mock — decides
+    /// the failure. The margin absorbs loaded test machines: the delayed
+    /// response arrives only after the budget expired several times over.
+    const SLOW_BMC_RESPONSE_DELAY: Duration = Duration::from_secs(3);
+
     const SERVICE_ROOT_BODY: &str = r#"{
         "@odata.id":"/redfish/v1/",
         "Id":"RootService",
@@ -22648,6 +22667,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slow_document_is_skipped_without_erasing_the_rest_of_the_read()
+    -> Result<(), Box<dyn Error>> {
+        // The Thermal singleton's response is delayed past the injected
+        // request budget of the slow-BMC gateway: the client's own request
+        // timeout fires while the BMC still "works on" the document, the
+        // member-level skip semantics leave the readable remainder intact
+        // (§0.2.0 acceptance), and the read completes without the Thermal
+        // snapshot — exactly like a dropped or undecodable member. The
+        // production request budget (30 s) is untouched; only the test
+        // gateway carries the shortened budget.
+        let responses = session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", SYSTEMS_WITH_MEMBER_BODY),
+                ("200 OK", SYSTEM_BODY),
+                ("200 OK", CHASSIS_WITH_MEMBER_BODY),
+                ("200 OK", CHASSIS_WITH_TELEMETRY_BODY),
+                ("200 OK", POWER_FULL_BODY),
+                ("200 OK", THERMAL_FULL_BODY),
+                ("200 OK", SENSORS_BODY),
+                ("200 OK", CONTROLS_BODY),
+                ("200 OK", MANAGERS_WITH_MEMBER_BODY),
+                ("200 OK", MANAGER_BODY),
+            ],
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, response)| {
+            let delay = (index == 9).then_some(SLOW_BMC_RESPONSE_DELAY);
+            (response, delay)
+        })
+        .collect();
+        let server = TestRedfishServer::start_raw_sequence_with_delays(responses).await?;
+        let gateway = slow_bmc_gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let resources = gateway
+            .read_core_resources(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+            )
+            .await?;
+
+        // The delayed Thermal singleton is absent; every other advertised
+        // document still produced its snapshot.
+        assert_eq!(resources.len(), 5);
+        assert_eq!(
+            resources
+                .iter()
+                .map(CoreResourceProjection::feature)
+                .collect::<Vec<_>>(),
+            [
+                ResourceFeature::ServiceRoot,
+                ResourceFeature::Systems,
+                ResourceFeature::Chassis,
+                ResourceFeature::Power,
+                ResourceFeature::Managers,
+            ]
+        );
+        // The Thermal request itself was dispatched (the request log proves
+        // the attempt) and the Session lifecycle ran to completion.
+        assert_session_requests(&server.finish_all().await?, &EMPTY_TELEMETRY_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn absent_telemetry_links_produce_no_telemetry_collection_snapshots()
     -> Result<(), Box<dyn Error>> {
         let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
@@ -23462,6 +23549,23 @@ mod tests {
         roots.add(certificate)?;
         Ok(RedfishGateway {
             tls: TlsProbe::from_root_store(roots, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
+            request_timeout: HTTP_REQUEST_TIMEOUT,
+        })
+    }
+
+    /// Builds a gateway whose per-request budget is shortened for slow-BMC
+    /// tests: the scripted server delays one response past this budget, so
+    /// the client's own request timeout — not a real 30 s wait — decides the
+    /// failure. Production semantics are untouched: every production
+    /// construction path keeps [`HTTP_REQUEST_TIMEOUT`].
+    fn slow_bmc_gateway_with_root(
+        certificate: CertificateDer<'static>,
+    ) -> Result<RedfishGateway, Box<dyn Error>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate)?;
+        Ok(RedfishGateway {
+            tls: TlsProbe::from_root_store(roots, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
+            request_timeout: SLOW_BMC_REQUEST_BUDGET,
         })
     }
 
@@ -27213,6 +27317,67 @@ mod tests {
         let write = std::str::from_utf8(&requests[6])?;
         assert!(write.starts_with("POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset"));
         assert_eq!(request_body(&requests[6]), Some(r#"{"ResetType":"On"}"#));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_a_slow_write_response_as_result_unknown() -> Result<(), Box<dyn Error>> {
+        // The Reset POST's response is delayed past the injected request
+        // budget of the slow-BMC gateway: the client's own request timeout
+        // fires while the BMC still "works on" the write, so its outcome
+        // cannot be proven — exactly like a dropped or lost response (§13.5),
+        // because a slow BMC may have applied the write before timing out.
+        // The production request budget (30 s) is untouched; only the test
+        // gateway carries the shortened budget, so no CI run waits 30 s.
+        let responses = command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response("204 No Content", ""),
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, response)| {
+            let delay = (index == 6).then_some(SLOW_BMC_RESPONSE_DELAY);
+            (response, delay)
+        })
+        .collect();
+        let server = TestRedfishServer::start_raw_sequence_with_delays(responses).await?;
+        let gateway = slow_bmc_gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(accepted) => {
+                return Err(format!("a slow write must fail, got {accepted:?}").into());
+            }
+        };
+        assert!(
+            error.outcome_is_unknown(),
+            "a slow response may mean the write was applied: {error}"
+        );
+        // The write request itself was captured before the delay, proving the
+        // write was actually dispatched, and the Session cleanup still ran to
+        // completion after the timeout.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 8);
+        let write = std::str::from_utf8(&requests[6])?;
+        assert!(write.starts_with("POST /redfish/v1/Systems/1/Actions/ComputerSystem.Reset"));
+        assert_eq!(request_body(&requests[6]), Some(r#"{"ResetType":"On"}"#));
+        let cleanup = std::str::from_utf8(&requests[7])?;
+        assert!(cleanup.starts_with("DELETE /redfish/v1/SessionService/Sessions/1"));
         Ok(())
     }
 
@@ -31274,11 +31439,47 @@ mod tests {
             .await
         }
 
+        /// Starts the scripted server where each response may carry a delay
+        /// the server waits before writing it — a slow-BMC script. A delayed
+        /// slot's request is still read and captured, and the response is
+        /// written only after the delay, so the client's own request budget
+        /// decides the timeout instead of a real 30 s wait. The delayed write
+        /// runs concurrently with the remaining script, so a slow BMC delays
+        /// only the document it is slow for.
+        async fn start_raw_sequence_with_delays(
+            responses: Vec<(Vec<u8>, Option<Duration>)>,
+        ) -> Result<Self, Box<dyn Error>> {
+            Self::start_sequence_server_for_hosts(
+                responses,
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect::<Vec<String>>(),
+            )
+            .await
+        }
+
         /// Starts the scripted server with an explicit certificate subject
         /// alternative name list, for tests that must provoke a hostname
         /// mismatch against the served identity.
         async fn start_raw_sequence_for_hosts(
             responses: Vec<Vec<u8>>,
+            sans: Vec<String>,
+        ) -> Result<Self, Box<dyn Error>> {
+            Self::start_sequence_server_for_hosts(
+                responses
+                    .into_iter()
+                    .map(|response| (response, None))
+                    .collect(),
+                sans,
+            )
+            .await
+        }
+
+        /// Starts the scripted server with an explicit certificate subject
+        /// alternative name list and a per-response delay plan.
+        async fn start_sequence_server_for_hosts(
+            responses: Vec<(Vec<u8>, Option<Duration>)>,
             sans: Vec<String>,
         ) -> Result<Self, Box<dyn Error>> {
             let CertifiedKey { cert, signing_key } = generate_simple_self_signed(sans)?;
@@ -31293,7 +31494,7 @@ mod tests {
             let socket = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
             let (stop, stop_receiver) = watch::channel(false);
-            let task = tokio::spawn(run_server_sequence(
+            let task = tokio::spawn(run_server_sequence_with_delays(
                 listener,
                 acceptor,
                 responses,
@@ -31358,15 +31559,16 @@ mod tests {
         .into_bytes()
     }
 
-    async fn run_server_sequence(
+    async fn run_server_sequence_with_delays(
         listener: TcpListener,
         acceptor: TlsAcceptor,
-        responses: Vec<Vec<u8>>,
+        responses: Vec<(Vec<u8>, Option<Duration>)>,
         stop: watch::Receiver<bool>,
     ) -> Result<Vec<Vec<u8>>, io::Error> {
         let mut requests = Vec::with_capacity(responses.len());
+        let mut delayed_writes = Vec::new();
         let mut stop = stop;
-        for response in responses {
+        for (response, delay) in responses {
             // One scripted response is served to exactly one request. A
             // connection that dies before its request — the client abandons
             // the TLS handshake — is dropped without consuming the scripted
@@ -31398,6 +31600,22 @@ mod tests {
                     // response, which the client observes as a broken
                     // connection.
                     requests.push(request);
+                } else if let Some(delay) = delay {
+                    // A slow-BMC slot: the request is captured immediately,
+                    // but the response is written only after the delay, so
+                    // the client's own request budget expires first. The late
+                    // write runs concurrently with the remaining script (a
+                    // slow BMC delays only the document it is slow for) and
+                    // its failure is tolerated: the client is expected to
+                    // have timed out and closed the connection by then. The
+                    // script is complete only after every delayed write
+                    // settled, so `finish_all` still observes the whole plan.
+                    requests.push(request);
+                    delayed_writes.push(tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = stream.write_all(&response).await;
+                        let _ = stream.shutdown().await;
+                    }));
                 } else {
                     stream.write_all(&response).await?;
                     stream.shutdown().await?;
@@ -31405,6 +31623,11 @@ mod tests {
                 }
                 break;
             }
+        }
+        for delayed in delayed_writes {
+            delayed
+                .await
+                .map_err(|_| io::Error::other("test delayed response task"))?;
         }
         Ok(requests)
     }
