@@ -27,6 +27,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) enum HttpMethod {
     Get,
     Post,
+    Patch,
     Delete,
     /// Any other method is not part of the fixture surface and is routed to
     /// the Redfish-shaped 404.
@@ -38,6 +39,7 @@ impl HttpMethod {
         match value {
             "GET" => Self::Get,
             "POST" => Self::Post,
+            "PATCH" => Self::Patch,
             "DELETE" => Self::Delete,
             _ => Self::Other,
         }
@@ -48,6 +50,7 @@ impl HttpMethod {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Patch => "PATCH",
             Self::Delete => "DELETE",
             Self::Other => "UNKNOWN",
         }

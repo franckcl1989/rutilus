@@ -240,6 +240,178 @@ fn session_delete_removes_only_the_named_session() {
 }
 
 #[test]
+fn account_collection_serves_the_built_in_admin_and_members() -> Result<(), Box<dyn Error>> {
+    let state = MockState::new();
+
+    let collection = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/AccountService/Accounts",
+        &[],
+        &state,
+    );
+    assert_eq!(collection.status, "200 OK");
+    let body: serde_json::Value = serde_json::from_str(&collection.body)?;
+    let members = body["Members"]
+        .as_array()
+        .ok_or("collection must carry Members")?;
+    assert_eq!(members.len(), 1);
+    assert_eq!(
+        members[0]["@odata.id"],
+        "/redfish/v1/AccountService/Accounts/admin"
+    );
+
+    // The typed read path may request the collection with `$expand`; the
+    // mock serves the same resource regardless of the query string.
+    let expanded = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/AccountService/Accounts?$expand=.($levels=1)",
+        &[],
+        &state,
+    );
+    assert_eq!(expanded.status, "200 OK");
+
+    let member = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/AccountService/Accounts/admin",
+        &[],
+        &state,
+    );
+    assert_eq!(member.status, "200 OK");
+    let admin: serde_json::Value = serde_json::from_str(&member.body)?;
+    assert_eq!(admin["Id"], "admin");
+    assert_eq!(admin["UserName"], "admin");
+    assert_eq!(admin["RoleId"], "Administrator");
+    assert_eq!(admin["Enabled"], true);
+
+    let missing = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/AccountService/Accounts/ghost",
+        &[],
+        &state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
+fn account_creation_assigns_an_id_and_appears_in_the_collection() -> Result<(), Box<dyn Error>> {
+    let state = MockState::new();
+
+    let created = route::dispatch(
+        HttpMethod::Post,
+        "/redfish/v1/AccountService/Accounts",
+        br#"{"UserName":"jane","Password":"initial-secret","RoleId":"Operator"}"#,
+        &state,
+    );
+    assert_eq!(created.status, "201 Created");
+    let body: serde_json::Value = serde_json::from_str(&created.body)?;
+    assert_eq!(body["Id"], "user-1");
+    assert_eq!(body["UserName"], "jane");
+    assert_eq!(body["RoleId"], "Operator");
+    assert_eq!(body["Enabled"], true);
+
+    let collection = route::dispatch(
+        HttpMethod::Get,
+        "/redfish/v1/AccountService/Accounts",
+        &[],
+        &state,
+    );
+    let members: serde_json::Value = serde_json::from_str(&collection.body)?;
+    let ids = members["Members"]
+        .as_array()
+        .ok_or("collection must carry Members")?
+        .iter()
+        .map(|member| member["@odata.id"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("member ids must be strings")?;
+    assert_eq!(
+        ids,
+        [
+            "/redfish/v1/AccountService/Accounts/admin".to_owned(),
+            "/redfish/v1/AccountService/Accounts/user-1".to_owned(),
+        ]
+    );
+    assert_eq!(state.lock_accounts().ids(), ["admin", "user-1"]);
+    Ok(())
+}
+
+#[test]
+fn account_update_applies_role_and_user_name_changes() -> Result<(), Box<dyn Error>> {
+    let state = MockState::new();
+
+    let role = route::dispatch(
+        HttpMethod::Patch,
+        "/redfish/v1/AccountService/Accounts/admin",
+        br#"{"RoleId":"Operator"}"#,
+        &state,
+    );
+    assert_eq!(role.status, "200 OK");
+    let body: serde_json::Value = serde_json::from_str(&role.body)?;
+    assert_eq!(body["RoleId"], "Operator");
+    assert_eq!(body["UserName"], "admin");
+
+    let rename = route::dispatch(
+        HttpMethod::Patch,
+        "/redfish/v1/AccountService/Accounts/admin",
+        br#"{"UserName":"admin.renamed"}"#,
+        &state,
+    );
+    assert_eq!(rename.status, "200 OK");
+    let body: serde_json::Value = serde_json::from_str(&rename.body)?;
+    assert_eq!(body["UserName"], "admin.renamed");
+    assert_eq!(body["RoleId"], "Operator");
+
+    // The password property is accepted but never stored or echoed (the
+    // CSDL marks it null in responses).
+    let password = route::dispatch(
+        HttpMethod::Patch,
+        "/redfish/v1/AccountService/Accounts/admin",
+        br#"{"Password":"new-secret"}"#,
+        &state,
+    );
+    assert_eq!(password.status, "200 OK");
+    assert!(!password.body.contains("new-secret"));
+
+    let missing = route::dispatch(
+        HttpMethod::Patch,
+        "/redfish/v1/AccountService/Accounts/ghost",
+        br#"{"RoleId":"Operator"}"#,
+        &state,
+    );
+    assert_eq!(missing.status, "404 Not Found");
+    Ok(())
+}
+
+#[test]
+fn account_delete_removes_only_the_named_account() {
+    let state = MockState::new();
+    route::dispatch(
+        HttpMethod::Post,
+        "/redfish/v1/AccountService/Accounts",
+        br#"{"UserName":"jane","Password":"initial-secret","RoleId":"Operator"}"#,
+        &state,
+    );
+
+    let deleted = route::dispatch(
+        HttpMethod::Delete,
+        "/redfish/v1/AccountService/Accounts/user-1",
+        &[],
+        &state,
+    );
+    assert_eq!(deleted.status, "204 No Content");
+    assert_eq!(state.lock_accounts().ids(), ["admin"]);
+
+    // Deleting the same account again is a 404, not a silent success.
+    let again = route::dispatch(
+        HttpMethod::Delete,
+        "/redfish/v1/AccountService/Accounts/user-1",
+        &[],
+        &state,
+    );
+    assert_eq!(again.status, "404 Not Found");
+}
+
+#[test]
 fn dell_profile_swaps_identity_and_serves_attributes_route_only() -> Result<(), Box<dyn Error>> {
     // The fixture mapping: the Dell profile swaps the Service Root identity
     // strings and adds the manager `Oem.Dell` segment, while the default
