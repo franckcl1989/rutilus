@@ -13,6 +13,9 @@ thiserror.workspace = true
 # The macOS Keychain `security(1)` calls and the Windows DPAPI calls run
 # under `spawn_blocking` so they never block the product's async runtime.
 tokio.workspace = true
+# §6.2 diagnostic logging: the service-activation command failures are
+# recorded through tracing::error! on the app binary's subscriber.
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
