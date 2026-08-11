@@ -81,6 +81,11 @@ impl MockServices {
 struct MockGateway {
     certificate: TlsCertificate,
     evaluation: SystemCaEvaluation,
+    /// Whether `read_core_resources` also answers the four standard resource
+    /// families (network-device-function, power-equipment, power-supplies,
+    /// environment-metrics) beside the system and manager documents, pinning
+    /// the enrollment counts' three-field surface.
+    four_families: bool,
 }
 
 impl MockGateway {
@@ -88,6 +93,15 @@ impl MockGateway {
         Self {
             certificate,
             evaluation: SystemCaEvaluation::Verified,
+            four_families: false,
+        }
+    }
+
+    fn verified_with_four_families(certificate: TlsCertificate) -> Self {
+        Self {
+            certificate,
+            evaluation: SystemCaEvaluation::Verified,
+            four_families: true,
         }
     }
 
@@ -95,6 +109,7 @@ impl MockGateway {
         Self {
             certificate,
             evaluation: SystemCaEvaluation::Rejected,
+            four_families: false,
         }
     }
 }
@@ -663,8 +678,8 @@ impl CoreResourceReader for MockGateway {
         _username: &'a CredentialUsername,
         _password: &'a SecretString,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
-        Box::pin(async {
-            Ok(vec![
+        Box::pin(async move {
+            let mut observations = vec![
                 ResourceObservation::new(
                     ResourceFeature::Systems,
                     ResourceODataId::parse("/redfish/v1/Systems/1")
@@ -679,7 +694,40 @@ impl CoreResourceReader for MockGateway {
                     ResourceSnapshotPayload::parse(r#"{"Name":"Manager"}"#)
                         .map_err(|_| MockError::Probe)?,
                 ),
-            ])
+            ];
+            if self.four_families {
+                observations.extend(
+                    [
+                        (
+                            ResourceFeature::NetworkDeviceFunctions,
+                            "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                        ),
+                        (
+                            ResourceFeature::PowerEquipment,
+                            "/redfish/v1/PowerEquipment",
+                        ),
+                        (
+                            ResourceFeature::PowerSupplies,
+                            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                        ),
+                        (
+                            ResourceFeature::EnvironmentMetrics,
+                            "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(feature, odata_id)| {
+                        Ok(ResourceObservation::new(
+                            feature,
+                            ResourceODataId::parse(odata_id).map_err(|_| MockError::Probe)?,
+                            ResourceSnapshotPayload::parse(r#"{"Name":"Family"}"#)
+                                .map_err(|_| MockError::Probe)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            Ok(observations)
         })
     }
 }
@@ -1084,6 +1132,38 @@ async fn enrolls_a_trusted_endpoint_and_records_its_audit_trail() -> Result<(), 
             .ok_or("audit message must exist")?
             .contains("enroll-endpoint started")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrollment_counts_ignore_the_four_standard_families() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let certificate = TlsCertificate::from_der(b"enrollment families certificate".to_vec())?;
+    let router = test_router(
+        MockServices::new(Arc::clone(&state)),
+        MockGateway::verified_with_four_families(certificate),
+    );
+
+    let response = post_json(
+        &router,
+        "/api/v1/endpoints",
+        json!({
+            "display_name": "Rack A BMC",
+            "address": "https://192.0.2.31",
+            "trust": { "mode": "system_ca" },
+            "credential_id": CREDENTIAL_ID
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    // The four standard families stay out of the three-field enrollment
+    // counts exactly like the other non-triad families; the typed
+    // resource-inventory route carries their full snapshots instead.
+    assert_eq!(body["resource_counts"]["systems"], 1);
+    assert_eq!(body["resource_counts"]["chassis"], 0);
+    assert_eq!(body["resource_counts"]["managers"], 1);
     Ok(())
 }
 

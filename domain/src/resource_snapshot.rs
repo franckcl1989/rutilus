@@ -128,6 +128,78 @@ pub enum ResourceFeature {
     /// addresses only the read surface and must not be mistaken for a
     /// capability code (see the ledger-consistency test).
     OemLenovoSecurityService,
+    /// The §2.1 `oem-ami` read surface, added as a typed resource family in
+    /// the 0.5 slice. The family reads the Service Root's embedded
+    /// `Oem.Ami` segment — the `AmiServiceRoot` document `nv-redfish` 0.13
+    /// compiles, whose `RtpVersion` names the Redfish Technology Pack
+    /// version — as part of the Service Root document itself, never a
+    /// separate fetch. The family code is `ami-service-root` (not `oem-ami`,
+    /// which stays the namespace capability code): the one `oem-ami`
+    /// capability covers the namespace advertisement that precedes the read,
+    /// so this variant addresses only the read surface and must not be
+    /// mistaken for a capability code (see the ledger-consistency test).
+    OemAmiServiceRoot,
+    /// The §2.1 `oem-ami` read surface, added as a typed resource family in
+    /// the 0.5 slice. The family reads the manager-scoped AMI `ConfigBMC`
+    /// document through the `Ami` OEM namespace: the manager's `Oem.Ami`
+    /// segment carries the `ConfigBMC` reference string, and the document is
+    /// fetched through that vendor-published reference exactly like the
+    /// `nv-redfish` 0.13 `ConfigBmc` wrapper resolves it. The family code is
+    /// `ami-config-bmc` (not `oem-ami`, which stays the namespace capability
+    /// code): the one `oem-ami` capability covers the namespace advertisement
+    /// that precedes the read, so this variant addresses only the read
+    /// surface and must not be mistaken for a capability code (see the
+    /// ledger-consistency test).
+    OemAmiConfigBmc,
+    /// The §2.1 `oem-hpe` read surface, added as a typed resource family in
+    /// the 0.5 slice. The family reads the Service Root's embedded `Oem.Hpe`
+    /// segment — the `HpeiLoServiceExt` document `nv-redfish` 0.13 compiles,
+    /// whose `Manager` entries name the iLO manager type and firmware — as
+    /// part of the Service Root document itself, never a separate fetch. The
+    /// family code is `hpe-ilo-service-ext` (not `oem-hpe`, which stays the
+    /// namespace capability code): the one `oem-hpe` capability covers the
+    /// namespace advertisement that precedes the read, so this variant
+    /// addresses only the read surface and must not be mistaken for a
+    /// capability code (see the ledger-consistency test).
+    OemHpeILoServiceExt,
+    /// The §2.1 `oem-hpe` read surface, added as a typed resource family in
+    /// the 0.5 slice. The family reads the Manager's embedded `Oem.Hpe`
+    /// segment — the `HpeiLo` document `nv-redfish` 0.13 compiles, whose
+    /// `VirtualNICEnabled` names the host-side virtual NIC support state —
+    /// as part of the Manager document itself, never a separate fetch. The
+    /// family code is `hpe-manager` (not `oem-hpe`, which stays the namespace
+    /// capability code): the one `oem-hpe` capability covers the namespace
+    /// advertisement that precedes the read, so this variant addresses only
+    /// the read surface and must not be mistaken for a capability code (see
+    /// the ledger-consistency test).
+    OemHpeManager,
+    /// The §2.1 `oem-liteon` read surface, added as a typed resource family
+    /// in the 0.5 slice. The family reads the power supplies of a `LiteOn`
+    /// chassis through the `LiteonPowerSupply` schema `nv-redfish` 0.13
+    /// compiles: the chassis `Manufacturer` value `LITE-ON TECHNOLOGY CORP.`
+    /// gates the family exactly like the upstream `chassis_fetch_links`
+    /// gate, the `PowerSubsystem` document's `PowerSupplies` collection is
+    /// re-decoded through the compiled `LiteonPowerSupplyCollection`, and
+    /// each member is fetched through the compiled `LiteonPowerSupply` type.
+    /// The family code is `liteon-power-supply` (not `oem-liteon`, which
+    /// stays the capability code, and not `oem-liteon-power-supply`, which
+    /// stays unallocated in the capability space): the one `oem-liteon`
+    /// capability covers the advertisement gate that precedes the read, so
+    /// this variant addresses only the read surface and must not be mistaken
+    /// for a capability code (see the ledger-consistency test).
+    OemLiteOnPowerSupply,
+    /// The §2.1 `oem-delta` read surface, added as a typed resource family in
+    /// the 0.5 slice. The family reads the `Oem.deltaenergysystems` segment
+    /// of each power supply document behind a chassis's `PowerSubsystem`
+    /// collection — the `DeltaPowerSupply` extension `nv-redfish` 0.13
+    /// compiles, whose `Power` flag names whether the PSU outputs power and
+    /// whose `FanSpeedTarget` names the target fan speed. The family code is
+    /// `delta-power-supply` (not `oem-delta`, which stays the namespace
+    /// capability code): the one `oem-delta` capability covers the namespace
+    /// advertisement that precedes the read, so this variant addresses only
+    /// the read surface and must not be mistaken for a capability code (see
+    /// the ledger-consistency test).
+    OemDeltaPowerSupply,
     /// The §2.1 `processors` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
@@ -144,6 +216,12 @@ pub enum ResourceFeature {
     /// in the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
     NetworkAdapters,
+    /// The §2.1 `network-device-functions` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface. The
+    /// family reads the `NetworkDeviceFunction` collection behind each
+    /// decoded `NetworkAdapter` member's `NetworkDeviceFunctions` navigation.
+    NetworkDeviceFunctions,
     /// The §2.1 `ethernet-interfaces` feature, added as a typed resource
     /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
     /// product code so both inventories address the same wire surface.
@@ -168,6 +246,18 @@ pub enum ResourceFeature {
     /// snapshot; the code matches the `EndpointCapability` product code so
     /// both inventories address the same wire surface.
     Power,
+    /// The §2.1 `power-equipment` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface. The family
+    /// reads the root-level `PowerEquipment` service document and the
+    /// `PowerDistribution` members of its `PowerShelves` collection.
+    PowerEquipment,
+    /// The §2.1 `power-supplies` feature, added as a typed resource family in
+    /// the 0.2 snapshot; the code matches the `EndpointCapability` product
+    /// code so both inventories address the same wire surface. The family
+    /// reads the `PowerSupply` members of the `PowerSupplies` collection
+    /// behind each decoded Chassis member's `PowerSubsystem` navigation.
+    PowerSupplies,
     /// The §2.1 `thermal` feature, added as a typed resource family in the
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code
     /// so both inventories address the same wire surface.
@@ -180,6 +270,12 @@ pub enum ResourceFeature {
     /// 0.2 snapshot; the code matches the `EndpointCapability` product code
     /// so both inventories address the same wire surface.
     Controls,
+    /// The §2.1 `environment-metrics` feature, added as a typed resource
+    /// family in the 0.2 snapshot; the code matches the `EndpointCapability`
+    /// product code so both inventories address the same wire surface. The
+    /// family reads the `EnvironmentMetrics` singleton behind each decoded
+    /// Chassis member's `EnvironmentMetrics` navigation.
+    EnvironmentMetrics,
     /// The §2.1 `log-services` feature, added as a typed resource family in
     /// the 0.2 snapshot; the code matches the `EndpointCapability` product
     /// code so both inventories address the same wire surface.
@@ -270,19 +366,29 @@ impl ResourceFeature {
             Self::OemNvidiaPowerCompliance => "nvidia-power-compliance",
             Self::OemNvidiaManagedEntity => "nvidia-managed-entity",
             Self::OemLenovoSecurityService => "lenovo-security-service",
+            Self::OemAmiServiceRoot => "ami-service-root",
+            Self::OemAmiConfigBmc => "ami-config-bmc",
+            Self::OemHpeILoServiceExt => "hpe-ilo-service-ext",
+            Self::OemHpeManager => "hpe-manager",
+            Self::OemLiteOnPowerSupply => "liteon-power-supply",
+            Self::OemDeltaPowerSupply => "delta-power-supply",
             Self::Processors => "processors",
             Self::Memory => "memory",
             Self::Storages => "storages",
             Self::NetworkAdapters => "network-adapters",
+            Self::NetworkDeviceFunctions => "network-device-functions",
             Self::EthernetInterfaces => "ethernet-interfaces",
             Self::Accounts => "accounts",
             Self::Bios => "bios",
             Self::BootOptions => "boot-options",
             Self::SecureBoot => "secure-boot",
             Self::Power => "power",
+            Self::PowerEquipment => "power-equipment",
+            Self::PowerSupplies => "power-supplies",
             Self::Thermal => "thermal",
             Self::Sensors => "sensors",
             Self::Controls => "controls",
+            Self::EnvironmentMetrics => "environment-metrics",
             Self::LogServices => "log-services",
             Self::ManagerNetworkProtocol => "manager-network-protocol",
             Self::HostInterfaces => "host-interfaces",
@@ -322,19 +428,29 @@ impl FromStr for ResourceFeature {
             "nvidia-power-compliance" => Ok(Self::OemNvidiaPowerCompliance),
             "nvidia-managed-entity" => Ok(Self::OemNvidiaManagedEntity),
             "lenovo-security-service" => Ok(Self::OemLenovoSecurityService),
+            "ami-service-root" => Ok(Self::OemAmiServiceRoot),
+            "ami-config-bmc" => Ok(Self::OemAmiConfigBmc),
+            "hpe-ilo-service-ext" => Ok(Self::OemHpeILoServiceExt),
+            "hpe-manager" => Ok(Self::OemHpeManager),
+            "liteon-power-supply" => Ok(Self::OemLiteOnPowerSupply),
+            "delta-power-supply" => Ok(Self::OemDeltaPowerSupply),
             "processors" => Ok(Self::Processors),
             "memory" => Ok(Self::Memory),
             "storages" => Ok(Self::Storages),
             "network-adapters" => Ok(Self::NetworkAdapters),
+            "network-device-functions" => Ok(Self::NetworkDeviceFunctions),
             "ethernet-interfaces" => Ok(Self::EthernetInterfaces),
             "accounts" => Ok(Self::Accounts),
             "bios" => Ok(Self::Bios),
             "boot-options" => Ok(Self::BootOptions),
             "secure-boot" => Ok(Self::SecureBoot),
             "power" => Ok(Self::Power),
+            "power-equipment" => Ok(Self::PowerEquipment),
+            "power-supplies" => Ok(Self::PowerSupplies),
             "thermal" => Ok(Self::Thermal),
             "sensors" => Ok(Self::Sensors),
             "controls" => Ok(Self::Controls),
+            "environment-metrics" => Ok(Self::EnvironmentMetrics),
             "log-services" => Ok(Self::LogServices),
             "manager-network-protocol" => Ok(Self::ManagerNetworkProtocol),
             "host-interfaces" => Ok(Self::HostInterfaces),
@@ -894,19 +1010,29 @@ mod tests {
             ResourceFeature::OemNvidiaPowerCompliance,
             ResourceFeature::OemNvidiaManagedEntity,
             ResourceFeature::OemLenovoSecurityService,
+            ResourceFeature::OemAmiServiceRoot,
+            ResourceFeature::OemAmiConfigBmc,
+            ResourceFeature::OemHpeILoServiceExt,
+            ResourceFeature::OemHpeManager,
+            ResourceFeature::OemLiteOnPowerSupply,
+            ResourceFeature::OemDeltaPowerSupply,
             ResourceFeature::Processors,
             ResourceFeature::Memory,
             ResourceFeature::Storages,
             ResourceFeature::NetworkAdapters,
+            ResourceFeature::NetworkDeviceFunctions,
             ResourceFeature::EthernetInterfaces,
             ResourceFeature::Accounts,
             ResourceFeature::Bios,
             ResourceFeature::BootOptions,
             ResourceFeature::SecureBoot,
             ResourceFeature::Power,
+            ResourceFeature::PowerEquipment,
+            ResourceFeature::PowerSupplies,
             ResourceFeature::Thermal,
             ResourceFeature::Sensors,
             ResourceFeature::Controls,
+            ResourceFeature::EnvironmentMetrics,
             ResourceFeature::LogServices,
             ResourceFeature::ManagerNetworkProtocol,
             ResourceFeature::HostInterfaces,
@@ -952,6 +1078,10 @@ mod tests {
                 EndpointCapability::NetworkAdapters,
             ),
             (
+                ResourceFeature::NetworkDeviceFunctions,
+                EndpointCapability::NetworkDeviceFunctions,
+            ),
+            (
                 ResourceFeature::EthernetInterfaces,
                 EndpointCapability::EthernetInterfaces,
             ),
@@ -966,9 +1096,21 @@ mod tests {
             // §2.1 codes that the ledger already persists, so the feature
             // and capability inventories cannot drift on the wire.
             (ResourceFeature::Power, EndpointCapability::Power),
+            (
+                ResourceFeature::PowerEquipment,
+                EndpointCapability::PowerEquipment,
+            ),
+            (
+                ResourceFeature::PowerSupplies,
+                EndpointCapability::PowerSupplies,
+            ),
             (ResourceFeature::Thermal, EndpointCapability::Thermal),
             (ResourceFeature::Sensors, EndpointCapability::Sensors),
             (ResourceFeature::Controls, EndpointCapability::Controls),
+            (
+                ResourceFeature::EnvironmentMetrics,
+                EndpointCapability::EnvironmentMetrics,
+            ),
             // The 0.2 Manager-facing families reuse the §2.1 codes the
             // ledger already persists for `log-services`,
             // `manager-network-protocol`, and `host-interfaces`, so the
@@ -1130,6 +1272,53 @@ mod tests {
             (
                 ResourceFeature::OemLenovoSecurityService,
                 EndpointCapability::OemLenovo,
+            ),
+            // The 0.5 AMI families follow the same precedent: the
+            // service-root family reads the Service Root's embedded
+            // `Oem.Ami` segment (`AmiServiceRoot`) and the config-bmc family
+            // reads the manager's `ConfigBMC` document, so both map to the
+            // `oem-ami` namespace capability (the feature that advertises
+            // that namespace) under the narrower family codes
+            // `ami-service-root` and `ami-config-bmc` — never the `oem-ami`
+            // capability code, which stays with the ledger.
+            (
+                ResourceFeature::OemAmiServiceRoot,
+                EndpointCapability::OemAmi,
+            ),
+            (ResourceFeature::OemAmiConfigBmc, EndpointCapability::OemAmi),
+            // The 0.5 HPE families follow the same precedent: the
+            // iLo-service-ext family reads the Service Root's embedded
+            // `Oem.Hpe` segment (`HpeiLoServiceExt`) and the manager family
+            // reads the Manager's embedded `Oem.Hpe` segment (`HpeiLo`), so
+            // both map to the `oem-hpe` namespace capability (the feature
+            // that advertises that namespace) under the narrower family
+            // codes `hpe-ilo-service-ext` and `hpe-manager` — never the
+            // `oem-hpe` capability code, which stays with the ledger.
+            (
+                ResourceFeature::OemHpeILoServiceExt,
+                EndpointCapability::OemHpe,
+            ),
+            (ResourceFeature::OemHpeManager, EndpointCapability::OemHpe),
+            // The 0.5 LiteOn power-supply family follows the same precedent:
+            // the family reads the power supplies of a LiteOn chassis
+            // (gated by the `LITE-ON TECHNOLOGY CORP.` manufacturer value),
+            // so it maps to the `oem-liteon` capability (the feature that
+            // gates that advertisement) under the narrower family code
+            // `liteon-power-supply` — never the `oem-liteon` capability
+            // code, which stays with the ledger.
+            (
+                ResourceFeature::OemLiteOnPowerSupply,
+                EndpointCapability::OemLiteOn,
+            ),
+            // The 0.5 Delta power-supply family follows the same precedent:
+            // the family reads the `Oem.deltaenergysystems` segment of the
+            // power supply documents, so it maps to the `oem-delta` namespace
+            // capability (the feature that advertises that namespace) under
+            // the narrower family code `delta-power-supply` — never the
+            // `oem-delta` capability code, which stays with the ledger.
+            (
+                ResourceFeature::OemDeltaPowerSupply,
+                EndpointCapability::OemDelta,
             ),
         ];
         for (feature, capability) in subsidiary {
@@ -1317,6 +1506,97 @@ mod tests {
             "oem-lenovo".parse::<ResourceFeature>(),
             Err(ResourceFeatureParseError)
         );
+        // The 0.5 AMI families keep their narrow `ami-service-root` and
+        // `ami-config-bmc` codes; the `oem-ami` namespace capability stays
+        // with the ledger, so the snapshot and capability inventories cannot
+        // silently drift into aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemAmiServiceRoot.as_str(),
+            "ami-service-root"
+        );
+        assert_eq!(ResourceFeature::OemAmiConfigBmc.as_str(), "ami-config-bmc");
+        assert_eq!(EndpointCapability::OemAmi.as_str(), "oem-ami");
+        assert_eq!(
+            "ami-service-root".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemAmiServiceRoot)
+        );
+        assert_eq!(
+            "ami-service-root".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-ami".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemAmi)
+        );
+        assert_eq!(
+            "oem-ami".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        // The 0.5 HPE families keep their narrow `hpe-ilo-service-ext` and
+        // `hpe-manager` codes; the `oem-hpe` namespace capability stays with
+        // the ledger, so the snapshot and capability inventories cannot
+        // silently drift into aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemHpeILoServiceExt.as_str(),
+            "hpe-ilo-service-ext"
+        );
+        assert_eq!(ResourceFeature::OemHpeManager.as_str(), "hpe-manager");
+        assert_eq!(EndpointCapability::OemHpe.as_str(), "oem-hpe");
+        assert_eq!(
+            "hpe-ilo-service-ext".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemHpeILoServiceExt)
+        );
+        assert_eq!(
+            "hpe-ilo-service-ext".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-hpe".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemHpe)
+        );
+        assert_eq!(
+            "oem-hpe".parse::<ResourceFeature>(),
+            Err(ResourceFeatureParseError)
+        );
+        // The 0.5 LiteOn and Delta power-supply families keep their narrow
+        // `liteon-power-supply` and `delta-power-supply` codes; the
+        // `oem-liteon` and `oem-delta` capabilities stay with the ledger, so
+        // the snapshot and capability inventories cannot silently drift into
+        // aliasing each other.
+        assert_eq!(
+            ResourceFeature::OemLiteOnPowerSupply.as_str(),
+            "liteon-power-supply"
+        );
+        assert_eq!(
+            ResourceFeature::OemDeltaPowerSupply.as_str(),
+            "delta-power-supply"
+        );
+        assert_eq!(EndpointCapability::OemLiteOn.as_str(), "oem-liteon");
+        assert_eq!(EndpointCapability::OemDelta.as_str(), "oem-delta");
+        assert_eq!(
+            "liteon-power-supply".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemLiteOnPowerSupply)
+        );
+        assert_eq!(
+            "liteon-power-supply".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "delta-power-supply".parse::<ResourceFeature>(),
+            Ok(ResourceFeature::OemDeltaPowerSupply)
+        );
+        assert_eq!(
+            "delta-power-supply".parse::<EndpointCapability>(),
+            Err(EndpointCapabilityParseError)
+        );
+        assert_eq!(
+            "oem-liteon".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemLiteOn)
+        );
+        assert_eq!(
+            "oem-delta".parse::<EndpointCapability>(),
+            Ok(EndpointCapability::OemDelta)
+        );
     }
 
     // The exhaustive near-miss spellings below exceed the pedantic line
@@ -1337,6 +1617,10 @@ mod tests {
             "Memory",
             "storage",
             "network-adapter",
+            "network-device-function",
+            "network-device-functions/",
+            "networkdevicefunctions",
+            "NetworkDeviceFunctions",
             "ethernet-interface",
             "storages/",
             "network-adapters/",
@@ -1360,9 +1644,14 @@ mod tests {
             "powers",
             "power/",
             "Power",
-            "power-equipment",
-            "power-supplies",
+            "power-equipments",
+            "power-equipment/",
+            "powerequipment",
+            "PowerEquipment",
             "power-supply",
+            "power-supplies/",
+            "powersupplies",
+            "PowerSupplies",
             "thermals",
             "thermal/",
             "Thermal",
@@ -1373,7 +1662,10 @@ mod tests {
             "control",
             "controls/",
             "Controls",
-            "environment-metrics",
+            "environment-metric",
+            "environment-metrics/",
+            "environmentmetrics",
+            "EnvironmentMetrics",
             "log-service",
             "log-services/",
             "logservice",

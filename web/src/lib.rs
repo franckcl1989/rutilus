@@ -36,13 +36,14 @@ use rutilus_api::{
     EndpointResourceInventoryResponse, EndpointResourceSnapshotResponse,
     EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
-    ErrorResponse, EventListResponse, EventResponse, GroupListResponse, GroupResponse,
-    HealthResponse, MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse,
-    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
-    OperationTargetResponse, RefreshEndpointsRequest, ResourceDiagnosticsResponse,
-    ResourceStatusResponse, TagListResponse, TagResponse, TelemetrySampleListResponse,
-    TelemetrySampleResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
-    TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
+    EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, ErrorResponse,
+    EventListResponse, EventResponse, GroupListResponse, GroupResponse, HealthResponse,
+    MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse,
+    OperationResponse, OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
+    RefreshEndpointsRequest, ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse,
+    TagResponse, TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
+    TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
+    UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -59,12 +60,13 @@ use rutilus_application::{
     EndpointInventoryRepository, EndpointRefreshOutcome, EndpointRefreshRepository,
     EndpointResourceInventory, EndpointResourceInventoryQuery, EndpointResourceInventoryQueryError,
     EndpointTrustChallenge, EndpointTrustEstablishment, EndpointTrustExpectation,
-    EndpointTrustExpectationError, EnrolledEndpoint, EventRepository, GroupManagement,
-    GroupManagementError, GroupRepository, NewCredentialRequest, OnboardEndpointError,
-    OnboardEndpointRequest, OperationStore, OperationSubmission, RedfishDiscovery,
-    ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
-    ResourceStatusSummary, SubmissionError, TagManagement, TagManagementError, TagRepository,
-    TelemetryRepository, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    EndpointTrustExpectationError, EnrolledEndpoint, EnvironmentMetricsControlSummary,
+    EnvironmentMetricsReadingSummary, EventRepository, GroupManagement, GroupManagementError,
+    GroupRepository, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
+    OperationStore, OperationSubmission, RedfishDiscovery, ResourceDiagnostics,
+    ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError, ResourceStatusSummary,
+    SubmissionError, TagManagement, TagManagementError, TagRepository, TelemetryRepository,
+    TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
@@ -2555,15 +2557,19 @@ fn project_enrollment(
             | ResourceFeature::Memory
             | ResourceFeature::Storages
             | ResourceFeature::NetworkAdapters
+            | ResourceFeature::NetworkDeviceFunctions
             | ResourceFeature::EthernetInterfaces
             | ResourceFeature::Accounts
             | ResourceFeature::Bios
             | ResourceFeature::BootOptions
             | ResourceFeature::SecureBoot
             | ResourceFeature::Power
+            | ResourceFeature::PowerEquipment
+            | ResourceFeature::PowerSupplies
             | ResourceFeature::Thermal
             | ResourceFeature::Sensors
             | ResourceFeature::Controls
+            | ResourceFeature::EnvironmentMetrics
             | ResourceFeature::LogServices
             | ResourceFeature::ManagerNetworkProtocol
             | ResourceFeature::HostInterfaces
@@ -2574,6 +2580,12 @@ fn project_enrollment(
             | ResourceFeature::OemNvidiaPowerCompliance
             | ResourceFeature::OemNvidiaManagedEntity
             | ResourceFeature::OemLenovoSecurityService
+            | ResourceFeature::OemAmiServiceRoot
+            | ResourceFeature::OemAmiConfigBmc
+            | ResourceFeature::OemHpeILoServiceExt
+            | ResourceFeature::OemHpeManager
+            | ResourceFeature::OemLiteOnPowerSupply
+            | ResourceFeature::OemDeltaPowerSupply
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory
@@ -3886,6 +3898,14 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
         CoreResourceDetails::Storage { .. } => project_storage_details(details),
         CoreResourceDetails::NetworkAdapter { .. } => project_network_adapter_details(details),
+        CoreResourceDetails::NetworkDeviceFunction { .. } => {
+            project_network_device_function_details(details)
+        }
+        CoreResourceDetails::PowerEquipment { .. } => project_power_equipment_details(details),
+        CoreResourceDetails::PowerSupply { .. } => project_power_supply_details(details),
+        CoreResourceDetails::EnvironmentMetrics { .. } => {
+            project_environment_metrics_details(details)
+        }
         CoreResourceDetails::EthernetInterface { .. } => {
             project_ethernet_interface_details(details)
         }
@@ -4675,6 +4695,199 @@ fn project_network_adapter_details(details: &CoreResourceDetails) -> CoreResourc
         model: model.clone(),
         status: status.as_ref().map(project_resource_status),
     }
+}
+
+/// Projects the §2.1 network-device-function family into the shared wire
+/// contract, preserving the `NetDevFuncType` enumeration string so clients
+/// never re-parse text.
+///
+/// The dispatcher guarantees this receives the `NetworkDeviceFunction`
+/// variant; the fallback keeps a stable empty projection instead of panicking
+/// if that contract is ever violated.
+fn project_network_device_function_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::NetworkDeviceFunction {
+        net_dev_func_type,
+        device_enabled,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::NetworkDeviceFunction {
+            net_dev_func_type: None,
+            device_enabled: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::NetworkDeviceFunction {
+        net_dev_func_type: net_dev_func_type.clone(),
+        device_enabled: *device_enabled,
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 power-equipment family into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `PowerEquipment` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_power_equipment_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::PowerEquipment {
+        equipment_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        version,
+        firmware_version,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::PowerEquipment {
+            equipment_type: None,
+            manufacturer: None,
+            model: None,
+            part_number: None,
+            serial_number: None,
+            version: None,
+            firmware_version: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::PowerEquipment {
+        equipment_type: equipment_type.clone(),
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        part_number: part_number.clone(),
+        serial_number: serial_number.clone(),
+        version: version.clone(),
+        firmware_version: firmware_version.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 power-supply family into the shared wire contract,
+/// preserving the numeric capacity so clients never re-parse text.
+///
+/// The dispatcher guarantees this receives the `PowerSupply` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_power_supply_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::PowerSupply {
+        power_supply_type,
+        power_capacity_watts,
+        manufacturer,
+        model,
+        firmware_version,
+        serial_number,
+        part_number,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::PowerSupply {
+            power_supply_type: None,
+            power_capacity_watts: None,
+            manufacturer: None,
+            model: None,
+            firmware_version: None,
+            serial_number: None,
+            part_number: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::PowerSupply {
+        power_supply_type: power_supply_type.clone(),
+        power_capacity_watts: *power_capacity_watts,
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        firmware_version: firmware_version.clone(),
+        serial_number: serial_number.clone(),
+        part_number: part_number.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §2.1 environment-metrics family into the shared wire
+/// contract; every embedded measurement the schema declares is projected
+/// through its excerpt reading shape.
+///
+/// The dispatcher guarantees this receives the `EnvironmentMetrics` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_environment_metrics_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::EnvironmentMetrics {
+        temperature_celsius,
+        humidity_percent,
+        fan_speeds_percent,
+        power_watts,
+        energyk_wh,
+        power_load_percent,
+        power_limit_watts,
+        dew_point_celsius,
+        absolute_humidity,
+        energy_joules,
+        ambient_temperature_celsius,
+        voltage,
+        current_amps,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::EnvironmentMetrics {
+            temperature_celsius: None,
+            humidity_percent: None,
+            fan_speeds_percent: None,
+            power_watts: None,
+            energyk_wh: None,
+            power_load_percent: None,
+            power_limit_watts: None,
+            dew_point_celsius: None,
+            absolute_humidity: None,
+            energy_joules: None,
+            ambient_temperature_celsius: None,
+            voltage: None,
+            current_amps: None,
+        };
+    };
+    CoreResourceDetailsResponse::EnvironmentMetrics {
+        temperature_celsius: temperature_celsius
+            .as_ref()
+            .map(project_environment_reading),
+        humidity_percent: humidity_percent.as_ref().map(project_environment_reading),
+        fan_speeds_percent: fan_speeds_percent
+            .as_ref()
+            .map(|speeds| speeds.iter().map(project_environment_reading).collect()),
+        power_watts: power_watts.as_ref().map(project_environment_reading),
+        energyk_wh: energyk_wh.as_ref().map(project_environment_reading),
+        power_load_percent: power_load_percent.as_ref().map(project_environment_reading),
+        power_limit_watts: power_limit_watts.as_ref().map(project_environment_control),
+        dew_point_celsius: dew_point_celsius.as_ref().map(project_environment_reading),
+        absolute_humidity: absolute_humidity.as_ref().map(project_environment_reading),
+        energy_joules: energy_joules.as_ref().map(project_environment_reading),
+        ambient_temperature_celsius: ambient_temperature_celsius
+            .as_ref()
+            .map(project_environment_reading),
+        voltage: voltage.as_ref().map(project_environment_reading),
+        current_amps: current_amps.as_ref().map(project_environment_reading),
+    }
+}
+
+fn project_environment_reading(
+    reading: &EnvironmentMetricsReadingSummary,
+) -> EnvironmentMetricsReadingResponse {
+    EnvironmentMetricsReadingResponse::new(
+        reading.data_source_uri().map(str::to_owned),
+        reading.reading(),
+    )
+}
+
+fn project_environment_control(
+    control: &EnvironmentMetricsControlSummary,
+) -> EnvironmentMetricsControlResponse {
+    EnvironmentMetricsControlResponse::new(
+        control.data_source_uri().map(str::to_owned),
+        control.set_point(),
+    )
 }
 
 /// Projects the §2.1 ethernet-interface family into the shared wire contract,

@@ -724,6 +724,73 @@ impl CoreResourceCommonResponse {
     }
 }
 
+/// One embedded sensor excerpt of the §2.1 `environment-metrics` family.
+///
+/// The `EnvironmentMetrics` schema embeds each measurement as an excerpt
+/// carrying the `DataSourceUri` link to its backing `Sensor` resource and
+/// the current `Reading` value; `reading` stays numeric (`Edm.Decimal`
+/// compiles to `f64` in nv-redfish 0.13) so the console renders the
+/// measurement without re-parsing text, and `data_source_uri` names the
+/// sensor that sourced it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentMetricsReadingResponse {
+    data_source_uri: Option<String>,
+    reading: Option<f64>,
+}
+
+impl EnvironmentMetricsReadingResponse {
+    #[must_use]
+    pub const fn new(data_source_uri: Option<String>, reading: Option<f64>) -> Self {
+        Self {
+            data_source_uri,
+            reading,
+        }
+    }
+
+    #[must_use]
+    pub fn data_source_uri(&self) -> Option<&str> {
+        self.data_source_uri.as_deref()
+    }
+
+    #[must_use]
+    pub const fn reading(&self) -> Option<f64> {
+        self.reading
+    }
+}
+
+/// The embedded power-limit control excerpt of the §2.1 `environment-metrics`
+/// family.
+///
+/// `PowerLimitWatts` embeds a `Control` excerpt instead of a sensor excerpt,
+/// so it carries the `DataSourceUri` link and the `SetPoint` reading.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentMetricsControlResponse {
+    data_source_uri: Option<String>,
+    set_point: Option<f64>,
+}
+
+impl EnvironmentMetricsControlResponse {
+    #[must_use]
+    pub const fn new(data_source_uri: Option<String>, set_point: Option<f64>) -> Self {
+        Self {
+            data_source_uri,
+            set_point,
+        }
+    }
+
+    #[must_use]
+    pub fn data_source_uri(&self) -> Option<&str> {
+        self.data_source_uri.as_deref()
+    }
+
+    #[must_use]
+    pub const fn set_point(&self) -> Option<f64> {
+        self.set_point
+    }
+}
+
 /// Original typed Redfish status values retained for unified and source-aware
 /// presentation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -803,6 +870,13 @@ impl OemNvidiaSystemConfigProfileTruststoreResponse {
 /// `PartialEq` (not `Eq`) is deliberate: the Sensor and Control variants
 /// carry numeric readings (`f64`, matching the compiled `Edm.Decimal` type of
 /// nv-redfish 0.13), and `f64` cannot implement `Eq`.
+///
+/// The `EnvironmentMetrics` variant is the largest because the schema embeds
+/// thirteen measurements; boxing its excerpt fields would change the wire
+/// shape (the tagged `details` object must stay flat for the strict
+/// `deny_unknown_fields` boundary), so the size difference stays a
+/// deliberate contract property.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(
     tag = "resource_type",
@@ -1151,6 +1225,22 @@ pub enum CoreResourceDetailsResponse {
         model: Option<String>,
         status: Option<ResourceStatusResponse>,
     },
+    /// One §2.1 `network-device-functions` family member projected from the
+    /// typed Redfish network-device-function schema (`NetworkDeviceFunction_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `NetDevFuncType`, `DeviceEnabled`, and `Status`
+    /// properties. `NetDevFuncType` is the `NetworkDeviceTechnology`
+    /// enumeration (`Disabled`, `Ethernet`, `FibreChannel`, `iSCSI`,
+    /// `FibreChannelOverEthernet`, `InfiniBand`) retained as a string so the
+    /// console renders it without re-parsing text; the protocol-specific
+    /// configuration bags (`Ethernet`, `iSCSIBoot`, `FibreChannel`, ...) stay
+    /// out of this strictly projectable field set.
+    NetworkDeviceFunction {
+        net_dev_func_type: Option<String>,
+        device_enabled: Option<bool>,
+        status: Option<ResourceStatusResponse>,
+    },
     /// One §2.1 `ethernet-interfaces` family member projected from the typed
     /// Redfish ethernet-interface schema (`EthernetInterface_v1`,
     /// nv-redfish-schema 0.13).
@@ -1230,6 +1320,43 @@ pub enum CoreResourceDetailsResponse {
     /// uniform field would break the strict `deny_unknown_fields` alignment
     /// with the infra payload.
     Power {},
+    /// One §2.1 `power-equipment` family member projected from the typed
+    /// Redfish power-equipment schema (`PowerEquipment_v1` for the service
+    /// document, `PowerDistribution_v1` for the `PowerShelves` members,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// The service document carries only its `Status` beside the common
+    /// identity fields; the members carry their required `EquipmentType` (the
+    /// `PowerEquipmentType` enumeration, e.g. `PowerShelf`, retained as a
+    /// string), the hardware identity properties, and `Status`. `None` means
+    /// the endpoint did not publish the property.
+    PowerEquipment {
+        equipment_type: Option<String>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        part_number: Option<String>,
+        serial_number: Option<String>,
+        version: Option<String>,
+        firmware_version: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `power-supplies` family member projected from the typed
+    /// Redfish power-supply schema (`PowerSupply_v1`, nv-redfish-schema 0.13).
+    ///
+    /// Fields are the direct `PowerSupplyType` (`AC`, `DC`, `ACorDC`,
+    /// `DCRegulator`, retained as a string), `PowerCapacityWatts`, the
+    /// hardware identity properties, and `Status`. The input-range and
+    /// output-rail bags stay out of this strictly projectable field set.
+    PowerSupply {
+        power_supply_type: Option<String>,
+        power_capacity_watts: Option<f64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        firmware_version: Option<String>,
+        serial_number: Option<String>,
+        part_number: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
     /// One §2.1 `thermal` family member projected from the typed Redfish
     /// thermal schema (`Thermal_v1`, nv-redfish-schema 0.13).
     ///
@@ -1269,6 +1396,31 @@ pub enum CoreResourceDetailsResponse {
         control_type: Option<String>,
         set_point: Option<f64>,
         status: Option<ResourceStatusResponse>,
+    },
+    /// One §2.1 `environment-metrics` family member projected from the typed
+    /// Redfish environment-metrics schema (`EnvironmentMetrics_v1`,
+    /// nv-redfish-schema 0.13).
+    ///
+    /// Every embedded measurement the schema declares is projected through
+    /// its excerpt reading shape: `reading` carries the current value and
+    /// `data_source_uri` the link to the backing `Sensor` resource. The fan
+    /// speeds project as the excerpt array, and `power_limit_watts` carries
+    /// the embedded control's `set_point` instead of a sensor reading. Each
+    /// field is `None` when the endpoint did not publish the measurement.
+    EnvironmentMetrics {
+        temperature_celsius: Option<EnvironmentMetricsReadingResponse>,
+        humidity_percent: Option<EnvironmentMetricsReadingResponse>,
+        fan_speeds_percent: Option<Vec<EnvironmentMetricsReadingResponse>>,
+        power_watts: Option<EnvironmentMetricsReadingResponse>,
+        energyk_wh: Option<EnvironmentMetricsReadingResponse>,
+        power_load_percent: Option<EnvironmentMetricsReadingResponse>,
+        power_limit_watts: Option<EnvironmentMetricsControlResponse>,
+        dew_point_celsius: Option<EnvironmentMetricsReadingResponse>,
+        absolute_humidity: Option<EnvironmentMetricsReadingResponse>,
+        energy_joules: Option<EnvironmentMetricsReadingResponse>,
+        ambient_temperature_celsius: Option<EnvironmentMetricsReadingResponse>,
+        voltage: Option<EnvironmentMetricsReadingResponse>,
+        current_amps: Option<EnvironmentMetricsReadingResponse>,
     },
     /// One §2.1 `log-services` family member projected from the typed Redfish
     /// log-service schema (`LogService_v1`, nv-redfish-schema 0.13).
@@ -7471,6 +7623,251 @@ mod tests {
     }
 
     #[test]
+    fn core_resource_contract_carries_network_device_function_wire_values()
+    -> Result<(), Box<dyn Error>> {
+        let function = network_device_function_resource();
+
+        assert_eq!(
+            serde_json::to_value(&function)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789f0",
+                    "odata_id": "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                    "odata_type": "#NetworkDeviceFunction.v1_5_0.NetworkDeviceFunction",
+                    "etag": "W/\"ndf-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Adapter One Function One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "network_device_function",
+                    "details": {
+                        "net_dev_func_type": "Ethernet",
+                        "device_enabled": true,
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&function)?)?,
+            function
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "network_device_function",
+                "details": {
+                    "net_dev_func_type": null,
+                    "device_enabled": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_power_equipment_wire_values() -> Result<(), Box<dyn Error>> {
+        let equipment = power_equipment_resource();
+
+        assert_eq!(
+            serde_json::to_value(&equipment)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789f1",
+                    "odata_id": "/redfish/v1/PowerEquipment",
+                    "odata_type": "#PowerEquipment.v1_1_0.PowerEquipment",
+                    "etag": "W/\"power-equipment-1\""
+                },
+                "common": {
+                    "id": "PowerEquipment",
+                    "name": "Power Equipment",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "power_equipment",
+                    "details": {
+                        "equipment_type": "PowerShelf",
+                        "manufacturer": "Rutilus Test",
+                        "model": "PDU-30K",
+                        "part_number": "PDU-PART-1",
+                        "serial_number": "PDU-1",
+                        "version": "2.0",
+                        "firmware_version": "3.1.4",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&equipment)?)?,
+            equipment
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "power_equipment",
+                "details": {
+                    "equipment_type": null,
+                    "manufacturer": null,
+                    "model": null,
+                    "part_number": null,
+                    "serial_number": null,
+                    "version": null,
+                    "firmware_version": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_power_supply_wire_values() -> Result<(), Box<dyn Error>> {
+        let supply = power_supply_resource();
+
+        assert_eq!(
+            serde_json::to_value(&supply)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789f2",
+                    "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                    "odata_type": "#PowerSupply.v1_5_0.PowerSupply",
+                    "etag": "W/\"power-supply-1\""
+                },
+                "common": {
+                    "id": "1",
+                    "name": "Power Supply One",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "power_supply",
+                    "details": {
+                        "power_supply_type": "AC",
+                        "power_capacity_watts": 1600.0,
+                        "manufacturer": "Rutilus Test",
+                        "model": "PSU-1600",
+                        "firmware_version": "1.0.0",
+                        "serial_number": "PSU-1",
+                        "part_number": "PSU-PART-1",
+                        "status": {
+                            "state": "Enabled",
+                            "health": "OK",
+                            "health_rollup": "OK"
+                        }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&supply)?)?,
+            supply
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "power_supply",
+                "details": {
+                    "power_supply_type": null,
+                    "power_capacity_watts": null,
+                    "manufacturer": null,
+                    "model": null,
+                    "firmware_version": null,
+                    "serial_number": null,
+                    "part_number": null,
+                    "status": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_resource_contract_carries_environment_metrics_wire_values() -> Result<(), Box<dyn Error>>
+    {
+        let metrics = environment_metrics_resource();
+
+        assert_eq!(
+            serde_json::to_value(&metrics)?,
+            json!({
+                "source": {
+                    "resource_id": "01989abc-def0-7abc-8def-0123456789f3",
+                    "odata_id": "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                    "odata_type": "#EnvironmentMetrics.v1_1_0.EnvironmentMetrics",
+                    "etag": "W/\"env-metrics-1\""
+                },
+                "common": {
+                    "id": "EnvironmentMetrics",
+                    "name": "Environment Metrics",
+                    "description": null
+                },
+                "resource": {
+                    "resource_type": "environment_metrics",
+                    "details": {
+                        "temperature_celsius": {
+                            "data_source_uri": "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                            "reading": 27.5
+                        },
+                        "humidity_percent": null,
+                        "fan_speeds_percent": null,
+                        "power_watts": null,
+                        "energyk_wh": null,
+                        "power_load_percent": null,
+                        "power_limit_watts": null,
+                        "dew_point_celsius": null,
+                        "absolute_humidity": null,
+                        "energy_joules": null,
+                        "ambient_temperature_celsius": null,
+                        "voltage": null,
+                        "current_amps": null
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CoreResourceResponse>(serde_json::to_value(&metrics)?)?,
+            metrics
+        );
+        assert!(
+            serde_json::from_value::<CoreResourceDetailsResponse>(json!({
+                "resource_type": "environment_metrics",
+                "details": {
+                    "temperature_celsius": null,
+                    "humidity_percent": null,
+                    "fan_speeds_percent": null,
+                    "power_watts": null,
+                    "energyk_wh": null,
+                    "power_load_percent": null,
+                    "power_limit_watts": null,
+                    "dew_point_celsius": null,
+                    "absolute_humidity": null,
+                    "energy_joules": null,
+                    "ambient_temperature_celsius": null,
+                    "voltage": null,
+                    "current_amps": null,
+                    "arbitrary": true
+                }
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn core_resource_contract_carries_log_service_wire_values() -> Result<(), Box<dyn Error>> {
         let log_service = log_service_resource();
 
@@ -7784,6 +8181,121 @@ mod tests {
                     Some("OK".to_owned()),
                     Some("OK".to_owned()),
                 )),
+            },
+        )
+    }
+
+    fn network_device_function_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789f0"),
+                "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1".to_owned(),
+                Some("#NetworkDeviceFunction.v1_5_0.NetworkDeviceFunction".to_owned()),
+                Some("W/\"ndf-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "1".to_owned(),
+                "Adapter One Function One".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::NetworkDeviceFunction {
+                net_dev_func_type: Some("Ethernet".to_owned()),
+                device_enabled: Some(true),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn power_equipment_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789f1"),
+                "/redfish/v1/PowerEquipment".to_owned(),
+                Some("#PowerEquipment.v1_1_0.PowerEquipment".to_owned()),
+                Some("W/\"power-equipment-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "PowerEquipment".to_owned(),
+                "Power Equipment".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::PowerEquipment {
+                equipment_type: Some("PowerShelf".to_owned()),
+                manufacturer: Some("Rutilus Test".to_owned()),
+                model: Some("PDU-30K".to_owned()),
+                part_number: Some("PDU-PART-1".to_owned()),
+                serial_number: Some("PDU-1".to_owned()),
+                version: Some("2.0".to_owned()),
+                firmware_version: Some("3.1.4".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn power_supply_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789f2"),
+                "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1".to_owned(),
+                Some("#PowerSupply.v1_5_0.PowerSupply".to_owned()),
+                Some("W/\"power-supply-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new("1".to_owned(), "Power Supply One".to_owned(), None),
+            CoreResourceDetailsResponse::PowerSupply {
+                power_supply_type: Some("AC".to_owned()),
+                power_capacity_watts: Some(1600.0),
+                manufacturer: Some("Rutilus Test".to_owned()),
+                model: Some("PSU-1600".to_owned()),
+                firmware_version: Some("1.0.0".to_owned()),
+                serial_number: Some("PSU-1".to_owned()),
+                part_number: Some("PSU-PART-1".to_owned()),
+                status: Some(ResourceStatusResponse::new(
+                    Some("Enabled".to_owned()),
+                    Some("OK".to_owned()),
+                    Some("OK".to_owned()),
+                )),
+            },
+        )
+    }
+
+    fn environment_metrics_resource() -> CoreResourceResponse {
+        CoreResourceResponse::new(
+            CoreResourceSourceResponse::new(
+                uuid!("01989abc-def0-7abc-8def-0123456789f3"),
+                "/redfish/v1/Chassis/1/EnvironmentMetrics".to_owned(),
+                Some("#EnvironmentMetrics.v1_1_0.EnvironmentMetrics".to_owned()),
+                Some("W/\"env-metrics-1\"".to_owned()),
+            ),
+            CoreResourceCommonResponse::new(
+                "EnvironmentMetrics".to_owned(),
+                "Environment Metrics".to_owned(),
+                None,
+            ),
+            CoreResourceDetailsResponse::EnvironmentMetrics {
+                temperature_celsius: Some(EnvironmentMetricsReadingResponse::new(
+                    Some("/redfish/v1/Chassis/1/Sensors/InletTemp".to_owned()),
+                    Some(27.5),
+                )),
+                humidity_percent: None,
+                fan_speeds_percent: None,
+                power_watts: None,
+                energyk_wh: None,
+                power_load_percent: None,
+                power_limit_watts: None,
+                dew_point_celsius: None,
+                absolute_humidity: None,
+                energy_joules: None,
+                ambient_temperature_celsius: None,
+                voltage: None,
+                current_amps: None,
             },
         )
     }

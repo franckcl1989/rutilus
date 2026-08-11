@@ -21,7 +21,8 @@ use rutilus_api::{
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointRefreshResultResponse,
     EndpointRefreshStatusResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EraseToken, EraseType,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest,
+    EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, EraseToken, EraseType,
     EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
     GroupResponse, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
@@ -341,6 +342,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
             | CoreResourceDetailsResponse::NetworkAdapter { .. }
+            | CoreResourceDetailsResponse::NetworkDeviceFunction { .. }
+            | CoreResourceDetailsResponse::PowerEquipment { .. }
+            | CoreResourceDetailsResponse::PowerSupply { .. }
+            | CoreResourceDetailsResponse::EnvironmentMetrics { .. }
             | CoreResourceDetailsResponse::EthernetInterface { .. }
             | CoreResourceDetailsResponse::Account { .. }
             | CoreResourceDetailsResponse::Bios { .. }
@@ -553,6 +558,10 @@ fn oem_resource_card(
         | CoreResourceDetailsResponse::Memory { .. }
         | CoreResourceDetailsResponse::Storage { .. }
         | CoreResourceDetailsResponse::NetworkAdapter { .. }
+        | CoreResourceDetailsResponse::NetworkDeviceFunction { .. }
+        | CoreResourceDetailsResponse::PowerEquipment { .. }
+        | CoreResourceDetailsResponse::PowerSupply { .. }
+        | CoreResourceDetailsResponse::EnvironmentMetrics { .. }
         | CoreResourceDetailsResponse::EthernetInterface { .. }
         | CoreResourceDetailsResponse::Account { .. }
         | CoreResourceDetailsResponse::Bios { .. }
@@ -584,7 +593,10 @@ fn oem_resource_card(
 /// Projects one resource into its card identity and family facts; the From
 /// implementation stays a thin assembly so the per-family projections remain
 /// readable and individually testable.
+// The dispatcher walks every §2.1 family in one switch; the pedantic line
+// budget is exceeded by the family count, so the lint is scoped here.
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(clippy::too_many_lines)]
 fn card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
@@ -646,6 +658,14 @@ fn card_facts(
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
         CoreResourceDetailsResponse::Storage { .. } => storage_card_facts(resource),
         CoreResourceDetailsResponse::NetworkAdapter { .. } => network_adapter_card_facts(resource),
+        CoreResourceDetailsResponse::NetworkDeviceFunction { .. } => {
+            network_device_function_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::PowerEquipment { .. } => power_equipment_card_facts(resource),
+        CoreResourceDetailsResponse::PowerSupply { .. } => power_supply_card_facts(resource),
+        CoreResourceDetailsResponse::EnvironmentMetrics { .. } => {
+            environment_metrics_card_facts(resource)
+        }
         CoreResourceDetailsResponse::EthernetInterface { .. } => {
             ethernet_interface_card_facts(resource)
         }
@@ -958,6 +978,37 @@ fn network_adapter_card_facts(
     ("Network adapter", facts)
 }
 
+/// Facts for a §2.1 network-device-function card; the `NetDevFuncType`
+/// enumeration stays as the canonical wire spelling so the card renders the
+/// function type without re-parsing text, and the `DeviceEnabled` boolean
+/// renders as Yes/No.
+///
+/// The dispatcher guarantees this receives the `NetworkDeviceFunction`
+/// variant; the fallback keeps a stable empty facts list instead of panicking
+/// if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn network_device_function_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::NetworkDeviceFunction {
+        net_dev_func_type,
+        device_enabled,
+        status,
+    } = resource
+    else {
+        return ("Network device function", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Function type", net_dev_func_type.as_deref());
+    push_fact(
+        &mut facts,
+        "Device enabled",
+        device_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Network device function", facts)
+}
+
 /// Facts for a §2.1 ethernet-interface card; `speed_mbps` stays numeric so
 /// the card renders the link speed without re-parsing text, and the enabled
 /// flag renders only when the BMC published it.
@@ -1120,6 +1171,84 @@ fn power_card_facts(
     ("Power", Vec::new())
 }
 
+/// Facts for a §2.1 power-equipment card; the `PowerEquipment` service
+/// document carries the `EquipmentType` enumeration and the hardware identity
+/// strings, so the card renders them without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `PowerEquipment` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn power_equipment_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::PowerEquipment {
+        equipment_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        version,
+        firmware_version,
+        status,
+    } = resource
+    else {
+        return ("Power equipment", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Equipment type", equipment_type.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Version", version.as_deref());
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Power equipment", facts)
+}
+
+/// Facts for a §2.1 power-supply card; the `PowerSupplyType` enumeration and
+/// the numeric capacity stay as published so the card renders the supply
+/// without re-parsing text, and the hardware identity strings follow.
+///
+/// The dispatcher guarantees this receives the `PowerSupply` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn power_supply_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::PowerSupply {
+        power_supply_type,
+        power_capacity_watts,
+        manufacturer,
+        model,
+        firmware_version,
+        serial_number,
+        part_number,
+        status,
+    } = resource
+    else {
+        return ("Power supply", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Supply type", power_supply_type.as_deref());
+    push_f64_fact(&mut facts, "Capacity (W)", *power_capacity_watts);
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Power supply", facts)
+}
+
 /// Facts for a §2.1 thermal card; only the resource-level status values are
 /// projectable, because temperature readings exist only on nested
 /// `Temperatures` members.
@@ -1189,6 +1318,95 @@ fn control_card_facts(
     push_f64_fact(&mut facts, "Set point", *set_point);
     push_status_facts(&mut facts, status.as_ref());
     ("Control", facts)
+}
+
+/// Facts for a §2.1 environment-metrics card; every embedded measurement the
+/// schema declares is projected through its numeric `Reading` so the card
+/// renders it without re-parsing text, and the fan-speed excerpt array stays
+/// as a count like the metric-report card keeps its values count. The schema
+/// declares no `Status` property, so the card carries no status facts.
+///
+/// The dispatcher guarantees this receives the `EnvironmentMetrics` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn environment_metrics_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::EnvironmentMetrics {
+        temperature_celsius,
+        humidity_percent,
+        fan_speeds_percent,
+        power_watts,
+        energyk_wh,
+        power_load_percent,
+        power_limit_watts,
+        dew_point_celsius,
+        absolute_humidity,
+        energy_joules,
+        ambient_temperature_celsius,
+        voltage,
+        current_amps,
+    } = resource
+    else {
+        return ("Environment metrics", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_environment_reading_fact(&mut facts, "Temperature (C)", temperature_celsius.as_ref());
+    push_environment_reading_fact(&mut facts, "Humidity (%)", humidity_percent.as_ref());
+    push_u64_fact(
+        &mut facts,
+        "Fan readings",
+        fan_speeds_percent
+            .as_ref()
+            .map(|speeds| speeds.len() as u64),
+    );
+    push_environment_reading_fact(&mut facts, "Power (W)", power_watts.as_ref());
+    push_environment_reading_fact(&mut facts, "Energy (kWh)", energyk_wh.as_ref());
+    push_environment_reading_fact(&mut facts, "Power load (%)", power_load_percent.as_ref());
+    push_environment_control_fact(&mut facts, "Power limit (W)", power_limit_watts.as_ref());
+    push_environment_reading_fact(&mut facts, "Dew point (C)", dew_point_celsius.as_ref());
+    push_environment_reading_fact(&mut facts, "Absolute humidity", absolute_humidity.as_ref());
+    push_environment_reading_fact(&mut facts, "Energy (J)", energy_joules.as_ref());
+    push_environment_reading_fact(
+        &mut facts,
+        "Ambient temperature (C)",
+        ambient_temperature_celsius.as_ref(),
+    );
+    push_environment_reading_fact(&mut facts, "Voltage (V)", voltage.as_ref());
+    push_environment_reading_fact(&mut facts, "Current (A)", current_amps.as_ref());
+    ("Environment metrics", facts)
+}
+
+/// Pushes one environment-metrics sensor-excerpt reading as a fact, keeping
+/// the numeric value without re-parsing text; missing measurements stay
+/// absent from the card.
+#[cfg(any(target_arch = "wasm32", test))]
+fn push_environment_reading_fact(
+    facts: &mut Vec<ResourceFactProjection>,
+    label: &'static str,
+    reading: Option<&EnvironmentMetricsReadingResponse>,
+) {
+    push_f64_fact(
+        facts,
+        label,
+        reading.and_then(EnvironmentMetricsReadingResponse::reading),
+    );
+}
+
+/// Pushes the environment-metrics power-limit control-excerpt set point as a
+/// fact; a missing control stays absent from the card.
+#[cfg(any(target_arch = "wasm32", test))]
+fn push_environment_control_fact(
+    facts: &mut Vec<ResourceFactProjection>,
+    label: &'static str,
+    control: Option<&EnvironmentMetricsControlResponse>,
+) {
+    push_f64_fact(
+        facts,
+        label,
+        control.and_then(EnvironmentMetricsControlResponse::set_point),
+    );
 }
 
 /// Facts for a §2.1 log-service card; the service-enabled flag renders as
@@ -16789,6 +17007,149 @@ mod tests {
         })
     }
 
+    fn network_device_function_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c3",
+                "odata_id": "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                "odata_type": "#NetworkDeviceFunction.v1_5_0.NetworkDeviceFunction",
+                "etag": "W/\"ndf-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Adapter One Function One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "network_device_function",
+                "details": {
+                    "net_dev_func_type": "Ethernet",
+                    "device_enabled": true,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn power_equipment_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c4",
+                "odata_id": "/redfish/v1/PowerEquipment/PowerShelves/1",
+                "odata_type": "#PowerDistribution.v1_4_0.PowerDistribution",
+                "etag": "W/\"power-shelf-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Shelf One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "power_equipment",
+                "details": {
+                    "equipment_type": "PowerShelf",
+                    "manufacturer": "Rutilus Test",
+                    "model": "PDU-30K",
+                    "part_number": "PDU-PART-1",
+                    "serial_number": "PDU-1",
+                    "version": "2.0",
+                    "firmware_version": "3.1.4",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn power_supply_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c5",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                "odata_type": "#PowerSupply.v1_5_0.PowerSupply",
+                "etag": "W/\"power-supply-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Supply One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "power_supply",
+                "details": {
+                    "power_supply_type": "AC",
+                    "power_capacity_watts": 1600.0,
+                    "manufacturer": "Rutilus Test",
+                    "model": "PSU-1600",
+                    "firmware_version": "1.0.0",
+                    "serial_number": "PSU-1",
+                    "part_number": "PSU-PART-1",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn environment_metrics_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c6",
+                "odata_id": "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                "odata_type": "#EnvironmentMetrics.v1_1_0.EnvironmentMetrics",
+                "etag": "W/\"env-metrics-1\""
+            },
+            "common": {
+                "id": "EnvironmentMetrics",
+                "name": "Environment Metrics",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "environment_metrics",
+                "details": {
+                    "temperature_celsius": {
+                        "data_source_uri": "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                        "reading": 27.5
+                    },
+                    "humidity_percent": null,
+                    "fan_speeds_percent": [
+                        {
+                            "data_source_uri": "/redfish/v1/Chassis/1/Sensors/Fan1",
+                            "reading": 45.0
+                        },
+                        {
+                            "data_source_uri": "/redfish/v1/Chassis/1/Sensors/Fan2",
+                            "reading": 50.0
+                        }
+                    ],
+                    "power_watts": null,
+                    "energyk_wh": null,
+                    "power_load_percent": null,
+                    "power_limit_watts": {
+                        "data_source_uri": "/redfish/v1/Chassis/1/Controls/PowerLimit",
+                        "set_point": 800.0
+                    },
+                    "dew_point_celsius": null,
+                    "absolute_humidity": null,
+                    "energy_joules": null,
+                    "ambient_temperature_celsius": null,
+                    "voltage": null,
+                    "current_amps": null
+                }
+            }
+        })
+    }
+
     /// The §2.1 capability ledger in design-document order (plus the 0.13.0
     /// compile-surface additions `ports`, `bmc-http`, and
     /// `update-service-deprecated`; only `ports` is new in 0.13.0): product
@@ -17989,6 +18350,156 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn network_device_function_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse =
+            serde_json::from_value(network_device_function_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Network device function");
+        assert_eq!(card.name, "Adapter One Function One");
+        assert_eq!(
+            card.source,
+            "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1"
+        );
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Function type",
+            value: "Ethernet".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Device enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn power_equipment_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse = serde_json::from_value(power_equipment_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Power equipment");
+        assert_eq!(card.name, "Power Shelf One");
+        assert_eq!(card.source, "/redfish/v1/PowerEquipment/PowerShelves/1");
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Equipment type",
+            value: "PowerShelf".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Rutilus Test".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PDU-30K".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Part number",
+            value: "PDU-PART-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Serial number",
+            value: "PDU-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Version",
+            value: "2.0".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Firmware version",
+            value: "3.1.4".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn power_supply_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse = serde_json::from_value(power_supply_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Power supply");
+        assert_eq!(card.name, "Power Supply One");
+        assert_eq!(
+            card.source,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Supply type",
+            value: "AC".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Capacity (W)",
+            value: "1600".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Rutilus Test".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PSU-1600".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Firmware version",
+            value: "1.0.0".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Serial number",
+            value: "PSU-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Part number",
+            value: "PSU-PART-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn environment_metrics_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse =
+            serde_json::from_value(environment_metrics_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Environment metrics");
+        assert_eq!(card.name, "Environment Metrics");
+        assert_eq!(card.source, "/redfish/v1/Chassis/1/EnvironmentMetrics");
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Temperature (C)",
+            value: "27.5".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Fan readings",
+            value: "2".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Power limit (W)",
+            value: "800".to_owned(),
+        }));
+        assert!(!card.facts.iter().any(|fact| fact.label == "Humidity (%)"));
+        assert!(!card.facts.iter().any(|fact| fact.label == "State"));
         Ok(())
     }
 
