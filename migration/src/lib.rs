@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
+//! # Bare-SQL boundary (§7.3)
+//!
+//! The migration crate is the only production code that may run raw SQL,
+//! and only for the `SQLite` DDL the `SeaQuery` builders cannot express (the
+//! DDL-only exception, §7.3 of the design document): `execute_unprepared`
+//! statements must start with `CREATE`, `ALTER`, `DROP`, or `PRAGMA`, and
+//! DML is forbidden — the rebuild data copies (`INSERT ... SELECT`) go
+//! through the query builder (`select_from`). `tests/bare_sql_gate.rs`
+//! enforces the boundary mechanically.
 
 use sea_orm_migration::prelude::*;
 

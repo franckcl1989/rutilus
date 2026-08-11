@@ -824,6 +824,20 @@ domain / application / web 不得依赖 sqlx
 
 正常业务 CRUD 和 Migration 不允许手写 SQL。
 
+### 例外：Migration 的 DDL-only 边界
+
+Migration 允许 `execute_unprepared` 执行 SeaQuery 无法表达的 SQLite DDL
+（`ALTER TABLE ... ADD COLUMN` 带 `CHECK`/`REFERENCES`、表重建的
+`CREATE`/`DROP`/`RENAME`、部分索引的 `WHERE` 子句等），且语句必须以
+`CREATE`/`ALTER`/`DROP`/`PRAGMA` 开头；禁止任何 DML
+（`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`VACUUM`/`REINDEX` 等）裸语句。
+表重建的数据搬迁（`INSERT ... SELECT`）通过 SeaQuery 查询构造器表达，
+不写裸 SQL。该边界由 `migration/tests/bare_sql_gate.rs` 机械检查
+（§19.4 门禁）。
+
+persistence 测试用 `PRAGMA` 模拟旧版本写入（升级场景），属测试例外，
+不进生产路径。
+
 ---
 
 ## 7.4 BMC 原始 HTTP 禁止策略
