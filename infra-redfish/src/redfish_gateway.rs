@@ -21657,6 +21657,25 @@ mod tests {
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
+    /// The request order of two consecutive Task polls: two complete Session
+    /// lifecycles, because each poll establishes and deletes its own
+    /// transient Session (§13.6) — a failed poll leaves no session state
+    /// behind for the next one.
+    const TASK_READ_RECOVERY_REQUEST_PATHS: [&str; 12] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TaskService/Tasks/1",
+        "/redfish/v1/SessionService/Sessions/1",
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/TaskService/Tasks/1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
     #[tokio::test]
     async fn reads_a_task_through_typed_navigation_with_session_token_auth()
     -> Result<(), Box<dyn Error>> {
@@ -21871,6 +21890,94 @@ mod tests {
             other => {
                 return Err(format!("an undecodable Task must be ReadFailed, got {other}").into());
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_disappeared_task_recovers_on_the_next_poll_after_a_bmc_restart()
+    -> Result<(), Box<dyn Error>> {
+        // A BMC restarting mid-update: the first poll's Task read 404s and
+        // the second recovers. The sequence pins the monitor's defer/recovery
+        // contract (`transient_read_failure_defers_without_any_side_effects`,
+        // task_monitor.rs) at the wire level: the failed poll changes nothing
+        // outside its own Session — the transient Session was deleted and no
+        // gateway state survives the failure — so the next poll starts from
+        // scratch and recovers.
+        let mut responses = session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[(
+                "404 Not Found",
+                "{\"error\":{\"code\":\"Base.1.0.ResourceMissing\",\"message\":\"The task was deleted\"}}",
+            )],
+        );
+        responses.extend(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[("200 OK", TASK_MONITOR_RUNNING_BODY)],
+        ));
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+        let task_uri = ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?;
+
+        // Poll 1: the Task is gone — the monitor's recovery-reverification
+        // signal (§13.6), never a verdict on the write itself.
+        match gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &task_uri,
+            )
+            .await
+        {
+            Err(TaskReadError::TaskGone { task_uri: gone, .. }) => {
+                assert_eq!(gone.as_str(), "/redfish/v1/TaskService/Tasks/1");
+            }
+            other => {
+                return Err(
+                    format!("a 404 Task read must surface as TaskGone, got {other:?}").into(),
+                );
+            }
+        }
+
+        // Poll 2: the BMC is back — the same read URI recovers through a
+        // brand-new Session, proving the failed poll left nothing behind.
+        let observation = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &task_uri,
+            )
+            .await?;
+        assert_eq!(observation.task_state(), Some("running"));
+        assert_eq!(
+            observation.task_uri().as_str(),
+            "/redfish/v1/TaskService/Tasks/1"
+        );
+
+        // Two complete Session lifecycles, one per poll: the second poll
+        // established and deleted its own brand-new Session.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), TASK_READ_RECOVERY_REQUEST_PATHS.len());
+        for (poll, lifecycle) in requests.chunks(6).enumerate() {
+            assert_session_requests(
+                lifecycle,
+                &[
+                    "/redfish/v1",
+                    "/redfish/v1/SessionService",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/SessionService/Sessions",
+                    "/redfish/v1/TaskService/Tasks/1",
+                    "/redfish/v1/SessionService/Sessions/1",
+                ],
+            )
+            .map_err(|source| {
+                std::io::Error::other(format!("poll {poll} Session lifecycle: {source}"))
+            })?;
         }
         Ok(())
     }
