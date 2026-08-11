@@ -89,8 +89,8 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | 限制 | 说明 | 事实来源 |
 |---|---|---|
 | 遥测保留期不可配置 | 7 天是产品常量（`TELEMETRY_RETENTION`）；"历史保留周期可配置"（§14.4）尚未实现为设置项，代码注释明确是 later iteration | `app/src/telemetry_sampler.rs` |
-| 事件监听器失败后不自动恢复 | 连续 10 次重连失败（预算约 4 分钟）后端点监听器标记 Failed 并退出；周期性重新拉起是 later iteration | `app/src/event_listener.rs` |
-| 事件监听按启动扫描拉起 | 启动时枚举全部端点拉起 SSE 监听；登记端点时懒启动是 later iteration | 同上 |
+| 事件监听器失败后不自动恢复 | 连续 10 次重连失败（预算约 4 分钟）后端点监听器标记 Failed 并退出；supervisor 周期重扫**刻意不**重新拉起 Failed 端点（重新拉起是 later iteration），Failed 状态在本次进程运行内保持终态，重启后由首轮重扫恢复 | `app/src/event_listener.rs` |
+| 事件监听懒启动已实现 | 监听器随登记端点存在性驱动（§14.4 EventService SSE）：supervisor 每 10 秒重扫登记集（`LISTENER_RECONCILE_INTERVAL`），首轮扫立即执行并拉起全部已登记端点（重启恢复），运行中登记的端点在其后 10 秒内自动拉起监听，端点离开登记集则停止其监听器（结构化 drain）；登记集枚举走轻量端点表查询（`store.list_endpoints()`，与遥测采样共用 `StandaloneEndpointLister`），不再是启动时的资源清单查询 | `app/src/event_listener.rs`；`app/src/standalone_runtime.rs` |
 | 日志设施范围受限 | 设计 §6.2 的 `tracing` + `tracing-subscriber` 已进入 workspace；app/application/platform 的运行诊断经 `tracing::error!`/`warn!` 记录，由 app 二进制在启动时初始化 stderr subscriber（`RUST_LOG` 过滤，默认 `info`）；**CLI 用户可见输出**（init 向导、backup 结果、doctor 报告、console 横幅、bootstrap code）仍为 `println!`（§7.6 用户信息与诊断信息分离），测试基础设施与测试内诊断（`test-support` mock、`infra-redfish` 测试）仍用 `eprintln!`（无 subscriber 上下文）；未使用 span/`#[instrument]`、无结构化 JSON 输出 | 根 `Cargo.toml`；`app/src/main.rs`；`app/src/event_listener.rs` 注释 |
 | `cargo audit` 独立门禁未启用 | advisory 扫描已由 `cargo deny check` 覆盖；独立 audit 门禁为后续工作 | `.github/workflows/ci.yml` 注释 |
 | CI 与发布目标差异 | CI 当前编译验证 linux-gnu / windows-msvc / darwin（x86_64）+ wasm32；musl、aarch64、ARM64、macOS Universal 2 合并构建尚未在 CI 验证 | `.github/workflows/ci.yml`；`deny.toml` |

@@ -341,7 +341,7 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 
 ### 7.1 事件
 
-- 每个已登记端点后台监听其 EventService SSE 流（`app/src/event_listener.rs`）；
+- 每个已登记端点后台监听其 EventService SSE 流（`app/src/event_listener.rs`）：启动时恢复全部已登记端点，运行中新登记的端点在 10 秒内自动拉起监听（懒启动），端点离开登记集则停止监听；
 - 支持订阅（创建/删除 EventDestination）与 SSE；记录事件来源，展示原始 MessageId 与 Severity（§14.4）；
 - 断线重连有界：指数退避从 1 秒翻倍至上限 60 秒，连续 10 次失败后该端点监听器标记为失败并退出（预算约 4 分钟，可吸收典型 BMC 重启）；
 - 一个端点的监听器失败不影响其他端点（失败隔离）；
