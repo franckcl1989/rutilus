@@ -1180,15 +1180,25 @@ pub(crate) enum SharedTelemetryRepositoryError {
     Endpoints(#[source] EndpointRepositoryError),
 }
 
-/// The §14.4 enrolled-endpoint listing of the sampling loop over the
-/// concrete Standalone composition.
+/// The §14.4 enrolled-endpoint listing shared by the sampling loop and the
+/// event-listener supervisor over the concrete Standalone composition.
 ///
 /// Lists through the store's endpoint-only listing — one light query per
-/// tick — instead of the resource-bearing inventory listing the event
-/// listeners use at startup.
+/// tick or sweep.
 struct StandaloneEndpointLister(Arc<StandaloneState>);
 
 impl telemetry_sampler::EndpointLister for StandaloneEndpointLister {
+    type Error = EndpointRepositoryError;
+
+    fn list_enrolled_endpoints(&self) -> BoundaryFuture<'_, Result<Vec<EndpointId>, Self::Error>> {
+        Box::pin(async move {
+            let endpoints = self.0.store.list_endpoints().await?;
+            Ok(endpoints.iter().map(Endpoint::id).collect())
+        })
+    }
+}
+
+impl event_listener::EndpointLister for StandaloneEndpointLister {
     type Error = EndpointRepositoryError;
 
     fn list_enrolled_endpoints(&self) -> BoundaryFuture<'_, Result<Vec<EndpointId>, Self::Error>> {
@@ -1640,13 +1650,13 @@ where
         Arc::clone(&services),
         Arc::clone(&gateway),
     ));
-    // §14.4: one EventService listener per enrolled endpoint. The 0.4.0
-    // cut is a startup sweep — a failed inventory listing starts with no
-    // listeners and records the failure; re-arming later is a later
-    // iteration.
+    // §14.4: one EventService listener per enrolled endpoint, reconciled
+    // against the enrolled set every LISTENER_RECONCILE_INTERVAL — the
+    // first sweep arms every endpoint enrolled before startup, a later
+    // sweep arms an endpoint enrolled mid-run and stops one that left the
+    // set, and a failed listing only skips the sweep.
     let mut listeners = tokio::spawn(run_event_listeners(
         stop_watch.clone(),
-        list_enrolled_endpoint_ids(services.as_ref()).await,
         Arc::clone(&services),
         Arc::clone(&gateway),
     ));
@@ -1713,41 +1723,24 @@ where
     }
 }
 
-/// Lists the ids of every enrolled endpoint for the §14.4 listeners.
-///
-/// # Why a failed listing starts with no listeners
-///
-/// The listing failure is recorded and the listeners simply do not start:
-/// a store that cannot list endpoints cannot serve the console either, and
-/// the listener sweep is re-attempted at the next process start. A later
-/// iteration can retry the sweep in place.
-async fn list_enrolled_endpoint_ids(state: &StandaloneState) -> Vec<EndpointId> {
-    match EndpointInventoryRepository::list_endpoint_inventory(state).await {
-        Ok(items) => items.iter().map(|item| item.endpoint().id()).collect(),
-        Err(error) => {
-            tracing::error!("could not list enrolled endpoints for event listeners: {error}");
-            Vec::new()
-        }
-    }
-}
-
 /// Assembles the §14.4 `EventService` listeners over the authenticated
-/// Standalone state and runs them until the stop watch fires.
+/// Standalone state and runs the reconciling supervisor until the stop
+/// watch fires.
 ///
 /// # Why the composition lives here
 ///
 /// Like [`run_operation_scheduler`]: the listeners compose the concrete
 /// `StandaloneState` (through the `EventIngestion` use case over its
-/// `EventRepository` role) and the `RedfishGateway` (through the
-/// [`StandaloneEventStream`] adapter), and the state type is private to this
+/// `EventRepository` role), the `RedfishGateway` (through the
+/// [`StandaloneEventStream`] adapter), and the enrolled-endpoint listing
+/// ([`StandaloneEndpointLister`]), and the state type is private to this
 /// module. The task owns its Arc clones, so the composition is `'static` and
-/// spawnable. The task returns when every per-endpoint listener has stopped
-/// (the stop signal) or given up (the bounded reconnect budget), and the
-/// runtime joins it before closing `SQLite` — no listener ever touches the
-/// store after shutdown begins.
+/// spawnable. The task returns when the stop signal fires, after every
+/// per-endpoint listener has drained (§7.8), and the runtime joins it before
+/// closing `SQLite` — no listener ever touches the store after shutdown
+/// begins.
 async fn run_event_listeners(
     stop: scheduler::StopWatch,
-    endpoint_ids: Vec<EndpointId>,
     state: Arc<StandaloneState>,
     gateway: Arc<RedfishGateway>,
 ) {
@@ -1758,14 +1751,16 @@ async fn run_event_listeners(
     let sink = Arc::new(EventIngestion::new(SharedEventRepository(Arc::clone(
         &state,
     ))));
-    let listeners = event_listener::EventListeners::start(
-        endpoint_ids,
-        &stop,
+    let lister = StandaloneEndpointLister(Arc::clone(&state));
+    event_listener::run(
+        stop,
+        &lister,
         &stream,
         &sink,
         event_listener::ReconnectPolicy::default(),
-    );
-    listeners.drain_all().await;
+        event_listener::LISTENER_RECONCILE_INTERVAL,
+    )
+    .await;
 }
 
 /// The §14.4 `EventStream` boundary over the concrete Standalone
@@ -1980,10 +1975,10 @@ async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
 
 /// Waits for the event-listener task and reports an unexpected failure.
 ///
-/// The listeners never return an error — each task exits on the stop signal
-/// or on a terminal reconnect give-up — so a `JoinError` means the wrapper
-/// panicked or was cancelled, a programming defect worth surfacing but not a
-/// blocker for the `SQLite` close that follows.
+/// The listener supervisor never returns an error — it exits on the stop
+/// signal, after every per-endpoint listener has drained — so a `JoinError`
+/// means the wrapper panicked or was cancelled, a programming defect worth
+/// surfacing but not a blocker for the `SQLite` close that follows.
 async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = listeners.await {
         tracing::error!("The event listener task failed: {join_error}");
