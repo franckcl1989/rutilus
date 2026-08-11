@@ -11,21 +11,22 @@ targets = [
 all-features = true
 
 [advisories]
-# cargo-audit also sees rust_decimal's inactive optional rkyv 0.7 lock entry.
-# RUSTSEC-2026-0235 is ignored only in the audit command after proving that
-# `cargo tree --workspace --target all -i rkyv` has no active dependency path.
 # nv-redfish 0.13.0 pins quick-xml 0.38.4 only in its CSDL build compiler.
-# RUSTSEC-2026-0194 and RUSTSEC-2026-0195 cannot process runtime, device, or
-# user-controlled XML; remove both exceptions as soon as upstream accepts
-# quick-xml 0.41 or later.
-# Leptos 0.8.20 transitively retains the unmaintained compile-time-only paste
-# and proc-macro-error2 crates, with no safe stable upgrade. Neither is linked
-# into the browser runtime; remove both exceptions when stable Leptos does.
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both patched in quick-xml >= 0.41.0)
+# cannot process runtime, device, or user-controlled XML. They are
+# deliberately NOT ignored: they stay visible as triggers for the upstream
+# quick-xml 0.41+ upgrade and clear once nv-redfish accepts it.
+# RUSTSEC-2026-0235: rkyv is an unactivated optional dependency of
+# rust_decimal; never compiled; lockfile noise (`cargo tree --workspace
+# --target all -i rkyv` has no active dependency path).
+# RUSTSEC-2024-0436: informational unmaintained; no fixed release; the
+# leptos 0.9 migration will resolve it.
+# RUSTSEC-2026-0173: same family as RUSTSEC-2024-0436 (informational
+# unmaintained, no fixed release); also resolved by the leptos 0.9 migration.
 ignore = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0173",
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0235",
 ]
 
 [licenses]
