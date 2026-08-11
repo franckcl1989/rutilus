@@ -25,7 +25,7 @@ use crate::{BootstrapCodeId, InstanceId, PrincipalId};
 
 /// The longest principal name the product records, matching the
 /// `principals.name` column width (64).
-const MAX_PRINCIPAL_NAME_CHARS: usize = 64;
+pub const MAX_PRINCIPAL_NAME_CHARS: usize = 64;
 
 /// A normalized, unique product user name (§16.1).
 ///

@@ -124,9 +124,9 @@ pub use totp::{
     TotpAuthenticatorError, TotpRestoreError, TotpState, TotpStateParseError, verify_totp_code,
 };
 pub use user::{
-    BootstrapCode, BootstrapCodeError, Principal, PrincipalName, PrincipalNameError,
-    PrincipalRestoreError, PrincipalState, PrincipalStateParseError, Role, RoleAssignment,
-    RoleParseError,
+    BootstrapCode, BootstrapCodeError, MAX_PRINCIPAL_NAME_CHARS, Principal, PrincipalName,
+    PrincipalNameError, PrincipalRestoreError, PrincipalState, PrincipalStateParseError, Role,
+    RoleAssignment, RoleParseError,
 };
 
 /// The execution boundary inside the single Rutilus binary.
