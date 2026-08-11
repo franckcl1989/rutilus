@@ -5,9 +5,10 @@
 //! picked up by the next tick, unlike the event listeners' startup sweep),
 //! samples every endpoint through the [`TelemetryDriver`] seam — the
 //! application [`TelemetrySampler`] use case over the stored-snapshot reader
-//! — and prunes the history older than [`TELEMETRY_RETENTION`] through the
-//! same seam. The listing failure aborts only the sweep, never the loop: the
-//! next tick retries.
+//! — and prunes the history older than the configured retention
+//! ([`TelemetryRetention`], default seven days) through the same seam. The
+//! listing failure aborts only the sweep, never the loop: the next tick
+//! retries.
 //!
 //! # Why sixty seconds
 //!
@@ -20,14 +21,14 @@
 //! scheduler's two-second tick stays reserved for operations, where a human
 //! waits on the latency.
 //!
-//! # Why the retention is a constant
+//! # Why the retention is a product option
 //!
 //! Design §14.4 requires the history retention to be configurable (历史保留
-//! 周期可配置); 0.4.0 realizes it as the [`TELEMETRY_RETENTION`] constant,
-//! and the configuration surface (the settings page of a later iteration)
-//! will pass the same constant through to the prune use case. The honest
-//! 0.4.0 position: the retention is a product constant, documented where an
-//! operator can find it, not yet a setting.
+//! 周期可配置). The configuration surface is the
+//! `--telemetry-retention-days` option of the `run` and `service` CLI
+//! subcommands (default 7 days, validated 1–365 by [`TelemetryRetention`]);
+//! the settings page of a later iteration will pass the same value through
+//! the same path.
 //!
 //! # Cancellation and drain (design §7.8)
 //!
@@ -47,7 +48,7 @@
 //! endpoint listing) aborts the tick, and the loop retries it on the next
 //! tick. The loop itself never panics: every fallible call is handled.
 
-use std::{error::Error, time::Duration};
+use std::{error::Error, fmt, time::Duration};
 
 use rutilus_application::{
     BoundaryFuture, Clock, EndpointSampling, MetricReportReader, TelemetryRepository,
@@ -74,20 +75,124 @@ use crate::scheduler::StopWatch;
 #[allow(clippy::duration_suboptimal_units)]
 pub(crate) const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long one series' samples are kept before the prune deletes them.
+/// The validated telemetry history retention window (design §14.4: 历史保留
+/// 周期可配置).
 ///
-/// # Why seven days
+/// One window is a whole number of days; the prune cutoff is `now - days`
+/// (the application use case subtracts the window from the product clock).
+/// The value is validated at the product boundary, so the runtime and the
+/// loop can assume a sane window and the CLI rejects the rest at parse time.
+///
+/// # Why the default is seven days
 ///
 /// A week of history at the sixty-second cadence is 10,080 samples per
 /// series — enough to see a trend across a maintenance cycle while keeping
-/// the `SQLite` store small. The §14.4 "历史保留周期可配置" requirement is
-/// realized as this constant in `0.4.0`; the settings surface (a later
-/// iteration) will pass the configured value through the same prune use
-/// case, and this constant is the documented default.
+/// the `SQLite` store small. The `--telemetry-retention-days` option
+/// defaults to this window, and the CLI help documents the default.
 ///
-/// The unit is the `time` crate's `Duration` because it feeds the prune use
-/// case's clock arithmetic (`OffsetDateTime::checked_sub`).
-pub(crate) const TELEMETRY_RETENTION: time::Duration = time::Duration::days(7);
+/// # Why the window is bounded
+///
+/// At least one day: a zero-day window would make the first prune tick
+/// erase the entire history — the §14.4 bounded-history promise inverted.
+/// At most 365 days: a year at the sixty-second cadence is 525,600 samples
+/// per series, and the §14.4 "不把产品变成通用时序数据库" promise keeps the
+/// store bounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TelemetryRetention {
+    days: u16,
+}
+
+impl TelemetryRetention {
+    /// The smallest valid window: one day.
+    pub const MIN_DAYS: u16 = 1;
+    /// The largest valid window: one year.
+    pub const MAX_DAYS: u16 = 365;
+    /// The default window: seven days (the pre-configuration product
+    /// constant).
+    pub const DEFAULT_DAYS: u16 = 7;
+
+    /// Validates one retention window in days.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryRetentionError::OutOfRange`] when `days` lies
+    /// outside the validated `MIN_DAYS..=MAX_DAYS` window.
+    pub fn try_new(days: u16) -> Result<Self, TelemetryRetentionError> {
+        if !(Self::MIN_DAYS..=Self::MAX_DAYS).contains(&days) {
+            return Err(TelemetryRetentionError::OutOfRange { days });
+        }
+        Ok(Self { days })
+    }
+
+    /// The window in whole days.
+    #[must_use]
+    pub const fn days(self) -> u16 {
+        self.days
+    }
+
+    /// The window as the `time` crate duration the prune use case consumes.
+    ///
+    /// The unit is the `time` crate's `Duration` because it feeds the prune
+    /// use case's clock arithmetic (`OffsetDateTime::checked_sub`).
+    #[must_use]
+    pub const fn as_duration(self) -> time::Duration {
+        time::Duration::days(self.days as i64)
+    }
+}
+
+impl Default for TelemetryRetention {
+    /// The seven-day product default.
+    ///
+    /// `DEFAULT_DAYS` lies inside the validated window — asserted by the
+    /// unit test below — so the default needs no fallible path; `try_new`
+    /// guards every other construction.
+    fn default() -> Self {
+        Self {
+            days: Self::DEFAULT_DAYS,
+        }
+    }
+}
+
+impl std::str::FromStr for TelemetryRetention {
+    type Err = TelemetryRetentionError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let days = text
+            .parse::<u16>()
+            .map_err(|_| TelemetryRetentionError::NotANumber {
+                value: text.to_owned(),
+            })?;
+        Self::try_new(days)
+    }
+}
+
+/// Why one retention value cannot be a telemetry history window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelemetryRetentionError {
+    /// The value is not a whole number of days.
+    NotANumber { value: String },
+    /// The value lies outside the validated day window.
+    OutOfRange { days: u16 },
+}
+
+impl fmt::Display for TelemetryRetentionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotANumber { value } => write!(
+                formatter,
+                "telemetry retention must be a whole number of days, got \"{value}\""
+            ),
+            Self::OutOfRange { days } => write!(
+                formatter,
+                "telemetry retention must be between {} and {} days, got {days}",
+                TelemetryRetention::MIN_DAYS,
+                TelemetryRetention::MAX_DAYS,
+            ),
+        }
+    }
+}
+
+impl Error for TelemetryRetentionError {}
 
 /// The record seam the sampling loop drives.
 ///
@@ -160,8 +265,9 @@ pub(crate) trait EndpointLister: Send + Sync {
 /// observed while waiting for the next tick and before starting a sweep, the
 /// in-flight sweep finishes before the loop exits (structured drain), and a
 /// failed sweep is recorded and retried on the next tick. The caller passes
-/// the retention — the loop's only product constant besides the interval —
-/// so tests can drive the cadence fast and the runtime owns the policy.
+/// the retention — the runtime's configured policy, defaulting to
+/// [`TelemetryRetention::default`] — so tests can drive the cadence fast and
+/// the runtime owns the policy.
 pub(crate) async fn run<Driver, Lister, Time>(
     mut stop: StopWatch,
     driver: &Driver,
@@ -241,6 +347,7 @@ mod tests {
         collections::HashMap,
         error::Error,
         fmt,
+        str::FromStr as _,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -270,6 +377,7 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct FakeDriver {
         calls: Arc<Mutex<Vec<DriverCall>>>,
+        prune_retentions: Arc<Mutex<Vec<time::Duration>>>,
         failures: Arc<Mutex<HashMap<EndpointId, usize>>>,
         gate: Option<Arc<Notify>>,
     }
@@ -295,6 +403,13 @@ mod tests {
 
         fn calls(&self) -> Vec<DriverCall> {
             self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn prune_retentions(&self) -> Vec<time::Duration> {
+            self.prune_retentions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
@@ -342,13 +457,17 @@ mod tests {
 
         fn prune_history(
             &self,
-            _retention: time::Duration,
+            retention: time::Duration,
         ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(DriverCall::Prune);
+                self.prune_retentions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(retention);
                 Ok(())
             })
         }
@@ -439,7 +558,7 @@ mod tests {
                 &loop_driver,
                 &loop_lister,
                 FAST_INTERVAL,
-                TELEMETRY_RETENTION,
+                TelemetryRetention::default().as_duration(),
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
             )
             .await;
@@ -502,7 +621,7 @@ mod tests {
                 &loop_driver,
                 &loop_lister,
                 FAST_INTERVAL,
-                TELEMETRY_RETENTION,
+                TelemetryRetention::default().as_duration(),
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
             )
             .await;
@@ -546,7 +665,7 @@ mod tests {
                 &loop_driver,
                 &loop_lister,
                 FAST_INTERVAL,
-                TELEMETRY_RETENTION,
+                TelemetryRetention::default().as_duration(),
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
             )
             .await;
@@ -604,7 +723,7 @@ mod tests {
                 &loop_driver,
                 &loop_lister,
                 StdDuration::from_secs(60),
-                TELEMETRY_RETENTION,
+                TelemetryRetention::default().as_duration(),
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
             )
             .await;
@@ -653,7 +772,7 @@ mod tests {
                 &loop_driver,
                 &loop_lister,
                 FAST_INTERVAL,
-                TELEMETRY_RETENTION,
+                TelemetryRetention::default().as_duration(),
                 FixedClock(OffsetDateTime::UNIX_EPOCH),
             )
             .await;
@@ -678,6 +797,114 @@ mod tests {
         assert!(
             driver.calls().contains(&DriverCall::Sample(endpoint_id)),
             "the recovered listing must dispatch the sweep"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_uses_the_retention_the_runtime_configured() -> Result<(), Box<dyn Error>> {
+        // The configuration surface (the run CLI option) ends at the
+        // loop's `retention` parameter; this test pins that the loop hands
+        // the configured window to the prune verbatim, so a configured
+        // retention changes the prune cutoff exactly as configured.
+        let driver = FakeDriver::default();
+        let lister = FakeLister::with_endpoints(Vec::new());
+        let loop_driver = driver.clone();
+        let loop_lister = lister.clone();
+        let (stop_signal, stop_watch) = StopSignal::new();
+        let configured = TelemetryRetention::try_new(3)?;
+
+        let task = tokio::spawn(async move {
+            run(
+                stop_watch,
+                &loop_driver,
+                &loop_lister,
+                FAST_INTERVAL,
+                configured.as_duration(),
+                FixedClock(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+        });
+        for _ in 0..200 {
+            if !driver.prune_retentions().is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        stop_signal.signal();
+        join_with_timeout(task).await?;
+
+        let retentions = driver.prune_retentions();
+        assert!(
+            !retentions.is_empty(),
+            "the configured retention must reach the prune"
+        );
+        assert!(
+            retentions
+                .iter()
+                .all(|retention| *retention == time::Duration::days(3)),
+            "every prune must carry the configured retention: {retentions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_defaults_to_the_seven_day_product_window() -> Result<(), Box<dyn Error>> {
+        let retention = TelemetryRetention::default();
+        assert_eq!(retention.days(), TelemetryRetention::DEFAULT_DAYS);
+        assert_eq!(retention.as_duration(), time::Duration::days(7));
+        assert_eq!(
+            retention,
+            TelemetryRetention::try_new(7)?,
+            "the default must lie inside the validated window"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_rejects_windows_that_would_erase_or_unbound_history() {
+        // Zero days makes the first prune tick erase the whole history
+        // (cutoff = now); more than a year unbounds the store — both invert
+        // the §14.4 bounded-history promise.
+        assert!(matches!(
+            TelemetryRetention::try_new(0),
+            Err(TelemetryRetentionError::OutOfRange { days: 0 })
+        ));
+        assert!(matches!(
+            TelemetryRetention::try_new(366),
+            Err(TelemetryRetentionError::OutOfRange { days: 366 })
+        ));
+        assert!(TelemetryRetention::try_new(1).is_ok());
+        assert!(TelemetryRetention::try_new(365).is_ok());
+    }
+
+    #[test]
+    fn retention_cli_text_must_be_whole_days_within_the_window() -> Result<(), Box<dyn Error>> {
+        // The CLI surface parses through `FromStr`; clap rejects the
+        // failures with the error's message.
+        assert_eq!(
+            TelemetryRetention::from_str("30")?,
+            TelemetryRetention::try_new(30)?
+        );
+        assert!(matches!(
+            TelemetryRetention::from_str("abc"),
+            Err(TelemetryRetentionError::NotANumber { .. })
+        ));
+        assert!(matches!(
+            TelemetryRetention::from_str("-1"),
+            Err(TelemetryRetentionError::NotANumber { .. })
+        ));
+        assert!(matches!(
+            TelemetryRetention::from_str("0"),
+            Err(TelemetryRetentionError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            TelemetryRetention::from_str("366"),
+            Err(TelemetryRetentionError::OutOfRange { .. })
+        ));
+        assert_eq!(
+            TelemetryRetentionError::OutOfRange { days: 0 }.to_string(),
+            "telemetry retention must be between 1 and 365 days, got 0"
         );
         Ok(())
     }

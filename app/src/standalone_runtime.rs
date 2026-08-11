@@ -68,7 +68,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ActiveCredentialResolverError, StandaloneUnlock, SystemClock, event_listener, scheduler,
-    telemetry_sampler,
+    telemetry_sampler::{self, TelemetryRetention},
 };
 
 /// Defensive upper bound for the in-memory recent-audit tail served by the
@@ -81,23 +81,34 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StandaloneRunOptions {
     open_browser: bool,
+    telemetry_retention: TelemetryRetention,
 }
 
 impl StandaloneRunOptions {
     #[must_use]
-    pub const fn new(open_browser: bool) -> Self {
-        Self { open_browser }
+    pub const fn new(open_browser: bool, telemetry_retention: TelemetryRetention) -> Self {
+        Self {
+            open_browser,
+            telemetry_retention,
+        }
     }
 
     #[must_use]
     pub const fn open_browser(self) -> bool {
         self.open_browser
     }
+
+    /// The configured telemetry history retention window (default seven
+    /// days); the background sampling loop prunes older history with it.
+    #[must_use]
+    pub const fn telemetry_retention(self) -> TelemetryRetention {
+        self.telemetry_retention
+    }
 }
 
 impl Default for StandaloneRunOptions {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(true, TelemetryRetention::default())
     }
 }
 
@@ -1556,6 +1567,7 @@ pub async fn run_initialized_standalone(
         run_background_services(
             Arc::clone(&instance.state),
             gateway,
+            options.telemetry_retention(),
             move |policy, stop_watch, scheduler_done_receiver| {
                 binding.serve_until(
                     options,
@@ -1598,6 +1610,10 @@ pub async fn run_initialized_standalone(
 /// plus the SCM stop watch for Windows services), and the same one-stop
 /// signal path stops every background task before the store closes.
 ///
+/// `retention` is the telemetry history window the sampling loop prunes
+/// with — the runtime's configured policy from the run options, so both
+/// postures honor the operator's `--telemetry-retention-days` value.
+///
 /// # Errors
 ///
 /// Returns [`StandaloneRunError`] when signal registration or HTTP serving
@@ -1606,6 +1622,7 @@ pub async fn run_initialized_standalone(
 pub(crate) async fn run_background_services<Server, Stop>(
     services: Arc<StandaloneState>,
     gateway: Arc<RedfishGateway>,
+    retention: TelemetryRetention,
     make_server: impl FnOnce(AuthPolicy, scheduler::StopWatch, oneshot::Receiver<()>) -> Server,
     stop: Stop,
 ) -> Result<(), StandaloneRunError>
@@ -1639,6 +1656,7 @@ where
     let mut sampler = tokio::spawn(run_telemetry_sampler(
         stop_watch.clone(),
         Arc::clone(&services),
+        retention,
     ));
     // The §16.2 loopback lifecycle: while an unconsumed bootstrap code
     // exists the console serves open (the first-run claim must be
@@ -1854,6 +1872,10 @@ enum StandaloneEventStreamError {
 /// Assembles the §14.4 telemetry sampling loop over the authenticated
 /// Standalone state and runs it until the stop watch fires.
 ///
+/// `retention` is the configured history window (default seven days) the
+/// prune uses; it comes from the run options, so the operator's
+/// `--telemetry-retention-days` value reaches the prune verbatim.
+///
 /// # Why the composition lives here
 ///
 /// Like [`run_operation_scheduler`]: the loop's sampler composes the
@@ -1864,7 +1886,11 @@ enum StandaloneEventStreamError {
 /// composition is `'static` and spawnable; it exits on the stop signal after
 /// its in-flight sweep finishes, and the runtime joins it before closing
 /// `SQLite`.
-async fn run_telemetry_sampler(stop: scheduler::StopWatch, state: Arc<StandaloneState>) {
+async fn run_telemetry_sampler(
+    stop: scheduler::StopWatch,
+    state: Arc<StandaloneState>,
+    retention: TelemetryRetention,
+) {
     // The reader borrows the state for the task's lifetime, and the store
     // role owns it through the Arc wrapper; the sampler's clock is the
     // product's `SystemClock`, so the sweep instant and the retention cutoff
@@ -1878,7 +1904,7 @@ async fn run_telemetry_sampler(stop: scheduler::StopWatch, state: Arc<Standalone
         &sampler,
         &lister,
         telemetry_sampler::TELEMETRY_SAMPLE_INTERVAL,
-        telemetry_sampler::TELEMETRY_RETENTION,
+        retention.as_duration(),
         SystemClock,
     )
     .await;
@@ -2144,7 +2170,7 @@ mod tests {
         let instance = StandaloneInstance::open(&paths, &unlock).await?;
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let server = tokio::spawn(binding.serve_until(
-            StandaloneRunOptions::new(false),
+            StandaloneRunOptions::new(false, TelemetryRetention::default()),
             DeploymentPosture::Standalone,
             AuthPolicy::Open,
             Arc::clone(&instance.state),
@@ -2188,9 +2214,21 @@ mod tests {
     }
 
     #[test]
-    fn standalone_options_default_to_browser_launch() {
+    fn standalone_options_default_to_browser_launch_and_seven_day_retention()
+    -> Result<(), Box<dyn Error>> {
         assert!(StandaloneRunOptions::default().open_browser());
-        assert!(!StandaloneRunOptions::new(false).open_browser());
+        assert!(!StandaloneRunOptions::new(false, TelemetryRetention::default()).open_browser());
+        // The configured retention rides in the options, so a configured
+        // `--telemetry-retention-days` reaches the background sampler.
+        assert_eq!(
+            StandaloneRunOptions::default().telemetry_retention().days(),
+            TelemetryRetention::DEFAULT_DAYS
+        );
+        assert_eq!(
+            StandaloneRunOptions::new(false, TelemetryRetention::try_new(3)?).telemetry_retention(),
+            TelemetryRetention::try_new(3)?
+        );
+        Ok(())
     }
 
     fn unlock(value: &str) -> Result<StandaloneUnlock, crate::StandaloneUnlockError> {
@@ -2209,7 +2247,12 @@ mod tests {
             Err(StandaloneInstanceError::NotInitialized)
         ));
         assert!(matches!(
-            run_initialized_standalone(&paths, &correct, StandaloneRunOptions::new(false)).await,
+            run_initialized_standalone(
+                &paths,
+                &correct,
+                StandaloneRunOptions::new(false, TelemetryRetention::default()),
+            )
+            .await,
             Err(StandaloneExecutionError::Open(
                 StandaloneInstanceError::NotInitialized
             ))

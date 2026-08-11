@@ -55,5 +55,6 @@ pub use standalone_runtime::{
     StandaloneInstanceError, StandaloneRunError, StandaloneRunOptions, console_stop_signal,
     run_initialized_standalone, run_standalone,
 };
+pub use telemetry_sampler::{TelemetryRetention, TelemetryRetentionError};
 pub use tls_material::TlsMaterialError;
 pub use x509::DerReadError;

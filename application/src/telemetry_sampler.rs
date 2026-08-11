@@ -1020,6 +1020,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_configured_retention_shifts_the_prune_cutoff() -> Result<(), Box<dyn Error>> {
+        // The §14.4 configurability contract: each configured window cuts
+        // the history at its own cutoff, so the product's configured value
+        // decides what history survives.
+        let now = instant(30);
+        let store = RecordingStore::new();
+        let sampler = TelemetrySampler::new(
+            FakeReader::with_reports(Vec::new()),
+            &store,
+            FixedClock(now),
+        );
+
+        sampler.prune_history(time::Duration::days(1)).await?;
+        sampler.prune_history(time::Duration::days(30)).await?;
+
+        assert_eq!(
+            store.prune_cutoffs(),
+            vec![
+                now - time::Duration::days(1),
+                now - time::Duration::days(30),
+            ],
+            "each configured retention must cut the history at its own cutoff"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_clock_jump_forward_moves_the_prune_cutoff_forward() -> Result<(), Box<dyn Error>> {
         // The product clock jumps forward (NTP correction, a missed tick):
         // the next prune derives its cutoff from the new instant, so the
