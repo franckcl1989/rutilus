@@ -22,6 +22,7 @@ mod event_ingestion;
 mod group_management;
 mod operation_executor;
 mod operation_submission;
+mod overview;
 mod resource_diagnostics;
 mod tag_management;
 mod task_monitor;
@@ -115,6 +116,12 @@ pub use event_ingestion::{
 pub use group_management::{GroupManagement, GroupManagementError, GroupRepository};
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
 pub use operation_submission::{OperationSubmission, SubmissionError};
+pub use overview::{
+    OVERVIEW_RECENT_EVENTS, OverviewAggregate, OverviewCapabilityCoverage,
+    OverviewEndpointCounts, OverviewFreshnessBucket, OverviewFreshnessCount, OverviewFirmwareSummary,
+    OverviewHealthCount, OverviewHealthLevel, OverviewQuery, OverviewQueryError,
+    OverviewVendorCount,
+};
 pub use resource_diagnostics::{
     ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
 };
