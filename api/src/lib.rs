@@ -8,14 +8,14 @@ use std::{fmt, num::NonZeroU64};
 // the domain's own surface exactly.
 pub use rutilus_domain::{
     AccountCommand, AccountId, AccountPassword, AccountUserName, BootCommand, BootSource,
-    BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateAccount,
-    CreateSubscription, DeleteAccount, DeleteSubscription, EraseToken, EraseType, EventCommand,
-    EventDestinationProtocol, EventType, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS,
-    MAX_ACCOUNT_USER_NAME_CHARS, MAX_ROLE_ID_CHARS, ManagerCommand, NvidiaDebugTokenCommand,
-    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
-    ProfileId, RedfishCommand, ResetKeysType, ResetType, RoleId, SecureBootCommand,
-    SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType, UpdateAccount,
-    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, ControlCommand,
+    CreateAccount, CreateSubscription, DeleteAccount, DeleteSubscription, EraseToken, EraseType,
+    EventCommand, EventDestinationProtocol, EventType, LogCommand, MAX_ACCOUNT_ID_CHARS,
+    MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS, MAX_ROLE_ID_CHARS, ManagerCommand,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OemCommand, ProfileFile, ProfileId, RedfishCommand, ResetKeysType, ResetType, RoleId,
+    SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType,
+    UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
