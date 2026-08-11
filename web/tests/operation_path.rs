@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     error::Error,
-    fmt,
+    fmt, io,
     num::NonZeroU64,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -29,20 +29,20 @@ use rutilus_application::{
     StoredCapability, TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation, BatchOperationId,
-    Credential, CredentialId, CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint,
-    EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event,
-    InstanceId, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-    PrincipalId, RedfishCommand, ResetType, ResourceODataId, ResourceSnapshot, SeriesKey,
-    SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsCertificate,
-    TlsTrust,
+    AccountCommand, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation,
+    BatchOperationId, Credential, CredentialId, CredentialUsername, CredentialVersionId,
+    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
+    EndpointDisplayName, EndpointId, Event, InstanceId, Operation, OperationId, OperationSource,
+    OperationState, OperationTarget, PrincipalId, RedfishCommand, ResetType, ResourceODataId,
+    ResourceSnapshot, SeriesKey, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
+    TelemetrySeriesId, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{
     AuditEventQuery, CenterEndpointView, CenterOperationRefusal, CenterOperationView,
     CenterServices, CenterSiteView, DispatchedCenterOperation, RegisteredCenterSite,
     WebProductInfo, router,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt as _;
@@ -744,6 +744,69 @@ async fn submits_an_operation_and_echoes_the_queued_projection() -> Result<(), B
             endpoint.id(),
             "the persisted target must bind the submitted endpoint"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn submits_an_account_operation_and_echoes_the_typed_command() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let router = test_router(MockServices::new(Arc::clone(&state)));
+
+    // An account creation rides the same typed command boundary as every
+    // other §7.5 family: the route persists the payload verbatim.
+    let response = post_json(
+        &router,
+        "/api/v1/operations",
+        json!({
+            "targets": [endpoint.id().to_string()],
+            "command": { "Account": { "CreateAccount": {
+                "user_name": "jane",
+                "password": "initial-secret",
+                "role_id": "Operator"
+            } } }
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let body = json_body(response).await?;
+    assert_eq!(
+        body["command"],
+        json!({ "Account": { "CreateAccount": {
+            "user_name": "jane",
+            "password": "initial-secret",
+            "role_id": "Operator"
+        } } })
+    );
+    assert_eq!(body["state"], "queued");
+
+    {
+        let state = state.lock().map_err(|_| MockError::Lock)?;
+        let operation_id = body["operation_id"]
+            .as_str()
+            .ok_or("submission must return an operation_id")?
+            .parse::<OperationId>()?;
+        let stored = state
+            .operations
+            .get(&operation_id)
+            .ok_or("the submitted operation must be persisted")?;
+        let RedfishCommand::Account(AccountCommand::CreateAccount(create)) = stored.command()
+        else {
+            return Err(io::Error::other(
+                "the persisted command must be the submitted account creation",
+            )
+            .into());
+        };
+        assert_eq!(create.user_name().as_str(), "jane");
+        assert_eq!(create.password().expose_secret(), "initial-secret");
+        assert_eq!(create.role_id().as_str(), "Operator");
     }
     Ok(())
 }
