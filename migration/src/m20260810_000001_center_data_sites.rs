@@ -63,6 +63,10 @@ impl MigrationTrait for Migration {
             .map(|_| ())
     }
 
+    // The down rebuild recreates three tables and copies their rows, so it
+    // exceeds the pedantic line budget (same exception as the family
+    // migrations' rebuilds).
+    #[allow(clippy::too_many_lines)]
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let connection = manager.get_connection();
         // `SQLite` cannot drop columns in place, so the down direction
@@ -82,10 +86,30 @@ impl MigrationTrait for Migration {
                  updated_at TEXT NOT NULL)",
             )
             .await?;
+        // The copies go through the SeaQuery builder (`INSERT ... SELECT` via
+        // `select_from`), so the rebuild's raw-SQL surface stays DDL-only —
+        // the §7.3 bare-SQL gate in `tests/bare_sql_gate.rs` enforces that.
         connection
-            .execute_unprepared(
-                "INSERT INTO endpoints_rebuild (id, display_name, created_at, updated_at) \
-                 SELECT id, display_name, created_at, updated_at FROM endpoints",
+            .execute(
+                &Query::insert()
+                    .into_table(EndpointShape::RebuildTable)
+                    .columns([
+                        EndpointShape::Id,
+                        EndpointShape::DisplayName,
+                        EndpointShape::CreatedAt,
+                        EndpointShape::UpdatedAt,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(EndpointShape::Id)
+                            .column(EndpointShape::DisplayName)
+                            .column(EndpointShape::CreatedAt)
+                            .column(EndpointShape::UpdatedAt)
+                            .from(EndpointShape::Table)
+                            .take(),
+                    )
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .take(),
             )
             .await?;
         connection
@@ -110,11 +134,34 @@ impl MigrationTrait for Migration {
             )
             .await?;
         connection
-            .execute_unprepared(
-                "INSERT INTO events_rebuild \
-                 (id, endpoint_id, message_id, severity, message, event_timestamp, observed_at, dedup_key) \
-                 SELECT id, endpoint_id, message_id, severity, message, event_timestamp, observed_at, dedup_key \
-                 FROM events",
+            .execute(
+                &Query::insert()
+                    .into_table(EventShape::RebuildTable)
+                    .columns([
+                        EventShape::Id,
+                        EventShape::EndpointId,
+                        EventShape::MessageId,
+                        EventShape::Severity,
+                        EventShape::Message,
+                        EventShape::EventTimestamp,
+                        EventShape::ObservedAt,
+                        EventShape::DedupKey,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(EventShape::Id)
+                            .column(EventShape::EndpointId)
+                            .column(EventShape::MessageId)
+                            .column(EventShape::Severity)
+                            .column(EventShape::Message)
+                            .column(EventShape::EventTimestamp)
+                            .column(EventShape::ObservedAt)
+                            .column(EventShape::DedupKey)
+                            .from(EventShape::Table)
+                            .take(),
+                    )
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .take(),
             )
             .await?;
         connection.execute_unprepared("DROP TABLE events").await?;
@@ -146,11 +193,34 @@ impl MigrationTrait for Migration {
             )
             .await?;
         connection
-            .execute_unprepared(
-                "INSERT INTO artifacts_rebuild \
-                 (id, name, size_bytes, sha256, state, uploaded_bytes, created_at, updated_at) \
-                 SELECT id, name, size_bytes, sha256, state, uploaded_bytes, created_at, updated_at \
-                 FROM artifacts",
+            .execute(
+                &Query::insert()
+                    .into_table(ArtifactShape::RebuildTable)
+                    .columns([
+                        ArtifactShape::Id,
+                        ArtifactShape::Name,
+                        ArtifactShape::SizeBytes,
+                        ArtifactShape::Sha256,
+                        ArtifactShape::State,
+                        ArtifactShape::UploadedBytes,
+                        ArtifactShape::CreatedAt,
+                        ArtifactShape::UpdatedAt,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(ArtifactShape::Id)
+                            .column(ArtifactShape::Name)
+                            .column(ArtifactShape::SizeBytes)
+                            .column(ArtifactShape::Sha256)
+                            .column(ArtifactShape::State)
+                            .column(ArtifactShape::UploadedBytes)
+                            .column(ArtifactShape::CreatedAt)
+                            .column(ArtifactShape::UpdatedAt)
+                            .from(ArtifactShape::Table)
+                            .take(),
+                    )
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .take(),
             )
             .await?;
         connection
@@ -164,4 +234,51 @@ impl MigrationTrait for Migration {
             .await
             .map(|_| ())
     }
+}
+
+/// The three §15.5 data-table shapes the down rebuild restores, each with
+/// the live table the copy reads from; the column variants are shared
+/// because both shapes carry the same columns.
+#[derive(DeriveIden)]
+enum EndpointShape {
+    #[sea_orm(iden = "endpoints")]
+    Table,
+    #[sea_orm(iden = "endpoints_rebuild")]
+    RebuildTable,
+    Id,
+    DisplayName,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum EventShape {
+    #[sea_orm(iden = "events")]
+    Table,
+    #[sea_orm(iden = "events_rebuild")]
+    RebuildTable,
+    Id,
+    EndpointId,
+    MessageId,
+    Severity,
+    Message,
+    EventTimestamp,
+    ObservedAt,
+    DedupKey,
+}
+
+#[derive(DeriveIden)]
+enum ArtifactShape {
+    #[sea_orm(iden = "artifacts")]
+    Table,
+    #[sea_orm(iden = "artifacts_rebuild")]
+    RebuildTable,
+    Id,
+    Name,
+    SizeBytes,
+    Sha256,
+    State,
+    UploadedBytes,
+    CreatedAt,
+    UpdatedAt,
 }

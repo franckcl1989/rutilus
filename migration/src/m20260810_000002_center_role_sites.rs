@@ -71,12 +71,30 @@ async fn rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                ON UPDATE CASCADE ON DELETE SET NULL)",
         )
         .await?;
+    // The copy goes through the SeaQuery builder (`INSERT ... SELECT` via
+    // `select_from`), so the rebuild's raw-SQL surface stays DDL-only — the
+    // §7.3 bare-SQL gate in `tests/bare_sql_gate.rs` enforces that.
     connection
-        .execute_unprepared(
-            "INSERT INTO role_assignments_rebuild \
-             (principal_id, role, assigned_by, assigned_at) \
-             SELECT principal_id, role, assigned_by, assigned_at \
-             FROM role_assignments",
+        .execute(
+            &Query::insert()
+                .into_table(RoleAssignmentShape::RebuildTable)
+                .columns([
+                    RoleAssignmentShape::PrincipalId,
+                    RoleAssignmentShape::Role,
+                    RoleAssignmentShape::AssignedBy,
+                    RoleAssignmentShape::AssignedAt,
+                ])
+                .select_from(
+                    Query::select()
+                        .column(RoleAssignmentShape::PrincipalId)
+                        .column(RoleAssignmentShape::Role)
+                        .column(RoleAssignmentShape::AssignedBy)
+                        .column(RoleAssignmentShape::AssignedAt)
+                        .from(RoleAssignmentShape::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
         )
         .await?;
     connection
@@ -86,4 +104,18 @@ async fn rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .execute_unprepared("ALTER TABLE role_assignments_rebuild RENAME TO role_assignments")
         .await
         .map(|_| ())
+}
+
+/// The two `role_assignments` shapes the rebuild alternates between; the
+/// column variants are shared because both shapes carry the same columns.
+#[derive(DeriveIden)]
+enum RoleAssignmentShape {
+    #[sea_orm(iden = "role_assignments")]
+    Table,
+    #[sea_orm(iden = "role_assignments_rebuild")]
+    RebuildTable,
+    PrincipalId,
+    Role,
+    AssignedBy,
+    AssignedAt,
 }

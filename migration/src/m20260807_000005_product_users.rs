@@ -441,7 +441,10 @@ enum RebuildDirection {
 /// change is a create-copy-drop-rename cycle with the indexes recreated
 /// after the rename. All statements run on the migration's transaction (see
 /// [`Migration::use_transaction`]), so a failure leaves the old table
-/// untouched.
+/// untouched. The copy steps enumerate every column of both shapes in the
+/// insert and select lists, so the function exceeds the pedantic line
+/// budget (same exception as the family migrations' rebuilds).
+#[allow(clippy::too_many_lines)]
 async fn rebuild_audit_events(
     manager: &SchemaManager<'_>,
     direction: RebuildDirection,
@@ -449,18 +452,66 @@ async fn rebuild_audit_events(
     let connection = manager.get_connection();
     if direction == RebuildDirection::Forward {
         connection.execute_unprepared(AUDIT_EVENTS_NEW_DDL).await?;
+        // The copy goes through the SeaQuery builder (`INSERT ... SELECT` via
+        // `select_from`), so the rebuild's raw-SQL surface stays DDL-only —
+        // the §7.3 bare-SQL gate in `tests/bare_sql_gate.rs` enforces that.
+        // The `actor_principal_id` column did not exist in the 0.5 shape, so
+        // the forward copy writes `NULL` there.
         connection
-            .execute_unprepared(
-                "INSERT INTO audit_events_new \
-                 (id, operation_id, event_sequence, actor, actor_principal_id, origin, \
-                  target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
-                  credential_id, trust_mode, row_count, permission, action, redfish_operation, \
-                  outcome, progress, failure, verification, occurred_at) \
-                 SELECT id, operation_id, event_sequence, actor, NULL, origin, \
-                  target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
-                  credential_id, trust_mode, row_count, permission, action, redfish_operation, \
-                  outcome, progress, failure, verification, occurred_at \
-                 FROM audit_events",
+            .execute(
+                &Query::insert()
+                    .into_table(AuditEventShape::NewTable)
+                    .columns([
+                        AuditEventShape::Id,
+                        AuditEventShape::OperationId,
+                        AuditEventShape::EventSequence,
+                        AuditEventShape::Actor,
+                        AuditEventShape::ActorPrincipalId,
+                        AuditEventShape::Origin,
+                        AuditEventShape::TargetKind,
+                        AuditEventShape::TargetEndpointId,
+                        AuditEventShape::TargetEndpointAddress,
+                        AuditEventShape::ParameterKind,
+                        AuditEventShape::CredentialId,
+                        AuditEventShape::TrustMode,
+                        AuditEventShape::RowCount,
+                        AuditEventShape::Permission,
+                        AuditEventShape::Action,
+                        AuditEventShape::RedfishOperation,
+                        AuditEventShape::Outcome,
+                        AuditEventShape::Progress,
+                        AuditEventShape::Failure,
+                        AuditEventShape::Verification,
+                        AuditEventShape::OccurredAt,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(AuditEventShape::Id)
+                            .column(AuditEventShape::OperationId)
+                            .column(AuditEventShape::EventSequence)
+                            .column(AuditEventShape::Actor)
+                            .expr(Expr::val(None::<&str>))
+                            .column(AuditEventShape::Origin)
+                            .column(AuditEventShape::TargetKind)
+                            .column(AuditEventShape::TargetEndpointId)
+                            .column(AuditEventShape::TargetEndpointAddress)
+                            .column(AuditEventShape::ParameterKind)
+                            .column(AuditEventShape::CredentialId)
+                            .column(AuditEventShape::TrustMode)
+                            .column(AuditEventShape::RowCount)
+                            .column(AuditEventShape::Permission)
+                            .column(AuditEventShape::Action)
+                            .column(AuditEventShape::RedfishOperation)
+                            .column(AuditEventShape::Outcome)
+                            .column(AuditEventShape::Progress)
+                            .column(AuditEventShape::Failure)
+                            .column(AuditEventShape::Verification)
+                            .column(AuditEventShape::OccurredAt)
+                            .from(AuditEventShape::Table)
+                            .take(),
+                    )
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .take(),
             )
             .await?;
         connection
@@ -471,17 +522,58 @@ async fn rebuild_audit_events(
             .execute_unprepared(AUDIT_EVENTS_ORIGINAL_DDL)
             .await?;
         connection
-            .execute_unprepared(
-                "INSERT INTO audit_events_old \
-                 (id, operation_id, event_sequence, actor, origin, \
-                  target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
-                  credential_id, trust_mode, row_count, permission, action, redfish_operation, \
-                  outcome, progress, failure, verification, occurred_at) \
-                 SELECT id, operation_id, event_sequence, actor, origin, \
-                  target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
-                  credential_id, trust_mode, row_count, permission, action, redfish_operation, \
-                  outcome, progress, failure, verification, occurred_at \
-                 FROM audit_events",
+            .execute(
+                &Query::insert()
+                    .into_table(AuditEventShape::OldTable)
+                    .columns([
+                        AuditEventShape::Id,
+                        AuditEventShape::OperationId,
+                        AuditEventShape::EventSequence,
+                        AuditEventShape::Actor,
+                        AuditEventShape::Origin,
+                        AuditEventShape::TargetKind,
+                        AuditEventShape::TargetEndpointId,
+                        AuditEventShape::TargetEndpointAddress,
+                        AuditEventShape::ParameterKind,
+                        AuditEventShape::CredentialId,
+                        AuditEventShape::TrustMode,
+                        AuditEventShape::RowCount,
+                        AuditEventShape::Permission,
+                        AuditEventShape::Action,
+                        AuditEventShape::RedfishOperation,
+                        AuditEventShape::Outcome,
+                        AuditEventShape::Progress,
+                        AuditEventShape::Failure,
+                        AuditEventShape::Verification,
+                        AuditEventShape::OccurredAt,
+                    ])
+                    .select_from(
+                        Query::select()
+                            .column(AuditEventShape::Id)
+                            .column(AuditEventShape::OperationId)
+                            .column(AuditEventShape::EventSequence)
+                            .column(AuditEventShape::Actor)
+                            .column(AuditEventShape::Origin)
+                            .column(AuditEventShape::TargetKind)
+                            .column(AuditEventShape::TargetEndpointId)
+                            .column(AuditEventShape::TargetEndpointAddress)
+                            .column(AuditEventShape::ParameterKind)
+                            .column(AuditEventShape::CredentialId)
+                            .column(AuditEventShape::TrustMode)
+                            .column(AuditEventShape::RowCount)
+                            .column(AuditEventShape::Permission)
+                            .column(AuditEventShape::Action)
+                            .column(AuditEventShape::RedfishOperation)
+                            .column(AuditEventShape::Outcome)
+                            .column(AuditEventShape::Progress)
+                            .column(AuditEventShape::Failure)
+                            .column(AuditEventShape::Verification)
+                            .column(AuditEventShape::OccurredAt)
+                            .from(AuditEventShape::Table)
+                            .take(),
+                    )
+                    .map_err(|error| DbErr::Custom(error.to_string()))?
+                    .take(),
             )
             .await?;
         connection
@@ -821,4 +913,38 @@ enum BootstrapCode {
     CreatedAt,
     UsedAt,
     UsedBy,
+}
+
+/// The two `audit_events` shapes the rebuild alternates between, plus the
+/// live `audit_events` table the copy reads from; the column variants are
+/// shared because both shapes carry the same columns.
+#[derive(DeriveIden)]
+enum AuditEventShape {
+    #[sea_orm(iden = "audit_events")]
+    Table,
+    #[sea_orm(iden = "audit_events_new")]
+    NewTable,
+    #[sea_orm(iden = "audit_events_old")]
+    OldTable,
+    Id,
+    OperationId,
+    EventSequence,
+    Actor,
+    ActorPrincipalId,
+    Origin,
+    TargetKind,
+    TargetEndpointId,
+    TargetEndpointAddress,
+    ParameterKind,
+    CredentialId,
+    TrustMode,
+    RowCount,
+    Permission,
+    Action,
+    RedfishOperation,
+    Outcome,
+    Progress,
+    Failure,
+    Verification,
+    OccurredAt,
 }

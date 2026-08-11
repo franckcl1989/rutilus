@@ -466,6 +466,11 @@ mod tests {
         // so the bypass is deterministic (the `PRAGMA
         // ignore_check_constraints` precedent in the event repository
         // tests).
+        //
+        // Test-scope exception to the §7.3 bare-SQL ban: the PRAGMA only
+        // simulates the foreign-build write above; no production path runs
+        // raw SQL (the `tests/bare_sql_gate.rs` gate in the migration crate
+        // pins persistence/src to PRAGMA-only).
         let database_path = store.database_path();
         let normalized_path = database_path.to_string_lossy().replace('\\', "/");
         let mut options = ConnectOptions::new(format!("sqlite://{normalized_path}?mode=rwc"));

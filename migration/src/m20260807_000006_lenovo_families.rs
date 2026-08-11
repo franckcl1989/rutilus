@@ -236,20 +236,61 @@ async fn create_resource_tables_with(
         )
         .await?;
 
+    // The copy statements go through the SeaQuery builder (`INSERT ... SELECT`
+    // via `select_from`), so the rebuild's raw-SQL surface stays DDL-only —
+    // the §7.3 bare-SQL gate in `tests/bare_sql_gate.rs` enforces that.
     rebuild
         .get_connection()
-        .execute_unprepared(
-            "INSERT INTO resources_new (id, endpoint_id, odata_id, feature, created_at) \
-                 SELECT id, endpoint_id, odata_id, feature, created_at FROM resources",
+        .execute(
+            &Query::insert()
+                .into_table(ResourceNew::Table)
+                .columns([
+                    ResourceNew::Id,
+                    ResourceNew::EndpointId,
+                    ResourceNew::OdataId,
+                    ResourceNew::Feature,
+                    ResourceNew::CreatedAt,
+                ])
+                .select_from(
+                    Query::select()
+                        .column(Resource::Id)
+                        .column(Resource::EndpointId)
+                        .column(Resource::OdataId)
+                        .column(Resource::Feature)
+                        .column(Resource::CreatedAt)
+                        .from(Resource::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
         )
         .await?;
     rebuild
         .get_connection()
-        .execute_unprepared(
-            "INSERT INTO resource_snapshots_new \
-                 (resource_id, generation, odata_type, etag, typed_payload_json, observed_at) \
-                 SELECT resource_id, generation, odata_type, etag, typed_payload_json, observed_at \
-                 FROM resource_snapshots",
+        .execute(
+            &Query::insert()
+                .into_table(ResourceSnapshotNew::Table)
+                .columns([
+                    ResourceSnapshotNew::ResourceId,
+                    ResourceSnapshotNew::Generation,
+                    ResourceSnapshotNew::OdataType,
+                    ResourceSnapshotNew::Etag,
+                    ResourceSnapshotNew::TypedPayloadJson,
+                    ResourceSnapshotNew::ObservedAt,
+                ])
+                .select_from(
+                    Query::select()
+                        .column(ResourceSnapshot::ResourceId)
+                        .column(ResourceSnapshot::Generation)
+                        .column(ResourceSnapshot::OdataType)
+                        .column(ResourceSnapshot::Etag)
+                        .column(ResourceSnapshot::TypedPayloadJson)
+                        .column(ResourceSnapshot::ObservedAt)
+                        .from(ResourceSnapshot::Table)
+                        .take(),
+                )
+                .map_err(|error| DbErr::Custom(error.to_string()))?
+                .take(),
         )
         .await?;
     // The child is dropped first, so the cascade that fires when the old
@@ -310,9 +351,23 @@ enum Endpoint {
 enum Resource {
     #[sea_orm(iden = "resources")]
     Table,
+    Id,
     EndpointId,
     OdataId,
     Feature,
+    CreatedAt,
+}
+
+#[derive(DeriveIden)]
+enum ResourceSnapshot {
+    #[sea_orm(iden = "resource_snapshots")]
+    Table,
+    ResourceId,
+    Generation,
+    OdataType,
+    Etag,
+    TypedPayloadJson,
+    ObservedAt,
 }
 
 #[derive(DeriveIden)]

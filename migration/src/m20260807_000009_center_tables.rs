@@ -177,8 +177,9 @@ async fn create_center_bindings(manager: &SchemaManager<'_>) -> Result<(), DbErr
 
     // The single-center-binding rule (D6): at most one active (pending or
     // bound) binding per site. `SQLite` cannot express a partial unique
-    // index through the SeaQuery index builder, so the WHERE clause is DDL
-    // like the rebuild migrations' copy statements.
+    // index through the SeaQuery index builder, so the WHERE clause is raw
+    // DDL like the CHECK-widening `ALTER`s of the rebuild migrations (the
+    // §7.3 DDL-only exception).
     manager
         .get_connection()
         .execute_unprepared(
