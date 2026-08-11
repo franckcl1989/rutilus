@@ -520,7 +520,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_hostname_mismatch_on_an_otherwise_trusted_certificate()
     -> Result<(), Box<dyn Error>> {
-        let server = TestTlsServer::start(1).await?;
+        // The shared test server's certificate covers the numeric loopback;
+        // this test must see the hostname check fail, so it serves a
+        // certificate that does not cover the address it connects to.
+        let server = TestTlsServer::start_with_versions_and_sans(
+            1,
+            rustls::DEFAULT_VERSIONS,
+            vec![String::from("localhost")],
+        )
+        .await?;
         let mut roots = RootCertStore::empty();
         roots.add(server.certificate.clone())?;
         let probe =
@@ -567,7 +575,11 @@ mod tests {
         });
         let probe = test_probe(DEFAULT_CONNECT_TIMEOUT, Duration::from_millis(10))?;
 
-        let result = probe.probe(&endpoint_address(socket, "localhost")?).await;
+        // Connect through the numeric IPv4 loopback the listener binds:
+        // `localhost` can resolve to `::1` on Windows, which the IPv4-only
+        // listener refuses and turns the expected handshake timeout into a
+        // plain connection error.
+        let result = probe.probe(&endpoint_address(socket, "127.0.0.1")?).await;
 
         assert!(matches!(
             result,
@@ -705,6 +717,16 @@ mod tests {
         Ok(())
     }
 
+    /// The subject alternative names of the scripted TLS server's leaf
+    /// certificate: the DNS name the certificate has always carried, plus
+    /// the numeric IPv4 loopback the tests connect through.
+    ///
+    /// The endpoint address must be the numeric loopback, never `localhost`:
+    /// Windows can resolve `localhost` to `::1`, which the IPv4-only listener
+    /// refuses, and the refused connection turns an expected handshake
+    /// timeout into a plain connection error.
+    const TEST_SERVER_CERTIFICATE_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
+
     struct TestTlsServer {
         address: EndpointAddress,
         socket: SocketAddr,
@@ -725,8 +747,26 @@ mod tests {
             connections: usize,
             versions: &[&'static SupportedProtocolVersion],
         ) -> Result<Self, Box<dyn Error>> {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed([String::from("localhost")])?;
+            Self::start_with_versions_and_sans(
+                connections,
+                versions,
+                TEST_SERVER_CERTIFICATE_SANS
+                    .iter()
+                    .map(|sans| String::from(*sans))
+                    .collect(),
+            )
+            .await
+        }
+
+        /// Starts the scripted TLS server with an explicit certificate
+        /// subject alternative name list, for tests that must provoke a
+        /// hostname mismatch against the served identity.
+        async fn start_with_versions_and_sans(
+            connections: usize,
+            versions: &[&'static SupportedProtocolVersion],
+            sans: Vec<String>,
+        ) -> Result<Self, Box<dyn Error>> {
+            let CertifiedKey { cert, signing_key } = generate_simple_self_signed(sans)?;
             let certificate = cert.der().clone();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -739,7 +779,7 @@ mod tests {
             let acceptor = TlsAcceptor::from(Arc::new(config));
             let task = tokio::spawn(run_test_server(listener, acceptor, connections));
             Ok(Self {
-                address: endpoint_address(socket, "localhost")?,
+                address: endpoint_address(socket, "127.0.0.1")?,
                 socket,
                 certificate,
                 task,
