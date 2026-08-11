@@ -13,12 +13,15 @@ all-features = true
 [advisories]
 # nv-redfish 0.13.0 pins quick-xml 0.38.4 only in its CSDL build compiler.
 # RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (both patched in quick-xml >= 0.41.0)
-# cannot process runtime, device, or user-controlled XML. They are
-# deliberately NOT ignored: they stay visible as triggers for the upstream
-# quick-xml 0.41+ upgrade and clear once nv-redfish accepts it.
-# RUSTSEC-2026-0235: rkyv is an unactivated optional dependency of
-# rust_decimal; never compiled; lockfile noise (`cargo tree --workspace
-# --target all -i rkyv` has no active dependency path).
+# cannot process runtime, device, or user-controlled XML. D1 assessed the
+# actual risk as low (build-time only, trusted input, csdl-compiler never
+# calls NsReader), so they are ignored -- but each entry carries a trigger
+# note: delete it and upgrade nv-redfish once upstream ships a csdl-compiler
+# with quick-xml >= 0.41.0.
+# RUSTSEC-2026-0235 was removed from this list: rkyv is an unactivated
+# optional dependency of rust_decimal, never compiled, and unreachable in the
+# cargo-deny graph (`cargo tree --workspace --target all -i rkyv` prints
+# nothing) -- lockfile noise. Re-register it if cargo-audit is enabled later.
 # RUSTSEC-2024-0436: informational unmaintained; no fixed release; the
 # leptos 0.9 migration will resolve it.
 # RUSTSEC-2026-0173: same family as RUSTSEC-2024-0436 (informational
@@ -26,7 +29,8 @@ all-features = true
 ignore = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0173",
-    "RUSTSEC-2026-0235",
+    { id = "RUSTSEC-2026-0194", reason = "TRIGGER: delete this entry and upgrade nv-redfish once upstream csdl-compiler accepts quick-xml >= 0.41.0. Here quick-xml 0.38.4 only compiles trusted CSDL input in nv-redfish's build compiler; it never processes runtime, device, or user-controlled XML and csdl-compiler never calls NsReader (D1: actual risk low)." },
+    { id = "RUSTSEC-2026-0195", reason = "TRIGGER: delete this entry and upgrade nv-redfish once upstream csdl-compiler accepts quick-xml >= 0.41.0. Here quick-xml 0.38.4 only compiles trusted CSDL input in nv-redfish's build compiler; it never processes runtime, device, or user-controlled XML and csdl-compiler never calls NsReader (D1: actual risk low)." },
 ]
 
 [licenses]
@@ -69,6 +73,7 @@ skip = [
     { crate = "hashbrown@0.15.5", reason = "prost-build's petgraph pins the 0.15 generation while SQLx uses 0.16/0.17; this is build-time only" },
     { crate = "hashbrown@0.16.1", reason = "SQLx 0.9 currently uses two non-compatible hashbrown generations internally" },
     { crate = "heck@0.4.1", reason = "SeaORM 2.0 macros have not fully converged on heck 0.5" },
+    { crate = "sha1@0.10.7", reason = "tokio-tungstenite 0.24 pins sha1 0.10 (via tungstenite 0.24, used by the app and test-support WebSocket stack) while rutilus-domain TOTP uses the 0.11 generation; the tokio-tungstenite 0.30 upgrade removes this" },
     { crate = "syn@2.0.119", reason = "URL/ICU macros have not fully converged on syn 3; this is build-time only" },
     { crate = "thiserror@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },
     { crate = "thiserror-impl@1.0.69", reason = "Leptos server_fn still uses gloo-net's legacy error generation while Rutilus and current Leptos internals use thiserror 2" },

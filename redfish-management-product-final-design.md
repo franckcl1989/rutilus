@@ -67,7 +67,7 @@
 
 ## 2.1 当前事实基线
 
-截至 **2026 年 8 月 4 日**，`nv-redfish` 开发基线（`NvRedfishDevelopmentBaseline`）为 **0.13.0**，发布于 2026 年 8 月 4 日；**0.14.2** 为已知更新正式版本，在 0.8.0 能力冻结评审时评估是否跟进。它是模块化、按 Cargo feature 编译的 Redfish 客户端栈，不启用任何默认 feature；`std-redfish` 提供较广的标准 Redfish Schema 面，OEM 能力则通过独立 feature 启用。
+截至本文档修订时，`nv-redfish` 开发基线（`NvRedfishDevelopmentBaseline`）为 **0.13.0**，发布于 2026 年 8 月 4 日；**0.14.2**（2026 年 8 月 10 日发布）为已知更新正式版本，在 0.8.0 能力冻结评审时评估是否跟进。它是模块化、按 Cargo feature 编译的 Redfish 客户端栈，不启用任何默认 feature；`std-redfish` 提供较广的标准 Redfish Schema 面，OEM 能力则通过独立 feature 启用。
 
 当前标准功能 feature 包括：
 

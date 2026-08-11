@@ -100,8 +100,11 @@ jobs:
 
       # §19.4: cargo deny. Official cargo-deny action (pinned to the version
       # verified locally against deny.toml: `cargo deny check` -> all of
-      # advisories/bans/licenses/sources ok); the action caches the advisory
-      # database on top of swatinem/rust-cache above.
+      # advisories/bans/licenses/sources ok). Advisories stay green via the
+      # two quick-xml ignores (RUSTSEC-2026-0194/0195) whose trigger notes
+      # gate the nv-redfish quick-xml 0.41+ upgrade, and bans stay green via
+      # the sha1 0.10 skip (tokio-tungstenite 0.24); the action caches the
+      # advisory database on top of swatinem/rust-cache above.
       - name: Deny checks
         uses: embarkstudios/cargo-deny-action@v2
         with:
