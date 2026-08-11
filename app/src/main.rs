@@ -187,8 +187,23 @@ enum ServiceCommand {
     },
 }
 
+/// Initializes the §6.2 diagnostic logging: a `fmt` subscriber writing to
+/// stderr, filtered by the `RUST_LOG` environment variable (defaulting to
+/// `info` when unset or invalid). Diagnostics therefore never mix with the
+/// CLI's user-facing stdout output (§7.6 user information vs. diagnostic
+/// information separation).
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
@@ -537,8 +552,8 @@ async fn run_windows_service(
     control.finish();
     match dispatch.await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("The service dispatcher failed: {error}"),
-        Err(error) => eprintln!("The service dispatcher task failed: {error}"),
+        Ok(Err(error)) => tracing::error!("The service dispatcher failed: {error}"),
+        Err(error) => tracing::error!("The service dispatcher task failed: {error}"),
     }
     result
 }
