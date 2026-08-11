@@ -342,6 +342,12 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
             | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. }
             | CoreResourceDetailsResponse::OemLenovoSecurityService { .. }
+            | CoreResourceDetailsResponse::OemAmiServiceRoot { .. }
+            | CoreResourceDetailsResponse::OemAmiConfigBmc { .. }
+            | CoreResourceDetailsResponse::OemHpeILoServiceExt { .. }
+            | CoreResourceDetailsResponse::OemHpeManager { .. }
+            | CoreResourceDetailsResponse::OemLiteOnPowerSupply { .. }
+            | CoreResourceDetailsResponse::OemDeltaPowerSupply { .. }
             | CoreResourceDetailsResponse::Processor { .. }
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
@@ -554,7 +560,13 @@ fn oem_resource_card(
         | CoreResourceDetailsResponse::OemNvidiaPsuState { .. }
         | CoreResourceDetailsResponse::OemNvidiaPsuRedundancy { .. }
         | CoreResourceDetailsResponse::OemNvidiaManagedEntity { .. }
-        | CoreResourceDetailsResponse::OemLenovoSecurityService { .. } => Some(
+        | CoreResourceDetailsResponse::OemLenovoSecurityService { .. }
+        | CoreResourceDetailsResponse::OemAmiServiceRoot { .. }
+        | CoreResourceDetailsResponse::OemAmiConfigBmc { .. }
+        | CoreResourceDetailsResponse::OemHpeILoServiceExt { .. }
+        | CoreResourceDetailsResponse::OemHpeManager { .. }
+        | CoreResourceDetailsResponse::OemLiteOnPowerSupply { .. }
+        | CoreResourceDetailsResponse::OemDeltaPowerSupply { .. } => Some(
             CoreResourceCardProjection::from_resource(endpoint_id, resource),
         ),
         CoreResourceDetailsResponse::ServiceRoot { .. }
@@ -657,6 +669,22 @@ fn card_facts(
         }
         CoreResourceDetailsResponse::OemLenovoSecurityService { .. } => {
             oem_lenovo_security_service_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemAmiServiceRoot { .. } => {
+            oem_ami_service_root_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemAmiConfigBmc { .. } => {
+            oem_ami_config_bmc_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemHpeILoServiceExt { .. } => {
+            oem_hpe_ilo_service_ext_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemHpeManager { .. } => oem_hpe_manager_card_facts(resource),
+        CoreResourceDetailsResponse::OemLiteOnPowerSupply { .. } => {
+            oem_liteon_power_supply_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::OemDeltaPowerSupply { .. } => {
+            oem_delta_power_supply_card_facts(resource)
         }
         CoreResourceDetailsResponse::Processor { .. } => processor_card_facts(resource),
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
@@ -2377,6 +2405,215 @@ fn oem_lenovo_security_service_card_facts(
     let mut facts = Vec::new();
     push_fact(&mut facts, "Firmware rollback", fw_rollback.as_deref());
     ("Lenovo Security Service", facts)
+}
+
+/// The §12.2 AMI `AmiServiceRoot` OEM card facts: the Redfish Technology
+/// Pack version, kept verbatim per §12.3. The optional value renders only
+/// when the endpoint published the property.
+///
+/// The dispatcher guarantees this receives the `OemAmiServiceRoot` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_ami_service_root_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemAmiServiceRoot { rtp_version } = resource else {
+        return ("AMI Service Root", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Redfish Technology Pack version",
+        rtp_version.as_deref(),
+    );
+    ("AMI Service Root", facts)
+}
+
+/// The §12.2 AMI `ConfigBmc` OEM card facts: the four BIOS lockout/lockdown
+/// states, each the vendor's enum spelling kept verbatim per §12.3 (e.g.
+/// `Enable`, `Disable`, or `UnsupportedValue` for a value this build cannot
+/// classify). The optional values render only when the document published
+/// the property.
+///
+/// The dispatcher guarantees this receives the `OemAmiConfigBmc` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_ami_config_bmc_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemAmiConfigBmc {
+        lockout_host_control,
+        lockout_bios_variable_write_mode,
+        lockdown_bios_settings_change,
+        lockdown_bios_upgrade_downgrade,
+    } = resource
+    else {
+        return ("AMI Config BMC", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Host control lockout",
+        lockout_host_control.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        "BIOS variable write lockout",
+        lockout_bios_variable_write_mode.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        "BIOS settings-change lockdown",
+        lockdown_bios_settings_change.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        "BIOS upgrade/downgrade lockdown",
+        lockdown_bios_upgrade_downgrade.as_deref(),
+    );
+    ("AMI Config BMC", facts)
+}
+
+/// The §12.2 HPE `HpeiLoServiceExt` OEM card facts: the iLO manager type and
+/// firmware version of the first `Manager` entry, kept verbatim per §12.3
+/// (e.g. `iLO 5`). The optional values render only when the endpoint
+/// published the properties.
+///
+/// The dispatcher guarantees this receives the `OemHpeILoServiceExt` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_hpe_ilo_service_ext_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemHpeILoServiceExt {
+        manager_type,
+        manager_firmware_version,
+    } = resource
+    else {
+        return ("HPE iLO Service Extension", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Manager type", manager_type.as_deref());
+    push_fact(
+        &mut facts,
+        "Manager firmware version",
+        manager_firmware_version.as_deref(),
+    );
+    ("HPE iLO Service Extension", facts)
+}
+
+/// The §12.2 HPE `HpeiLo` OEM card facts: the host-side virtual NIC support
+/// state. The optional value renders only when the endpoint published the
+/// property.
+///
+/// The dispatcher guarantees this receives the `OemHpeManager` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_hpe_manager_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemHpeManager {
+        virtual_nic_enabled,
+    } = resource
+    else {
+        return ("HPE iLO Manager", Vec::new());
+    };
+    let mut facts = Vec::new();
+    if let Some(virtual_nic_enabled) = virtual_nic_enabled {
+        facts.push(ResourceFactProjection {
+            label: "Virtual NIC enabled",
+            value: virtual_nic_enabled.to_string(),
+        });
+    }
+    ("HPE iLO Manager", facts)
+}
+
+/// The §12.2 `LiteOn` power-supply OEM card facts: the `PowerSupplyType`
+/// enum spelling kept verbatim per §12.3, the numeric `PowerCapacityWatts`,
+/// and the hardware identity texts and `Status`. The optional values render
+/// only when the endpoint published the properties.
+///
+/// The dispatcher guarantees this receives the `OemLiteOnPowerSupply`
+/// variant; the fallback keeps a stable empty facts list instead of
+/// panicking if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_liteon_power_supply_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemLiteOnPowerSupply {
+        power_supply_type,
+        power_capacity_watts,
+        manufacturer,
+        model,
+        firmware_version,
+        serial_number,
+        part_number,
+        status,
+    } = resource
+    else {
+        return ("LiteOn Power Supply", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(
+        &mut facts,
+        "Power supply type",
+        power_supply_type.as_deref(),
+    );
+    if let Some(power_capacity_watts) = power_capacity_watts {
+        facts.push(ResourceFactProjection {
+            label: "Power capacity (watts)",
+            value: power_capacity_watts.to_string(),
+        });
+    }
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("LiteOn Power Supply", facts)
+}
+
+/// The §12.2 Delta power-supply OEM card facts: the `Power` flag and the
+/// numeric `FanSpeedTarget`, the extension's authoritative readings kept
+/// verbatim per §12.3. The optional values render only when the endpoint
+/// published the properties.
+///
+/// The dispatcher guarantees this receives the `OemDeltaPowerSupply` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn oem_delta_power_supply_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::OemDeltaPowerSupply {
+        power,
+        fan_speed_target,
+    } = resource
+    else {
+        return ("Delta Power Supply", Vec::new());
+    };
+    let mut facts = Vec::new();
+    if let Some(power) = power {
+        facts.push(ResourceFactProjection {
+            label: "Power",
+            value: power.to_string(),
+        });
+    }
+    if let Some(fan_speed_target) = fan_speed_target {
+        facts.push(ResourceFactProjection {
+            label: "Fan speed target",
+            value: fan_speed_target.to_string(),
+        });
+    }
+    ("Delta Power Supply", facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -18391,6 +18628,150 @@ mod tests {
         })
     }
 
+    fn oem_ami_service_root_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e6",
+                "odata_id": "/redfish/v1/Oem/Ami",
+                "odata_type": "#AmiServiceRoot.v1_0_0.AmiServiceRoot",
+                "etag": "W/\"root-1\""
+            },
+            "common": {
+                "id": "RootService",
+                "name": "Root Service"
+            },
+            "resource": {
+                "resource_type": "oem_ami_service_root",
+                "details": {
+                    "rtp_version": "1.2.3"
+                }
+            }
+        })
+    }
+
+    fn oem_ami_config_bmc_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e7",
+                "odata_id": "/redfish/v1/Managers/1/Oem/ConfigBMC",
+                "odata_type": "#ConfigBMC.v1_0_0.ConfigBMC",
+                "etag": "W/\"ami-config-bmc-1\""
+            },
+            "common": {
+                "id": "ConfigBMC",
+                "name": "ConfigBMC"
+            },
+            "resource": {
+                "resource_type": "oem_ami_config_bmc",
+                "details": {
+                    "lockout_host_control": "Enable",
+                    "lockout_bios_variable_write_mode": "Disable",
+                    "lockdown_bios_settings_change": "Enable",
+                    "lockdown_bios_upgrade_downgrade": "Disable"
+                }
+            }
+        })
+    }
+
+    fn oem_hpe_ilo_service_ext_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e8",
+                "odata_id": "/redfish/v1/Oem/Hpe",
+                "odata_type": "#HpeiLoServiceExt.v1_0_0.HpeiLoServiceExt",
+                "etag": "W/\"root-1\""
+            },
+            "common": {
+                "id": "RootService",
+                "name": "Root Service"
+            },
+            "resource": {
+                "resource_type": "oem_hpe_i_lo_service_ext",
+                "details": {
+                    "manager_type": "iLO 5",
+                    "manager_firmware_version": "2.44"
+                }
+            }
+        })
+    }
+
+    fn oem_hpe_manager_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789e9",
+                "odata_id": "/redfish/v1/Managers/1/Oem/Hpe",
+                "odata_type": "#HpeiLo.v1_0_0.HpeiLo",
+                "etag": "W/\"manager-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Manager One"
+            },
+            "resource": {
+                "resource_type": "oem_hpe_manager",
+                "details": {
+                    "virtual_nic_enabled": true
+                }
+            }
+        })
+    }
+
+    fn oem_liteon_power_supply_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789ea",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
+                "odata_type": "#LiteonPowerSupply.v1_0_0.LiteonPowerSupply",
+                "etag": "W/\"liteon-psu-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Supply 1",
+                "description": "LiteOn power supply"
+            },
+            "resource": {
+                "resource_type": "oem_lite_on_power_supply",
+                "details": {
+                    "power_supply_type": "AC",
+                    "power_capacity_watts": 2200.0,
+                    "manufacturer": "LITE-ON TECHNOLOGY CORP.",
+                    "model": "PS-2200",
+                    "firmware_version": "1.02",
+                    "serial_number": "LN1234",
+                    "part_number": "LTP-2200",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn oem_delta_power_supply_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789eb",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
+                "odata_type": "#PowerSupply.v1_6_0.PowerSupply",
+                "etag": "W/\"delta-psu-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Supply 1",
+                "description": "Delta power supply"
+            },
+            "resource": {
+                "resource_type": "oem_delta_power_supply",
+                "details": {
+                    "power": true,
+                    "fan_speed_target": 50
+                }
+            }
+        })
+    }
+
     fn oem_nvidia_system_config_profile_resource() -> serde_json::Value {
         json!({
             "source": {
@@ -22399,6 +22780,144 @@ mod tests {
         assert!(security_service.facts.contains(&ResourceFactProjection {
             label: "Firmware rollback",
             value: "Enabled".to_owned(),
+        }));
+        Ok(())
+    }
+
+    // The six 0.5 OEM read families are asserted in one test so the full
+    // fact surface stays one contract; the six card projections exceed the
+    // pedantic line budget, so the lint is scoped here exactly like the
+    // other OEM card-form tests.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn oem_section_derives_the_card_form_from_landed_oem_read_families()
+    -> Result<(), Box<dyn Error>> {
+        // The api contract has landed the six 0.5 OEM read families
+        // (`oem-ami`, `oem-hpe`, `oem-liteon`, and `oem-delta`), so the
+        // snapshots derive the data-card form through the wire projection,
+        // not by direct construction.
+        let inventory: EndpointResourceInventoryResponse = serde_json::from_value(json!({
+            "endpoint": {
+                "endpoint_id": "01989abc-def0-7abc-8def-0123456789af",
+                "display_name": "Rack E BMC",
+                "address": "https://192.0.2.14/",
+                "tls_trust_mode": "pinned_certificate",
+                "created_at": "2026-08-05T09:10:11Z",
+                "updated_at": "2026-08-05T09:12:13Z"
+            },
+            "snapshot": {
+                "state": "current",
+                "details": {
+                    "generation": 7,
+                    "observed_at": "2026-08-05T09:12:13Z",
+                    "resources": [
+                        oem_ami_service_root_resource(),
+                        oem_ami_config_bmc_resource(),
+                        oem_hpe_ilo_service_ext_resource(),
+                        oem_hpe_manager_resource(),
+                        oem_liteon_power_supply_resource(),
+                        oem_delta_power_supply_resource()
+                    ]
+                }
+            }
+        }))?;
+        let card = EndpointCardProjection::from(&inventory);
+        let OemSectionProjection::Available { cards } = card.oem_section else {
+            return Err("the OEM read families must derive the OEM card form".into());
+        };
+        assert_eq!(cards.len(), 6);
+        // The AMI service-root card keeps the Service Root identity and the
+        // `RtpVersion` text verbatim per §12.3.
+        let ami_root = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Oem/Ami")
+            .ok_or("the AMI service-root card must exist")?;
+        assert_eq!(ami_root.type_label, "AMI Service Root");
+        assert_eq!(ami_root.name, "Root Service");
+        assert!(ami_root.facts.contains(&ResourceFactProjection {
+            label: "Redfish Technology Pack version",
+            value: "1.2.3".to_owned(),
+        }));
+        // The `ConfigBmc` card derives its identity from the `@odata.id`
+        // final segment and keeps the four lockout/lockdown spellings
+        // verbatim.
+        let config_bmc = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/Oem/ConfigBMC")
+            .ok_or("the AMI ConfigBMC card must exist")?;
+        assert_eq!(config_bmc.type_label, "AMI Config BMC");
+        assert_eq!(config_bmc.name, "ConfigBMC");
+        assert!(config_bmc.facts.contains(&ResourceFactProjection {
+            label: "Host control lockout",
+            value: "Enable".to_owned(),
+        }));
+        assert!(config_bmc.facts.contains(&ResourceFactProjection {
+            label: "BIOS upgrade/downgrade lockdown",
+            value: "Disable".to_owned(),
+        }));
+        // The HPE service-root card keeps the first `Manager` entry's texts
+        // verbatim.
+        let hpe_root = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Oem/Hpe")
+            .ok_or("the HPE service-extension card must exist")?;
+        assert!(hpe_root.facts.contains(&ResourceFactProjection {
+            label: "Manager type",
+            value: "iLO 5".to_owned(),
+        }));
+        assert!(hpe_root.facts.contains(&ResourceFactProjection {
+            label: "Manager firmware version",
+            value: "2.44".to_owned(),
+        }));
+        // The HPE manager card keeps the `VirtualNICEnabled` boolean.
+        let hpe_manager = cards
+            .iter()
+            .find(|card| card.source == "/redfish/v1/Managers/1/Oem/Hpe")
+            .ok_or("the HPE manager card must exist")?;
+        assert_eq!(hpe_manager.type_label, "HPE iLO Manager");
+        assert!(hpe_manager.facts.contains(&ResourceFactProjection {
+            label: "Virtual NIC enabled",
+            value: "true".to_owned(),
+        }));
+        // The `LiteOn` supply card keeps the typed power-supply identity
+        // under its synthetic storage key (distinct from the supply
+        // document's own identity).
+        let liteon = cards
+            .iter()
+            .find(|card| {
+                card.source == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn"
+                    && card.type_label == "LiteOn Power Supply"
+            })
+            .ok_or("the LiteOn supply card must exist")?;
+        assert!(liteon.facts.contains(&ResourceFactProjection {
+            label: "Power supply type",
+            value: "AC".to_owned(),
+        }));
+        assert!(liteon.facts.contains(&ResourceFactProjection {
+            label: "Power capacity (watts)",
+            value: "2200".to_owned(),
+        }));
+        assert!(liteon.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "LITE-ON TECHNOLOGY CORP.".to_owned(),
+        }));
+        // The Delta supply card keeps the `deltaenergysystems` flags
+        // verbatim under its own synthetic storage key.
+        let delta = cards
+            .iter()
+            .find(|card| {
+                card.source
+                    == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems"
+                    && card.type_label == "Delta Power Supply"
+            })
+            .ok_or("the Delta supply card must exist")?;
+        assert!(delta.facts.contains(&ResourceFactProjection {
+            label: "Power",
+            value: "true".to_owned(),
+        }));
+        assert!(delta.facts.contains(&ResourceFactProjection {
+            label: "Fan speed target",
+            value: "50".to_owned(),
         }));
         Ok(())
     }

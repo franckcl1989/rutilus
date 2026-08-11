@@ -1208,9 +1208,6 @@ where
             )
             | EndpointResourceInventoryQueryError::Projection { .. },
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
-        Err(EndpointResourceInventoryQueryError::NotYetProjectable { .. }) => {
-            return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
-        }
     };
     let Ok(response) = project_endpoint_resources(&inventory) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -3839,6 +3836,10 @@ fn project_core_resource(resource: &CoreResourceSummary) -> CoreResourceResponse
     )
 }
 
+// The dispatcher walks every §2.1 family in one switch; the pedantic line
+// budget is exceeded by the family count, so the lint is scoped here
+// exactly like the enrollment counter.
+#[allow(clippy::too_many_lines)]
 fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
     match details {
         CoreResourceDetails::ServiceRoot { .. } => project_service_root_details(details),
@@ -3893,6 +3894,20 @@ fn project_core_resource_details(details: &CoreResourceDetails) -> CoreResourceD
         }
         CoreResourceDetails::OemLenovoSecurityService { .. } => {
             project_oem_lenovo_security_service_details(details)
+        }
+        CoreResourceDetails::OemAmiServiceRoot { .. } => {
+            project_oem_ami_service_root_details(details)
+        }
+        CoreResourceDetails::OemAmiConfigBmc { .. } => project_oem_ami_config_bmc_details(details),
+        CoreResourceDetails::OemHpeILoServiceExt { .. } => {
+            project_oem_hpe_ilo_service_ext_details(details)
+        }
+        CoreResourceDetails::OemHpeManager { .. } => project_oem_hpe_manager_details(details),
+        CoreResourceDetails::OemLiteOnPowerSupply { .. } => {
+            project_oem_liteon_power_supply_details(details)
+        }
+        CoreResourceDetails::OemDeltaPowerSupply { .. } => {
+            project_oem_delta_power_supply_details(details)
         }
         CoreResourceDetails::Processor { .. } => project_processor_details(details),
         CoreResourceDetails::Memory { .. } => project_memory_details(details),
@@ -4575,6 +4590,166 @@ fn project_oem_lenovo_security_service_details(
     };
     CoreResourceDetailsResponse::OemLenovoSecurityService {
         fw_rollback: fw_rollback.clone(),
+    }
+}
+
+/// Projects the §11.5 AMI `AmiServiceRoot` segment into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemAmiServiceRoot` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_ami_service_root_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemAmiServiceRoot { rtp_version } = details else {
+        return CoreResourceDetailsResponse::OemAmiServiceRoot { rtp_version: None };
+    };
+    CoreResourceDetailsResponse::OemAmiServiceRoot {
+        rtp_version: rtp_version.clone(),
+    }
+}
+
+/// Projects the §11.5 AMI `ConfigBmc` document into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemAmiConfigBmc` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_ami_config_bmc_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemAmiConfigBmc {
+        lockout_host_control,
+        lockout_bios_variable_write_mode,
+        lockdown_bios_settings_change,
+        lockdown_bios_upgrade_downgrade,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemAmiConfigBmc {
+            lockout_host_control: None,
+            lockout_bios_variable_write_mode: None,
+            lockdown_bios_settings_change: None,
+            lockdown_bios_upgrade_downgrade: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemAmiConfigBmc {
+        lockout_host_control: lockout_host_control.clone(),
+        lockout_bios_variable_write_mode: lockout_bios_variable_write_mode.clone(),
+        lockdown_bios_settings_change: lockdown_bios_settings_change.clone(),
+        lockdown_bios_upgrade_downgrade: lockdown_bios_upgrade_downgrade.clone(),
+    }
+}
+
+/// Projects the §11.5 HPE `HpeiLoServiceExt` segment into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemHpeILoServiceExt` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_hpe_ilo_service_ext_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemHpeILoServiceExt {
+        manager_type,
+        manager_firmware_version,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemHpeILoServiceExt {
+            manager_type: None,
+            manager_firmware_version: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemHpeILoServiceExt {
+        manager_type: manager_type.clone(),
+        manager_firmware_version: manager_firmware_version.clone(),
+    }
+}
+
+/// Projects the §11.5 HPE `HpeiLo` segment into the shared wire contract.
+///
+/// The dispatcher guarantees this receives the `OemHpeManager` variant; the
+/// fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_hpe_manager_details(details: &CoreResourceDetails) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemHpeManager {
+        virtual_nic_enabled,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemHpeManager {
+            virtual_nic_enabled: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemHpeManager {
+        virtual_nic_enabled: *virtual_nic_enabled,
+    }
+}
+
+/// Projects the §11.5 `LiteOn` power-supply family into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemLiteOnPowerSupply`
+/// variant; the fallback keeps a stable empty projection instead of
+/// panicking if that contract is ever violated.
+fn project_oem_liteon_power_supply_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemLiteOnPowerSupply {
+        power_supply_type,
+        power_capacity_watts,
+        manufacturer,
+        model,
+        firmware_version,
+        serial_number,
+        part_number,
+        status,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemLiteOnPowerSupply {
+            power_supply_type: None,
+            power_capacity_watts: None,
+            manufacturer: None,
+            model: None,
+            firmware_version: None,
+            serial_number: None,
+            part_number: None,
+            status: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemLiteOnPowerSupply {
+        power_supply_type: power_supply_type.clone(),
+        power_capacity_watts: *power_capacity_watts,
+        manufacturer: manufacturer.clone(),
+        model: model.clone(),
+        firmware_version: firmware_version.clone(),
+        serial_number: serial_number.clone(),
+        part_number: part_number.clone(),
+        status: status.as_ref().map(project_resource_status),
+    }
+}
+
+/// Projects the §11.5 Delta power-supply family into the shared wire
+/// contract.
+///
+/// The dispatcher guarantees this receives the `OemDeltaPowerSupply` variant;
+/// the fallback keeps a stable empty projection instead of panicking if that
+/// contract is ever violated.
+fn project_oem_delta_power_supply_details(
+    details: &CoreResourceDetails,
+) -> CoreResourceDetailsResponse {
+    let CoreResourceDetails::OemDeltaPowerSupply {
+        power,
+        fan_speed_target,
+    } = details
+    else {
+        return CoreResourceDetailsResponse::OemDeltaPowerSupply {
+            power: None,
+            fan_speed_target: None,
+        };
+    };
+    CoreResourceDetailsResponse::OemDeltaPowerSupply {
+        power: *power,
+        fan_speed_target: *fan_speed_target,
     }
 }
 
@@ -6113,6 +6288,115 @@ mod tests {
         Ok(())
     }
 
+    // The six 0.5 OEM read families are asserted in one contract so the full
+    // wire surface stays one place; the six snapshot fixtures exceed the
+    // pedantic line budget, so the lint is scoped here exactly like the
+    // other fixture-sequence tests.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn exposes_the_six_oem_read_families() -> Result<(), Box<dyn Error>> {
+        let item = oem_six_families_inventory_item()?;
+        let endpoint_id = item.endpoint().id();
+        let response = test_router_with(Ok(vec![item]))
+            .oneshot(
+                Request::get(format!("/api/v1/endpoints/{endpoint_id}/resources"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let resources = body["snapshot"]["details"]["resources"]
+            .as_array()
+            .ok_or("resources must be an array")?;
+        assert_eq!(resources.len(), 7);
+        assert_eq!(resources[0]["resource"]["resource_type"], "service_root");
+        // The inventory orders resources by `@odata.id`, so each family is
+        // resolved by its source identity instead of its position.
+        let by_source = |odata_id: &str| {
+            resources
+                .iter()
+                .find(|resource| resource["source"]["odata_id"] == odata_id)
+                .ok_or_else(|| format!("the {odata_id} resource must exist"))
+        };
+        // The AMI service-root segment keeps the Service Root's own identity
+        // and carries the `RtpVersion` text verbatim (§12.3).
+        let ami_root = by_source("/redfish/v1/Oem/Ami")?;
+        assert_eq!(
+            ami_root["resource"]["resource_type"],
+            "oem_ami_service_root"
+        );
+        assert_eq!(ami_root["resource"]["details"]["rtp_version"], "1.2.3");
+        // The `ConfigBmc` schema models no common identity, so the common id
+        // is the `@odata.id` final segment; the four lockout/lockdown
+        // spellings stay verbatim.
+        let config_bmc = by_source("/redfish/v1/Managers/1/Oem/ConfigBMC")?;
+        assert_eq!(
+            config_bmc["resource"]["resource_type"],
+            "oem_ami_config_bmc"
+        );
+        assert_eq!(config_bmc["common"]["id"], "ConfigBMC");
+        assert_eq!(
+            config_bmc["resource"]["details"]["lockout_host_control"],
+            "Enable"
+        );
+        assert_eq!(
+            config_bmc["resource"]["details"]["lockout_bios_variable_write_mode"],
+            "Disable"
+        );
+        assert_eq!(
+            config_bmc["resource"]["details"]["lockdown_bios_settings_change"],
+            "Enable"
+        );
+        assert_eq!(
+            config_bmc["resource"]["details"]["lockdown_bios_upgrade_downgrade"],
+            "Disable"
+        );
+        // The HPE service-root segment keeps the Service Root's own identity
+        // and carries the first `Manager` entry's texts verbatim.
+        let hpe_root = by_source("/redfish/v1/Oem/Hpe")?;
+        assert_eq!(
+            hpe_root["resource"]["resource_type"],
+            "oem_hpe_i_lo_service_ext"
+        );
+        assert_eq!(hpe_root["resource"]["details"]["manager_type"], "iLO 5");
+        assert_eq!(
+            hpe_root["resource"]["details"]["manager_firmware_version"],
+            "2.44"
+        );
+        // The HPE manager segment keeps the Manager's own identity and
+        // carries the `VirtualNICEnabled` boolean.
+        let hpe_manager = by_source("/redfish/v1/Managers/1/Oem/Hpe")?;
+        assert_eq!(hpe_manager["resource"]["resource_type"], "oem_hpe_manager");
+        assert_eq!(
+            hpe_manager["resource"]["details"]["virtual_nic_enabled"],
+            true
+        );
+        // The `LiteOn` supply carries the typed power-supply identity with
+        // the numeric capacity and the `Status` summary, under its synthetic
+        // storage key (distinct from the supply document's own identity).
+        let liteon = by_source("/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn")?;
+        assert_eq!(
+            liteon["resource"]["resource_type"],
+            "oem_lite_on_power_supply"
+        );
+        assert_eq!(liteon["resource"]["details"]["power_supply_type"], "AC");
+        assert_eq!(
+            liteon["resource"]["details"]["power_capacity_watts"],
+            2200.0
+        );
+        assert_eq!(liteon["resource"]["details"]["status"]["health"], "OK");
+        // The Delta supply carries the `deltaenergysystems` flags verbatim,
+        // under its own synthetic storage key.
+        let delta = by_source(
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
+        )?;
+        assert_eq!(delta["resource"]["resource_type"], "oem_delta_power_supply");
+        assert_eq!(delta["resource"]["details"]["power"], true);
+        assert_eq!(delta["resource"]["details"]["fan_speed_target"], 50);
+        Ok(())
+    }
+
     // The 157-line test exceeds the pedantic line budget because the whole
     // NVIDIA wire surface (the system chain plus the power chains) is
     // asserted in one contract; the lint is scoped here exactly like the
@@ -7579,6 +7863,134 @@ mod tests {
         Ok(EndpointInventoryItem::try_new(
             endpoint,
             vec![root, security_service],
+        )?)
+    }
+
+    // The six 0.5 OEM read families are served in one inventory so the wire
+    // contract stays one surface; the six snapshot fixtures exceed the
+    // pedantic line budget, so the lint is scoped here exactly like the
+    // other fixture builders.
+    #[allow(clippy::too_many_lines)]
+    fn oem_six_families_inventory_item() -> Result<EndpointInventoryItem, Box<dyn Error>> {
+        let created_at = OffsetDateTime::UNIX_EPOCH;
+        let observed_at = created_at + Duration::SECOND;
+        let endpoint = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("AMI HPE LiteOn Delta OEM BMC")?,
+            EndpointAddress::parse("https://192.0.2.42")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(vec![42])?,
+                trusted_at: created_at,
+            },
+            CredentialId::generate(),
+            created_at,
+            created_at,
+        )?;
+        let generation = RefreshGeneration::new(6)?;
+        let root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::ServiceRoot,
+            "/redfish/v1",
+            r#"{"Id":"RootService","Name":"Root Service","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+            observed_at,
+            generation,
+        )?;
+        // The AMI service-root segment keeps the Service Root's own
+        // identity (the segment lives at the `Oem.Ami` key inside the
+        // Service Root document); the payload carries the common fields plus
+        // the `RtpVersion` text.
+        let ami_root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemAmiServiceRoot,
+            "/redfish/v1/Oem/Ami",
+            r#"{"Id":"RootService","Name":"Root Service","RtpVersion":"1.2.3"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#AmiServiceRoot.v1_0_0.AmiServiceRoot",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"root-1\"")?);
+        // The compiled `ConfigBmc` schema models no `Id` / `Name`, so the
+        // payload carries only the four lockout/lockdown spellings and the
+        // common identity derives from the `@odata.id` final segment.
+        let config_bmc = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemAmiConfigBmc,
+            "/redfish/v1/Managers/1/Oem/ConfigBMC",
+            r#"{"LockoutHostControl":"Enable","LockoutBiosVariableWriteMode":"Disable","LockdownBiosSettingsChange":"Enable","LockdownBiosUpgradeDowngrade":"Disable"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#ConfigBMC.v1_0_0.ConfigBMC")?)
+        .with_etag(ResourceEtag::parse("W/\"ami-config-bmc-1\"")?);
+        // The HPE service-root segment keeps the Service Root's own identity
+        // plus the first `Manager` entry's texts.
+        let hpe_root = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemHpeILoServiceExt,
+            "/redfish/v1/Oem/Hpe",
+            r#"{"Id":"RootService","Name":"Root Service","ManagerType":"iLO 5","ManagerFirmwareVersion":"2.44"}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#HpeiLoServiceExt.v1_0_0.HpeiLoServiceExt",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"root-1\"")?);
+        // The HPE manager segment keeps the Manager's own identity plus the
+        // `VirtualNICEnabled` boolean.
+        let hpe_manager = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemHpeManager,
+            "/redfish/v1/Managers/1/Oem/Hpe",
+            r#"{"Id":"1","Name":"Manager One","VirtualNICEnabled":true}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse("#HpeiLo.v1_0_0.HpeiLo")?)
+        .with_etag(ResourceEtag::parse("W/\"manager-1\"")?);
+        // The `LiteOn` supply projects the typed power-supply identity
+        // fields exactly like the standard family, under the synthetic
+        // storage key the gateway derives from the supply document's own URL.
+        let liteon = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemLiteOnPowerSupply,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn",
+            r#"{"Id":"1","Name":"Power Supply 1","Description":"LiteOn power supply","PowerSupplyType":"AC","PowerCapacityWatts":2200,"Manufacturer":"LITE-ON TECHNOLOGY CORP.","Model":"PS-2200","FirmwareVersion":"1.02","SerialNumber":"LN1234","PartNumber":"LTP-2200","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#LiteonPowerSupply.v1_0_0.LiteonPowerSupply",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"liteon-psu-1\"")?);
+        // The Delta supply projects the `deltaenergysystems` flags beside
+        // the common identity fields, under the synthetic storage key derived
+        // from the same supply document's URL the `LiteOn` family shares.
+        let delta = resource_snapshot_with_payload(
+            endpoint.id(),
+            ResourceFeature::OemDeltaPowerSupply,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems",
+            r#"{"Id":"1","Name":"Power Supply 1","Description":"Delta power supply","Power":true,"FanSpeedTarget":50}"#,
+            observed_at,
+            generation,
+        )?
+        .with_odata_type(ResourceODataType::parse(
+            "#PowerSupply.v1_6_0.PowerSupply",
+        )?)
+        .with_etag(ResourceEtag::parse("W/\"delta-psu-1\"")?);
+        Ok(EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                root,
+                ami_root,
+                config_bmc,
+                hpe_root,
+                hpe_manager,
+                liteon,
+                delta,
+            ],
         )?)
     }
 

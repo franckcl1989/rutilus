@@ -1185,6 +1185,91 @@ pub enum CoreResourceDetailsResponse {
     /// the upstream wrapper collapses that nesting onto its single
     /// `fw_rollback()` accessor, so the wire carries the flattened value.
     OemLenovoSecurityService { fw_rollback: Option<String> },
+    /// One §0.5.0 OEM family member projected from the embedded AMI
+    /// `AmiServiceRoot` segment of the Service Root document
+    /// (`AmiServiceRoot`, nv-redfish-schema 0.13, `oem-ami` feature).
+    ///
+    /// The segment is part of the Service Root document (§11.5: an OEM
+    /// surface is projected only when upstream strongly types it), so the
+    /// common identity is the Service Root's own; `rtp_version` names the
+    /// Redfish Technology Pack version and is `None` when the endpoint did
+    /// not publish it.
+    OemAmiServiceRoot { rtp_version: Option<String> },
+    /// One §0.5.0 OEM family member projected from the typed AMI `ConfigBmc`
+    /// schema (`ConfigBmc`, nv-redfish-schema 0.13, `oem-ami` feature).
+    ///
+    /// The manager's `ConfigBMC` document is the AMI BIOS lockout/lockdown
+    /// surface (§11.5), read through the `ConfigBMC` reference of the
+    /// `Oem.Ami` segment; the four state values are the vendor's enum
+    /// spellings verbatim (`Enable`, `Disable`, or `UnsupportedValue` for a
+    /// value this build cannot classify), per §12.3. The compiled schema
+    /// models no `Id` / `Name` / `Description`, so the common identity is the
+    /// resource's own `@odata.id` final segment (the Redfish `Id` per
+    /// DSP0266), never a product-invented label.
+    OemAmiConfigBmc {
+        lockout_host_control: Option<String>,
+        lockout_bios_variable_write_mode: Option<String>,
+        lockdown_bios_settings_change: Option<String>,
+        lockdown_bios_upgrade_downgrade: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the embedded HPE
+    /// `HpeiLoServiceExt` segment of the Service Root document
+    /// (`HpeiLoServiceExt`, nv-redfish-schema 0.13, `oem-hpe` feature).
+    ///
+    /// The segment is part of the Service Root document (§11.5), so the
+    /// common identity is the Service Root's own; `manager_type` and
+    /// `manager_firmware_version` come from the first `Manager` entry (the
+    /// first-entry surface of the upstream `manager_type()` accessor) and
+    /// are `None` when the endpoint did not publish them.
+    OemHpeILoServiceExt {
+        manager_type: Option<String>,
+        manager_firmware_version: Option<String>,
+    },
+    /// One §0.5.0 OEM family member projected from the embedded HPE `HpeiLo`
+    /// segment of the Manager document (`HpeiLo`, nv-redfish-schema 0.13,
+    /// `oem-hpe` feature).
+    ///
+    /// The segment is part of the Manager document (§11.5), so the common
+    /// identity is the Manager's own; `virtual_nic_enabled` names the
+    /// host-side virtual NIC support state and is `None` when the endpoint
+    /// did not publish it.
+    OemHpeManager { virtual_nic_enabled: Option<bool> },
+    /// One §0.5.0 OEM family member projected from the typed `LiteOn`
+    /// `LiteonPowerSupply` schema (`LiteonPowerSupply`, `nv-redfish-schema`
+    /// 0.13, `oem-liteon` feature).
+    ///
+    /// One power supply of a `LiteOn` chassis, gated by the chassis
+    /// `Manufacturer` value `LITE-ON TECHNOLOGY CORP.` (§11.5 — the exact
+    /// gate the upstream `chassis_fetch_links` applies, the one
+    /// `Manufacturer`-gated surface of the product). `power_supply_type` is
+    /// the vendor's enum spelling verbatim per §12.3, `power_capacity_watts`
+    /// stays numeric, and the `Manufacturer` / `Model` / `FirmwareVersion` /
+    /// `SerialNumber` / `PartNumber` texts and `Status` are each `None` when
+    /// the endpoint did not publish them.
+    OemLiteOnPowerSupply {
+        power_supply_type: Option<String>,
+        power_capacity_watts: Option<f64>,
+        manufacturer: Option<String>,
+        model: Option<String>,
+        firmware_version: Option<String>,
+        serial_number: Option<String>,
+        part_number: Option<String>,
+        status: Option<ResourceStatusResponse>,
+    },
+    /// One §0.5.0 OEM family member projected from the typed Delta
+    /// `PowerSupply` extension (`PowerSupply`, nv-redfish-schema 0.13,
+    /// `oem-delta` feature).
+    ///
+    /// One power supply whose `Oem` segment carries the
+    /// `deltaenergysystems` extension (§11.5): the `Power` flag names whether
+    /// the PSU outputs power and `fan_speed_target` the target fan speed —
+    /// the extension's authoritative readings, which Delta power shelves
+    /// publish instead of the standard `PowerState` field. Each value is
+    /// `None` when the endpoint did not publish it.
+    OemDeltaPowerSupply {
+        power: Option<bool>,
+        fan_speed_target: Option<i64>,
+    },
     /// One §2.1 `processors` family member projected from the typed Redfish
     /// processor schema. `total_cores` stays numeric so the console can
     /// render a core count without re-parsing text.
