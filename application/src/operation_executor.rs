@@ -35,7 +35,7 @@
 use std::{error::Error, fmt, fs, io, path::PathBuf};
 
 use rutilus_domain::{
-    ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
+    AccountCommand, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
     AuditFailureVerification, AuditOperationContext, AuditOperationContextError, AuditOperationId,
     AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget, BootCommand,
     CapabilityState, ChassisCommand, DeploymentPosture, EndpointCapability, EndpointId,
@@ -1207,6 +1207,21 @@ pub(crate) fn operation_audit_context(
 /// accountability differs.
 fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
     match command {
+        // The five account writes are audited separately because their
+        // accountability differs: creating an account, changing its role,
+        // changing its password, renaming it, and deleting it are different
+        // security-relevant actions (§16.3 granularity decision).
+        RedfishCommand::Account(account) => match account {
+            AccountCommand::CreateAccount(_) => AuditRedfishOperation::CreateAccount,
+            AccountCommand::UpdateAccount(_) => AuditRedfishOperation::UpdateAccount,
+            AccountCommand::UpdateAccountPassword(_) => {
+                AuditRedfishOperation::UpdateAccountPassword
+            }
+            AccountCommand::UpdateAccountUserName(_) => {
+                AuditRedfishOperation::UpdateAccountUserName
+            }
+            AccountCommand::DeleteAccount(_) => AuditRedfishOperation::DeleteAccount,
+        },
         RedfishCommand::System(SystemCommand::Reset(_)) => AuditRedfishOperation::ResetSystem,
         RedfishCommand::Manager(ManagerCommand::Reset(_)) => AuditRedfishOperation::ResetManager,
         RedfishCommand::Chassis(ChassisCommand::Reset(_)) => AuditRedfishOperation::ResetChassis,
@@ -1254,6 +1269,9 @@ fn command_audit_operation(command: &RedfishCommand) -> AuditRedfishOperation {
 /// subscription writes require the event service.
 pub(crate) fn required_capability(command: &RedfishCommand) -> EndpointCapability {
     match command {
+        // Account writes target the BMC's `AccountService` (`ManagerAccount`
+        // resources), so they require the accounts capability (§2.1).
+        RedfishCommand::Account(_) => EndpointCapability::Accounts,
         // Boot configuration lives on the `ComputerSystem` resource, so a
         // boot command needs the same `Systems` capability as a system reset.
         RedfishCommand::System(_) | RedfishCommand::Boot(_) => EndpointCapability::Systems,
@@ -1564,15 +1582,16 @@ mod tests {
     };
 
     use rutilus_domain::{
-        Artifact, ArtifactName, ArtifactState, AuditOutcomeKind, AuditVerification, BootCommand,
-        BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
-        ChassisCommand, CreateSubscription, CredentialId, DeleteSubscription, Endpoint,
-        EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
+        AccountCommand, AccountId, AccountPassword, AccountUserName, Artifact, ArtifactName,
+        ArtifactState, AuditOutcomeKind, AuditVerification, BootCommand, BootSource,
+        BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState, ChassisCommand,
+        CreateAccount, CreateSubscription, CredentialId, DeleteAccount, DeleteSubscription,
+        Endpoint, EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
         EventCommand, EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
         NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OperationSource,
-        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, SecureBootCommand,
+        OperationTarget, ResetKeysType, ResetType, ResourceSnapshot, RoleId, SecureBootCommand,
         SetBootSourceOverride, Sha256Hex, StartUpdate, SystemCommand, TargetId, TlsCertificate,
-        TlsTrust, UpdateCommand,
+        TlsTrust, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
     };
     use rutilus_operation_engine::{
         BoundaryFuture as OperationBoundaryFuture, ClassifiedBatchChild, RemoteTaskState, TaskUri,
@@ -4241,17 +4260,61 @@ mod tests {
         Ok(())
     }
 
+    // One pair per §7.5 write family; the line count grows with the family
+    // count, so the lint is scoped here like the domain's family
+    // enumeration tests.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn command_audit_operations_pin_the_thirteen_write_families() -> Result<(), Box<dyn Error>>
+    async fn command_audit_operations_pin_the_eighteen_write_families() -> Result<(), Box<dyn Error>>
     {
         // One representative command per §7.5 write family, pinned against
         // the audit operation type it must map to — the same exhaustive-pair
         // style as the domain's execute-context tests, so a swapped mapping
         // (Enable ↔ Disable, Create ↔ Delete, one Reset ↔ another, one OEM
         // face ↔ another) fails here instead of reaching the audit log. The
-        // three OEM faces are pinned separately because their accountability
-        // differs (§11.5).
-        let pairs: [(&RedfishCommand, AuditRedfishOperation); 13] = [
+        // five account writes are pinned separately because their
+        // accountability differs (§16.3), and the three OEM faces are pinned
+        // separately for the same reason (§11.5).
+        let pairs: [(&RedfishCommand, AuditRedfishOperation); 18] = [
+            (
+                &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+                AuditRedfishOperation::CreateAccount,
+            ),
+            (
+                &RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                    AccountId::parse("admin")?,
+                    RoleId::parse("Operator")?,
+                ))),
+                AuditRedfishOperation::UpdateAccount,
+            ),
+            (
+                &RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                    UpdateAccountPassword::new(
+                        AccountId::parse("admin")?,
+                        AccountPassword::parse("new-secret".to_owned())?,
+                    ),
+                )),
+                AuditRedfishOperation::UpdateAccountPassword,
+            ),
+            (
+                &RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                    UpdateAccountUserName::new(
+                        AccountId::parse("admin")?,
+                        AccountUserName::parse("admin.renamed")?,
+                    ),
+                )),
+                AuditRedfishOperation::UpdateAccountUserName,
+            ),
+            (
+                &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("admin")?,
+                ))),
+                AuditRedfishOperation::DeleteAccount,
+            ),
             (
                 &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
                 AuditRedfishOperation::ResetSystem,
@@ -4335,6 +4398,46 @@ mod tests {
                 command_audit_operation(command),
                 expected,
                 "the command family must map to exactly its own audit operation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn account_commands_require_the_accounts_capability() -> Result<(), Box<dyn Error>> {
+        // Every account write targets the BMC's `AccountService`
+        // (`ManagerAccount` resources), so each of the five commands must
+        // require the same §2.1 accounts capability.
+        for command in [
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("initial-secret".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                AccountId::parse("admin")?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("admin")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("admin")?,
+                    AccountUserName::parse("admin.renamed")?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("admin")?,
+            ))),
+        ] {
+            assert_eq!(
+                required_capability(&command),
+                EndpointCapability::Accounts,
+                "every account write must require the accounts capability"
             );
         }
         Ok(())
