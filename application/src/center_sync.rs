@@ -687,12 +687,17 @@ where
             let mut envelope: Envelope = match serde_json::from_str(entry.payload_json()) {
                 Ok(envelope) => envelope,
                 Err(source) => {
-                    // One corrupt row must not wedge the whole flush: log
-                    // it, skip it, and deliver the rest of the queue. The
-                    // row has no durable failure state, so it stays pending
-                    // and every flush re-logs it until an operator repairs
-                    // or clears it (a future migration could add a failed
-                    // state).
+                    // Ciphertext rows are authenticated by the list scan:
+                    // a tampered payload fails the whole `list_pending`
+                    // read as Corrupt before this loop runs, so a flush
+                    // never sends on top of a tampered queue (fail closed,
+                    // deliberate). The per-row skip here survives only for
+                    // legacy plaintext rows whose JSON no longer parses:
+                    // log it, skip it, and deliver the rest of the queue.
+                    // The row has no durable failure state, so it stays
+                    // pending and every flush re-logs it until an operator
+                    // repairs or clears it (a future migration could add a
+                    // failed state).
                     eprintln!(
                         "site {}: skipping outbox entry {} with a corrupt payload: {source}",
                         self.instance_id,

@@ -99,11 +99,12 @@ pub struct SqliteStore {
     database_path: PathBuf,
     migration_backup: Option<MigrationBackup>,
     write_gate: Arc<Semaphore>,
-    /// The instance master key protecting the operation command columns at
-    /// rest (XChaCha20-Poly1305, security crate). A store without the key —
-    /// the backup, onboarding, and test paths, which never read or write
-    /// command payloads — refuses command writes and ciphertext reads (fail
-    /// closed), so no payload is ever persisted or released unprotected.
+    /// The instance master key protecting the operation command columns and
+    /// the center queue payloads at rest (XChaCha20-Poly1305, security
+    /// crate). A store without the key — the backup, onboarding, and test
+    /// paths, which never read or write command payloads — refuses command
+    /// writes and ciphertext reads (fail closed), so no payload is ever
+    /// persisted or released unprotected.
     command_key: Option<Arc<MasterKey>>,
 }
 
@@ -115,7 +116,7 @@ impl SqliteStore {
     ///
     /// The store is opened without a command encryption key; use
     /// [`Self::open_with_command_key`] when the store will read or write
-    /// operation command payloads.
+    /// operation command payloads or the center queue payloads.
     ///
     /// # Errors
     ///
@@ -125,8 +126,9 @@ impl SqliteStore {
         Self::open_with_settings(database_path.as_ref(), SqliteSettings::default()).await
     }
 
-    /// Opens a file-backed store whose operation command columns are
-    /// encrypted at rest under the given instance master key.
+    /// Opens a file-backed store whose operation command columns and center
+    /// queue payloads are encrypted at rest under the given instance master
+    /// key.
     ///
     /// `command_key` is shared with the runtime's other key users (the
     /// credential protector and resolver), so the secret bytes exist in one
