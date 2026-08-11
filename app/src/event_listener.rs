@@ -6,13 +6,16 @@
 //! [`EventSink`] seam (wired to the application `EventIngestion` use case,
 //! which appends through the repository boundary).
 //!
-//! # The 0.4.0 cut: a startup sweep
+//! # The supervisor: listeners follow the enrolled-endpoint set
 //!
-//! The [`EventListeners::start`] supervisor spawns one task per endpoint
-//! passed by the runtime, which lists the enrolled endpoints at startup.
-//! Spawning a listener at enrollment time (lazily, per endpoint) is a later
-//! iteration: it needs a hook in the enrollment path, and a restart already
-//! re-arms every endpoint through the startup sweep.
+//! The [`EventListeners`] supervisor reconciles its listener set against the
+//! enrolled-endpoint set on every [`LISTENER_RECONCILE_INTERVAL`] sweep,
+//! listed through the [`EndpointLister`] seam. The first sweep fires
+//! immediately — the restart recovery, re-arming every endpoint enrolled
+//! before the process start — and every later sweep starts a listener for
+//! an endpoint enrolled mid-run (the lazy start at enrollment time: no hook
+//! in the enrollment path needed, the next sweep picks the endpoint up) and
+//! stops the listener of an endpoint that left the enrolled set.
 //!
 //! # Reconnect discipline
 //!
@@ -27,7 +30,9 @@
 //! (the §0.4.0 "BMC 重启后的重连" requirement) — the production waits sum to
 //! roughly four minutes — while an endpoint that stays unreachable beyond it
 //! is surfaced as failed instead of retrying hot forever. Re-arming failed
-//! listeners (a periodic supervisor re-scan) is a later iteration.
+//! listeners is a later iteration: the reconciling sweep (above)
+//! deliberately does not restart an endpoint whose listener gave up, so the
+//! `Failed` state stays terminal within a process run.
 //!
 //! # Cancellation and drain (design §7.8)
 //!
@@ -54,7 +59,7 @@
 //! the SSE connection stays healthy, and a later iteration can add buffering.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -65,7 +70,7 @@ use rutilus_application::{
 };
 use rutilus_domain::{EndpointId, Event};
 
-use crate::scheduler::StopWatch;
+use crate::scheduler::{StopSignal, StopWatch};
 
 /// The first reconnect delay after one failed stream attempt (§14.4).
 ///
@@ -98,6 +103,20 @@ pub(crate) const EVENT_RECONNECT_MAX_INTERVAL: Duration = Duration::from_secs(60
 /// still surfacing a permanently unreachable endpoint as failed instead of
 /// retrying forever.
 pub(crate) const EVENT_RECONNECT_MAX_ATTEMPTS: usize = 10;
+
+/// The cadence of one listener-set reconciliation sweep.
+///
+/// # Why ten seconds
+///
+/// Each sweep re-lists the enrolled endpoints (one light `SQLite` query) and
+/// diffs the listener set against it, so the interval bounds how quickly a
+/// freshly enrolled endpoint starts being listened to and a removed one
+/// stops. Ten seconds keeps that latency well below what a human notices
+/// after enrolling an endpoint, while the sweep's cost stays trivial — the
+/// listeners themselves hold the network connections, the sweep only
+/// compares sets. A faster cadence would re-run the same diff needlessly
+/// often, and a slower one would make a just-enrolled endpoint feel ignored.
+pub(crate) const LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The bounded reconnect policy of one endpoint listener (design §7.8).
 ///
@@ -194,77 +213,167 @@ where
     }
 }
 
+/// The enrolled-endpoint listing seam of the reconciling supervisor.
+///
+/// The supervisor re-lists every sweep — unlike a one-shot startup sweep —
+/// so an endpoint enrolled mid-run is listened to from the next sweep on and
+/// a removed one stops being listened to.
+pub(crate) trait EndpointLister: Send + Sync {
+    /// The listing's controlled failure type; only its `Display` is used.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Lists the ids of every enrolled endpoint.
+    fn list_enrolled_endpoints(&self) -> BoundaryFuture<'_, Result<Vec<EndpointId>, Self::Error>>;
+}
+
 /// The supervisor of one listener task per enrolled endpoint (§14.4).
 ///
-/// Spawns one [`tokio::task::JoinHandle`] per endpoint (design §7.8: every
-/// task is tracked — never a detached task), keeps the observable
-/// [`ListenerStatus`] per endpoint, and joins every task on
-/// [`Self::drain_all`] so the runtime can drain the listeners before closing
-/// the store.
+/// Tracks one [`tokio::task::JoinHandle`] and one per-endpoint stop signal
+/// per armed endpoint (design §7.8: every task is tracked and cancellable —
+/// never a detached task), keeps the observable [`ListenerStatus`] per
+/// endpoint, and joins every task on [`Self::drain_all`] so the runtime can
+/// drain the listeners before closing the store. The armed set is
+/// reconciled against the enrolled set by [`Self::reconcile`]: a freshly
+/// enrolled endpoint gets a listener, a removed one loses it.
 pub(crate) struct EventListeners {
     statuses: Arc<Mutex<HashMap<EndpointId, ListenerStatus>>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    listeners: HashMap<EndpointId, EndpointListener>,
+}
+
+/// One armed listener: its per-endpoint stop signal and its task handle.
+///
+/// The per-endpoint signal is what makes removal possible: stopping one
+/// endpoint's listener must never touch the others. The §7.8 structured
+/// drain applies per listener — the in-flight event finishes and the stream
+/// closes gracefully before the task exits — and the supervisor joins the
+/// task, so a removed endpoint's listener never touches the store again.
+struct EndpointListener {
+    stop: StopSignal,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl EventListeners {
-    /// Spawns one listener task per endpoint and records each one as
-    /// `Listening`.
+    /// Creates an empty supervisor; [`Self::reconcile`] arms it.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            statuses: Arc::new(Mutex::new(HashMap::new())),
+            listeners: HashMap::new(),
+        }
+    }
+
+    /// Reconciles the listener set against the listed enrolled endpoints.
     ///
     /// The stop watch, stream boundary, and sink are only ever cloned into
-    /// the spawned tasks, so the caller keeps owning them.
-    pub(crate) fn start<Stream, Sink>(
-        endpoints: Vec<EndpointId>,
-        stop: &StopWatch,
+    /// the spawned tasks, so the caller keeps owning them. The sweep starts
+    /// a listener for every enrolled endpoint that was never armed in this
+    /// run — an endpoint whose listener gave up stays armed but stopped, so
+    /// the `Failed` state survives the sweep (re-arming is a later
+    /// iteration) — and stops, through the per-endpoint stop signal, the
+    /// listener of every armed endpoint that is no longer enrolled.
+    pub(crate) async fn reconcile<Stream, Sink>(
+        &mut self,
+        listed: Vec<EndpointId>,
         stream: &Arc<Stream>,
         sink: &Arc<Sink>,
         policy: ReconnectPolicy,
-    ) -> Self
-    where
+    ) where
         Stream: EventStream + 'static,
         Sink: EventSink + 'static,
     {
-        let statuses = Arc::new(Mutex::new(HashMap::new()));
-        let tasks = endpoints
-            .into_iter()
-            .map(|endpoint_id| {
-                // A poisoned status map is a programming defect, not a
-                // shutdown path: recover the value so bookkeeping continues.
-                statuses
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(endpoint_id, ListenerStatus::Listening);
-                let task_stop = stop.clone();
-                let task_stream = Arc::clone(stream);
-                let task_sink = Arc::clone(sink);
-                let task_statuses = Arc::clone(&statuses);
-                tokio::spawn(async move {
-                    run_endpoint_stream(
-                        task_stop,
-                        endpoint_id,
-                        task_stream.as_ref(),
-                        task_sink.as_ref(),
-                        policy,
-                        task_statuses.as_ref(),
-                    )
-                    .await;
-                })
-            })
+        let listed: HashSet<EndpointId> = listed.into_iter().collect();
+        let removed: Vec<EndpointId> = self
+            .listeners
+            .keys()
+            .filter(|endpoint_id| !listed.contains(endpoint_id))
+            .copied()
             .collect();
-        Self { statuses, tasks }
+        for endpoint_id in removed {
+            self.stop_listener(endpoint_id).await;
+        }
+        for endpoint_id in listed {
+            if self.listeners.contains_key(&endpoint_id) {
+                continue;
+            }
+            self.spawn_listener(endpoint_id, stream, sink, policy);
+        }
     }
 
-    /// Waits for every listener task (design §7.8 structured drain), then
-    /// surfaces every endpoint whose listener gave up.
+    /// Spawns one endpoint's listener task and records it as `Listening`.
     ///
-    /// The listener tasks exit on the stop signal or on a terminal reconnect
-    /// give-up; each in-flight event finishes before its task exits, so
-    /// joining here guarantees no listener touches the store afterwards. The
-    /// failed-endpoint report is the operational consumption of the §14.4
-    /// 标记端点事件监听失败状态 status map: at shutdown the runtime's log
-    /// shows exactly which endpoints stopped being listened to.
+    /// The task owns its stop watch, stream, sink, and status-map clones; a
+    /// poisoned status map is a programming defect, not a shutdown path, so
+    /// the bookkeeping recovers the value.
+    fn spawn_listener<Stream, Sink>(
+        &mut self,
+        endpoint_id: EndpointId,
+        stream: &Arc<Stream>,
+        sink: &Arc<Sink>,
+        policy: ReconnectPolicy,
+    ) where
+        Stream: EventStream + 'static,
+        Sink: EventSink + 'static,
+    {
+        self.statuses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(endpoint_id, ListenerStatus::Listening);
+        let (stop, task_stop) = StopSignal::new();
+        let task_stream = Arc::clone(stream);
+        let task_sink = Arc::clone(sink);
+        let task_statuses = Arc::clone(&self.statuses);
+        let task = tokio::spawn(async move {
+            run_endpoint_stream(
+                task_stop,
+                endpoint_id,
+                task_stream.as_ref(),
+                task_sink.as_ref(),
+                policy,
+                task_statuses.as_ref(),
+            )
+            .await;
+        });
+        self.listeners
+            .insert(endpoint_id, EndpointListener { stop, task });
+    }
+
+    /// Stops one endpoint's listener and forgets the endpoint.
+    ///
+    /// The per-endpoint signal fires, then the task is joined: the in-flight
+    /// event finishes and the stream closes gracefully (§7.8) before the
+    /// supervisor moves on, so a removed endpoint's listener never touches
+    /// the store afterwards. The status entry goes with it, so the endpoint
+    /// is armed afresh if it is ever enrolled again.
+    async fn stop_listener(&mut self, endpoint_id: EndpointId) {
+        let Some(listener) = self.listeners.remove(&endpoint_id) else {
+            return;
+        };
+        listener.stop.signal();
+        if let Err(join_error) = listener.task.await {
+            tracing::error!("event listener task failed: {join_error}");
+        }
+        self.statuses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&endpoint_id);
+    }
+
+    /// Stops every listener (design §7.8 structured drain), then surfaces
+    /// every endpoint whose listener gave up.
+    ///
+    /// Every per-endpoint signal fires before any task is joined, so all the
+    /// listeners stop in parallel; each in-flight event finishes before its
+    /// task exits, so joining here guarantees no listener touches the store
+    /// afterwards. The failed-endpoint report is the operational consumption
+    /// of the §14.4 标记端点事件监听失败状态 status map: at shutdown the
+    /// runtime's log shows exactly which endpoints stopped being listened
+    /// to.
     pub(crate) async fn drain_all(self) {
-        for task in self.tasks {
-            if let Err(join_error) = task.await {
+        for listener in self.listeners.values() {
+            listener.stop.signal();
+        }
+        for listener in self.listeners.into_values() {
+            if let Err(join_error) = listener.task.await {
                 tracing::error!("event listener task failed: {join_error}");
             }
         }
@@ -296,6 +405,60 @@ impl EventListeners {
             .get(&endpoint_id)
             .cloned()
     }
+}
+
+/// Runs the reconciling supervisor until the stop signal, sweeping once per
+/// interval.
+///
+/// The loop mirrors the scheduler's and sampler's §7.8 shape: the stop
+/// signal is observed while waiting for the next sweep and before starting
+/// one, the in-flight sweep finishes before the loop exits (structured
+/// drain), and a failed sweep is recorded and retried on the next tick. The
+/// first sweep fires immediately, so the restart recovery — re-arming every
+/// endpoint enrolled before the process start — is exactly the first
+/// reconciliation. The caller passes the interval so tests can drive the
+/// cadence fast, and the runtime owns the policy.
+pub(crate) async fn run<Stream, Sink, Lister>(
+    mut stop: StopWatch,
+    lister: &Lister,
+    stream: &Arc<Stream>,
+    sink: &Arc<Sink>,
+    policy: ReconnectPolicy,
+    interval: Duration,
+) where
+    Stream: EventStream + 'static,
+    Sink: EventSink + 'static,
+    Lister: EndpointLister,
+{
+    let mut listeners = EventListeners::new();
+    let mut ticker = tokio::time::interval(interval);
+    // Sweeps never burst: if one reconciliation outlasts the interval, the
+    // next sweep starts as soon as possible after it instead of piling up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = stop.stopped() => break,
+            _ = ticker.tick() => {
+                // The stop may have landed while the interval arm was ready
+                // (`select!` picks a ready arm at random): a signalled loop
+                // must not start new work, so the sweep is skipped.
+                if stop.has_stopped() {
+                    break;
+                }
+                let enrolled = match lister.list_enrolled_endpoints().await {
+                    Ok(enrolled) => enrolled,
+                    Err(error) => {
+                        tracing::error!(
+                            "event listener sweep could not list enrolled endpoints: {error}"
+                        );
+                        continue;
+                    }
+                };
+                listeners.reconcile(enrolled, stream, sink, policy).await;
+            }
+        }
+    }
+    listeners.drain_all().await;
 }
 
 /// The verdict of one bounded reconnect wait.
@@ -461,8 +624,6 @@ mod tests {
     use rutilus_domain::{EventId, EventSeverity, MessageId};
     use time::{Duration, OffsetDateTime};
     use tokio::sync::Notify;
-
-    use crate::scheduler::StopSignal;
 
     use super::*;
 
@@ -716,6 +877,44 @@ mod tests {
             factor: EVENT_RECONNECT_FACTOR,
             max_interval: StdDuration::from_millis(10),
             max_attempts,
+        }
+    }
+
+    /// A fast reconciliation cadence for the `run` loop tests.
+    const FAST_RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(1);
+
+    /// Scripted enrolled-endpoint listing with a shared failure flag, so the
+    /// test can flip the failure while the loop task holds its clone.
+    #[derive(Clone, Debug, Default)]
+    struct FakeLister {
+        endpoints: Arc<Mutex<Vec<EndpointId>>>,
+        fail_listing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeLister {
+        fn with_endpoints(endpoints: Vec<EndpointId>) -> Self {
+            Self {
+                endpoints: Arc::new(Mutex::new(endpoints)),
+                fail_listing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl EndpointLister for FakeLister {
+        type Error = MockError;
+
+        fn list_enrolled_endpoints(
+            &self,
+        ) -> BoundaryFuture<'_, Result<Vec<EndpointId>, Self::Error>> {
+            Box::pin(async move {
+                if self.fail_listing.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(MockError::Store);
+                }
+                self.endpoints
+                    .lock()
+                    .map(|endpoints| endpoints.clone())
+                    .map_err(|_| MockError::Lock)
+            })
         }
     }
 
@@ -1136,17 +1335,13 @@ mod tests {
             .gate
             .clone()
             .ok_or_else(|| std::io::Error::other("the gated sink lost its gate"))?;
-        let (stop_signal, stop_watch) = StopSignal::new();
 
         let stream = Arc::new(stream);
         let sink = Arc::new(sink.clone());
-        let listeners = EventListeners::start(
-            vec![doomed, healthy],
-            &stop_watch,
-            &stream,
-            &sink,
-            fast_policy(2),
-        );
+        let mut listeners = EventListeners::new();
+        listeners
+            .reconcile(vec![doomed, healthy], &stream, &sink, fast_policy(2))
+            .await;
 
         // Wait until the doomed endpoint failed while the healthy one is
         // still consuming (blocked inside its first ingest).
@@ -1178,10 +1373,324 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(5)).await;
         }
         assert_eq!(sink.recorded()?, [(healthy, first), (healthy, second)]);
-        stop_signal.signal();
+        // `drain_all` stops every remaining listener through its own
+        // per-endpoint signal and joins each task.
         tokio::time::timeout(StdDuration::from_secs(2), listeners.drain_all())
             .await
             .map_err(|_| std::io::Error::other("the listeners did not drain"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listener_starts_for_an_endpoint_enrolled_mid_run() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let first = event(endpoint_id, 1)?;
+        let stream =
+            FakeStream::for_endpoint(endpoint_id, vec![Ok(VecDeque::from([Ok(first.clone())]))]);
+        let sink = FakeSink::for_endpoint(endpoint_id, vec![Ok(())]);
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+
+        let mut listeners = EventListeners::new();
+        // The endpoint is not yet enrolled: the sweep must arm nothing.
+        listeners
+            .reconcile(
+                Vec::new(),
+                &stream,
+                &sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+            )
+            .await;
+        assert_eq!(listeners.status(endpoint_id), None);
+        // The endpoint is enrolled mid-run: the next sweep must arm its
+        // listener (the lazy start).
+        listeners
+            .reconcile(
+                vec![endpoint_id],
+                &stream,
+                &sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+            )
+            .await;
+        for _ in 0..200 {
+            if !sink.recorded()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert_eq!(sink.recorded()?, [(endpoint_id, first)]);
+        assert_eq!(
+            listeners.status(endpoint_id),
+            Some(ListenerStatus::Listening)
+        );
+        listeners.drain_all().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_an_endpoint_stops_its_listener() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let (stream, _pull_gate) = FakeStream::gated_pull(endpoint_id);
+        let sink = FakeSink::for_endpoint(endpoint_id, Vec::new());
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+
+        let mut listeners = EventListeners::new();
+        listeners
+            .reconcile(
+                vec![endpoint_id],
+                &stream,
+                &sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+            )
+            .await;
+        // Wait until the listener is consuming (its pull is in flight).
+        for _ in 0..200 {
+            if stream.opens(endpoint_id).is_ok() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert!(
+            stream.opens(endpoint_id).is_ok(),
+            "the listener never opened the stream"
+        );
+        // The endpoint leaves the enrolled set: the sweep must stop the
+        // listener — the pending pull is dropped and the stream closes
+        // gracefully (§7.8) — and forget the endpoint.
+        listeners
+            .reconcile(
+                Vec::new(),
+                &stream,
+                &sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+            )
+            .await;
+        assert!(listeners.listeners.is_empty());
+        assert_eq!(listeners.status(endpoint_id), None);
+        assert_eq!(
+            stream.closes(endpoint_id)?,
+            1,
+            "the stream must be closed gracefully after the removal"
+        );
+        assert_eq!(
+            stream.opens(endpoint_id)?,
+            1,
+            "no attempt may start after the removal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_listener_is_not_re_armed_by_a_later_sweep() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let stream = FakeStream::for_endpoint(endpoint_id, Vec::new());
+        let sink = FakeSink::for_endpoint(endpoint_id, Vec::new());
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+
+        let mut listeners = EventListeners::new();
+        listeners
+            .reconcile(vec![endpoint_id], &stream, &sink, fast_policy(2))
+            .await;
+        // Wait until the listener exhausted its budget.
+        for _ in 0..200 {
+            if matches!(
+                listeners.status(endpoint_id),
+                Some(ListenerStatus::Failed { .. })
+            ) {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert!(matches!(
+            listeners.status(endpoint_id),
+            Some(ListenerStatus::Failed { .. })
+        ));
+        // The budget of two consecutive failed cycles consumed both opens.
+        let opens_after_give_up = stream.opens(endpoint_id)?;
+        assert_eq!(opens_after_give_up, 2);
+        // The endpoint is still enrolled: the sweep must not re-arm the
+        // failed listener — re-arming is a later iteration, so the `Failed`
+        // state survives the sweep.
+        listeners
+            .reconcile(vec![endpoint_id], &stream, &sink, fast_policy(2))
+            .await;
+        assert_eq!(
+            stream.opens(endpoint_id)?,
+            opens_after_give_up,
+            "no new listener may start for the failed endpoint"
+        );
+        assert!(matches!(
+            listeners.status(endpoint_id),
+            Some(ListenerStatus::Failed { .. })
+        ));
+        listeners.drain_all().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_arms_preexisting_endpoints_on_the_first_sweep() -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let first = event(endpoint_id, 1)?;
+        // The endpoint was enrolled before the process start: the first
+        // sweep (which fires immediately) must arm it — the restart
+        // recovery.
+        let stream =
+            FakeStream::for_endpoint(endpoint_id, vec![Ok(VecDeque::from([Ok(first.clone())]))]);
+        let sink = FakeSink::for_endpoint(endpoint_id, vec![Ok(())]);
+        let lister = FakeLister::with_endpoints(vec![endpoint_id]);
+        let loop_lister = lister.clone();
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+        let loop_stream = Arc::clone(&stream);
+        let loop_sink = Arc::clone(&sink);
+        let (stop_signal, stop_watch) = StopSignal::new();
+
+        let task = tokio::spawn(async move {
+            run(
+                stop_watch,
+                &loop_lister,
+                &loop_stream,
+                &loop_sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+                FAST_RECONCILE_INTERVAL,
+            )
+            .await;
+        });
+        for _ in 0..200 {
+            if !sink.recorded()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sink.recorded()?,
+            [(endpoint_id, first)],
+            "the first sweep must arm the preexisting endpoint"
+        );
+        stop_signal.signal();
+        join_with_timeout(task).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_stops_a_listener_when_its_endpoint_leaves_the_enrolled_set()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint_id = EndpointId::generate();
+        let (stream, _pull_gate) = FakeStream::gated_pull(endpoint_id);
+        let sink = FakeSink::for_endpoint(endpoint_id, Vec::new());
+        let lister = FakeLister::with_endpoints(vec![endpoint_id]);
+        let loop_lister = lister.clone();
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+        let loop_stream = Arc::clone(&stream);
+        let loop_sink = Arc::clone(&sink);
+        let (stop_signal, stop_watch) = StopSignal::new();
+
+        let task = tokio::spawn(async move {
+            run(
+                stop_watch,
+                &loop_lister,
+                &loop_stream,
+                &loop_sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+                FAST_RECONCILE_INTERVAL,
+            )
+            .await;
+        });
+        // Wait until the listener is consuming, then remove the endpoint
+        // from the enrolled set: the next sweep must stop the listener and
+        // close its stream gracefully.
+        for _ in 0..200 {
+            if stream.opens(endpoint_id).is_ok() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert!(
+            stream.opens(endpoint_id).is_ok(),
+            "the listener never opened the stream"
+        );
+        lister
+            .endpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        for _ in 0..200 {
+            if stream.closes(endpoint_id).is_ok() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert_eq!(
+            stream.closes(endpoint_id)?,
+            1,
+            "the stream must be closed gracefully after the removal"
+        );
+        assert_eq!(
+            stream.opens(endpoint_id)?,
+            1,
+            "no attempt may start after the removal"
+        );
+        stop_signal.signal();
+        join_with_timeout(task).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_aborts_only_the_sweep_and_retries_later() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint_id = EndpointId::generate();
+        let first = event(endpoint_id, 1)?;
+        let stream =
+            FakeStream::for_endpoint(endpoint_id, vec![Ok(VecDeque::from([Ok(first.clone())]))]);
+        let sink = FakeSink::for_endpoint(endpoint_id, vec![Ok(())]);
+        let lister = FakeLister::with_endpoints(vec![endpoint_id]);
+        lister
+            .fail_listing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let loop_lister = lister.clone();
+        let stream = Arc::new(stream);
+        let sink = Arc::new(sink);
+        let loop_stream = Arc::clone(&stream);
+        let loop_sink = Arc::clone(&sink);
+        let (stop_signal, stop_watch) = StopSignal::new();
+
+        let task = tokio::spawn(async move {
+            run(
+                stop_watch,
+                &loop_lister,
+                &loop_stream,
+                &loop_sink,
+                fast_policy(EVENT_RECONNECT_MAX_ATTEMPTS),
+                FAST_RECONCILE_INTERVAL,
+            )
+            .await;
+        });
+        // Several sweeps land while the listing fails: nothing may be armed.
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert!(
+            stream.opens(endpoint_id).is_err(),
+            "a sweep without a listing must not arm anything"
+        );
+        // The listing recovers: the very next sweep must arm the endpoint.
+        lister
+            .fail_listing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..200 {
+            if !sink.recorded()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert_eq!(
+            sink.recorded()?,
+            [(endpoint_id, first)],
+            "the recovered listing must arm the endpoint"
+        );
+        stop_signal.signal();
+        join_with_timeout(task).await?;
         Ok(())
     }
 }
