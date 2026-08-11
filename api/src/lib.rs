@@ -10945,6 +10945,9 @@ mod tests {
         Ok(())
     }
 
+    // The full-envelope golden assertion exceeds the pedantic line budget;
+    // the lint is scoped here exactly like the other contract tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn overview_contract_serializes_every_dashboard_block() -> Result<(), Box<dyn Error>> {
         let event_timestamp = OffsetDateTime::parse("2026-08-07T03:21:00Z", &Rfc3339)?;

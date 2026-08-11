@@ -21546,6 +21546,7 @@ mod tests {
             "The overview is temporarily unavailable."
         );
         assert_eq!(OverviewState::Idle.failure_message(), "");
+        assert_eq!(OverviewState::Loading.failure_message(), "");
         assert_eq!(OverviewState::Idle.projection(), None);
         assert_eq!(OverviewState::Failed.projection(), None);
     }
