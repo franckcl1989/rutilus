@@ -9597,11 +9597,12 @@ struct LiteOnStatusPayload {
 /// The §0.5.0 Delta power-supply family projection.
 ///
 /// The field set is exactly the `OemDeltaPowerSupplyPayload` the application
-/// boundary decodes with `deny_unknown_fields`. The common identity is the
-/// standard supply's own (the compiled `DeltaEnergySystemsPowerSupply` is an
-/// extension of the supply's `Oem` segment, not a separate document); the
-/// `Power` flag and the numeric `FanSpeedTarget` value are the compiled
-/// extension fields, projected only when the supply published them.
+/// boundary decodes with `deny_unknown_fields`. The common identity fields
+/// are the standard supply's own (the compiled
+/// `DeltaEnergySystemsPowerSupply` is an extension of the supply's `Oem`
+/// segment, not a separate document); the `Power` flag and the numeric
+/// `FanSpeedTarget` value are the compiled extension fields, projected only
+/// when the supply published them.
 #[derive(Serialize)]
 struct DeltaPowerSupplyPayload {
     #[serde(flatten)]
@@ -11004,14 +11005,22 @@ fn hpe_manager_projection(
 /// Projects one typed `LiteOn` `LiteonPowerSupply` document into the OEM
 /// family.
 ///
-/// The `@odata.id` and `ETag` come from the typed schema exactly like every
-/// other family; the compiled `LiteonPowerSupply` entity extends the
+/// The `@odata.id` is a product storage key derived from the supply
+/// document's own URL (`{supply}/Oem/LiteOn`), never a location the read
+/// fetches: the supply document itself is the real resource identity, taken
+/// by the standard `power-supplies` snapshot of the same refresh, and the
+/// endpoint inventory keeps one stable identity per snapshot — the same
+/// design language as the embedded AMI/HPE segments (§11.5 forbids
+/// fabricating a vendor URL to fetch). The `ETag` is the supply document's
+/// own, exactly like the standard family (the projection is built from that
+/// same document). The compiled `LiteonPowerSupply` entity extends the
 /// standard `PowerSupply` schema, so the projected fields are the same typed
-/// power-supply identity fields the standard family projects (`PowerSupplyType`
-/// spelling verbatim per §12.3, numeric `PowerCapacityWatts`, hardware
-/// identity texts, and `Status`). The document is one chain surface, so an
-/// unrepresentable identifier or payload is skipped by the caller through
-/// the member-level `member_projection` semantics.
+/// power-supply identity fields the standard family projects
+/// (`PowerSupplyType` spelling verbatim per §12.3, numeric
+/// `PowerCapacityWatts`, hardware identity texts, and `Status`). The
+/// document is one chain surface, so an unrepresentable identifier or
+/// payload is skipped by the caller through the member-level
+/// `member_projection` semantics.
 fn liteon_power_supply_projection(
     supply: &LiteonPowerSupplySchema,
 ) -> Result<CoreResourceProjection, CoreResourceReadError> {
@@ -11044,7 +11053,10 @@ fn liteon_power_supply_projection(
     };
     build_core_projection(
         ResourceFeature::OemLiteOnPowerSupply,
-        supply.odata_id(),
+        &ODataId::from(format!(
+            "{}/Oem/LiteOn",
+            supply.odata_id().to_string().trim_end_matches('/')
+        )),
         supply.etag(),
         &payload,
     )
@@ -11052,13 +11064,20 @@ fn liteon_power_supply_projection(
 
 /// Projects one typed Delta power-supply extension into the OEM family.
 ///
-/// The `@odata.id` and `ETag` are the standard supply's own (the compiled
-/// `DeltaEnergySystemsPowerSupply` is an extension of the supply's `Oem`
-/// segment, not a separate document); the `Power` flag and the numeric
-/// `FanSpeedTarget` value are the compiled extension fields, serialized by
-/// their vendor-defined shapes per §12.3. The document is one chain surface,
-/// so an unrepresentable identifier or payload is skipped by the caller
-/// through the member-level `member_projection` semantics.
+/// The `@odata.id` is a product storage key derived from the supply
+/// document's own URL (`{supply}/Oem/deltaenergysystems`), never a location
+/// the read fetches: the supply document itself is the real resource
+/// identity, taken by the standard `power-supplies` snapshot of the same
+/// refresh, and the endpoint inventory keeps one stable identity per
+/// snapshot — the same design language as the embedded AMI/HPE segments
+/// (§11.5 forbids fabricating a vendor URL to fetch). The `ETag` is the
+/// supply document's own (the compiled `DeltaEnergySystemsPowerSupply` is an
+/// extension of the supply's `Oem` segment, not a separate document); the
+/// `Power` flag and the numeric `FanSpeedTarget` value are the compiled
+/// extension fields, serialized by their vendor-defined shapes per §12.3.
+/// The document is one chain surface, so an unrepresentable identifier or
+/// payload is skipped by the caller through the member-level
+/// `member_projection` semantics.
 fn delta_power_supply_projection(
     supply: &PowerSupplySchema,
     delta: &DeltaPowerSupplySchema,
@@ -11070,7 +11089,10 @@ fn delta_power_supply_projection(
     };
     build_core_projection(
         ResourceFeature::OemDeltaPowerSupply,
-        supply.odata_id(),
+        &ODataId::from(format!(
+            "{}/Oem/deltaenergysystems",
+            supply.odata_id().to_string().trim_end_matches('/')
+        )),
         supply.etag(),
         &payload,
     )
@@ -19574,12 +19596,24 @@ mod tests {
             .await?;
 
         assert_eq!(resources.len(), 6);
+        // The standard `power-supplies` family and the `LiteOn` family
+        // project the same supply document; the `LiteOn` snapshot carries
+        // the family's synthetic storage key, so the two families stay
+        // distinct in one inventory (the application boundary's
+        // `DuplicateODataId` check must never fire).
+        let standard = &resources[3];
+        assert_eq!(standard.feature(), ResourceFeature::PowerSupplies);
+        assert_eq!(
+            standard.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
         let supply = &resources[4];
         assert_eq!(supply.feature(), ResourceFeature::OemLiteOnPowerSupply);
         assert_eq!(
             supply.odata_id().as_str(),
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn"
         );
+        assert_ne!(standard.odata_id(), supply.odata_id());
         assert_eq!(
             supply.etag().map(ResourceEtag::as_str),
             Some("W/\"liteon-psu-1\"")
@@ -19676,12 +19710,24 @@ mod tests {
             .await?;
 
         assert_eq!(resources.len(), 6);
+        // The standard `power-supplies` family and the Delta family project
+        // the same supply document; the Delta snapshot carries the family's
+        // synthetic storage key, so the two families stay distinct in one
+        // inventory (the application boundary's `DuplicateODataId` check must
+        // never fire).
+        let standard = &resources[3];
+        assert_eq!(standard.feature(), ResourceFeature::PowerSupplies);
+        assert_eq!(
+            standard.odata_id().as_str(),
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
         let supply = &resources[4];
         assert_eq!(supply.feature(), ResourceFeature::OemDeltaPowerSupply);
         assert_eq!(
             supply.odata_id().as_str(),
-            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems"
         );
+        assert_ne!(standard.odata_id(), supply.odata_id());
         assert_eq!(
             supply.etag().map(ResourceEtag::as_str),
             Some("W/\"delta-psu-1\"")
