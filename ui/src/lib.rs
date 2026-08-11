@@ -17007,6 +17007,149 @@ mod tests {
         })
     }
 
+    fn network_device_function_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c3",
+                "odata_id": "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                "odata_type": "#NetworkDeviceFunction.v1_5_0.NetworkDeviceFunction",
+                "etag": "W/\"ndf-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Adapter One Function One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "network_device_function",
+                "details": {
+                    "net_dev_func_type": "Ethernet",
+                    "device_enabled": true,
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn power_equipment_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c4",
+                "odata_id": "/redfish/v1/PowerEquipment/PowerShelves/1",
+                "odata_type": "#PowerDistribution.v1_4_0.PowerDistribution",
+                "etag": "W/\"power-shelf-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Shelf One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "power_equipment",
+                "details": {
+                    "equipment_type": "PowerShelf",
+                    "manufacturer": "Rutilus Test",
+                    "model": "PDU-30K",
+                    "part_number": "PDU-PART-1",
+                    "serial_number": "PDU-1",
+                    "version": "2.0",
+                    "firmware_version": "3.1.4",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn power_supply_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c5",
+                "odata_id": "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                "odata_type": "#PowerSupply.v1_5_0.PowerSupply",
+                "etag": "W/\"power-supply-1\""
+            },
+            "common": {
+                "id": "1",
+                "name": "Power Supply One",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "power_supply",
+                "details": {
+                    "power_supply_type": "AC",
+                    "power_capacity_watts": 1600.0,
+                    "manufacturer": "Rutilus Test",
+                    "model": "PSU-1600",
+                    "firmware_version": "1.0.0",
+                    "serial_number": "PSU-1",
+                    "part_number": "PSU-PART-1",
+                    "status": {
+                        "state": "Enabled",
+                        "health": "OK",
+                        "health_rollup": "OK"
+                    }
+                }
+            }
+        })
+    }
+
+    fn environment_metrics_resource() -> serde_json::Value {
+        json!({
+            "source": {
+                "resource_id": "01989abc-def0-7abc-8def-0123456789c6",
+                "odata_id": "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                "odata_type": "#EnvironmentMetrics.v1_1_0.EnvironmentMetrics",
+                "etag": "W/\"env-metrics-1\""
+            },
+            "common": {
+                "id": "EnvironmentMetrics",
+                "name": "Environment Metrics",
+                "description": null
+            },
+            "resource": {
+                "resource_type": "environment_metrics",
+                "details": {
+                    "temperature_celsius": {
+                        "data_source_uri": "/redfish/v1/Chassis/1/Sensors/InletTemp",
+                        "reading": 27.5
+                    },
+                    "humidity_percent": null,
+                    "fan_speeds_percent": [
+                        {
+                            "data_source_uri": "/redfish/v1/Chassis/1/Sensors/Fan1",
+                            "reading": 45.0
+                        },
+                        {
+                            "data_source_uri": "/redfish/v1/Chassis/1/Sensors/Fan2",
+                            "reading": 50.0
+                        }
+                    ],
+                    "power_watts": null,
+                    "energyk_wh": null,
+                    "power_load_percent": null,
+                    "power_limit_watts": {
+                        "data_source_uri": "/redfish/v1/Chassis/1/Controls/PowerLimit",
+                        "set_point": 800.0
+                    },
+                    "dew_point_celsius": null,
+                    "absolute_humidity": null,
+                    "energy_joules": null,
+                    "ambient_temperature_celsius": null,
+                    "voltage": null,
+                    "current_amps": null
+                }
+            }
+        })
+    }
+
     /// The §2.1 capability ledger in design-document order: product code,
     /// upstream feature, and wire `ui_location` value of the shared contract.
     const LEDGER_FIXTURE: [(&str, &str, &str); 30] = [
@@ -18194,6 +18337,156 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn network_device_function_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse =
+            serde_json::from_value(network_device_function_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Network device function");
+        assert_eq!(card.name, "Adapter One Function One");
+        assert_eq!(
+            card.source,
+            "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1"
+        );
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Function type",
+            value: "Ethernet".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Device enabled",
+            value: "Yes".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn power_equipment_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse = serde_json::from_value(power_equipment_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Power equipment");
+        assert_eq!(card.name, "Power Shelf One");
+        assert_eq!(card.source, "/redfish/v1/PowerEquipment/PowerShelves/1");
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Equipment type",
+            value: "PowerShelf".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Rutilus Test".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PDU-30K".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Part number",
+            value: "PDU-PART-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Serial number",
+            value: "PDU-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Version",
+            value: "2.0".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Firmware version",
+            value: "3.1.4".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "State",
+            value: "Enabled".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn power_supply_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse = serde_json::from_value(power_supply_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Power supply");
+        assert_eq!(card.name, "Power Supply One");
+        assert_eq!(
+            card.source,
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+        );
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Supply type",
+            value: "AC".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Capacity (W)",
+            value: "1600".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Manufacturer",
+            value: "Rutilus Test".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Model",
+            value: "PSU-1600".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Firmware version",
+            value: "1.0.0".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Serial number",
+            value: "PSU-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Part number",
+            value: "PSU-PART-1".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Health",
+            value: "OK".to_owned(),
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn environment_metrics_card_projects_its_facts() -> Result<(), Box<dyn Error>> {
+        let resource: CoreResourceResponse =
+            serde_json::from_value(environment_metrics_resource())?;
+        let card = CoreResourceCardProjection::from_resource(
+            "01989abc-def0-7abc-8def-0123456789ac",
+            &resource,
+        );
+        assert_eq!(card.type_label, "Environment metrics");
+        assert_eq!(card.name, "Environment Metrics");
+        assert_eq!(card.source, "/redfish/v1/Chassis/1/EnvironmentMetrics");
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Temperature (C)",
+            value: "27.5".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Fan readings",
+            value: "2".to_owned(),
+        }));
+        assert!(card.facts.contains(&ResourceFactProjection {
+            label: "Power limit (W)",
+            value: "800".to_owned(),
+        }));
+        assert!(!card.facts.iter().any(|fact| fact.label == "Humidity (%)"));
+        assert!(!card.facts.iter().any(|fact| fact.label == "State"));
         Ok(())
     }
 

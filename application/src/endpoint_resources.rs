@@ -4214,6 +4214,222 @@ mod tests {
     }
 
     #[tokio::test]
+    // The contract walk pins every projected field of all four families and
+    // both PowerEquipment payload shapes, so the line count is the coverage.
+    #[allow(clippy::too_many_lines)]
+    async fn projects_the_four_standard_families_without_losing_source_values()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let generation = RefreshGeneration::new(12)?;
+        let observed_at = endpoint.updated_at();
+        let item = EndpointInventoryItem::try_new(
+            endpoint,
+            vec![
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::ServiceRoot,
+                    "/redfish/v1",
+                    r#"{"Id":"RootService","Name":"Root","Vendor":"Vendor A","Product":"BMC","RedfishVersion":"1.20.0"}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::NetworkDeviceFunctions,
+                    "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                    r#"{"Id":"1","Name":"Adapter One Function One","NetDevFuncType":"Ethernet","DeviceEnabled":true,"Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::PowerEquipment,
+                    "/redfish/v1/PowerEquipment",
+                    r#"{"Id":"PowerEquipment","Name":"Power Equipment","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::PowerEquipment,
+                    "/redfish/v1/PowerEquipment/PowerShelves/1",
+                    r#"{"Id":"1","Name":"Power Shelf One","EquipmentType":"PowerShelf","Manufacturer":"Rutilus Test","Model":"PDU-30K","PartNumber":"PDU-PART-1","SerialNumber":"PDU-1","Version":"2.0","FirmwareVersion":"3.1.4","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::PowerSupplies,
+                    "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1",
+                    r#"{"Id":"1","Name":"Power Supply One","PowerSupplyType":"AC","PowerCapacityWatts":1600.0,"Manufacturer":"Rutilus Test","Model":"PSU-1600","FirmwareVersion":"1.0.0","SerialNumber":"PSU-1","PartNumber":"PSU-PART-1","Status":{"State":"Enabled","Health":"OK","HealthRollup":"OK"}}"#,
+                    observed_at,
+                    generation,
+                )?,
+                snapshot(
+                    endpoint_id,
+                    ResourceFeature::EnvironmentMetrics,
+                    "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                    r#"{"Id":"EnvironmentMetrics","Name":"Environment Metrics","TemperatureCelsius":{"DataSourceUri":"/redfish/v1/Chassis/1/Sensors/InletTemp","Reading":27.5},"FanSpeedsPercent":[{"DataSourceUri":"/redfish/v1/Chassis/1/Sensors/Fan1","Reading":45.0}],"PowerLimitWatts":{"DataSourceUri":"/redfish/v1/Chassis/1/Controls/PowerLimit","SetPoint":800.0}}"#,
+                    observed_at,
+                    generation,
+                )?,
+            ],
+        )?;
+        let query =
+            EndpointResourceInventoryQuery::new(MockRepository::ok(vec![item]), endpoint_id);
+        let result = query.execute().await?.ok_or("endpoint must exist")?;
+
+        assert_eq!(result.generation(), Some(generation));
+        assert_eq!(result.observed_at(), Some(observed_at));
+        assert_eq!(result.resources().len(), 6);
+        assert_eq!(result.resources()[0].common().name(), "Root");
+
+        // `EndpointInventoryItem` sorts its snapshots by `@odata.id`, so the
+        // resources are looked up by their stable identifiers.
+        let function = &result
+            .resources()
+            .iter()
+            .find(|resource| {
+                resource.odata_id().as_str()
+                    == "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1"
+            })
+            .ok_or("the network device function must be projected")?;
+        assert_eq!(function.feature(), ResourceFeature::NetworkDeviceFunctions);
+        assert_eq!(function.common().name(), "Adapter One Function One");
+        assert_eq!(
+            function.details(),
+            &CoreResourceDetails::NetworkDeviceFunction {
+                net_dev_func_type: Some("Ethernet".to_owned()),
+                device_enabled: Some(true),
+                status: Some(ResourceStatusSummary {
+                    state: Some("Enabled".to_owned()),
+                    health: Some("OK".to_owned()),
+                    health_rollup: Some("OK".to_owned()),
+                }),
+            }
+        );
+
+        let equipment_root = &result
+            .resources()
+            .iter()
+            .find(|resource| resource.odata_id().as_str() == "/redfish/v1/PowerEquipment")
+            .ok_or("the power equipment root document must be projected")?;
+        assert_eq!(equipment_root.feature(), ResourceFeature::PowerEquipment);
+        assert_eq!(equipment_root.common().name(), "Power Equipment");
+        assert_eq!(
+            equipment_root.details(),
+            &CoreResourceDetails::PowerEquipment {
+                equipment_type: None,
+                manufacturer: None,
+                model: None,
+                part_number: None,
+                serial_number: None,
+                version: None,
+                firmware_version: None,
+                status: Some(ResourceStatusSummary {
+                    state: Some("Enabled".to_owned()),
+                    health: Some("OK".to_owned()),
+                    health_rollup: Some("OK".to_owned()),
+                }),
+            }
+        );
+
+        let equipment_shelf = &result
+            .resources()
+            .iter()
+            .find(|resource| {
+                resource.odata_id().as_str() == "/redfish/v1/PowerEquipment/PowerShelves/1"
+            })
+            .ok_or("the power equipment shelf member must be projected")?;
+        assert_eq!(equipment_shelf.feature(), ResourceFeature::PowerEquipment);
+        assert_eq!(equipment_shelf.common().name(), "Power Shelf One");
+        assert_eq!(
+            equipment_shelf.details(),
+            &CoreResourceDetails::PowerEquipment {
+                equipment_type: Some("PowerShelf".to_owned()),
+                manufacturer: Some("Rutilus Test".to_owned()),
+                model: Some("PDU-30K".to_owned()),
+                part_number: Some("PDU-PART-1".to_owned()),
+                serial_number: Some("PDU-1".to_owned()),
+                version: Some("2.0".to_owned()),
+                firmware_version: Some("3.1.4".to_owned()),
+                status: Some(ResourceStatusSummary {
+                    state: Some("Enabled".to_owned()),
+                    health: Some("OK".to_owned()),
+                    health_rollup: Some("OK".to_owned()),
+                }),
+            }
+        );
+
+        let supply = &result
+            .resources()
+            .iter()
+            .find(|resource| {
+                resource.odata_id().as_str()
+                    == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
+            })
+            .ok_or("the power supply must be projected")?;
+        assert_eq!(supply.feature(), ResourceFeature::PowerSupplies);
+        assert_eq!(supply.common().name(), "Power Supply One");
+        assert_eq!(
+            supply.details(),
+            &CoreResourceDetails::PowerSupply {
+                power_supply_type: Some("AC".to_owned()),
+                power_capacity_watts: Some(1600.0),
+                manufacturer: Some("Rutilus Test".to_owned()),
+                model: Some("PSU-1600".to_owned()),
+                firmware_version: Some("1.0.0".to_owned()),
+                serial_number: Some("PSU-1".to_owned()),
+                part_number: Some("PSU-PART-1".to_owned()),
+                status: Some(ResourceStatusSummary {
+                    state: Some("Enabled".to_owned()),
+                    health: Some("OK".to_owned()),
+                    health_rollup: Some("OK".to_owned()),
+                }),
+            }
+        );
+
+        let metrics = &result
+            .resources()
+            .iter()
+            .find(|resource| {
+                resource.odata_id().as_str() == "/redfish/v1/Chassis/1/EnvironmentMetrics"
+            })
+            .ok_or("the environment metrics singleton must be projected")?;
+        assert_eq!(metrics.feature(), ResourceFeature::EnvironmentMetrics);
+        assert_eq!(metrics.common().name(), "Environment Metrics");
+        assert_eq!(
+            metrics.details(),
+            &CoreResourceDetails::EnvironmentMetrics {
+                temperature_celsius: Some(EnvironmentMetricsReadingSummary::new(
+                    Some("/redfish/v1/Chassis/1/Sensors/InletTemp".to_owned()),
+                    Some(27.5),
+                )),
+                humidity_percent: None,
+                fan_speeds_percent: Some(vec![EnvironmentMetricsReadingSummary::new(
+                    Some("/redfish/v1/Chassis/1/Sensors/Fan1".to_owned()),
+                    Some(45.0),
+                )]),
+                power_watts: None,
+                energyk_wh: None,
+                power_load_percent: None,
+                power_limit_watts: Some(EnvironmentMetricsControlSummary::new(
+                    Some("/redfish/v1/Chassis/1/Controls/PowerLimit".to_owned()),
+                    Some(800.0),
+                )),
+                dew_point_celsius: None,
+                absolute_humidity: None,
+                energy_joules: None,
+                ambient_temperature_celsius: None,
+                voltage: None,
+                current_amps: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn projects_storage_network_and_ethernet_families_without_losing_source_values()
     -> Result<(), Box<dyn Error>> {
         let endpoint = endpoint()?;
