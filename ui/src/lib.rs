@@ -21,7 +21,8 @@ use rutilus_api::{
     EndpointEnrollmentResponse, EndpointInventoryResponse, EndpointRefreshResultResponse,
     EndpointRefreshStatusResponse, EndpointResourceInventoryResponse,
     EndpointResourceSnapshotResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
-    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EraseToken, EraseType,
+    EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest,
+    EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, EraseToken, EraseType,
     EventCommand, EventDestinationProtocol, EventListResponse, EventResponse, EventType,
     GroupResponse, ManagerCommand, MetricValueResponse, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, OperationResponse,
@@ -341,6 +342,10 @@ fn count_core_resources(resources: &[CoreResourceResponse]) -> ResourceCountsPro
             | CoreResourceDetailsResponse::Memory { .. }
             | CoreResourceDetailsResponse::Storage { .. }
             | CoreResourceDetailsResponse::NetworkAdapter { .. }
+            | CoreResourceDetailsResponse::NetworkDeviceFunction { .. }
+            | CoreResourceDetailsResponse::PowerEquipment { .. }
+            | CoreResourceDetailsResponse::PowerSupply { .. }
+            | CoreResourceDetailsResponse::EnvironmentMetrics { .. }
             | CoreResourceDetailsResponse::EthernetInterface { .. }
             | CoreResourceDetailsResponse::Account { .. }
             | CoreResourceDetailsResponse::Bios { .. }
@@ -553,6 +558,10 @@ fn oem_resource_card(
         | CoreResourceDetailsResponse::Memory { .. }
         | CoreResourceDetailsResponse::Storage { .. }
         | CoreResourceDetailsResponse::NetworkAdapter { .. }
+        | CoreResourceDetailsResponse::NetworkDeviceFunction { .. }
+        | CoreResourceDetailsResponse::PowerEquipment { .. }
+        | CoreResourceDetailsResponse::PowerSupply { .. }
+        | CoreResourceDetailsResponse::EnvironmentMetrics { .. }
         | CoreResourceDetailsResponse::EthernetInterface { .. }
         | CoreResourceDetailsResponse::Account { .. }
         | CoreResourceDetailsResponse::Bios { .. }
@@ -646,6 +655,14 @@ fn card_facts(
         CoreResourceDetailsResponse::Memory { .. } => memory_card_facts(resource),
         CoreResourceDetailsResponse::Storage { .. } => storage_card_facts(resource),
         CoreResourceDetailsResponse::NetworkAdapter { .. } => network_adapter_card_facts(resource),
+        CoreResourceDetailsResponse::NetworkDeviceFunction { .. } => {
+            network_device_function_card_facts(resource)
+        }
+        CoreResourceDetailsResponse::PowerEquipment { .. } => power_equipment_card_facts(resource),
+        CoreResourceDetailsResponse::PowerSupply { .. } => power_supply_card_facts(resource),
+        CoreResourceDetailsResponse::EnvironmentMetrics { .. } => {
+            environment_metrics_card_facts(resource)
+        }
         CoreResourceDetailsResponse::EthernetInterface { .. } => {
             ethernet_interface_card_facts(resource)
         }
@@ -958,6 +975,37 @@ fn network_adapter_card_facts(
     ("Network adapter", facts)
 }
 
+/// Facts for a §2.1 network-device-function card; the `NetDevFuncType`
+/// enumeration stays as the canonical wire spelling so the card renders the
+/// function type without re-parsing text, and the `DeviceEnabled` boolean
+/// renders as Yes/No.
+///
+/// The dispatcher guarantees this receives the `NetworkDeviceFunction`
+/// variant; the fallback keeps a stable empty facts list instead of panicking
+/// if that contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn network_device_function_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::NetworkDeviceFunction {
+        net_dev_func_type,
+        device_enabled,
+        status,
+    } = resource
+    else {
+        return ("Network device function", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Function type", net_dev_func_type.as_deref());
+    push_fact(
+        &mut facts,
+        "Device enabled",
+        device_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
+    );
+    push_status_facts(&mut facts, status.as_ref());
+    ("Network device function", facts)
+}
+
 /// Facts for a §2.1 ethernet-interface card; `speed_mbps` stays numeric so
 /// the card renders the link speed without re-parsing text, and the enabled
 /// flag renders only when the BMC published it.
@@ -1120,6 +1168,84 @@ fn power_card_facts(
     ("Power", Vec::new())
 }
 
+/// Facts for a §2.1 power-equipment card; the `PowerEquipment` service
+/// document carries the `EquipmentType` enumeration and the hardware identity
+/// strings, so the card renders them without re-parsing text.
+///
+/// The dispatcher guarantees this receives the `PowerEquipment` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn power_equipment_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::PowerEquipment {
+        equipment_type,
+        manufacturer,
+        model,
+        part_number,
+        serial_number,
+        version,
+        firmware_version,
+        status,
+    } = resource
+    else {
+        return ("Power equipment", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Equipment type", equipment_type.as_deref());
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Version", version.as_deref());
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Power equipment", facts)
+}
+
+/// Facts for a §2.1 power-supply card; the `PowerSupplyType` enumeration and
+/// the numeric capacity stay as published so the card renders the supply
+/// without re-parsing text, and the hardware identity strings follow.
+///
+/// The dispatcher guarantees this receives the `PowerSupply` variant; the
+/// fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn power_supply_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::PowerSupply {
+        power_supply_type,
+        power_capacity_watts,
+        manufacturer,
+        model,
+        firmware_version,
+        serial_number,
+        part_number,
+        status,
+    } = resource
+    else {
+        return ("Power supply", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_fact(&mut facts, "Supply type", power_supply_type.as_deref());
+    push_f64_fact(&mut facts, "Capacity (W)", *power_capacity_watts);
+    push_hardware_facts(
+        &mut facts,
+        manufacturer.as_deref(),
+        model.as_deref(),
+        part_number.as_deref(),
+        serial_number.as_deref(),
+    );
+    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_status_facts(&mut facts, status.as_ref());
+    ("Power supply", facts)
+}
+
 /// Facts for a §2.1 thermal card; only the resource-level status values are
 /// projectable, because temperature readings exist only on nested
 /// `Temperatures` members.
@@ -1189,6 +1315,95 @@ fn control_card_facts(
     push_f64_fact(&mut facts, "Set point", *set_point);
     push_status_facts(&mut facts, status.as_ref());
     ("Control", facts)
+}
+
+/// Facts for a §2.1 environment-metrics card; every embedded measurement the
+/// schema declares is projected through its numeric `Reading` so the card
+/// renders it without re-parsing text, and the fan-speed excerpt array stays
+/// as a count like the metric-report card keeps its values count. The schema
+/// declares no `Status` property, so the card carries no status facts.
+///
+/// The dispatcher guarantees this receives the `EnvironmentMetrics` variant;
+/// the fallback keeps a stable empty facts list instead of panicking if that
+/// contract is ever violated.
+#[cfg(any(target_arch = "wasm32", test))]
+fn environment_metrics_card_facts(
+    resource: &CoreResourceDetailsResponse,
+) -> (&'static str, Vec<ResourceFactProjection>) {
+    let CoreResourceDetailsResponse::EnvironmentMetrics {
+        temperature_celsius,
+        humidity_percent,
+        fan_speeds_percent,
+        power_watts,
+        energyk_wh,
+        power_load_percent,
+        power_limit_watts,
+        dew_point_celsius,
+        absolute_humidity,
+        energy_joules,
+        ambient_temperature_celsius,
+        voltage,
+        current_amps,
+    } = resource
+    else {
+        return ("Environment metrics", Vec::new());
+    };
+    let mut facts = Vec::new();
+    push_environment_reading_fact(&mut facts, "Temperature (C)", temperature_celsius.as_ref());
+    push_environment_reading_fact(&mut facts, "Humidity (%)", humidity_percent.as_ref());
+    push_u64_fact(
+        &mut facts,
+        "Fan readings",
+        fan_speeds_percent
+            .as_ref()
+            .map(|speeds| speeds.len() as u64),
+    );
+    push_environment_reading_fact(&mut facts, "Power (W)", power_watts.as_ref());
+    push_environment_reading_fact(&mut facts, "Energy (kWh)", energyk_wh.as_ref());
+    push_environment_reading_fact(&mut facts, "Power load (%)", power_load_percent.as_ref());
+    push_environment_control_fact(&mut facts, "Power limit (W)", power_limit_watts.as_ref());
+    push_environment_reading_fact(&mut facts, "Dew point (C)", dew_point_celsius.as_ref());
+    push_environment_reading_fact(&mut facts, "Absolute humidity", absolute_humidity.as_ref());
+    push_environment_reading_fact(&mut facts, "Energy (J)", energy_joules.as_ref());
+    push_environment_reading_fact(
+        &mut facts,
+        "Ambient temperature (C)",
+        ambient_temperature_celsius.as_ref(),
+    );
+    push_environment_reading_fact(&mut facts, "Voltage (V)", voltage.as_ref());
+    push_environment_reading_fact(&mut facts, "Current (A)", current_amps.as_ref());
+    ("Environment metrics", facts)
+}
+
+/// Pushes one environment-metrics sensor-excerpt reading as a fact, keeping
+/// the numeric value without re-parsing text; missing measurements stay
+/// absent from the card.
+#[cfg(any(target_arch = "wasm32", test))]
+fn push_environment_reading_fact(
+    facts: &mut Vec<ResourceFactProjection>,
+    label: &'static str,
+    reading: Option<&EnvironmentMetricsReadingResponse>,
+) {
+    push_f64_fact(
+        facts,
+        label,
+        reading.and_then(EnvironmentMetricsReadingResponse::reading),
+    );
+}
+
+/// Pushes the environment-metrics power-limit control-excerpt set point as a
+/// fact; a missing control stays absent from the card.
+#[cfg(any(target_arch = "wasm32", test))]
+fn push_environment_control_fact(
+    facts: &mut Vec<ResourceFactProjection>,
+    label: &'static str,
+    control: Option<&EnvironmentMetricsControlResponse>,
+) {
+    push_f64_fact(
+        facts,
+        label,
+        control.and_then(EnvironmentMetricsControlResponse::set_point),
+    );
 }
 
 /// Facts for a §2.1 log-service card; the service-enabled flag renders as

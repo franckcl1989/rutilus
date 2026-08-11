@@ -2578,6 +2578,12 @@ fn project_enrollment(
             | ResourceFeature::OemNvidiaPowerCompliance
             | ResourceFeature::OemNvidiaManagedEntity
             | ResourceFeature::OemLenovoSecurityService
+            | ResourceFeature::OemAmiServiceRoot
+            | ResourceFeature::OemAmiConfigBmc
+            | ResourceFeature::OemHpeILoServiceExt
+            | ResourceFeature::OemHpeManager
+            | ResourceFeature::OemLiteOnPowerSupply
+            | ResourceFeature::OemDeltaPowerSupply
             | ResourceFeature::PcieDevices
             | ResourceFeature::Assembly
             | ResourceFeature::SoftwareInventory

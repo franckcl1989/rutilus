@@ -828,6 +828,23 @@ where
         ResourceFeature::OemLenovoSecurityService => {
             project_oem_lenovo_security_service(snapshot, payload)?
         }
+        ResourceFeature::OemAmiServiceRoot
+        | ResourceFeature::OemAmiConfigBmc
+        | ResourceFeature::OemHpeILoServiceExt
+        | ResourceFeature::OemHpeManager
+        | ResourceFeature::OemLiteOnPowerSupply
+        | ResourceFeature::OemDeltaPowerSupply => {
+            // The typed projections of the 0.5 OEM read families (`AmiServiceRoot`,
+            // `ConfigBmc`, `HpeiLoServiceExt`, `HpeiLo`, `LiteonPowerSupply`, and
+            // `DeltaPowerSupply`) land with the resource-details slice; these arms
+            // keep the compiled families' snapshots countable and storable, and
+            // report the missing projection as a controlled error instead of
+            // panicking.
+            return Err(EndpointResourceInventoryQueryError::NotYetProjectable {
+                resource_id: snapshot.resource_id(),
+                feature: snapshot.feature(),
+            });
+        }
         ResourceFeature::Processors => project_processor(snapshot, payload)?,
         ResourceFeature::Memory => project_memory(snapshot, payload)?,
         ResourceFeature::Storages => project_storage(snapshot, payload)?,
