@@ -1169,6 +1169,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pin_mismatch_during_refresh_fails_and_keeps_the_capability_snapshot()
+    -> Result<(), Box<dyn Error>> {
+        // A TLS certificate rotation the refresh cannot verify: the gateway
+        // read refuses the pinned identity (the infra gateway surfaces this
+        // as the `TlsIdentityChanged` class of `CoreResourceReadError`), so
+        // the refresh fails before any Generation commit and the last
+        // capability snapshot stays intact (§9.5) — a pin mismatch is never
+        // a reason to overwrite the endpoint's stored capability truth.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = endpoint()?;
+        let repository = MockRepository::succeed(endpoint.clone(), Arc::clone(&events));
+        let snapshot_calls = repository.snapshot_calls();
+        let service = EndpointRefresh::new(
+            repository,
+            MockCredentials::available(Arc::clone(&events)),
+            MockReader::fail_pin(Arc::clone(&events)),
+            FixedClock(endpoint.updated_at()),
+        );
+
+        let result = service.execute(endpoint.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(EndpointRefreshError::Read(MockError::TlsPinMismatch))
+        ));
+        assert_eq!(
+            recorded(&events)?,
+            ["load", "credential", "read"],
+            "a pin-mismatched read must stop the refresh before any commit"
+        );
+        assert_eq!(
+            recorded_snapshot_calls(&snapshot_calls)?.len(),
+            0,
+            "a pin-mismatched read must never touch the capability snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audited_refresh_records_a_pin_mismatch_as_core_resource_read_failed()
+    -> Result<(), Box<dyn Error>> {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let endpoint = endpoint()?;
+        let endpoint_id = endpoint.id();
+        let service = AuditedEndpointRefresh::new(
+            MockRepository::succeed(endpoint, Arc::clone(&lifecycle)),
+            MockCredentials::available(Arc::clone(&lifecycle)),
+            MockReader::fail_pin(Arc::clone(&lifecycle)),
+            MockAudit::succeed(Arc::clone(&lifecycle), Arc::clone(&audit_state)),
+            FixedClock(OffsetDateTime::now_utc()),
+            AuditActor::System,
+            None,
+            DeploymentPosture::Site,
+        );
+
+        let result = service.execute(endpoint_id).await;
+
+        // The endpoint's refresh is marked failed in the audit trail, with
+        // the typed read-failure classification — a pin mismatch is the one
+        // refresh failure the operator must investigate.
+        assert!(matches!(
+            result,
+            Err(AuditedEndpointRefreshError::Refresh {
+                endpoint_id: id,
+                source,
+            }) if id == endpoint_id
+                && matches!(
+                    *source,
+                    EndpointRefreshError::Read(MockError::TlsPinMismatch)
+                )
+        ));
+        let audit = recorded_audit_events(&audit_state)?;
+        assert_eq!(audit.len(), 2);
+        assert_eq!(
+            audit[1].outcome().failure(),
+            Some(AuditFailure::CoreResourceReadFailed)
+        );
+        assert_eq!(
+            audit[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        assert_eq!(
+            recorded(&lifecycle)?,
+            ["audit", "load", "credential", "read", "audit"],
+            "a pin-mismatched read must never reach the Generation or the snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn capability_snapshot_replace_failure_propagates() -> Result<(), Box<dyn Error>> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let endpoint = endpoint()?;
@@ -1309,6 +1400,11 @@ mod tests {
         Credential,
         Reader,
         Audit,
+        /// The reader's `read_core_resources` refused the pinned identity:
+        /// the refresh's "gateway" surfaced a TLS pin mismatch (the infra
+        /// gateway surfaces this through `CoreResourceReadError` when the
+        /// observed certificate no longer matches the pinned fingerprint).
+        TlsPinMismatch,
     }
 
     impl fmt::Display for MockError {
@@ -1555,6 +1651,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         succeeds: bool,
         probe_succeeds: bool,
+        pin_mismatch: bool,
     }
 
     impl MockReader {
@@ -1563,6 +1660,7 @@ mod tests {
                 events,
                 succeeds: true,
                 probe_succeeds: true,
+                pin_mismatch: false,
             }
         }
 
@@ -1571,6 +1669,18 @@ mod tests {
                 events,
                 succeeds: false,
                 probe_succeeds: true,
+                pin_mismatch: false,
+            }
+        }
+
+        /// The refresh's "gateway" read refused the pinned identity: the
+        /// observed certificate no longer matches the pinned fingerprint.
+        fn fail_pin(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                succeeds: true,
+                probe_succeeds: true,
+                pin_mismatch: true,
             }
         }
 
@@ -1579,6 +1689,7 @@ mod tests {
                 events,
                 succeeds: true,
                 probe_succeeds: false,
+                pin_mismatch: false,
             }
         }
     }
@@ -1595,6 +1706,9 @@ mod tests {
         ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
             Box::pin(async move {
                 record(&self.events, "read")?;
+                if self.pin_mismatch {
+                    return Err(MockError::TlsPinMismatch);
+                }
                 if self.succeeds {
                     observations().map_err(|_| MockError::Reader)
                 } else {
