@@ -29,7 +29,8 @@ use rutilus_api::{
     LogCommand, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS, MAX_ACCOUNT_USER_NAME_CHARS,
     MAX_ROLE_ID_CHARS, ManagerCommand, MetricReportMetric, MetricValueResponse,
     NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
-    OemCommand, OperationResponse, OperationSourceResponse, OperationStateResponse, ProfileFile,
+    OemCommand, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    OverviewFreshnessBucketResponse, OverviewHealthLevelResponse, OverviewResponse, ProfileFile,
     ProfileId, RedfishCommand, ResetKeysType, ResetType, ResourceDiagnosticsResponse,
     ResourceStatusResponse, RoleId, RoleResponse, SecureBootCommand, SetBootSourceOverride,
     StartUpdate, SystemCommand, TagListResponse, TelemetryCommand, TelemetrySampleListResponse,
@@ -4498,6 +4499,222 @@ impl From<&EventResponse> for EventCardProjection {
 #[cfg(any(target_arch = "wasm32", test))]
 fn short_endpoint_id(endpoint_id: &str) -> String {
     endpoint_id.chars().take(8).collect()
+}
+
+/// The §14.2 homepage aggregate state of the Overview section.
+///
+/// The aggregate is one server-derived read of `/api/v1/overview`, fetched
+/// once the console inventory is ready and re-armed on every inventory
+/// refresh, exactly like the tag inventory — the dashboard blocks and the
+/// card grid always describe the same serving-time fleet.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OverviewState {
+    Idle,
+    Loading,
+    Ready(OverviewProjection),
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OverviewState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    const fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// The ready projection, or `None` while idle, loading, or failed.
+    fn projection(&self) -> Option<&OverviewProjection> {
+        match self {
+            Self::Ready(projection) => Some(projection),
+            Self::Idle | Self::Loading | Self::Failed => None,
+        }
+    }
+
+    /// Static failure copy for the whole-section error state.
+    const fn failure_message(&self) -> &'static str {
+        match self {
+            Self::Failed => "The overview is temporarily unavailable.",
+            Self::Idle | Self::Loading | Self::Ready(_) => "",
+        }
+    }
+}
+
+/// One §14.2 homepage distribution bucket as a dashboard chip.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverviewCountChipProjection {
+    label: String,
+    count: u64,
+}
+
+/// One §14.2 homepage health-distribution bucket as a dashboard chip; the
+/// unified level drives the same badge styling as the endpoint cards.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverviewHealthChipProjection {
+    level: HealthLevel,
+    count: u64,
+}
+
+/// The §14.2 homepage capability coverage with the derived percentage.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityCoverageProjection {
+    observed_entries: u64,
+    supported_entries: u64,
+    percent_text: String,
+}
+
+/// The §14.2 homepage dashboard blocks, projected from the aggregate wire
+/// contract.
+///
+/// Every fact is server-derived; the projection only formats labels and
+/// counts for rendering, so the console never recomputes an aggregate. The
+/// vendor chips label the unobserved bucket honestly ("Unpublished") instead
+/// of inventing a vendor name, and the coverage percentage is derived from
+/// the server's observed/supported counts.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OverviewProjection {
+    total_endpoints: u64,
+    with_current_snapshot: u64,
+    awaiting_first_refresh: u64,
+    running_operations: u64,
+    firmware_endpoints: u64,
+    firmware_entries: u64,
+    firmware_versions: u64,
+    capability_coverage: Option<CapabilityCoverageProjection>,
+    vendors: Vec<OverviewCountChipProjection>,
+    health: Vec<OverviewHealthChipProjection>,
+    freshness: Vec<OverviewCountChipProjection>,
+    recent_events: Vec<EventCardProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl OverviewProjection {
+    /// The heading fact of the dashboard: how many endpoints are managed.
+    fn endpoints_count_text(&self) -> String {
+        match self.total_endpoints {
+            1 => "1 endpoint".to_owned(),
+            _ => format!("{} endpoints", self.total_endpoints),
+        }
+    }
+
+    /// The §14.2 capability-coverage text, absent while no capability entry
+    /// has an observed state yet ("supported over observed" is undefined
+    /// over zero observations).
+    fn capability_coverage_text(&self) -> Option<String> {
+        self.capability_coverage
+            .as_ref()
+            .map(|coverage| {
+                format!(
+                    "{} of {} ({}) supported",
+                    coverage.supported_entries, coverage.observed_entries, coverage.percent_text
+                )
+            })
+    }
+
+    /// The §14.2 firmware-summary fact line.
+    fn firmware_summary_text(&self) -> String {
+        format!(
+            "{} members across {} endpoints, {} distinct versions",
+            self.firmware_entries, self.firmware_endpoints, self.firmware_versions
+        )
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&OverviewResponse> for OverviewProjection {
+    fn from(overview: &OverviewResponse) -> Self {
+        let counts = overview.endpoints();
+        let coverage = overview.capabilities();
+        let capability_coverage = if coverage.observed_entries() > 0 {
+            Some(CapabilityCoverageProjection {
+                observed_entries: coverage.observed_entries(),
+                supported_entries: coverage.supported_entries(),
+                percent_text: format!(
+                    "{}%",
+                    coverage.supported_entries() * 100 / coverage.observed_entries()
+                ),
+            })
+        } else {
+            None
+        };
+        Self {
+            total_endpoints: counts.total(),
+            with_current_snapshot: counts.with_current_snapshot(),
+            awaiting_first_refresh: counts.awaiting_first_refresh(),
+            running_operations: overview.running_operations(),
+            firmware_endpoints: overview.firmware().endpoints_with_inventory(),
+            firmware_entries: overview.firmware().entries(),
+            firmware_versions: overview.firmware().distinct_versions(),
+            capability_coverage,
+            vendors: overview
+                .vendors()
+                .iter()
+                .map(|count| OverviewCountChipProjection {
+                    label: count
+                        .vendor()
+                        .map_or_else(|| "Unpublished".to_owned(), str::to_owned),
+                    count: count.count(),
+                })
+                .collect(),
+            health: overview
+                .health()
+                .iter()
+                .map(|count| OverviewHealthChipProjection {
+                    level: overview_health_level(count.level()),
+                    count: count.count(),
+                })
+                .collect(),
+            freshness: overview
+                .freshness()
+                .iter()
+                .map(|count| OverviewCountChipProjection {
+                    label: freshness_bucket_label(count.bucket()),
+                    count: count.count(),
+                })
+                .collect(),
+            recent_events: overview
+                .recent_events()
+                .iter()
+                .map(EventCardProjection::from)
+                .collect(),
+        }
+    }
+}
+
+/// Maps one wire §12.3 health level onto the unified console level so the
+/// dashboard chips reuse the endpoint-card badge styling.
+#[cfg(any(target_arch = "wasm32", test))]
+fn overview_health_level(level: OverviewHealthLevelResponse) -> HealthLevel {
+    match level {
+        OverviewHealthLevelResponse::Unknown => HealthLevel::Unknown,
+        OverviewHealthLevelResponse::Ok => HealthLevel::Ok,
+        OverviewHealthLevelResponse::Warning => HealthLevel::Warning,
+        OverviewHealthLevelResponse::Critical => HealthLevel::Critical,
+    }
+}
+
+/// The console label of one §14.2 staleness age class.
+#[cfg(any(target_arch = "wasm32", test))]
+fn freshness_bucket_label(bucket: OverviewFreshnessBucketResponse) -> String {
+    match bucket {
+        OverviewFreshnessBucketResponse::NeverRefreshed => "Never refreshed",
+        OverviewFreshnessBucketResponse::WithinOneHour => "Within 1 hour",
+        OverviewFreshnessBucketResponse::WithinOneDay => "Within 1 day",
+        OverviewFreshnessBucketResponse::WithinSevenDays => "Within 7 days",
+        OverviewFreshnessBucketResponse::OlderThanSevenDays => "Older than 7 days",
+    }
+    .to_owned()
 }
 
 /// One reading of the bounded §14.4 history, newest first, pre-formatted.
@@ -11299,6 +11516,11 @@ mod browser {
         // change tags independently of endpoint data.
         let (tags_state, set_tags_state) = signal(TagsListState::Idle);
         let (tags_triggered, set_tags_triggered) = signal(false);
+        // The §14.2 homepage aggregate follows the same lifecycle: one fetch
+        // once the inventory is ready, re-armed on every refresh, so the
+        // dashboard blocks and the card grid always describe the same fleet.
+        let (overview_state, set_overview_state) = signal(OverviewState::Idle);
+        let (overview_triggered, set_overview_triggered) = signal(false);
 
         // The §14.2 refresh-selection state lives at the shell level because
         // the Overview section renders here: the selection is the set of
@@ -11315,6 +11537,13 @@ mod browser {
                     set_tags_state.set(fetch_tags().await);
                 });
             }
+            if state.with(ConsoleLoadState::is_ready) && !overview_triggered.get() {
+                set_overview_triggered.set(true);
+                set_overview_state.set(OverviewState::Loading);
+                spawn_local(async move {
+                    set_overview_state.set(fetch_overview().await);
+                });
+            }
         });
 
         let on_refresh_inventory = move |_| {
@@ -11322,10 +11551,13 @@ mod browser {
             spawn_local(async move {
                 set_state.set(fetch_console().await);
             });
-            // Re-arming the trigger lets the ready-effect above fetch the tag
-            // inventory once the refreshed console data lands.
+            // Re-arming the triggers lets the ready-effect above fetch the
+            // tag inventory and the homepage aggregate once the refreshed
+            // console data lands.
             set_tags_triggered.set(false);
             set_tags_state.set(TagsListState::Loading);
+            set_overview_triggered.set(false);
+            set_overview_state.set(OverviewState::Loading);
         };
 
         let on_search_input = move |event| {
@@ -11379,6 +11611,8 @@ mod browser {
                         });
                         set_tags_triggered.set(false);
                         set_tags_state.set(TagsListState::Loading);
+                        set_overview_triggered.set(false);
+                        set_overview_state.set(OverviewState::Loading);
                     }
                     Err(failure) => {
                         set_refresh_state.set(RefreshBatchState::Failed(failure));
@@ -11581,6 +11815,218 @@ mod browser {
                             }}
                         </p>
                     </div>
+
+                    // The §14.2 homepage dashboard: one server-derived
+                    // aggregate of the whole fleet. The blocks render only
+                    // once the aggregate is ready; a failed aggregate shows
+                    // the static unavailable message instead of stale facts.
+                    <section
+                        class="overview-dashboard"
+                        hidden=move || !overview_state.get().is_ready()
+                    >
+                        <div class="overview-stats">
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or(0, |projection| projection.total_endpoints)
+                                    }}
+                                </span>
+                                <span class="stat-label">"Endpoints"</span>
+                            </div>
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or(0, |projection| {
+                                                projection.with_current_snapshot
+                                            })
+                                    }}
+                                </span>
+                                <span class="stat-label">"With current snapshot"</span>
+                            </div>
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or(0, |projection| {
+                                                projection.awaiting_first_refresh
+                                            })
+                                    }}
+                                </span>
+                                <span class="stat-label">"Awaiting first refresh"</span>
+                            </div>
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or(0, |projection| projection.running_operations)
+                                    }}
+                                </span>
+                                <span class="stat-label">"Running operations"</span>
+                            </div>
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or(0, |projection| projection.firmware_entries)
+                                    }}
+                                </span>
+                                <span class="stat-label">"Firmware members"</span>
+                            </div>
+                            <div class="stat-tile">
+                                <span class="stat-value">
+                                    {move || {
+                                        overview_state
+                                            .get()
+                                            .projection()
+                                            .and_then(|projection| {
+                                                projection.capability_coverage.clone()
+                                            })
+                                            .map_or_else(|| "—".to_owned(), |coverage| {
+                                                coverage.percent_text
+                                            })
+                                    }}
+                                </span>
+                                <span class="stat-label">"Capability coverage"</span>
+                            </div>
+                        </div>
+                        <div class="overview-blocks">
+                            <div class="overview-block">
+                                <h3>"Vendors"</h3>
+                                {move || {
+                                    let chips = overview_state
+                                        .get()
+                                        .projection()
+                                        .map_or_else(Vec::new, |projection| {
+                                            projection.vendors.clone()
+                                        });
+                                    chips
+                                        .into_iter()
+                                        .map(|chip| {
+                                            view! {
+                                                <span class="overview-chip">
+                                                    <span>{chip.label}</span>
+                                                    <b>{chip.count}</b>
+                                                </span>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                            <div class="overview-block">
+                                <h3>"Health"</h3>
+                                {move || {
+                                    let chips = overview_state
+                                        .get()
+                                        .projection()
+                                        .map_or_else(Vec::new, |projection| {
+                                            projection.health.clone()
+                                        });
+                                    chips
+                                        .into_iter()
+                                        .map(|chip| {
+                                            let level = chip.level;
+                                            let label = health_level_label(level);
+                                            let class = format!(
+                                                "overview-chip {}",
+                                                health_badge_class(level)
+                                            );
+                                            view! {
+                                                <span class=class>
+                                                    <span>{label}</span>
+                                                    <b>{chip.count}</b>
+                                                </span>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                            <div class="overview-block">
+                                <h3>"Data freshness"</h3>
+                                {move || {
+                                    let chips = overview_state
+                                        .get()
+                                        .projection()
+                                        .map_or_else(Vec::new, |projection| {
+                                            projection.freshness.clone()
+                                        });
+                                    chips
+                                        .into_iter()
+                                        .map(|chip| {
+                                            view! {
+                                                <span class="overview-chip">
+                                                    <span>{chip.label}</span>
+                                                    <b>{chip.count}</b>
+                                                </span>
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                            <div class="overview-block overview-block-events">
+                                <h3>"Recent events"</h3>
+                                <p
+                                    class="overview-events-summary"
+                                    hidden=move || {
+                                        !overview_state
+                                            .get()
+                                            .projection()
+                                            .is_some_and(|projection| {
+                                                projection.recent_events.is_empty()
+                                            })
+                                    }
+                                >
+                                    "No events have been observed yet."
+                                </p>
+                                <ul class="overview-events">
+                                    {move || {
+                                        let events = overview_state
+                                            .get()
+                                            .projection()
+                                            .map_or_else(Vec::new, |projection| {
+                                                projection.recent_events.clone()
+                                            });
+                                        events
+                                            .into_iter()
+                                            .map(|event| {
+                                                view! {
+                                                    <li class="overview-event">
+                                                        <span class=event.severity_class>
+                                                            {event.severity_label}
+                                                        </span>
+                                                        <span class="overview-event-message">
+                                                            {event.message_id}
+                                                        </span>
+                                                        <span class="overview-event-time">
+                                                            {event.observed_at_text}
+                                                        </span>
+                                                    </li>
+                                                }
+                                            })
+                                            .collect_view()
+                                    }}
+                                </ul>
+                            </div>
+                        </div>
+                        <p
+                            class="form-error"
+                            hidden=move || !overview_state.get().is_failed()
+                        >
+                            {move || overview_state.get().failure_message()}
+                        </p>
+                    </section>
+
                     <div class="overview-filter-bar">
                         <div class="filter-field filter-field-search">
                             <label for="overview-search">"Search"</label>
@@ -15111,6 +15557,30 @@ mod browser {
                     .collect(),
             ),
             Err(_) => OperationsListState::Failed,
+        }
+    }
+
+    /// Loads the §14.2 homepage aggregate.
+    ///
+    /// Any transport failure or non-200 status maps to the single static
+    /// unavailable message, exactly like the other list views; a 200 body
+    /// that violates the strict shared contract maps to the same failure
+    /// because a dashboard that cannot be projected is as useless as one
+    /// that never arrived.
+    async fn fetch_overview() -> OverviewState {
+        let response = Request::get("/api/v1/overview")
+            .header("Accept", "application/json")
+            .send()
+            .await;
+        let Ok(response) = response else {
+            return OverviewState::Failed;
+        };
+        if !response_ok(&response) {
+            return OverviewState::Failed;
+        }
+        match response.json::<OverviewResponse>().await {
+            Ok(overview) => OverviewState::Ready(OverviewProjection::from(&overview)),
+            Err(_) => OverviewState::Failed,
         }
     }
 
@@ -20917,6 +21387,159 @@ mod tests {
         assert_eq!(empty.count_text(), "0 events");
         assert_eq!(empty.event_cards().len(), 0);
         assert_eq!(EventsListState::Idle.event_cards().len(), 0);
+    }
+
+    #[test]
+    fn overview_projection_renders_every_dashboard_block() -> Result<(), Box<dyn Error>> {
+        let overview = serde_json::from_value::<OverviewResponse>(json!({
+            "endpoints": {
+                "total": 3,
+                "with_current_snapshot": 2,
+                "awaiting_first_refresh": 1
+            },
+            "vendors": [
+                { "vendor": null, "count": 1 },
+                { "vendor": "ACME", "count": 2 }
+            ],
+            "health": [
+                { "level": "critical", "count": 1 },
+                { "level": "ok", "count": 1 },
+                { "level": "unknown", "count": 1 }
+            ],
+            "firmware": {
+                "endpoints_with_inventory": 2,
+                "entries": 3,
+                "distinct_versions": 2
+            },
+            "capabilities": {
+                "observed_entries": 60,
+                "supported_entries": 45
+            },
+            "running_operations": 2,
+            "recent_events": [
+                {
+                    "id": "01989abc-def0-7abc-8def-0123456789f1",
+                    "endpoint_id": "01989abc-def0-7abc-8def-0123456789a1",
+                    "message_id": "Base.1.18.ResourceUpdated",
+                    "severity": "critical",
+                    "message": "Power supply 1 lost input",
+                    "event_timestamp": "2026-08-06T11:12:13Z",
+                    "observed_at": "2026-08-06T11:12:14Z"
+                }
+            ],
+            "freshness": [
+                { "bucket": "never_refreshed", "count": 1 },
+                { "bucket": "within_one_hour", "count": 1 },
+                { "bucket": "older_than_seven_days", "count": 1 }
+            ]
+        }))?;
+        let state = OverviewState::Ready(OverviewProjection::from(&overview));
+        assert!(state.is_ready());
+        assert!(!state.is_failed());
+        assert!(!state.is_loading());
+
+        let projection = state.projection().ok_or("the ready projection must exist")?;
+        assert_eq!(projection.endpoints_count_text(), "3 endpoints");
+        assert_eq!(projection.total_endpoints, 3);
+        assert_eq!(projection.with_current_snapshot, 2);
+        assert_eq!(projection.awaiting_first_refresh, 1);
+        assert_eq!(projection.running_operations, 2);
+        // The unobserved vendor bucket is labeled honestly, and the observed
+        // vendor keeps its raw name.
+        assert_eq!(projection.vendors[0].label, "Unpublished");
+        assert_eq!(projection.vendors[0].count, 1);
+        assert_eq!(projection.vendors[1].label, "ACME");
+        assert_eq!(projection.vendors[1].count, 2);
+        // The unified health levels map onto the console badge vocabulary.
+        assert_eq!(projection.health[0].level, HealthLevel::Critical);
+        assert_eq!(projection.health[0].count, 1);
+        assert_eq!(projection.health[1].level, HealthLevel::Ok);
+        assert_eq!(projection.health[2].level, HealthLevel::Unknown);
+        // The staleness buckets carry the console age-class labels.
+        assert_eq!(projection.freshness[0].label, "Never refreshed");
+        assert_eq!(projection.freshness[1].label, "Within 1 hour");
+        assert_eq!(projection.freshness[2].label, "Older than 7 days");
+        // The firmware summary line and the coverage percentage are derived
+        // from the server counts.
+        assert_eq!(
+            projection.firmware_summary_text(),
+            "3 members across 2 endpoints, 2 distinct versions"
+        );
+        let coverage = projection
+            .capability_coverage
+            .as_ref()
+            .ok_or("the coverage must be derived over 60 observations")?;
+        assert_eq!(coverage.observed_entries, 60);
+        assert_eq!(coverage.supported_entries, 45);
+        assert_eq!(coverage.percent_text, "75%");
+        assert_eq!(
+            projection.capability_coverage_text(),
+            Some("45 of 60 (75%) supported".to_owned())
+        );
+        // The recent-event tail reuses the event card projection.
+        assert_eq!(projection.recent_events.len(), 1);
+        assert_eq!(
+            projection.recent_events[0].message_id,
+            "Base.1.18.ResourceUpdated"
+        );
+        assert_eq!(projection.recent_events[0].severity_label, "Critical");
+        Ok(())
+    }
+
+    #[test]
+    fn overview_projection_handles_zero_observations_and_empty_blocks()
+    -> Result<(), Box<dyn Error>> {
+        let empty = serde_json::from_value::<OverviewResponse>(json!({
+            "endpoints": {
+                "total": 0,
+                "with_current_snapshot": 0,
+                "awaiting_first_refresh": 0
+            },
+            "vendors": [],
+            "health": [],
+            "firmware": {
+                "endpoints_with_inventory": 0,
+                "entries": 0,
+                "distinct_versions": 0
+            },
+            "capabilities": {
+                "observed_entries": 0,
+                "supported_entries": 0
+            },
+            "running_operations": 0,
+            "recent_events": [],
+            "freshness": []
+        }))?;
+        let projection = OverviewProjection::from(&empty);
+        assert_eq!(projection.endpoints_count_text(), "0 endpoints");
+        assert!(projection.vendors.is_empty());
+        assert!(projection.health.is_empty());
+        assert!(projection.freshness.is_empty());
+        assert!(projection.recent_events.is_empty());
+        // "Supported over observed" is undefined over zero observations: no
+        // coverage fact is rendered instead of a fabricated 0%.
+        assert!(projection.capability_coverage.is_none());
+        assert_eq!(projection.capability_coverage_text(), None);
+        assert_eq!(
+            projection.firmware_summary_text(),
+            "0 members across 0 endpoints, 0 distinct versions"
+        );
+        assert!(OverviewState::Ready(projection).is_ready());
+        Ok(())
+    }
+
+    #[test]
+    fn overview_state_failure_uses_static_copy() {
+        assert!(OverviewState::Failed.is_failed());
+        assert!(!OverviewState::Failed.is_ready());
+        assert_eq!(
+            OverviewState::Failed.failure_message(),
+            "The overview is temporarily unavailable."
+        );
+        assert_eq!(OverviewState::Idle.failure_message(), "");
+        assert!(OverviewState::Loading.is_loading());
+        assert_eq!(OverviewState::Idle.projection(), None);
+        assert_eq!(OverviewState::Failed.projection(), None);
     }
 
     #[test]

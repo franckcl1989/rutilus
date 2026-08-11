@@ -1183,6 +1183,120 @@ dd {
   font-size: 0.78rem;
 }
 
+/* ----- §14.2 Overview dashboard ----- */
+.overview-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 0 0 1.2rem;
+}
+
+.overview-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+  gap: 0.75rem;
+}
+
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgb(143 171 207 / 18%);
+  border-radius: 1rem;
+  background: rgb(14 23 36 / 62%);
+}
+
+.stat-value {
+  color: #f3f7fc;
+  font-size: 1.6rem;
+  font-weight: 750;
+  line-height: 1.1;
+}
+
+.stat-label {
+  color: #8495ad;
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.overview-blocks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0.75rem;
+}
+
+.overview-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgb(143 171 207 / 18%);
+  border-radius: 1rem;
+  background: rgb(14 23 36 / 62%);
+}
+
+.overview-block h3 {
+  margin: 0;
+  color: #ccd7e5;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.overview-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.28rem 0.65rem;
+  border: 1px solid rgb(143 171 207 / 22%);
+  border-radius: 999px;
+  color: #aebbd0;
+  background: rgb(16 25 40 / 72%);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.overview-chip b {
+  color: #f3f7fc;
+  font-weight: 750;
+}
+
+.overview-events {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.overview-event {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.overview-event-message {
+  overflow: hidden;
+  color: #ccd7e5;
+  font-size: 0.8rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-event-time {
+  margin-left: auto;
+  color: #8495ad;
+  font-size: 0.72rem;
+}
+
+.overview-events-summary {
+  margin: 0;
+  color: #8495ad;
+  font-size: 0.78rem;
+}
+
 /* ----- §12.3 endpoint health badge ----- */
 .health-badge {
   padding: 0.25rem 0.6rem;
