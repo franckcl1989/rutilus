@@ -170,6 +170,7 @@ use nv_redfish::{
         },
         computer_system_collection::ComputerSystemCollection as ComputerSystemCollectionSchema,
         control::Control as ControlSchema,
+        control::ControlUpdate as ControlUpdateSchema,
         control_collection::ControlCollection as ControlCollectionSchema,
         environment_metrics::EnvironmentMetrics as EnvironmentMetricsSchema,
         ethernet_interface::EthernetInterface as EthernetInterfaceSchema,
@@ -223,6 +224,7 @@ use nv_redfish::{
         thermal::Thermal as ThermalSchema,
         update_service::UpdateParametersUpdate as MultipartUpdateParameters,
         update_service::UpdateService as UpdateServiceSchema,
+        update_service::UpdateServiceUpdate as UpdateServiceUpdateSchema,
     },
     session_service::{Session, SessionCreate},
 };
@@ -238,16 +240,18 @@ use rustls::{
 };
 use rutilus_domain::{
     AccountCommand, AccountId, BootCommand, BootSource, BootSourceOverrideEnabled,
-    BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, CreateAccount,
-    CreateSubscription, CredentialUsername, DeleteAccount, DeleteSubscription, EndpointAddress,
-    EndpointCapability, EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
-    EventDestinationProtocol, EventId, EventSeverity, EventType, ManagerCommand, MessageId,
-    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
-    OemCommand, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
+    BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, ClearLog,
+    ControlCommand, ControlId, CreateAccount, CreateSubscription, CredentialUsername,
+    DeleteAccount, DeleteSubscription, EndpointAddress, EndpointCapability,
+    EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
+    EventDestinationProtocol, EventId, EventSeverity, EventType, LogCommand, LogServiceId,
+    ManagerCommand, ManagerResetToDefaultsType, MessageId, NvidiaDebugTokenCommand,
+    NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, PowerSupplyId,
+    PowerSupplyReset, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
     ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError, SecureBootCommand, SetBootSourceOverride, SystemCommand,
     TlsIdentityChanged, TlsTrust, TokenType, UpdateAccount, UpdateAccountPassword,
-    UpdateAccountUserName,
+    UpdateAccountUserName, UpdateCommand, UpdateControl, UpdatePatch,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -3647,8 +3651,14 @@ async fn execute_authenticated_command(
         RedfishCommand::Manager(ManagerCommand::Reset(reset_type)) => {
             execute_manager_reset(bmc, root, identity, trust, *reset_type).await
         }
+        RedfishCommand::Manager(ManagerCommand::ResetToDefaults(reset_type)) => {
+            execute_manager_reset_to_defaults(bmc, root, identity, trust, *reset_type).await
+        }
         RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => {
             execute_chassis_reset(bmc, root, identity, trust, *reset_type).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(payload)) => {
+            execute_power_supply_reset(bmc, root, identity, trust, payload).await
         }
         RedfishCommand::Boot(BootCommand::SetBootSourceOverride(override_value)) => {
             execute_boot_override(bmc, root, identity, trust, override_value).await
@@ -3668,18 +3678,29 @@ async fn execute_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             execute_delete_subscription(bmc, root, identity, trust, payload).await
         }
-        // The Update family is deliberately dispatched through the dedicated
-        // `UpdateExecutor` boundary, never this one: the typed command
-        // carries only the database-serializable artifact id, while the
-        // upload needs the resolved artifact bytes, which the application
+        RedfishCommand::Log(LogCommand::ClearLog(payload)) => {
+            execute_log_clear(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Control(ControlCommand::Update(payload)) => {
+            execute_control_update(bmc, root, identity, trust, payload).await
+        }
+        // The `StartUpdate` variant is deliberately dispatched through the
+        // dedicated `UpdateExecutor` boundary, never this one: the typed
+        // command carries only the database-serializable artifact id, while
+        // the upload needs the resolved artifact bytes, which the application
         // resolves from the artifact store at execution time (§13.3 step 4,
         // §14.3). Reaching this arm means the caller misrouted the command
         // through the wrong boundary; the refusal is provable (no write is
         // ever sent) and the payload is rejected because it cannot be
-        // executed through this boundary.
-        RedfishCommand::Update(_) => Err(CommandExecutionError::Rejected(
-            CommandRejection::InvalidCommandPayload,
-        )),
+        // executed through this boundary. The `Patch` variant is an ordinary
+        // property PATCH of the `UpdateService` document — no artifact bytes
+        // are involved — so it dispatches through this boundary.
+        RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => Err(
+            CommandExecutionError::Rejected(CommandRejection::InvalidCommandPayload),
+        ),
+        RedfishCommand::Update(UpdateCommand::Patch(payload)) => {
+            execute_update_service_patch(bmc, root, identity, trust, payload).await
+        }
         RedfishCommand::Oem(oem) => {
             execute_nvidia_oem_command(bmc, root, identity, trust, oem).await
         }
@@ -4718,6 +4739,567 @@ async fn execute_chassis_reset(
     outcome_from_modification(response)
 }
 
+/// Executes a `Manager` reset-to-defaults through the decoded
+/// `#Manager.ResetToDefaults` action.
+///
+/// The navigation is exactly [`execute_manager_reset`]'s: the endpoint's
+/// first manager member and its decoded actions, with the compiled
+/// `ManagerResetToDefaultsAction` parameter type carrying the CSDL
+/// `ResetToDefaultsType` member mapped from the domain enum.
+async fn execute_manager_reset_to_defaults(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    reset_type: ManagerResetToDefaultsType,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(manager) =
+        first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(action) = manager
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset_to_defaults.as_ref())
+    else {
+        // §13.3 step 2: the decoded manager does not advertise the
+        // ResetToDefaults action, so the command is provably unsupported on
+        // this endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::manager::ManagerResetToDefaultsAction {
+        reset_type: Some(map_manager_reset_to_defaults_type(reset_type)),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::manager::ManagerResetToDefaultsAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Maps the domain reset-to-defaults scope onto the compiled CSDL member.
+fn map_manager_reset_to_defaults_type(
+    reset_type: ManagerResetToDefaultsType,
+) -> nv_redfish::schema::manager::ResetToDefaultsType {
+    match reset_type {
+        ManagerResetToDefaultsType::ResetAll => {
+            nv_redfish::schema::manager::ResetToDefaultsType::ResetAll
+        }
+        ManagerResetToDefaultsType::PreserveNetworkAndUsers => {
+            nv_redfish::schema::manager::ResetToDefaultsType::PreserveNetworkAndUsers
+        }
+        ManagerResetToDefaultsType::PreserveNetwork => {
+            nv_redfish::schema::manager::ResetToDefaultsType::PreserveNetwork
+        }
+    }
+}
+
+/// Executes a power supply reset through the decoded `#PowerSupply.Reset`
+/// action.
+///
+/// The navigation mirrors the §3.1 `power-supplies` read slice: the
+/// endpoint's first chassis member, its `PowerSubsystem` document, and the
+/// `PowerSupplies` members (the same `Chassis::power_supplies` path the
+/// typed wrapper follows). The target member is the one named by the
+/// payload id — matched by the `@odata.id` tail segment, the only stable
+/// identity of a `ReferenceableMember` — or the collection's first member,
+/// the endpoint-scoped write rule of the reset families. The action is
+/// invoked through the `Bmc::action` typed API with the compiled
+/// `PowerSupplyResetAction` parameter type; the CSDL `ResetType` parameter
+/// stays `None`, which the service answers with the documented
+/// `GracefulRestart` default (see the [`PowerSupplyReset`] payload doc).
+async fn execute_power_supply_reset(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &PowerSupplyReset,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(power_supplies) = power_supplies_of_chassis(&chassis, bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let power_supply = match payload.power_supply_id() {
+        Some(id) => find_power_supply(&power_supplies, id),
+        None => power_supplies.first(),
+    };
+    let Some(power_supply) = power_supply else {
+        // A named member that is absent from the decoded collection is the
+        // same provable refusal as the account member writes: the BMC cannot
+        // apply the write to a power supply it does not serve. An empty
+        // collection (first-member default) means the family is not
+        // advertised ("资源存在才呈现").
+        return Err(CommandExecutionError::Rejected(
+            if payload.power_supply_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let Some(action) = power_supply
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.reset.as_ref())
+    else {
+        // §13.3 step 2: the decoded power supply does not advertise the
+        // Reset action, so the command is provably unsupported on this
+        // endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::power_supply::PowerSupplyResetAction { reset_type: None };
+    let response = match bmc
+        .action::<nv_redfish::schema::power_supply::PowerSupplyResetAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the `PowerSupply` members behind one decoded Chassis's
+/// `PowerSubsystem` navigation; a missing `PowerSubsystem` or
+/// `PowerSupplies` link is `None`.
+///
+/// This is the write twin of the §3.1 read slice's
+/// [`read_power_supply_resources`] navigation — the same
+/// `Chassis::power_supplies` path the typed wrapper follows — with the
+/// write's strict member fetch: a member that cannot be fetched is a
+/// preparation failure, never a skip.
+async fn power_supplies_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<PowerSupplySchema>>>, CommandExecutionError> {
+    let Some(power_subsystem) = chassis.power_subsystem.as_ref() else {
+        return Ok(None);
+    };
+    let subsystem = power_subsystem
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let Some(power_supplies) = subsystem.power_supplies.as_ref() else {
+        return Ok(None);
+    };
+    let collection = power_supplies
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members().len());
+    for power_supply in collection.members() {
+        members.push(
+            power_supply
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Finds one decoded `PowerSupply` member by its `@odata.id` tail segment —
+/// the same identity the domain [`PowerSupplyId`] validates.
+fn find_power_supply<'a>(
+    power_supplies: &'a [Arc<PowerSupplySchema>],
+    power_supply_id: &PowerSupplyId,
+) -> Option<&'a Arc<PowerSupplySchema>> {
+    power_supplies.iter().find(|power_supply| {
+        power_supply.odata_id().last_segment() == Some(power_supply_id.as_str())
+    })
+}
+
+/// Executes a log clear through the decoded `#LogService.ClearLog` action.
+///
+/// The target log service resolution follows the §3.1 `log-services` read
+/// slice, which exposes log services under the manager: a named id is
+/// matched against the manager's `LogServices` collection members, and the
+/// first-member default takes the manager's first log service — the BMC's
+/// own logs (event log, SEL) are the product's primary surface — falling
+/// back to the chassis's first log service when the manager advertises
+/// none (a chassis can host its own log services; the fallback keeps the
+/// command expressible on endpoints whose manager carries no logs). The
+/// operator-supplied `LogEntriesETag` precondition is passed through
+/// unchanged; the gateway never invents one.
+async fn execute_log_clear(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &ClearLog,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(log_service) =
+        resolve_log_service(bmc, root, identity, trust, payload.log_service_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            if payload.log_service_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let Some(action) = log_service
+        .actions
+        .as_ref()
+        .and_then(|actions| actions.clear_log.as_ref())
+    else {
+        // §13.3 step 2: the decoded log service does not advertise the
+        // ClearLog action, so the command is provably unsupported on this
+        // endpoint.
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let params = nv_redfish::schema::log_service::LogServiceClearLogAction {
+        log_entries_etag: payload.etag().map(str::to_owned),
+    };
+    let response = match bmc
+        .action::<nv_redfish::schema::log_service::LogServiceClearLogAction, ()>(action, &params)
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Resolves the target `LogService` of a log clear: the member named by the
+/// id from the manager's `LogServices` collection, or the manager's first
+/// member with the chassis's first member as fallback; a target the
+/// endpoint cannot serve is `None`.
+async fn resolve_log_service(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    log_service_id: Option<&LogServiceId>,
+) -> Result<Option<Arc<LogServiceSchema>>, CommandExecutionError> {
+    let Some(manager) =
+        first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Ok(None);
+    };
+    let manager_log_services =
+        log_services_of_document(manager.log_services.as_ref(), bmc, identity, trust).await?;
+    if let Some(id) = log_service_id {
+        return Ok(find_log_service(&manager_log_services, id).cloned());
+    }
+    if let Some(first) = manager_log_services.first() {
+        return Ok(Some(first.clone()));
+    }
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Ok(None);
+    };
+    let chassis_log_services =
+        log_services_of_document(chassis.log_services.as_ref(), bmc, identity, trust).await?;
+    Ok(chassis_log_services.first().cloned())
+}
+
+/// Fetches the `LogService` members behind one decoded document's
+/// `LogServices` navigation; a missing link is `None`.
+async fn log_services_of_document(
+    log_services: Option<&NavProperty<LogServiceCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<Arc<LogServiceSchema>>, CommandExecutionError> {
+    let Some(log_services) = log_services else {
+        return Ok(Vec::new());
+    };
+    let collection = log_services
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(members)
+}
+
+/// Finds one decoded `LogService` member by its Redfish `Id`.
+fn find_log_service<'a>(
+    log_services: &'a [Arc<LogServiceSchema>],
+    log_service_id: &LogServiceId,
+) -> Option<&'a Arc<LogServiceSchema>> {
+    log_services
+        .iter()
+        .find(|log_service| log_service.base.id == log_service_id.as_str())
+}
+
+/// Executes a control update as a typed `SetPoint` property `PATCH` of the
+/// decoded `Control` resource.
+///
+/// The target resolution follows the §3.1 `controls` read slice: a named id
+/// is matched against the chassis's `Controls` collection members, and the
+/// first-member default takes the chassis's environment power limit control
+/// — the `Control` behind `EnvironmentMetrics.PowerLimitWatts`, the
+/// product's primary control surface — falling back to the first `Controls`
+/// member when the environment metrics expose none. The body is the
+/// compiled `ControlUpdate` type carrying only `SetPoint`, the complete
+/// intent of the domain payload (§7.1), and the write passes the decoded
+/// document's etag for optimistic concurrency exactly like the account
+/// member updates.
+async fn execute_control_update(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateControl,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(set_point) = payload.set_point() else {
+        // The first-cut payload's only settable member is the set point, so
+        // a payload without one would be an empty PATCH: provably a no-op,
+        // rejected before any network work (§7.1, §13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        ));
+    };
+    let Some(chassis) =
+        first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(control) =
+        resolve_control(&chassis, bmc, identity, trust, payload.control_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            if payload.control_id().is_some() {
+                CommandRejection::RefusedByBmc
+            } else {
+                CommandRejection::CapabilityUnavailable
+            },
+        ));
+    };
+    let update = ControlUpdateSchema::builder()
+        .with_set_point(set_point)
+        .build();
+    let response = match bmc
+        .update::<ControlUpdateSchema, NavProperty<ControlSchema>>(
+            control.odata_id(),
+            control.etag(),
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Resolves the target `Control` of a control update: the member named by
+/// the id from the chassis's `Controls` collection, or the environment
+/// power limit control with the first `Controls` member as fallback; a
+/// target the endpoint cannot serve is `None`.
+async fn resolve_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    control_id: Option<&ControlId>,
+) -> Result<Option<Arc<ControlSchema>>, CommandExecutionError> {
+    if let Some(id) = control_id {
+        let Some(controls) = controls_of_chassis(chassis, bmc, identity, trust).await? else {
+            return Ok(None);
+        };
+        return Ok(find_control(&controls, id).cloned());
+    }
+    if let Some(control) = environment_power_limit_control(chassis, bmc, identity, trust).await? {
+        return Ok(Some(control));
+    }
+    let Some(controls) = controls_of_chassis(chassis, bmc, identity, trust).await? else {
+        return Ok(None);
+    };
+    Ok(controls.first().cloned())
+}
+
+/// Fetches the `Control` members behind one decoded Chassis's `Controls`
+/// navigation; a missing link is `None`.
+async fn controls_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<ControlSchema>>>, CommandExecutionError> {
+    let Some(controls) = chassis.controls.as_ref() else {
+        return Ok(None);
+    };
+    let collection = controls
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_preparation_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Fetches the environment power limit `Control` behind one decoded
+/// Chassis's `EnvironmentMetrics.PowerLimitWatts` data source; `None` when
+/// the metrics link, the `PowerLimitWatts` excerpt, or its data source URI
+/// is absent.
+///
+/// This mirrors `nv-redfish`'s `Chassis::environment_power_limit_control`
+/// exactly: the decoded metrics excerpt's `DataSourceUri` is resolved as a
+/// typed reference — the endpoint's own URI structure is never guessed
+/// (§11.1).
+async fn environment_power_limit_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<ControlSchema>>, CommandExecutionError> {
+    let Some(environment_metrics) = chassis.environment_metrics.as_ref() else {
+        return Ok(None);
+    };
+    let metrics = environment_metrics
+        .get(bmc)
+        .await
+        .map_err(|source| command_preparation_error(source, identity, trust))?;
+    let Some(uri) = metrics
+        .power_limit_watts
+        .as_ref()
+        .and_then(|control| control.data_source_uri.as_ref())
+        .and_then(Option::as_deref)
+    else {
+        return Ok(None);
+    };
+    let control_ref = NavProperty::<ControlSchema>::new_reference(ODataId::from(uri.to_owned()));
+    control_ref
+        .get(bmc)
+        .await
+        .map(Some)
+        .map_err(|source| command_preparation_error(source, identity, trust))
+}
+
+/// Finds one decoded `Control` member by its Redfish `Id`.
+fn find_control<'a>(
+    controls: &'a [Arc<ControlSchema>],
+    control_id: &ControlId,
+) -> Option<&'a Arc<ControlSchema>> {
+    controls
+        .iter()
+        .find(|control| control.base.id == control_id.as_str())
+}
+
+/// Executes an `UpdateService` property patch as a typed `PATCH` of the
+/// decoded `UpdateService` document.
+///
+/// The body is the compiled `UpdateServiceUpdate` type carrying only the
+/// domain payload's members (`ServiceEnabled`, `HttpPushUriTargets`), and
+/// the write passes the decoded document's etag for optimistic concurrency
+/// exactly like the control update. The endpoint's own `UpdateService`
+/// navigation is used (§11.1), the same document the §14.3 upload flow
+/// reads.
+async fn execute_update_service_patch(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdatePatch,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    if payload.service_enabled().is_none() && payload.targets().is_none() {
+        // Neither member of the first-cut patch is set: the PATCH body would
+        // be empty, provably a no-op, rejected before any network work
+        // (§7.1, §13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::InvalidCommandPayload,
+        ));
+    }
+    let Some(update_service) = update_service_document(bmc, root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let mut update = UpdateServiceUpdateSchema::builder();
+    if let Some(service_enabled) = payload.service_enabled() {
+        update = update.with_service_enabled(service_enabled);
+    }
+    if let Some(targets) = payload.targets() {
+        update = update.with_http_push_uri_targets(targets.to_vec());
+    }
+    let update = update.build();
+    let response = match bmc
+        .update::<UpdateServiceUpdateSchema, NavProperty<UpdateServiceSchema>>(
+            update_service.odata_id(),
+            update_service.etag(),
+            &update,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(
+                nv_redfish::Error::Bmc(source),
+                identity,
+                trust,
+            ));
+        }
+    };
+    outcome_from_modification(response)
+}
+
 /// Executes a boot source override as a typed `Boot` property `PATCH`.
 ///
 /// The update carries the three CSDL properties
@@ -5368,11 +5950,18 @@ async fn verify_authenticated_command(
         | RedfishCommand::Boot(BootCommand::SetBootSourceOverride(_)) => {
             verify_system_readable(bmc, root, identity, trust).await
         }
-        RedfishCommand::Manager(ManagerCommand::Reset(_)) => {
-            verify_manager_readable(bmc, root, identity, trust).await
-        }
+        // The manager Reset and ResetToDefaults families verify by
+        // re-reading the endpoint's first manager ("accepted" semantics).
+        RedfishCommand::Manager(command) => match command {
+            ManagerCommand::Reset(_) | ManagerCommand::ResetToDefaults(_) => {
+                verify_manager_readable(bmc, root, identity, trust).await
+            }
+        },
         RedfishCommand::Chassis(ChassisCommand::Reset(_)) => {
             verify_chassis_readable(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(payload)) => {
+            verify_power_supply_readable(bmc, root, identity, trust, payload).await
         }
         RedfishCommand::SecureBoot(_) => {
             verify_secure_boot_readable(bmc, root, identity, trust).await
@@ -5383,13 +5972,26 @@ async fn verify_authenticated_command(
         RedfishCommand::Event(EventCommand::DeleteSubscription(payload)) => {
             verify_subscription_deleted(bmc, root, identity, trust, payload).await
         }
-        // §14.3 update verification: the complete `SoftwareInventory` family
-        // must re-read without error. The application contract for this
-        // family records a provably absent inventory surface as `Mismatched`
-        // (the update did not leave the expected result) instead of the
-        // reset families' `CapabilityUnavailable` error — see the
-        // `CommandVerifier` contract doc.
-        RedfishCommand::Update(_) => verify_authenticated_update(bmc, root, identity, trust).await,
+        RedfishCommand::Log(LogCommand::ClearLog(payload)) => {
+            verify_log_service_readable(bmc, root, identity, trust, payload).await
+        }
+        RedfishCommand::Control(ControlCommand::Update(payload)) => {
+            verify_control_readable(bmc, root, identity, trust, payload).await
+        }
+        // §14.3 update verification for the upload family: the complete
+        // `SoftwareInventory` family must re-read without error. The
+        // application contract for this family records a provably absent
+        // inventory surface as `Mismatched` (the update did not leave the
+        // expected result) instead of the reset families'
+        // `CapabilityUnavailable` error — see the `CommandVerifier` contract
+        // doc. The `Patch` variant verifies by re-reading the patched
+        // `UpdateService` document itself.
+        RedfishCommand::Update(UpdateCommand::StartUpdate(_)) => {
+            verify_authenticated_update(bmc, root, identity, trust).await
+        }
+        RedfishCommand::Update(UpdateCommand::Patch(_)) => {
+            verify_update_service_readable(bmc, root, identity, trust).await
+        }
         RedfishCommand::Oem(oem) => verify_nvidia_oem_target(bmc, root, identity, trust, oem).await,
     }
 }
@@ -5625,6 +6227,305 @@ async fn verify_chassis_readable(
     match verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await? {
         Some(_) => Ok(CommandVerificationOutcome::Confirmed),
         None => Err(CommandVerificationError::CapabilityUnavailable),
+    }
+}
+
+/// "Accepted" verification of a power supply reset: the target power supply
+/// must re-read without error through the same Chassis → `PowerSubsystem` →
+/// `PowerSupplies` navigation the write used.
+///
+/// The physical effect is deliberately not asserted (see
+/// [`RedfishGateway::verify_command`]). An absent `PowerSubsystem` or
+/// `PowerSupplies` surface is [`CommandVerificationError::CapabilityUnavailable`]
+/// exactly like the reset families; a member named by the payload id that
+/// vanished from the re-read collection is the provably absent expected
+/// result, so it is [`CommandVerificationOutcome::Mismatched`] — the
+/// account-member precedent.
+async fn verify_power_supply_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &PowerSupplyReset,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let Some(power_supplies) =
+        verify_power_supplies_of_chassis(&chassis, bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    match payload.power_supply_id() {
+        Some(id) => {
+            let found = find_power_supply(&power_supplies, id);
+            Ok(if found.is_some() {
+                CommandVerificationOutcome::Confirmed
+            } else {
+                CommandVerificationOutcome::Mismatched
+            })
+        }
+        None => {
+            if power_supplies.is_empty() {
+                Err(CommandVerificationError::CapabilityUnavailable)
+            } else {
+                Ok(CommandVerificationOutcome::Confirmed)
+            }
+        }
+    }
+}
+
+/// Re-reads the `PowerSupply` members behind one decoded Chassis's
+/// `PowerSubsystem` navigation for verification, with every failure mapped
+/// onto the verification error contract.
+async fn verify_power_supplies_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<PowerSupplySchema>>>, CommandVerificationError> {
+    let Some(power_subsystem) = chassis.power_subsystem.as_ref() else {
+        return Ok(None);
+    };
+    let subsystem = power_subsystem
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(power_supplies) = subsystem.power_supplies.as_ref() else {
+        return Ok(None);
+    };
+    let collection = power_supplies
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members().len());
+    for power_supply in collection.members() {
+        members.push(
+            power_supply
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// "Accepted" verification of a log clear: the target log service must
+/// re-read without error through the same manager-first, chassis-fallback
+/// resolution the write used.
+///
+/// The physical effect (the entries are gone) is deliberately not asserted:
+/// clearing the log of a BMC that asynchronously re-logs is not a
+/// deterministic post-condition (see [`RedfishGateway::verify_command`]). An
+/// absent log-service surface is [`CommandVerificationError::CapabilityUnavailable`]
+/// exactly like the reset families; a member named by the payload id that
+/// vanished from the re-read collection is the provably absent expected
+/// result, so it is [`CommandVerificationOutcome::Mismatched`] — the
+/// account-member precedent.
+async fn verify_log_service_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &ClearLog,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(manager) =
+        verify_first_collection_member(root.root.managers.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let manager_log_services =
+        verify_log_services_of_document(manager.log_services.as_ref(), bmc, identity, trust)
+            .await?;
+    if let Some(id) = payload.log_service_id() {
+        return Ok(if find_log_service(&manager_log_services, id).is_some() {
+            CommandVerificationOutcome::Confirmed
+        } else {
+            CommandVerificationOutcome::Mismatched
+        });
+    }
+    if manager_log_services.is_empty() {
+        // The manager advertises no log services: the chassis fallback of
+        // the write resolution, exactly like `resolve_log_service`.
+    } else {
+        return Ok(CommandVerificationOutcome::Confirmed);
+    }
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    let chassis_log_services =
+        verify_log_services_of_document(chassis.log_services.as_ref(), bmc, identity, trust)
+            .await?;
+    if chassis_log_services.is_empty() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `LogService` members behind one decoded document's
+/// `LogServices` navigation for verification.
+async fn verify_log_services_of_document(
+    log_services: Option<&NavProperty<LogServiceCollectionSchema>>,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<Arc<LogServiceSchema>>, CommandVerificationError> {
+    let Some(log_services) = log_services else {
+        return Ok(Vec::new());
+    };
+    let collection = log_services
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(members)
+}
+
+/// "Accepted" verification of a control update: the target control must
+/// re-read without error through the same id-first,
+/// environment-power-limit-second, first-member-fallback resolution the
+/// write used.
+///
+/// The physical effect (the set point changed) is deliberately not asserted:
+/// the decoded `Control` re-read carries the service's applied set point,
+/// which may legitimately differ from the requested value while the control
+/// loop settles (see [`RedfishGateway::verify_command`]). An absent controls
+/// surface is [`CommandVerificationError::CapabilityUnavailable`] exactly
+/// like the reset families; a member named by the payload id that vanished
+/// from the re-read collection is the provably absent expected result, so
+/// it is [`CommandVerificationOutcome::Mismatched`] — the account-member
+/// precedent.
+async fn verify_control_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateControl,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(chassis) =
+        verify_first_collection_member(root.root.chassis.as_ref(), bmc, identity, trust).await?
+    else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    if let Some(id) = payload.control_id() {
+        let Some(controls) = verify_controls_of_chassis(&chassis, bmc, identity, trust).await?
+        else {
+            return Err(CommandVerificationError::CapabilityUnavailable);
+        };
+        return Ok(if find_control(&controls, id).is_some() {
+            CommandVerificationOutcome::Confirmed
+        } else {
+            CommandVerificationOutcome::Mismatched
+        });
+    }
+    if verify_environment_power_limit_control(&chassis, bmc, identity, trust)
+        .await?
+        .is_some()
+    {
+        return Ok(CommandVerificationOutcome::Confirmed);
+    }
+    let Some(controls) = verify_controls_of_chassis(&chassis, bmc, identity, trust).await? else {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    };
+    if controls.is_empty() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    Ok(CommandVerificationOutcome::Confirmed)
+}
+
+/// Re-reads the `Control` members behind one decoded Chassis's `Controls`
+/// navigation for verification.
+async fn verify_controls_of_chassis(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Vec<Arc<ControlSchema>>>, CommandVerificationError> {
+    let Some(controls) = chassis.controls.as_ref() else {
+        return Ok(None);
+    };
+    let collection = controls
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let mut members = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        members.push(
+            member
+                .get(bmc)
+                .await
+                .map_err(|source| command_verification_read_error(source, identity, trust))?,
+        );
+    }
+    Ok(Some(members))
+}
+
+/// Re-reads the environment power limit `Control` for verification.
+async fn verify_environment_power_limit_control(
+    chassis: &ChassisSchema,
+    bmc: &UpstreamBmc,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<Arc<ControlSchema>>, CommandVerificationError> {
+    let Some(environment_metrics) = chassis.environment_metrics.as_ref() else {
+        return Ok(None);
+    };
+    let metrics = environment_metrics
+        .get(bmc)
+        .await
+        .map_err(|source| command_verification_read_error(source, identity, trust))?;
+    let Some(uri) = metrics
+        .power_limit_watts
+        .as_ref()
+        .and_then(|control| control.data_source_uri.as_ref())
+        .and_then(Option::as_deref)
+    else {
+        return Ok(None);
+    };
+    let control_ref = NavProperty::<ControlSchema>::new_reference(ODataId::from(uri.to_owned()));
+    control_ref
+        .get(bmc)
+        .await
+        .map(Some)
+        .map_err(|source| command_verification_read_error(source, identity, trust))
+}
+
+/// "Accepted" verification of an `UpdateService` property patch: the
+/// patched `UpdateService` document must re-read without error through the
+/// root navigation the write used.
+///
+/// The physical effect is deliberately not asserted: a `ServiceEnabled`
+/// toggle or a target-list change is read back exactly as the BMC applies
+/// it, and the re-read success is the honest "accepted" check of the reset
+/// families. A vanished document — the root link is gone or the document
+/// answers `404` — proves the service surface is absent after the accepted
+/// write, so it is [`CommandVerificationOutcome::Mismatched`], the same
+/// provable-absence contract the §14.3 family keeps for its inventory
+/// re-read.
+async fn verify_update_service_readable(
+    bmc: &UpstreamBmc,
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let Some(update_service) = root.root.update_service.as_ref() else {
+        return Ok(CommandVerificationOutcome::Mismatched);
+    };
+    match update_service.get(bmc).await {
+        Ok(_service) => Ok(CommandVerificationOutcome::Confirmed),
+        Err(source) => classify_update_surface_fetch(source, identity, trust),
     }
 }
 

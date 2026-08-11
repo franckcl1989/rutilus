@@ -839,11 +839,13 @@ mod tests {
     use rutilus_domain::{
         AccountCommand, AccountId, AccountPassword, AccountUserName, ArtifactId, BatchOperation,
         BatchOperationId, BootCommand, BootSource, BootSourceOverrideEnabled,
-        BootSourceOverrideMode, ChassisCommand, CreateAccount, CreateSubscription, EndpointId,
-        EventCommand, EventDestinationProtocol, EventType, FailureKind, ManagerCommand,
-        NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile, RedfishCommand, ResetKeysType,
-        ResetType, RoleId, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
-        TargetId, UpdateAccountPassword, UpdateCommand,
+        BootSourceOverrideMode, ChassisCommand, ClearLog, ControlCommand, CreateAccount,
+        CreateSubscription, EndpointId, EventCommand, EventDestinationProtocol, EventType,
+        FailureKind, LogCommand, ManagerCommand, ManagerResetToDefaultsType,
+        NvidiaSystemConfigProfileCommand, OemCommand, PowerSupplyReset, ProfileFile,
+        RedfishCommand, ResetKeysType, ResetType, RoleId, SecureBootCommand, SetBootSourceOverride,
+        StartUpdate, SystemCommand, TargetId, UpdateAccountPassword, UpdateCommand, UpdateControl,
+        UpdatePatch,
     };
     use rutilus_entity::{batch_operation, operation, operation_target};
     use rutilus_operation_engine::OperationEngine;
@@ -2267,7 +2269,19 @@ mod tests {
             ))),
             one_command(),
             RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
+            RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                ManagerResetToDefaultsType::PreserveNetwork,
+            )),
             RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
+            RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                None,
+            ))),
+            RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+            RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                None,
+                Some(700.0),
+            ))),
+            RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
             RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
                 SetBootSourceOverride::new(
                     BootSource::Pxe,
