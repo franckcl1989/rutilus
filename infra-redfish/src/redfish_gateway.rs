@@ -21776,6 +21776,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifies_an_expired_session_token_during_a_task_poll_as_authentication_failed()
+    -> Result<(), Box<dyn Error>> {
+        // The BMC rejected the Session token mid-poll (401 on the Task
+        // fetch): the read surfaces the authentication failure class, the
+        // monitor defers the poll (a failed Task read is never a verdict,
+        // task_monitor.rs), and the transient Session was deleted — the next
+        // poll re-authenticates from scratch ("清会话重建"), so an expired
+        // token can never poison the following polls.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            CORE_SERVICE_ROOT_BODY,
+            &[("401 Unauthorized", "{}")],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let result = gateway
+            .read_task(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &ResourceODataId::parse("/redfish/v1/TaskService/Tasks/1")?,
+            )
+            .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(observation) => {
+                return Err(format!("a 401 Task read must fail, got {observation:?}").into());
+            }
+        };
+        match error {
+            TaskReadError::ReadFailed { task_uri, source } => {
+                assert_eq!(task_uri.as_str(), "/redfish/v1/TaskService/Tasks/1");
+                assert!(
+                    matches!(
+                        *source,
+                        RedfishServiceRootError::AuthenticationFailed { .. }
+                    ),
+                    "a 401 Task read must classify as an authentication failure: {source:?}"
+                );
+            }
+            other => {
+                return Err(
+                    format!("a 401 Task read must surface as ReadFailed, got {other:?}").into(),
+                );
+            }
+        }
+        // The rejected Session was deleted, so the next poll starts clean.
+        assert_session_requests(&server.finish_all().await?, &TASK_READ_REQUEST_PATHS)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn classifies_an_undecodable_task_document_as_schema_incompatible()
     -> Result<(), Box<dyn Error>> {
         let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
@@ -31274,6 +31329,42 @@ mod tests {
         );
         // Both failures deleted the Session created for the failed open.
         assert_session_requests(&forbidden.finish_all().await?, &expected_paths)?;
+
+        // A 401 on the SSE request is a token invalidation: the Session the
+        // open created was rejected, so the application reconnect loop must
+        // rebuild it ("清会话重建") instead of treating the endpoint as gone —
+        // the reconnectable class keeps the loop retrying with a fresh
+        // Session on the next attempt.
+        let expired_token = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", EVENT_SERVICE_WITH_SSE_BODY),
+                ("401 Unauthorized", "{}"),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(expired_token.certificate.clone())?;
+        let trust = system_ca_trust(&expired_token.certificate)?;
+        assert!(
+            matches!(
+                gateway
+                    .open_event_stream(
+                        &expired_token.address,
+                        &trust,
+                        &credentials.0,
+                        &credentials.1,
+                        EndpointId::generate(),
+                        CancellationToken::new(),
+                    )
+                    .await,
+                Err(EventStreamOpenError::Reconnectable(
+                    RedfishServiceRootError::AuthenticationFailed { .. }
+                ))
+            ),
+            "a 401 SSE response is a reconnectable session-rebuild signal"
+        );
+        // The rejected Session was still deleted before the error returned.
+        assert_session_requests(&expired_token.finish_all().await?, &expected_paths)?;
         Ok(())
     }
 
