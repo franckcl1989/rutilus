@@ -24,19 +24,19 @@
 //! invariant because the development baseline is allowed to move ahead of the
 //! frozen version during the review.
 //!
-//! # Audit mode for unmapped operations
+//! # Audit mode for public operations
 //!
-//! The 0.8.0 acceptance criterion requires `未映射公开操作 = 0` (no public
-//! operation without a product mapping). At this point in the 0.8.0 work the
-//! parallel write-surface work items are still implementing several families
-//! (control, log clear, telemetry CRUD, ...), so this gate runs in
-//! **audit mode**: the operation inventory lists every upstream typed write
-//! operation with an explicit status, and the gate asserts the inventory is
-//! internally consistent and that the unmapped count equals the frozen
-//! record [`FROZEN_UNMAPPED_OPERATION_COUNT`] — it does *not* assert the
-//! count is zero. When the parallel work items land, the count is updated
-//! deliberately (each entry flips to `Mapped`), and the final 0.8.0 gate
-//! switches the assertion to zero by making the frozen count `0`.
+//! The 0.8.0 acceptance criterion `未映射公开操作 = 0` (no public operation
+//! without a product mapping) is met: the operation inventory lists every
+//! upstream typed write operation with an explicit status, and the gates
+//! assert the inventory is internally consistent, that the unmapped count
+//! equals the frozen record [`FROZEN_UNMAPPED_OPERATION_COUNT`] (now `0`),
+//! and that the deliberately-unprovided operations equal the frozen
+//! [`FROZEN_OUT_OF_SCOPE_OPERATION_COUNT`] `OutOfScope` entries. The
+//! `OutOfScope` classification is an explicit product decision — the §22
+//! "明确不包含" spirit applied to operations: an entry there is
+//! intentionally not implemented, distinct from an `Unmapped` entry that
+//! should be implemented but is not yet.
 //!
 //! # Where the inventories come from
 //!
@@ -550,9 +550,10 @@ pub const RELEASE_BASELINE_MODULES: [BaselineModule; 29] = [
 ///
 /// `Mapped` and `CompiledCsdlOnly` name the §7.5 command family (one of
 /// [`REDFISH_COMMAND_FAMILIES`]); `Unmapped` marks an upstream typed
-/// operation without a product command yet (the audit-mode list of the
-/// 0.8.0 `未映射公开操作 = 0` criterion); `Infrastructure` and `Internal`
-/// mark operations the product uses outside the command surface.
+/// operation without a product command yet; `OutOfScope` marks an upstream
+/// operation the product deliberately does not provide (an explicit product
+/// decision, never a silent omission); `Infrastructure` and `Internal` mark
+/// operations the product uses outside the command surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationMapping {
     /// The operation is dispatched by the named `RedfishCommand` family.
@@ -560,6 +561,14 @@ pub enum OperationMapping {
     /// No product command exists yet; listed explicitly for the 0.8.0
     /// audit gate.
     Unmapped,
+    /// An upstream public operation the product deliberately does not
+    /// provide, recorded as an explicit decision at the freeze — the §22
+    /// "明确不包含" spirit applied to operations. `reason` states the
+    /// decision in one sentence, and the operation entry's `note` documents
+    /// it in full. The audit mode distinguishes this from [`Self::Unmapped`]:
+    /// `Unmapped` is "should be implemented, not yet", `OutOfScope` is
+    /// "intentionally not implemented".
+    OutOfScope { reason: &'static str },
     /// Used by product plumbing (for example, the authentication flow),
     /// never through a command family.
     Infrastructure,
@@ -575,6 +584,12 @@ impl OperationMapping {
     #[must_use]
     pub const fn is_unmapped(self) -> bool {
         matches!(self, Self::Unmapped)
+    }
+
+    /// Reports whether this operation is deliberately out of scope.
+    #[must_use]
+    pub const fn is_out_of_scope(self) -> bool {
+        matches!(self, Self::OutOfScope { .. })
     }
 }
 
@@ -628,7 +643,7 @@ impl BaselineOperation {
 /// here so the operation inventory can reference them without constructing
 /// command values. The domain crate pins these codes itself; a new family
 /// must be added to both places.
-pub const REDFISH_COMMAND_FAMILIES: [&str; 9] = [
+pub const REDFISH_COMMAND_FAMILIES: [&str; 12] = [
     "account",
     "system",
     "manager",
@@ -636,6 +651,9 @@ pub const REDFISH_COMMAND_FAMILIES: [&str; 9] = [
     "boot",
     "secure-boot",
     "event",
+    "log",
+    "control",
+    "telemetry",
     "update",
     "oem",
 ];
@@ -646,13 +664,16 @@ pub const REDFISH_COMMAND_FAMILIES: [&str; 9] = [
 /// 0.13.0 (the §0.5.0 OEM write surfaces), plus the six product command
 /// surfaces upstream exposes only through compiled CSDL member sets.
 ///
-/// The audit gate
-/// [`release_baseline_unmapped_operation_count_is_frozen`] pins
-/// [`FROZEN_UNMAPPED_OPERATION_COUNT`] instead of asserting zero until the
-/// parallel write-surface work items land; the final 0.8.0 gate flips the
-/// frozen count to `0`. The non-NVIDIA OEM modules (AMI, Dell, Delta, HPE,
-/// Lenovo, `LiteOn`, Supermicro) expose no typed write surface in 0.13.0
-/// (read navigation only), so they contribute no operation entries.
+/// The audit gates
+/// [`release_baseline_unmapped_operation_count_is_frozen`] and
+/// [`release_baseline_out_of_scope_operation_count_is_frozen`] pin
+/// [`FROZEN_UNMAPPED_OPERATION_COUNT`] at `0` — the 0.8.0 criterion
+/// `未映射公开操作 = 0` is met — and [`FROZEN_OUT_OF_SCOPE_OPERATION_COUNT`]
+/// at `3`: every entry is `Mapped`, `CompiledCsdlOnly`, `Infrastructure`,
+/// `Internal`, or an explicitly decided `OutOfScope`, with no fuzzy
+/// omission. The non-NVIDIA OEM modules (AMI, Dell, Delta, HPE, Lenovo,
+/// `LiteOn`, Supermicro) expose no typed write surface in 0.13.0 (read
+/// navigation only), so they contribute no operation entries.
 pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
     BaselineOperation {
         code: "account.create",
@@ -693,8 +714,8 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "control.update",
         upstream_surface: "control::Control::update",
         feature: "controls",
-        mapping: OperationMapping::Unmapped,
-        note: "no control command family yet (power capping, fan control)",
+        mapping: OperationMapping::Mapped { command: "control" },
+        note: "RedfishCommand::Control(ControlCommand::Update)",
     },
     BaselineOperation {
         code: "manager.reset",
@@ -707,8 +728,8 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "manager.reset-to-defaults",
         upstream_surface: "manager::Manager::reset_to_defaults",
         feature: "managers",
-        mapping: OperationMapping::Unmapped,
-        note: "no command variant for the ResetToDefaults action",
+        mapping: OperationMapping::Mapped { command: "manager" },
+        note: "RedfishCommand::Manager(ManagerCommand::ResetToDefaults)",
     },
     BaselineOperation {
         code: "system.reset",
@@ -721,8 +742,13 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "system.set-boot-order",
         upstream_surface: "computer_system::ComputerSystem::set_boot_order",
         feature: "computer-systems",
-        mapping: OperationMapping::Unmapped,
-        note: "the product maps the BootSourceOverride PATCH (Boot family), not the persistent boot order",
+        mapping: OperationMapping::OutOfScope {
+            reason: "the product Boot family provides BootSourceOverride only (one-shot/continuous \
+                     override), never a persistent boot-order mutation",
+        },
+        note: "explicit 0.8.0 freeze decision (§22 spirit): the Boot family implements \
+               BootSourceOverride (one-shot/continuous override) only, so the persistent \
+               boot-order mutation is deliberately not provided — OutOfScope, not Unmapped",
     },
     BaselineOperation {
         code: "chassis.reset",
@@ -735,36 +761,48 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "power-supply.reset",
         upstream_surface: "chassis::PowerSupply::reset",
         feature: "chassis",
-        mapping: OperationMapping::Unmapped,
-        note: "no command variant for the power-supply Reset action",
+        mapping: OperationMapping::Mapped { command: "chassis" },
+        note: "RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset)",
     },
     BaselineOperation {
         code: "log.clear",
         upstream_surface: "log_service::LogService::clear_log",
         feature: "log-services",
-        mapping: OperationMapping::Unmapped,
-        note: "no log command family yet",
+        mapping: OperationMapping::Mapped { command: "log" },
+        note: "RedfishCommand::Log(LogCommand::ClearLog)",
     },
     BaselineOperation {
         code: "update.simple",
         upstream_surface: "update_service::UpdateService::simple_update",
         feature: "update-service",
-        mapping: OperationMapping::Unmapped,
-        note: "image-URI flow; §14.3 submits artifact bytes, never a remote image URI",
+        mapping: OperationMapping::OutOfScope {
+            reason: "SimpleUpdate takes a remote image URI; §14.3 submits artifact bytes only \
+                     and accepts no user-supplied URI",
+        },
+        note: "explicit 0.8.0 freeze decision (§22 spirit): the §14.3 update flow uploads \
+               artifact bytes and never accepts a remote image URI, so SimpleUpdate is \
+               deliberately not provided — OutOfScope, not Unmapped",
     },
     BaselineOperation {
         code: "update.start",
         upstream_surface: "update_service::UpdateService::start_update",
         feature: "update-service",
-        mapping: OperationMapping::Unmapped,
-        note: "the StartUpdate action (apply on start request); no product flow invokes it",
+        mapping: OperationMapping::OutOfScope {
+            reason: "the §14.3 update flow is the full multipart/http-push upload-and-apply \
+                     flow; a standalone StartUpdate action entry is not provided",
+        },
+        note: "explicit 0.8.0 freeze decision (§22 spirit): the product update flow uploads \
+               artifacts through the multipart/http-push path and applies them in one command \
+               (RedfishCommand::Update(UpdateCommand::StartUpdate)), so the separate upstream \
+               StartUpdate action entry is deliberately not provided — OutOfScope, not Unmapped",
     },
     BaselineOperation {
         code: "update.patch",
         upstream_surface: "update_service::UpdateService::update",
         feature: "update-service-deprecated",
-        mapping: OperationMapping::Unmapped,
-        note: "deprecated UpdateServiceUpdate PATCH; compiled for §0.4.0 legacy compatibility only",
+        mapping: OperationMapping::Mapped { command: "update" },
+        note: "RedfishCommand::Update(UpdateCommand::Patch); the deprecated §0.4.0 legacy \
+               compatibility PATCH surface",
     },
     BaselineOperation {
         code: "update.http-push",
@@ -784,50 +822,64 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
         code: "telemetry.set-enabled",
         upstream_surface: "telemetry_service::TelemetryService::set_enabled",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5) and land with the event-service write surface",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::SetEnabled)",
     },
     BaselineOperation {
         code: "telemetry.create-metric-definition",
         upstream_surface: "telemetry_service::TelemetryService::create_metric_definition",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::CreateMetricDefinition)",
     },
     BaselineOperation {
         code: "telemetry.update-metric-definition",
         upstream_surface: "telemetry_service::MetricDefinition::update",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricDefinition)",
     },
     BaselineOperation {
         code: "telemetry.delete-metric-definition",
         upstream_surface: "telemetry_service::MetricDefinition::delete",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricDefinition)",
     },
     BaselineOperation {
         code: "telemetry.create-metric-report-definition",
         upstream_surface: "telemetry_service::TelemetryService::create_metric_report_definition",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::CreateMetricReportDefinition)",
     },
     BaselineOperation {
         code: "telemetry.update-metric-report-definition",
         upstream_surface: "telemetry_service::MetricReportDefinition::update",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::UpdateMetricReportDefinition)",
     },
     BaselineOperation {
         code: "telemetry.delete-metric-report-definition",
         upstream_surface: "telemetry_service::MetricReportDefinition::delete",
         feature: "telemetry-service",
-        mapping: OperationMapping::Unmapped,
-        note: "telemetry writes are deferred (§7.5)",
+        mapping: OperationMapping::Mapped {
+            command: "telemetry",
+        },
+        note: "RedfishCommand::Telemetry(TelemetryCommand::DeleteMetricReportDefinition)",
     },
     BaselineOperation {
         code: "session.create",
@@ -966,12 +1018,25 @@ pub const RELEASE_BASELINE_OPERATIONS: [BaselineOperation; 43] = [
 /// The frozen number of upstream typed write operations without a product
 /// mapping yet.
 ///
-/// The 0.8.0 acceptance criterion `未映射公开操作 = 0` is met when this
-/// count is `0`; until the parallel write-surface work items land, the audit
-/// gate asserts the inventory reports exactly this documented count so the
-/// record cannot grow silently. The count matches the `Unmapped` entries of
+/// The 0.8.0 acceptance criterion `未映射公开操作 = 0` is met: this count is
+/// `0`, and the audit gate asserts the inventory reports exactly this
+/// documented count so the record cannot grow silently. The count matches
+/// the `Unmapped` entries of [`RELEASE_BASELINE_OPERATIONS`].
+pub const FROZEN_UNMAPPED_OPERATION_COUNT: usize = 0;
+
+/// The frozen number of upstream typed write operations the product
+/// deliberately does not provide.
+///
+/// Every operation classified [`OperationMapping::OutOfScope`] carries an
+/// explicit product decision (the §22 "明确不包含" spirit):
+/// `system.set-boot-order` (the Boot family is `BootSourceOverride` only),
+/// `update.simple` (§14.3 accepts artifact bytes, never a remote image URI),
+/// and `update.start` (the §14.3 flow is the full upload-and-apply path).
+/// The audit gate asserts the inventory reports exactly this documented
+/// count, so an out-of-scope decision can never be dropped or added
+/// silently. The count matches the `OutOfScope` entries of
 /// [`RELEASE_BASELINE_OPERATIONS`].
-pub const FROZEN_UNMAPPED_OPERATION_COUNT: usize = 15;
+pub const FROZEN_OUT_OF_SCOPE_OPERATION_COUNT: usize = 3;
 
 /// The frozen capability-ledger hash snapshot (§2.3 "能力账本 Hash").
 ///
@@ -1070,13 +1135,29 @@ impl NvRedfishReleaseBaseline {
     }
 
     /// Returns how many public operations have no product mapping yet — the
-    /// audit-mode number behind the 0.8.0 `未映射公开操作 = 0` criterion.
+    /// number behind the 0.8.0 `未映射公开操作 = 0` criterion, frozen at `0`.
     #[must_use]
     pub const fn unmapped_operation_count(self) -> usize {
         let mut count = 0;
         let mut index = 0;
         while index < self.operations.len() {
             if self.operations[index].mapping.is_unmapped() {
+                count += 1;
+            }
+            index += 1;
+        }
+        count
+    }
+
+    /// Returns how many public operations the product deliberately does not
+    /// provide — the frozen [`FROZEN_OUT_OF_SCOPE_OPERATION_COUNT`] number of
+    /// explicitly recorded `OutOfScope` decisions.
+    #[must_use]
+    pub const fn out_of_scope_operation_count(self) -> usize {
+        let mut count = 0;
+        let mut index = 0;
+        while index < self.operations.len() {
+            if self.operations[index].mapping.is_out_of_scope() {
                 count += 1;
             }
             index += 1;
@@ -1587,7 +1668,13 @@ mod tests {
         }
         // Every §7.5 family must be covered by at least one operation entry
         // (mapped or compiled-CSDL-only): the reverse direction of the
-        // mapping table.
+        // mapping table. The frozen family list must also be the 12 domain
+        // `RedfishCommand` variants exactly.
+        assert_eq!(
+            REDFISH_COMMAND_FAMILIES.len(),
+            12,
+            "the frozen families must match the 12 domain RedfishCommand variants"
+        );
         covered_families.sort_unstable();
         let mut families = REDFISH_COMMAND_FAMILIES.to_vec();
         families.sort_unstable();
@@ -1606,12 +1693,41 @@ mod tests {
             .count();
         assert_eq!(
             unmapped, FROZEN_UNMAPPED_OPERATION_COUNT,
-            "the audit-mode record freezes the unmapped count; change both sides deliberately \
-             when a parallel write-surface work item lands"
+            "the 0.8.0 criterion `未映射公开操作 = 0` is met: every public operation has a \
+             product mapping, and the frozen count records exactly zero unmapped entries"
         );
         assert_eq!(
             NV_REDFISH_RELEASE_BASELINE.unmapped_operation_count(),
             FROZEN_UNMAPPED_OPERATION_COUNT
+        );
+    }
+
+    #[test]
+    fn release_baseline_out_of_scope_operation_count_is_frozen() {
+        let mut out_of_scope = 0;
+        for operation in RELEASE_BASELINE_OPERATIONS {
+            if let OperationMapping::OutOfScope { reason } = operation.mapping() {
+                assert!(
+                    !reason.is_empty(),
+                    "operation {} must state why it is out of scope",
+                    operation.code()
+                );
+                assert!(
+                    !operation.note().is_empty(),
+                    "operation {} must carry the product decision in its note",
+                    operation.code()
+                );
+                out_of_scope += 1;
+            }
+        }
+        assert_eq!(
+            out_of_scope, FROZEN_OUT_OF_SCOPE_OPERATION_COUNT,
+            "the frozen record pins the out-of-scope decisions; change both sides deliberately \
+             when a product decision changes"
+        );
+        assert_eq!(
+            NV_REDFISH_RELEASE_BASELINE.out_of_scope_operation_count(),
+            FROZEN_OUT_OF_SCOPE_OPERATION_COUNT
         );
     }
 
@@ -1673,6 +1789,7 @@ mod tests {
                 OperationMapping::Mapped { command }
                 | OperationMapping::CompiledCsdlOnly { command } => Some(command),
                 OperationMapping::Unmapped
+                | OperationMapping::OutOfScope { .. }
                 | OperationMapping::Infrastructure
                 | OperationMapping::Internal => None,
             }
