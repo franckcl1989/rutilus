@@ -8,6 +8,7 @@ use std::{
 };
 
 use rutilus_migration::Migrator;
+use rutilus_security::MasterKey;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use sea_orm_migration::MigratorTrait;
 use thiserror::Error;
@@ -98,6 +99,12 @@ pub struct SqliteStore {
     database_path: PathBuf,
     migration_backup: Option<MigrationBackup>,
     write_gate: Arc<Semaphore>,
+    /// The instance master key protecting the operation command columns at
+    /// rest (XChaCha20-Poly1305, security crate). A store without the key —
+    /// the backup, onboarding, and test paths, which never read or write
+    /// command payloads — refuses command writes and ciphertext reads (fail
+    /// closed), so no payload is ever persisted or released unprotected.
+    command_key: Option<Arc<MasterKey>>,
 }
 
 impl SqliteStore {
@@ -106,12 +113,44 @@ impl SqliteStore {
     /// Existing corrupt or incompatible files are reported as errors and are
     /// never deleted or silently recreated.
     ///
+    /// The store is opened without a command encryption key; use
+    /// [`Self::open_with_command_key`] when the store will read or write
+    /// operation command payloads.
+    ///
     /// # Errors
     ///
     /// Returns [`OpenStoreError`] when the path is invalid, the data directory
     /// cannot be created, the database cannot be opened, or a migration fails.
     pub async fn open(database_path: impl AsRef<Path>) -> Result<Self, OpenStoreError> {
         Self::open_with_settings(database_path.as_ref(), SqliteSettings::default()).await
+    }
+
+    /// Opens a file-backed store whose operation command columns are
+    /// encrypted at rest under the given instance master key.
+    ///
+    /// `command_key` is shared with the runtime's other key users (the
+    /// credential protector and resolver), so the secret bytes exist in one
+    /// allocation; the store holds its `Arc` clone.
+    ///
+    /// Every command write is persisted as an authenticated ciphertext
+    /// envelope (see `rutilus_security::encrypt_command`), and every command
+    /// read decrypts through the key. Legacy rows written before at-rest
+    /// encryption remain readable as plaintext, and a keyless store refuses
+    /// command writes and ciphertext reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenStoreError`] when the path is invalid, the data directory
+    /// cannot be created, the database cannot be opened, or a migration fails.
+    pub async fn open_with_command_key(
+        database_path: impl AsRef<Path>,
+        command_key: Arc<MasterKey>,
+    ) -> Result<Self, OpenStoreError> {
+        let store = Self::open(database_path).await?;
+        Ok(Self {
+            command_key: Some(command_key),
+            ..store
+        })
     }
 
     #[must_use]
@@ -137,6 +176,7 @@ impl SqliteStore {
             database_path,
             migration_backup: _,
             write_gate,
+            command_key: _,
         } = self;
         let _write_permit =
             write_gate
@@ -196,6 +236,7 @@ impl SqliteStore {
             database_path: database_path.to_path_buf(),
             migration_backup,
             write_gate: Arc::new(Semaphore::new(1)),
+            command_key: None,
         })
     }
 }

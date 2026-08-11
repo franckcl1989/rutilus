@@ -638,7 +638,7 @@ pub enum EndpointInventoryPersistenceError {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, sync::Arc};
 
     use rutilus_application::{
         AuditEventWriter, CapabilityQueryRepository, CapabilitySnapshotRepository,
@@ -1114,7 +1114,7 @@ mod tests {
         assert_repository::<SqliteStore>();
 
         let directory = tempfile::tempdir()?;
-        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let store = test_operation_store(directory.path()).await?;
         let created_at = OffsetDateTime::now_utc();
         let operation = Operation::new(
             OperationId::generate(),
@@ -1167,7 +1167,7 @@ mod tests {
         assert_repository::<SqliteStore>();
 
         let directory = tempfile::tempdir()?;
-        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let store = test_operation_store(directory.path()).await?;
         let created_at = OffsetDateTime::now_utc();
         let operation = Operation::new(
             OperationId::generate(),
@@ -1225,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn operation_engine_drives_the_sqlite_store_end_to_end() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let store = test_operation_store(directory.path()).await?;
         let engine = OperationEngine::new(&store);
         let created_at = OffsetDateTime::now_utc();
         let target = OperationTarget::new(TargetId::generate(), EndpointId::generate());
@@ -1310,5 +1310,19 @@ mod tests {
         store.close().await?;
         drop(directory);
         Ok(())
+    }
+
+    /// Opens a command-encrypted store for the operation boundary tests: the
+    /// production shape persists ciphertext envelopes and decrypts them on
+    /// read, including on the §13.6 recovery scan.
+    async fn test_operation_store(
+        directory: &std::path::Path,
+    ) -> Result<SqliteStore, Box<dyn Error>> {
+        let store = SqliteStore::open_with_command_key(
+            directory.join("rutilus.db"),
+            Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32]))),
+        )
+        .await?;
+        Ok(store)
     }
 }

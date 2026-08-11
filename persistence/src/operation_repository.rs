@@ -4,10 +4,15 @@ use rutilus_domain::{
     OperationTarget, OperationTimelineError, RedfishCommand,
 };
 use rutilus_entity::{batch_operation, operation, operation_target};
+use rutilus_security::{
+    COMMAND_CIPHER_ENVELOPE_PREFIX, CommandProtectionError, MasterKey, decrypt_command,
+    encrypt_command,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
     QueryFilter, QueryOrder, Set, TransactionTrait,
 };
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -17,12 +22,16 @@ use crate::SqliteStore;
 impl SqliteStore {
     /// Atomically persists one operation and all of its targets.
     ///
-    /// The typed command is stored as its serde JSON serialization — the §9.4
-    /// `TypedPayloadJson` rule applied to commands: the column can only ever
-    /// hold JSON produced by a type successfully serialized, never arbitrary
-    /// hand-written JSON, and the database does not parse the structure.
-    /// Reading it back goes through the domain type again (see
-    /// [`Self::find_operation`]).
+    /// The typed command is protected before it is written: the §9.4
+    /// `TypedPayloadJson` serialization is stored as an authenticated
+    /// `XChaCha20-Poly1305` ciphertext envelope under the instance master
+    /// key, bound to the operation id, so the command column never holds
+    /// plaintext payloads at rest (the §10 split: the domain command stays
+    /// plaintext, at-rest protection is this crate's concern). The column
+    /// can only ever hold an envelope produced from a type successfully
+    /// serialized, never arbitrary hand-written values, and the database
+    /// does not parse the structure. Reading it back goes through the
+    /// domain type again (see [`Self::find_operation`]).
     ///
     /// Delivery is at-least-once (design §15.4), so re-creating an operation
     /// id that is already stored is a no-op: the persisted row is
@@ -33,13 +42,15 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns [`OperationRepositoryError`] when write coordination fails, the
-    /// transaction cannot commit, the command cannot be serialized, or a
-    /// stored row violates an aggregate invariant.
+    /// Returns [`OperationRepositoryError`] when write coordination fails,
+    /// the store has no command key, the transaction cannot commit, the
+    /// command cannot be serialized, or a stored row violates an aggregate
+    /// invariant.
     pub async fn create_operation(
         &self,
         operation: &Operation,
     ) -> Result<(), OperationRepositoryError> {
+        self.command_key()?;
         let _write_permit = self
             .write_gate
             .acquire()
@@ -50,7 +61,8 @@ impl SqliteStore {
             .begin()
             .await
             .map_err(OperationRepositoryError::Database)?;
-        insert_operation_aggregate(&transaction, operation, None).await?;
+        self.insert_operation_aggregate(&transaction, operation, None)
+            .await?;
         transaction
             .commit()
             .await
@@ -61,13 +73,13 @@ impl SqliteStore {
     /// Atomically persists one batch parent and every child operation
     /// (design §13.7).
     ///
-    /// The parent row carries the submission facts — source, the typed
-    /// command as its §9.4 serde JSON serialization, and the acceptance
-    /// time — and each child is persisted through the same
-    /// [`Self::create_operation`] aggregate write with its `batch_id` link
-    /// set, so a child can never exist without its batch (or half a batch
-    /// without the rest): the parent and all children commit in one
-    /// transaction.
+    /// The parent row carries the submission facts — source, the command
+    /// protected exactly like [`Self::create_operation`] (its envelope is
+    /// bound to the batch id), and the acceptance time — and each child is
+    /// persisted through the same [`Self::create_operation`] aggregate write
+    /// with its `batch_id` link set, so a child can never exist without its
+    /// batch (or half a batch without the rest): the parent and all children
+    /// commit in one transaction.
     ///
     /// Delivery is at-least-once (design §15.4), exactly like
     /// [`Self::create_operation`]: a batch id that is already stored is a
@@ -77,14 +89,16 @@ impl SqliteStore {
     ///
     /// # Errors
     ///
-    /// Returns [`OperationRepositoryError`] when write coordination fails, the
-    /// transaction cannot commit, a command cannot be serialized, or a stored
-    /// row violates an aggregate invariant.
+    /// Returns [`OperationRepositoryError`] when write coordination fails,
+    /// the store has no command key, the transaction cannot commit, a
+    /// command cannot be serialized, or a stored row violates an aggregate
+    /// invariant.
     pub async fn create_batch(
         &self,
         batch: &BatchOperation,
         children: &[Operation],
     ) -> Result<(), OperationRepositoryError> {
+        self.command_key()?;
         let _write_permit = self
             .write_gate
             .acquire()
@@ -114,14 +128,17 @@ impl SqliteStore {
         batch_operation::ActiveModel {
             id: Set(batch_id),
             source: Set(batch.source().as_str().to_owned()),
-            command: Set(serialize_command(&batch.command())?),
+            command: Set(
+                self.serialize_command(&batch.command(), batch.id().into_uuid().into_bytes())?
+            ),
             created_at: Set(batch.created_at()),
         }
         .insert(&transaction)
         .await
         .map_err(OperationRepositoryError::Database)?;
         for child in children {
-            insert_operation_aggregate(&transaction, child, Some(batch_id)).await?;
+            self.insert_operation_aggregate(&transaction, child, Some(batch_id))
+                .await?;
         }
         transaction
             .commit()
@@ -132,12 +149,13 @@ impl SqliteStore {
 
     /// Reads one batch parent by stable identity.
     ///
-    /// The stored command JSON is rehydrated through the domain
-    /// [`RedfishCommand`] deserializer with the same corrupt-aggregate rule
-    /// as [`Self::find_operation`]: a payload this build cannot deserialize,
-    /// or a source code it cannot classify, makes the whole parent
-    /// [`OperationRepositoryError::BatchCorrupt`] instead of being
-    /// half-understood.
+    /// The stored command payload (a ciphertext envelope decrypted under the
+    /// store's master key, or a legacy plaintext row) is rehydrated through
+    /// the domain [`RedfishCommand`] deserializer with the same
+    /// corrupt-aggregate rule as [`Self::find_operation`]: a payload this
+    /// build cannot deserialize, or a source code it cannot classify, makes
+    /// the whole parent [`OperationRepositoryError::BatchCorrupt`] instead
+    /// of being half-understood.
     ///
     /// # Errors
     ///
@@ -163,7 +181,7 @@ impl SqliteStore {
                 .map_err(OperationRepositoryError::Database)?;
             return Ok(None);
         };
-        let domain = map_stored_batch(batch_id, &model)?;
+        let domain = map_stored_batch(self, batch_id, &model)?;
         transaction
             .commit()
             .await
@@ -198,7 +216,7 @@ impl SqliteStore {
         let mut batches = Vec::with_capacity(models.len());
         for model in models {
             let batch_id = BatchOperationId::from_uuid(model.id);
-            batches.push(map_stored_batch(batch_id, &model)?);
+            batches.push(map_stored_batch(self, batch_id, &model)?);
         }
         transaction
             .commit()
@@ -253,7 +271,7 @@ impl SqliteStore {
                         .map_err(|source| corrupt(operation_id, source))
                 })
                 .transpose()?;
-            let operation = map_stored_operation(&transaction, operation_id, model).await?;
+            let operation = map_stored_operation(self, &transaction, operation_id, model).await?;
             children.push((operation, failure_kind));
         }
         // Target order: each child carries exactly one target, so the target
@@ -317,17 +335,20 @@ impl SqliteStore {
 
     /// Reads one complete operation aggregate by stable identity.
     ///
-    /// The stored command JSON is rehydrated through the domain
-    /// [`RedfishCommand`] deserializer. A payload this build cannot
-    /// deserialize — a family, payload shape, or member this build does not
-    /// know — makes the whole aggregate [`OperationRepositoryError::Corrupt`]
-    /// instead of being half-understood, exactly like an unknown state or
-    /// source code (`InvalidState` precedent). Upgrade order therefore
-    /// matters: records written by a newer build must not be read by an older
-    /// one, so in-flight operations must be drained (or the product must not
-    /// be rolled back) before a downgrade — the same discipline as the §0.5.0
-    /// OEM records, which only builds with the OEM mapping compiled in can
-    /// interpret.
+    /// The stored command payload (a ciphertext envelope decrypted under the
+    /// store's master key, or a legacy plaintext row) is rehydrated through
+    /// the domain [`RedfishCommand`] deserializer. A payload this build
+    /// cannot deserialize — a family, payload shape, or member this build
+    /// does not know — makes the whole aggregate
+    /// [`OperationRepositoryError::Corrupt`] instead of being half-understood,
+    /// exactly like an unknown state or source code (`InvalidState`
+    /// precedent); a ciphertext envelope that cannot be authenticated (a
+    /// tampered row or a different master key) is refused the same way.
+    /// Upgrade order therefore matters: records written by a newer build must
+    /// not be read by an older one, so in-flight operations must be drained
+    /// (or the product must not be rolled back) before a downgrade — the same
+    /// discipline as the §0.5.0 OEM records, which only builds with the OEM
+    /// mapping compiled in can interpret.
     ///
     /// # Errors
     ///
@@ -353,7 +374,7 @@ impl SqliteStore {
                 .map_err(OperationRepositoryError::Database)?;
             return Ok(None);
         };
-        let domain = map_stored_operation(&transaction, operation_id, model).await?;
+        let domain = map_stored_operation(self, &transaction, operation_id, model).await?;
         transaction
             .commit()
             .await
@@ -462,7 +483,7 @@ impl SqliteStore {
         let mut operations = Vec::with_capacity(models.len());
         for model in models {
             let operation_id = OperationId::from_uuid(model.id);
-            operations.push(map_stored_operation(&transaction, operation_id, model).await?);
+            operations.push(map_stored_operation(self, &transaction, operation_id, model).await?);
         }
         transaction
             .commit()
@@ -472,56 +493,137 @@ impl SqliteStore {
     }
 }
 
-async fn insert_operation_aggregate<C>(
-    database: &C,
-    domain: &Operation,
-    batch_id: Option<Uuid>,
-) -> Result<(), OperationRepositoryError>
-where
-    C: ConnectionTrait,
-{
-    let operation_id = domain.id();
-    if operation::Entity::find_by_id(operation_id.into_uuid())
-        .one(database)
-        .await
-        .map_err(OperationRepositoryError::Database)?
-        .is_some()
+impl SqliteStore {
+    async fn insert_operation_aggregate<C>(
+        &self,
+        database: &C,
+        domain: &Operation,
+        batch_id: Option<Uuid>,
+    ) -> Result<(), OperationRepositoryError>
+    where
+        C: ConnectionTrait,
     {
-        // At-least-once delivery (design §15.4): the stored row is
-        // authoritative and must not be rewritten.
-        return Ok(());
-    }
-    operation::ActiveModel {
-        id: Set(operation_id.into_uuid()),
-        source: Set(domain.source().as_str().to_owned()),
-        state: Set(domain.state().as_str().to_owned()),
-        command: Set(serialize_command(&domain.command())?),
-        // A batch child carries its parent link at the persistence layer
-        // only; the domain `Operation` aggregate has no batch concept. New
-        // operations are never born classified: the failure kind is written
-        // by the refusal path before a `Failed` transition.
-        batch_id: Set(batch_id),
-        failure_kind: Set(None),
-        created_at: Set(domain.created_at()),
-        updated_at: Set(domain.updated_at()),
-    }
-    .insert(database)
-    .await
-    .map_err(OperationRepositoryError::Database)?;
-    for target in domain.targets() {
-        operation_target::ActiveModel {
-            operation_id: Set(operation_id.into_uuid()),
-            target_id: Set(target.target_id().into_uuid()),
-            endpoint_id: Set(target.endpoint_id().into_uuid()),
+        let operation_id = domain.id();
+        if operation::Entity::find_by_id(operation_id.into_uuid())
+            .one(database)
+            .await
+            .map_err(OperationRepositoryError::Database)?
+            .is_some()
+        {
+            // At-least-once delivery (design §15.4): the stored row is
+            // authoritative and must not be rewritten.
+            return Ok(());
+        }
+        operation::ActiveModel {
+            id: Set(operation_id.into_uuid()),
+            source: Set(domain.source().as_str().to_owned()),
+            state: Set(domain.state().as_str().to_owned()),
+            command: Set(
+                self.serialize_command(&domain.command(), operation_id.into_uuid().into_bytes())?
+            ),
+            // A batch child carries its parent link at the persistence layer
+            // only; the domain `Operation` aggregate has no batch concept. New
+            // operations are never born classified: the failure kind is written
+            // by the refusal path before a `Failed` transition.
+            batch_id: Set(batch_id),
+            failure_kind: Set(None),
+            created_at: Set(domain.created_at()),
+            updated_at: Set(domain.updated_at()),
         }
         .insert(database)
         .await
         .map_err(OperationRepositoryError::Database)?;
+        for target in domain.targets() {
+            operation_target::ActiveModel {
+                operation_id: Set(operation_id.into_uuid()),
+                target_id: Set(target.target_id().into_uuid()),
+                endpoint_id: Set(target.endpoint_id().into_uuid()),
+            }
+            .insert(database)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Returns the command encryption key, refusing command work on a
+    /// keyless store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError::CommandKeyMissing`] when the store
+    /// was opened without a command key.
+    fn command_key(&self) -> Result<&MasterKey, OperationRepositoryError> {
+        self.command_key
+            .as_deref()
+            .ok_or(OperationRepositoryError::CommandKeyMissing)
+    }
+
+    /// Protects one typed command for its row: the §9.4 serde JSON form is
+    /// encrypted under the instance master key as an `XChaCha20-Poly1305`
+    /// envelope bound to the row's 16-byte identity (see
+    /// `rutilus_security::encrypt_command`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError::CommandEncode`] when the command
+    /// value cannot be serialized — the domain command types are plain value
+    /// types, so this is only reachable through a serde contract violation,
+    /// and it exists for totality, like every error arm of this repository —
+    /// and [`OperationRepositoryError::CommandProtection`] when the
+    /// authenticated encryption cannot complete.
+    fn serialize_command(
+        &self,
+        command: &RedfishCommand,
+        identity: [u8; 16],
+    ) -> Result<String, OperationRepositoryError> {
+        let master_key = self.command_key()?;
+        let plaintext: SecretString = serde_json::to_string(command)
+            .map_err(OperationRepositoryError::CommandEncode)?
+            .into();
+        encrypt_command(master_key, identity, &plaintext)
+            .map_err(OperationRepositoryError::CommandProtection)
+    }
+
+    /// Recovers one stored command payload.
+    ///
+    /// An envelope row (the `RUTC1:` marker) is decrypted under the instance
+    /// master key with the row's 16-byte identity, and a legacy row written
+    /// before at-rest encryption is read as plaintext JSON — both then go
+    /// through the domain [`RedfishCommand`] deserializer, which is the only
+    /// judge of what the stored payload means (§9.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoredCommandError::KeyMissing`] when an envelope row is
+    /// read through a keyless store,
+    /// [`StoredCommandError::Protection`] when the envelope cannot be
+    /// decoded or authenticated (a tampered envelope or a different master
+    /// key), and [`StoredCommandError::Invalid`] when the recovered or
+    /// legacy plaintext is not a command this build can deserialize.
+    fn deserialize_command(
+        &self,
+        stored: &str,
+        identity: [u8; 16],
+    ) -> Result<RedfishCommand, StoredCommandError> {
+        let plaintext = if stored.starts_with(COMMAND_CIPHER_ENVELOPE_PREFIX) {
+            let master_key = self
+                .command_key
+                .as_deref()
+                .ok_or(StoredCommandError::KeyMissing)?;
+            decrypt_command(master_key, identity, stored).map_err(StoredCommandError::Protection)?
+        } else {
+            // Legacy plaintext rows written before at-rest encryption. The
+            // plaintext stays secret-wrapped until the deserializer has
+            // consumed it, exactly like the decrypted envelope.
+            SecretString::from(stored.to_owned())
+        };
+        serde_json::from_str(plaintext.expose_secret()).map_err(StoredCommandError::Invalid)
+    }
 }
 
 fn map_stored_batch(
+    store: &SqliteStore,
     batch_id: BatchOperationId,
     model: &batch_operation::Model,
 ) -> Result<BatchOperation, OperationRepositoryError> {
@@ -531,11 +633,20 @@ fn map_stored_batch(
         .map_err(StoredBatchError::InvalidSource)
         .map_err(|source| corrupt_batch(batch_id, source))?;
     // Rehydration goes through the domain type, never through string
-    // inspection: the deserializer is the only judge of what the stored JSON
-    // means, and anything it refuses corrupts the whole parent (§9.4).
-    let command = serde_json::from_str(&model.command)
-        .map_err(StoredBatchError::InvalidCommand)
-        .map_err(|source| corrupt_batch(batch_id, source))?;
+    // inspection: the deserializer is the only judge of what the stored
+    // payload means, and anything it refuses corrupts the whole parent
+    // (§9.4).
+    let command = store
+        .deserialize_command(&model.command, batch_id.into_uuid().into_bytes())
+        .map_err(|error| match error {
+            StoredCommandError::KeyMissing => OperationRepositoryError::CommandKeyMissing,
+            StoredCommandError::Protection(source) => {
+                corrupt_batch(batch_id, StoredBatchError::InvalidCommandCiphertext(source))
+            }
+            StoredCommandError::Invalid(source) => {
+                corrupt_batch(batch_id, StoredBatchError::InvalidCommand(source))
+            }
+        })?;
     Ok(BatchOperation::try_from_parts(
         batch_id,
         source,
@@ -545,6 +656,7 @@ fn map_stored_batch(
 }
 
 async fn map_stored_operation<C>(
+    store: &SqliteStore,
     database: &C,
     operation_id: OperationId,
     model: operation::Model,
@@ -563,11 +675,21 @@ where
         .map_err(StoredOperationError::InvalidState)
         .map_err(|source| corrupt(operation_id, source))?;
     // Rehydration goes through the domain type, never through string
-    // inspection: the deserializer is the only judge of what the stored JSON
-    // means, and anything it refuses corrupts the whole aggregate (§9.4).
-    let command = serde_json::from_str(&model.command)
-        .map_err(StoredOperationError::InvalidCommand)
-        .map_err(|source| corrupt(operation_id, source))?;
+    // inspection: the deserializer is the only judge of what the stored
+    // payload means, and anything it refuses corrupts the whole aggregate
+    // (§9.4).
+    let command = store
+        .deserialize_command(&model.command, operation_id.into_uuid().into_bytes())
+        .map_err(|error| match error {
+            StoredCommandError::KeyMissing => OperationRepositoryError::CommandKeyMissing,
+            StoredCommandError::Protection(source) => corrupt(
+                operation_id,
+                StoredOperationError::InvalidCommandCiphertext(source),
+            ),
+            StoredCommandError::Invalid(source) => {
+                corrupt(operation_id, StoredOperationError::InvalidCommand(source))
+            }
+        })?;
     // Targets are reconstructed in target-identity order so the recovery
     // scan and batch reporting always see the same deterministic list.
     let targets = operation_target::Entity::find()
@@ -596,16 +718,14 @@ where
     .map_err(|source| corrupt(operation_id, source))
 }
 
-/// Encodes the typed command as its §9.4 serde JSON form.
-///
-/// # Errors
-///
-/// Returns [`OperationRepositoryError::CommandEncode`] when the command value
-/// cannot be serialized. The domain command types are plain value types, so
-/// this is only reachable through a serde contract violation; it exists for
-/// totality — persistence never writes a string it could not produce.
-fn serialize_command(command: &RedfishCommand) -> Result<String, OperationRepositoryError> {
-    serde_json::to_string(command).map_err(OperationRepositoryError::CommandEncode)
+/// Why a stored command payload cannot be mapped back into a domain command.
+enum StoredCommandError {
+    /// An envelope row was read through a store opened without a command key.
+    KeyMissing,
+    /// The envelope cannot be decoded or authenticated.
+    Protection(CommandProtectionError),
+    /// The recovered plaintext is not a command this build can deserialize.
+    Invalid(serde_json::Error),
 }
 
 fn corrupt(operation_id: OperationId, source: StoredOperationError) -> OperationRepositoryError {
@@ -652,6 +772,16 @@ pub enum OperationRepositoryError {
     /// no value written by this product can actually trigger.
     #[error("operation command cannot be serialized as JSON: {0}")]
     CommandEncode(#[source] serde_json::Error),
+    /// The store was opened without a command encryption key, but the
+    /// operation command column requires one: a keyless store refuses every
+    /// command write and every ciphertext read (fail closed), so no command
+    /// payload is ever persisted or released without at-rest protection.
+    #[error("the operation store has no command encryption key")]
+    CommandKeyMissing,
+    /// The command payload could not be protected or recovered with the
+    /// store's master key.
+    #[error("operation command protection failed: {0}")]
+    CommandProtection(#[source] CommandProtectionError),
 }
 
 /// Why persisted operation data cannot be mapped into valid product types.
@@ -668,6 +798,13 @@ pub enum StoredOperationError {
     /// upgrade-order consequence.
     #[error("operation command JSON is invalid: {0}")]
     InvalidCommand(#[source] serde_json::Error),
+    /// The stored command ciphertext envelope cannot be decoded or
+    /// authenticated: a tampered envelope, an envelope written with a
+    /// different master key, or envelope plaintext that is not valid UTF-8.
+    /// The whole aggregate is refused rather than half-understood, exactly
+    /// like [`Self::InvalidCommand`].
+    #[error("operation command ciphertext is invalid: {0}")]
+    InvalidCommandCiphertext(#[source] CommandProtectionError),
     #[error("operation timeline is invalid: {0}")]
     InvalidTimeline(#[source] OperationTimelineError),
     #[error("operation failure kind code is invalid: {0}")]
@@ -686,22 +823,32 @@ pub enum StoredBatchError {
     /// upgrade-order consequence.
     #[error("batch command JSON is invalid: {0}")]
     InvalidCommand(#[source] serde_json::Error),
+    /// The stored command ciphertext envelope cannot be decoded or
+    /// authenticated: a tampered envelope, an envelope written with a
+    /// different master key, or envelope plaintext that is not valid UTF-8.
+    /// The whole parent is refused rather than half-understood, exactly like
+    /// [`Self::InvalidCommand`].
+    #[error("batch command ciphertext is invalid: {0}")]
+    InvalidCommandCiphertext(#[source] CommandProtectionError),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, sync::Arc};
 
     use rutilus_domain::{
-        ArtifactId, BatchOperation, BatchOperationId, BootCommand, BootSource,
-        BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateSubscription,
-        EndpointId, EventCommand, EventDestinationProtocol, EventSubscriptionError, EventType,
-        FailureKind, ManagerCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
-        RedfishCommand, ResetKeysType, ResetType, SecureBootCommand, SetBootSourceOverride,
-        StartUpdate, SystemCommand, TargetId, UpdateCommand,
+        AccountCommand, AccountId, AccountPassword, AccountUserName, ArtifactId, BatchOperation,
+        BatchOperationId, BootCommand, BootSource, BootSourceOverrideEnabled,
+        BootSourceOverrideMode, ChassisCommand, CreateAccount, CreateSubscription, EndpointId,
+        EventCommand, EventDestinationProtocol, EventType, FailureKind, ManagerCommand,
+        NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile, RedfishCommand, ResetKeysType,
+        ResetType, RoleId, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+        TargetId, UpdateAccountPassword, UpdateCommand,
     };
     use rutilus_entity::{batch_operation, operation, operation_target};
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use rutilus_operation_engine::OperationEngine;
+    use rutilus_security::{COMMAND_CIPHER_ENVELOPE_PREFIX, MasterKey};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
     use time::{Duration, OffsetDateTime};
 
     use super::*;
@@ -1188,7 +1335,9 @@ mod tests {
             id: Set(operation_id.into_uuid()),
             source: Set(String::from("standalone")),
             state: Set(String::from("queued")),
-            command: Set(serialize_command(&one_command())?),
+            command: Set(
+                store.serialize_command(&one_command(), operation_id.into_uuid().into_bytes())?
+            ),
             batch_id: Set(None),
             failure_kind: Set(None),
             created_at: Set(created_at),
@@ -1246,7 +1395,7 @@ mod tests {
     async fn refuses_command_json_this_build_cannot_deserialize() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
         let now = OffsetDateTime::now_utc();
-        // A deferred family (design section 7.5: `Account`, `Bios`, `Storage`,
+        // A deferred family (design section 7.5: `Bios`, `Storage`,
         // `Telemetry`; `Oem` is compiled in this build, so an unknown OEM face
         // is rejected by the domain instead) and a truncated document are both
         // written directly, bypassing the repository's serializer — exactly
@@ -1317,6 +1466,317 @@ mod tests {
                 source: StoredOperationError::InvalidCommand(_),
             }) if operation_id == corrupt_id
         ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn account_command_passwords_never_land_plaintext_in_the_command_column()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let password = "correct-horse-battery-staple";
+        let commands = [
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse(password.to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("jane")?,
+                    AccountPassword::parse(password.to_owned())?,
+                ),
+            )),
+        ];
+        for command in commands {
+            let operation = queued_operation(
+                OperationSource::Standalone,
+                &three_sorted_targets(),
+                command.clone(),
+                OffsetDateTime::now_utc(),
+            );
+            let operation_id = operation.id();
+            store.create_operation(&operation).await?;
+
+            let model = operation::Entity::find_by_id(operation_id.into_uuid())
+                .one(&store.database)
+                .await?
+                .ok_or("stored operation is missing")?;
+            assert!(
+                model.command.starts_with(COMMAND_CIPHER_ENVELOPE_PREFIX),
+                "the command column must hold the ciphertext envelope"
+            );
+            assert!(
+                !model.command.contains(password),
+                "the command column must never hold the password plaintext"
+            );
+            assert_eq!(
+                store.find_operation(operation_id).await?,
+                Some(operation),
+                "the protected command must read back exactly"
+            );
+        }
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_envelopes_survive_a_store_reopen_and_the_recovery_scan()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let key = test_key();
+        let (operation_id, batch_id) = {
+            let store =
+                SqliteStore::open_with_command_key(&database_path, Arc::clone(&key)).await?;
+            let now = OffsetDateTime::now_utc();
+            let operation = queued_operation(
+                OperationSource::Site,
+                &[OperationTarget::new(
+                    TargetId::generate(),
+                    EndpointId::generate(),
+                )],
+                one_command(),
+                now,
+            );
+            let operation_id = operation.id();
+            store.create_operation(&operation).await?;
+            store
+                .apply_transition(
+                    operation_id,
+                    OperationState::WaitingRemote,
+                    now + Duration::SECOND,
+                )
+                .await?;
+            let batch = BatchOperation::try_from_parts(
+                BatchOperationId::generate(),
+                OperationSource::Site,
+                one_command(),
+                now,
+            );
+            let batch_id = batch.id();
+            store.create_batch(&batch, &[]).await?;
+            store.close().await?;
+            (operation_id, batch_id)
+        };
+
+        // A restarted process recovers the same master key and reopens with
+        // it: every §13.6 recovery read decrypts the stored envelopes.
+        let store = SqliteStore::open_with_command_key(&database_path, key).await?;
+        let recovered = store
+            .find_operation(operation_id)
+            .await?
+            .ok_or("stored operation is missing")?;
+        assert_eq!(recovered.command(), one_command());
+        assert_eq!(recovered.state(), OperationState::WaitingRemote);
+        let engine = OperationEngine::new(&store);
+        let pending = engine.recover_pending().await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id(), operation_id);
+        assert_eq!(pending[0].command(), one_command());
+        let batch = store
+            .find_batch(batch_id)
+            .await?
+            .ok_or("stored batch is missing")?;
+        assert_eq!(batch.command(), one_command());
+        assert_eq!(
+            store
+                .list_operations(Some(OperationState::WaitingRemote))
+                .await?
+                .len(),
+            1
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_legacy_plaintext_command_rows_written_before_at_rest_encryption()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let now = OffsetDateTime::now_utc();
+        // A row written by a build before at-rest encryption: the plain
+        // serde JSON sits directly in the column, and a keyed store must
+        // still read it back unchanged (upgrade compatibility).
+        let operation_id = OperationId::generate();
+        operation::ActiveModel {
+            id: Set(operation_id.into_uuid()),
+            source: Set(String::from("standalone")),
+            state: Set(String::from("queued")),
+            command: Set(serde_json::to_string(&one_command())?),
+            batch_id: Set(None),
+            failure_kind: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&store.database)
+        .await?;
+
+        let stored = store
+            .find_operation(operation_id)
+            .await?
+            .ok_or("legacy operation is missing")?;
+        assert_eq!(stored.command(), one_command());
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_tampered_command_envelope_as_corrupt() -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let operation = queued_operation(
+            OperationSource::Standalone,
+            &three_sorted_targets(),
+            one_command(),
+            OffsetDateTime::now_utc(),
+        );
+        let operation_id = operation.id();
+        store.create_operation(&operation).await?;
+        let model = operation::Entity::find_by_id(operation_id.into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("stored operation is missing")?;
+        // Flip one envelope character inside the ciphertext encoding (the
+        // 24-byte nonce encodes to 32 characters): the authenticated
+        // ciphertext changes, so the read-back must refuse the whole
+        // aggregate instead of half-understanding it.
+        let mut tampered = model.command.clone().into_bytes();
+        let ciphertext_offset = COMMAND_CIPHER_ENVELOPE_PREFIX.len() + 32;
+        tampered[ciphertext_offset] = if tampered[ciphertext_offset] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let mut active = model.into_active_model();
+        active.command = Set(String::from_utf8(tampered)?);
+        active.update(&store.database).await?;
+
+        assert!(matches!(
+            store.find_operation(operation_id).await,
+            Err(OperationRepositoryError::Corrupt {
+                operation_id: id,
+                source: StoredOperationError::InvalidCommandCiphertext(_),
+            }) if id == operation_id
+        ));
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_command_envelopes_written_with_a_different_master_key_as_corrupt()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let operation_id = {
+            let store = SqliteStore::open_with_command_key(&database_path, test_key()).await?;
+            let operation = queued_operation(
+                OperationSource::Standalone,
+                &three_sorted_targets(),
+                one_command(),
+                OffsetDateTime::now_utc(),
+            );
+            let operation_id = operation.id();
+            store.create_operation(&operation).await?;
+            store.close().await?;
+            operation_id
+        };
+
+        // A store opened with a different key cannot authenticate the
+        // envelope, so the aggregate is refused as corrupt — never released
+        // half-understood.
+        let store = SqliteStore::open_with_command_key(&database_path, other_test_key()).await?;
+        assert!(matches!(
+            store.find_operation(operation_id).await,
+            Err(OperationRepositoryError::Corrupt {
+                operation_id: id,
+                source: StoredOperationError::InvalidCommandCiphertext(_),
+            }) if id == operation_id
+        ));
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyless_stores_refuse_command_writes_and_ciphertext_reads()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("rutilus.db");
+        let now = OffsetDateTime::now_utc();
+        let persisted_id = {
+            // A keyed store writes the envelope first...
+            let store = SqliteStore::open_with_command_key(&database_path, test_key()).await?;
+            let operation = queued_operation(
+                OperationSource::Standalone,
+                &three_sorted_targets(),
+                one_command(),
+                now,
+            );
+            let persisted_id = operation.id();
+            store.create_operation(&operation).await?;
+            store.close().await?;
+            persisted_id
+        };
+
+        // ...and the keyless store (backup, onboarding, and test paths) fails
+        // closed: no command write, and no ciphertext plaintext released.
+        let store = SqliteStore::open(&database_path).await?;
+        let operation = queued_operation(
+            OperationSource::Standalone,
+            &three_sorted_targets(),
+            one_command(),
+            now,
+        );
+        assert!(matches!(
+            store.create_operation(&operation).await,
+            Err(OperationRepositoryError::CommandKeyMissing)
+        ));
+        let batch = BatchOperation::try_from_parts(
+            BatchOperationId::generate(),
+            OperationSource::Standalone,
+            one_command(),
+            now,
+        );
+        assert!(matches!(
+            store.create_batch(&batch, &[]).await,
+            Err(OperationRepositoryError::CommandKeyMissing)
+        ));
+        assert!(matches!(
+            store.find_operation(persisted_id).await,
+            Err(OperationRepositoryError::CommandKeyMissing)
+        ));
+        assert!(matches!(
+            store.list_operations(None).await,
+            Err(OperationRepositoryError::CommandKeyMissing)
+        ));
+
+        // A legacy plaintext row needs no key and reads exactly as before.
+        let legacy_id = OperationId::generate();
+        operation::ActiveModel {
+            id: Set(legacy_id.into_uuid()),
+            source: Set(String::from("standalone")),
+            state: Set(String::from("queued")),
+            command: Set(serde_json::to_string(&one_command())?),
+            batch_id: Set(None),
+            failure_kind: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&store.database)
+        .await?;
+        let stored = store
+            .find_operation(legacy_id)
+            .await?
+            .ok_or("legacy operation is missing")?;
+        assert_eq!(stored.command(), one_command());
 
         store.close().await?;
         drop(directory);
@@ -1566,7 +2026,9 @@ mod tests {
             id: Set(child_id.into_uuid()),
             source: Set(String::from("site")),
             state: Set(String::from("failed")),
-            command: Set(serialize_command(&one_command())?),
+            command: Set(
+                store.serialize_command(&one_command(), child_id.into_uuid().into_bytes())?
+            ),
             batch_id: Set(Some(batch.id().into_uuid())),
             failure_kind: Set(Some(String::from("capability-missing"))),
             created_at: Set(now),
@@ -1723,7 +2185,8 @@ mod tests {
         let invalid_source = batch_operation::ActiveModel {
             id: Set(invalid_source_id.into_uuid()),
             source: Set(String::from("cluster")),
-            command: Set(serialize_command(&one_command())?),
+            command: Set(store
+                .serialize_command(&one_command(), invalid_source_id.into_uuid().into_bytes())?),
             created_at: Set(now),
         }
         .insert(&store.database)
@@ -1792,9 +2255,16 @@ mod tests {
 
     /// One representative command per §7.5 family, mirroring the domain's
     /// exhaustive family list so a newly added family cannot hide from
-    /// persistence tests.
-    fn all_commands() -> Result<Vec<RedfishCommand>, EventSubscriptionError> {
+    /// persistence tests. The `Account` family carries a §10 secret (the
+    /// `AccountPassword` of `CreateAccount`), so its round trip also proves
+    /// the at-rest envelope survives the most sensitive payload.
+    fn all_commands() -> Result<Vec<RedfishCommand>, Box<dyn Error>> {
         Ok(vec![
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("correct-horse-battery-staple".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
             one_command(),
             RedfishCommand::Manager(ManagerCommand::Reset(ResetType::GracefulRestart)),
             RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::ForceOff)),
@@ -1827,9 +2297,25 @@ mod tests {
         ])
     }
 
+    /// The fixed test command key, shared by every keyed store in this
+    /// module so a store written and re-read across two opens uses the same
+    /// key, exactly like the credential repository's test key.
+    fn test_key() -> Arc<MasterKey> {
+        Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32])))
+    }
+
+    /// A second key, for the wrong-key tests.
+    fn other_test_key() -> Arc<MasterKey> {
+        Arc::new(MasterKey::from_boxed_bytes(Box::new([0x6a; 32])))
+    }
+
+    /// Opens a command-encrypted store: every test in this module exercises
+    /// the real production shape (ciphertext at rest, decrypted on read).
     async fn store_with_directory() -> Result<(tempfile::TempDir, SqliteStore), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let store =
+            SqliteStore::open_with_command_key(directory.path().join("rutilus.db"), test_key())
+                .await?;
         Ok((directory, store))
     }
 }

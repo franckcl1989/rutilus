@@ -19,14 +19,16 @@
 use std::{error::Error, io};
 
 use rutilus_domain::{
-    CAPABILITY_LEDGER_ORDER, CapabilityState, CredentialUsername, EndpointAddress,
+    AccountCommand, AccountId, AccountPassword, AccountUserName, CAPABILITY_LEDGER_ORDER,
+    CapabilityState, CreateAccount, CredentialUsername, DeleteAccount, EndpointAddress,
     EndpointCapability, EndpointCapabilityObservation, EraseToken, EraseType,
     NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
     OEM_CAPABILITY_LEDGER_ORDER, OemCommand, ProfileFile, ProfileId, RedfishCommand,
-    ResourceFeature, TlsTrust, TokenData, TokenType,
+    ResourceFeature, RoleId, TlsTrust, TokenData, TokenType, UpdateAccount, UpdateAccountPassword,
+    UpdateAccountUserName,
 };
 use rutilus_infra_redfish::{
-    CommandExecutionError, CommandExecutionOutcome, CommandVerificationOutcome,
+    CommandExecutionError, CommandExecutionOutcome, CommandRejection, CommandVerificationOutcome,
     CoreResourceProjection, RedfishGateway, SystemCaStatus,
 };
 use rutilus_test_support::{MockBmc, MockProfile, RequestRecord};
@@ -1706,5 +1708,177 @@ async fn no_oem_profiles_read_the_default_core_tree_without_oem_snapshots()
             "the resource read must delete its transient Session before returning"
         );
     }
+    Ok(())
+}
+
+/// The §0.3.0 account write surface: every one of the five typed operations
+/// executes against the mock's account ledger and verifies through a
+/// post-write re-read, exactly like the §13.3 flow drives them.
+//
+// The five operations each assert execution, ledger state, and verification
+// in one flow, so the shared pin/credentials sequence runs once; the line
+// count is the coverage.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn executes_and_verifies_all_five_account_write_operations() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start().await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    // Create: the ledger gains the account and the verification re-read
+    // confirms the user name.
+    let create = RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+        AccountUserName::parse("jane")?,
+        AccountPassword::parse("initial-secret".to_owned())?,
+        RoleId::parse("Operator")?,
+    )));
+    assert_eq!(
+        gateway
+            .execute_command(&address, &trust, &username, &password, &create)
+            .await?,
+        CommandExecutionOutcome::Accepted
+    );
+    assert_eq!(mock.account_ids(), ["admin", "user-1"]);
+    assert_eq!(
+        mock.account("user-1").ok_or("created account")?.user_name(),
+        "jane"
+    );
+    assert_eq!(
+        gateway
+            .verify_command(&address, &trust, &username, &password, &create)
+            .await?,
+        CommandVerificationOutcome::Confirmed
+    );
+
+    // Role update: the ledger reflects the new role and the verification
+    // re-read confirms it.
+    let role = RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+        AccountId::parse("admin")?,
+        RoleId::parse("Operator")?,
+    )));
+    assert_eq!(
+        gateway
+            .execute_command(&address, &trust, &username, &password, &role)
+            .await?,
+        CommandExecutionOutcome::Accepted
+    );
+    assert_eq!(
+        mock.account("admin").ok_or("admin account")?.role_id(),
+        "Operator"
+    );
+    assert_eq!(
+        gateway
+            .verify_command(&address, &trust, &username, &password, &role)
+            .await?,
+        CommandVerificationOutcome::Confirmed
+    );
+
+    // Password change: accepted, and the verification re-read confirms the
+    // member stays readable (the CSDL password property is write-only).
+    let password_change = RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+        UpdateAccountPassword::new(
+            AccountId::parse("admin")?,
+            AccountPassword::parse("new-secret".to_owned())?,
+        ),
+    ));
+    assert_eq!(
+        gateway
+            .execute_command(&address, &trust, &username, &password, &password_change)
+            .await?,
+        CommandExecutionOutcome::Accepted
+    );
+    assert_eq!(
+        gateway
+            .verify_command(&address, &trust, &username, &password, &password_change)
+            .await?,
+        CommandVerificationOutcome::Confirmed
+    );
+
+    // Rename: the ledger reflects the new user name and the verification
+    // re-read confirms it.
+    let rename = RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+        UpdateAccountUserName::new(
+            AccountId::parse("admin")?,
+            AccountUserName::parse("admin.renamed")?,
+        ),
+    ));
+    assert_eq!(
+        gateway
+            .execute_command(&address, &trust, &username, &password, &rename)
+            .await?,
+        CommandExecutionOutcome::Accepted
+    );
+    assert_eq!(
+        mock.account("admin").ok_or("admin account")?.user_name(),
+        "admin.renamed"
+    );
+    assert_eq!(
+        gateway
+            .verify_command(&address, &trust, &username, &password, &rename)
+            .await?,
+        CommandVerificationOutcome::Confirmed
+    );
+
+    // Delete: the ledger drops the account and the verification re-read
+    // confirms the absence.
+    let delete = RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+        AccountId::parse("admin")?,
+    )));
+    assert_eq!(
+        gateway
+            .execute_command(&address, &trust, &username, &password, &delete)
+            .await?,
+        CommandExecutionOutcome::Accepted
+    );
+    assert_eq!(mock.account_ids(), ["user-1"]);
+    assert_eq!(
+        gateway
+            .verify_command(&address, &trust, &username, &password, &delete)
+            .await?,
+        CommandVerificationOutcome::Confirmed
+    );
+
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "every command must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+/// A member write targeting an account the endpoint does not hold is refused
+/// provably, before any write request is sent.
+#[tokio::test]
+async fn refuses_account_member_writes_for_an_unknown_account() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start().await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let outcome = gateway
+        .execute_command(
+            &address,
+            &trust,
+            &username,
+            &password,
+            &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("ghost")?,
+            ))),
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc
+        ))
+    ));
+    assert_eq!(mock.account_ids(), ["admin"]);
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the refused write must still delete its transient Session"
+    );
     Ok(())
 }

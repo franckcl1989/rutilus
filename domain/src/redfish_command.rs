@@ -20,9 +20,10 @@
 //! projection; the gateway translates them to the CSDL property names (for
 //! example `BootSourceOverrideTarget`) when dispatching.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ArtifactId;
 
@@ -538,6 +539,639 @@ impl DeleteSubscription {
     }
 }
 
+/// The maximum length of one account id in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `ManagerAccount` `Id` property, so the
+/// bound is a product decision: an id is a short stable label, and the
+/// product's own bounds stay generous enough for every id a BMC can
+/// reasonably serve.
+pub const MAX_ACCOUNT_ID_CHARS: usize = 128;
+
+/// The maximum length of one account user name in Unicode scalar values.
+///
+/// The same product bound as [`crate::CredentialUsername`], because a
+/// `ManagerAccount` `UserName` is the same kind of label the product already
+/// sends to BMC authentication services.
+pub const MAX_ACCOUNT_USER_NAME_CHARS: usize = 256;
+
+/// The maximum length of one account password in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `ManagerAccount` `Password` property
+/// (an `Edm.String` marked `Redfish.RequiredOnCreate`), so the bound is a
+/// product decision sized to the longest password a BMC can reasonably
+/// store.
+pub const MAX_ACCOUNT_PASSWORD_CHARS: usize = 256;
+
+/// The maximum length of one role id in Unicode scalar values.
+///
+/// The CSDL defines no bound on the `ManagerAccount` `RoleId` property (an
+/// `Edm.String` marked `Nullable=false`), so the bound is a product decision
+/// sized to the role names Redfish defines and the custom roles a BMC can
+/// add.
+pub const MAX_ROLE_ID_CHARS: usize = 128;
+
+/// The Redfish `Id` of one `ManagerAccount` collection member.
+///
+/// The id is the last path segment of the account's `@odata.id` — the same
+/// identity the verification re-read matches against — so only one plain
+/// segment may participate: the charset is ASCII alphanumerics, `-`, and
+/// `_`, which excludes the separators and escape characters (`/`, `\`, `?`,
+/// `#`, `%`) and the dot segments (`.`, `..`) that could redirect a
+/// constructed URI outside the collection, and excludes whitespace and
+/// control characters that could smuggle request structure. This is the
+/// exact rule [`DeleteSubscription`] applies to subscription ids.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AccountId(String);
+
+impl AccountId {
+    /// Validates an account id as a single safe URI path segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountIdError`] for an empty id, a character outside the
+    /// safe-segment charset, or an id longer than
+    /// [`MAX_ACCOUNT_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, AccountIdError> {
+        if value.is_empty() {
+            return Err(AccountIdError::Empty);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(AccountIdError::UnsafeCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_ACCOUNT_ID_CHARS {
+            return Err(AccountIdError::TooLong {
+                actual,
+                maximum: MAX_ACCOUNT_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the account id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AccountId {
+    type Err = AccountIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for AccountId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why an account id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountIdError {
+    /// The id is empty.
+    Empty,
+    /// The id contains a character outside the safe URI segment charset.
+    UnsafeCharacter,
+    /// The id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for AccountIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("account id cannot be empty"),
+            Self::UnsafeCharacter => formatter
+                .write_str("account id can only contain ASCII letters, digits, '-', and '_'"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "account id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for AccountIdError {}
+
+/// The `UserName` of one `ManagerAccount` (the CSDL `UserName` property, an
+/// `Edm.String` marked `Nullable=false`).
+///
+/// The validation mirrors [`crate::CredentialUsername`] exactly: the user
+/// name is a label sent to the BMC's account service, so the same bounds
+/// apply.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AccountUserName(String);
+
+impl AccountUserName {
+    /// Validates an account user name without changing significant
+    /// whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountUserNameError`] for an empty user name, a control
+    /// character, or a value longer than
+    /// [`MAX_ACCOUNT_USER_NAME_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, AccountUserNameError> {
+        if value.trim().is_empty() {
+            return Err(AccountUserNameError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(AccountUserNameError::ControlCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_ACCOUNT_USER_NAME_CHARS {
+            return Err(AccountUserNameError::TooLong {
+                actual,
+                maximum: MAX_ACCOUNT_USER_NAME_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the user name as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountUserName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AccountUserName {
+    type Err = AccountUserNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for AccountUserName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountUserName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why an account user name cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountUserNameError {
+    /// The user name is empty.
+    Empty,
+    /// The user name contains a control character.
+    ControlCharacter,
+    /// The user name is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for AccountUserNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("account user name cannot be empty"),
+            Self::ControlCharacter => {
+                formatter.write_str("account user name cannot contain control characters")
+            }
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "account user name has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for AccountUserNameError {}
+
+/// The `RoleId` of one `ManagerAccount` (the CSDL `RoleId` property, an
+/// `Edm.String` marked `Nullable=false`).
+///
+/// A role id names one role of the BMC's `Role` collection; the product
+/// treats it as an opaque label exactly like the CSDL (it never interprets
+/// or renames a role).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RoleId(String);
+
+impl RoleId {
+    /// Validates a role id without changing significant whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleIdError`] for an empty role id, a control character, or
+    /// a value longer than [`MAX_ROLE_ID_CHARS`] Unicode scalar values.
+    pub fn parse(value: &str) -> Result<Self, RoleIdError> {
+        if value.trim().is_empty() {
+            return Err(RoleIdError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(RoleIdError::ControlCharacter);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_ROLE_ID_CHARS {
+            return Err(RoleIdError::TooLong {
+                actual,
+                maximum: MAX_ROLE_ID_CHARS,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the role id as its plain string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RoleId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for RoleId {
+    type Err = RoleIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for RoleId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RoleId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a role id cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoleIdError {
+    /// The role id is empty.
+    Empty,
+    /// The role id contains a control character.
+    ControlCharacter,
+    /// The role id is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for RoleIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("role id cannot be empty"),
+            Self::ControlCharacter => {
+                formatter.write_str("role id cannot contain control characters")
+            }
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "role id has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for RoleIdError {}
+
+/// The password of one `ManagerAccount` — a §10 secret.
+///
+/// The value is wrapped in [`SecretString`] so it is zeroized on drop,
+/// redacted in `Debug`, and never exposed through `Display`. The serde wire
+/// form carries the exposed value exactly like every other payload field:
+/// the command JSON is the §9.4 typed-payload contract shared by persistence
+/// and the center protocol, and the at-rest protection of the command column
+/// is the persistence crate's concern — the same split §10 keeps for the
+/// endpoint credential, whose at-rest encryption lives outside the domain
+/// command. Persistence stores every command JSON as an authenticated
+/// `XChaCha20-Poly1305` ciphertext envelope under the instance master key
+/// (bound to the operation identity, `rutilus_security::encrypt_command`),
+/// so the command column never holds this value in the clear.
+///
+/// `PartialEq`/`Eq` compare the exposed values: command payloads are
+/// compared for round-trip and state equality, never for authentication, so
+/// a plain comparison is the honest implementation (the constant-time
+/// comparison of §16 passwords lives in [`crate::Argon2IdHash::verify`]).
+#[derive(Clone)]
+pub struct AccountPassword(SecretString);
+
+impl AccountPassword {
+    /// Validates an account password.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPasswordError`] for an empty password (a password
+    /// that secures nothing) or a value longer than
+    /// [`MAX_ACCOUNT_PASSWORD_CHARS`] Unicode scalar values.
+    pub fn parse(value: String) -> Result<Self, AccountPasswordError> {
+        if value.is_empty() {
+            return Err(AccountPasswordError::Empty);
+        }
+        let actual = value.chars().count();
+        if actual > MAX_ACCOUNT_PASSWORD_CHARS {
+            return Err(AccountPasswordError::TooLong {
+                actual,
+                maximum: MAX_ACCOUNT_PASSWORD_CHARS,
+            });
+        }
+        Ok(Self(SecretString::from(value)))
+    }
+
+    /// Returns the exposed password value; callers must never log it.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for AccountPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountPassword([REDACTED])")
+    }
+}
+
+impl PartialEq for AccountPassword {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose_secret() == other.expose_secret()
+    }
+}
+
+impl Eq for AccountPassword {}
+
+impl Serialize for AccountPassword {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.expose_secret())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountPassword {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why an account password cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountPasswordError {
+    /// The password is empty.
+    Empty,
+    /// The password is longer than the product bound.
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for AccountPasswordError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("account password cannot be empty"),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "account password has {actual} characters; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for AccountPasswordError {}
+
+/// The payload of [`AccountCommand::CreateAccount`].
+///
+/// The three fields mirror the CSDL `ManagerAccount` create-required
+/// properties `UserName`, `Password`, and `RoleId` (each marked
+/// `Redfish.RequiredOnCreate` in `ManagerAccount_v1.xml`). Every other
+/// create property of the CSDL is optional, so it stays out of the first-cut
+/// typed projection: a product command is the complete intent, and a create
+/// that leaves the identity, credential, or role open cannot be expressed
+/// (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAccount {
+    user_name: AccountUserName,
+    password: AccountPassword,
+    role_id: RoleId,
+}
+
+impl CreateAccount {
+    /// Constructs one account creation with the user name, password, and
+    /// role.
+    #[must_use]
+    pub const fn new(
+        user_name: AccountUserName,
+        password: AccountPassword,
+        role_id: RoleId,
+    ) -> Self {
+        Self {
+            user_name,
+            password,
+            role_id,
+        }
+    }
+
+    /// Returns the user name of the account to create.
+    #[must_use]
+    pub const fn user_name(&self) -> &AccountUserName {
+        &self.user_name
+    }
+
+    /// Returns the password of the account to create.
+    #[must_use]
+    pub fn password(&self) -> &AccountPassword {
+        &self.password
+    }
+
+    /// Returns the role of the account to create.
+    #[must_use]
+    pub const fn role_id(&self) -> &RoleId {
+        &self.role_id
+    }
+}
+
+/// The payload of [`AccountCommand::UpdateAccount`].
+///
+/// `account_id` names the existing `ManagerAccount` by its Redfish `Id`, and
+/// `role_id` is the role the account must be changed to. The update is the
+/// complete intent: a role change with an open target or an open role cannot
+/// be expressed (§7.1).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAccount {
+    account_id: AccountId,
+    role_id: RoleId,
+}
+
+impl UpdateAccount {
+    /// Constructs one role update of an existing account.
+    #[must_use]
+    pub const fn new(account_id: AccountId, role_id: RoleId) -> Self {
+        Self {
+            account_id,
+            role_id,
+        }
+    }
+
+    /// Returns the id of the account whose role is updated.
+    #[must_use]
+    pub const fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// Returns the role the account is changed to.
+    #[must_use]
+    pub const fn role_id(&self) -> &RoleId {
+        &self.role_id
+    }
+}
+
+/// The payload of [`AccountCommand::UpdateAccountPassword`].
+///
+/// `account_id` names the existing `ManagerAccount` by its Redfish `Id`, and
+/// `password` is the new password. The CSDL `Password` property is
+/// write-only (it is `null` in responses), so the verification re-read can
+/// only confirm the account remains readable, never the stored password.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAccountPassword {
+    account_id: AccountId,
+    password: AccountPassword,
+}
+
+impl UpdateAccountPassword {
+    /// Constructs one password change of an existing account.
+    #[must_use]
+    pub const fn new(account_id: AccountId, password: AccountPassword) -> Self {
+        Self {
+            account_id,
+            password,
+        }
+    }
+
+    /// Returns the id of the account whose password is changed.
+    #[must_use]
+    pub const fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// Returns the new password.
+    #[must_use]
+    pub fn password(&self) -> &AccountPassword {
+        &self.password
+    }
+}
+
+/// The payload of [`AccountCommand::UpdateAccountUserName`].
+///
+/// `account_id` names the existing `ManagerAccount` by its Redfish `Id`, and
+/// `user_name` is the new user name. The account `Id` itself is unchanged by
+/// a rename on the BMCs the typed `nv-redfish` API targets, so the id stays
+/// the identity the verification re-read matches against.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAccountUserName {
+    account_id: AccountId,
+    user_name: AccountUserName,
+}
+
+impl UpdateAccountUserName {
+    /// Constructs one user name change of an existing account.
+    #[must_use]
+    pub const fn new(account_id: AccountId, user_name: AccountUserName) -> Self {
+        Self {
+            account_id,
+            user_name,
+        }
+    }
+
+    /// Returns the id of the account whose user name is changed.
+    #[must_use]
+    pub const fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// Returns the new user name.
+    #[must_use]
+    pub const fn user_name(&self) -> &AccountUserName {
+        &self.user_name
+    }
+}
+
+/// The payload of [`AccountCommand::DeleteAccount`].
+///
+/// `account_id` names the existing `ManagerAccount` by its Redfish `Id`, the
+/// same identity the verification re-read matches against.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAccount {
+    account_id: AccountId,
+}
+
+impl DeleteAccount {
+    /// Constructs an account deletion for one existing account.
+    #[must_use]
+    pub const fn new(account_id: AccountId) -> Self {
+        Self { account_id }
+    }
+
+    /// Returns the id of the account to delete.
+    #[must_use]
+    pub const fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+}
+
 /// Serializes [`ArtifactId`] as its uuid string, the §9.4 typed-payload rule
 /// applied to the command wire contract.
 ///
@@ -663,6 +1297,31 @@ pub enum EventCommand {
     CreateSubscription(CreateSubscription),
     /// Deletes one existing event subscription.
     DeleteSubscription(DeleteSubscription),
+}
+
+/// Commands against the account service (§7.5).
+///
+/// Redfish models accounts as `ManagerAccount` resources under the
+/// `AccountService` `Accounts` collection; see
+/// [`crate::ResourceFeature::Accounts`] for the matching read surface.
+/// The five writes mirror the typed `nv-redfish` 0.13.0 account API
+/// (`AccountCollection::create_account`, `Account::update`,
+/// `Account::update_password`, `Account::update_user_name`, and
+/// `Account::delete`) one-to-one, so the gateway maps the domain payloads
+/// onto the compiled `ManagerAccountCreate`/`ManagerAccountUpdate` types
+/// without inventing a wire shape (§7.4).
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub enum AccountCommand {
+    /// Creates one account with a user name, password, and role.
+    CreateAccount(CreateAccount),
+    /// Changes the role of one existing account.
+    UpdateAccount(UpdateAccount),
+    /// Changes the password of one existing account.
+    UpdateAccountPassword(UpdateAccountPassword),
+    /// Renames one existing account.
+    UpdateAccountUserName(UpdateAccountUserName),
+    /// Deletes one existing account.
+    DeleteAccount(DeleteAccount),
 }
 
 /// Commands against the update service (§7.5, §14.3).
@@ -1019,9 +1678,6 @@ pub enum OemCommand {
 /// because an arm that no payload can ever fill would only mislead the
 /// exhaustive matches. The deferred families and their reasons:
 ///
-/// - `Account` — account writes carry passwords, which are §10 secrets that
-///   must be encrypted before persistence; the write surface lands together
-///   with the secret-handling iteration.
 /// - `Bios` — BIOS writes are an unbounded attribute bag (the CSDL
 ///   `Attributes` property), which conflicts with the strict typed projection
 ///   of this module; the surface lands when a bounded attribute projection
@@ -1031,11 +1687,20 @@ pub enum OemCommand {
 /// - `Telemetry` — telemetry writes (metric report subscription lifecycle)
 ///   build on the event-service surface and land with it.
 ///
-/// The `Oem` family is no longer deferred: upstream NVIDIA typed actions are
-/// compiled in (see [`OemCommand`]), and the remaining vendors' OEM write
-/// surfaces land as their actions get compiled.
+/// The `Account` family is no longer deferred: account writes carry
+/// passwords, which are §10 secrets handled by the secret infrastructure
+/// that landed with the credential milestone — the domain wraps them in
+/// [`AccountPassword`] (a zeroizing `SecretString` with a redacted `Debug`),
+/// and the §10 at-rest encryption of the persisted command column is the
+/// persistence crate's concern, exactly like the endpoint credential.
+///
+/// The `Oem` family is no longer deferred either: upstream NVIDIA typed
+/// actions are compiled in (see [`OemCommand`]), and the remaining vendors'
+/// OEM write surfaces land as their actions get compiled.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum RedfishCommand {
+    /// A command against the account service.
+    Account(AccountCommand),
     /// A command against a system resource.
     System(SystemCommand),
     /// A command against a manager resource.
@@ -1070,6 +1735,7 @@ impl RedfishCommand {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::Account(_) => "account",
             Self::System(_) => "system",
             Self::Manager(_) => "manager",
             Self::Chassis(_) => "chassis",
@@ -1299,11 +1965,19 @@ mod tests {
 
     /// One representative command per family with its expected family code.
     ///
-    /// The eight entries are the exhaustive §7.5 family list for this
+    /// The nine entries are the exhaustive §7.5 family list for this
     /// iteration; adding a family must add an entry here or the
     /// exhaustiveness tests fail.
-    fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, EventSubscriptionError> {
+    fn all_families() -> Result<Vec<(RedfishCommand, &'static str)>, Box<dyn Error>> {
         Ok(vec![
+            (
+                RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+                "account",
+            ),
             (
                 RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
                 "system",
@@ -1377,11 +2051,11 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            8,
+            9,
             "add the new family to `all_families` when a variant is added"
         );
         // The deferred §7.5 families must not be claimed by an existing code.
-        for deferred in ["account", "bios", "storage", "telemetry"] {
+        for deferred in ["bios", "storage", "telemetry"] {
             assert!(
                 !seen.contains(&deferred),
                 "the deferred family code {deferred} must not be claimed"
@@ -1396,6 +2070,7 @@ mod tests {
         // forces reviewing both this match and `RedfishCommand::as_str`.
         for (command, expected) in all_families()? {
             let matched = match command {
+                RedfishCommand::Account(_) => "account",
                 RedfishCommand::System(_) => "system",
                 RedfishCommand::Manager(_) => "manager",
                 RedfishCommand::Chassis(_) => "chassis",
@@ -1422,7 +2097,6 @@ mod tests {
         // the wire contract cannot drift into accepting a family no payload
         // can fill — regardless of the payload shape under it.
         for unknown in [
-            r#"{"Account":{"Create":{}}}"#,
             r#"{"Bios":{"SetAttributes":{}}}"#,
             r#"{"Storage":{"Format":{}}}"#,
             r#"{"Telemetry":{"SubmitTestMetricReport":{}}}"#,
@@ -1450,9 +2124,53 @@ mod tests {
     /// any change to the serialized form (variant names, payload field
     /// names, enum member names, or nesting) fails this test until the
     /// translation boundary is reviewed.
+    //
+    // One literal per command of every family; the line count grows with the
+    // §7.5 surface, so the lint is scoped here like the other family
+    // enumeration tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn golden_wire_contracts_pin_every_command_family() -> Result<(), Box<dyn Error>> {
         let commands = [
+            (
+                RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+                r#"{"Account":{"CreateAccount":{"user_name":"jane","password":"initial-secret","role_id":"Operator"}}}"#,
+            ),
+            (
+                RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                    AccountId::parse("admin")?,
+                    RoleId::parse("Administrator")?,
+                ))),
+                r#"{"Account":{"UpdateAccount":{"account_id":"admin","role_id":"Administrator"}}}"#,
+            ),
+            (
+                RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                    UpdateAccountPassword::new(
+                        AccountId::parse("jane")?,
+                        AccountPassword::parse("new-secret".to_owned())?,
+                    ),
+                )),
+                r#"{"Account":{"UpdateAccountPassword":{"account_id":"jane","password":"new-secret"}}}"#,
+            ),
+            (
+                RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                    UpdateAccountUserName::new(
+                        AccountId::parse("jane")?,
+                        AccountUserName::parse("jane.doe")?,
+                    ),
+                )),
+                r#"{"Account":{"UpdateAccountUserName":{"account_id":"jane","user_name":"jane.doe"}}}"#,
+            ),
+            (
+                RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("jane")?,
+                ))),
+                r#"{"Account":{"DeleteAccount":{"account_id":"jane"}}}"#,
+            ),
             (
                 RedfishCommand::System(SystemCommand::Reset(ResetType::On)),
                 r#"{"System":{"Reset":"On"}}"#,
@@ -1797,6 +2515,248 @@ mod tests {
             serde_json::from_str::<ProfileId>(r#"{"profile_id":3,"name":"eco"}"#).is_err(),
             "unknown payload fields must be rejected"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn account_ids_are_safe_single_path_segments() -> Result<(), Box<dyn Error>> {
+        for valid in ["admin", "user-1", "jane_doe", "A1b2C3"] {
+            let id = AccountId::parse(valid)?;
+            assert_eq!(id.as_str(), valid);
+            assert_eq!(id.to_string().parse::<AccountId>()?, id);
+        }
+        for invalid in ["..", ".", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\tb"] {
+            assert_eq!(
+                AccountId::parse(invalid),
+                Err(AccountIdError::UnsafeCharacter),
+                "account id {invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(AccountId::parse(""), Err(AccountIdError::Empty));
+        let long = "x".repeat(MAX_ACCOUNT_ID_CHARS + 1);
+        assert_eq!(
+            AccountId::parse(&long),
+            Err(AccountIdError::TooLong {
+                actual: MAX_ACCOUNT_ID_CHARS + 1,
+                maximum: MAX_ACCOUNT_ID_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_user_names_reject_empty_control_and_oversized_values() -> Result<(), Box<dyn Error>>
+    {
+        for valid in ["jane", "jane.doe", "JANE_1"] {
+            let name = AccountUserName::parse(valid)?;
+            assert_eq!(name.as_str(), valid);
+            assert_eq!(name.to_string().parse::<AccountUserName>(), Ok(name));
+        }
+        assert_eq!(AccountUserName::parse(""), Err(AccountUserNameError::Empty));
+        assert_eq!(
+            AccountUserName::parse("  "),
+            Err(AccountUserNameError::Empty)
+        );
+        assert_eq!(
+            AccountUserName::parse("jane\ndoe"),
+            Err(AccountUserNameError::ControlCharacter)
+        );
+        let long = "x".repeat(MAX_ACCOUNT_USER_NAME_CHARS + 1);
+        assert_eq!(
+            AccountUserName::parse(&long),
+            Err(AccountUserNameError::TooLong {
+                actual: MAX_ACCOUNT_USER_NAME_CHARS + 1,
+                maximum: MAX_ACCOUNT_USER_NAME_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn role_ids_reject_empty_control_and_oversized_values() -> Result<(), Box<dyn Error>> {
+        for valid in ["Administrator", "Operator", "ReadOnly"] {
+            let role = RoleId::parse(valid)?;
+            assert_eq!(role.as_str(), valid);
+            assert_eq!(role.to_string().parse::<RoleId>(), Ok(role));
+        }
+        assert_eq!(RoleId::parse(""), Err(RoleIdError::Empty));
+        assert_eq!(RoleId::parse("  "), Err(RoleIdError::Empty));
+        assert_eq!(
+            RoleId::parse("Admin\0strator"),
+            Err(RoleIdError::ControlCharacter)
+        );
+        let long = "x".repeat(MAX_ROLE_ID_CHARS + 1);
+        assert_eq!(
+            RoleId::parse(&long),
+            Err(RoleIdError::TooLong {
+                actual: MAX_ROLE_ID_CHARS + 1,
+                maximum: MAX_ROLE_ID_CHARS
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_passwords_are_secrets_redacted_and_bounded() -> Result<(), Box<dyn Error>> {
+        let password = AccountPassword::parse("s3cret-value".to_owned())?;
+        assert_eq!(password.expose_secret(), "s3cret-value");
+        assert_eq!(
+            format!("{password:?}"),
+            "AccountPassword([REDACTED])",
+            "a password must never print its value"
+        );
+        assert_eq!(
+            AccountPassword::parse(String::new()),
+            Err(AccountPasswordError::Empty)
+        );
+        let long = "x".repeat(MAX_ACCOUNT_PASSWORD_CHARS + 1);
+        assert_eq!(
+            AccountPassword::parse(long),
+            Err(AccountPasswordError::TooLong {
+                actual: MAX_ACCOUNT_PASSWORD_CHARS + 1,
+                maximum: MAX_ACCOUNT_PASSWORD_CHARS
+            })
+        );
+
+        // The serde wire form carries the exposed value (the §9.4 typed
+        // payload contract), and the value round-trips through it.
+        let json = serde_json::to_string(&password)?;
+        assert_eq!(json, r#""s3cret-value""#);
+        assert_eq!(serde_json::from_str::<AccountPassword>(&json)?, password);
+        assert!(
+            serde_json::from_str::<AccountPassword>("\"\"").is_err(),
+            "an empty password must not deserialize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_account_payload_round_trips_and_denies_unknown_fields() -> Result<(), Box<dyn Error>>
+    {
+        let create = CreateAccount::new(
+            AccountUserName::parse("jane")?,
+            AccountPassword::parse("initial-secret".to_owned())?,
+            RoleId::parse("Operator")?,
+        );
+        assert_eq!(create.user_name().as_str(), "jane");
+        assert_eq!(create.password().expose_secret(), "initial-secret");
+        assert_eq!(create.role_id().as_str(), "Operator");
+
+        let json = serde_json::to_string(&create)?;
+        assert_eq!(
+            json,
+            r#"{"user_name":"jane","password":"initial-secret","role_id":"Operator"}"#
+        );
+        assert_eq!(serde_json::from_str::<CreateAccount>(&json)?, create);
+        assert!(
+            serde_json::from_str::<CreateAccount>(
+                r#"{"user_name":"jane","password":"initial-secret","role_id":"Operator","enabled":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_update_payloads_round_trip_and_deny_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let update = UpdateAccount::new(AccountId::parse("admin")?, RoleId::parse("Operator")?);
+        assert_eq!(update.account_id().as_str(), "admin");
+        assert_eq!(update.role_id().as_str(), "Operator");
+        let json = serde_json::to_string(&update)?;
+        assert_eq!(json, r#"{"account_id":"admin","role_id":"Operator"}"#);
+        assert_eq!(serde_json::from_str::<UpdateAccount>(&json)?, update);
+        assert!(
+            serde_json::from_str::<UpdateAccount>(
+                r#"{"account_id":"admin","role_id":"Operator","locked":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let password = UpdateAccountPassword::new(
+            AccountId::parse("jane")?,
+            AccountPassword::parse("new-secret".to_owned())?,
+        );
+        assert_eq!(password.account_id().as_str(), "jane");
+        assert_eq!(password.password().expose_secret(), "new-secret");
+        let json = serde_json::to_string(&password)?;
+        assert_eq!(json, r#"{"account_id":"jane","password":"new-secret"}"#);
+        assert_eq!(
+            serde_json::from_str::<UpdateAccountPassword>(&json)?,
+            password
+        );
+        assert!(
+            serde_json::from_str::<UpdateAccountPassword>(
+                r#"{"account_id":"jane","password":"new-secret","expires":true}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let rename = UpdateAccountUserName::new(
+            AccountId::parse("jane")?,
+            AccountUserName::parse("jane.doe")?,
+        );
+        assert_eq!(rename.account_id().as_str(), "jane");
+        assert_eq!(rename.user_name().as_str(), "jane.doe");
+        let json = serde_json::to_string(&rename)?;
+        assert_eq!(json, r#"{"account_id":"jane","user_name":"jane.doe"}"#);
+        assert_eq!(
+            serde_json::from_str::<UpdateAccountUserName>(&json)?,
+            rename
+        );
+        assert!(
+            serde_json::from_str::<UpdateAccountUserName>(
+                r#"{"account_id":"jane","user_name":"jane.doe","email":"j@x"}"#
+            )
+            .is_err(),
+            "unknown payload fields must be rejected"
+        );
+
+        let deletion = DeleteAccount::new(AccountId::parse("jane")?);
+        assert_eq!(deletion.account_id().as_str(), "jane");
+        let json = serde_json::to_string(&deletion)?;
+        assert_eq!(json, r#"{"account_id":"jane"}"#);
+        assert_eq!(serde_json::from_str::<DeleteAccount>(&json)?, deletion);
+        assert!(
+            serde_json::from_str::<DeleteAccount>(r#"{"account_id":"jane","force":true}"#).is_err(),
+            "unknown payload fields must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_commands_round_trip_per_operation() -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("initial-secret".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                AccountId::parse("admin")?,
+                RoleId::parse("ReadOnly")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("jane")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("jane")?,
+                    AccountUserName::parse("jane.doe")?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("jane")?,
+            ))),
+        ] {
+            let json = serde_json::to_string(&command)?;
+            assert_eq!(serde_json::from_str::<RedfishCommand>(&json)?, command);
+        }
         Ok(())
     }
 }

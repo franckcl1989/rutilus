@@ -51,7 +51,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
-use crate::mock_bmc::route::SessionLedger;
+use crate::mock_bmc::route::{AccountLedger, MockAccount, SessionLedger};
 
 #[cfg(test)]
 mod tests;
@@ -201,6 +201,19 @@ impl MockBmc {
         self.state.active_sessions()
     }
 
+    /// Returns the ids of every account the mock currently holds, starting
+    /// with the built-in `admin` account.
+    #[must_use]
+    pub fn account_ids(&self) -> Vec<String> {
+        self.state.lock_accounts().ids()
+    }
+
+    /// Returns a snapshot of one account the mock currently holds, by id.
+    #[must_use]
+    pub fn account(&self, id: &str) -> Option<MockAccount> {
+        self.state.lock_accounts().find(id)
+    }
+
     /// Stops the serve loop, releases the loopback port, and waits for the
     /// background task to exit.
     ///
@@ -255,6 +268,7 @@ pub enum MockBmcError {
 pub(crate) struct MockState {
     profile: MockProfile,
     ledger: Mutex<SessionLedger>,
+    accounts: Mutex<AccountLedger>,
     requests_served: AtomicU64,
     records: Mutex<Vec<RequestRecord>>,
 }
@@ -272,6 +286,7 @@ impl MockState {
         Self {
             profile,
             ledger: Mutex::new(SessionLedger::new()),
+            accounts: Mutex::new(AccountLedger::new()),
             requests_served: AtomicU64::new(0),
             records: Mutex::new(Vec::new()),
         }
@@ -309,6 +324,12 @@ impl MockState {
 
     fn lock_ledger(&self) -> std::sync::MutexGuard<'_, SessionLedger> {
         self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn lock_accounts(&self) -> std::sync::MutexGuard<'_, AccountLedger> {
+        self.accounts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

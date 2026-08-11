@@ -20,6 +20,9 @@ use super::profile::MockProfile;
 /// The path prefix of one Session resource inside the Session collection.
 const SESSIONS_PREFIX: &str = "/redfish/v1/SessionService/Sessions/";
 
+/// The path prefix of one account resource inside the `Accounts` collection.
+const ACCOUNTS_PREFIX: &str = "/redfish/v1/AccountService/Accounts/";
+
 /// The fixed Session token issued on every successful creation.
 ///
 /// The product treats the token as opaque, so a fixed value keeps
@@ -49,7 +52,15 @@ pub(crate) fn dispatch(
     body: &[u8],
     state: &MockState,
 ) -> HttpResponse {
-    let path = target.trim_end_matches('/');
+    // The path is normalized by trimming a trailing slash and dropping the
+    // query string, so hand-typed URLs and typed-client requests with
+    // `$expand` behave like the links the product decodes — a real BMC
+    // serves the same resource regardless of query parameters.
+    let path = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .trim_end_matches('/');
     match (method, path) {
         (HttpMethod::Get, "/redfish/v1") => json_ok(fixtures::service_root(state.profile())),
         (HttpMethod::Get, "/redfish/v1/SessionService") => json_ok(fixtures::SESSION_SERVICE),
@@ -59,11 +70,18 @@ pub(crate) fn dispatch(
             delete_session(path, state)
         }
         (HttpMethod::Get, "/redfish/v1/AccountService") => json_ok(fixtures::ACCOUNT_SERVICE),
-        (HttpMethod::Get, "/redfish/v1/AccountService/Accounts") => {
-            json_ok(fixtures::ACCOUNTS_COLLECTION)
+        // The §0.3.0 account write surface is served from the account
+        // ledger, so a created, updated, renamed, or deleted account is
+        // visible to the next read — exactly what the gateway's
+        // post-write verification re-reads (§13.3 steps 9-10).
+        (HttpMethod::Get, "/redfish/v1/AccountService/Accounts") => accounts_collection(state),
+        (HttpMethod::Post, "/redfish/v1/AccountService/Accounts") => create_account(body, state),
+        (HttpMethod::Get, path) if path.starts_with(ACCOUNTS_PREFIX) => account_member(path, state),
+        (HttpMethod::Patch, path) if path.starts_with(ACCOUNTS_PREFIX) => {
+            update_account(path, body, state)
         }
-        (HttpMethod::Get, "/redfish/v1/AccountService/Accounts/admin") => {
-            json_ok(fixtures::ACCOUNT_ADMIN)
+        (HttpMethod::Delete, path) if path.starts_with(ACCOUNTS_PREFIX) => {
+            delete_account(path, state)
         }
         (HttpMethod::Get, "/redfish/v1/Systems") => json_ok(fixtures::SYSTEMS_COLLECTION),
         (HttpMethod::Get, "/redfish/v1/Systems/1") => json_ok(fixtures::system(state.profile())),
@@ -466,6 +484,244 @@ fn session_body(id: u64, user_name: &str) -> String {
         "UserName": user_name,
     })
     .to_string()
+}
+
+/// Builds the `Accounts` collection document from the account ledger.
+fn accounts_collection(state: &MockState) -> HttpResponse {
+    let accounts = state.lock_accounts();
+    let members = accounts
+        .ids()
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "@odata.id": format!("/redfish/v1/AccountService/Accounts/{id}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "@odata.type": "#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id": "/redfish/v1/AccountService/Accounts",
+        "Name": "Account Collection",
+        "Members": members,
+    })
+    .to_string();
+    json_ok(body)
+}
+
+/// Serves one account member document from the ledger, or a Redfish-shaped
+/// 404 when the account does not exist.
+fn account_member(path: &str, state: &MockState) -> HttpResponse {
+    let Some(id) = path.strip_prefix(ACCOUNTS_PREFIX) else {
+        return not_found();
+    };
+    match state.lock_accounts().find(id) {
+        Some(account) => json_ok(account_document(&account)),
+        None => not_found(),
+    }
+}
+
+/// Creates one account from the typed `ManagerAccountCreate` wire shape and
+/// answers `201` with the created member document.
+///
+/// The id is assigned from a monotonic counter (`user-1`, `user-2`, ...);
+/// the product never guesses or depends on the value — the gateway
+/// verification re-reads the collection and matches by user name (§13.3).
+fn create_account(body: &[u8], state: &MockState) -> HttpResponse {
+    let Some(create) = serde_json::from_slice::<Value>(body).ok() else {
+        return not_found();
+    };
+    let Some(user_name) = create.get("UserName").and_then(Value::as_str) else {
+        return not_found();
+    };
+    let Some(role_id) = create.get("RoleId").and_then(Value::as_str) else {
+        return not_found();
+    };
+    let account = state.lock_accounts().create(user_name, role_id);
+    HttpResponse::json("201 Created", account_document(&account))
+}
+
+/// Applies one typed `ManagerAccountUpdate` shape to the named account and
+/// answers `200` with the updated member document.
+///
+/// The `Password` property is accepted but never stored (the CSDL marks it
+/// `null` in responses); `UserName` and `RoleId` updates are applied so a
+/// rename or role change is visible to the next read.
+fn update_account(path: &str, body: &[u8], state: &MockState) -> HttpResponse {
+    let Some(id) = path.strip_prefix(ACCOUNTS_PREFIX) else {
+        return not_found();
+    };
+    let Some(update) = serde_json::from_slice::<Value>(body).ok() else {
+        return not_found();
+    };
+    let user_name = update.get("UserName").and_then(Value::as_str);
+    let role_id = update.get("RoleId").and_then(Value::as_str);
+    match state.lock_accounts().update(id, user_name, role_id) {
+        Some(account) => json_ok(account_document(&account)),
+        None => not_found(),
+    }
+}
+
+/// Deletes the named account, answering `204` only when it existed.
+fn delete_account(path: &str, state: &MockState) -> HttpResponse {
+    let Some(id) = path.strip_prefix(ACCOUNTS_PREFIX) else {
+        return not_found();
+    };
+    if state.lock_accounts().delete(id) {
+        no_content()
+    } else {
+        not_found()
+    }
+}
+
+/// Renders one ledger account as its `ManagerAccount` member document.
+fn account_document(account: &MockAccount) -> String {
+    serde_json::json!({
+        "@odata.type": "#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id": format!("/redfish/v1/AccountService/Accounts/{}", account.id),
+        "@odata.etag": format!("W/\"account-{}\"", account.etag),
+        "Id": account.id,
+        "Name": format!("{} Account", account.user_name),
+        "UserName": account.user_name,
+        "RoleId": account.role_id,
+        "Enabled": account.enabled,
+        "Locked": account.locked,
+        "AccountTypes": ["Redfish"],
+    })
+    .to_string()
+}
+
+/// The mock's account bookkeeping: the built-in `admin` account plus every
+/// created account, so creation, update, deletion, and listing stay
+/// consistent across the gateway's write-then-verify flows.
+pub(crate) struct AccountLedger {
+    next_id: u64,
+    next_etag: u64,
+    accounts: Vec<MockAccount>,
+}
+
+/// One account held by the mock, projected from the wire shapes it serves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MockAccount {
+    pub(crate) id: String,
+    pub(crate) user_name: String,
+    pub(crate) role_id: String,
+    pub(crate) enabled: bool,
+    pub(crate) locked: bool,
+    etag: u64,
+}
+
+impl MockAccount {
+    /// Returns the Redfish `Id` of the account.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the `UserName` of the account.
+    #[must_use]
+    pub fn user_name(&self) -> &str {
+        &self.user_name
+    }
+
+    /// Returns the `RoleId` of the account.
+    #[must_use]
+    pub fn role_id(&self) -> &str {
+        &self.role_id
+    }
+
+    /// Returns whether the account is enabled.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns whether the account is locked.
+    #[must_use]
+    pub const fn locked(&self) -> bool {
+        self.locked
+    }
+}
+
+impl AccountLedger {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_id: 1,
+            next_etag: 2,
+            accounts: vec![MockAccount {
+                id: "admin".to_owned(),
+                user_name: "admin".to_owned(),
+                role_id: "Administrator".to_owned(),
+                enabled: true,
+                locked: false,
+                etag: 1,
+            }],
+        }
+    }
+
+    /// Returns the account ids in ledger order.
+    pub(crate) fn ids(&self) -> Vec<String> {
+        self.accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect()
+    }
+
+    /// Returns one account by id.
+    pub(crate) fn find(&self, id: &str) -> Option<MockAccount> {
+        self.accounts
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+    }
+
+    /// Creates one account with an assigned id.
+    fn create(&mut self, user_name: &str, role_id: &str) -> MockAccount {
+        let account = MockAccount {
+            id: format!("user-{}", self.next_id),
+            user_name: user_name.to_owned(),
+            role_id: role_id.to_owned(),
+            enabled: true,
+            locked: false,
+            etag: self.next_etag,
+        };
+        self.next_id += 1;
+        self.next_etag += 1;
+        self.accounts.push(account.clone());
+        account
+    }
+
+    /// Applies one update to the named account; returns the updated account
+    /// or `None` when the account does not exist.
+    fn update(
+        &mut self,
+        id: &str,
+        user_name: Option<&str>,
+        role_id: Option<&str>,
+    ) -> Option<MockAccount> {
+        let account = self.accounts.iter_mut().find(|account| account.id == id)?;
+        if let Some(user_name) = user_name {
+            user_name.clone_into(&mut account.user_name);
+        }
+        if let Some(role_id) = role_id {
+            role_id.clone_into(&mut account.role_id);
+        }
+        account.etag = self.next_etag;
+        self.next_etag += 1;
+        Some(account.clone())
+    }
+
+    /// Removes the named account; returns whether it existed.
+    fn delete(&mut self, id: &str) -> bool {
+        let before = self.accounts.len();
+        self.accounts.retain(|account| account.id != id);
+        self.accounts.len() != before
+    }
+}
+
+impl Default for AccountLedger {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The mock's Session bookkeeping: one monotonic id counter plus the active

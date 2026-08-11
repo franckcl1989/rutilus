@@ -1717,11 +1717,14 @@ mod tests {
 
     /// A test instance state over one migrated store.
     async fn test_state(paths: &RuntimePaths) -> Result<Arc<StandaloneState>, Box<dyn Error>> {
-        let store = SqliteStore::open(paths.database_path()).await?;
+        let master_key = Arc::new(MasterKey::generate()?);
+        let store =
+            SqliteStore::open_with_command_key(paths.database_path(), Arc::clone(&master_key))
+                .await?;
         let runtime_lock = RuntimeLock::acquire(paths.runtime_lock_path())?;
         Ok(Arc::new(StandaloneState {
             store,
-            master_key: MasterKey::generate()?,
+            master_key,
             _runtime_lock: runtime_lock,
             audit_tail: Arc::new(Mutex::new(VecDeque::new())),
             registry: Arc::new(CenterSessionRegistry::new()),

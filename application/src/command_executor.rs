@@ -168,6 +168,22 @@ pub enum VerificationVerdict {
 /// The expected result is derived from the command itself, so the boundary
 /// carries no separate expectation parameter:
 ///
+/// - [`AccountCommand::CreateAccount`](rutilus_domain::AccountCommand::CreateAccount) —
+///   the re-read `Accounts` collection must contain a member whose `UserName`
+///   matches the payload; an absent user name is `Mismatched`.
+/// - [`AccountCommand::UpdateAccount`](rutilus_domain::AccountCommand::UpdateAccount) —
+///   the member named by the payload id must exist and carry the requested
+///   `RoleId`.
+/// - [`AccountCommand::UpdateAccountPassword`](rutilus_domain::AccountCommand::UpdateAccountPassword) —
+///   the CSDL `Password` property is write-only (null in responses), so the
+///   honest check is that the member named by the payload id re-reads without
+///   error; the stored password is never asserted.
+/// - [`AccountCommand::UpdateAccountUserName`](rutilus_domain::AccountCommand::UpdateAccountUserName) —
+///   the member named by the payload id must exist and carry the requested
+///   `UserName`.
+/// - [`AccountCommand::DeleteAccount`](rutilus_domain::AccountCommand::DeleteAccount) —
+///   the member named by the payload id must be absent from the re-read
+///   collection.
 /// - [`EventCommand::CreateSubscription`](rutilus_domain::EventCommand::CreateSubscription) —
 ///   the re-read `EventSubscriptions` collection must contain the requested
 ///   `destination`; an absent destination is `Mismatched`.

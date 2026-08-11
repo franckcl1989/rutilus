@@ -17,6 +17,17 @@ use nv_redfish::{
     Bmc as _,
     Resource as NvResource,
     ServiceRoot,
+    // The §0.3.0 account write family dispatches through the typed account
+    // API (`AccountService`/`AccountCollection`/`Account` wrappers with the
+    // compiled `ManagerAccountCreate`/`ManagerAccountUpdate` payloads), the
+    // same high-level surface `ServiceRoot::account_service` exposes — never
+    // a hand-written account request (§7.4).
+    account::{
+        Account as AccountWrapper, AccountCollection as AccountCollectionWrapper,
+        AccountService as AccountServiceWrapper,
+        ManagerAccountCreate as ManagerAccountCreateSchema,
+        ManagerAccountUpdate as ManagerAccountUpdateSchema,
+    },
     bmc_http::{
         BmcCredentials, CacheSettings, HttpBmc,
         reqwest::{BmcError, Client as NvHttpClient},
@@ -226,15 +237,17 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rutilus_domain::{
-    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, CapabilityState,
-    CertificateFingerprint, ChassisCommand, CreateSubscription, CredentialUsername,
-    DeleteSubscription, EndpointAddress, EndpointCapability, EndpointCapabilityObservation,
-    EndpointId, EraseType, Event, EventCommand, EventDestinationProtocol, EventId, EventSeverity,
-    EventType, ManagerCommand, MessageId, NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand,
-    NvidiaSystemConfigProfileCommand, OemCommand, RedfishCommand, ResetKeysType, ResetType,
-    ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
-    ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
-    SetBootSourceOverride, SystemCommand, TlsIdentityChanged, TlsTrust, TokenType,
+    AccountCommand, AccountId, BootCommand, BootSource, BootSourceOverrideEnabled,
+    BootSourceOverrideMode, CapabilityState, CertificateFingerprint, ChassisCommand, CreateAccount,
+    CreateSubscription, CredentialUsername, DeleteAccount, DeleteSubscription, EndpointAddress,
+    EndpointCapability, EndpointCapabilityObservation, EndpointId, EraseType, Event, EventCommand,
+    EventDestinationProtocol, EventId, EventSeverity, EventType, ManagerCommand, MessageId,
+    NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
+    OemCommand, RedfishCommand, ResetKeysType, ResetType, ResourceEtag, ResourceEtagError,
+    ResourceFeature, ResourceODataId, ResourceODataIdError, ResourceSnapshotPayload,
+    ResourceSnapshotPayloadError, SecureBootCommand, SetBootSourceOverride, SystemCommand,
+    TlsIdentityChanged, TlsTrust, TokenType, UpdateAccount, UpdateAccountPassword,
+    UpdateAccountUserName,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -3625,6 +3638,9 @@ async fn execute_authenticated_command(
     command: &RedfishCommand,
 ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
     match command {
+        RedfishCommand::Account(account) => {
+            execute_account_command(root, identity, trust, account).await
+        }
         RedfishCommand::System(SystemCommand::Reset(reset_type)) => {
             execute_system_reset(bmc, root, identity, trust, *reset_type).await
         }
@@ -4964,6 +4980,285 @@ async fn execute_delete_subscription(
     outcome_from_modification(response)
 }
 
+/// Executes one account command through the typed `nv-redfish` 0.13.0
+/// account API (§0.3.0, the §7.5 `Account` family).
+///
+/// Every write goes through the high-level wrappers `ServiceRoot` exposes —
+/// `AccountService`, `AccountCollection`, `Account` — with the compiled
+/// `ManagerAccountCreate`/`ManagerAccountUpdate` payload types, never a
+/// hand-written JSON request (§7.4). The §13.3 step-2 capability check is
+/// the decoded `AccountService` link and its `Accounts` collection: a
+/// missing link or collection rejects the command with
+/// [`CommandRejection::CapabilityUnavailable`] before any write is sent,
+/// exactly like the missing `Subscriptions` link of the event family.
+async fn execute_account_command(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    account: &AccountCommand,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    match account {
+        AccountCommand::CreateAccount(payload) => {
+            execute_create_account(root, identity, trust, payload).await
+        }
+        AccountCommand::UpdateAccount(payload) => {
+            execute_update_account(root, identity, trust, payload).await
+        }
+        AccountCommand::UpdateAccountPassword(payload) => {
+            execute_update_account_password(root, identity, trust, payload).await
+        }
+        AccountCommand::UpdateAccountUserName(payload) => {
+            execute_update_account_user_name(root, identity, trust, payload).await
+        }
+        AccountCommand::DeleteAccount(payload) => {
+            execute_delete_account(root, identity, trust, payload).await
+        }
+    }
+}
+
+/// Executes an account creation as a typed `POST` to the decoded `Accounts`
+/// collection.
+///
+/// The create body is the compiled `ManagerAccountCreate` type with the
+/// three `Redfish.RequiredOnCreate` properties (`UserName`, `Password`,
+/// `RoleId`) projected from the domain payload; every optional create
+/// property stays `None`, so the wire payload is exactly the product's
+/// first-cut account shape.
+async fn execute_create_account(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &CreateAccount,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = account_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(collection) = accounts_collection_document(&service, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let create = ManagerAccountCreateSchema::builder(
+        payload.password().expose_secret().to_owned(),
+        payload.user_name().as_str().to_owned(),
+        payload.role_id().as_str().to_owned(),
+    )
+    .build();
+    let response = match collection.create_account(create).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes an account role update as a typed `PATCH` of the `RoleId`
+/// property.
+///
+/// The target account is resolved from the decoded `Accounts` collection by
+/// its Redfish `Id` — the same identity the verification re-read matches —
+/// and the update body is the compiled `ManagerAccountUpdate` type carrying
+/// only `RoleId`, the complete intent of the domain payload (§7.1).
+async fn execute_update_account(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateAccount,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = account_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(collection) = accounts_collection_document(&service, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(account) = find_account(&collection, identity, trust, payload.account_id()).await?
+    else {
+        // The named account is not part of the endpoint's account surface:
+        // the BMC provably cannot apply the write, so the refusal is
+        // provable (§13.5).
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let update = ManagerAccountUpdateSchema::builder()
+        .with_role_id(payload.role_id().as_str().to_owned())
+        .build();
+    let response = match account.update(&update).await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes an account password change through
+/// `Account::update_password`, the typed helper of the `nv-redfish` account
+/// API.
+async fn execute_update_account_password(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateAccountPassword,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = account_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(collection) = accounts_collection_document(&service, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(account) = find_account(&collection, identity, trust, payload.account_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let response = match account
+        .update_password(payload.password().expose_secret().to_owned())
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes an account rename through `Account::update_user_name`, the typed
+/// helper of the `nv-redfish` account API.
+async fn execute_update_account_user_name(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &UpdateAccountUserName,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = account_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(collection) = accounts_collection_document(&service, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(account) = find_account(&collection, identity, trust, payload.account_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let response = match account
+        .update_user_name(payload.user_name().as_str().to_owned())
+        .await
+    {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Executes an account deletion through `Account::delete`, the typed helper
+/// of the `nv-redfish` account API.
+async fn execute_delete_account(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    payload: &DeleteAccount,
+) -> Result<CommandExecutionOutcome, CommandExecutionError> {
+    let Some(service) = account_service_document(root, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(collection) = accounts_collection_document(&service, identity, trust).await? else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::CapabilityUnavailable,
+        ));
+    };
+    let Some(account) = find_account(&collection, identity, trust, payload.account_id()).await?
+    else {
+        return Err(CommandExecutionError::Rejected(
+            CommandRejection::RefusedByBmc,
+        ));
+    };
+    let response = match account.delete().await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(classify_command_write_error(source, identity, trust));
+        }
+    };
+    outcome_from_modification(response)
+}
+
+/// Fetches the typed `AccountService` wrapper through the root navigation
+/// property; a missing link is `None`.
+///
+/// The wrapper is the `ServiceRoot::account_service` high-level surface, so
+/// the decoded `AccountService` document and the `nv-redfish` quirks
+/// (vendor patches, slot-defined accounts) are exactly what the library
+/// would apply to any other account client.
+async fn account_service_document(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<AccountServiceWrapper<UpstreamBmc>>, CommandExecutionError> {
+    if root.root.account_service.is_none() {
+        return Ok(None);
+    }
+    match root.account_service().await {
+        Ok(service) => Ok(service),
+        Err(source) => Err(classify_command_preparation_error(source, identity, trust)),
+    }
+}
+
+/// Fetches the `Accounts` collection of one decoded `AccountService`; a
+/// missing collection link is `None`.
+async fn accounts_collection_document(
+    service: &AccountServiceWrapper<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Option<AccountCollectionWrapper<UpstreamBmc>>, CommandExecutionError> {
+    match service.accounts().await {
+        Ok(collection) => Ok(collection),
+        Err(source) => Err(classify_command_preparation_error(source, identity, trust)),
+    }
+}
+
+/// Resolves one `ManagerAccount` member by its Redfish `Id` from the decoded
+/// `Accounts` collection; a member with the id is `None` when it does not
+/// exist on the endpoint.
+async fn find_account(
+    collection: &AccountCollectionWrapper<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    account_id: &AccountId,
+) -> Result<Option<AccountWrapper<UpstreamBmc>>, CommandExecutionError> {
+    let accounts = match collection.all_accounts_data().await {
+        Ok(accounts) => accounts,
+        Err(source) => {
+            return Err(classify_command_preparation_error(source, identity, trust));
+        }
+    };
+    Ok(accounts
+        .into_iter()
+        .find(|account| account.raw().base.id == account_id.as_str()))
+}
+
 /// Fetches the typed `EventService` document through its root navigation
 /// property; a missing link is `None`.
 async fn event_service_document(
@@ -5064,6 +5359,9 @@ async fn verify_authenticated_command(
     command: &RedfishCommand,
 ) -> Result<CommandVerificationOutcome, CommandVerificationError> {
     match command {
+        RedfishCommand::Account(account) => {
+            verify_account_command(root, identity, trust, account).await
+        }
         // Both families verify by re-reading the endpoint's first system
         // ("accepted" semantics).
         RedfishCommand::System(SystemCommand::Reset(_))
@@ -5430,6 +5728,115 @@ async fn re_read_subscriptions(
     bmc.get::<EventSubscriptionCollectionSchema>(&subscriptions.odata_id)
         .await
         .map_err(|source| command_verification_read_error(source, identity, trust))
+}
+
+/// "Accepted" verification of one account command: the `Accounts` collection
+/// is re-read through the same typed `nv-redfish` account API the write used,
+/// and the expected result is derived from the command itself (§13.3 steps
+/// 9–10).
+///
+/// - `CreateAccount` — a member whose `UserName` matches the payload must
+///   exist; an absent user name is `Mismatched`.
+/// - `UpdateAccount` — the member named by the payload id must exist and
+///   carry the requested `RoleId`; the re-read proves the expected role or
+///   the write failed.
+/// - `UpdateAccountPassword` — the CSDL `Password` property is write-only
+///   (it is `null` in responses), so the honest check is that the member
+///   named by the payload id re-reads without error; the stored password is
+///   deliberately not asserted.
+/// - `UpdateAccountUserName` — the member named by the payload id must exist
+///   and carry the requested `UserName` (the account `Id` is unchanged by a
+///   rename).
+/// - `DeleteAccount` — the member named by the payload id must be absent
+///   from the re-read collection; a present member is `Mismatched`.
+async fn verify_account_command(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+    account: &AccountCommand,
+) -> Result<CommandVerificationOutcome, CommandVerificationError> {
+    let accounts = re_read_accounts(root, identity, trust).await?;
+    match account {
+        AccountCommand::CreateAccount(payload) => {
+            for account in &accounts {
+                if account.raw().user_name.as_deref() == Some(payload.user_name().as_str()) {
+                    return Ok(CommandVerificationOutcome::Confirmed);
+                }
+            }
+            Ok(CommandVerificationOutcome::Mismatched)
+        }
+        AccountCommand::UpdateAccount(payload) => {
+            for account in &accounts {
+                if account.raw().base.id == payload.account_id().as_str() {
+                    return Ok(
+                        if account.raw().role_id.as_deref() == Some(payload.role_id().as_str()) {
+                            CommandVerificationOutcome::Confirmed
+                        } else {
+                            CommandVerificationOutcome::Mismatched
+                        },
+                    );
+                }
+            }
+            Ok(CommandVerificationOutcome::Mismatched)
+        }
+        AccountCommand::UpdateAccountPassword(payload) => {
+            for account in &accounts {
+                if account.raw().base.id == payload.account_id().as_str() {
+                    return Ok(CommandVerificationOutcome::Confirmed);
+                }
+            }
+            Ok(CommandVerificationOutcome::Mismatched)
+        }
+        AccountCommand::UpdateAccountUserName(payload) => {
+            for account in &accounts {
+                if account.raw().base.id == payload.account_id().as_str() {
+                    return Ok(
+                        if account.raw().user_name.as_deref() == Some(payload.user_name().as_str())
+                        {
+                            CommandVerificationOutcome::Confirmed
+                        } else {
+                            CommandVerificationOutcome::Mismatched
+                        },
+                    );
+                }
+            }
+            Ok(CommandVerificationOutcome::Mismatched)
+        }
+        AccountCommand::DeleteAccount(payload) => {
+            for account in &accounts {
+                if account.raw().base.id == payload.account_id().as_str() {
+                    return Ok(CommandVerificationOutcome::Mismatched);
+                }
+            }
+            Ok(CommandVerificationOutcome::Confirmed)
+        }
+    }
+}
+
+/// Re-reads the `Accounts` collection through the typed `nv-redfish` account
+/// API (§11.1: no guessed path).
+async fn re_read_accounts(
+    root: &ServiceRoot<UpstreamBmc>,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<Vec<AccountWrapper<UpstreamBmc>>, CommandVerificationError> {
+    if root.root.account_service.is_none() {
+        return Err(CommandVerificationError::CapabilityUnavailable);
+    }
+    let service = root
+        .account_service()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+        .ok_or(CommandVerificationError::CapabilityUnavailable)?;
+    let collection = service
+        .accounts()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?
+        .ok_or(CommandVerificationError::CapabilityUnavailable)?;
+    Ok(collection
+        .all_accounts_data()
+        .await
+        .map_err(|source| classify_service_root_error(source, identity, trust))?)
 }
 
 /// Completes one verification re-read with the transient Session lifecycle.
@@ -10395,8 +10802,8 @@ mod tests {
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
     use rutilus_domain::{
-        EraseToken, ProfileFile, ProfileId, StartUpdate, TlsCertificate, TlsTrust, TokenData,
-        UpdateCommand,
+        AccountPassword, AccountUserName, EraseToken, ProfileFile, ProfileId, RoleId, StartUpdate,
+        TlsCertificate, TlsTrust, TokenData, UpdateCommand,
     };
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::{
@@ -11184,6 +11591,27 @@ mod tests {
         "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
         "Managers":{"@odata.id":"/redfish/v1/Managers"},
         "AccountService":{"@odata.id":"/redfish/v1/AccountService"},
+        "Tasks":{"@odata.id":"/redfish/v1/TaskService"},
+        "EventService":{"@odata.id":"/redfish/v1/EventService"},
+        "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
+        "UpdateService":{"@odata.id":"/redfish/v1/UpdateService"},
+        "PowerEquipment":{"@odata.id":"/redfish/v1/PowerEquipment"}
+    }"#;
+
+    /// The full Service Root without the `AccountService` link, as served by
+    /// an endpoint that exposes no account surface.
+    const FULL_SERVICE_ROOT_WITHOUT_ACCOUNT_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/",
+        "Id":"RootService",
+        "Name":"Root Service",
+        "Links":{"Sessions":{"@odata.id":"/redfish/v1/SessionService/Sessions"}},
+        "RedfishVersion":"1.20.0",
+        "Vendor":"Rutilus Test",
+        "Product":"Fixture BMC",
+        "SessionService":{"@odata.id":"/redfish/v1/SessionService"},
+        "Systems":{"@odata.id":"/redfish/v1/Systems"},
+        "Chassis":{"@odata.id":"/redfish/v1/Chassis"},
+        "Managers":{"@odata.id":"/redfish/v1/Managers"},
         "Tasks":{"@odata.id":"/redfish/v1/TaskService"},
         "EventService":{"@odata.id":"/redfish/v1/EventService"},
         "TelemetryService":{"@odata.id":"/redfish/v1/TelemetryService"},
@@ -20007,6 +20435,109 @@ mod tests {
         "EventTypes":["Alert"]
     }"#;
 
+    /// The `AccountService` document for write tests: advertises the
+    /// `Accounts` collection.
+    const COMMAND_ACCOUNT_SERVICE_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/AccountService",
+        "Id":"AccountService",
+        "Name":"Account Service",
+        "Accounts":{"@odata.id":"/redfish/v1/AccountService/Accounts"}
+    }"#;
+
+    /// An `AccountService` document that advertises no `Accounts`
+    /// collection.
+    const COMMAND_ACCOUNT_SERVICE_WITHOUT_ACCOUNTS_BODY: &str = r#"{
+        "@odata.id":"/redfish/v1/AccountService",
+        "Id":"AccountService",
+        "Name":"Account Service"
+    }"#;
+
+    /// The `Accounts` collection for write tests: one built-in `admin`
+    /// member in reference form.
+    const COMMAND_ACCOUNTS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id":"/redfish/v1/AccountService/Accounts",
+        "Name":"Account Collection",
+        "Members":[{"@odata.id":"/redfish/v1/AccountService/Accounts/admin"}]
+    }"##;
+
+    /// The `Accounts` collection after a creation: the `admin` member plus
+    /// the new `jane` member.
+    const COMMAND_ACCOUNTS_COLLECTION_WITH_JANE_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id":"/redfish/v1/AccountService/Accounts",
+        "Name":"Account Collection",
+        "Members":[
+            {"@odata.id":"/redfish/v1/AccountService/Accounts/admin"},
+            {"@odata.id":"/redfish/v1/AccountService/Accounts/jane"}
+        ]
+    }"##;
+
+    /// The `admin` member for write tests; `AccountTypes` is
+    /// `Redfish.Required` and must stay present to decode.
+    const COMMAND_ACCOUNT_ADMIN_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/admin",
+        "@odata.etag":"W/\"account-1\"",
+        "Id":"admin",
+        "Name":"Administrator Account",
+        "UserName":"admin",
+        "RoleId":"Administrator",
+        "Enabled":true,
+        "Locked":false,
+        "AccountTypes":["Redfish"]
+    }"##;
+
+    /// The `admin` member after its role was updated to `Operator`.
+    const COMMAND_ACCOUNT_ADMIN_ROLE_OPERATOR_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/admin",
+        "@odata.etag":"W/\"account-2\"",
+        "Id":"admin",
+        "Name":"Administrator Account",
+        "UserName":"admin",
+        "RoleId":"Operator",
+        "Enabled":true,
+        "Locked":false,
+        "AccountTypes":["Redfish"]
+    }"##;
+
+    /// The `admin` member after its user name was renamed.
+    const COMMAND_ACCOUNT_ADMIN_RENAMED_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/admin",
+        "@odata.etag":"W/\"account-2\"",
+        "Id":"admin",
+        "Name":"Administrator Account",
+        "UserName":"admin.renamed",
+        "RoleId":"Administrator",
+        "Enabled":true,
+        "Locked":false,
+        "AccountTypes":["Redfish"]
+    }"##;
+
+    /// The `201` create response of one new account member.
+    const COMMAND_ACCOUNT_CREATED_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
+        "@odata.id":"/redfish/v1/AccountService/Accounts/jane",
+        "Id":"jane",
+        "Name":"Jane Account",
+        "UserName":"jane",
+        "RoleId":"Operator",
+        "Enabled":true,
+        "Locked":false,
+        "AccountTypes":["Redfish"]
+    }"##;
+
+    /// An `Accounts` collection without members, as served after every
+    /// account was deleted.
+    const EMPTY_ACCOUNTS_COLLECTION_BODY: &str = r##"{
+        "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
+        "@odata.id":"/redfish/v1/AccountService/Accounts",
+        "Name":"Account Collection",
+        "Members":[]
+    }"##;
+
     /// The request order of one System/Manager/Chassis reset: the Session
     /// lifecycle around the collection, member, and action requests.
     const RESET_COMMAND_REQUEST_PATHS: [&str; 8] = [
@@ -20087,6 +20618,64 @@ mod tests {
         "/redfish/v1/SessionService/Sessions",
         "/redfish/v1/EventService",
         "/redfish/v1/EventService/Subscriptions/Sub-1",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one account creation: the Session lifecycle
+    /// around the `AccountService` document, the decoded `Accounts`
+    /// collection, and the typed `POST` onto the collection.
+    const ACCOUNT_CREATE_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one account role update, password change,
+    /// rename, or deletion: the Session lifecycle around the `AccountService`
+    /// document, the `Accounts` collection, the member fetch, and the typed
+    /// write request against the member.
+    const ACCOUNT_MEMBER_WRITE_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts/admin",
+        "/redfish/v1/AccountService/Accounts/admin",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one account verification re-read: the Session
+    /// lifecycle around the `AccountService` document, the `Accounts`
+    /// collection, and one member fetch per member of the collection.
+    const ACCOUNT_VERIFY_SINGLE_MEMBER_REQUEST_PATHS: [&str; 8] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts/admin",
+        "/redfish/v1/SessionService/Sessions/1",
+    ];
+
+    /// The request order of one account verification re-read over a
+    /// two-member collection (the built-in `admin` plus the created `jane`).
+    const ACCOUNT_VERIFY_TWO_MEMBER_REQUEST_PATHS: [&str; 9] = [
+        "/redfish/v1",
+        "/redfish/v1/SessionService",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/SessionService/Sessions",
+        "/redfish/v1/AccountService",
+        "/redfish/v1/AccountService/Accounts",
+        "/redfish/v1/AccountService/Accounts/admin",
+        "/redfish/v1/AccountService/Accounts/jane",
         "/redfish/v1/SessionService/Sessions/1",
     ];
 
@@ -20533,6 +21122,377 @@ mod tests {
             "DELETE",
             "",
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_account_creation_through_the_typed_create_api() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+            ],
+            http_response("201 Created", COMMAND_ACCOUNT_CREATED_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_CREATE_REQUEST_PATHS,
+            "POST",
+            r#"{"Password":"initial-secret","UserName":"jane","RoleId":"Operator"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_account_role_update_through_the_typed_update_api()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+            http_response("200 OK", COMMAND_ACCOUNT_ADMIN_ROLE_OPERATOR_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                    AccountId::parse("admin")?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_MEMBER_WRITE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"RoleId":"Operator"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_account_password_change_through_the_typed_helper()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                    UpdateAccountPassword::new(
+                        AccountId::parse("admin")?,
+                        AccountPassword::parse("new-secret".to_owned())?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_MEMBER_WRITE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"Password":"new-secret"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_account_rename_through_the_typed_helper() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+            http_response("200 OK", COMMAND_ACCOUNT_ADMIN_RENAMED_BODY),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                    UpdateAccountUserName::new(
+                        AccountId::parse("admin")?,
+                        AccountUserName::parse("admin.renamed")?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_MEMBER_WRITE_REQUEST_PATHS,
+            "PATCH",
+            r#"{"UserName":"admin.renamed"}"#,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executes_account_deletion_through_the_typed_delete_api() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("admin")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        assert_command_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_MEMBER_WRITE_REQUEST_PATHS,
+            "DELETE",
+            "",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_account_commands_when_the_account_service_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        for command in [
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("initial-secret".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                AccountId::parse("admin")?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("admin")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("admin")?,
+                    AccountUserName::parse("admin.renamed")?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("admin")?,
+            ))),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+                FULL_SERVICE_ROOT_WITHOUT_ACCOUNT_SERVICE_BODY,
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CommandExecutionError::Rejected(
+                    CommandRejection::CapabilityUnavailable
+                ))
+            ));
+            // The capability check stops the sequence before the account
+            // service fetch: only the Session lifecycle requests were made.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.starts_with(b"GET /redfish/v1/AccountService"))
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_account_commands_when_the_accounts_collection_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[("200 OK", COMMAND_ACCOUNT_SERVICE_WITHOUT_ACCOUNTS_BODY)],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(CommandExecutionError::Rejected(
+                CommandRejection::CapabilityUnavailable
+            ))
+        ));
+        // The capability check stops the sequence before any write request:
+        // the account service is read, then the Session is deleted.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with(b"POST /redfish/v1/AccountService/Accounts"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_account_member_writes_when_the_account_does_not_exist()
+    -> Result<(), Box<dyn Error>> {
+        // The named account is absent from the decoded collection, so the
+        // write is refused after the member reads, before any write request:
+        // the sequence is the Session lifecycle plus the account service,
+        // collection, and admin member reads.
+        for command in [
+            RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                AccountId::parse("ghost")?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("ghost")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("ghost")?,
+                    AccountUserName::parse("ghost.renamed")?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("ghost")?,
+            ))),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                    ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                    ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let outcome = gateway
+                .execute_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                Err(CommandExecutionError::Rejected(
+                    CommandRejection::RefusedByBmc
+                ))
+            ));
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 8);
+            assert!(requests.iter().all(|request| {
+                !request.starts_with(b"PATCH /redfish/v1/AccountService/Accounts/ghost")
+                    && !request.starts_with(b"DELETE /redfish/v1/AccountService/Accounts/ghost")
+            }));
+        }
         Ok(())
     }
 
@@ -21955,6 +22915,383 @@ mod tests {
             &server.finish_all().await?,
             &VERIFY_SUBSCRIPTION_COLLECTION_REQUEST_PATHS,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_creation_by_re_reading_the_collection() -> Result<(), Box<dyn Error>>
+    {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_WITH_JANE_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+                ("200 OK", COMMAND_ACCOUNT_CREATED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_VERIFY_TWO_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_role_update_by_re_reading_the_member() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_ROLE_OPERATOR_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                    AccountId::parse("admin")?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_password_change_by_re_reading_the_member()
+    -> Result<(), Box<dyn Error>> {
+        // The CSDL `Password` property is write-only (null in responses), so
+        // the honest check is that the member re-reads without error.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                    UpdateAccountPassword::new(
+                        AccountId::parse("admin")?,
+                        AccountPassword::parse("new-secret".to_owned())?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_rename_by_re_reading_the_member() -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_RENAMED_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                    UpdateAccountUserName::new(
+                        AccountId::parse("admin")?,
+                        AccountUserName::parse("admin.renamed")?,
+                    ),
+                )),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_password_change_and_rename_as_mismatched_when_the_member_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read collection no longer contains the member named by the
+        // payload id, so the expected result is provably absent: `Mismatched`,
+        // exactly like the role update's member-absent branch. Both commands
+        // share the empty-collection shape, so one fixture pins both branches.
+        for command in [
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("admin")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("admin")?,
+                    AccountUserName::parse("admin.renamed")?,
+                ),
+            )),
+        ] {
+            let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+                FULL_SERVICE_ROOT_BODY,
+                &[
+                    ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                    ("200 OK", EMPTY_ACCOUNTS_COLLECTION_BODY),
+                ],
+            ))
+            .await?;
+            let gateway = gateway_with_root(server.certificate.clone())?;
+            let trust = system_ca_trust(&server.certificate)?;
+
+            let verdict = gateway
+                .verify_command(
+                    &server.address,
+                    &trust,
+                    &CredentialUsername::parse("admin")?,
+                    &SecretString::from("password"),
+                    &command,
+                )
+                .await?;
+
+            assert_eq!(
+                verdict,
+                CommandVerificationOutcome::Mismatched,
+                "an absent member is the provably absent expected result"
+            );
+            // The absent member proves the outcome from the collection alone:
+            // no member fetch happens, exactly like the deletion confirmation
+            // over the empty collection.
+            let requests = server.finish_all().await?;
+            assert_eq!(requests.len(), 7);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_deletion_as_mismatched_when_the_member_is_still_present()
+    -> Result<(), Box<dyn Error>> {
+        // The re-read collection still contains the deleted member, so the
+        // expected result is provably absent.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("admin")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        assert_verification_requests(
+            &server.finish_all().await?,
+            &ACCOUNT_VERIFY_SINGLE_MEMBER_REQUEST_PATHS,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_deletion_by_re_reading_the_collection() -> Result<(), Box<dyn Error>>
+    {
+        // The deleted member is absent from the re-read collection (only the
+        // Session lifecycle and the account service/collection reads happen:
+        // no member fetch is needed to prove the absence).
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", EMPTY_ACCOUNTS_COLLECTION_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("admin")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Confirmed);
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_creation_as_mismatched_when_the_user_name_is_absent()
+    -> Result<(), Box<dyn Error>> {
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                    AccountUserName::parse("jane")?,
+                    AccountPassword::parse("initial-secret".to_owned())?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_role_update_as_mismatched_when_the_role_is_not_applied()
+    -> Result<(), Box<dyn Error>> {
+        // The member re-reads with the old role: the expected result is
+        // absent, so the verdict is Mismatched.
+        let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", COMMAND_ACCOUNT_SERVICE_BODY),
+                ("200 OK", COMMAND_ACCOUNTS_COLLECTION_BODY),
+                ("200 OK", COMMAND_ACCOUNT_ADMIN_BODY),
+            ],
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                    AccountId::parse("admin")?,
+                    RoleId::parse("Operator")?,
+                ))),
+            )
+            .await?;
+
+        assert_eq!(verdict, CommandVerificationOutcome::Mismatched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verifies_account_commands_as_an_error_when_the_account_service_is_gone()
+    -> Result<(), Box<dyn Error>> {
+        // A vanished `AccountService` link makes the re-read inconclusive:
+        // the verifier reports `CapabilityUnavailable` instead of fabricating
+        // a verdict, exactly like the vanished subscription link.
+        let server = TestRedfishServer::start_raw_sequence(session_lifecycle_sequence(
+            FULL_SERVICE_ROOT_WITHOUT_ACCOUNT_SERVICE_BODY,
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let verdict = gateway
+            .verify_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                    AccountId::parse("admin")?,
+                ))),
+            )
+            .await;
+
+        assert!(matches!(
+            verdict,
+            Err(CommandVerificationError::CapabilityUnavailable)
+        ));
         Ok(())
     }
 

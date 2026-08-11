@@ -7,12 +7,15 @@ use std::{fmt, num::NonZeroU64};
 // must be able to name those types (E0603 otherwise). The re-export mirrors
 // the domain's own surface exactly.
 pub use rutilus_domain::{
-    BootCommand, BootSource, BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand,
-    CreateSubscription, DeleteSubscription, EraseToken, EraseType, EventCommand,
-    EventDestinationProtocol, EventType, ManagerCommand, NvidiaDebugTokenCommand,
+    AccountCommand, AccountId, AccountPassword, AccountUserName, BootCommand, BootSource,
+    BootSourceOverrideEnabled, BootSourceOverrideMode, ChassisCommand, CreateAccount,
+    CreateSubscription, DeleteAccount, DeleteSubscription, EraseToken, EraseType, EventCommand,
+    EventDestinationProtocol, EventType, MAX_ACCOUNT_ID_CHARS, MAX_ACCOUNT_PASSWORD_CHARS,
+    MAX_ACCOUNT_USER_NAME_CHARS, MAX_ROLE_ID_CHARS, ManagerCommand, NvidiaDebugTokenCommand,
     NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand, OemCommand, ProfileFile,
-    ProfileId, RedfishCommand, ResetKeysType, ResetType, SecureBootCommand, SetBootSourceOverride,
-    StartUpdate, SystemCommand, TokenData, TokenType, UpdateCommand,
+    ProfileId, RedfishCommand, ResetKeysType, ResetType, RoleId, SecureBootCommand,
+    SetBootSourceOverride, StartUpdate, SystemCommand, TokenData, TokenType, UpdateAccount,
+    UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -5208,7 +5211,10 @@ impl CenterOperationSubmitResponse {
 mod tests {
     use std::{error::Error, num::NonZeroU64};
 
-    use rutilus_domain::{ResetType, SecureBootCommand, SystemCommand};
+    use rutilus_domain::{
+        AccountCommand, AccountPassword, AccountUserName, CreateAccount, ResetType, RoleId,
+        SecureBootCommand, SystemCommand,
+    };
     use serde_json::json;
     use time::format_description::well_known::Rfc3339;
     use uuid::uuid;
@@ -9788,6 +9794,35 @@ mod tests {
             .source(),
             Some("center")
         );
+        // The account write family is part of the wire contract: an account
+        // creation round-trips with its password value in the typed payload.
+        let account_request = CreateOperationRequest::new(
+            None,
+            vec![endpoint_id],
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("initial-secret".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+        );
+        assert_eq!(
+            serde_json::to_value(&account_request)?,
+            json!({
+                "source": null,
+                "targets": [endpoint_id],
+                "command": { "Account": { "CreateAccount": {
+                    "user_name": "jane",
+                    "password": "initial-secret",
+                    "role_id": "Operator"
+                } } }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateOperationRequest>(serde_json::to_value(
+                &account_request
+            )?)?,
+            account_request
+        );
         // Unknown request fields and unknown command families are rejected.
         assert!(
             serde_json::from_value::<CreateOperationRequest>(json!({
@@ -9798,6 +9833,16 @@ mod tests {
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<CreateOperationRequest>(json!({
+                "source": "standalone",
+                "targets": [endpoint_id],
+                "command": { "Bios": { "SetAttributes": {} } }
+            }))
+            .is_err()
+        );
+        // The compiled Account family still refuses a payload no domain
+        // command can fill.
         assert!(
             serde_json::from_value::<CreateOperationRequest>(json!({
                 "source": "standalone",

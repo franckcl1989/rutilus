@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 mod backup_package;
 mod binding_code;
 mod bootstrap_code;
+mod command_cipher;
 mod master_key;
 mod password_hash;
 mod session_token;
@@ -26,6 +27,10 @@ pub use backup_package::{
 pub use binding_code::{BindingCodeError, generate_binding_code};
 pub use bootstrap_code::{
     BOOTSTRAP_CODE_CHARACTERS, BootstrapCodeError, generate_bootstrap_code, hash_bootstrap_code,
+};
+pub use command_cipher::{
+    COMMAND_CIPHER_ENVELOPE_PREFIX, COMMAND_NONCE_LENGTH, CommandProtectionError, decrypt_command,
+    encrypt_command,
 };
 pub use master_key::{
     MASTER_KEY_ENVELOPE_LENGTH, MAX_SYSTEM_KEY_PAYLOAD_LENGTH, MasterKey, MasterKeyProtectionError,

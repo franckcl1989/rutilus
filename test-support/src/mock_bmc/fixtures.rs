@@ -124,33 +124,6 @@ pub(crate) const ACCOUNT_SERVICE: &str = r#"{
     "Accounts":{"@odata.id":"/redfish/v1/AccountService/Accounts"}
 }"#;
 
-/// `GET /redfish/v1/AccountService/Accounts` -- the manager account
-/// collection with the single built-in account member.
-pub(crate) const ACCOUNTS_COLLECTION: &str = r##"{
-    "@odata.type":"#ManagerAccountCollection.ManagerAccountCollection",
-    "@odata.id":"/redfish/v1/AccountService/Accounts",
-    "Name":"Account Collection",
-    "Members":[{"@odata.id":"/redfish/v1/AccountService/Accounts/admin"}]
-}"##;
-
-/// `GET /redfish/v1/AccountService/Accounts/admin` -- the built-in
-/// administrator account. `AccountTypes` is `Redfish.Required` in the
-/// schema and must stay present to decode, matching the full member shape
-/// `rutilus-infra-redfish` projects in its own tests.
-pub(crate) const ACCOUNT_ADMIN: &str = r##"{
-    "@odata.type":"#ManagerAccount.v1_12_0.ManagerAccount",
-    "@odata.id":"/redfish/v1/AccountService/Accounts/admin",
-    "@odata.etag":"W/\"account-1\"",
-    "Id":"admin",
-    "Name":"Administrator Account",
-    "Description":"Built-in administrator account",
-    "UserName":"admin",
-    "RoleId":"Administrator",
-    "Enabled":true,
-    "Locked":false,
-    "AccountTypes":["Redfish","IPMI"]
-}"##;
-
 /// `GET /redfish/v1/Systems` -- the computer system collection.
 pub(crate) const SYSTEMS_COLLECTION: &str = r##"{
     "@odata.type":"#ComputerSystemCollection.ComputerSystemCollection",

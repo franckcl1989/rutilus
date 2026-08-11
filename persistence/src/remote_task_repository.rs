@@ -277,7 +277,7 @@ pub enum StoredRemoteTaskError {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, sync::Arc};
 
     use rutilus_domain::{
         EndpointId, Operation, OperationId, OperationSource, OperationTarget, RedfishCommand,
@@ -285,6 +285,7 @@ mod tests {
     };
     use rutilus_entity::{operation, remote_task};
     use rutilus_operation_engine::{RemoteTask, RemoteTaskState, TaskUri};
+    use rutilus_security::MasterKey;
     use sea_orm::EntityTrait;
     use time::{Duration, OffsetDateTime};
 
@@ -652,7 +653,13 @@ mod tests {
 
     async fn store_with_directory() -> Result<(tempfile::TempDir, SqliteStore), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
-        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        // The remote-task tests seed operations, so the store carries the
+        // command encryption key like the production runtime.
+        let store = SqliteStore::open_with_command_key(
+            directory.path().join("rutilus.db"),
+            Arc::new(MasterKey::from_boxed_bytes(Box::new([0x5a; 32]))),
+        )
+        .await?;
         Ok((directory, store))
     }
 }
