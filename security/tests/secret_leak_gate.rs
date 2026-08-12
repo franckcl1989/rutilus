@@ -323,10 +323,10 @@ fn is_sensitive_log_identifier(name: &str) -> bool {
 /// constant, confirm it still holds no secret material, then update the
 /// entry — the deny.toml TRIGGER-note discipline. Verified 2026-08-12.
 const ALLOWED_CONSTANT_HITS: [(&str, usize, &str, &str); 2] = [
-    ("app/src/backup.rs", 83, "ENTRY_MASTER_KEY", "master-key"),
+    ("app/src/backup.rs", 88, "ENTRY_MASTER_KEY", "master-key"),
     (
         "app/src/backup.rs",
-        84,
+        89,
         "ENTRY_SYSTEM_MASTER_KEY",
         "system-master-key",
     ),
