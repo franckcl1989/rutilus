@@ -942,9 +942,10 @@ async fn mock_serves_the_nvidia_demo_flow_and_cleans_up() -> Result<(), Box<dyn 
     // The typed core resource read carries the standard families plus the
     // system-config-profile chain and the manager power-compliance and
     // managed-entity chains.
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
     assert_eq!(
         resources.len(),
         28 + 4 + 10,
@@ -988,9 +989,10 @@ async fn mock_serves_the_nvidia_demo_flow_and_cleans_up() -> Result<(), Box<dyn 
     );
 
     // A refresh repeats the same flow against the same fixture tree.
-    let refreshed = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let refreshed = outcome.projections();
     assert_eq!(refreshed.len(), resources.len());
     assert_eq!(mock.active_sessions(), 0);
 
@@ -1124,12 +1126,13 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
     );
 
     // The typed core resource read: every family in the documented order.
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
     assert_resource_order(&resources);
     assert_surface_payloads(&resources)?;
-    for resource in &resources {
+    for resource in resources {
         assert!(
             resource.etag().is_some(),
             "{} must carry its upstream ETag",
@@ -1143,9 +1146,10 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
     );
 
     // A refresh repeats the same flow against the same fixture tree.
-    let refreshed = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let refreshed = outcome.projections();
     assert_eq!(refreshed.len(), resources.len());
     assert_eq!(mock.active_sessions(), 0);
 

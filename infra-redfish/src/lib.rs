@@ -14,7 +14,8 @@ pub use application_adapter::{
 pub use redfish_gateway::{
     CommandExecutionError, CommandExecutionOutcome, CommandRejection, CommandVerificationError,
     CommandVerificationOutcome, CoreEndpointDiscovery, CoreResourceProjection,
-    CoreResourceReadError, EndpointEvent, EventStream, EventStreamError, EventStreamOpenError,
+    CoreResourceReadError, CoreResourceReadOutcome, DecodeFailureExtendedInfo,
+    DecodeFailureObservation, EndpointEvent, EventStream, EventStreamError, EventStreamOpenError,
     RedfishGateway, RedfishServiceRootError, ServiceRootSummary, TaskMessageObservation,
     TaskObservation, TaskReadError, TlsIdentityStateError, UpdateArtifactUpload,
 };

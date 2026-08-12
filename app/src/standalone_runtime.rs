@@ -19,9 +19,9 @@ use rutilus_application::{
     CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
     EndpointInventoryRepository, EndpointRefreshRepository, EventIngestion, EventRepository,
     EventStream, EventStreamPull, GroupRepository, MetricReportSnapshotReader, OperationExecutor,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, TagRepository, TaskMonitor, TelemetryRepository, TelemetrySampler,
-    TlsIdentityProbe,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceDecodeFailure,
+    ResourceObservation, StoredCapability, TagRepository, TaskMonitor, TelemetryRepository,
+    TelemetrySampler, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Argon2IdHash, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BootstrapCode,
@@ -268,12 +268,14 @@ impl EndpointRefreshRepository for StandaloneState {
         &'a self,
         endpoint_id: EndpointId,
         observations: &'a [ResourceObservation],
+        decode_failures: &'a [ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
         <SqliteStore as EndpointRefreshRepository>::commit_resource_generation(
             &self.store,
             endpoint_id,
             observations,
+            decode_failures,
             observed_at,
         )
     }
@@ -2090,8 +2092,8 @@ mod tests {
     use std::{error::Error, fmt};
 
     use rutilus_application::{
-        BoundaryFuture, CoreResourceReader, EndpointDiscovery, RedfishDiscovery,
-        ResourceObservation, TlsIdentityObservation, TlsIdentityProbe,
+        BoundaryFuture, CoreResourceReadOutcome, CoreResourceReader, EndpointDiscovery,
+        RedfishDiscovery, TlsIdentityObservation, TlsIdentityProbe,
     };
     use rutilus_domain::{CredentialUsername, EndpointAddress, TlsTrust};
     use secrecy::SecretString;
@@ -2152,7 +2154,7 @@ mod tests {
             _trust: &'a TlsTrust,
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
-        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
             Box::pin(async { Err(UnavailableGatewayError) })
         }
     }

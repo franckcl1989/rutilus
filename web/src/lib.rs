@@ -6002,9 +6002,10 @@ mod tests {
     };
     use http_body_util::BodyExt as _;
     use rutilus_application::{
-        BoundaryFuture, CapabilitySnapshotRepository, ClassifiedBatchChild, EndpointDiscovery,
-        EndpointRefreshFailureKind, EndpointRefreshOutcome, MAX_REFRESH_TARGETS,
-        ProtectedCredentialCreation, ResolvedCredential, ResourceDiagnostics, ResourceObservation,
+        BoundaryFuture, CapabilitySnapshotRepository, ClassifiedBatchChild,
+        CoreResourceReadOutcome, EndpointDiscovery, EndpointRefreshFailureKind,
+        EndpointRefreshOutcome, MAX_REFRESH_TARGETS, ProtectedCredentialCreation,
+        ResolvedCredential, ResourceDecodeFailure, ResourceDiagnostics, ResourceObservation,
         StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
@@ -9164,6 +9165,7 @@ mod tests {
             &'a self,
             endpoint_id: EndpointId,
             observations: &'a [ResourceObservation],
+            _decode_failures: &'a [ResourceDecodeFailure],
             observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             let working = self.refresh_working;
@@ -9733,27 +9735,30 @@ mod tests {
             _trust: &'a TlsTrust,
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
-        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
             let working = self.working;
             Box::pin(async move {
                 if !working {
                     return Err(MockWriteError);
                 }
-                Ok(vec![
-                    ResourceObservation::new(
-                        ResourceFeature::ServiceRoot,
-                        ResourceODataId::parse("/redfish/v1/").map_err(|_| MockWriteError)?,
-                        ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)
-                            .map_err(|_| MockWriteError)?,
-                    ),
-                    ResourceObservation::new(
-                        ResourceFeature::Systems,
-                        ResourceODataId::parse("/redfish/v1/Systems/1")
-                            .map_err(|_| MockWriteError)?,
-                        ResourceSnapshotPayload::parse(r#"{"Name":"System"}"#)
-                            .map_err(|_| MockWriteError)?,
-                    ),
-                ])
+                Ok(CoreResourceReadOutcome::new(
+                    vec![
+                        ResourceObservation::new(
+                            ResourceFeature::ServiceRoot,
+                            ResourceODataId::parse("/redfish/v1/").map_err(|_| MockWriteError)?,
+                            ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)
+                                .map_err(|_| MockWriteError)?,
+                        ),
+                        ResourceObservation::new(
+                            ResourceFeature::Systems,
+                            ResourceODataId::parse("/redfish/v1/Systems/1")
+                                .map_err(|_| MockWriteError)?,
+                            ResourceSnapshotPayload::parse(r#"{"Name":"System"}"#)
+                                .map_err(|_| MockWriteError)?,
+                        ),
+                    ],
+                    Vec::new(),
+                ))
             })
         }
     }

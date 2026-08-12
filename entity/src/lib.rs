@@ -25,6 +25,7 @@ pub mod password_credential;
 pub mod principal;
 pub mod remote_task;
 pub mod resource;
+pub mod resource_decode_failure;
 pub mod resource_snapshot;
 pub mod role_assignment;
 pub mod session;

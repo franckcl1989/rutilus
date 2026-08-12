@@ -1,16 +1,20 @@
 use std::{collections::BTreeMap, str::FromStr};
 
+use rutilus_application::{
+    ResourceDecodeFailure, ResourceDecodeFailureError, ResourceExtendedInfo,
+};
 use rutilus_domain::{
     EndpointId, RefreshGeneration, RefreshGenerationError, ResourceEtag, ResourceEtagError,
     ResourceFeature, ResourceFeatureParseError, ResourceId, ResourceODataId, ResourceODataIdError,
     ResourceODataType, ResourceODataTypeError, ResourceSnapshot, ResourceSnapshotPayload,
     ResourceSnapshotPayloadError,
 };
-use rutilus_entity::{endpoint, resource, resource_snapshot};
+use rutilus_entity::{endpoint, resource, resource_decode_failure, resource_snapshot};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, JoinType, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -56,12 +60,17 @@ impl NewResourceSnapshot {
 }
 
 impl SqliteStore {
-    /// Atomically appends one complete endpoint refresh Generation.
+    /// Atomically appends one complete endpoint refresh Generation, including
+    /// the Generation's member decode-failure records (§12.4).
     ///
     /// The Generation is assigned under the store's write gate. Existing
     /// resource identities are reused by exact `@odata.id`; newly observed
-    /// identities are created in the same transaction. Readers see either the
-    /// preceding complete Generation or this complete Generation.
+    /// identities are created in the same transaction. The decode-failure
+    /// records are written in the same transaction, so they are retained or
+    /// dropped with the Generation they describe (§9.5): a failed commit
+    /// keeps the last complete snapshot — and the last Generation's records —
+    /// as one intact whole. Readers see either the preceding complete
+    /// Generation or this complete Generation.
     ///
     /// # Errors
     ///
@@ -73,6 +82,7 @@ impl SqliteStore {
         &self,
         endpoint_id: EndpointId,
         observations: &[NewResourceSnapshot],
+        decode_failures: &[ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> Result<Vec<ResourceSnapshot>, ResourceSnapshotRepositoryError> {
         validate_observations(endpoint_id, observations)?;
@@ -130,6 +140,9 @@ impl SqliteStore {
                 observation,
                 observed_at,
             ));
+        }
+        for failure in decode_failures {
+            insert_decode_failure(&transaction, endpoint_id, generation, failure).await?;
         }
         transaction
             .commit()
@@ -212,6 +225,48 @@ impl SqliteStore {
             .await
             .map_err(ResourceSnapshotRepositoryError::Database)?;
         Ok(Some(snapshots))
+    }
+
+    /// Loads one endpoint Generation's member decode-failure records
+    /// (§12.4) in stable `@odata.id` order.
+    ///
+    /// The records are managed exactly like the snapshots: they belong to one
+    /// explicit Generation, so the caller passes the Generation whose
+    /// snapshots it already loaded. A Generation that recorded no member
+    /// decode failures returns an empty vector — a stale record from an older
+    /// Generation can never leak into a newer one, because the records are
+    /// replaced by Generation, not accumulated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceSnapshotRepositoryError`] when the query fails or
+    /// persisted record data violates the diagnostics contract.
+    pub async fn find_current_decode_failures(
+        &self,
+        endpoint_id: EndpointId,
+        generation: RefreshGeneration,
+    ) -> Result<Vec<ResourceDecodeFailure>, ResourceSnapshotRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(ResourceSnapshotRepositoryError::Database)?;
+        let rows = resource_decode_failure::Entity::find()
+            .filter(resource_decode_failure::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .filter(resource_decode_failure::Column::Generation.eq(generation.get().cast_signed()))
+            .order_by_asc(resource_decode_failure::Column::OdataUri)
+            .all(&transaction)
+            .await
+            .map_err(ResourceSnapshotRepositoryError::Database)?;
+        let failures = rows
+            .iter()
+            .map(|row| map_stored_decode_failure(endpoint_id, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction
+            .commit()
+            .await
+            .map_err(ResourceSnapshotRepositoryError::Database)?;
+        Ok(failures)
     }
 }
 
@@ -352,6 +407,128 @@ where
     .await
     .map_err(ResourceSnapshotRepositoryError::Database)?;
     Ok(())
+}
+
+/// Inserts one member decode-failure record of a refresh Generation.
+///
+/// The record arrives as the validated application record type (its
+/// construction is the record layer's `try_new` contract), and the row is
+/// keyed by `endpoint_id + generation + odata_uri`, so re-committing a
+/// Generation can never duplicate a record.
+async fn insert_decode_failure<C>(
+    database: &C,
+    endpoint_id: EndpointId,
+    generation: RefreshGeneration,
+    failure: &ResourceDecodeFailure,
+) -> Result<(), ResourceSnapshotRepositoryError>
+where
+    C: ConnectionTrait,
+{
+    resource_decode_failure::ActiveModel {
+        endpoint_id: Set(endpoint_id.into_uuid()),
+        generation: Set(generation.get().cast_signed()),
+        odata_uri: Set(failure.odata_uri().as_str().to_owned()),
+        odata_type: Set(failure.odata_type().map(ToString::to_string)),
+        feature: Set(failure.feature().to_string()),
+        oem_namespace: Set(failure.oem_namespace().map(str::to_owned)),
+        error_summary: Set(failure.error_summary().to_owned()),
+        extended_info_json: Set(serialize_extended_info(failure)?),
+    }
+    .insert(database)
+    .await
+    .map_err(ResourceSnapshotRepositoryError::Database)?;
+    Ok(())
+}
+
+/// The stored JSON shape of one `ExtendedInfo` entry, exactly the
+/// Redfish-defined fields the diagnostics view displays.
+#[derive(Deserialize, Serialize)]
+struct StoredExtendedInfo {
+    message_id: String,
+    message: Option<String>,
+    severity: Option<String>,
+    resolution: Option<String>,
+    related_properties: Vec<String>,
+}
+
+/// Serializes one record's `ExtendedInfo` entries into their stored JSON
+/// shape.
+fn serialize_extended_info(
+    failure: &ResourceDecodeFailure,
+) -> Result<String, ResourceSnapshotRepositoryError> {
+    let entries = failure
+        .extended_info()
+        .iter()
+        .map(|entry| StoredExtendedInfo {
+            message_id: entry.message_id().to_owned(),
+            message: entry.message().map(str::to_owned),
+            severity: entry.severity().map(str::to_owned),
+            resolution: entry.resolution().map(str::to_owned),
+            related_properties: entry.related_properties().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&entries).map_err(|source| {
+        ResourceSnapshotRepositoryError::Database(DbErr::Json(source.to_string()))
+    })
+}
+
+/// Maps one stored decode-failure row back into the validated application
+/// record type.
+///
+/// The record-layer construction is re-run on read, so a store that does not
+/// round-trip the diagnostics contract surfaces as an internal fault instead
+/// of being silently trusted.
+fn map_stored_decode_failure(
+    endpoint_id: EndpointId,
+    row: &resource_decode_failure::Model,
+) -> Result<ResourceDecodeFailure, ResourceSnapshotRepositoryError> {
+    let feature = ResourceFeature::from_str(&row.feature)
+        .map_err(StoredResourceDecodeFailureError::UnknownFeature)
+        .map_err(|source| corrupt_decode_failures(endpoint_id, source))?;
+    let odata_uri = ResourceODataId::parse(&row.odata_uri)
+        .map_err(StoredResourceDecodeFailureError::InvalidODataUri)
+        .map_err(|source| corrupt_decode_failures(endpoint_id, source))?;
+    let odata_type = row
+        .odata_type
+        .as_deref()
+        .map(ResourceODataType::parse)
+        .transpose()
+        .map_err(StoredResourceDecodeFailureError::InvalidODataType)
+        .map_err(|source| corrupt_decode_failures(endpoint_id, source))?;
+    let extended_info = serde_json::from_str::<Vec<StoredExtendedInfo>>(&row.extended_info_json)
+        .map_err(StoredResourceDecodeFailureError::InvalidExtendedInfo)
+        .map_err(|source| corrupt_decode_failures(endpoint_id, source))?
+        .into_iter()
+        .map(|entry| {
+            ResourceExtendedInfo::new(
+                entry.message_id,
+                entry.message,
+                entry.severity,
+                entry.resolution,
+                entry.related_properties,
+            )
+        })
+        .collect();
+    ResourceDecodeFailure::try_new(
+        odata_uri,
+        odata_type,
+        feature,
+        row.oem_namespace.clone(),
+        row.error_summary.clone(),
+        extended_info,
+    )
+    .map_err(StoredResourceDecodeFailureError::InvalidDecodeFailure)
+    .map_err(|source| corrupt_decode_failures(endpoint_id, source))
+}
+
+fn corrupt_decode_failures(
+    endpoint_id: EndpointId,
+    source: StoredResourceDecodeFailureError,
+) -> ResourceSnapshotRepositoryError {
+    ResourceSnapshotRepositoryError::CorruptDecodeFailures {
+        endpoint_id,
+        source,
+    }
 }
 
 fn to_domain_snapshot(
@@ -532,6 +709,12 @@ pub enum ResourceSnapshotRepositoryError {
         #[source]
         source: StoredResourceSnapshotError,
     },
+    #[error("stored endpoint {endpoint_id} member decode-failure records are invalid: {source}")]
+    CorruptDecodeFailures {
+        endpoint_id: EndpointId,
+        #[source]
+        source: StoredResourceDecodeFailureError,
+    },
     #[error("resource snapshot database operation failed: {0}")]
     Database(#[source] DbErr),
 }
@@ -573,11 +756,27 @@ impl From<RefreshGenerationError> for StoredResourceSnapshotError {
     }
 }
 
+/// Why one persisted member decode-failure record cannot be mapped into the
+/// diagnostics record type.
+#[derive(Debug, Error)]
+pub enum StoredResourceDecodeFailureError {
+    #[error("decode-failure feature is unknown to this product build: {0}")]
+    UnknownFeature(#[source] ResourceFeatureParseError),
+    #[error("decode-failure @odata.id is invalid: {0}")]
+    InvalidODataUri(#[source] ResourceODataIdError),
+    #[error("decode-failure @odata.type is invalid: {0}")]
+    InvalidODataType(#[source] ResourceODataTypeError),
+    #[error("decode-failure ExtendedInfo is not valid JSON: {0}")]
+    InvalidExtendedInfo(#[source] serde_json::Error),
+    #[error("decode-failure record violates the diagnostics contract: {0}")]
+    InvalidDecodeFailure(#[source] ResourceDecodeFailureError),
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
-    use rutilus_entity::{endpoint, resource, resource_snapshot};
+    use rutilus_entity::{endpoint, resource, resource_decode_failure, resource_snapshot};
     use sea_orm::{
         ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
         Set,
@@ -603,7 +802,7 @@ mod tests {
                 .with_etag(ResourceEtag::parse("W/\"one\"")?),
         ];
         let first = store
-            .commit_resource_generation(endpoint_id, &first, created_at + Duration::SECOND)
+            .commit_resource_generation(endpoint_id, &first, &[], created_at + Duration::SECOND)
             .await?;
         assert!(
             first
@@ -630,7 +829,12 @@ mod tests {
             )?,
         ];
         let second = store
-            .commit_resource_generation(endpoint_id, &second, created_at + Duration::seconds(2))
+            .commit_resource_generation(
+                endpoint_id,
+                &second,
+                &[],
+                created_at + Duration::seconds(2),
+            )
             .await?;
         assert!(
             second
@@ -669,13 +873,13 @@ mod tests {
 
         assert!(matches!(
             store
-                .commit_resource_generation(endpoint_id, &[], created_at)
+                .commit_resource_generation(endpoint_id, &[], &[], created_at)
                 .await,
             Err(ResourceSnapshotRepositoryError::EmptyGeneration { .. })
         ));
         assert!(matches!(
             store
-                .commit_resource_generation(endpoint_id, &[system], created_at)
+                .commit_resource_generation(endpoint_id, &[system], &[], created_at)
                 .await,
             Err(ResourceSnapshotRepositoryError::ServiceRootMissing { .. })
         ));
@@ -691,6 +895,7 @@ mod tests {
                             "Other root",
                         )?,
                     ],
+                    &[],
                     created_at,
                 )
                 .await,
@@ -698,7 +903,12 @@ mod tests {
         ));
         assert!(matches!(
             store
-                .commit_resource_generation(endpoint_id, &[root.clone(), root.clone()], created_at)
+                .commit_resource_generation(
+                    endpoint_id,
+                    &[root.clone(), root.clone()],
+                    &[],
+                    created_at
+                )
                 .await,
             Err(ResourceSnapshotRepositoryError::DuplicateODataId { .. })
         ));
@@ -707,6 +917,7 @@ mod tests {
                 .commit_resource_generation(
                     endpoint_id,
                     std::slice::from_ref(&root),
+                    &[],
                     created_at - Duration::SECOND,
                 )
                 .await,
@@ -714,7 +925,7 @@ mod tests {
         ));
         assert!(matches!(
             store
-                .commit_resource_generation(EndpointId::generate(), &[root], created_at)
+                .commit_resource_generation(EndpointId::generate(), &[root], &[], created_at)
                 .await,
             Err(ResourceSnapshotRepositoryError::EndpointNotFound { .. })
         ));
@@ -749,7 +960,7 @@ mod tests {
             )?,
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -824,7 +1035,7 @@ mod tests {
             .with_etag(ResourceEtag::parse("W/\"eth-1\"")?),
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -917,7 +1128,7 @@ mod tests {
             .with_odata_type(ResourceODataType::parse("#SecureBoot.v1_1_2.SecureBoot")?),
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -1002,7 +1213,7 @@ mod tests {
             .with_etag(ResourceEtag::parse("W/\"control-fan-1\"")?),
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -1079,7 +1290,7 @@ mod tests {
             .with_etag(ResourceEtag::parse("W/\"host-interface-1\"")?),
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -1157,7 +1368,7 @@ mod tests {
             )?,
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -1264,7 +1475,7 @@ mod tests {
             .with_odata_type(ResourceODataType::parse("#Task.v1_7_4.Task")?),
         ];
         let committed = store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         assert!(
             committed
@@ -1334,7 +1545,7 @@ mod tests {
             observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
         ];
         store
-            .commit_resource_generation(endpoint_id, &first, created_at)
+            .commit_resource_generation(endpoint_id, &first, &[], created_at)
             .await?;
         let invalid = [
             observation(ResourceFeature::Chassis, "/redfish/v1/Chassis/1", "Chassis")?,
@@ -1348,7 +1559,12 @@ mod tests {
 
         assert!(matches!(
             store
-                .commit_resource_generation(endpoint_id, &invalid, created_at + Duration::SECOND)
+                .commit_resource_generation(
+                    endpoint_id,
+                    &invalid,
+                    &[],
+                    created_at + Duration::SECOND
+                )
                 .await,
             Err(ResourceSnapshotRepositoryError::FeatureChanged {
                 stored: ResourceFeature::Systems,
@@ -1386,7 +1602,7 @@ mod tests {
             observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
         ];
         store
-            .commit_resource_generation(endpoint_id, &generation, created_at)
+            .commit_resource_generation(endpoint_id, &generation, &[], created_at)
             .await?;
         let system = resource::Entity::find()
             .filter(resource::Column::EndpointId.eq(endpoint_id.into_uuid()))
@@ -1441,6 +1657,307 @@ mod tests {
         store.close().await?;
         drop(directory);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn commits_decode_failures_with_the_generation_and_reads_them_back()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = vec![
+            observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        let decode_failures = vec![decode_failure(
+            "/redfish/v1/Systems/2",
+            Some("#ComputerSystem.v1_20_0.ComputerSystem"),
+            ResourceFeature::Systems,
+            Some("Vendor"),
+            "schema decode failed: missing required field",
+            Some("Base.1.13.ResourceNotFound"),
+        )?];
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &generation,
+                &decode_failures,
+                created_at + Duration::SECOND,
+            )
+            .await?;
+
+        let generation = RefreshGeneration::new(1)?;
+        let loaded = store
+            .find_current_decode_failures(endpoint_id, generation)
+            .await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].odata_uri().as_str(), "/redfish/v1/Systems/2");
+        assert_eq!(
+            loaded[0].odata_type().map(ResourceODataType::as_str),
+            Some("#ComputerSystem.v1_20_0.ComputerSystem")
+        );
+        assert_eq!(loaded[0].feature(), ResourceFeature::Systems);
+        assert_eq!(loaded[0].oem_namespace(), Some("Vendor"));
+        assert_eq!(
+            loaded[0].error_summary(),
+            "schema decode failed: missing required field"
+        );
+        let entries = loaded[0].extended_info();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_id(), "Base.1.13.ResourceNotFound");
+        assert_eq!(
+            entries[0].message(),
+            Some("The requested resource could not be found.")
+        );
+        assert_eq!(entries[0].severity(), Some("Critical"));
+        assert_eq!(
+            entries[0].resolution(),
+            Some("Remove and re-add the resource.")
+        );
+        assert_eq!(entries[0].related_properties(), &["MemberId".to_owned()]);
+
+        // A Generation that recorded no failures reads back empty.
+        assert!(
+            store
+                .find_current_decode_failures(endpoint_id, RefreshGeneration::new(2)?)
+                .await?
+                .is_empty()
+        );
+        // An endpoint without a completed refresh reads back empty.
+        assert!(
+            store
+                .find_current_decode_failures(EndpointId::generate(), generation)
+                .await?
+                .is_empty()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_failures_are_retained_per_generation_and_replaced_by_the_latest()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let first = vec![
+            observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &first,
+                &[decode_failure(
+                    "/redfish/v1/Systems/2",
+                    None,
+                    ResourceFeature::Systems,
+                    None,
+                    "first generation failure",
+                    None,
+                )?],
+                created_at + Duration::SECOND,
+            )
+            .await?;
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &first,
+                &[decode_failure(
+                    "/redfish/v1/Managers/9",
+                    None,
+                    ResourceFeature::Managers,
+                    None,
+                    "second generation failure",
+                    None,
+                )?],
+                created_at + Duration::seconds(2),
+            )
+            .await?;
+
+        // The records are managed like the snapshots: each Generation keeps
+        // its own rows, and a caller reads exactly the Generation it loaded.
+        let second = store
+            .find_current_decode_failures(endpoint_id, RefreshGeneration::new(2)?)
+            .await?;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].odata_uri().as_str(), "/redfish/v1/Managers/9");
+        assert_eq!(second[0].error_summary(), "second generation failure");
+        let first = store
+            .find_current_decode_failures(endpoint_id, RefreshGeneration::new(1)?)
+            .await?;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].odata_uri().as_str(), "/redfish/v1/Systems/2");
+        assert_eq!(first[0].error_summary(), "first generation failure");
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_generation_commit_drops_its_decode_failures_with_it()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let first = vec![
+            observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &first,
+                &[decode_failure(
+                    "/redfish/v1/Systems/2",
+                    None,
+                    ResourceFeature::Systems,
+                    None,
+                    "committed generation failure",
+                    None,
+                )?],
+                created_at + Duration::SECOND,
+            )
+            .await?;
+
+        // A feature-changed second Generation rolls back as one atomic
+        // transaction: neither its snapshots nor its decode-failure records
+        // can leak into the store (§9.5).
+        let invalid = vec![
+            observation(
+                ResourceFeature::Managers,
+                "/redfish/v1/Systems/1",
+                "Changed",
+            )?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        assert!(matches!(
+            store
+                .commit_resource_generation(
+                    endpoint_id,
+                    &invalid,
+                    &[decode_failure(
+                        "/redfish/v1/Managers/9",
+                        None,
+                        ResourceFeature::Managers,
+                        None,
+                        "rolled back generation failure",
+                        None,
+                    )?],
+                    created_at + Duration::seconds(2),
+                )
+                .await,
+            Err(ResourceSnapshotRepositoryError::FeatureChanged { .. })
+        ));
+
+        let second = store
+            .find_current_decode_failures(endpoint_id, RefreshGeneration::new(2)?)
+            .await?;
+        assert!(
+            second.is_empty(),
+            "a rolled-back Generation must never leave its records behind"
+        );
+        let first = store
+            .find_current_decode_failures(endpoint_id, RefreshGeneration::new(1)?)
+            .await?;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].error_summary(), "committed generation failure");
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_stored_decode_failure_is_an_internal_fault() -> Result<(), Box<dyn Error>> {
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = vec![
+            observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &generation,
+                &[decode_failure(
+                    "/redfish/v1/Systems/2",
+                    None,
+                    ResourceFeature::Systems,
+                    None,
+                    "corruptible failure",
+                    None,
+                )?],
+                created_at + Duration::SECOND,
+            )
+            .await?;
+
+        // A stored record that no longer round-trips the diagnostics
+        // contract surfaces as an internal fault instead of a fabricated
+        // record: first an `ExtendedInfo` column that is not valid JSON,
+        // then an empty error summary the record construction refuses.
+        let stored = resource_decode_failure::Entity::find()
+            .one(&store.database)
+            .await?
+            .ok_or("stored decode failure is missing")?;
+        let mut invalid_json = stored.clone().into_active_model();
+        invalid_json.extended_info_json = Set(String::from("not json"));
+        invalid_json.update(&store.database).await?;
+        assert!(matches!(
+            store
+                .find_current_decode_failures(endpoint_id, RefreshGeneration::new(1)?)
+                .await,
+            Err(ResourceSnapshotRepositoryError::CorruptDecodeFailures {
+                source: StoredResourceDecodeFailureError::InvalidExtendedInfo(_),
+                ..
+            })
+        ));
+        let mut restored_json = stored.clone().into_active_model();
+        restored_json.extended_info_json = Set(stored.extended_info_json.clone());
+        restored_json.update(&store.database).await?;
+
+        let mut invalid_summary = stored.into_active_model();
+        invalid_summary.error_summary = Set(String::new());
+        invalid_summary.update(&store.database).await?;
+        assert!(matches!(
+            store
+                .find_current_decode_failures(endpoint_id, RefreshGeneration::new(1)?)
+                .await,
+            Err(ResourceSnapshotRepositoryError::CorruptDecodeFailures {
+                source: StoredResourceDecodeFailureError::InvalidDecodeFailure(
+                    ResourceDecodeFailureError::EmptyErrorSummary
+                ),
+                ..
+            })
+        ));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    fn decode_failure(
+        odata_uri: &str,
+        odata_type: Option<&str>,
+        feature: ResourceFeature,
+        oem_namespace: Option<&str>,
+        error_summary: &str,
+        message_id: Option<&str>,
+    ) -> Result<ResourceDecodeFailure, Box<dyn Error>> {
+        let extended_info = match message_id {
+            Some(message_id) => vec![ResourceExtendedInfo::new(
+                message_id.to_owned(),
+                Some("The requested resource could not be found.".to_owned()),
+                Some("Critical".to_owned()),
+                Some("Remove and re-add the resource.".to_owned()),
+                vec!["MemberId".to_owned()],
+            )],
+            None => Vec::new(),
+        };
+        Ok(ResourceDecodeFailure::try_new(
+            ResourceODataId::parse(odata_uri)?,
+            odata_type.map(ResourceODataType::parse).transpose()?,
+            feature,
+            oem_namespace.map(str::to_owned),
+            error_summary.to_owned(),
+            extended_info,
+        )?)
     }
 
     fn observation(

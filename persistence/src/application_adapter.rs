@@ -4,7 +4,8 @@ use rutilus_application::{
     CenterRoleRepository, CredentialInventoryRepository, DiscoveredEndpointRepository,
     EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
     EndpointProjectionWrite, EndpointRefreshRepository, InboxInsertOutcome, InstanceRepository,
-    ProjectionWriteOutcome, ResourceObservation, ResourceProjectionWrite, StoredCapability,
+    ProjectionWriteOutcome, ResourceDecodeFailure, ResourceObservation, ResourceProjectionWrite,
+    StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
 use rutilus_domain::{
@@ -128,6 +129,7 @@ impl EndpointRefreshRepository for SqliteStore {
         &'a self,
         endpoint_id: EndpointId,
         observations: &'a [ResourceObservation],
+        decode_failures: &'a [ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
         Box::pin(async move {
@@ -135,9 +137,15 @@ impl EndpointRefreshRepository for SqliteStore {
                 .iter()
                 .map(project_observation)
                 .collect::<Vec<_>>();
-            SqliteStore::commit_resource_generation(self, endpoint_id, &snapshots, observed_at)
-                .await
-                .map_err(EndpointRefreshPersistenceError::Snapshot)
+            SqliteStore::commit_resource_generation(
+                self,
+                endpoint_id,
+                &snapshots,
+                decode_failures,
+                observed_at,
+            )
+            .await
+            .map_err(EndpointRefreshPersistenceError::Snapshot)
         })
     }
 }
@@ -258,10 +266,21 @@ impl EndpointInventoryRepository for SqliteStore {
                     .ok_or(EndpointInventoryPersistenceError::EndpointDisappeared {
                         endpoint_id,
                     })?;
-                inventory.push(
-                    EndpointInventoryItem::try_new(endpoint, resources)
-                        .map_err(EndpointInventoryPersistenceError::Inventory)?,
-                );
+                let item = EndpointInventoryItem::try_new(endpoint, resources)
+                    .map_err(EndpointInventoryPersistenceError::Inventory)?;
+                // The member decode failures belong to the item's current
+                // Generation (§12.4): they are loaded for exactly the
+                // Generation the snapshots carry, so a stale record from an
+                // older Generation can never ride along.
+                let item = match item.generation() {
+                    Some(generation) => item.with_decode_failures(
+                        SqliteStore::find_current_decode_failures(self, endpoint_id, generation)
+                            .await
+                            .map_err(EndpointInventoryPersistenceError::DecodeFailures)?,
+                    ),
+                    None => item,
+                };
+                inventory.push(item);
             }
             Ok(inventory)
         })
@@ -630,6 +649,8 @@ pub enum EndpointInventoryPersistenceError {
     Endpoint(#[source] EndpointRepositoryError),
     #[error("failed to load an endpoint's current resource Generation: {0}")]
     Snapshot(#[source] ResourceSnapshotRepositoryError),
+    #[error("failed to load an endpoint's current Generation decode failures: {0}")]
+    DecodeFailures(#[source] ResourceSnapshotRepositoryError),
     #[error("endpoint {endpoint_id} disappeared while loading its inventory")]
     EndpointDisappeared { endpoint_id: EndpointId },
     #[error("persisted endpoint inventory violates application invariants: {0}")]
@@ -751,6 +772,7 @@ mod tests {
                 &store,
                 endpoint_id,
                 &observations,
+                &[],
                 OffsetDateTime::now_utc(),
             )
             .await,
@@ -801,6 +823,7 @@ mod tests {
             &store,
             endpoint.id(),
             &observations,
+            &[],
             observed_at,
         )
         .await?;

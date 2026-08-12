@@ -374,6 +374,7 @@ async fn seed_offerable_endpoint(
                     ResourceSnapshotPayload::parse(r#"{"@odata.id":"/redfish/v1/Systems/1"}"#)?,
                 ),
             ],
+            &[],
             now,
         )
         .await?;

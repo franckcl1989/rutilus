@@ -8,19 +8,25 @@
 //! snapshot, and §12.4 forbids changing Method, submitting arbitrary JSON,
 //! and bypassing the normal permission and task model.
 
-use std::{error::Error, fmt, num::NonZeroU64, path::PathBuf, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, EventRepository, OperationStore,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceDecodeFailure,
-    ResourceExtendedInfo, ResourceObservation, StoredCapability, SystemCaEvaluation,
-    TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
+    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReadOutcome,
+    CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, EventRepository,
+    OperationStore, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceDecodeFailure, ResourceExtendedInfo, ResourceObservation, StoredCapability,
+    SystemCaEvaluation, TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
@@ -40,26 +46,66 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use tower::ServiceExt as _;
 
+/// One committed refresh Generation the stateful mock retains, so the
+/// inventory read can serve exactly what the refresh pipeline committed
+/// (snapshots and §12.4 decode-failure records together).
+#[derive(Clone)]
+struct CommittedRefresh {
+    endpoint: Endpoint,
+    snapshots: Vec<ResourceSnapshot>,
+    decode_failures: Vec<ResourceDecodeFailure>,
+}
+
 /// Implements every application boundary behind the injected services bundle.
 ///
 /// Only the endpoint-inventory read is served; every other boundary reports
-/// the controlled failure because the diagnostics path never calls them.
+/// the controlled failure because the diagnostics path never calls them. The
+/// refresh surfaces are stateful for the end-to-end refresh test: the mock
+/// BMC's read outcome is committed through the same boundaries the web
+/// refresh route exercises, and the inventory read then serves the committed
+/// Generation.
 #[derive(Clone)]
 struct MockServices {
     inventory: Result<Vec<EndpointInventoryItem>, MockError>,
+    refresh_endpoint: Option<Endpoint>,
+    refresh_credential: Option<(CredentialUsername, SecretString)>,
+    committed: Arc<Mutex<Option<(EndpointId, CommittedRefresh)>>>,
 }
 
 impl MockServices {
     fn ok(items: Vec<EndpointInventoryItem>) -> Self {
         Self {
             inventory: Ok(items),
+            refresh_endpoint: None,
+            refresh_credential: None,
+            committed: Arc::new(Mutex::new(None)),
         }
     }
 
     fn failed() -> Self {
         Self {
             inventory: Err(MockError::Persistence),
+            refresh_endpoint: None,
+            refresh_credential: None,
+            committed: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Serves one managed endpoint and credential for the refresh pipeline.
+    fn refreshing(endpoint: Endpoint, credential: (CredentialUsername, SecretString)) -> Self {
+        Self {
+            inventory: Ok(Vec::new()),
+            refresh_endpoint: Some(endpoint),
+            refresh_credential: Some(credential),
+            committed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn committed_refresh(&self) -> Result<Option<(EndpointId, CommittedRefresh)>, MockError> {
+        self.committed
+            .lock()
+            .map(|committed| committed.clone())
+            .map_err(|_| MockError::Persistence)
     }
 }
 
@@ -69,6 +115,10 @@ impl MockServices {
 struct MockGateway {
     certificate: TlsCertificate,
     evaluation: SystemCaEvaluation,
+    /// Whether the mock BMC's core resource read also reports one
+    /// undecodable member: the member is skipped (§0.2.0) and the capture
+    /// record flows through the refresh pipeline into the diagnostics view.
+    undecodable_member: bool,
 }
 
 impl MockGateway {
@@ -76,6 +126,17 @@ impl MockGateway {
         Self {
             certificate,
             evaluation: SystemCaEvaluation::Verified,
+            undecodable_member: false,
+        }
+    }
+
+    /// A mock BMC whose core resource read decodes every member but one:
+    /// the skipped member is reported as a §12.4 decode-failure capture.
+    fn with_undecodable_member(certificate: TlsCertificate) -> Self {
+        Self {
+            certificate,
+            evaluation: SystemCaEvaluation::Verified,
+            undecodable_member: true,
         }
     }
 }
@@ -161,7 +222,12 @@ impl CredentialResolver for MockServices {
         &self,
         _credential_id: CredentialId,
     ) -> BoundaryFuture<'_, Result<Option<ResolvedCredential>, Self::Error>> {
-        Box::pin(async { Ok(None) })
+        let credential = self.refresh_credential.clone();
+        Box::pin(async move {
+            // `ResolvedCredential` is not `Clone`, so the parts are stored and
+            // rebuilt per call, exactly like the infra adapter's test double.
+            Ok(credential.map(|(username, password)| ResolvedCredential::new(username, password)))
+        })
     }
 }
 
@@ -171,7 +237,29 @@ impl EndpointInventoryRepository for MockServices {
     fn list_endpoint_inventory(
         &self,
     ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
-        Box::pin(async { self.inventory.clone() })
+        let inventory = self.inventory.clone();
+        let committed = self.committed_refresh();
+        Box::pin(async move {
+            // A refresh committed through this mock replaces the served
+            // inventory: the item carries exactly the committed Generation —
+            // snapshots and decode-failure records together, exactly like the
+            // persisted inventory read.
+            if let Some((
+                _endpoint_id,
+                CommittedRefresh {
+                    endpoint,
+                    snapshots,
+                    decode_failures,
+                },
+            )) = committed?
+            {
+                let item = EndpointInventoryItem::try_new(endpoint, snapshots)
+                    .map_err(|_| MockError::Persistence)?
+                    .with_decode_failures(decode_failures);
+                return Ok(vec![item]);
+            }
+            inventory
+        })
     }
 }
 
@@ -192,18 +280,51 @@ impl EndpointRefreshRepository for MockServices {
 
     fn find_endpoint(
         &self,
-        _endpoint_id: EndpointId,
+        endpoint_id: EndpointId,
     ) -> BoundaryFuture<'_, Result<Option<Endpoint>, Self::Error>> {
-        Box::pin(async { Ok(None) })
+        let endpoint = self.refresh_endpoint.clone();
+        Box::pin(async move { Ok(endpoint.filter(|endpoint| endpoint.id() == endpoint_id)) })
     }
 
     fn commit_resource_generation<'a>(
         &'a self,
-        _endpoint_id: EndpointId,
-        _observations: &'a [ResourceObservation],
-        _observed_at: OffsetDateTime,
+        endpoint_id: EndpointId,
+        observations: &'a [ResourceObservation],
+        decode_failures: &'a [ResourceDecodeFailure],
+        observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
+        let endpoint = self.refresh_endpoint.clone();
+        let committed = Arc::clone(&self.committed);
+        Box::pin(async move {
+            let endpoint = endpoint.ok_or(MockError::Persistence)?;
+            let generation = RefreshGeneration::new(1).map_err(|_| MockError::Persistence)?;
+            let snapshots = observations
+                .iter()
+                .map(|observation| {
+                    ResourceSnapshot::new(
+                        ResourceId::generate(),
+                        endpoint_id,
+                        observation.feature(),
+                        observation.odata_id().clone(),
+                        observation.payload().clone(),
+                        observed_at,
+                        generation,
+                    )
+                })
+                .collect::<Vec<_>>();
+            committed
+                .lock()
+                .map_err(|_| MockError::Persistence)?
+                .replace((
+                    endpoint_id,
+                    CommittedRefresh {
+                        endpoint,
+                        snapshots: snapshots.clone(),
+                        decode_failures: decode_failures.to_vec(),
+                    },
+                ));
+            Ok(snapshots)
+        })
     }
 }
 
@@ -214,7 +335,9 @@ impl AuditEventWriter for MockServices {
         &'a self,
         _event: &'a AuditEvent,
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
+        // The refresh end-to-end test drives the audited refresh pipeline,
+        // whose start and terminal facts must be appends, not failures.
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -267,7 +390,9 @@ impl CapabilitySnapshotRepository for MockServices {
         _observations: &'a [EndpointCapabilityObservation],
         _observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async { Err(MockError::Persistence) })
+        // The refresh end-to-end test drives the complete refresh pipeline,
+        // whose capability snapshot replace must succeed.
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -528,7 +653,7 @@ impl RedfishDiscovery for MockGateway {
         _username: &'a CredentialUsername,
         _password: &'a SecretString,
     ) -> BoundaryFuture<'a, Result<rutilus_application::EndpointDiscovery, Self::Error>> {
-        Box::pin(async { Err(MockError::Probe) })
+        Box::pin(async { Ok(rutilus_application::EndpointDiscovery::new(Vec::new())) })
     }
 }
 
@@ -541,8 +666,55 @@ impl CoreResourceReader for MockGateway {
         _trust: &'a TlsTrust,
         _username: &'a CredentialUsername,
         _password: &'a SecretString,
-    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
-        Box::pin(async { Err(MockError::Probe) })
+    ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
+        let undecodable_member = self.undecodable_member;
+        Box::pin(async move {
+            if undecodable_member {
+                // The mock BMC serves a Systems collection whose second
+                // member cannot be decoded into the compiled schema: the
+                // member is skipped (§0.2.0) and the capture record travels
+                // with the read outcome into the refresh pipeline.
+                let decode_failure = ResourceDecodeFailure::try_new(
+                    ResourceODataId::parse("/redfish/v1/Systems/2")
+                        .map_err(|_| MockError::Probe)?,
+                    Some(
+                        ResourceODataType::parse("#ComputerSystem.v1_20_0.ComputerSystem")
+                            .map_err(|_| MockError::Probe)?,
+                    ),
+                    ResourceFeature::Systems,
+                    Some("Vendor".to_owned()),
+                    "schema decode failed: missing required field".to_owned(),
+                    vec![ResourceExtendedInfo::new(
+                        "Base.1.13.ResourceNotFound".to_owned(),
+                        Some("The requested resource could not be found.".to_owned()),
+                        Some("Critical".to_owned()),
+                        Some("Remove and re-add the resource.".to_owned()),
+                        vec!["MemberId".to_owned()],
+                    )],
+                )
+                .map_err(|_| MockError::Probe)?;
+                Ok(CoreResourceReadOutcome::new(
+                    vec![
+                        ResourceObservation::new(
+                            ResourceFeature::ServiceRoot,
+                            ResourceODataId::parse("/redfish/v1").map_err(|_| MockError::Probe)?,
+                            ResourceSnapshotPayload::parse(r#"{"Id":"RootService","Name":"Root"}"#)
+                                .map_err(|_| MockError::Probe)?,
+                        ),
+                        ResourceObservation::new(
+                            ResourceFeature::Systems,
+                            ResourceODataId::parse("/redfish/v1/Systems/1")
+                                .map_err(|_| MockError::Probe)?,
+                            ResourceSnapshotPayload::parse(r#"{"Id":"1","Name":"System One"}"#)
+                                .map_err(|_| MockError::Probe)?,
+                        ),
+                    ],
+                    vec![decode_failure],
+                ))
+            } else {
+                Err(MockError::Probe)
+            }
+        })
     }
 }
 
@@ -570,6 +742,21 @@ async fn get(router: &Router, path: &str) -> Result<axum::response::Response, Bo
     Ok(router
         .clone()
         .oneshot(Request::get(path).body(Body::empty())?)
+        .await?)
+}
+
+async fn post(
+    router: &Router,
+    path: &str,
+    body: Value,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    Ok(router
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
         .await?)
 }
 
@@ -787,6 +974,84 @@ async fn serves_decode_failure_records_while_the_endpoint_stays_usable()
     let body = json_body(response).await?;
     assert_eq!(body["odata_uri"], "/redfish/v1/Systems/1");
     assert_eq!(body["generation"], 7);
+    assert_eq!(
+        body["decode_failures"],
+        serde_json::json!([{
+            "odata_uri": "/redfish/v1/Systems/2",
+            "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+            "feature": "systems",
+            "oem_namespace": "Vendor",
+            "error_summary": "schema decode failed: missing required field",
+            "extended_info": [{
+                "message_id": "Base.1.13.ResourceNotFound",
+                "message": "The requested resource could not be found.",
+                "severity": "Critical",
+                "resolution": "Remove and re-add the resource.",
+                "related_properties": ["MemberId"]
+            }]
+        }])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_capture_flows_into_the_diagnostics_response() -> Result<(), Box<dyn Error>> {
+    let endpoint = known_endpoint()?;
+    let endpoint_id = endpoint.id();
+    let services = MockServices::refreshing(
+        endpoint,
+        (
+            CredentialUsername::parse("admin")?,
+            SecretString::from("password"),
+        ),
+    );
+    let router = test_router(
+        services.clone(),
+        MockGateway::with_undecodable_member(TlsCertificate::from_der(
+            b"diagnostics refresh certificate".to_vec(),
+        )?),
+    );
+
+    // The refresh batch drives the production pipeline end to end: the mock
+    // BMC's read outcome — the decoded members plus the undecodable member's
+    // §12.4 capture — is committed as one refresh Generation.
+    let response = post(
+        &router,
+        "/api/v1/endpoints/refresh",
+        serde_json::json!({ "endpoint_ids": [endpoint_id.to_string()] }),
+    )
+    .await?;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "the refresh batch must report the endpoint outcome inside the 200 report"
+    );
+
+    let (committed_endpoint_id, committed) = services
+        .committed_refresh()?
+        .ok_or("the refresh must commit one Generation")?;
+    assert_eq!(committed_endpoint_id, endpoint_id);
+    let system = committed
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.feature() == ResourceFeature::Systems)
+        .ok_or("the committed Generation must carry the decoded System")?;
+
+    // The endpoint stays fully usable (§0.2.0): the diagnostics view serves
+    // the decoded System with 200, and the skipped member's decode failure
+    // is displayed as a sibling record.
+    let response = get(
+        &router,
+        &format!(
+            "/api/v1/endpoints/{endpoint_id}/resources/{}/diagnostics",
+            system.resource_id()
+        ),
+    )
+    .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    assert_eq!(body["odata_uri"], "/redfish/v1/Systems/1");
+    assert_eq!(body["generation"], 1);
     assert_eq!(
         body["decode_failures"],
         serde_json::json!([{

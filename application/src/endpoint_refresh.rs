@@ -13,7 +13,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::{
-    AuditEventWriter, AuditRecordError, BoundaryFuture, Clock, CredentialResolver, RedfishDiscovery,
+    AuditEventWriter, AuditRecordError, BoundaryFuture, Clock, CredentialResolver,
+    RedfishDiscovery, ResourceDecodeFailure,
 };
 
 /// A typed Redfish resource projection returned by the BMC boundary.
@@ -80,6 +81,46 @@ impl ResourceObservation {
     }
 }
 
+/// The complete result of one typed core resource read: every decoded
+/// observation plus every member decode failure captured during the read
+/// (§12.4 decode-error path).
+///
+/// The outcome carries the member-level decode failures alongside the
+/// observations so the refresh pipeline can commit both as one Generation
+/// (§9.5): a member whose typed decoding failed was skipped as one odd member
+/// (§0.2.0 — the endpoint stays fully usable), and the record keeps that
+/// path visible to diagnostics instead of silently dropping it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreResourceReadOutcome {
+    observations: Vec<ResourceObservation>,
+    decode_failures: Vec<ResourceDecodeFailure>,
+}
+
+impl CoreResourceReadOutcome {
+    #[must_use]
+    pub fn new(
+        observations: Vec<ResourceObservation>,
+        decode_failures: Vec<ResourceDecodeFailure>,
+    ) -> Self {
+        Self {
+            observations,
+            decode_failures,
+        }
+    }
+
+    /// Borrows every decoded resource observation, in read order.
+    #[must_use]
+    pub fn observations(&self) -> &[ResourceObservation] {
+        &self.observations
+    }
+
+    /// Borrows every member decode failure captured during the read.
+    #[must_use]
+    pub fn decode_failures(&self) -> &[ResourceDecodeFailure] {
+        &self.decode_failures
+    }
+}
+
 /// Reads the complete 0.1 resource surface through typed Redfish navigation.
 pub trait CoreResourceReader: Send + Sync {
     type Error: Error + Send + Sync + 'static;
@@ -90,7 +131,7 @@ pub trait CoreResourceReader: Send + Sync {
         trust: &'a TlsTrust,
         username: &'a CredentialUsername,
         password: &'a SecretString,
-    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>>;
+    ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>>;
 }
 
 /// Loads an endpoint and atomically commits one complete resource Generation.
@@ -106,6 +147,7 @@ pub trait EndpointRefreshRepository: Send + Sync {
         &'a self,
         endpoint_id: EndpointId,
         observations: &'a [ResourceObservation],
+        decode_failures: &'a [ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>>;
 }
@@ -122,7 +164,7 @@ where
         trust: &'a TlsTrust,
         username: &'a CredentialUsername,
         password: &'a SecretString,
-    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+    ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
         Reader::read_core_resources(*self, address, trust, username, password)
     }
 }
@@ -144,9 +186,16 @@ where
         &'a self,
         endpoint_id: EndpointId,
         observations: &'a [ResourceObservation],
+        decode_failures: &'a [ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
-        Repository::commit_resource_generation(*self, endpoint_id, observations, observed_at)
+        Repository::commit_resource_generation(
+            *self,
+            endpoint_id,
+            observations,
+            decode_failures,
+            observed_at,
+        )
     }
 }
 
@@ -235,9 +284,15 @@ where
     }
 
     /// Loads the exact endpoint and selected credential, performs a typed core
-    /// read, commits all observations as one new Generation, then re-probes
-    /// the endpoint's advertised capabilities and atomically replaces the
-    /// complete capability snapshot at the refresh clock time.
+    /// read, commits all observations and the read's member decode failures
+    /// (§12.4) as one new Generation, then re-probes the endpoint's advertised
+    /// capabilities and atomically replaces the complete capability snapshot
+    /// at the refresh clock time.
+    ///
+    /// The decode-failure records are committed in the same transaction as
+    /// the snapshots, so they are retained or dropped with the Generation
+    /// they describe (§9.5): a failed commit keeps the last complete
+    /// snapshot — and the last Generation's records — as one intact whole.
     ///
     /// The capability snapshot is written only after the resource Generation
     /// commits, and a failed probe or failed replace fails the whole refresh
@@ -280,7 +335,7 @@ where
             .await
             .map_err(EndpointRefreshError::Credential)?
             .ok_or(EndpointRefreshError::CredentialNotFound { credential_id })?;
-        let observations = self
+        let outcome = self
             .reader
             .read_core_resources(
                 endpoint.address(),
@@ -292,7 +347,12 @@ where
             .map_err(EndpointRefreshError::Read)?;
         let snapshots = self
             .repository
-            .commit_resource_generation(endpoint_id, &observations, self.clock.now())
+            .commit_resource_generation(
+                endpoint_id,
+                outcome.observations(),
+                outcome.decode_failures(),
+                self.clock.now(),
+            )
             .await
             .map_err(EndpointRefreshError::Commit)?;
         let discovery = self
@@ -1551,6 +1611,7 @@ mod tests {
             &'a self,
             endpoint_id: EndpointId,
             observations: &'a [ResourceObservation],
+            _decode_failures: &'a [ResourceDecodeFailure],
             observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             Box::pin(async move {
@@ -1703,14 +1764,17 @@ mod tests {
             _trust: &'a TlsTrust,
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
-        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
             Box::pin(async move {
                 record(&self.events, "read")?;
                 if self.pin_mismatch {
                     return Err(MockError::TlsPinMismatch);
                 }
                 if self.succeeds {
-                    observations().map_err(|_| MockError::Reader)
+                    Ok(CoreResourceReadOutcome::new(
+                        observations().map_err(|_| MockError::Reader)?,
+                        Vec::new(),
+                    ))
                 } else {
                     Err(MockError::Reader)
                 }

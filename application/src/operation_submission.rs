@@ -527,6 +527,7 @@ mod tests {
             &'a self,
             _endpoint_id: EndpointId,
             _observations: &'a [ResourceObservation],
+            _decode_failures: &'a [crate::ResourceDecodeFailure],
             _observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             Box::pin(async { Ok(Vec::new()) })

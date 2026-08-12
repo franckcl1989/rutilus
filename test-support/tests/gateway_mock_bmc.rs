@@ -213,9 +213,10 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
     let (username, password) = credentials()?;
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The mock serves one System with its configuration surface (Bios,
     // BootOptions, SecureBoot), two Processors, one Memory module, and one
@@ -770,9 +771,10 @@ async fn dell_profile_reads_oem_dell_attributes_snapshot() -> Result<(), Box<dyn
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
     let (username, password) = credentials()?;
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The Dell read surface adds exactly the §11.5 `DellAttributes` snapshot
     // to the default 28-resource tree, in the documented read order: it is
@@ -956,9 +958,10 @@ async fn supermicro_profile_reads_oem_supermicro_documents_snapshot() -> Result<
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
     let (username, password) = credentials()?;
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The Supermicro read surface adds exactly the §11.5 `SysLockdown` and
     // `KcsInterface` snapshots to the default 28-resource tree, in the
@@ -1161,9 +1164,10 @@ async fn nvidia_profile_reads_system_config_profile_chain_snapshots() -> Result<
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
     let (username, password) = credentials()?;
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The NVIDIA read surface adds exactly the four §11.5
     // system-config-profile snapshots to the default 28-resource tree (the
@@ -1659,9 +1663,10 @@ async fn lenovo_profile_reads_lenovo_security_service_snapshot() -> Result<(), B
     let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
     let (username, password) = credentials()?;
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The Lenovo read surface adds exactly the §11.5 `SecurityService`
     // snapshot to the default 28-resource tree, in the documented read order:
@@ -1823,9 +1828,10 @@ async fn liteon_profile_reads_both_power_supply_families_with_distinct_identitie
         "the power-supplies probe must fetch the subsystem chain exactly once"
     );
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The read surface adds exactly the two supply snapshots to the default
     // 28-resource tree: the standard `power-supplies` family and the §11.5
@@ -1905,9 +1911,10 @@ async fn delta_profile_reads_both_power_supply_families_with_distinct_identities
         "the power-supplies probe must fetch the subsystem chain exactly once"
     );
 
-    let resources = gateway
+    let outcome = gateway
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
+    let resources = outcome.projections();
 
     // The read surface adds exactly the two supply snapshots to the default
     // 28-resource tree: the standard `power-supplies` family and the §11.5
@@ -2031,9 +2038,10 @@ async fn no_oem_profiles_read_the_default_core_tree_without_oem_snapshots()
         let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
         let (username, password) = credentials()?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(&address, &trust, &username, &password)
             .await?;
+        let resources = outcome.projections();
 
         // The read surface is the default 28-resource tree with zero OEM
         // snapshots: the exact feature order of the default profile, so any

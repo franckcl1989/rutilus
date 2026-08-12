@@ -96,8 +96,8 @@ pub use endpoint_onboarding::{
 };
 pub use endpoint_refresh::{
     AuditedEndpointRefresh, AuditedEndpointRefreshError, CapabilitySnapshotRepository,
-    CoreResourceReader, EndpointRefresh, EndpointRefreshError, EndpointRefreshRepository,
-    RefreshAuditStage, ResourceObservation,
+    CoreResourceReadOutcome, CoreResourceReader, EndpointRefresh, EndpointRefreshError,
+    EndpointRefreshRepository, RefreshAuditStage, ResourceObservation,
 };
 pub use endpoint_resources::{
     CoreResourceCommon, CoreResourceDetails, CoreResourceSummary, EndpointResourceInventory,

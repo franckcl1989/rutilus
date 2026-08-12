@@ -2,11 +2,13 @@ use std::error::Error as StdError;
 
 use nv_redfish::core::ODataId;
 use rutilus_application::{
-    BoundaryFuture, CommandExecutor, CommandOutcome, CommandVerifier, CoreResourceReader,
+    BoundaryFuture, CommandExecutor, CommandOutcome, CommandVerifier,
+    CoreResourceReadOutcome as ApplicationCoreResourceReadOutcome, CoreResourceReader,
     CredentialResolver, DispatchVerdict, DispatchVerdictClassifier, EndpointDiscovery,
-    EndpointRefreshRepository, RedfishDiscovery, ResourceObservation, SystemCaEvaluation,
-    TaskObservation as ApplicationTaskObservation, TaskReader, TlsIdentityObservation,
-    TlsIdentityProbe, UpdateArtifactPayload, UpdateExecutor, VerificationVerdict,
+    EndpointRefreshRepository, RedfishDiscovery, ResourceDecodeFailure, ResourceExtendedInfo,
+    ResourceObservation, SystemCaEvaluation, TaskObservation as ApplicationTaskObservation,
+    TaskReader, TlsIdentityObservation, TlsIdentityProbe, UpdateArtifactPayload, UpdateExecutor,
+    VerificationVerdict,
 };
 use rutilus_domain::{
     CredentialUsername, EndpointAddress, EndpointId, RedfishCommand, ResourceODataId,
@@ -18,9 +20,9 @@ use thiserror::Error;
 
 use crate::{
     CommandExecutionError, CommandExecutionOutcome, CommandVerificationError,
-    CommandVerificationOutcome, CoreResourceReadError, RedfishGateway, RedfishServiceRootError,
-    SystemCaStatus, TaskMessageObservation, TaskObservation, TaskReadError, TlsProbeError,
-    UpdateArtifactUpload,
+    CommandVerificationOutcome, CoreResourceReadError, DecodeFailureObservation, RedfishGateway,
+    RedfishServiceRootError, SystemCaStatus, TaskMessageObservation, TaskObservation,
+    TaskReadError, TlsProbeError, UpdateArtifactUpload,
 };
 
 impl TlsIdentityProbe for RedfishGateway {
@@ -70,13 +72,14 @@ impl CoreResourceReader for RedfishGateway {
         trust: &'a TlsTrust,
         username: &'a CredentialUsername,
         password: &'a SecretString,
-    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+    ) -> BoundaryFuture<'a, Result<ApplicationCoreResourceReadOutcome, Self::Error>> {
         Box::pin(async move {
-            let projections =
+            let outcome =
                 RedfishGateway::read_core_resources(self, address, trust, username, password)
                     .await?;
-            Ok(projections
-                .into_iter()
+            let observations = outcome
+                .projections()
+                .iter()
                 .map(|projection| {
                     let mut observation = ResourceObservation::new(
                         projection.feature(),
@@ -88,9 +91,48 @@ impl CoreResourceReader for RedfishGateway {
                     }
                     observation
                 })
-                .collect())
+                .collect();
+            Ok(ApplicationCoreResourceReadOutcome::new(
+                observations,
+                outcome
+                    .decode_failures()
+                    .iter()
+                    .filter_map(project_decode_failure)
+                    .collect(),
+            ))
         })
     }
+}
+
+/// Maps one gateway decode-failure capture onto the application record type.
+///
+/// The mapping is total for every capture the gateway produces: the summary
+/// and OEM namespace come from the gateway's own closed mappings, so the
+/// record-layer construction can only refuse a value a future gateway change
+/// made unrepresentable — the record is then left behind (refused, never
+/// fabricated), exactly like an `@odata.id` the domain validator refuses.
+fn project_decode_failure(failure: &DecodeFailureObservation) -> Option<ResourceDecodeFailure> {
+    ResourceDecodeFailure::try_new(
+        failure.odata_uri().clone(),
+        failure.odata_type().cloned(),
+        failure.feature(),
+        failure.oem_namespace().map(str::to_owned),
+        failure.error_summary().to_owned(),
+        failure
+            .extended_info()
+            .iter()
+            .map(|entry| {
+                ResourceExtendedInfo::new(
+                    entry.message_id().to_owned(),
+                    entry.message().map(str::to_owned),
+                    entry.severity().map(str::to_owned),
+                    entry.resolution().map(str::to_owned),
+                    entry.related_properties().to_vec(),
+                )
+            })
+            .collect(),
+    )
+    .ok()
 }
 
 /// The Redfish gateway surface the command executor delegates to.
@@ -685,7 +727,8 @@ mod tests {
     use rutilus_application::{
         CommandExecutor, CommandOutcome, CommandVerifier, CoreResourceReader, DispatchVerdict,
         DispatchVerdictClassifier, EndpointRefreshRepository, RedfishDiscovery,
-        ResourceObservation, TaskReader, TlsIdentityProbe, UpdateArtifactPayload, UpdateExecutor,
+        ResourceDecodeFailure, ResourceObservation, TaskReader, TlsIdentityProbe,
+        UpdateArtifactPayload, UpdateExecutor,
     };
     use rutilus_domain::{
         ArtifactName, CredentialId, CredentialUsername, Endpoint, EndpointAddress,
@@ -761,6 +804,7 @@ mod tests {
             &'a self,
             _endpoint_id: EndpointId,
             _observations: &'a [ResourceObservation],
+            _decode_failures: &'a [ResourceDecodeFailure],
             _observed_at: time::OffsetDateTime,
         ) -> Pin<
             Box<

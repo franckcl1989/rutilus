@@ -773,7 +773,7 @@ mod tests {
             outcome.entry_count() >= 3,
             "database, key, and marker entries"
         );
-        assert_eq!(outcome.schema_version(), 21);
+        assert_eq!(outcome.schema_version(), 22);
         let original_key_bytes = std::fs::read(paths.master_key_path())?;
 
         // Damage the live data after the backup.

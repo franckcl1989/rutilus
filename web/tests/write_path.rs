@@ -18,13 +18,13 @@ use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt as _;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, EventRepository, OperationStore,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, SystemCaEvaluation, TelemetryRepository, TlsIdentityObservation,
-    TlsIdentityProbe,
+    CapabilitySnapshotRepository, ClassifiedBatchChild, Clock, CoreResourceReadOutcome,
+    CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, EventRepository,
+    OperationStore, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceDecodeFailure, ResourceObservation, StoredCapability, SystemCaEvaluation,
+    TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, CapabilityState, Credential,
@@ -279,6 +279,7 @@ impl EndpointRefreshRepository for MockServices {
         &'a self,
         endpoint_id: EndpointId,
         observations: &'a [ResourceObservation],
+        _decode_failures: &'a [ResourceDecodeFailure],
         observed_at: OffsetDateTime,
     ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
         Box::pin(async move {
@@ -677,7 +678,7 @@ impl CoreResourceReader for MockGateway {
         _trust: &'a TlsTrust,
         _username: &'a CredentialUsername,
         _password: &'a SecretString,
-    ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+    ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
         Box::pin(async move {
             let mut observations = vec![
                 ResourceObservation::new(
@@ -727,7 +728,7 @@ impl CoreResourceReader for MockGateway {
                     .collect::<Result<Vec<_>, _>>()?,
                 );
             }
-            Ok(observations)
+            Ok(CoreResourceReadOutcome::new(observations, Vec::new()))
         })
     }
 }

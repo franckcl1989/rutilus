@@ -317,7 +317,7 @@ use rutilus_domain::{
     NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
     OemCommand, PowerSupplyId, PowerSupplyReset, RedfishCommand, ResetKeysType, ResetType,
     ResourceEtag, ResourceEtagError, ResourceFeature, ResourceODataId, ResourceODataIdError,
-    ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
+    ResourceODataType, ResourceSnapshotPayload, ResourceSnapshotPayloadError, SecureBootCommand,
     SetBootSourceOverride, SystemCommand, TelemetryCommand, TlsIdentityChanged, TlsTrust,
     TokenType, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
     UpdateControl, UpdateMetricDefinition, UpdateMetricReportDefinition, UpdatePatch,
@@ -516,7 +516,8 @@ impl RedfishGateway {
     /// Service Root and collection types; the gateway never constructs a BMC
     /// resource URI. Member-granular failures are skippable (§0.2.0
     /// acceptance): one member that cannot be fetched or represented is left
-    /// behind without disabling its collection or the rest of the read.
+    /// behind without disabling its collection or the rest of the read, and
+    /// is captured as one §12.4 decode-failure record in the outcome.
     /// Service Root and collection-document failures still abort the complete
     /// read so the application cannot commit a partial refresh Generation.
     /// Session tokens are scoped to this call, kept only in memory, and
@@ -532,7 +533,7 @@ impl RedfishGateway {
         trust: &TlsTrust,
         username: &CredentialUsername,
         password: &SecretString,
-    ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+    ) -> Result<CoreResourceReadOutcome, CoreResourceReadError> {
         let (bmc, http, identity) = self.authenticated_bmc(address, trust, username, password)?;
         let root = ServiceRoot::new(Arc::clone(&bmc))
             .await
@@ -1382,25 +1383,32 @@ fn map_event_severity(
 /// Members are fetched one at a time from the decoded collection documents
 /// instead of through the `nv-redfish` wholesale accessors, because the
 /// wholesale accessors abort on the first undecodable member. Fetching
-/// individually is what makes the §0.2.0 member-skip acceptance implementable.
+/// individually is what makes the §0.2.0 member-skip acceptance implementable;
+/// every skipped member is captured as one §12.4 decode-failure record.
 async fn read_authenticated_core_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
-) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+) -> Result<CoreResourceReadOutcome, CoreResourceReadError> {
+    let mut captures = Vec::new();
     let mut resources = vec![service_root_projection(root)?];
-    resources.extend(read_root_oem_surfaces(root)?);
-    resources.extend(read_systems_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_chassis_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_manager_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_account_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_software_inventory_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_event_service_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_telemetry_service_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_task_service_resources(bmc, root, identity, trust).await?);
-    resources.extend(read_power_equipment_resources(bmc, root, identity, trust).await?);
-    Ok(resources)
+    resources.extend(read_root_oem_surfaces(root, &mut captures)?);
+    resources.extend(read_systems_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources.extend(read_chassis_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources.extend(read_manager_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources.extend(read_account_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources.extend(
+        read_software_inventory_resources(bmc, root, identity, trust, &mut captures).await?,
+    );
+    resources
+        .extend(read_event_service_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources
+        .extend(read_telemetry_service_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources.extend(read_task_service_resources(bmc, root, identity, trust, &mut captures).await?);
+    resources
+        .extend(read_power_equipment_resources(bmc, root, identity, trust, &mut captures).await?);
+    Ok(CoreResourceReadOutcome::new(resources, captures))
 }
 
 /// Reads the root-level `PowerEquipment` service document and its
@@ -1417,15 +1425,29 @@ async fn read_power_equipment_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(power_equipment) = root.root.power_equipment.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(equipment) = fetch_member(power_equipment, bmc, identity, trust).await? else {
+    let Some(equipment) = fetch_member(
+        power_equipment,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::PowerEquipment],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) = member_projection(power_equipment_projection(&equipment))? {
+    if let Some(projection) = member_projection(
+        power_equipment_projection(&equipment),
+        captures,
+        equipment.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -1434,6 +1456,8 @@ async fn read_power_equipment_resources(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::PowerEquipment,
             power_distribution_projection,
         )
         .await?,
@@ -1450,11 +1474,17 @@ async fn read_power_equipment_resources(
 /// ("资源存在才呈现"); a failed Systems collection document aborts the read
 /// with the existing classified error semantics. Only individual members and
 /// singletons are skippable.
+// The Systems reader covers the member loop plus every member-scoped family
+// navigation in one place; the capture threading pushed it over the pedantic
+// line budget, so the lint is scoped here exactly like the fixture-sequence
+// tests.
+#[allow(clippy::too_many_lines)]
 async fn read_systems_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(systems) = root.root.systems.as_ref() else {
         return Ok(Vec::new());
@@ -1465,18 +1495,39 @@ async fn read_systems_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in &collection.members {
-        let Some(system) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(system) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::Systems],
+        )
+        .await?
+        else {
             continue;
         };
-        let Some(system_projection) = member_projection(computer_system_projection(&system))?
+        let Some(system_projection) = member_projection(
+            computer_system_projection(&system),
+            captures,
+            system.odata_id(),
+        )?
         else {
             continue;
         };
         resources.push(system_projection);
-        resources.extend(read_system_nvidia_oem(&system, bmc, identity, trust).await?);
+        resources.extend(read_system_nvidia_oem(&system, bmc, identity, trust, captures).await?);
         resources.extend(
-            read_singleton_resources(system.bios.as_ref(), bmc, identity, trust, bios_projection)
-                .await?,
+            read_singleton_resources(
+                system.bios.as_ref(),
+                bmc,
+                identity,
+                trust,
+                captures,
+                ResourceFeature::Bios,
+                bios_projection,
+            )
+            .await?,
         );
         resources.extend(
             read_collection_resources(
@@ -1487,6 +1538,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::BootOptions,
                 boot_option_projection,
             )
             .await?,
@@ -1497,6 +1550,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::SecureBoot,
                 secure_boot_projection,
             )
             .await?,
@@ -1507,6 +1562,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Processors,
                 processor_projection,
             )
             .await?,
@@ -1517,6 +1574,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Memory,
                 memory_projection,
             )
             .await?,
@@ -1527,6 +1586,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Storages,
                 storage_projection,
             )
             .await?,
@@ -1537,6 +1598,8 @@ async fn read_systems_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::PcieDevices,
                 pcie_device_projection,
             )
             .await?,
@@ -1558,11 +1621,17 @@ async fn read_systems_resources(
 /// failed Chassis collection document aborts the read with the existing
 /// classified error semantics. Only individual members and singletons are
 /// skippable.
+// The Chassis reader covers the member loop plus every member-scoped family
+// navigation in one place; the capture threading pushed it over the pedantic
+// line budget, so the lint is scoped here exactly like the fixture-sequence
+// tests.
+#[allow(clippy::too_many_lines)]
 async fn read_chassis_resources(
     bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(chassis) = root.root.chassis.as_ref() else {
         return Ok(Vec::new());
@@ -1573,16 +1642,33 @@ async fn read_chassis_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in &collection.members {
-        let Some(chassis) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(chassis) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::Chassis],
+        )
+        .await?
+        else {
             continue;
         };
-        let Some(projection) = member_projection(chassis_projection(&chassis))? else {
+        let Some(projection) =
+            member_projection(chassis_projection(&chassis), captures, chassis.odata_id())?
+        else {
             continue;
         };
         resources.push(projection);
         resources.extend(
-            read_network_adapter_resources(chassis.network_adapters.as_ref(), bmc, identity, trust)
-                .await?,
+            read_network_adapter_resources(
+                chassis.network_adapters.as_ref(),
+                bmc,
+                identity,
+                trust,
+                captures,
+            )
+            .await?,
         );
         resources.extend(
             read_singleton_resources(
@@ -1590,6 +1676,8 @@ async fn read_chassis_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Power,
                 power_projection,
             )
             .await?,
@@ -1600,6 +1688,8 @@ async fn read_chassis_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Thermal,
                 thermal_projection,
             )
             .await?,
@@ -1610,6 +1700,8 @@ async fn read_chassis_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Sensors,
                 sensor_projection,
             )
             .await?,
@@ -1620,12 +1712,15 @@ async fn read_chassis_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::Controls,
                 control_projection,
             )
             .await?,
         );
         resources.extend(
-            read_assembly_resources(chassis.assembly.as_ref(), bmc, identity, trust).await?,
+            read_assembly_resources(chassis.assembly.as_ref(), bmc, identity, trust, captures)
+                .await?,
         );
         resources.extend(
             read_singleton_resources(
@@ -1633,15 +1728,24 @@ async fn read_chassis_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::EnvironmentMetrics,
                 environment_metrics_projection,
             )
             .await?,
         );
         resources.extend(
-            read_power_supply_resources(chassis.power_subsystem.as_ref(), bmc, identity, trust)
-                .await?,
+            read_power_supply_resources(
+                chassis.power_subsystem.as_ref(),
+                bmc,
+                identity,
+                trust,
+                captures,
+            )
+            .await?,
         );
-        resources.extend(read_chassis_oem_resources(&chassis, bmc, identity, trust).await?);
+        resources
+            .extend(read_chassis_oem_resources(&chassis, bmc, identity, trust, captures).await?);
     }
     Ok(resources)
 }
@@ -1661,11 +1765,21 @@ async fn read_power_supply_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(power_subsystem) = power_subsystem else {
         return Ok(Vec::new());
     };
-    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+    let Some(subsystem) = fetch_member(
+        power_subsystem,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::PowerSupplies],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_collection_resources(
@@ -1673,6 +1787,8 @@ async fn read_power_supply_resources(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::PowerSupplies,
         power_supply_projection,
     )
     .await
@@ -1694,6 +1810,7 @@ async fn read_chassis_oem_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let mut resources = Vec::new();
     if chassis
@@ -1703,7 +1820,9 @@ async fn read_chassis_oem_resources(
         .map(String::as_str)
         == Some(LITEON_CHASSIS_MANUFACTURER)
     {
-        resources.extend(read_liteon_power_supply_resources(chassis, bmc, identity, trust).await?);
+        resources.extend(
+            read_liteon_power_supply_resources(chassis, bmc, identity, trust, captures).await?,
+        );
     }
     let advertises_delta = chassis
         .base
@@ -1712,7 +1831,9 @@ async fn read_chassis_oem_resources(
         .as_ref()
         .is_some_and(|oem| oem.additional_properties.get(DELTA_OEM_KEY).is_some());
     if advertises_delta {
-        resources.extend(read_delta_power_supply_resources(chassis, bmc, identity, trust).await?);
+        resources.extend(
+            read_delta_power_supply_resources(chassis, bmc, identity, trust, captures).await?,
+        );
     }
     Ok(resources)
 }
@@ -1735,11 +1856,21 @@ async fn read_liteon_power_supply_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(power_subsystem) = &chassis.power_subsystem else {
         return Ok(Vec::new());
     };
-    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+    let Some(subsystem) = fetch_member(
+        power_subsystem,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemLiteOnPowerSupply],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let Some(power_supplies) = &subsystem.power_supplies else {
@@ -1753,10 +1884,23 @@ async fn read_liteon_power_supply_resources(
     .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in &collection.members {
-        let Some(supply) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(supply) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::OemLiteOnPowerSupply],
+        )
+        .await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(liteon_power_supply_projection(&supply))? {
+        if let Some(projection) = member_projection(
+            liteon_power_supply_projection(&supply),
+            captures,
+            supply.odata_id(),
+        )? {
             resources.push(projection);
         }
     }
@@ -1778,11 +1922,21 @@ async fn read_delta_power_supply_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(power_subsystem) = &chassis.power_subsystem else {
         return Ok(Vec::new());
     };
-    let Some(subsystem) = fetch_member(power_subsystem, bmc, identity, trust).await? else {
+    let Some(subsystem) = fetch_member(
+        power_subsystem,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemDeltaPowerSupply],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let Some(power_supplies) = &subsystem.power_supplies else {
@@ -1794,14 +1948,26 @@ async fn read_delta_power_supply_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in collection.members() {
-        let Some(supply) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(supply) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::OemDeltaPowerSupply],
+        )
+        .await?
+        else {
             continue;
         };
         let Some(delta) = decode_delta_segment(&supply) else {
             continue;
         };
-        if let Some(projection) = member_projection(delta_power_supply_projection(&supply, &delta))?
-        {
+        if let Some(projection) = member_projection(
+            delta_power_supply_projection(&supply, &delta),
+            captures,
+            supply.odata_id(),
+        )? {
             resources.push(projection);
         }
     }
@@ -1845,6 +2011,7 @@ async fn read_network_adapter_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(network_adapters) = network_adapters else {
         return Ok(Vec::new());
@@ -1855,10 +2022,23 @@ async fn read_network_adapter_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in collection.members() {
-        let Some(adapter) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(adapter) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::NetworkAdapters],
+        )
+        .await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(network_adapter_projection(&adapter))? {
+        if let Some(projection) = member_projection(
+            network_adapter_projection(&adapter),
+            captures,
+            adapter.odata_id(),
+        )? {
             resources.push(projection);
         }
         resources.extend(
@@ -1867,6 +2047,8 @@ async fn read_network_adapter_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::NetworkDeviceFunctions,
                 network_device_function_projection,
             )
             .await?,
@@ -1889,6 +2071,7 @@ async fn read_manager_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(managers) = root.root.managers.as_ref() else {
         return Ok(Vec::new());
@@ -1899,10 +2082,21 @@ async fn read_manager_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in &collection.members {
-        let Some(manager) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(manager) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::Managers],
+        )
+        .await?
+        else {
             continue;
         };
-        let Some(projection) = member_projection(manager_projection(&manager))? else {
+        let Some(projection) =
+            member_projection(manager_projection(&manager), captures, manager.odata_id())?
+        else {
             continue;
         };
         resources.push(projection);
@@ -1912,6 +2106,8 @@ async fn read_manager_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::EthernetInterfaces,
                 ethernet_interface_projection,
             )
             .await?,
@@ -1922,6 +2118,8 @@ async fn read_manager_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::LogServices,
                 log_service_projection,
             )
             .await?,
@@ -1932,6 +2130,8 @@ async fn read_manager_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::ManagerNetworkProtocol,
                 manager_network_protocol_projection,
             )
             .await?,
@@ -1942,16 +2142,20 @@ async fn read_manager_resources(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::HostInterfaces,
                 host_interface_projection,
             )
             .await?,
         );
-        resources.extend(read_manager_dell_attributes(&manager, bmc, identity, trust).await?);
-        resources.extend(read_manager_supermicro_oem(&manager, bmc, identity, trust).await?);
-        resources.extend(read_manager_nvidia_oem(&manager, bmc, identity, trust).await?);
-        resources.extend(read_manager_lenovo_oem(&manager, bmc, identity, trust).await?);
-        resources.extend(read_manager_ami_oem(&manager, bmc, identity, trust).await?);
-        resources.extend(read_manager_hpe_oem(&manager)?);
+        resources
+            .extend(read_manager_dell_attributes(&manager, bmc, identity, trust, captures).await?);
+        resources
+            .extend(read_manager_supermicro_oem(&manager, bmc, identity, trust, captures).await?);
+        resources.extend(read_manager_nvidia_oem(&manager, bmc, identity, trust, captures).await?);
+        resources.extend(read_manager_lenovo_oem(&manager, bmc, identity, trust, captures).await?);
+        resources.extend(read_manager_ami_oem(&manager, bmc, identity, trust, captures).await?);
+        resources.extend(read_manager_hpe_oem(&manager, captures)?);
     }
     Ok(resources)
 }
@@ -1977,6 +2181,7 @@ async fn read_manager_dell_attributes(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let advertises_dell = manager
         .base
@@ -1992,17 +2197,30 @@ async fn read_manager_dell_attributes(
         manager.odata_id(),
         manager.base.id
     ));
-    let attributes = match NavProperty::<DellAttributesSchema>::new_reference(odata_id)
+    let attributes = match NavProperty::<DellAttributesSchema>::new_reference(odata_id.clone())
         .get(bmc)
         .await
     {
         Ok(attributes) => attributes,
         Err(source) => {
-            skip_member_failure(source, identity, trust)?;
+            let extended_info = member_failure_extended_info(&source);
+            let classification = classify_member_failure(source, identity, trust)?;
+            capture_fetch_failure(
+                captures,
+                &odata_id,
+                &[ResourceFeature::OemDell],
+                classification,
+                &extended_info,
+            );
             return Ok(Vec::new());
         }
     };
-    let Some(projection) = member_projection(dell_attributes_projection(&attributes))? else {
+    let Some(projection) = member_projection(
+        dell_attributes_projection(&attributes),
+        captures,
+        attributes.odata_id(),
+    )?
+    else {
         return Ok(Vec::new());
     };
     Ok(vec![projection])
@@ -2031,6 +2249,7 @@ async fn read_manager_supermicro_oem(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(oem_value) = manager
         .base
@@ -2044,10 +2263,21 @@ async fn read_manager_supermicro_oem(
     // The embedded `Oem.Supermicro` value is vendor-shaped until the compiled
     // `smc_manager_extensions` schema decodes it; a segment the compiled
     // schema rejects is one odd manager surface and leaves the whole
-    // Supermicro family absent, exactly like an undecodable member.
-    let extensions: SmcManagerExtensionsSchema = match serde_json::from_value(oem_value.clone()) {
-        Ok(extensions) => extensions,
-        Err(_) => return Ok(Vec::new()),
+    // Supermicro family absent, exactly like an undecodable member, and is
+    // captured as one §12.4 decode-failure record per absent family.
+    let Some(extensions) =
+        serde_json::from_value::<SmcManagerExtensionsSchema>(oem_value.clone()).ok()
+    else {
+        capture_segment_decode_failure(
+            captures,
+            manager.odata_id(),
+            &[
+                ResourceFeature::OemSmcSysLockdown,
+                ResourceFeature::OemSmcKcsInterface,
+            ],
+            "the embedded Oem.Supermicro segment could not be decoded into the compiled schema",
+        );
+        return Ok(Vec::new());
     };
     let mut resources = Vec::new();
     // Each present navigation property follows the singleton decision: an
@@ -2059,6 +2289,8 @@ async fn read_manager_supermicro_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemSmcSysLockdown,
             smc_sys_lockdown_projection,
         )
         .await?,
@@ -2069,6 +2301,8 @@ async fn read_manager_supermicro_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemSmcKcsInterface,
             smc_kcs_interface_projection,
         )
         .await?,
@@ -2123,11 +2357,16 @@ async fn read_manager_supermicro_oem(
 /// whether the chain exists and one odd chain surface must not erase the
 /// readable remainder; a failed projection skips the member through
 /// `member_projection`.
+// The NVIDIA manager reader covers both chains and every sub-navigation in
+// one place; the capture threading pushed it over the pedantic line budget,
+// so the lint is scoped here exactly like the fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
 async fn read_manager_nvidia_oem(
     manager: &ManagerSchema,
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nvidia) = manager
         .base
@@ -2138,22 +2377,43 @@ async fn read_manager_nvidia_oem(
     else {
         return Ok(Vec::new());
     };
-    let Some(power_compliance) =
-        decode_nvidia_manager_navigation(nvidia, bmc, identity, trust).await?
+    let Some(power_compliance) = decode_nvidia_manager_navigation(
+        nvidia,
+        bmc,
+        identity,
+        trust,
+        captures,
+        manager.odata_id(),
+    )
+    .await?
     else {
         return Ok(Vec::new());
     };
     let power_compliance =
         NavProperty::<NvidiaPowerComplianceManagerSchema>::new_reference(power_compliance);
-    let Some(compliance) = fetch_member(&power_compliance, bmc, identity, trust).await? else {
+    let Some(compliance) = fetch_member(
+        &power_compliance,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[
+            ResourceFeature::OemNvidiaPowerCompliance,
+            ResourceFeature::OemNvidiaManagedEntity,
+        ],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
     // The power-compliance family: the chain-root document first, then its
     // sub-chains in the compiled navigation order.
-    if let Some(projection) =
-        member_projection(nvidia_power_compliance_manager_projection(&compliance))?
-    {
+    if let Some(projection) = member_projection(
+        nvidia_power_compliance_manager_projection(&compliance),
+        captures,
+        compliance.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -2162,6 +2422,7 @@ async fn read_manager_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
         )
         .await?,
     );
@@ -2171,6 +2432,8 @@ async fn read_manager_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemNvidiaPowerCompliance,
             nvidia_power_policy_projection,
         )
         .await?,
@@ -2181,6 +2444,8 @@ async fn read_manager_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemNvidiaPowerCompliance,
             nvidia_power_policy_projection,
         )
         .await?,
@@ -2194,12 +2459,19 @@ async fn read_manager_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
         )
         .await?,
     );
     resources.extend(
-        read_nvidia_power_state_group(compliance.power_state_group.as_ref(), bmc, identity, trust)
-            .await?,
+        read_nvidia_power_state_group(
+            compliance.power_state_group.as_ref(),
+            bmc,
+            identity,
+            trust,
+            captures,
+        )
+        .await?,
     );
     resources.extend(
         read_singleton_resources(
@@ -2207,6 +2479,8 @@ async fn read_manager_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemNvidiaPowerCompliance,
             nvidia_psu_redundancy_projection,
         )
         .await?,
@@ -2240,6 +2514,7 @@ async fn read_manager_lenovo_oem(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(oem_value) = manager
         .base
@@ -2253,10 +2528,18 @@ async fn read_manager_lenovo_oem(
     // The embedded `Oem.Lenovo` value is vendor-shaped until the compiled
     // untagged `LenovoManagerSchema` decodes it; a segment the compiled
     // schema rejects is one odd manager surface and leaves the whole Lenovo
-    // family absent, exactly like an undecodable member.
-    let lenovo_manager: LenovoManagerSchema = match serde_json::from_value(oem_value.clone()) {
-        Ok(segment) => segment,
-        Err(_) => return Ok(Vec::new()),
+    // family absent, exactly like an undecodable member, and is captured as
+    // one §12.4 decode-failure record.
+    let Some(lenovo_manager) =
+        serde_json::from_value::<LenovoManagerSchema>(oem_value.clone()).ok()
+    else {
+        capture_segment_decode_failure(
+            captures,
+            manager.odata_id(),
+            &[ResourceFeature::OemLenovoSecurityService],
+            "the embedded Oem.Lenovo segment could not be decoded into the compiled schema",
+        );
+        return Ok(Vec::new());
     };
     // The two untagged versions flatten the same unversioned `base` with the
     // `Security` navigation, so either arm resolves the same reference: the
@@ -2272,6 +2555,8 @@ async fn read_manager_lenovo_oem(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemLenovoSecurityService,
         lenovo_security_service_projection,
     )
     .await
@@ -2294,26 +2579,58 @@ async fn read_manager_lenovo_oem(
 /// forbids fabricating a vendor URL to fetch).
 fn read_root_oem_surfaces(
     root: &ServiceRoot<UpstreamBmc>,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let oem = root.root.base.base.oem.as_ref();
     let mut resources = Vec::new();
     // AMI: the embedded `Oem.Ami` value is vendor-shaped until the compiled
     // `AmiServiceRoot` schema decodes it; a segment the compiled schema
     // rejects is one odd root surface and leaves the AMI service-root family
-    // absent, exactly like an undecodable member.
-    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Ami"))
-        && let Ok(segment) = serde_json::from_value::<AmiServiceRootSchema>(value.clone())
-        && let Some(projection) = member_projection(ami_service_root_projection(root, &segment))?
-    {
-        resources.push(projection);
+    // absent, exactly like an undecodable member, and is captured as one
+    // §12.4 decode-failure record.
+    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Ami")) {
+        match serde_json::from_value::<AmiServiceRootSchema>(value.clone()) {
+            Ok(segment) => {
+                if let Some(projection) = member_projection(
+                    ami_service_root_projection(root, &segment),
+                    captures,
+                    root.odata_id(),
+                )? {
+                    resources.push(projection);
+                }
+            }
+            Err(_) => {
+                capture_segment_decode_failure(
+                    captures,
+                    root.odata_id(),
+                    &[ResourceFeature::OemAmiServiceRoot],
+                    "the embedded Oem.Ami segment could not be decoded into the compiled schema",
+                );
+            }
+        }
     }
     // HPE: the embedded `Oem.Hpe` value carries the `HpeiLoServiceExt`
     // segment; the same embedded-segment semantics apply.
-    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Hpe"))
-        && let Ok(segment) = serde_json::from_value::<HpeiLoServiceExtSchema>(value.clone())
-        && let Some(projection) = member_projection(hpe_ilo_service_ext_projection(root, &segment))?
-    {
-        resources.push(projection);
+    if let Some(value) = oem.and_then(|oem| oem.additional_properties.get("Hpe")) {
+        match serde_json::from_value::<HpeiLoServiceExtSchema>(value.clone()) {
+            Ok(segment) => {
+                if let Some(projection) = member_projection(
+                    hpe_ilo_service_ext_projection(root, &segment),
+                    captures,
+                    root.odata_id(),
+                )? {
+                    resources.push(projection);
+                }
+            }
+            Err(_) => {
+                capture_segment_decode_failure(
+                    captures,
+                    root.odata_id(),
+                    &[ResourceFeature::OemHpeILoServiceExt],
+                    "the embedded Oem.Hpe segment could not be decoded into the compiled schema",
+                );
+            }
+        }
     }
     Ok(resources)
 }
@@ -2337,6 +2654,7 @@ async fn read_manager_ami_oem(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let oem = manager.base.base.oem.as_ref();
     let advertises_ami = oem.is_some_and(|oem| oem.additional_properties.get("Ami").is_some());
@@ -2355,6 +2673,8 @@ async fn read_manager_ami_oem(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemAmiConfigBmc,
         ami_config_bmc_projection,
     )
     .await
@@ -2376,6 +2696,7 @@ async fn read_manager_ami_oem(
 /// target.
 fn read_manager_hpe_oem(
     manager: &ManagerSchema,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(oem_value) = manager
         .base
@@ -2386,15 +2707,24 @@ fn read_manager_hpe_oem(
     else {
         return Ok(Vec::new());
     };
-    let hpe: HpeManagerSchema = match serde_json::from_value(oem_value.clone()) {
-        Ok(segment) => segment,
-        Err(_) => return Ok(Vec::new()),
+    let Some(hpe) = serde_json::from_value::<HpeManagerSchema>(oem_value.clone()).ok() else {
+        capture_segment_decode_failure(
+            captures,
+            manager.odata_id(),
+            &[ResourceFeature::OemHpeManager],
+            "the embedded Oem.Hpe segment could not be decoded into the compiled schema",
+        );
+        return Ok(Vec::new());
     };
     let odata_id = ODataId::from(format!(
         "{}/Oem/Hpe",
         manager.odata_id().to_string().trim_end_matches('/')
     ));
-    let Some(projection) = member_projection(hpe_manager_projection(&hpe, &odata_id, manager))?
+    let Some(projection) = member_projection(
+        hpe_manager_projection(&hpe, &odata_id, manager),
+        captures,
+        &odata_id,
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -2424,6 +2754,8 @@ async fn decode_nvidia_manager_navigation(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    carrier_uri: &ODataId,
 ) -> Result<Option<ODataId>, CoreResourceReadError> {
     if is_nvidia_reference_form(nvidia) {
         let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
@@ -2432,7 +2764,19 @@ async fn decode_nvidia_manager_navigation(
         let navigation = NavProperty::<NvidiaManagerSegmentReferenceSchema>::new_reference(
             ODataId::from(id.to_owned()),
         );
-        let Some(segment) = fetch_member(&navigation, bmc, identity, trust).await? else {
+        let Some(segment) = fetch_member(
+            &navigation,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[
+                ResourceFeature::OemNvidiaPowerCompliance,
+                ResourceFeature::OemNvidiaManagedEntity,
+            ],
+        )
+        .await?
+        else {
             return Ok(None);
         };
         return Ok(segment
@@ -2443,13 +2787,25 @@ async fn decode_nvidia_manager_navigation(
     }
     match nvidia_segment_kind(nvidia) {
         Some(NvidiaSegmentKind::Manager) => {
-            match serde_json::from_value::<NvidiaManagerSegmentSchema>(nvidia.clone()) {
-                Ok(segment) => Ok(segment
+            if let Ok(segment) =
+                serde_json::from_value::<NvidiaManagerSegmentSchema>(nvidia.clone())
+            {
+                Ok(segment
                     .power_compliance
                     .as_ref()
                     .map(NavProperty::id)
-                    .cloned()),
-                Err(_) => Ok(None),
+                    .cloned())
+            } else {
+                capture_segment_decode_failure(
+                    captures,
+                    carrier_uri,
+                    &[
+                        ResourceFeature::OemNvidiaPowerCompliance,
+                        ResourceFeature::OemNvidiaManagedEntity,
+                    ],
+                    "the embedded Oem.Nvidia segment could not be decoded into the compiled schema",
+                );
+                Ok(None)
             }
         }
         Some(NvidiaSegmentKind::ComputerSystem | NvidiaSegmentKind::Chassis) | None => Ok(None),
@@ -2502,11 +2858,21 @@ async fn read_nvidia_power_domain_collection(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaPowerCompliance],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_nvidia_member_documents(
@@ -2514,6 +2880,8 @@ async fn read_nvidia_power_domain_collection(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemNvidiaPowerCompliance,
         nvidia_power_domain_projection,
     )
     .await
@@ -2536,20 +2904,42 @@ async fn read_nvidia_managed_entity_groups(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaPowerCompliance],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
     for group_nav in &collection.members {
-        let Some(group) = fetch_member(group_nav, bmc, identity, trust).await? else {
+        let Some(group) = fetch_member(
+            group_nav,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::OemNvidiaPowerCompliance],
+        )
+        .await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(nvidia_managed_entity_group_projection(&group))?
-        {
+        if let Some(projection) = member_projection(
+            nvidia_managed_entity_group_projection(&group),
+            captures,
+            group.odata_id(),
+        )? {
             resources.push(projection);
         }
         resources.extend(
@@ -2558,6 +2948,7 @@ async fn read_nvidia_managed_entity_groups(
                 bmc,
                 identity,
                 trust,
+                captures,
             )
             .await?,
         );
@@ -2572,11 +2963,21 @@ async fn read_nvidia_managed_entity_collection(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaManagedEntity],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_nvidia_member_documents(
@@ -2584,6 +2985,8 @@ async fn read_nvidia_managed_entity_collection(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemNvidiaManagedEntity,
         nvidia_managed_entity_projection,
     )
     .await
@@ -2599,15 +3002,29 @@ async fn read_nvidia_power_state_group(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(group) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(group) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaPowerCompliance],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) = member_projection(nvidia_power_state_group_projection(&group))? {
+    if let Some(projection) = member_projection(
+        nvidia_power_state_group_projection(&group),
+        captures,
+        group.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -2616,11 +3033,19 @@ async fn read_nvidia_power_state_group(
             bmc,
             identity,
             trust,
+            captures,
         )
         .await?,
     );
     resources.extend(
-        read_nvidia_psu_state_collection(Some(&group.power_supplies), bmc, identity, trust).await?,
+        read_nvidia_psu_state_collection(
+            Some(&group.power_supplies),
+            bmc,
+            identity,
+            trust,
+            captures,
+        )
+        .await?,
     );
     Ok(resources)
 }
@@ -2631,11 +3056,21 @@ async fn read_nvidia_psc_state_collection(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaPowerCompliance],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_nvidia_member_documents(
@@ -2643,6 +3078,8 @@ async fn read_nvidia_psc_state_collection(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemNvidiaPowerCompliance,
         nvidia_psc_state_projection,
     )
     .await
@@ -2654,11 +3091,21 @@ async fn read_nvidia_psu_state_collection(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaPowerCompliance],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_nvidia_member_documents(
@@ -2666,6 +3113,8 @@ async fn read_nvidia_psu_state_collection(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::OemNvidiaPowerCompliance,
         nvidia_psu_state_projection,
     )
     .await
@@ -2682,6 +3131,8 @@ async fn read_nvidia_member_documents<M>(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    feature: ResourceFeature,
     project: impl Fn(&M) -> Result<CoreResourceProjection, CoreResourceReadError>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
 where
@@ -2689,10 +3140,12 @@ where
 {
     let mut resources = Vec::new();
     for member in members {
-        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(member) = fetch_member(member, bmc, identity, trust, captures, &[feature]).await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(project(&member))? {
+        if let Some(projection) = member_projection(project(&member), captures, member.odata_id())?
+        {
             resources.push(projection);
         }
     }
@@ -2747,6 +3200,7 @@ async fn read_system_nvidia_oem(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nvidia) = system
         .base
@@ -2757,21 +3211,38 @@ async fn read_system_nvidia_oem(
     else {
         return Ok(Vec::new());
     };
-    let Some(system_config_profile) =
-        decode_nvidia_system_config_profile_navigation(nvidia, bmc, identity, trust).await?
+    let Some(system_config_profile) = decode_nvidia_system_config_profile_navigation(
+        nvidia,
+        bmc,
+        identity,
+        trust,
+        captures,
+        system.odata_id(),
+    )
+    .await?
     else {
         return Ok(Vec::new());
     };
     let system_config_profile =
         NavProperty::<NvidiaSystemConfigProfileSchema>::new_reference(system_config_profile);
-    let Some(config_profile) = fetch_member(&system_config_profile, bmc, identity, trust).await?
+    let Some(config_profile) = fetch_member(
+        &system_config_profile,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaSystemConfigProfile],
+    )
+    .await?
     else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) =
-        member_projection(nvidia_system_config_profile_projection(&config_profile))?
-    {
+    if let Some(projection) = member_projection(
+        nvidia_system_config_profile_projection(&config_profile),
+        captures,
+        config_profile.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -2780,13 +3251,21 @@ async fn read_system_nvidia_oem(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::OemNvidiaSystemConfigProfile,
             nvidia_system_config_profile_status_projection,
         )
         .await?,
     );
     resources.extend(
-        read_nvidia_profile_collection(config_profile.profiles.as_ref(), bmc, identity, trust)
-            .await?,
+        read_nvidia_profile_collection(
+            config_profile.profiles.as_ref(),
+            bmc,
+            identity,
+            trust,
+            captures,
+        )
+        .await?,
     );
     Ok(resources)
 }
@@ -2815,6 +3294,8 @@ async fn decode_nvidia_system_config_profile_navigation(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    carrier_uri: &ODataId,
 ) -> Result<Option<ODataId>, CoreResourceReadError> {
     if is_nvidia_reference_form(nvidia) {
         let Some(id) = nvidia.get("@odata.id").and_then(serde_json::Value::as_str) else {
@@ -2823,7 +3304,16 @@ async fn decode_nvidia_system_config_profile_navigation(
         let navigation = NavProperty::<NvidiaComputerSystemSegmentSchema>::new_reference(
             ODataId::from(id.to_owned()),
         );
-        let Some(segment) = fetch_member(&navigation, bmc, identity, trust).await? else {
+        let Some(segment) = fetch_member(
+            &navigation,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::OemNvidiaSystemConfigProfile],
+        )
+        .await?
+        else {
             return Ok(None);
         };
         return Ok(segment
@@ -2834,13 +3324,22 @@ async fn decode_nvidia_system_config_profile_navigation(
     }
     match nvidia_segment_kind(nvidia) {
         Some(NvidiaSegmentKind::ComputerSystem) => {
-            match serde_json::from_value::<NvidiaComputerSystemSchema>(nvidia.clone()) {
-                Ok(segment) => Ok(segment
+            if let Ok(segment) =
+                serde_json::from_value::<NvidiaComputerSystemSchema>(nvidia.clone())
+            {
+                Ok(segment
                     .system_config_profile
                     .as_ref()
                     .map(NavProperty::id)
-                    .cloned()),
-                Err(_) => Ok(None),
+                    .cloned())
+            } else {
+                capture_segment_decode_failure(
+                    captures,
+                    carrier_uri,
+                    &[ResourceFeature::OemNvidiaSystemConfigProfile],
+                    "the embedded Oem.Nvidia segment could not be decoded into the compiled schema",
+                );
+                Ok(None)
             }
         }
         // A Manager segment carries no system-config-profile chain; the
@@ -2958,19 +3457,42 @@ async fn read_nvidia_profile_collection(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(collection) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(collection) = fetch_member(
+        nav,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::OemNvidiaSystemConfigProfile],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
     for member in &collection.members {
-        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(member) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::OemNvidiaSystemConfigProfile],
+        )
+        .await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(nvidia_system_profile_projection(&member))? {
+        if let Some(projection) = member_projection(
+            nvidia_system_profile_projection(&member),
+            captures,
+            member.odata_id(),
+        )? {
             resources.push(projection);
         }
         resources.extend(
@@ -2979,6 +3501,8 @@ async fn read_nvidia_profile_collection(
                 bmc,
                 identity,
                 trust,
+                captures,
+                ResourceFeature::OemNvidiaSystemConfigProfile,
                 nvidia_system_profile_file_projection,
             )
             .await?,
@@ -3002,11 +3526,21 @@ async fn read_account_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(account_service) = root.root.account_service.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(service) = fetch_member(account_service, bmc, identity, trust).await? else {
+    let Some(service) = fetch_member(
+        account_service,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::Accounts],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_collection_resources(
@@ -3014,6 +3548,8 @@ async fn read_account_resources(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::Accounts,
         manager_account_projection,
     )
     .await
@@ -3034,11 +3570,21 @@ async fn read_software_inventory_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(update_service) = root.root.update_service.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(service) = fetch_member(update_service, bmc, identity, trust).await? else {
+    let Some(service) = fetch_member(
+        update_service,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::SoftwareInventory],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_collection_resources(
@@ -3046,6 +3592,8 @@ async fn read_software_inventory_resources(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::SoftwareInventory,
         software_inventory_projection,
     )
     .await
@@ -3070,20 +3618,40 @@ async fn read_event_service_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(event_service) = root.root.event_service.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(service) = fetch_member(event_service, bmc, identity, trust).await? else {
+    let Some(service) = fetch_member(
+        event_service,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::EventService],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) = member_projection(event_service_projection(&service))? {
+    if let Some(projection) = member_projection(
+        event_service_projection(&service),
+        captures,
+        service.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
-        read_event_subscription_resources(service.subscriptions.as_ref(), bmc, identity, trust)
-            .await?,
+        read_event_subscription_resources(
+            service.subscriptions.as_ref(),
+            bmc,
+            identity,
+            trust,
+            captures,
+        )
+        .await?,
     );
     Ok(resources)
 }
@@ -3105,6 +3673,7 @@ async fn read_event_subscription_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(subscriptions) = subscriptions else {
         return Ok(Vec::new());
@@ -3115,10 +3684,23 @@ async fn read_event_subscription_resources(
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in collection.members() {
-        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(member) = fetch_member(
+            member,
+            bmc,
+            identity,
+            trust,
+            captures,
+            &[ResourceFeature::EventSubscription],
+        )
+        .await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(event_subscription_projection(&member))? {
+        if let Some(projection) = member_projection(
+            event_subscription_projection(&member),
+            captures,
+            member.odata_id(),
+        )? {
             resources.push(projection);
         }
     }
@@ -3141,15 +3723,29 @@ async fn read_telemetry_service_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(telemetry_service) = root.root.telemetry_service.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(service) = fetch_member(telemetry_service, bmc, identity, trust).await? else {
+    let Some(service) = fetch_member(
+        telemetry_service,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::TelemetryService],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) = member_projection(telemetry_service_projection(&service))? {
+    if let Some(projection) = member_projection(
+        telemetry_service_projection(&service),
+        captures,
+        service.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -3158,6 +3754,8 @@ async fn read_telemetry_service_resources(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::MetricDefinition,
             metric_definition_projection,
         )
         .await?,
@@ -3168,6 +3766,8 @@ async fn read_telemetry_service_resources(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::MetricReport,
             metric_report_projection,
         )
         .await?,
@@ -3190,15 +3790,29 @@ async fn read_task_service_resources(
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(task_service) = root.root.tasks.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(service) = fetch_member(task_service, bmc, identity, trust).await? else {
+    let Some(service) = fetch_member(
+        task_service,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::TaskService],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     let mut resources = Vec::new();
-    if let Some(projection) = member_projection(task_service_projection(&service))? {
+    if let Some(projection) = member_projection(
+        task_service_projection(&service),
+        captures,
+        service.odata_id(),
+    )? {
         resources.push(projection);
     }
     resources.extend(
@@ -3207,6 +3821,8 @@ async fn read_task_service_resources(
             bmc,
             identity,
             trust,
+            captures,
+            ResourceFeature::Task,
             task_projection,
         )
         .await?,
@@ -3227,11 +3843,21 @@ async fn read_assembly_resources(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
     let Some(assembly) = assembly else {
         return Ok(Vec::new());
     };
-    let Some(assembly) = fetch_member(assembly, bmc, identity, trust).await? else {
+    let Some(assembly) = fetch_member(
+        assembly,
+        bmc,
+        identity,
+        trust,
+        captures,
+        &[ResourceFeature::Assembly],
+    )
+    .await?
+    else {
         return Ok(Vec::new());
     };
     read_nav_link_members(
@@ -3239,6 +3865,8 @@ async fn read_assembly_resources(
         bmc,
         identity,
         trust,
+        captures,
+        ResourceFeature::Assembly,
         assembly_data_projection,
     )
     .await
@@ -3258,6 +3886,8 @@ async fn read_nav_link_members<T>(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    feature: ResourceFeature,
     project: impl Fn(&T) -> Result<CoreResourceProjection, CoreResourceReadError>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
 where
@@ -3268,10 +3898,12 @@ where
     };
     let mut resources = Vec::new();
     for link in links {
-        let Some(member) = fetch_member(link, bmc, identity, trust).await? else {
+        let Some(member) = fetch_member(link, bmc, identity, trust, captures, &[feature]).await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(project(&member))? {
+        if let Some(projection) = member_projection(project(&member), captures, member.odata_id())?
+        {
             resources.push(projection);
         }
     }
@@ -3578,6 +4210,8 @@ async fn read_singleton_resources<T>(
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    feature: ResourceFeature,
     project: impl Fn(&T) -> Result<CoreResourceProjection, CoreResourceReadError>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
 where
@@ -3586,10 +4220,15 @@ where
     let Some(nav) = nav else {
         return Ok(Vec::new());
     };
-    let Some(resource) = fetch_member(nav, bmc, identity, trust).await? else {
+    let Some(resource) = fetch_member(nav, bmc, identity, trust, captures, &[feature]).await?
+    else {
         return Ok(Vec::new());
     };
-    Ok(member_projection(project(&resource))?.into_iter().collect())
+    Ok(
+        member_projection(project(&resource), captures, resource.odata_id())?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Projects one typed collection with per-member skip semantics.
@@ -3597,12 +4236,16 @@ where
 /// A missing link or an empty collection produces no snapshots, because a
 /// family the endpoint does not advertise must not be presented as existing.
 /// A failed collection document keeps the existing classified read-error
-/// semantics, so the refresh Generation stays all-or-nothing.
+/// semantics, so the refresh Generation stays all-or-nothing. Every skipped
+/// member (a failed fetch or an unrepresentable projection) is captured as
+/// one §12.4 decode-failure record per affected feature.
 async fn read_collection_resources<C, M>(
     nav: Option<&NavProperty<C>>,
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    feature: ResourceFeature,
     project: impl Fn(&M) -> Result<CoreResourceProjection, CoreResourceReadError>,
 ) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError>
 where
@@ -3618,10 +4261,12 @@ where
         .map_err(|source| collection_failure(source, identity, trust))?;
     let mut resources = Vec::new();
     for member in collection.members() {
-        let Some(member) = fetch_member(member, bmc, identity, trust).await? else {
+        let Some(member) = fetch_member(member, bmc, identity, trust, captures, &[feature]).await?
+        else {
             continue;
         };
-        if let Some(projection) = member_projection(project(&member))? {
+        if let Some(projection) = member_projection(project(&member), captures, member.odata_id())?
+        {
             resources.push(projection);
         }
     }
@@ -3632,13 +4277,16 @@ where
 ///
 /// A member-level failure is endpoint-local and must not erase the readable
 /// remainder of its collection (§0.2.0 acceptance), so endpoint-local errors
-/// skip the member. TLS-safety errors always abort: a changed or rejected
+/// skip the member and are captured as one §12.4 decode-failure record per
+/// affected feature. TLS-safety errors always abort: a changed or rejected
 /// identity is never swallowed by a member-scoped skip.
 async fn fetch_member<T>(
     nav: &NavProperty<T>,
     bmc: &UpstreamBmc,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
+    captures: &mut Vec<DecodeFailureObservation>,
+    features: &[ResourceFeature],
 ) -> Result<Option<Arc<T>>, CoreResourceReadError>
 where
     T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
@@ -3646,45 +4294,108 @@ where
     match nav.get(bmc).await {
         Ok(member) => Ok(Some(member)),
         Err(source) => {
-            skip_member_failure(source, identity, trust)?;
+            let extended_info = member_failure_extended_info(&source);
+            let classification = classify_member_failure(source, identity, trust)?;
+            capture_fetch_failure(captures, nav.id(), features, classification, &extended_info);
             Ok(None)
         }
     }
 }
 
-/// Decides whether one member-level fetch failure is skippable.
+/// Extracts the Redfish `@Message.ExtendedInfo` entries a failed member
+/// response body carries, when the transport retained the body.
 ///
-/// Reuses the capability classifier's Ok/Err split: endpoint-local states
-/// (unauthorized, permission, schema, availability) leave the member behind,
-/// while TLS-safety failures abort the complete read.
-fn skip_member_failure(
+/// Only an unsuccessful Redfish response retains a body (`InvalidResponse`),
+/// so schema decode and network failures contribute no entries.
+fn member_failure_extended_info(source: &BmcError) -> Vec<DecodeFailureExtendedInfo> {
+    match source {
+        BmcError::InvalidResponse { text, .. } => extended_info_from_body(text),
+        BmcError::ReqwestError(_)
+        | BmcError::JsonError(_)
+        | BmcError::SseStreamError(_)
+        | BmcError::CacheMiss
+        | BmcError::CacheError(_)
+        | BmcError::DecodeError(_)
+        | BmcError::EncodeError(_)
+        | BmcError::InvalidRequest(_)
+        | BmcError::SseEventTooLarge { .. }
+        | BmcError::SseIdleTimeout { .. } => Vec::new(),
+    }
+}
+
+/// The §7.6 user-facing classification of one skippable member-level fetch
+/// failure.
+///
+/// The classification mirrors the capability classifier's endpoint-local
+/// split (unauthorized, schema, availability), but retains the finer
+/// authentication-versus-permission distinction so the diagnostics capture
+/// can describe the member's fate without parsing error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberFailureClassification {
+    Authentication,
+    Permission,
+    Schema,
+    Unavailable,
+}
+
+impl MemberFailureClassification {
+    /// Returns the stable user-facing summary of this classification.
+    #[must_use]
+    const fn summary(self) -> &'static str {
+        match self {
+            Self::Authentication => "the member could not be fetched: BMC authentication failed",
+            Self::Permission => "the member could not be fetched: permission denied",
+            Self::Schema => "the member document is incompatible with the compiled schema",
+            Self::Unavailable => {
+                "the member could not be fetched: the endpoint is temporarily unavailable"
+            }
+        }
+    }
+}
+
+/// Classifies one member-level fetch failure exactly once, so the skip
+/// decision and the diagnostics capture can never disagree.
+///
+/// The classification consumes the identity-monitor change state like every
+/// other classifier, so it must run exactly once per failure: the caller
+/// derives both the skip decision and the capture summary from this one
+/// result.
+///
+/// # Errors
+///
+/// Returns the classified [`RedfishServiceRootError`] for TLS-safety
+/// failures, which abort the complete read instead of skipping the member.
+fn classify_member_failure(
     source: BmcError,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
-) -> Result<(), CoreResourceReadError> {
-    match classify_capability_error(nv_redfish::Error::Bmc(source), identity, trust) {
-        Ok(_) => Ok(()),
-        Err(source) => Err(source.into()),
-    }
+) -> Result<MemberFailureClassification, RedfishServiceRootError> {
+    classify_member_failure_from_classified(nv_redfish::Error::Bmc(source), identity, trust)
 }
 
 /// Resolves one member projection, skipping representation failures.
 ///
 /// A decoded member that cannot be represented (invalid @odata.id or
 /// `ETag`, oversized payload) is skipped like an undecodable member: it is
-/// one odd member, not an endpoint-wide condition. Transport failures cannot
-/// occur inside the synchronous projection and abort defensively.
+/// one odd member, not an endpoint-wide condition, and it is captured as one
+/// §12.4 decode-failure record. Transport failures cannot occur inside the
+/// synchronous projection and abort defensively.
 fn member_projection(
     result: Result<CoreResourceProjection, CoreResourceReadError>,
+    captures: &mut Vec<DecodeFailureObservation>,
+    odata_uri: &ODataId,
 ) -> Result<Option<CoreResourceProjection>, CoreResourceReadError> {
     match result {
         Ok(projection) => Ok(Some(projection)),
         Err(
-            CoreResourceReadError::InvalidODataId { .. }
+            source @ (CoreResourceReadError::InvalidODataId { .. }
             | CoreResourceReadError::InvalidEtag { .. }
             | CoreResourceReadError::SerializePayload { .. }
-            | CoreResourceReadError::InvalidPayload { .. },
-        ) => Ok(None),
+            | CoreResourceReadError::InvalidPayload { .. }),
+        ) => {
+            capture_projection_failure(captures, odata_uri, &source);
+            Ok(None)
+        }
         Err(source) => Err(source),
     }
 }
@@ -3890,11 +4601,11 @@ async fn finish_redfish_operation<T>(
 }
 
 async fn finish_core_resource_read(
-    operation: Result<Vec<CoreResourceProjection>, CoreResourceReadError>,
+    operation: Result<CoreResourceReadOutcome, CoreResourceReadError>,
     session: Option<Session<UpstreamBmc>>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
-) -> Result<Vec<CoreResourceProjection>, CoreResourceReadError> {
+) -> Result<CoreResourceReadOutcome, CoreResourceReadError> {
     let cleanup = cleanup_session(session, identity, trust).await;
     match (operation, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
@@ -7922,6 +8633,448 @@ impl CoreResourceProjection {
     }
 }
 
+/// The maximum length of one captured `ExtendedInfo` text field, mirroring
+/// the diagnostics record-layer bound so the application mapping can never be
+/// refused for a value the gateway produced.
+const DECODE_FAILURE_EXTENDED_INFO_TEXT_MAX_CHARS: usize = 1024;
+
+/// The maximum number of `RelatedProperties` entries retained per captured
+/// `ExtendedInfo` entry, mirroring the diagnostics record-layer bound.
+const DECODE_FAILURE_EXTENDED_INFO_RELATED_PROPERTIES_MAX: usize = 32;
+
+/// One Redfish `@Message.ExtendedInfo` entry retained from a member-level
+/// failure response (§12.4).
+///
+/// The entry is the gateway-shaped projection of the upstream shape: the
+/// fields Redfish defines are validated structurally (a mandatory, bounded
+/// `MessageId`; bounded optional strings; a bounded `RelatedProperties`
+/// array), and any vendor-added entry properties are ignored — a body that
+/// does not round-trip the defined fields contributes no fabricated entry,
+/// exactly like the diagnostics record layer refuses one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeFailureExtendedInfo {
+    message_id: String,
+    message: Option<String>,
+    severity: Option<String>,
+    resolution: Option<String>,
+    related_properties: Vec<String>,
+}
+
+impl DecodeFailureExtendedInfo {
+    #[must_use]
+    pub const fn new(
+        message_id: String,
+        message: Option<String>,
+        severity: Option<String>,
+        resolution: Option<String>,
+        related_properties: Vec<String>,
+    ) -> Self {
+        Self {
+            message_id,
+            message,
+            severity,
+            resolution,
+            related_properties,
+        }
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    #[must_use]
+    pub fn severity(&self) -> Option<&str> {
+        self.severity.as_deref()
+    }
+
+    #[must_use]
+    pub fn resolution(&self) -> Option<&str> {
+        self.resolution.as_deref()
+    }
+
+    #[must_use]
+    pub fn related_properties(&self) -> &[String] {
+        &self.related_properties
+    }
+}
+
+/// One member whose typed Schema decoding failed during a core resource
+/// read, captured for §12.4 diagnostics.
+///
+/// The record is the gateway's own §7.2 projection of a member-level decode
+/// failure: `nv-redfish` types never cross the gateway, and the application
+/// refresh boundary maps this observation onto its `ResourceDecodeFailure`
+/// record type. The member was skipped as one odd member (§0.2.0) — the read
+/// succeeded and the endpoint stays fully usable — and this record keeps the
+/// skipped path visible instead of silently dropping it. `odata_type` stays
+/// `None` from every gateway capture site: the type string lives only in the
+/// raw document that failed to decode and is never retained by the typed
+/// fetch machinery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeFailureObservation {
+    odata_uri: ResourceODataId,
+    odata_type: Option<ResourceODataType>,
+    feature: ResourceFeature,
+    oem_namespace: Option<String>,
+    error_summary: String,
+    extended_info: Vec<DecodeFailureExtendedInfo>,
+}
+
+impl DecodeFailureObservation {
+    /// Constructs one capture from already-validated parts.
+    ///
+    /// The gateway produces the parts through its own closed mappings
+    /// ([`oem_namespace_for`], the classification summaries, the strict
+    /// `ExtendedInfo` extraction), so the construction is total; an
+    /// `@odata.id` the domain validator refuses is left behind by the
+    /// capture helpers instead of reaching this constructor.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        odata_uri: ResourceODataId,
+        odata_type: Option<ResourceODataType>,
+        feature: ResourceFeature,
+        oem_namespace: Option<String>,
+        error_summary: String,
+        extended_info: Vec<DecodeFailureExtendedInfo>,
+    ) -> Self {
+        Self {
+            odata_uri,
+            odata_type,
+            feature,
+            oem_namespace,
+            error_summary,
+            extended_info,
+        }
+    }
+
+    /// Borrows the exact member identifier the read attempted to decode.
+    #[must_use]
+    pub const fn odata_uri(&self) -> &ResourceODataId {
+        &self.odata_uri
+    }
+
+    /// Borrows the member's `@odata.type`, when the failed decode retained
+    /// one (the gateway capture sites never retain one today).
+    #[must_use]
+    pub const fn odata_type(&self) -> Option<&ResourceODataType> {
+        self.odata_type.as_ref()
+    }
+
+    /// Returns the upstream feature whose member decode failed.
+    #[must_use]
+    pub const fn feature(&self) -> ResourceFeature {
+        self.feature
+    }
+
+    /// Borrows the OEM Namespace of the failed member, when the feature
+    /// reads one.
+    #[must_use]
+    pub fn oem_namespace(&self) -> Option<&str> {
+        self.oem_namespace.as_deref()
+    }
+
+    /// Borrows the §7.6 user-facing classification summary of the failure.
+    #[must_use]
+    pub fn error_summary(&self) -> &str {
+        &self.error_summary
+    }
+
+    /// Borrows the Redfish `@Message.ExtendedInfo` entries the failed
+    /// response body carried, when the fetch failure retained them.
+    #[must_use]
+    pub fn extended_info(&self) -> &[DecodeFailureExtendedInfo] {
+        &self.extended_info
+    }
+}
+
+/// The complete result of one typed core resource read: every decoded
+/// projection plus every member-level decode failure captured while reading.
+///
+/// The outcome replaces the plain projection vector so the member-skip path
+/// (§0.2.0) can carry its §12.4 records to the application refresh boundary
+/// without changing the skip semantics themselves: a member that cannot be
+/// fetched or represented is still skipped, and the endpoint stays fully
+/// usable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreResourceReadOutcome {
+    projections: Vec<CoreResourceProjection>,
+    decode_failures: Vec<DecodeFailureObservation>,
+}
+
+impl CoreResourceReadOutcome {
+    #[must_use]
+    pub const fn new(
+        projections: Vec<CoreResourceProjection>,
+        decode_failures: Vec<DecodeFailureObservation>,
+    ) -> Self {
+        Self {
+            projections,
+            decode_failures,
+        }
+    }
+
+    /// Borrows every decoded resource projection, in read order.
+    #[must_use]
+    pub fn projections(&self) -> &[CoreResourceProjection] {
+        &self.projections
+    }
+
+    /// Borrows every member-level decode failure captured during the read.
+    #[must_use]
+    pub fn decode_failures(&self) -> &[DecodeFailureObservation] {
+        &self.decode_failures
+    }
+}
+
+/// The vendor OEM namespace one OEM feature reads through, or `None` for a
+/// standard feature or an OEM surface that navigates the standard schema
+/// (the `LiteOn` power-supply family decodes the standard `PowerSubsystem`
+/// navigation with vendor schema types, so it carries no OEM namespace).
+///
+/// The spelling mirrors the §11.3 namespace surface the capability probes
+/// decode: `Oem.Ami`, `Oem.Hpe`, and `Oem.deltaenergysystems` use their
+/// exact wire segment keys, while the other vendors use the short namespace
+/// name the domain ledger documents.
+#[must_use]
+const fn oem_namespace_for(feature: ResourceFeature) -> Option<&'static str> {
+    match feature {
+        ResourceFeature::OemDell => Some("Dell"),
+        ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface => {
+            Some("Supermicro")
+        }
+        ResourceFeature::OemNvidiaSystemConfigProfile
+        | ResourceFeature::OemNvidiaPowerCompliance
+        | ResourceFeature::OemNvidiaManagedEntity => Some("Nvidia"),
+        ResourceFeature::OemLenovoSecurityService => Some("Lenovo"),
+        ResourceFeature::OemAmiServiceRoot | ResourceFeature::OemAmiConfigBmc => Some("Ami"),
+        ResourceFeature::OemHpeILoServiceExt | ResourceFeature::OemHpeManager => Some("Hpe"),
+        ResourceFeature::OemDeltaPowerSupply => Some("deltaenergysystems"),
+        ResourceFeature::OemLiteOnPowerSupply
+        | ResourceFeature::ServiceRoot
+        | ResourceFeature::Systems
+        | ResourceFeature::Chassis
+        | ResourceFeature::Managers
+        | ResourceFeature::Processors
+        | ResourceFeature::Memory
+        | ResourceFeature::Storages
+        | ResourceFeature::NetworkAdapters
+        | ResourceFeature::NetworkDeviceFunctions
+        | ResourceFeature::EthernetInterfaces
+        | ResourceFeature::Accounts
+        | ResourceFeature::Bios
+        | ResourceFeature::BootOptions
+        | ResourceFeature::SecureBoot
+        | ResourceFeature::Power
+        | ResourceFeature::PowerEquipment
+        | ResourceFeature::PowerSupplies
+        | ResourceFeature::Thermal
+        | ResourceFeature::Sensors
+        | ResourceFeature::Controls
+        | ResourceFeature::EnvironmentMetrics
+        | ResourceFeature::LogServices
+        | ResourceFeature::ManagerNetworkProtocol
+        | ResourceFeature::HostInterfaces
+        | ResourceFeature::PcieDevices
+        | ResourceFeature::Assembly
+        | ResourceFeature::SoftwareInventory
+        | ResourceFeature::EventService
+        | ResourceFeature::EventSubscription
+        | ResourceFeature::TelemetryService
+        | ResourceFeature::MetricDefinition
+        | ResourceFeature::MetricReport
+        | ResourceFeature::TaskService
+        | ResourceFeature::Task => None,
+    }
+}
+
+/// Captures one member-level fetch failure as one record per affected
+/// feature.
+///
+/// A member `@odata.id` the domain validator refuses is left behind — an
+/// unrepresentable identifier cannot be a diagnostics record — and the
+/// classification summary and retained `ExtendedInfo` entries are the §7.6
+/// user-facing projection of the failure.
+fn capture_fetch_failure(
+    captures: &mut Vec<DecodeFailureObservation>,
+    odata_uri: &ODataId,
+    features: &[ResourceFeature],
+    classification: MemberFailureClassification,
+    extended_info: &[DecodeFailureExtendedInfo],
+) {
+    let Some(odata_uri) = ResourceODataId::parse(&odata_uri.to_string()).ok() else {
+        return;
+    };
+    for feature in features {
+        captures.push(DecodeFailureObservation::new(
+            odata_uri.clone(),
+            None,
+            *feature,
+            oem_namespace_for(*feature).map(str::to_owned),
+            classification.summary().to_owned(),
+            extended_info.to_vec(),
+        ));
+    }
+}
+
+/// Captures one member projection (representation) failure.
+///
+/// The failed `@odata.id` comes from the decoded member the caller already
+/// holds; the feature is carried by the typed error itself, so the capture
+/// never guesses it.
+fn capture_projection_failure(
+    captures: &mut Vec<DecodeFailureObservation>,
+    odata_uri: &ODataId,
+    failure: &CoreResourceReadError,
+) {
+    let (feature, summary) = match failure {
+        CoreResourceReadError::InvalidODataId { feature, .. } => {
+            (*feature, "the member carries an invalid @odata.id")
+        }
+        CoreResourceReadError::InvalidEtag { feature, .. } => {
+            (*feature, "the member carries an invalid ETag")
+        }
+        CoreResourceReadError::SerializePayload { feature, .. } => (
+            *feature,
+            "the member's typed projection could not be serialized",
+        ),
+        CoreResourceReadError::InvalidPayload { feature, .. } => (
+            *feature,
+            "the member's typed projection is not a valid snapshot payload",
+        ),
+        // Defensive: the capture is only reachable from the skippable
+        // variants above; every other class aborts the read without a
+        // record.
+        _ => return,
+    };
+    let Some(odata_uri) = ResourceODataId::parse(&odata_uri.to_string()).ok() else {
+        return;
+    };
+    captures.push(DecodeFailureObservation::new(
+        odata_uri,
+        None,
+        feature,
+        oem_namespace_for(feature).map(str::to_owned),
+        summary.to_owned(),
+        Vec::new(),
+    ));
+}
+
+/// Captures one embedded OEM segment the compiled schema rejected, as one
+/// record per affected feature.
+///
+/// The carrier document (the manager or Service Root that embeds the
+/// segment) is the honest location of the decode failure: the segment value
+/// is part of that document and carries no `@odata.id` of its own. A carrier
+/// `@odata.id` the domain validator refuses is left behind, exactly like the
+/// member capture helpers.
+fn capture_segment_decode_failure(
+    captures: &mut Vec<DecodeFailureObservation>,
+    carrier_uri: &ODataId,
+    features: &[ResourceFeature],
+    summary: &'static str,
+) {
+    let Some(carrier_uri) = ResourceODataId::parse(&carrier_uri.to_string()).ok() else {
+        return;
+    };
+    for feature in features {
+        captures.push(DecodeFailureObservation::new(
+            carrier_uri.clone(),
+            None,
+            *feature,
+            oem_namespace_for(*feature).map(str::to_owned),
+            summary.to_owned(),
+            Vec::new(),
+        ));
+    }
+}
+
+/// Extracts the Redfish `@Message.ExtendedInfo` entries a failed member
+/// response body carries, strictly.
+///
+/// The standard Redfish error envelope nests the array under the `error`
+/// object, so the body is inspected at the root and, when the root carries
+/// no array, inside its `error` member. Each entry must be an object with a
+/// mandatory, bounded `MessageId` and bounded optional strings (an array of
+/// strings for `RelatedProperties`). An entry that violates the defined
+/// shape is dropped — a vendor body that does not round-trip the
+/// Redfish-defined fields contributes no fabricated entry — and a body that
+/// is not JSON at all contributes nothing.
+fn extended_info_from_body(body: &str) -> Vec<DecodeFailureExtendedInfo> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(object) = root.as_object() else {
+        return Vec::new();
+    };
+    let entries = object
+        .get("@Message.ExtendedInfo")
+        .or_else(|| {
+            object
+                .get("error")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|error| error.get("@Message.ExtendedInfo"))
+        })
+        .and_then(serde_json::Value::as_array);
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(parse_extended_info_entry)
+        .collect()
+}
+
+/// Parses one `@Message.ExtendedInfo` entry strictly, or drops it.
+fn parse_extended_info_entry(entry: &serde_json::Value) -> Option<DecodeFailureExtendedInfo> {
+    let object = entry.as_object()?;
+    let message_id = object
+        .get("MessageId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .filter(|text| text.len() <= DECODE_FAILURE_EXTENDED_INFO_TEXT_MAX_CHARS)?;
+    let optional_text = |key: &str| -> Option<Option<String>> {
+        match object.get(key) {
+            None => Some(None),
+            Some(value) => value
+                .as_str()
+                .filter(|text| text.len() <= DECODE_FAILURE_EXTENDED_INFO_TEXT_MAX_CHARS)
+                .map(|text| Some(text.to_owned())),
+        }
+    };
+    let related_properties = match object.get("RelatedProperties") {
+        None => Vec::new(),
+        Some(value) => {
+            let properties = value.as_array()?;
+            if properties.len() > DECODE_FAILURE_EXTENDED_INFO_RELATED_PROPERTIES_MAX {
+                return None;
+            }
+            let mut retained = Vec::with_capacity(properties.len());
+            for property in properties {
+                let text = property.as_str()?;
+                if text.len() > DECODE_FAILURE_EXTENDED_INFO_TEXT_MAX_CHARS {
+                    return None;
+                }
+                retained.push(text.to_owned());
+            }
+            retained
+        }
+    };
+    Some(DecodeFailureExtendedInfo::new(
+        message_id.to_owned(),
+        optional_text("Message")?,
+        optional_text("Severity")?,
+        optional_text("Resolution")?,
+        related_properties,
+    ))
+}
+
 /// Service metadata and the usable state of every §2.1 standard capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreEndpointDiscovery {
@@ -11844,23 +12997,47 @@ fn classify_capability_probe<T>(
 ///
 /// TLS-safety failures stay hard errors so a capability probe can never paper
 /// over a changed identity; everything else becomes the state the capability
-/// ledger persists.
+/// ledger persists. The classification reuses the member-failure classifier
+/// so the capability ledger and the §12.4 capture records can never disagree
+/// about which failure class a navigation failure belongs to.
 fn classify_capability_error(
     source: UpstreamServiceRootError,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
 ) -> Result<CapabilityState, RedfishServiceRootError> {
+    match classify_member_failure_from_classified(source, identity, trust) {
+        Ok(classification) => Ok(match classification {
+            MemberFailureClassification::Authentication
+            | MemberFailureClassification::Permission => CapabilityState::Unauthorized,
+            MemberFailureClassification::Schema => CapabilityState::SchemaIncompatible,
+            MemberFailureClassification::Unavailable => CapabilityState::TemporarilyUnavailable,
+        }),
+        Err(source) => Err(source),
+    }
+}
+
+/// Classifies one navigation failure, accepting the `nv-redfish` error type
+/// the capability probes receive.
+fn classify_member_failure_from_classified(
+    source: UpstreamServiceRootError,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> Result<MemberFailureClassification, RedfishServiceRootError> {
     match classify_service_root_error(source, identity, trust) {
-        RedfishServiceRootError::AuthenticationFailed { .. }
-        | RedfishServiceRootError::PermissionDenied { .. } => Ok(CapabilityState::Unauthorized),
+        RedfishServiceRootError::AuthenticationFailed { .. } => {
+            Ok(MemberFailureClassification::Authentication)
+        }
+        RedfishServiceRootError::PermissionDenied { .. } => {
+            Ok(MemberFailureClassification::Permission)
+        }
         RedfishServiceRootError::SchemaIncompatible { .. } => {
-            Ok(CapabilityState::SchemaIncompatible)
+            Ok(MemberFailureClassification::Schema)
         }
         RedfishServiceRootError::NotRedfishService { .. }
         | RedfishServiceRootError::NetworkTimeout { .. }
         | RedfishServiceRootError::Network { .. }
         | RedfishServiceRootError::RemoteResponse { .. }
-        | RedfishServiceRootError::Upstream(_) => Ok(CapabilityState::TemporarilyUnavailable),
+        | RedfishServiceRootError::Upstream(_) => Ok(MemberFailureClassification::Unavailable),
         source @ (RedfishServiceRootError::TlsConfiguration(_)
         | RedfishServiceRootError::ClientBuild(_)
         | RedfishServiceRootError::TlsIdentityState(_)
@@ -17872,7 +19049,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -17880,6 +19057,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert_eq!(
@@ -17949,7 +19127,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -17957,6 +19135,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         let dell = &resources[4];
@@ -18009,7 +19188,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -18017,6 +19196,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(
@@ -18057,7 +19237,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18065,6 +19245,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(
@@ -18131,7 +19312,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18139,6 +19320,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         let sys_lockdown = &resources[4];
@@ -18194,7 +19376,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -18202,6 +19384,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(resources.iter().all(|resource| {
@@ -18223,7 +19406,9 @@ mod tests {
         // An `Oem.Supermicro` segment the compiled `smc_manager_extensions`
         // schema cannot decode (here: a non-object `SysLockdown` key) is one
         // odd manager surface: the read succeeds and leaves both Supermicro
-        // families absent, and no leaf request is ever fabricated.
+        // families absent, and no leaf request is ever fabricated. The
+        // segment decode failure is captured as one §12.4 record per absent
+        // family, anchored at the carrier Manager document.
         let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
             CORE_SERVICE_ROOT_BODY,
             &[
@@ -18239,7 +19424,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18247,6 +19432,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources.iter().all(|resource| {
@@ -18255,6 +19441,23 @@ mod tests {
                 ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface
             )
         }));
+        let failures = outcome.decode_failures();
+        assert_eq!(failures.len(), 2, "one record per absent Supermicro family");
+        for failure in failures {
+            assert_eq!(failure.odata_uri().as_str(), "/redfish/v1/Managers/1");
+            assert_eq!(failure.oem_namespace(), Some("Supermicro"));
+            assert_eq!(
+                failure.error_summary(),
+                "the embedded Oem.Supermicro segment could not be decoded into the compiled schema"
+            );
+            assert!(failure.extended_info().is_empty());
+        }
+        assert_eq!(
+            failures[0].feature(),
+            ResourceFeature::OemSmcSysLockdown,
+            "the records follow the segment's compiled navigation order"
+        );
+        assert_eq!(failures[1].feature(), ResourceFeature::OemSmcKcsInterface);
         assert_session_requests(&server.finish_all().await?, &CORE_RESOURCE_REQUEST_PATHS)?;
         Ok(())
     }
@@ -18266,7 +19469,8 @@ mod tests {
         // (missing the required `@odata.id`) and are one odd manager surface
         // each: the read succeeds and leaves both families absent, while the
         // embedded probes stay observable as requests, like every
-        // member-level skip.
+        // member-level skip. Each skipped document is captured as one §12.4
+        // decode-failure record with the schema-incompatible classification.
         let server = TestRedfishServer::start_raw_sequence(session_response_sequence(
             CORE_SERVICE_ROOT_BODY,
             &[
@@ -18284,7 +19488,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18292,6 +19496,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources.iter().all(|resource| {
@@ -18300,6 +19505,30 @@ mod tests {
                 ResourceFeature::OemSmcSysLockdown | ResourceFeature::OemSmcKcsInterface
             )
         }));
+        let failures = outcome.decode_failures();
+        assert_eq!(
+            failures.len(),
+            2,
+            "one record per undecodable leaf document"
+        );
+        for failure in failures {
+            assert_eq!(failure.oem_namespace(), Some("Supermicro"));
+            assert_eq!(
+                failure.error_summary(),
+                "the member document is incompatible with the compiled schema"
+            );
+            assert!(failure.extended_info().is_empty());
+        }
+        assert_eq!(
+            failures[0].odata_uri().as_str(),
+            "/redfish/v1/Managers/1/SysLockdown"
+        );
+        assert_eq!(failures[0].feature(), ResourceFeature::OemSmcSysLockdown);
+        assert_eq!(
+            failures[1].odata_uri().as_str(),
+            "/redfish/v1/Managers/1/KCSInterface"
+        );
+        assert_eq!(failures[1].feature(), ResourceFeature::OemSmcKcsInterface);
         assert_session_requests(
             &server.finish_all().await?,
             &CORE_RESOURCE_WITH_SUPERMICRO_OEM_REQUEST_PATHS,
@@ -18337,7 +19566,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18345,6 +19574,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 8);
         let chain_root = &resources[2];
@@ -18443,7 +19673,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18451,6 +19681,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources
@@ -18481,7 +19712,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18489,6 +19720,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources
@@ -18519,7 +19751,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18527,6 +19759,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources
@@ -18565,7 +19798,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18573,6 +19806,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 8);
         assert!(resources.iter().any(|resource| {
@@ -18612,7 +19846,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18620,6 +19854,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         let nvidia = resources
@@ -18639,6 +19874,85 @@ mod tests {
             &CORE_RESOURCE_WITH_FAILED_NVIDIA_CHAIN_REQUEST_PATHS,
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn oem_namespace_mapping_covers_every_compiled_oem_feature() {
+        // The §12.4 capture derives the OEM Namespace from the feature
+        // through this closed mapping; every OEM family must either name its
+        // vendor namespace or deliberately carry none (the LiteOn family
+        // decodes the standard `PowerSubsystem` navigation with vendor schema
+        // types, so it reads no OEM namespace).
+        for (feature, namespace) in [
+            (ResourceFeature::OemDell, Some("Dell")),
+            (ResourceFeature::OemSmcSysLockdown, Some("Supermicro")),
+            (ResourceFeature::OemSmcKcsInterface, Some("Supermicro")),
+            (
+                ResourceFeature::OemNvidiaSystemConfigProfile,
+                Some("Nvidia"),
+            ),
+            (ResourceFeature::OemNvidiaPowerCompliance, Some("Nvidia")),
+            (ResourceFeature::OemNvidiaManagedEntity, Some("Nvidia")),
+            (ResourceFeature::OemLenovoSecurityService, Some("Lenovo")),
+            (ResourceFeature::OemAmiServiceRoot, Some("Ami")),
+            (ResourceFeature::OemAmiConfigBmc, Some("Ami")),
+            (ResourceFeature::OemHpeILoServiceExt, Some("Hpe")),
+            (ResourceFeature::OemHpeManager, Some("Hpe")),
+            (ResourceFeature::OemLiteOnPowerSupply, None),
+            (
+                ResourceFeature::OemDeltaPowerSupply,
+                Some("deltaenergysystems"),
+            ),
+        ] {
+            assert_eq!(oem_namespace_for(feature), namespace, "{feature:?}");
+        }
+        // Every standard family reads no OEM namespace.
+        for feature in [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::Chassis,
+            ResourceFeature::Managers,
+            ResourceFeature::Processors,
+            ResourceFeature::PowerSupplies,
+            ResourceFeature::Task,
+        ] {
+            assert_eq!(oem_namespace_for(feature), None, "{feature:?}");
+        }
+    }
+
+    #[test]
+    fn extended_info_extraction_retains_only_defined_entries() {
+        // A body with valid entries keeps every Redfish-defined field and
+        // ignores vendor-added entry properties.
+        let entries = extended_info_from_body(
+            r#"{"error":{"code":"Base.1.0.GeneralError","message":"boom","@Message.ExtendedInfo":[
+                {"MessageId":"Base.1.13.ResourceNotFound","Message":"The resource is gone.","Severity":"Critical","Resolution":"Re-add it.","RelatedProperties":["MemberId"],"VendorExtra":true}
+            ]}}"#,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_id(), "Base.1.13.ResourceNotFound");
+        assert_eq!(entries[0].message(), Some("The resource is gone."));
+        assert_eq!(entries[0].severity(), Some("Critical"));
+        assert_eq!(entries[0].resolution(), Some("Re-add it."));
+        assert_eq!(entries[0].related_properties(), &["MemberId".to_owned()]);
+
+        // An entry without a mandatory `MessageId`, a non-object entry, a
+        // malformed body, and a body without the array contribute no
+        // fabricated entries.
+        for body in [
+            r#"{"error":{"@Message.ExtendedInfo":[{"Severity":"Critical"}]}}"#,
+            r#"{"error":{"@Message.ExtendedInfo":[7]}}"#,
+            "not json",
+            r#"{"error":{}}"#,
+        ] {
+            assert!(extended_info_from_body(body).is_empty(), "body: {body}");
+        }
+        // An oversized entry is refused instead of retained unbounded.
+        let oversized = format!(
+            r#"{{"error":{{"@Message.ExtendedInfo":[{{"MessageId":"{}"}}]}}}}"#,
+            "x".repeat(DECODE_FAILURE_EXTENDED_INFO_TEXT_MAX_CHARS + 1)
+        );
+        assert!(extended_info_from_body(&oversized).is_empty());
     }
 
     #[test]
@@ -18833,7 +20147,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18841,6 +20155,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 14);
         // The power-compliance family: the chain-root document, its
@@ -18970,7 +20285,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -18978,6 +20293,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources.iter().all(|resource| {
@@ -19010,7 +20326,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19018,6 +20334,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(resources.iter().all(|resource| {
@@ -19067,7 +20384,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19075,6 +20392,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 14);
         assert!(resources.iter().any(|resource| {
@@ -19125,7 +20443,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19133,6 +20451,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 13);
         let compliance = resources
@@ -19180,7 +20499,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19188,6 +20507,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         let security = &resources[4];
@@ -19241,7 +20561,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -19249,6 +20569,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(resources
@@ -19285,7 +20606,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19293,6 +20614,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         let ami = &resources[1];
@@ -19334,7 +20656,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -19342,6 +20664,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(
@@ -19377,7 +20700,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19385,6 +20708,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         let config_bmc = &resources[4];
@@ -19439,7 +20763,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -19447,6 +20771,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(
@@ -19482,7 +20807,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19490,6 +20815,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         let hpe_root = &resources[1];
@@ -19557,7 +20883,7 @@ mod tests {
             let gateway = gateway_with_root(server.certificate.clone())?;
             let trust = system_ca_trust(&server.certificate)?;
 
-            let resources = gateway
+            let outcome = gateway
                 .read_core_resources(
                     &server.address,
                     &trust,
@@ -19565,6 +20891,7 @@ mod tests {
                     &SecretString::from("password"),
                 )
                 .await?;
+            let resources = outcome.projections();
 
             assert_eq!(resources.len(), 4);
             assert!(resources.iter().all(|resource| {
@@ -19605,7 +20932,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19613,6 +20940,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         // The standard `power-supplies` family and the `LiteOn` family
@@ -19672,7 +21000,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19680,6 +21008,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(
@@ -19719,7 +21048,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19727,6 +21056,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         // The standard `power-supplies` family and the Delta family project
@@ -19791,7 +21121,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19799,6 +21129,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         assert!(
@@ -19836,7 +21167,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19844,6 +21175,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(
@@ -19876,7 +21208,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19884,6 +21216,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(
@@ -19918,7 +21251,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -19926,6 +21259,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert!(
@@ -20234,7 +21568,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20242,6 +21576,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 7);
         assert_eq!(
@@ -20316,7 +21651,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20324,6 +21659,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 4);
         assert_eq!(
@@ -20365,7 +21701,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20373,6 +21709,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // Systems/2, CPU2, and Chassis/1 all return undecodable bodies and
         // are skipped; every other member still produces a snapshot.
@@ -20419,7 +21756,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20427,6 +21764,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 8);
         assert_eq!(
@@ -20528,7 +21866,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20536,6 +21874,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 9);
         assert_eq!(
@@ -20695,7 +22034,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20703,6 +22042,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The Manager member advertises no LogServices, NetworkProtocol, or
         // HostInterfaces links, so none of the three families produce
@@ -20748,7 +22088,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20756,6 +22096,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The advertised-but-empty LogServices and HostInterfaces
         // collections produce no member snapshots, while the NetworkProtocol
@@ -20811,7 +22152,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20819,6 +22160,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The undecodable second LogService member and the undecodable
         // NetworkProtocol singleton are skipped; the readable members of
@@ -20873,7 +22215,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20881,6 +22223,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The advertised-but-empty Storage collection produces no snapshot,
         // and the Chassis and Manager members without network links produce
@@ -20928,7 +22271,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20936,6 +22279,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // Storage/2 returns an undecodable body and is skipped; the first
         // Storage member and the complete network families still produce
@@ -20991,7 +22335,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -20999,6 +22343,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 8);
         assert_eq!(
@@ -21095,7 +22440,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21103,6 +22448,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 6);
         assert_eq!(
@@ -21188,7 +22534,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21196,6 +22542,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 10);
         assert_eq!(
@@ -21258,7 +22605,7 @@ mod tests {
             "SoftwareId",
             "BMC-2026-1",
         )?;
-        assert_device_family_payloads(&resources)?;
+        assert_device_family_payloads(resources)?;
         assert_session_requests(
             &server.finish_all().await?,
             &DEVICE_FAMILY_RESOURCE_REQUEST_PATHS,
@@ -21340,7 +22687,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21348,6 +22695,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The System member advertises no PCIeDevices array, the Chassis
         // member no Assembly document, and the UpdateService no
@@ -21394,7 +22742,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21402,6 +22750,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The advertised-but-empty PCIeDevices array, Assembly document
         // without Assemblies members, and SoftwareInventory collection
@@ -21453,7 +22802,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21461,6 +22810,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The second PCIe device, the second AssemblyData member, and the
         // second SoftwareInventory member all return undecodable bodies and
@@ -21528,7 +22878,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -21536,6 +22886,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 15);
         assert_eq!(
@@ -21638,7 +22989,7 @@ mod tests {
             "TaskState",
             "Completed",
         )?;
-        assert_service_family_payloads(&resources)?;
+        assert_service_family_payloads(resources)?;
         assert_session_requests(
             &server.finish_all().await?,
             &SERVICES_RESOURCE_REQUEST_PATHS,
@@ -22226,7 +23577,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22234,6 +23585,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The Service Root advertises none of the three service links, so
         // none of the seven families produce snapshots ("资源存在才呈现").
@@ -22278,7 +23630,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22286,6 +23638,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The three service singletons are projected; every collection below
         // them is advertised but empty, so no member snapshot is produced.
@@ -22335,7 +23688,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22343,6 +23696,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The `EventService` singleton is undecodable and takes its whole
         // `Subscriptions` family with it; the `TaskService` singleton is
@@ -22388,7 +23742,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22396,6 +23750,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 5);
         assert_eq!(
@@ -22444,7 +23799,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22452,6 +23807,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The System member advertises no Bios, BootOptions, or SecureBoot
         // links and the AccountService advertises no Accounts collection, so
@@ -22496,7 +23852,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22504,6 +23860,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The advertised-but-empty BootOptions and Accounts collections
         // produce no member snapshots; the Bios and SecureBoot singletons
@@ -22553,7 +23910,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22561,6 +23918,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The undecodable Bios singleton and the second BootOption member
         // are skipped; the remaining configuration families still produce
@@ -22615,7 +23973,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22623,6 +23981,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 10);
         assert_eq!(
@@ -22797,7 +24156,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22805,6 +24164,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The advertised-but-empty Sensors and Controls collections produce
         // no member snapshots; the Power and Thermal singletons still do
@@ -22865,7 +24225,7 @@ mod tests {
         let gateway = slow_bmc_gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22873,6 +24233,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The delayed Thermal singleton is absent; every other advertised
         // document still produced its snapshot.
@@ -22916,7 +24277,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22924,6 +24285,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The Chassis member advertises the two telemetry singletons but no
         // Sensors or Controls link, so only the singletons are projected and
@@ -22976,7 +24338,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -22984,6 +24346,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The undecodable Power singleton is skipped with the member-level
         // semantics, and the first Sensor and Control members are skipped
@@ -23038,7 +24401,7 @@ mod tests {
         .await?;
         let gateway = gateway_with_root(absent_service.certificate.clone())?;
         let trust = system_ca_trust(&absent_service.certificate)?;
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &absent_service.address,
                 &trust,
@@ -23046,6 +24409,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
         // The undecodable AccountService document is a singleton failure: it
         // skips the whole Accounts family with the member-level semantics
         // instead of aborting the read.
@@ -23085,7 +24449,7 @@ mod tests {
         .await?;
         let gateway = gateway_with_root(failing_member.certificate.clone())?;
         let trust = system_ca_trust(&failing_member.certificate)?;
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &failing_member.address,
                 &trust,
@@ -23093,6 +24457,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
         // The undecodable first account member is skipped; the second
         // account member still produces a snapshot (§0.2.0 acceptance).
         assert_eq!(resources.len(), 5);
@@ -23149,7 +24514,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -23157,6 +24522,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The chassis member carries one adapter (projected by the
         // network-adapters family), the EnvironmentMetrics singleton, one
@@ -23323,7 +24689,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -23331,6 +24697,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].feature(), ResourceFeature::ServiceRoot);
@@ -23377,7 +24744,7 @@ mod tests {
         let gateway = gateway_with_root(server.certificate.clone())?;
         let trust = system_ca_trust(&server.certificate)?;
 
-        let resources = gateway
+        let outcome = gateway
             .read_core_resources(
                 &server.address,
                 &trust,
@@ -23385,6 +24752,7 @@ mod tests {
                 &SecretString::from("password"),
             )
             .await?;
+        let resources = outcome.projections();
 
         // The undecodable member is left behind; the Service Root snapshot
         // still completes, so the endpoint stays usable (§0.2.0 acceptance).

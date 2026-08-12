@@ -681,6 +681,7 @@ mod tests {
             &'a self,
             endpoint_id: EndpointId,
             observations: &'a [ResourceObservation],
+            _decode_failures: &'a [crate::ResourceDecodeFailure],
             observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             Box::pin(async move {
@@ -800,18 +801,21 @@ mod tests {
             _trust: &'a TlsTrust,
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
-        ) -> BoundaryFuture<'a, Result<Vec<ResourceObservation>, Self::Error>> {
+        ) -> BoundaryFuture<'a, Result<crate::CoreResourceReadOutcome, Self::Error>> {
             Box::pin(async move {
                 lock_state(&self.state)?.events.push("read");
                 if !self.read_succeeds {
                     return Err(MockError::Read);
                 }
-                Ok(vec![ResourceObservation::new(
-                    ResourceFeature::ServiceRoot,
-                    ResourceODataId::parse("/redfish/v1/").map_err(|_| MockError::State)?,
-                    ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)
-                        .map_err(|_| MockError::State)?,
-                )])
+                Ok(crate::CoreResourceReadOutcome::new(
+                    vec![ResourceObservation::new(
+                        ResourceFeature::ServiceRoot,
+                        ResourceODataId::parse("/redfish/v1/").map_err(|_| MockError::State)?,
+                        ResourceSnapshotPayload::parse(r#"{"Name":"Root"}"#)
+                            .map_err(|_| MockError::State)?,
+                    )],
+                    Vec::new(),
+                ))
             })
         }
     }

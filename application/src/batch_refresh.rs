@@ -1007,6 +1007,7 @@ mod tests {
             &'a self,
             endpoint_id: EndpointId,
             observations: &'a [crate::ResourceObservation],
+            _decode_failures: &'a [crate::ResourceDecodeFailure],
             observed_at: OffsetDateTime,
         ) -> crate::BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             Box::pin(async move {
@@ -1143,7 +1144,7 @@ mod tests {
             _trust: &'a TlsTrust,
             _username: &'a CredentialUsername,
             _password: &'a secrecy::SecretString,
-        ) -> crate::BoundaryFuture<'a, Result<Vec<crate::ResourceObservation>, Self::Error>>
+        ) -> crate::BoundaryFuture<'a, Result<crate::CoreResourceReadOutcome, Self::Error>>
         {
             let tracker = self.tracker.clone();
             let slow = self.slow;
@@ -1163,7 +1164,10 @@ mod tests {
                 let result = if !succeeds || fail_at.as_deref() == Some(address.as_url().as_str()) {
                     Err(MockError::Reader)
                 } else {
-                    observations().map_err(|_| MockError::Reader)
+                    Ok(crate::CoreResourceReadOutcome::new(
+                        observations().map_err(|_| MockError::Reader)?,
+                        Vec::new(),
+                    ))
                 };
                 if let Some(tracker) = &tracker {
                     tracker.lock().map_err(|_| MockError::Events)?.in_flight -= 1;

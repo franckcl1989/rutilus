@@ -2156,6 +2156,7 @@ mod tests {
             &'a self,
             _endpoint_id: EndpointId,
             _observations: &'a [crate::ResourceObservation],
+            _decode_failures: &'a [crate::ResourceDecodeFailure],
             _observed_at: OffsetDateTime,
         ) -> crate::BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             Box::pin(async move { Ok(Vec::new()) })

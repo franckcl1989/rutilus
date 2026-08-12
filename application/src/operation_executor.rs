@@ -2194,6 +2194,7 @@ mod tests {
             &'a self,
             _endpoint_id: EndpointId,
             _observations: &'a [ResourceObservation],
+            _decode_failures: &'a [crate::ResourceDecodeFailure],
             _observed_at: OffsetDateTime,
         ) -> BoundaryFuture<'a, Result<Vec<ResourceSnapshot>, Self::Error>> {
             // The operation scheduler never commits resource generations; the

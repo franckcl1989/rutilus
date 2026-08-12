@@ -413,6 +413,7 @@ async fn two_hundred_endpoints_round_trip_with_generation_consistent_refreshes()
             .commit_resource_generation(
                 endpoint.id(),
                 &generation_observations(index, 1)?,
+                &[],
                 observed_at,
             )
             .await?;
@@ -453,6 +454,7 @@ async fn two_hundred_endpoints_round_trip_with_generation_consistent_refreshes()
             .commit_resource_generation(
                 endpoint.id(),
                 &generation_observations(index, 2)?,
+                &[],
                 observed_at,
             )
             .await?;
@@ -511,6 +513,7 @@ async fn two_hundred_endpoints_round_trip_with_generation_consistent_refreshes()
             .commit_resource_generation(
                 endpoints[0].id(),
                 &invalid_generation,
+                &[],
                 endpoints[0].updated_at() + Duration::seconds(3),
             )
             .await,

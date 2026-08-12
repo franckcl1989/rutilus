@@ -133,9 +133,9 @@ async fn center_data_sites_migration_adds_and_drops_the_site_association()
 async fn center_data_sites_down_restores_the_original_table_shapes() -> Result<(), Box<dyn Error>> {
     let (directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
-    // Unwind the two 0.7.0 S5 migrations; the down of 000010 must restore
-    // the 000009-era shapes.
-    Migrator::down(&database, Some(2)).await?;
+    // Unwind the decode-failure migration plus the two 0.7.0 S5 migrations;
+    // the down of 000010 must restore the 000009-era shapes.
+    Migrator::down(&database, Some(3)).await?;
     let applied = Migrator::get_applied_migrations(&database).await?;
     assert_eq!(applied.len(), 19);
     assert_eq!(
