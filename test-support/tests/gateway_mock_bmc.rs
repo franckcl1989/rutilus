@@ -9,8 +9,11 @@
 //! probe states and its §11.5 `DellAttributes` snapshot, the NVIDIA
 //! profile's `oem-nvidia*` probe states and its §11.5 chains, the Lenovo
 //! profile's `oem-lenovo` probe states and its §11.5 `SecurityService`
-//! snapshot, and the xFusion/Inspur no-OEM profiles proving every OEM
-//! capability stays `NotAdvertised` and the read tree stays OEM-free).
+//! snapshot, the AMI profile's `oem-ami` probe state and its §11.5
+//! `AmiServiceRoot`/`ConfigBmc` snapshots, the HPE profile's `oem-hpe`
+//! probe state and its §11.5 `HpeiLoServiceExt`/`HpeiLo` segments, and the
+//! xFusion/Inspur no-OEM profiles proving every OEM capability stays
+//! `NotAdvertised` and the read tree stays OEM-free).
 //!
 //! Every test starts its own `MockBmc` on an ephemeral port, so the suite is
 //! self-contained: it needs no manual setup, no fixture files, and no
@@ -1769,6 +1772,480 @@ async fn lenovo_profile_reads_lenovo_security_service_snapshot() -> Result<(), B
         mock.active_sessions(),
         0,
         "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the AMI profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides `oem-ami` from the
+/// already-decoded Service Root and manager member and never probes a
+/// vendor URL.
+const AMI_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the AMI profile: the 51 requests of the default profile plus the
+/// single §11.5 `ConfigBmc` fetch through the manager's `ConfigBMC`
+/// reference.
+const AMI_RESOURCE_READ_REQUEST_COUNT: u64 = 52;
+
+#[tokio::test]
+async fn ami_profile_probes_oem_ami_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Ami).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile: a vendor profile only swaps the identity
+    // strings and the OEM surface, never the standard tree.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The AMI profile advertises exactly the AMI namespace: the decoded
+    // Service Root and manager member both carry `Oem.Ami`, so `oem-ami`
+    // probes `Supported`; no other vendor namespace is served, so every
+    // remaining OEM capability stays `NotAdvertised` (§11.3 advertised
+    // layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemAmi => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("AMI"),
+        "the probe must carry the AMI Service Root identity"
+    );
+    assert_eq!(
+        discovery.service_root().product(),
+        Some("MegaRAC SP-X"),
+        "the probe must carry the AMI Service Root product"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        AMI_PROBE_REQUEST_COUNT,
+        "the AMI namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete AMI read surface is asserted in one test so the request
+// position and the 30-resource order stay one contract; splitting it would
+// duplicate the pin/credentials flow. The infra crate allows the same lint
+// on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn ami_profile_reads_oem_ami_snapshots() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Ami).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let outcome = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+    let resources = outcome.projections();
+
+    // The AMI read surface adds exactly the two §11.5 snapshots to the
+    // default 28-resource tree, in the documented read order: the embedded
+    // `AmiServiceRoot` segment right after the Service Root projection, and
+    // the fetched `ConfigBmc` document right after the manager's
+    // `HostInterfaces` member and before the root-level `Accounts` family.
+    assert_eq!(resources.len(), 30);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::OemAmiServiceRoot,
+            ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::OemAmiConfigBmc,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The `AmiServiceRoot` snapshot carries the segment's location inside
+    // the Service Root document (`/redfish/v1/Oem/Ami`), the root's own
+    // ETag, and the Redfish Technology Pack version exactly as published.
+    let ami = &resources[1];
+    assert_eq!(ami.feature(), ResourceFeature::OemAmiServiceRoot);
+    assert_eq!(ami.odata_id().as_str(), "/redfish/v1/Oem/Ami");
+    assert!(
+        ami.etag().is_some(),
+        "{} must carry its upstream ETag",
+        ami.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(ami.payload().as_str())?;
+    assert_eq!(payload["Id"], "RootService");
+    assert_eq!(payload["Name"], "Root Service");
+    assert_eq!(payload["RtpVersion"], "1.2.3");
+
+    // The `ConfigBmc` snapshot carries the vendor-published document: the
+    // `ConfigBMC` reference identity, its upstream ETag, and the four BIOS
+    // lockout/lockdown states in their vendor enum spellings.
+    let config_bmc = &resources[20];
+    assert_eq!(config_bmc.feature(), ResourceFeature::OemAmiConfigBmc);
+    assert_eq!(
+        config_bmc.odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/ConfigBMC"
+    );
+    assert!(
+        config_bmc.etag().is_some(),
+        "{} must carry its upstream ETag",
+        config_bmc.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(config_bmc.payload().as_str())?;
+    assert_eq!(payload["LockoutHostControl"], "Enable");
+    assert_eq!(payload["LockoutBiosVariableWriteMode"], "Disable");
+    assert_eq!(payload["LockdownBiosSettingsChange"], "Enable");
+    assert_eq!(payload["LockdownBiosUpgradeDowngrade"], "Disable");
+
+    // The gateway fetches the `ConfigBmc` document exactly once, as one
+    // manager surface right after the `HostInterfaces/1` member, and through
+    // the Session token transport like every other read.
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        AMI_RESOURCE_READ_REQUEST_COUNT,
+        "the AMI read must issue exactly one request beyond the default flow"
+    );
+    let host_interface_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/HostInterfaces/1")
+        .ok_or_else(|| io::Error::other("HostInterfaces/1 is missing from the request log"))?;
+    let config_bmc_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1/Oem/ConfigBMC")
+        .ok_or_else(|| io::Error::other("the ConfigBmc fetch is missing from the request log"))?;
+    assert_eq!(
+        config_bmc_index,
+        host_interface_index + 1,
+        "the ConfigBmc fetch must follow the manager's HostInterfaces member"
+    );
+    assert_eq!(
+        requests[config_bmc_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the ConfigBmc fetch must authenticate with the Session token"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+/// The gateway's request count for one complete `probe_core_capabilities`
+/// flow with the HPE profile: exactly the 34 requests of the default
+/// profile, because the §11.3 namespace probe decides `oem-hpe` from the
+/// already-decoded Service Root and manager member and never probes a
+/// vendor URL.
+const HPE_PROBE_REQUEST_COUNT: u64 = 34;
+
+/// The gateway's request count for one complete `read_core_resources` flow
+/// with the HPE profile: exactly the 51 requests of the default profile,
+/// because both HPE segments are embedded in documents the default flow
+/// already fetches, so the read issues no request beyond the standard tree.
+const HPE_RESOURCE_READ_REQUEST_COUNT: u64 = 51;
+
+#[tokio::test]
+async fn hpe_profile_probes_oem_hpe_supported_with_standard_surface_unchanged()
+-> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Hpe).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+
+    // Same §2.1 inventory, same order, and the same served standard surface
+    // as the default profile: a vendor profile only swaps the identity
+    // strings and the OEM surface, never the standard tree.
+    assert_eq!(
+        discovery.capabilities().len(),
+        CAPABILITY_LEDGER_ORDER.len()
+    );
+    for (index, observation) in discovery.capabilities().iter().enumerate() {
+        assert_eq!(
+            observation.capability(),
+            CAPABILITY_LEDGER_ORDER[index],
+            "capability {index} must follow the §2.1 inventory order"
+        );
+    }
+    for capability in CORE_CAPABILITIES_SUPPORTED {
+        assert_capability_state(
+            discovery.capabilities(),
+            capability,
+            CapabilityState::Supported,
+        )?;
+    }
+    // The HPE profile advertises exactly the HPE namespace: the decoded
+    // Service Root and manager member both carry `Oem.Hpe`, so `oem-hpe`
+    // probes `Supported`; no other vendor namespace is served, so every
+    // remaining OEM capability stays `NotAdvertised` (§11.3 advertised
+    // layer).
+    for capability in OEM_CAPABILITY_LEDGER_ORDER {
+        let expected = match capability {
+            EndpointCapability::OemHpe => CapabilityState::Supported,
+            _ => CapabilityState::NotAdvertised,
+        };
+        assert_capability_state(discovery.capabilities(), capability, expected)?;
+    }
+    assert_eq!(
+        discovery.service_root().vendor(),
+        Some("HPE"),
+        "the probe must carry the HPE Service Root identity"
+    );
+    assert_eq!(
+        discovery.service_root().product(),
+        Some("ProLiant DL380 Gen11"),
+        "the probe must carry the HPE Service Root product"
+    );
+    assert_eq!(
+        mock.requests_served(),
+        HPE_PROBE_REQUEST_COUNT,
+        "the HPE namespace probe must fetch no document beyond the default flow"
+    );
+    Ok(())
+}
+
+// The complete HPE read surface is asserted in one test so the 30-resource
+// order stays one contract; splitting it would duplicate the pin/credentials
+// flow. The infra crate allows the same lint on its fixture-sequence tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn hpe_profile_reads_oem_hpe_segments_snapshot() -> Result<(), Box<dyn Error>> {
+    let mock = MockBmc::start_with_profile(MockProfile::Hpe).await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let outcome = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+    let resources = outcome.projections();
+
+    // The HPE read surface adds exactly the two §11.5 segments to the
+    // default 28-resource tree, in the documented read order: the embedded
+    // `HpeiLoServiceExt` segment right after the Service Root projection,
+    // and the embedded `HpeiLo` segment right after the manager's
+    // `HostInterfaces` member and before the root-level `Accounts` family.
+    assert_eq!(resources.len(), 30);
+    let features: Vec<ResourceFeature> = resources
+        .iter()
+        .map(CoreResourceProjection::feature)
+        .collect();
+    assert_eq!(
+        features,
+        [
+            ResourceFeature::ServiceRoot,
+            ResourceFeature::OemHpeILoServiceExt,
+            ResourceFeature::Systems,
+            ResourceFeature::Bios,
+            ResourceFeature::BootOptions,
+            ResourceFeature::SecureBoot,
+            ResourceFeature::Processors,
+            ResourceFeature::Processors,
+            ResourceFeature::Memory,
+            ResourceFeature::PcieDevices,
+            ResourceFeature::Chassis,
+            ResourceFeature::Power,
+            ResourceFeature::Thermal,
+            ResourceFeature::Sensors,
+            ResourceFeature::Controls,
+            ResourceFeature::Assembly,
+            ResourceFeature::Managers,
+            ResourceFeature::LogServices,
+            ResourceFeature::ManagerNetworkProtocol,
+            ResourceFeature::HostInterfaces,
+            ResourceFeature::OemHpeManager,
+            ResourceFeature::Accounts,
+            ResourceFeature::SoftwareInventory,
+            ResourceFeature::EventService,
+            ResourceFeature::EventSubscription,
+            ResourceFeature::TelemetryService,
+            ResourceFeature::MetricDefinition,
+            ResourceFeature::MetricReport,
+            ResourceFeature::TaskService,
+            ResourceFeature::Task,
+        ]
+    );
+
+    // The `HpeiLoServiceExt` snapshot carries the segment's location inside
+    // the Service Root document (`/redfish/v1/Oem/Hpe`), the root's own
+    // ETag, and the iLO manager identity of the first `Manager` entry
+    // exactly as published.
+    let hpe_root = &resources[1];
+    assert_eq!(hpe_root.feature(), ResourceFeature::OemHpeILoServiceExt);
+    assert_eq!(hpe_root.odata_id().as_str(), "/redfish/v1/Oem/Hpe");
+    assert!(
+        hpe_root.etag().is_some(),
+        "{} must carry its upstream ETag",
+        hpe_root.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(hpe_root.payload().as_str())?;
+    assert_eq!(payload["Id"], "RootService");
+    assert_eq!(payload["ManagerType"], "iLO 5");
+    assert_eq!(payload["ManagerFirmwareVersion"], "2.44");
+
+    // The `HpeiLo` snapshot carries the segment's location inside the
+    // Manager document (`/redfish/v1/Managers/1/Oem/Hpe`), the manager's
+    // own ETag, and the `VirtualNICEnabled` value exactly as published.
+    let hpe_manager = &resources[20];
+    assert_eq!(hpe_manager.feature(), ResourceFeature::OemHpeManager);
+    assert_eq!(
+        hpe_manager.odata_id().as_str(),
+        "/redfish/v1/Managers/1/Oem/Hpe"
+    );
+    assert!(
+        hpe_manager.etag().is_some(),
+        "{} must carry its upstream ETag",
+        hpe_manager.odata_id()
+    );
+    let payload: serde_json::Value = serde_json::from_str(hpe_manager.payload().as_str())?;
+    assert_eq!(payload["Id"], "1");
+    assert_eq!(payload["Name"], "Manager One");
+    assert_eq!(payload["VirtualNICEnabled"], true);
+
+    // The gateway fetches no document beyond the default flow: both HPE
+    // segments are embedded in the Service Root and Manager documents the
+    // default flow already fetches, so no vendor URL is fabricated and no
+    // request path carries an `Oem` segment (§11.5).
+    let requests = mock.requests();
+    assert_eq!(
+        mock.requests_served(),
+        HPE_RESOURCE_READ_REQUEST_COUNT,
+        "the HPE read must issue exactly the default request count"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path().contains("/Oem/")),
+        "the embedded HPE segments must not be fetched through a vendor URL"
+    );
+    let manager_index = requests
+        .iter()
+        .position(|request| request.path() == "/redfish/v1/Managers/1")
+        .ok_or_else(|| io::Error::other("Managers/1 is missing from the request log"))?;
+    assert_eq!(
+        requests[manager_index].header("x-auth-token"),
+        Some("test-session-token"),
+        "the HPE read must authenticate with the Session token"
+    );
+    assert_eq!(
+        mock.active_sessions(),
+        0,
+        "the resource read must delete its transient Session before returning"
+    );
+    Ok(())
+}
+
+/// An endpoint that serves no vendor namespace — the default profile — must
+/// leave both the AMI and HPE read families absent: the §11.3 advertised
+/// layer reports `oem-ami` and `oem-hpe` `NotAdvertised`, the read tree
+/// carries no AMI or HPE snapshot, and no AMI/HPE request is fabricated
+/// (the failure guard of §11.5's no-fabricated-URL rule).
+#[tokio::test]
+async fn namespace_free_endpoint_leaves_ami_and_hpe_families_absent() -> Result<(), Box<dyn Error>>
+{
+    let mock = MockBmc::start().await?;
+    let gateway = RedfishGateway::from_system_roots().await?;
+    let (address, trust) = pin_mock_identity(&gateway, &mock).await?;
+    let (username, password) = credentials()?;
+
+    let discovery = gateway
+        .probe_core_capabilities(&address, &trust, &username, &password)
+        .await?;
+    // The default tree serves no `Oem.Ami` / `Oem.Hpe` namespace anywhere,
+    // so the probe must report both OEM capabilities `NotAdvertised`.
+    assert_capability_state(
+        discovery.capabilities(),
+        EndpointCapability::OemAmi,
+        CapabilityState::NotAdvertised,
+    )?;
+    assert_capability_state(
+        discovery.capabilities(),
+        EndpointCapability::OemHpe,
+        CapabilityState::NotAdvertised,
+    )?;
+
+    let outcome = gateway
+        .read_core_resources(&address, &trust, &username, &password)
+        .await?;
+    let resources = outcome.projections();
+    // The read tree stays the default 28-resource tree: none of the four
+    // AMI/HPE resource features may appear.
+    assert_eq!(resources.len(), 28);
+    assert!(
+        resources.iter().all(|resource| !matches!(
+            resource.feature(),
+            ResourceFeature::OemAmiServiceRoot
+                | ResourceFeature::OemAmiConfigBmc
+                | ResourceFeature::OemHpeILoServiceExt
+                | ResourceFeature::OemHpeManager
+        )),
+        "a namespace-free endpoint must carry no AMI or HPE snapshot"
+    );
+    // The combined flow stays at the default request counts (the default
+    // tree shares the no-OEM request counts): no AMI/HPE fetch is
+    // fabricated.
+    assert_eq!(
+        mock.requests_served(),
+        NO_OEM_PROBE_REQUEST_COUNT + NO_OEM_RESOURCE_READ_REQUEST_COUNT,
+        "an AMI/HPE-free endpoint must issue exactly the default request count"
     );
     Ok(())
 }
