@@ -1932,6 +1932,180 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn commits_generations_with_the_previously_rejected_feature_families()
+    -> Result<(), Box<dyn Error>> {
+        // The 000013 feature-list alignment added the ten resource family
+        // codes the `ck_resources_feature` CHECK was missing. Before the
+        // alignment, this whole Generation would have been refused by the
+        // constraint and rolled back as one transaction; after it, the
+        // families commit and round-trip like every other family.
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = [
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+            observation(
+                ResourceFeature::PowerEquipment,
+                "/redfish/v1/PowerEquipment/PowerShelves/1",
+                "Power Shelf One",
+            )?,
+            observation(
+                ResourceFeature::PowerSupplies,
+                "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/PSU1",
+                "Power Supply One",
+            )?,
+            observation(
+                ResourceFeature::NetworkDeviceFunctions,
+                "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1",
+                "Network Device Function One",
+            )?,
+            observation(
+                ResourceFeature::EnvironmentMetrics,
+                "/redfish/v1/Chassis/1/EnvironmentMetrics",
+                "Environment Metrics",
+            )?,
+            observation(
+                ResourceFeature::OemAmiServiceRoot,
+                "/redfish/v1/Oem/Ami",
+                "AMI Service Root",
+            )?,
+            observation(
+                ResourceFeature::OemAmiConfigBmc,
+                "/redfish/v1/Managers/1/Oem/Ami/ConfigBMC",
+                "AMI Config BMC",
+            )?,
+            observation(
+                ResourceFeature::OemHpeILoServiceExt,
+                "/redfish/v1/Oem/Hpe",
+                "HPE iLO Service Ext",
+            )?,
+            observation(
+                ResourceFeature::OemHpeManager,
+                "/redfish/v1/Managers/1/Oem/Hpe",
+                "HPE Manager",
+            )?,
+            observation(
+                ResourceFeature::OemLiteOnPowerSupply,
+                "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/LiteOn1",
+                "LiteOn Power Supply",
+            )?,
+            observation(
+                ResourceFeature::OemDeltaPowerSupply,
+                "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/Delta1",
+                "Delta Power Supply",
+            )?,
+        ];
+        let committed = store
+            .commit_resource_generation(
+                endpoint_id,
+                &generation,
+                &[],
+                created_at + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(committed.len(), 11);
+
+        let loaded = store
+            .find_current_resource_generation(endpoint_id)
+            .await?
+            .ok_or("committed generation must load")?;
+        assert_eq!(loaded, committed);
+        for feature in [
+            ResourceFeature::PowerEquipment,
+            ResourceFeature::PowerSupplies,
+            ResourceFeature::NetworkDeviceFunctions,
+            ResourceFeature::EnvironmentMetrics,
+            ResourceFeature::OemAmiServiceRoot,
+            ResourceFeature::OemAmiConfigBmc,
+            ResourceFeature::OemHpeILoServiceExt,
+            ResourceFeature::OemHpeManager,
+            ResourceFeature::OemLiteOnPowerSupply,
+            ResourceFeature::OemDeltaPowerSupply,
+        ] {
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|snapshot| snapshot.feature() == feature)
+                    .count(),
+                1,
+                "feature {feature} must round-trip exactly once"
+            );
+        }
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commits_decode_failures_for_the_previously_rejected_families()
+    -> Result<(), Box<dyn Error>> {
+        // The 000013 feature-list alignment fixed MINOR-1: the
+        // `ck_resource_decode_failures_feature` CHECK was missing
+        // `lenovo-security-service` (and the ten codes the resources table
+        // gained), so a Lenovo `SecurityService` decode failure used to be
+        // refused and rolled back the whole Generation transaction. The
+        // records now commit inside the Generation and round-trip through
+        // the diagnostics read.
+        let (directory, store, endpoint_id, created_at) = store_with_endpoint().await?;
+        let generation = vec![
+            observation(ResourceFeature::Systems, "/redfish/v1/Systems/1", "System")?,
+            observation(ResourceFeature::ServiceRoot, "/redfish/v1", "Root")?,
+        ];
+        let decode_failures = vec![
+            decode_failure(
+                "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService",
+                Some("#LenovoManagerProperties.v1_0_0.LenovoManagerProperties"),
+                ResourceFeature::OemLenovoSecurityService,
+                Some("Lenovo"),
+                "schema decode failed: missing required field",
+                None,
+            )?,
+            decode_failure(
+                "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/PSU1/Oem/deltaenergysystems",
+                None,
+                ResourceFeature::OemDeltaPowerSupply,
+                Some("deltaenergysystems"),
+                "schema decode failed: unknown field",
+                None,
+            )?,
+        ];
+        store
+            .commit_resource_generation(
+                endpoint_id,
+                &generation,
+                &decode_failures,
+                created_at + Duration::SECOND,
+            )
+            .await?;
+
+        let loaded = store
+            .find_current_decode_failures(endpoint_id, RefreshGeneration::new(1)?)
+            .await?;
+        assert_eq!(loaded.len(), 2);
+        let security = loaded
+            .iter()
+            .find(|failure| failure.feature() == ResourceFeature::OemLenovoSecurityService)
+            .ok_or("lenovo security service record is missing")?;
+        assert_eq!(
+            security.odata_uri().as_str(),
+            "/redfish/v1/Managers/1/Oem/Lenovo/SecurityService"
+        );
+        assert_eq!(security.oem_namespace(), Some("Lenovo"));
+        let delta = loaded
+            .iter()
+            .find(|failure| failure.feature() == ResourceFeature::OemDeltaPowerSupply)
+            .ok_or("delta power supply record is missing")?;
+        assert_eq!(
+            delta.odata_uri().as_str(),
+            "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/PSU1/Oem/deltaenergysystems"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
     fn decode_failure(
         odata_uri: &str,
         odata_type: Option<&str>,

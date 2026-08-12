@@ -21,6 +21,10 @@ pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
+    // The table builder spells out every column, key, and constraint, which
+    // exceeds the pedantic line budget (the rebuild migrations allow the same
+    // lint on their exhaustive builders).
+    #[allow(clippy::too_many_lines)]
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(
@@ -42,7 +46,11 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(ColumnDef::new(ResourceDecodeFailure::OdataType).string())
-                    .col(ColumnDef::new(ResourceDecodeFailure::Feature).string().not_null())
+                    .col(
+                        ColumnDef::new(ResourceDecodeFailure::Feature)
+                            .string()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(ResourceDecodeFailure::OemNamespace).string())
                     .col(
                         ColumnDef::new(ResourceDecodeFailure::ErrorSummary)
@@ -63,7 +71,10 @@ impl MigrationTrait for Migration {
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_resource_decode_failures_endpoint")
-                            .from(ResourceDecodeFailure::Table, ResourceDecodeFailure::EndpointId)
+                            .from(
+                                ResourceDecodeFailure::Table,
+                                ResourceDecodeFailure::EndpointId,
+                            )
                             .to(Endpoint::Table, Endpoint::Id)
                             .on_update(ForeignKeyAction::Cascade)
                             .on_delete(ForeignKeyAction::Cascade),

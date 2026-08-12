@@ -185,16 +185,16 @@ async fn nvidia_power_families_migration_extends_the_feature_allow_list()
         )
         .exec(&database)
         .await?;
-    // Down nine migrations only: `down(None)` would unwind the whole
+    // Down ten migrations only: `down(None)` would unwind the whole
     // history and drop the `resources` table the assertions below seed
     // into, while this test only needs the NVIDIA power follow-up undone.
     // The migrations stacked after 000003 (000005 product users, 000007
     // audit action shapes, 000006 Lenovo families, 000008 audit
     // execute-operation, 000009 center tables, the two 0.7.0 center
-    // site-scoping migrations 000010/000011, and the decode-failure
-    // migration 000012) unwind first, so the restore lands on the exact
-    // 000001 allow-list the test asserts.
-    Migrator::down(&database, Some(9)).await?;
+    // site-scoping migrations 000010/000011, the decode-failure migration
+    // 000012, and the 000013 feature-list alignment) unwind first, so the
+    // restore lands on the exact 000001 allow-list the test asserts.
+    Migrator::down(&database, Some(10)).await?;
     for code in ["nvidia-power-compliance", "nvidia-managed-entity"] {
         assert!(
             seed_resource(

@@ -126,10 +126,10 @@ async fn center_role_sites_migration_scopes_the_roles_to_sites() -> Result<(), B
 async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<dyn Error>> {
     let (directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
-    // Unwind the decode-failure migration plus the center-role-sites
-    // migration; the down of 000010's successor must restore the 000010-era
-    // shape.
-    Migrator::down(&database, Some(2)).await?;
+    // Unwind the feature-list alignment and decode-failure migrations plus
+    // the center-role-sites migration; the down of 000010's successor must
+    // restore the 000010-era shape.
+    Migrator::down(&database, Some(3)).await?;
     let applied = Migrator::get_applied_migrations(&database).await?;
     assert_eq!(
         applied.last().map(sea_orm_migration::Migration::name),
