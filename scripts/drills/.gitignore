@@ -1,0 +1,7 @@
+# Drill runtime state: per-drill portable instances, logs, and downloads
+# must never enter source control.
+/tmp/
+/logs/
+*.log
+*.rut
+*.bin
