@@ -1748,7 +1748,7 @@ strings_catalog! {
     /// The "1 of {total} endpoints shown" overview filter summary.
     fmt_endpoints_shown_one: "1 of {total} endpoints shown", zh: "共 {total} 个端点，已显示 1 个",
     /// The "{shown} of {total} endpoints shown" overview filter summary.
-    fmt_endpoints_shown_many: "{shown} of {total} endpoints shown", zh: "共 {total} 个端点，已显示 {shown} 个",
+    fmt_endpoints_shown_many: "{shown} of {total} endpoints shown", zh: "已显示 {shown} 个，共 {total} 个端点",
     /// The "1 endpoint selected" overview selection summary.
     fmt_endpoints_selected_one: "1 endpoint selected", zh: "已选择 1 个端点",
     /// The "{count} endpoints selected" overview selection summary.
@@ -1758,7 +1758,7 @@ strings_catalog! {
     /// The "{count} center operations" center count text.
     fmt_center_operations_many: "{count} center operations", zh: "{count} 个中心操作",
     /// The "{entries} capabilities across {} pages" capability summary.
-    fmt_capabilities_count: "{entries} capabilities across {} pages", zh: "共 {} 页 {} 项能力",
+    fmt_capabilities_count: "{entries} capabilities across {} pages", zh: "{entries} 项能力，共 {} 页",
     /// The "{} of {} rows enrolled; {} failed" import summary.
     fmt_rows_enrolled: "{} of {} rows enrolled; {} failed", zh: "{} / {} 行已注册；{} 行失败",
     /// The "{} of {} endpoints refreshed; {} failed" refresh summary.
@@ -1766,7 +1766,7 @@ strings_catalog! {
     /// The "{} of {} ({}) supported" capability coverage text.
     fmt_coverage_supported: "{} of {} ({}) supported", zh: "{} / {}（{}）支持",
     /// The "{} members across {} endpoints, {} distinct versions" firmware summary.
-    fmt_members_versions: "{} members across {} endpoints, {} distinct versions", zh: "{} 个端点中 {} 个成员，{} 个不同版本",
+    fmt_members_versions: "{} members across {} endpoints, {} distinct versions", zh: "{} 个成员，分布于 {} 个端点，{} 个不同版本",
     /// The "{}%" progress text.
     fmt_percent: "{}%", zh: "{}%",
     /// The "Site {} · binding {} · expires {}" binding code text.
@@ -2040,6 +2040,40 @@ mod tests {
         let en_keys = EN_ENTRIES.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         let zh_keys = ZH_ENTRIES.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         assert_eq!(zh_keys, en_keys);
+    }
+
+    /// Every format template must expose its placeholders in the same order
+    /// in both languages: `format_catalog` fills the slots by their order of
+    /// appearance, so a template that reorders the slots swaps the arguments'
+    /// values in that language (e.g. "共 {total} 个端点，已显示 {shown} 个"
+    /// renders the shown count into the total position). Any language adding
+    /// a reversed template fails here before a view can render swapped
+    /// numbers; named and positional slots are compared as they appear.
+    #[test]
+    fn zh_templates_keep_the_en_placeholder_order() {
+        fn slot_sequence(template: &str) -> Vec<&str> {
+            let mut slots = Vec::new();
+            let mut rest = template;
+            while let Some(start) = rest.find('{') {
+                let Some(close_rel) = rest[start..].find('}') else {
+                    break;
+                };
+                let name = &rest[start + 1..start + close_rel];
+                slots.push(if name.is_empty() { "{}" } else { name });
+                rest = &rest[start + close_rel + 1..];
+            }
+            slots
+        }
+
+        // The completeness test pins the two key sets to the same order, so
+        // zipping the paired entries is safe here.
+        for ((key, en_template), (_, zh_template)) in EN_ENTRIES.iter().zip(ZH_ENTRIES) {
+            assert_eq!(
+                slot_sequence(zh_template),
+                slot_sequence(en_template),
+                "catalog entry `{key}` must keep its placeholder order in both languages"
+            );
+        }
     }
 
     /// The language selection entry point must map both languages to their

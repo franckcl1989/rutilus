@@ -3266,8 +3266,8 @@ impl CapabilityMatrixState {
         matches!(self, Self::Ready(matrix) if matrix.groups.is_empty())
     }
 
-    /// One-line summary of the loaded matrix, e.g. "33 capabilities across
-    /// 22 pages".
+    /// One-line summary of the loaded matrix, rendered through the
+    /// `fmt_capabilities_count` catalog template in the active language.
     fn summary_text(&self) -> String {
         match self {
             Self::Ready(matrix) => {
@@ -3276,10 +3276,7 @@ impl CapabilityMatrixState {
                     .iter()
                     .map(|group| group.entries.len())
                     .sum::<usize>();
-                format!(
-                    "{entries} capabilities across {} pages",
-                    matrix.groups.len()
-                )
+                catalog_format!(L().fmt_capabilities_count, entries, matrix.groups.len())
             }
             Self::Idle | Self::Loading | Self::Failed(_) => String::new(),
         }
@@ -4816,18 +4813,22 @@ impl OverviewProjection {
     /// over zero observations).
     fn capability_coverage_text(&self) -> Option<String> {
         self.capability_coverage.as_ref().map(|coverage| {
-            format!(
-                "{} of {} ({}) supported",
-                coverage.supported_entries, coverage.observed_entries, coverage.percent_text
+            catalog_format!(
+                L().fmt_coverage_supported,
+                coverage.supported_entries,
+                coverage.observed_entries,
+                coverage.percent_text
             )
         })
     }
 
     /// The §14.2 firmware-summary fact line.
     fn firmware_summary_text(&self) -> String {
-        format!(
-            "{} members across {} endpoints, {} distinct versions",
-            self.firmware_entries, self.firmware_endpoints, self.firmware_versions
+        catalog_format!(
+            L().fmt_members_versions,
+            self.firmware_entries,
+            self.firmware_endpoints,
+            self.firmware_versions
         )
     }
 }
@@ -21819,6 +21820,8 @@ mod tests {
 
     #[test]
     fn overview_projection_renders_every_dashboard_block() -> Result<(), Box<dyn Error>> {
+        use i18n::set_lang;
+
         let overview = serde_json::from_value::<OverviewResponse>(json!({
             "endpoints": {
                 "total": 3,
@@ -21902,8 +21905,21 @@ mod tests {
         assert_eq!(coverage.percent_text, "75%");
         assert_eq!(
             projection.capability_coverage_text(),
-            Some("45 of 60 (75%) supported".to_owned())
+            Some(catalog_format!(L().fmt_coverage_supported, 45, 60, "75%"))
         );
+        // The coverage and firmware lines are catalog copy: the same call
+        // sites render the Simplified Chinese templates after a language
+        // switch, so a hardcoded English fallback can never hide here.
+        set_lang(Lang::Zh);
+        assert_eq!(
+            projection.firmware_summary_text(),
+            "3 个成员，分布于 2 个端点，2 个不同版本"
+        );
+        assert_eq!(
+            projection.capability_coverage_text(),
+            Some("45 / 60（75%）支持".to_owned())
+        );
+        set_lang(Lang::En);
         // The recent-event tail reuses the event card projection.
         assert_eq!(projection.recent_events.len(), 1);
         assert_eq!(
@@ -23503,6 +23519,8 @@ mod tests {
 
     #[test]
     fn capability_load_failures_render_distinct_static_messages() -> Result<(), Box<dyn Error>> {
+        use i18n::set_lang;
+
         assert_eq!(
             CapabilityLoadFailure::EndpointNotFound.message(),
             "This endpoint no longer exists."
@@ -23526,7 +23544,10 @@ mod tests {
         let empty = CapabilityMatrixState::Ready(CapabilityMatrixProjection { groups: Vec::new() });
         assert!(empty.is_ready());
         assert!(empty.has_empty_matrix());
-        assert_eq!(empty.summary_text(), "0 capabilities across 0 pages");
+        assert_eq!(
+            empty.summary_text(),
+            catalog_format!(L().fmt_capabilities_count, 0, 0)
+        );
         assert_eq!(empty.groups().len(), 0);
         assert_eq!(empty.failure_message(), "");
 
@@ -23536,8 +23557,18 @@ mod tests {
         ));
         assert!(!ready.has_empty_matrix());
         assert_eq!(ready.groups().len(), 22);
-        assert_eq!(ready.summary_text(), "33 capabilities across 22 pages");
+        assert_eq!(
+            ready.summary_text(),
+            catalog_format!(L().fmt_capabilities_count, 33, 22)
+        );
         assert_eq!(ready.failure_message(), "");
+        // The summary is catalog copy too: the Simplified Chinese template
+        // keeps the slot order the call site passes, so the count values
+        // can never be swapped.
+        set_lang(Lang::Zh);
+        assert_eq!(empty.summary_text(), "0 项能力，共 0 页");
+        assert_eq!(ready.summary_text(), "33 项能力，共 22 页");
+        set_lang(Lang::En);
         Ok(())
     }
 
@@ -23593,7 +23624,7 @@ mod tests {
         }
         assert_eq!(
             CapabilityMatrixState::Ready(matrix).summary_text(),
-            "47 capabilities across 23 pages"
+            catalog_format!(L().fmt_capabilities_count, 47, 23)
         );
         Ok(())
     }
