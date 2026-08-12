@@ -4599,6 +4599,228 @@ mod tests {
         Ok(())
     }
 
+    /// The reconnect report pin (audit A2): `report_center_operations`
+    /// runs at the start of every established connection, so a reconnect
+    /// re-sends `OperationProgress` for still-active center operations,
+    /// while a completed operation is reported exactly once — its terminal
+    /// inbox entry makes every later connection's report skip it (§15.4
+    /// at-least-once, §15.6 idempotent reporting).
+    // The reconnect script is one continuous scenario — three connections
+    // with the local completion in between — so it stays in one test (the
+    // persistence stress tests allow the same lint on their exhaustive
+    // storm tests).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn reconnect_resends_progress_for_active_operations_and_skips_completed_ones()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let instance_id = InstanceId::generate();
+        let endpoint_id = endpoint.id();
+        // The store is shared with the engine so the test can complete one
+        // operation while the loop is connected; the outbox entries are
+        // shared for the final pending-message assertion, and the task
+        // returns the inbox for the recorded-state assertions.
+        let store = Arc::new(store);
+        let store_for_engine = Arc::clone(&store);
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let outbox = MockOutbox::new(instance_id);
+        let outbox_entries = Arc::clone(&outbox.entries);
+        let run = tokio::spawn(async move {
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                store_for_engine.as_ref(),
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(inbox)
+        });
+
+        // The first connection flushes the endpoint projection; the report
+        // ran before any operation existed, so no progress frame is among
+        // them.
+        let mut wire = next_wire(&mut wires).await?;
+        for sequence in [1, 2, 3] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+
+        // Two center operations are offered and accepted; both stay active
+        // (`Queued`).
+        let (offer_a, received_a) =
+            offer_for(instance_id, endpoint_id, now.unix_timestamp() + 3600)
+                .map_err(std::io::Error::other)?;
+        let (offer_b, received_b) =
+            offer_for(instance_id, endpoint_id, now.unix_timestamp() + 3600)
+                .map_err(std::io::Error::other)?;
+        for received in [&received_a, &received_b] {
+            wire.inbound
+                .send((*received).clone())
+                .map_err(|_| std::io::Error::other("the center feed closed"))?;
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert!(matches!(
+                envelope.message,
+                Some(EnvelopeMessage::OperationAccepted(_))
+            ));
+        }
+        // The whole first connection is acknowledged, so the reconnect
+        // flushes nothing but the fresh report rows.
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 5 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+
+        // Between the connections, operation B completes locally.
+        let operation_b: OperationId = offer_b.operation_id.parse()?;
+        store
+            .apply_transition(
+                operation_b,
+                OperationState::Succeeded,
+                now + time::Duration::SECOND,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        let Wire { outbound, inbound } = wire;
+        drop(outbound);
+        drop(inbound);
+
+        // The reconnect reports both operations: the still-active one as
+        // `OperationProgress`, the completed one as its single
+        // `OperationCompleted` (the inbox entry closes in the same report).
+        let mut second = next_wire(&mut wires).await?;
+        let mut progress_for_a = false;
+        let mut completed_for_b = false;
+        for _ in 0..2 {
+            let envelope = next_outbox_frame(&mut second).await?;
+            let Some(message) = envelope.message else {
+                return Err(
+                    std::io::Error::other("the reconnect report carried no message").into(),
+                );
+            };
+            match message {
+                EnvelopeMessage::OperationProgress(progress)
+                    if progress.operation_id == offer_a.operation_id =>
+                {
+                    assert_eq!(progress.state, OperationState::Queued.as_str());
+                    progress_for_a = true;
+                }
+                EnvelopeMessage::OperationCompleted(completed)
+                    if completed.operation_id == offer_b.operation_id =>
+                {
+                    assert!(completed.succeeded);
+                    completed_for_b = true;
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected reconnect frame: {other:?}"
+                    ))
+                    .into());
+                }
+            }
+        }
+        assert!(
+            progress_for_a,
+            "the reconnect must re-report the active operation as progress"
+        );
+        assert!(
+            completed_for_b,
+            "the reconnect must report the completed operation exactly once"
+        );
+        // The flush delivered exactly the two report frames: the next
+        // frame is a heartbeat.
+        let envelope = next_frame(&mut second).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
+        second
+            .inbound
+            .send(Envelope {
+                sequence: 20,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 7 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let Wire {
+            outbound: outbound_second,
+            inbound: inbound_second,
+        } = second;
+        drop(outbound_second);
+        drop(inbound_second);
+
+        // The second reconnect re-reports the still-active operation as
+        // progress and nothing for the completed one: its terminal inbox
+        // entry makes the report skip it, so no duplicate completion can
+        // reach the center.
+        let mut third = next_wire(&mut wires).await?;
+        let envelope = next_outbox_frame(&mut third).await?;
+        let Some(EnvelopeMessage::OperationProgress(progress)) = envelope.message else {
+            return Err(
+                std::io::Error::other("the re-sent report was not an OperationProgress").into(),
+            );
+        };
+        assert_eq!(progress.operation_id, offer_a.operation_id);
+        assert_eq!(progress.state, OperationState::Queued.as_str());
+        // The flush delivered exactly that one frame: the next frame is a
+        // heartbeat, never a duplicate completion.
+        let envelope = next_frame(&mut third).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        let inbox = stopped.map_err(|error| std::io::Error::other(error.to_string()))?;
+        // The recorded lifecycle: A stays accepted and active, B closed.
+        let operation_a: OperationId = offer_a.operation_id.parse()?;
+        assert_eq!(
+            inbox
+                .entry_state(operation_a)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Accepted)
+        );
+        assert_eq!(
+            inbox
+                .entry_state(operation_b)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Completed)
+        );
+        // The durable outbox: exactly one pending progress row for the
+        // active operation; B's completion was acknowledged and retired.
+        let messages = pending_messages_from(&outbox_entries).map_err(std::io::Error::other)?;
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(EnvelopeMessage::OperationProgress(progress))
+                if progress.operation_id == offer_a.operation_id
+        ));
+        Ok(())
+    }
+
     /// The storm interleaves heartbeats and reconnects: while two loops
     /// lose their connections, a third stays connected and keeps
     /// heartbeating, and the reconnecting loops resume on their fresh
