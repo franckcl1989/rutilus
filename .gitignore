@@ -1,5 +1,8 @@
 /target/
 
+# Release-staging build output.
+/target-release/
+
 # Local runtime state must never enter source control.
 *.db
 *.db-shm
