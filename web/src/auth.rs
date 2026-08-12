@@ -17,7 +17,9 @@
 //!   mutation flag, so the §16.1 role model is a declarative table instead
 //!   of scattered checks.
 //! - The in-process login rate limiter (§16.2 "登录失败限速"): 5 failures
-//!   per username and 20 per client address in a 15-minute window.
+//!   per username and 20 per client address in a 15-minute window, with
+//!   periodic pruning of expired buckets so the maps stay memory-bounded
+//!   under distributed attacks (security-review N3).
 //! - The sign-in, sign-out, bootstrap-claim, password-change, `me`, and
 //!   administration handlers.
 //!
@@ -27,7 +29,7 @@
 //! its `SqliteStore` and master key behind it).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     error::Error,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -114,6 +116,19 @@ const IP_FAILURE_LIMIT: usize = 20;
 /// never tighten a legitimate principal's budget, because valid names never
 /// exceed the bound.
 const RATE_LIMIT_USERNAME_CHARS: usize = rutilus_domain::MAX_PRINCIPAL_NAME_CHARS;
+
+/// New-bucket insertions between full sweeps of one rate-limit bucket map
+/// (security-review N3).
+///
+/// A bucket is only reclaimed once every entry has left the window, so
+/// without a backstop the maps would accumulate every distinct
+/// attacker-controlled key ever presented. Counting only *new* keys keeps
+/// the maps bounded by the working set of one window plus this many
+/// un-swept buckets: an attacker must keep a bucket alive with a fresh
+/// failure every window, so memory now tracks request traffic instead of
+/// growing without bound over time. Each sweep applies the same expiry
+/// rule as the access path, so it never changes a limit verdict.
+const BUCKET_PRUNE_THRESHOLD: usize = 4096;
 
 /// Whether the router enforces session authentication (§16.2).
 #[derive(Clone, Debug)]
@@ -859,17 +874,43 @@ impl AuthState {
 
 /// The §16.2 in-process sign-in rate limiter: 5 failures per username and
 /// 20 per client address in a 15-minute sliding window.
+///
+/// Both bucket maps are memory-bounded (security-review N3): a bucket is
+/// only removed once every entry has left the window, so without a
+/// backstop each map would accumulate every distinct key ever presented.
+/// [`BucketMap`] therefore sweeps the whole map once
+/// [`BUCKET_PRUNE_THRESHOLD`] new keys have been inserted since the last
+/// sweep, reclaiming every bucket whose entries have all expired — the
+/// dormant keys the per-access pruning never reaches.
 #[derive(Clone, Debug)]
 struct LoginRateLimiter {
-    by_username: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
-    by_ip: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    by_username: Arc<Mutex<BucketMap>>,
+    by_ip: Arc<Mutex<BucketMap>>,
+}
+
+/// One rate-limit bucket map with the bookkeeping that bounds its size.
+#[derive(Debug)]
+struct BucketMap {
+    buckets: HashMap<String, VecDeque<Instant>>,
+    /// New keys inserted since the last full sweep; reaching
+    /// [`BUCKET_PRUNE_THRESHOLD`] triggers one.
+    inserts_since_prune: usize,
+}
+
+impl BucketMap {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            inserts_since_prune: 0,
+        }
+    }
 }
 
 impl LoginRateLimiter {
     fn new() -> Self {
         Self {
-            by_username: Arc::new(Mutex::new(HashMap::new())),
-            by_ip: Arc::new(Mutex::new(HashMap::new())),
+            by_username: Arc::new(Mutex::new(BucketMap::new())),
+            by_ip: Arc::new(Mutex::new(BucketMap::new())),
         }
     }
 
@@ -896,33 +937,39 @@ impl LoginRateLimiter {
         Self::record_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT);
     }
 
-    fn allows_key(
-        bucket: &Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
-        key: &str,
-        now: Instant,
-        limit: usize,
-    ) -> bool {
-        let Ok(mut buckets) = bucket.lock() else {
+    fn allows_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) -> bool {
+        let Ok(mut guard) = bucket.lock() else {
             return false;
         };
-        let failures = buckets.entry(key.to_owned()).or_default();
+        let buckets = &mut *guard;
+        let failures = match buckets.buckets.entry(key.to_owned()) {
+            Entry::Vacant(entry) => {
+                buckets.inserts_since_prune += 1;
+                entry.insert(VecDeque::new())
+            }
+            Entry::Occupied(entry) => entry.into_mut(),
+        };
         while failures
             .front()
             .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
         {
             failures.pop_front();
         }
-        failures.len() < limit
+        let allowed = failures.len() < limit;
+        Self::prune_if_due(&mut buckets.buckets, &mut buckets.inserts_since_prune, now);
+        allowed
     }
 
-    fn record_key(
-        bucket: &Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
-        key: &str,
-        now: Instant,
-        limit: usize,
-    ) {
-        if let Ok(mut buckets) = bucket.lock() {
-            let failures = buckets.entry(key.to_owned()).or_default();
+    fn record_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) {
+        if let Ok(mut guard) = bucket.lock() {
+            let buckets = &mut *guard;
+            let failures = match buckets.buckets.entry(key.to_owned()) {
+                Entry::Vacant(entry) => {
+                    buckets.inserts_since_prune += 1;
+                    entry.insert(VecDeque::new())
+                }
+                Entry::Occupied(entry) => entry.into_mut(),
+            };
             while failures
                 .front()
                 .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
@@ -932,7 +979,39 @@ impl LoginRateLimiter {
             if failures.len() < limit {
                 failures.push_back(now);
             }
+            Self::prune_if_due(&mut buckets.buckets, &mut buckets.inserts_since_prune, now);
         }
+    }
+
+    /// Runs the full sweep once the map has grown by
+    /// [`BUCKET_PRUNE_THRESHOLD`] buckets since the last one. Only vacant
+    /// inserts can grow the map, so only they are counted (N3).
+    fn prune_if_due(
+        buckets: &mut HashMap<String, VecDeque<Instant>>,
+        inserts_since_prune: &mut usize,
+        now: Instant,
+    ) {
+        if *inserts_since_prune >= BUCKET_PRUNE_THRESHOLD {
+            *inserts_since_prune = 0;
+            Self::prune_expired(buckets, now);
+        }
+    }
+
+    /// Removes every bucket whose entries have all left the window — the
+    /// dormant keys the per-access pruning never reaches (N3). The sweep
+    /// applies the same expiry rule as the access path, so a bucket is
+    /// reclaimed only when the next access would empty it anyway, and the
+    /// limit verdicts are untouched.
+    fn prune_expired(buckets: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
+        buckets.retain(|_, failures| {
+            while failures
+                .front()
+                .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
+            {
+                failures.pop_front();
+            }
+            !failures.is_empty()
+        });
     }
 }
 
@@ -942,11 +1021,13 @@ impl LoginRateLimiter {
 /// The sign-in surface keys the per-username bucket on the *presented*
 /// username — before validation, so invalid-name attempts still consume the
 /// budget. The wire value is attacker-controlled and only bounded by the
-/// request body limit, so the raw string must never reach the bucket map
-/// (whose keys are never evicted): the key is the first
+/// request body limit, so the raw string must never reach the bucket map:
+/// the key is the first
 /// [`MAX_PRINCIPAL_NAME_CHARS`](rutilus_domain::MAX_PRINCIPAL_NAME_CHARS)
-/// characters. The borrow is returned when the value is already within the
-/// bound, so the common (valid-name) path allocates nothing.
+/// characters. The periodic pruning (N3) bounds the *number* of buckets;
+/// this bound keeps each key itself bounded, and both are needed. The
+/// borrow is returned when the value is already within the bound, so the
+/// common (valid-name) path allocates nothing.
 fn bounded_username_key(username: &str) -> std::borrow::Cow<'_, str> {
     if username.chars().count() <= RATE_LIMIT_USERNAME_CHARS {
         std::borrow::Cow::Borrowed(username)
@@ -2761,6 +2842,188 @@ mod tests {
             "the bounded key is the first 64 characters"
         );
         assert_eq!(bounded_username_key(&long).len(), RATE_LIMIT_USERNAME_CHARS);
+    }
+
+    #[test]
+    fn rate_limiter_prunes_expired_buckets_to_a_bounded_size() -> Result<(), Box<dyn Error>> {
+        // The N3 fix: a dormant bucket (all entries left the window) must
+        // be reclaimed by the periodic sweep even when it is never
+        // revisited. Fill the username map with a full threshold of
+        // buckets, slide the window, then fill another threshold: the last
+        // insert trips the sweep, which must reclaim the expired fill and
+        // land the map back at exactly the fresh fill's size — the bound
+        // is "one window's working set plus the threshold", never an
+        // all-time accumulation of distinct keys.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        for index in 0..BUCKET_PRUNE_THRESHOLD {
+            limiter.record_failure(&format!("user-{index}"), "192.0.2.10", now);
+        }
+        let after = now + RATE_WINDOW + StdDuration::from_secs(1);
+        for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
+            limiter.record_failure(&format!("user-{index}"), "192.0.2.10", after);
+        }
+
+        let buckets = limiter
+            .by_username
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert_eq!(
+            buckets.buckets.len(),
+            BUCKET_PRUNE_THRESHOLD,
+            "the sweep must reclaim the expired fill, leaving only the fresh one"
+        );
+        assert!(
+            !buckets.buckets.contains_key("user-0"),
+            "a bucket from the expired fill must be gone"
+        );
+        assert!(
+            buckets
+                .buckets
+                .contains_key(&format!("user-{BUCKET_PRUNE_THRESHOLD}")),
+            "a bucket from the fresh fill must survive"
+        );
+        assert_eq!(
+            buckets.inserts_since_prune, 0,
+            "the sweep must reset the insert counter so the bound recurs"
+        );
+        // The per-address map saw one address throughout: it must stay at
+        // one bucket — the sweep never touches an alive bucket.
+        let ip_buckets = limiter
+            .by_ip
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert_eq!(ip_buckets.buckets.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limiter_prune_spares_active_buckets() -> Result<(), Box<dyn Error>> {
+        // The sweep must reclaim only fully-expired buckets: a bucket
+        // holding a fresh budget keeps it across the sweep, and the limit
+        // verdicts around the sweep are unchanged.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        // Fill the map to one insert below the sweep threshold with stale
+        // buckets, then let the window pass.
+        for index in 0..(BUCKET_PRUNE_THRESHOLD - 1) {
+            limiter.record_failure(&format!("stale-{index}"), "192.0.2.20", now);
+        }
+        let after = now + RATE_WINDOW + StdDuration::from_secs(1);
+        // The first fresh insert trips the sweep while "admin" goes on to
+        // hold a full budget at the sweep time.
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            limiter.record_failure("admin", "192.0.2.10", after);
+        }
+
+        let buckets = limiter
+            .by_username
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert_eq!(
+            buckets.buckets.len(),
+            1,
+            "only the fresh admin bucket may survive the sweep"
+        );
+        drop(buckets);
+        assert!(
+            !limiter.allows("admin", "192.0.2.10", after),
+            "the swept survivor must keep its exhausted budget"
+        );
+        assert!(
+            limiter.allows("another", "192.0.2.10", after),
+            "a fresh username must still open a budget after the sweep"
+        );
+        assert!(
+            limiter.allows("admin2", "192.0.2.99", after),
+            "a fresh address must still open a budget after the sweep"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limiter_prune_reclaims_buckets_created_by_allows_only() -> Result<(), Box<dyn Error>> {
+        // `allows` runs before verification and creates a bucket even for
+        // attempts that never record a failure, so an attacker cycling
+        // distinct usernames grows the map without ever failing a login.
+        // Empty buckets carry no budget, so the sweep must reclaim them
+        // too — the map returns to empty after each full threshold cycle.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        for index in 0..BUCKET_PRUNE_THRESHOLD {
+            limiter.allows(&format!("user-{index}"), "192.0.2.40", now);
+        }
+        let after = now + RATE_WINDOW + StdDuration::from_secs(1);
+        for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
+            limiter.allows(&format!("user-{index}"), "192.0.2.40", after);
+        }
+        let buckets = limiter
+            .by_username
+            .lock()
+            .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert!(
+            buckets.buckets.is_empty(),
+            "buckets that never recorded a failure must be reclaimed by the sweep"
+        );
+        assert_eq!(buckets.inserts_since_prune, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_expired_reclaims_only_buckets_whose_entries_left_the_window() {
+        // Every entry is recorded at or after `start` and swept at `soon`
+        // (one second later) or `later` (one second past the window), so
+        // all ages are built from additions only.
+        let start = Instant::now();
+        let soon = start + StdDuration::from_secs(1);
+        let later = start + RATE_WINDOW + StdDuration::from_secs(1);
+        let expired = start;
+        // The straddling bucket's fresh failure, recorded one second
+        // inside the window at sweep time.
+        let fresh = start + RATE_WINDOW;
+
+        // The empty table sweeps to an empty table.
+        let mut buckets = HashMap::new();
+        LoginRateLimiter::prune_expired(&mut buckets, soon);
+        assert!(buckets.is_empty());
+
+        // A single fresh bucket survives (swept one second after the
+        // entry), and a single expired bucket is reclaimed (swept one
+        // second past the window).
+        let mut buckets = HashMap::new();
+        buckets.insert("alive".to_owned(), VecDeque::from([expired]));
+        LoginRateLimiter::prune_expired(&mut buckets, soon);
+        assert!(buckets.contains_key("alive"));
+        let mut buckets = HashMap::new();
+        buckets.insert("dead".to_owned(), VecDeque::from([expired]));
+        LoginRateLimiter::prune_expired(&mut buckets, later);
+        assert!(buckets.is_empty());
+
+        // A bucket straddling the window boundary — an expired failure
+        // followed by a fresh one — is popped to its fresh tail, exactly
+        // as the access path would: the fresh failure still counts toward
+        // the budget instead of being wiped with the expired one.
+        let mut buckets = HashMap::new();
+        buckets.insert("straddling".to_owned(), VecDeque::from([expired, fresh]));
+        LoginRateLimiter::prune_expired(&mut buckets, later);
+        assert_eq!(
+            buckets.get("straddling").map(VecDeque::len),
+            Some(1),
+            "the fresh entry must keep the straddling bucket"
+        );
+        assert!(
+            buckets
+                .get("straddling")
+                .is_some_and(|failures| failures.contains(&fresh))
+        );
+
+        // An all-expired table returns to empty.
+        let mut buckets = HashMap::new();
+        for index in 0..8 {
+            buckets.insert(format!("dead-{index}"), VecDeque::from([expired]));
+        }
+        LoginRateLimiter::prune_expired(&mut buckets, later);
+        assert!(buckets.is_empty());
     }
 
     #[test]
