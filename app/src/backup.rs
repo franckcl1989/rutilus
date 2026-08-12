@@ -773,7 +773,17 @@ mod tests {
             outcome.entry_count() >= 3,
             "database, key, and marker entries"
         );
-        assert_eq!(outcome.schema_version(), 22);
+        // The recorded schema version must equal the current migration
+        // count. It is derived from the migration crate through the
+        // read-only inspection (`applied + pending` is exactly
+        // `rutilus_migration::Migrator::migrations().len()`, which the app
+        // crate cannot name directly), so adding a migration can never
+        // leave this assertion stale again.
+        let expected_schema_version = {
+            let counts = rutilus_persistence::migration_counts(paths.database_path()).await?;
+            u32::try_from(counts.applied + counts.pending)?
+        };
+        assert_eq!(outcome.schema_version(), expected_schema_version);
         let original_key_bytes = std::fs::read(paths.master_key_path())?;
 
         // Damage the live data after the backup.
