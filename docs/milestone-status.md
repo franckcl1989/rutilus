@@ -36,7 +36,21 @@
 > 探测 / Wait-ConPtyOutput 超时〔默认 60s〕/ Stop-ConPtySession·Dispose 看门狗化），同环境
 > 复测 3 次均 0.6s 快速 FAIL、超时分支 3.2s 有界返回、清理 0s；**功能验证待真实交互控制台
 > 会话复跑**（人工依赖项）。发布级容量建议已发布（提交 9f9606e 已在容量主题提交，见 §六与
-> §7.1「性能容量测试」行）；详见 §7.1「故障注入」行与 §7.2-B。所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
+> §7.1「性能容量测试」行）；详见 §7.1「故障注入」行与 §7.2-B。
+> **迭代十已落地（2026-08-12，HEAD = 7533c03，3 个提交）**：`c607ae9`（test(migration)：迁移
+> down 顺序机械门禁 `migration/tests/down_order_gate.rs`（1264 行）——FK 边跨文件静态提取
+> （`ForeignKey::create` from/to + `DeriveIden` iden 解析 + raw `ALTER TABLE REFERENCES`）、
+> 双序列检查（down 函数体内 drop 序 + 全文件 raw `DROP TABLE` 序）、循环对豁免
+> （credentials↔credential_versions 由 `m20260805_000001` 的 NULL-out update 破环）、8 测试
+> （含注入坏序/不可解析表名自检）；真实突变验证（父先子后注入 → 精确 file:line 报错）；迁移
+> 全量 23 目标全过、clippy/fmt 干净；该纪律此前靠审查维护（深度审查批次 1711329），现已
+> 机械化）、`5359f2f`（fix(ci)：按实际产物名收集 cyclonedx SBOM——本机试跑 cargo-cyclonedx
+> 0.5.9 实证：产出 `<包名>.cdx.json`（15 个，per-crate 目录）而非 bom.json，原
+> `find -name bom.json` 首跑必然失败；已改 `-name '*.cdx.json'` + 注释如实化；ubuntu 实跑
+> 仍属首跑确认点——消掉首跑确认点 1 项：工具行为与 workspace 兼容性已本地验证）、`7533c03`
+> （docs：release-readiness 头注 bump，后经迭代十一 NOTE 修复统一为「迭代八合入后复核版
+> HEAD=d1b375c」口径）；**迭代十一 NOTE 修复进行中（工作区未提交，2026-08-12）**：
+> release-readiness 口径统一 + down_order_gate 注释精确化。所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-12 复核）：
 > §一-§五 的事实锚定冻结时 commit 4ad8c4a，行号一律以当前 master 为准。
@@ -427,3 +441,10 @@ master 61b9cc5，9 个提交 + T-C 决策，三批五维审计 APPROVE）——�
   web **133**（T-D 新增有界性测试 4 个）、rutilus **145**（141 + T-E 预快照 3 + T-F 重试 1）；
 - workspace 总计：**1723**（lib/集成 1723 + doc 1 = 1724），0 失败；fmt / clippy
   `-D warnings` 全 workspace 零警告；迭代八无新增 Rust 测试（drills 为脚本形态）。
+
+**测试计数（2026-08-12，迭代十合入后本机复跑，口径 `cargo test --workspace --locked -- --test-threads 4`）**：
+
+- per-crate：migration **38**（30 基线 + down_order_gate 新增 8）；五个核心 crate 与迭代七基线
+  相等——test-support **55** / ui **141** / application **301** / web **133** / rutilus(app) **145**；
+- workspace 总计：**1731**（lib/集成 1731 + doc 1 = 1732），0 失败；增量恰 +8（down_order_gate）；
+  fmt / clippy `-D warnings` 全 workspace 零警告。

@@ -12,7 +12,7 @@
 > 状态标记沿用仓库文档：✅ 达成（结构或实测，表中注明性质）；🟡 部分（有结构证据，演练/
 > 评估/发布级验证未做）；⏳ 待做（无代码或文档证据）。
 >
-> 修订说明：本版为 **迭代九合入后复核版**（HEAD = d1b375c）。迭代六（H4/H5）已合入：
+> 修订说明：本版为 **迭代八合入后复核版**（HEAD = d1b375c）。迭代六（H4/H5）已合入：
 > **UI 本地化完整落地**（H5 d3f7769：`strings_catalog!` 目录扩至 827 键 En/Zh 双语、
 > `Lang::{En, Zh}` 运行时语言选择器、URL fragment 持久化（`#lang=`，纯函数 `ui/src/i18n.rs:1915-1936`
 > + wasm 薄封装 `ui/src/lib.rs:11607-11635`）；0f91c17 `web/assets/rutilus_ui.js/.wasm` 再生成）
@@ -33,18 +33,21 @@
 > 已处置）、**本轮所有受影响 file:line 已逐条打开文件重核为当前 master 实际值**（auth.rs
 > T-D +263 净行、backup.rs T-E +431 净行、batch_refresh.rs/endpoint_enrollment.rs/web
 > lib.rs/ui i18n.rs/ui lib.rs/test-support/app 四文件等漂移，见 §六）。**迭代八（2026-08-12）
-> 已合入 5 个提交**：a80edda（进程级故障注入演练套件 `scripts/drills/` 9 个文件入库——7 个
-> PowerShell 脚本 + RESULTS.md + .gitignore，覆盖 §19.3 剩余 4 项中的 3 项 + §20.1/§20.2
-> 备份恢复 + §0.4.0 大文件中断；首轮实跑 6/6 SKIP 如实登记，挂起防护修复后快速 FAIL 路径
-> 已验证，功能验证待真实交互控制台复跑）、9f9606e（发布级容量建议，release 构建数据）、
-> 3fd0a46（release-staging 构建输出 gitignore）、3dc4f74（迭代八登记）、6a42a96（挂起防护
-> 一致性修复）；**迭代九（2026-08-12）已合入 d1b375c（行号修复，跨文档行号引用）**；§一
-> 「故障注入」「性能容量测试」行与 §四-B 相关行已按新事实更新（详见 `milestone-status.md`
-> §7.1/§7.2-B）；迭代八/九均无 Rust 测试变化（drills 为脚本形态、行号修复为纯文档），门禁
-> 计数沿用 61b9cc5 轮。**门禁复跑全绿（2026-08-12，master d1b375c）：fmt 干净、clippy
-> `-D warnings` 全 workspace 零警告、
-> 1723 测试 0 失败**（`cargo test --workspace -- --list` 口径：lib/集成 1723 + doc 1 = 1724；
-> per-crate：migration 30 / persistence 190+3 / application 301 / infra 291 /
+> 已合入 6 个提交（HEAD = d1b375c）**：a80edda（进程级故障注入演练套件 `scripts/drills/` 9 个
+> 文件入库——7 个 PowerShell 脚本 + RESULTS.md + .gitignore，覆盖 §19.3 剩余 4 项中的 3 项 +
+> §20.1/§20.2 备份恢复 + §0.4.0 大文件中断；首轮实跑 6/6 SKIP 如实登记，挂起防护修复后快速
+> FAIL 路径已验证，功能验证待真实交互控制台复跑）、9f9606e（发布级容量建议，release 构建
+> 数据）、3fd0a46（release-staging 构建输出 gitignore）、3dc4f74（迭代八登记）、6a42a96
+> （挂起防护一致性修复）、d1b375c（行号修复，跨文档行号引用——迭代八登记的配套收尾，归入
+> 本批内）；§一「故障注入」「性能容量测试」行与 §四-B 相关行已按新事实更新（详见
+> `milestone-status.md` §7.1/§7.2-B）；迭代八无 Rust 测试变化（drills 为脚本形态、行号修复
+> 为纯文档），门禁计数沿用 61b9cc5 轮；**迭代十（2026-08-12，HEAD = 7533c03，3 个提交）已合入**
+> （down 顺序机械门禁 `migration/tests/down_order_gate.rs` c607ae9 / SBOM 按实际产物名收集修复
+> 5359f2f / 头注 bump 7533c03，详见 `milestone-status.md` 头注），计数已更新。**门禁复跑全绿（2026-08-12，
+> HEAD = 7533c03）：fmt 干净、clippy `-D warnings` 全 workspace 零警告、
+> 1731 测试 0 失败**（`cargo test --workspace --locked -- --test-threads 4` 口径：lib/集成
+> 1731 + doc 1 = 1732；迭代十增量恰 +8，全部来自 down_order_gate）；per-crate：migration
+> 38（30 基线 + 8）/ persistence 190+3 / application 301 / infra 291 /
 > test-support 55 / web 133 / ui 141（含 15 个 i18n 测试）/ rutilus 145 / security 门禁 8）。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
@@ -216,7 +219,7 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
 - 本版（HEAD = d1b375c）已登记迭代六（H4/H5）落地（UI 本地化完整落地 d3f7769 + 0f91c17、
   发布管道代码侧 34503ea + d77d54e）、**深度审查批次**（9 个修复提交，2026-08-12，详见
   `milestone-status.md` §7.4）、**迭代七**（9 个提交 + T-C 决策，2026-08-12，§九遗留 8 项
-  清零，详见 `milestone-status.md` §7.5）与**迭代八/九**（drills 套件 + 容量建议 + 行号修复，
+  清零，详见 `milestone-status.md` §7.5）与**迭代八**（drills 套件 + 容量建议 + 行号修复，
   6 个提交，2026-08-12，详见 `milestone-status.md` §7.1/§7.2-B）。深度审查批次触面（`web/src/auth.rs`、
   `infra-redfish/src/redfish_gateway.rs`、`application/src/batch_refresh.rs`、
   `application/src/operation_executor.rs`、`migration/src/`、`ui/src/i18n.rs`、
@@ -228,14 +231,15 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
   的全部既有引用已逐条打开文件重核为当前 master 实际行号并修正（§六记录）**；此前的
   E1/E3a/E3b/E3c/E4、H1/H2、H4/H5 触面行号保持合并后已核实的值；遗留旧 ci.yml 引用已
   在前轮全部重核换算完毕。
-- 门禁复跑（2026-08-12，HEAD d1b375c）：**fmt 干净、clippy `-D warnings` 全 workspace 零警告、
-  1723 测试 0 失败**（`cargo test --workspace -- --list` 口径：lib/集成 1723 + doc 1 = 1724）；`ci.yml:306-330`（Migration `:306-310`、Capability Ledger `:312-317`、
-  Release Baseline `:319-330`）独立门禁复跑通过；per-crate 口径（本轮实测）：
-  migration 30 / persistence 190+3 / application 301 / infra 291 / test-support 55 /
+- 门禁复跑（2026-08-12，迭代十后，HEAD = 7533c03）：**fmt 干净、clippy `-D warnings` 全 workspace 零警告、
+  1731 测试 0 失败**（`cargo test --workspace --locked -- --test-threads 4` 口径：lib/集成 1731 + doc 1 = 1732；
+  迭代十增量恰 +8，全部来自 down_order_gate）；`ci.yml:306-330`（Migration `:306-310`、Capability Ledger `:312-317`、
+  Release Baseline `:319-330`）独立门禁复跑通过；per-crate 口径（迭代十复跑）：migration 38（30 基线 + 8）/
+  persistence 190+3 / application 301 / infra 291 / test-support 55 /
   web 133 / ui 141（含 15 个 i18n 测试）/ rutilus 145 / security 门禁 8。
 - 引用自检记录见下节（每个 file:line 均在本轮打开核实）。
 
-## 六、引用自检记录（2026-08-12，HEAD d1b375c 复核，迭代九后）
+## 六、引用自检记录（2026-08-12，HEAD d1b375c 复核，迭代八后）
 
 本轮逐一打开核实的引用（含全部 E1/E3a/E3b/E3c/E4、H1/H2、H4/H5、深度审查批次触面与
 **迭代七触面**——迭代七新增触面的旧引用一律打开文件按当前 master 重核，不沿用前轮值）：
