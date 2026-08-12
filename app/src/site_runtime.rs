@@ -1393,7 +1393,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::{CenterAcceptor, CenterAcceptorOptions, CenterCa};
+    use crate::{CenterAcceptor, CenterAcceptorError, CenterAcceptorOptions, CenterCa};
 
     fn parse_listen(value: &str) -> Result<ListenAddress, ListenAddressError> {
         ListenAddress::parse(value)
@@ -1502,6 +1502,48 @@ mod tests {
         Ok(port)
     }
 
+    /// A Site bind failed because a racer grabbed the probed port between
+    /// the probe and the bind; the retry loop moves on to a fresh port.
+    fn is_raced_site_bind(error: &SiteRunError) -> bool {
+        matches!(
+            error,
+            SiteRunError::Bind(inner) if inner.kind() == io::ErrorKind::AddrInUse
+        )
+    }
+
+    /// A center acceptor bind failed because a racer grabbed the probed
+    /// port between the probe and the bind; the retry loop moves on to a
+    /// fresh port.
+    fn is_raced_center_bind(error: &CenterAcceptorError) -> bool {
+        matches!(
+            error,
+            CenterAcceptorError::Bind(inner) if inner.kind() == io::ErrorKind::AddrInUse
+        )
+    }
+
+    /// Binds a Site listener on a free port on `host` (with the given
+    /// explicit certificate pair, when any). The probe inside `free_port`
+    /// is released before this bind, so a racer may grab the port in
+    /// between; the attempt is then retried on a fresh port instead of
+    /// failing the test. Returns the binding and the port it bound.
+    async fn bind_site(
+        paths: &RuntimePaths,
+        host: Ipv4Addr,
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+    ) -> Result<(SiteBinding, u16), Box<dyn Error>> {
+        loop {
+            let port = free_port(host).await?;
+            let listen = parse_listen(&format!("{host}:{port}"))?;
+            let options = SiteRunOptions::new(listen, cert.clone(), key.clone())?;
+            match SiteBinding::bind(paths, &options).await {
+                Ok(binding) => return Ok((binding, port)),
+                Err(error) if is_raced_site_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// The production-reachable end-to-end path: a non-loopback listen
     /// without CLI material generates and persists a self-signed pair and
     /// serves HTTPS, and a later boot reuses the persisted identity.
@@ -1510,10 +1552,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
-        let first_port = free_port(Ipv4Addr::UNSPECIFIED).await?;
-        let first_listen = parse_listen(&format!("0.0.0.0:{first_port}"))?;
-        let first =
-            SiteBinding::bind(&paths, &SiteRunOptions::new(first_listen, None, None)?).await?;
+        let (first, first_port) = bind_site(&paths, Ipv4Addr::UNSPECIFIED, None, None).await?;
         assert_eq!(first.url(), format!("https://0.0.0.0:{first_port}/"));
         let first_tls = first.tls.ok_or_else(|| {
             io::Error::other("the non-loopback bind generated a self-signed pair")
@@ -1523,10 +1562,7 @@ mod tests {
         assert!(paths.tls_directory().join("key.pem").is_file());
 
         // A second boot on a fresh port reuses the persisted identity.
-        let second_port = free_port(Ipv4Addr::UNSPECIFIED).await?;
-        let second_listen = parse_listen(&format!("0.0.0.0:{second_port}"))?;
-        let second =
-            SiteBinding::bind(&paths, &SiteRunOptions::new(second_listen, None, None)?).await?;
+        let (second, _) = bind_site(&paths, Ipv4Addr::UNSPECIFIED, None, None).await?;
         let second_tls = second
             .tls
             .ok_or_else(|| io::Error::other("the second boot reused the persisted pair"))?;
@@ -1541,9 +1577,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
-        let port = free_port(Ipv4Addr::LOCALHOST).await?;
-        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
-        let binding = SiteBinding::bind(&paths, &SiteRunOptions::new(listen, None, None)?).await?;
+        let (binding, port) = bind_site(&paths, Ipv4Addr::LOCALHOST, None, None).await?;
         assert!(binding.tls.is_none());
         assert_eq!(binding.url(), format!("http://127.0.0.1:{port}/"));
         assert!(!paths.tls_directory().join("cert.pem").is_file());
@@ -1560,9 +1594,7 @@ mod tests {
         let seed_listen = parse_listen("127.0.0.1:8443")?;
         let seeded = SiteTls::load_or_generate(&paths, &seed_listen, None)?;
 
-        let port = free_port(Ipv4Addr::LOCALHOST).await?;
-        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
-        let binding = SiteBinding::bind(&paths, &SiteRunOptions::new(listen, None, None)?).await?;
+        let (binding, port) = bind_site(&paths, Ipv4Addr::LOCALHOST, None, None).await?;
         assert_eq!(binding.url(), format!("https://127.0.0.1:{port}/"));
         let tls = binding
             .tls
@@ -1585,13 +1617,8 @@ mod tests {
         std::fs::copy(paths.tls_directory().join("cert.pem"), &cert_path)?;
         std::fs::copy(paths.tls_directory().join("key.pem"), &key_path)?;
 
-        let port = free_port(Ipv4Addr::LOCALHOST).await?;
-        let listen = parse_listen(&format!("127.0.0.1:{port}"))?;
-        let binding = SiteBinding::bind(
-            &paths,
-            &SiteRunOptions::new(listen, Some(cert_path), Some(key_path))?,
-        )
-        .await?;
+        let (binding, port) =
+            bind_site(&paths, Ipv4Addr::LOCALHOST, Some(cert_path), Some(key_path)).await?;
         assert_eq!(binding.url(), format!("https://127.0.0.1:{port}/"));
         let tls = binding
             .tls
@@ -2030,22 +2057,29 @@ mod tests {
         let center_paths = RuntimePaths::from_root(directory.path().join("center"))?;
 
         // The center side: an acceptor whose admission refuses the site
-        // because its binding is revoked there.
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+        // because its binding is revoked there. The probe port is
+        // released before this bind, so a racer may grab it; the bind is
+        // then retried on a fresh port.
         let ca = Arc::new(CenterCa::generate_or_load(&paths)?);
-        let acceptor = CenterAcceptor::bind_with_ca(
-            &paths,
-            &listen,
-            ca,
-            CenterAcceptorOptions {
-                handshake_timeout: Duration::from_secs(5),
-                idle_timeout: Duration::from_secs(5),
-            },
-        )
-        .await?;
+        let acceptor = loop {
+            let port = free_port(Ipv4Addr::LOCALHOST).await?;
+            let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            match CenterAcceptor::bind_with_ca(
+                &paths,
+                &listen,
+                Arc::clone(&ca),
+                CenterAcceptorOptions {
+                    handshake_timeout: Duration::from_secs(5),
+                    idle_timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+            {
+                Ok(acceptor) => break acceptor,
+                Err(error) if is_raced_center_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
         // The address and the pin material are captured before the
         // acceptor moves into the accept task.
         let acceptor_address = acceptor.address().to_string();

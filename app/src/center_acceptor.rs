@@ -952,21 +952,85 @@ mod tests {
     use super::*;
 
     /// Probes one free loopback port.
-    async fn free_port() -> io::Result<u16> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    fn free_port() -> io::Result<u16> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
         drop(listener);
         Ok(port)
+    }
+
+    /// A bind failed because a racer grabbed the probed port between the
+    /// probe and the bind; the retry loop moves on to a fresh port.
+    fn is_raced_bind(error: &CenterAcceptorError) -> bool {
+        matches!(
+            error,
+            CenterAcceptorError::Bind(inner) if inner.kind() == io::ErrorKind::AddrInUse
+        )
+    }
+
+    /// Binds an acceptor on a free loopback port with the given timing
+    /// bounds. The probe inside `free_port` is released before this bind,
+    /// so a racer may grab the port in between; the attempt is then
+    /// retried on a fresh port instead of failing the test.
+    ///
+    /// `probe` is the port source, injectable so the retry test can force
+    /// the race deterministically; callers pass `free_port`.
+    async fn bind_acceptor_with_options(
+        paths: &RuntimePaths,
+        options: CenterAcceptorOptions,
+        mut probe: impl FnMut() -> io::Result<u16>,
+    ) -> Result<(CenterAcceptor, ListenAddress), Box<dyn Error>> {
+        loop {
+            let port = probe()?;
+            let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            match CenterAcceptor::bind_with_options(paths, &listen, options).await {
+                Ok(acceptor) => return Ok((acceptor, listen)),
+                Err(error) if is_raced_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Binds an acceptor on a free loopback port.
     async fn bind_acceptor(
         paths: &RuntimePaths,
     ) -> Result<(CenterAcceptor, ListenAddress), Box<dyn Error>> {
-        let port = free_port().await?;
-        let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
-        let acceptor = CenterAcceptor::bind(paths, &listen).await?;
-        Ok((acceptor, listen))
+        bind_acceptor_with_options(paths, CenterAcceptorOptions::default(), free_port).await
+    }
+
+    /// The race, forced deterministically: the probe reports a port a
+    /// racer already grabbed, the bind at it fails with `AddrInUse`, and
+    /// the retry loop moves on to a fresh port instead of failing.
+    #[tokio::test]
+    async fn the_bind_retries_when_the_probed_port_was_grabbed() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+
+        // A racer holds the port the first probe reports.
+        let racer = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let raced_port = racer.local_addr()?.port();
+
+        // The first probe reports the raced port; the bind at it fails
+        // with AddrInUse and the loop probes again on a fresh port.
+        let mut calls = 0;
+        let probe = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(raced_port)
+            } else {
+                free_port()
+            }
+        };
+        let (acceptor, listen) =
+            bind_acceptor_with_options(&paths, CenterAcceptorOptions::default(), probe).await?;
+        assert_eq!(calls, 2);
+        assert_ne!(listen.port(), raced_port);
+
+        // The racer kept its port through the retry.
+        let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, raced_port)).await;
+        assert!(rebound.is_err_and(|error| error.kind() == io::ErrorKind::AddrInUse));
+        drop(acceptor);
+        Ok(())
     }
 
     /// A raw TLS + WebSocket client (without the product's site client),
@@ -1238,15 +1302,13 @@ mod tests {
     async fn runs_the_frame_loop_until_idle_timeout() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
-        let port = free_port().await?;
-        let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
-        let acceptor = CenterAcceptor::bind_with_options(
+        let (acceptor, _) = bind_acceptor_with_options(
             &paths,
-            &listen,
             CenterAcceptorOptions {
                 handshake_timeout: Duration::from_secs(2),
                 idle_timeout: Duration::from_millis(300),
             },
+            free_port,
         )
         .await?;
         let address = acceptor.address();
@@ -1337,9 +1399,7 @@ mod tests {
     async fn the_server_pair_persists_across_binds() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
-        let first_port = free_port().await?;
-        let first_listen = ListenAddress::parse(&format!("127.0.0.1:{first_port}"))?;
-        let first = CenterAcceptor::bind(&paths, &first_listen).await?;
+        let (first, _) = bind_acceptor(&paths).await?;
         let first_fingerprint = first.server_fingerprint();
         assert!(paths.tls_directory().join("center-cert.pem").is_file());
         assert!(paths.tls_directory().join("center-key.pem").is_file());
@@ -1356,9 +1416,7 @@ mod tests {
         // A second bind on a fresh port reuses the persisted server
         // identity: the certificate the operator pins stays stable across
         // restarts.
-        let second_port = free_port().await?;
-        let second_listen = ListenAddress::parse(&format!("127.0.0.1:{second_port}"))?;
-        let second = CenterAcceptor::bind(&paths, &second_listen).await?;
+        let (second, _) = bind_acceptor(&paths).await?;
         assert_eq!(second.server_fingerprint(), first_fingerprint);
         Ok(())
     }

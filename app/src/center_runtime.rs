@@ -896,15 +896,37 @@ mod tests {
         Ok(port)
     }
 
-    /// Binds a center acceptor on a free loopback port over a fresh CA.
-    async fn bind_acceptor(paths: &RuntimePaths) -> Result<CenterAcceptor, Box<dyn Error>> {
-        let port = free_port(Ipv4Addr::LOCALHOST).await?;
-        let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
-        let ca = Arc::new(CenterCa::generate_or_load(paths)?);
-        Ok(
-            CenterAcceptor::bind_with_ca(paths, &listen, ca, CenterAcceptorOptions::default())
-                .await?,
+    /// A bind failed because a racer grabbed the probed port between the
+    /// probe and the bind; the retry loop moves on to a fresh port.
+    fn is_raced_bind(error: &CenterAcceptorError) -> bool {
+        matches!(
+            error,
+            CenterAcceptorError::Bind(inner) if inner.kind() == io::ErrorKind::AddrInUse
         )
+    }
+
+    /// Binds a center acceptor on a free loopback port over a fresh CA.
+    /// The probe inside `free_port` is released before this bind, so a
+    /// racer may grab the port in between; the attempt is then retried on
+    /// a fresh port instead of failing the test.
+    async fn bind_acceptor(paths: &RuntimePaths) -> Result<CenterAcceptor, Box<dyn Error>> {
+        let ca = Arc::new(CenterCa::generate_or_load(paths)?);
+        loop {
+            let port = free_port(Ipv4Addr::LOCALHOST).await?;
+            let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            match CenterAcceptor::bind_with_ca(
+                paths,
+                &listen,
+                Arc::clone(&ca),
+                CenterAcceptorOptions::default(),
+            )
+            .await
+            {
+                Ok(acceptor) => return Ok(acceptor),
+                Err(error) if is_raced_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     #[tokio::test]

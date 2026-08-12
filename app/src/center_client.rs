@@ -603,7 +603,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        CenterAcceptor, CenterAcceptorOptions, CenterCa, CenterConnection,
+        CenterAcceptor, CenterAcceptorError, CenterAcceptorOptions, CenterCa, CenterConnection,
         center_acceptor::build_server_config,
     };
 
@@ -624,23 +624,36 @@ mod tests {
         Ok(port)
     }
 
+    /// A bind failed because a racer grabbed the probed port between the
+    /// probe and the bind; the retry loop moves on to a fresh port.
+    fn is_raced_bind(error: &CenterAcceptorError) -> bool {
+        matches!(
+            error,
+            CenterAcceptorError::Bind(inner) if inner.kind() == io::ErrorKind::AddrInUse
+        )
+    }
+
     /// Binds an acceptor on a free loopback port with short timing bounds,
     /// so idle-timeout tests do not wait out the production 90 seconds.
+    /// The probe inside `free_port` is released before this bind, so a
+    /// racer may grab the port in between; the attempt is then retried on
+    /// a fresh port instead of failing the test.
     async fn bind_acceptor(
         paths: &RuntimePaths,
     ) -> Result<(CenterAcceptor, crate::ListenAddress), Box<dyn Error>> {
-        let port = free_port().await?;
-        let listen = crate::ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
-        let acceptor = CenterAcceptor::bind_with_options(
-            paths,
-            &listen,
-            CenterAcceptorOptions {
-                handshake_timeout: Duration::from_secs(5),
-                idle_timeout: Duration::from_secs(5),
-            },
-        )
-        .await?;
-        Ok((acceptor, listen))
+        let options = CenterAcceptorOptions {
+            handshake_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+        };
+        loop {
+            let port = free_port().await?;
+            let listen = crate::ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            match CenterAcceptor::bind_with_options(paths, &listen, options).await {
+                Ok(acceptor) => return Ok((acceptor, listen)),
+                Err(error) if is_raced_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// The site-side config for one test, against the given acceptor.
