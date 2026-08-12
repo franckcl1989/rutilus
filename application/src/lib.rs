@@ -122,7 +122,11 @@ pub use overview::{
     OverviewHealthLevel, OverviewQuery, OverviewQueryError, OverviewVendorCount,
 };
 pub use resource_diagnostics::{
-    ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
+    RESOURCE_DECODE_FAILURE_OEM_NAMESPACE_MAX_CHARS, RESOURCE_DECODE_FAILURE_SUMMARY_MAX_CHARS,
+    RESOURCE_EXTENDED_INFO_RELATED_PROPERTIES_MAX, RESOURCE_EXTENDED_INFO_TEXT_MAX_CHARS,
+    ResourceDecodeFailure, ResourceDecodeFailureError, ResourceDiagnostics,
+    ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError, ResourceExtendedInfo,
+    ResourceExtendedInfoError,
 };
 pub use tag_management::{TagManagement, TagManagementError, TagRepository};
 pub use task_monitor::{

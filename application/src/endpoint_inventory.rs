@@ -6,13 +6,21 @@ use rutilus_domain::{
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::BoundaryFuture;
+use crate::{BoundaryFuture, ResourceDecodeFailure};
 
 /// One managed endpoint and its latest complete resource Generation.
+///
+/// `decode_failures` carries the current Generation's member decode failures
+/// (§12.4 decode-error path): members whose typed Schema decoding failed at
+/// refresh time were skipped as odd members (§0.2.0 — the endpoint stays
+/// fully usable), and this record keeps them visible to diagnostics instead
+/// of being silently dropped. The store replaces both lists atomically per
+/// Generation, exactly like the snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointInventoryItem {
     endpoint: Endpoint,
     resources: Vec<ResourceSnapshot>,
+    decode_failures: Vec<ResourceDecodeFailure>,
 }
 
 impl EndpointInventoryItem {
@@ -36,6 +44,7 @@ impl EndpointInventoryItem {
             return Ok(Self {
                 endpoint,
                 resources,
+                decode_failures: Vec::new(),
             });
         }
 
@@ -82,7 +91,20 @@ impl EndpointInventoryItem {
         Ok(Self {
             endpoint,
             resources,
+            decode_failures: Vec::new(),
         })
+    }
+
+    /// Attaches the endpoint's current Generation decode-failure records.
+    ///
+    /// The records belong to the item's endpoint and its current Generation
+    /// by construction: the store replaces them together with the snapshots
+    /// on every complete refresh, so a stale record can never outlive the
+    /// Generation it describes.
+    #[must_use]
+    pub fn with_decode_failures(mut self, decode_failures: Vec<ResourceDecodeFailure>) -> Self {
+        self.decode_failures = decode_failures;
+        self
     }
 
     #[must_use]
@@ -93,6 +115,13 @@ impl EndpointInventoryItem {
     #[must_use]
     pub fn resources(&self) -> &[ResourceSnapshot] {
         &self.resources
+    }
+
+    /// Borrows the current Generation's member decode-failure records
+    /// (§12.4 decode-error path), in store order.
+    #[must_use]
+    pub fn decode_failures(&self) -> &[ResourceDecodeFailure] {
+        &self.decode_failures
     }
 
     #[must_use]

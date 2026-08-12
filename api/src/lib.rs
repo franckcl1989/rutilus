@@ -1879,10 +1879,16 @@ impl EndpointResourceInventoryResponse {
 /// read-only response (§9.4), including any OEM Namespace sections and Task
 /// URI the decoded payload itself retains.
 ///
-/// Decode-error paths and `ExtendedInfo` are deliberately absent: a member
-/// whose typed decoding failed was skipped at refresh time without leaving a
-/// record, so no diagnostics can be fabricated for resources that never
-/// entered the snapshot store.
+/// `extended_info` carries the Redfish `@Message.ExtendedInfo` entries the
+/// requested resource's stored typed payload retains (§7.6: Redfish
+/// `ExtendedInfo` is preserved, never flattened into a plain string).
+/// `decode_failures` carries the endpoint's current Generation member decode
+/// failures (§12.4 decode-error path): members whose typed decoding failed at
+/// refresh time were skipped as odd members (§0.2.0) without disabling the
+/// endpoint, and the diagnostics view keeps those records instead of
+/// silently dropping them. Both lists are empty when the refresh recorded
+/// none; the fields are `#[serde(default)]` so older readers stay compatible
+/// with the enriched response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceDiagnosticsResponse {
@@ -1893,6 +1899,10 @@ pub struct ResourceDiagnosticsResponse {
     feature: String,
     generation: NonZeroU64,
     typed_payload: serde_json::Value,
+    #[serde(default)]
+    extended_info: Vec<ResourceExtendedInfoResponse>,
+    #[serde(default)]
+    decode_failures: Vec<ResourceDecodeFailureResponse>,
 }
 
 impl ResourceDiagnosticsResponse {
@@ -1906,6 +1916,8 @@ impl ResourceDiagnosticsResponse {
         feature: String,
         generation: NonZeroU64,
         typed_payload: serde_json::Value,
+        extended_info: Vec<ResourceExtendedInfoResponse>,
+        decode_failures: Vec<ResourceDecodeFailureResponse>,
     ) -> Self {
         Self {
             endpoint_id,
@@ -1915,6 +1927,8 @@ impl ResourceDiagnosticsResponse {
             feature,
             generation,
             typed_payload,
+            extended_info,
+            decode_failures,
         }
     }
 
@@ -1951,6 +1965,152 @@ impl ResourceDiagnosticsResponse {
     #[must_use]
     pub const fn typed_payload(&self) -> &serde_json::Value {
         &self.typed_payload
+    }
+
+    /// Borrows the Redfish `@Message.ExtendedInfo` entries the requested
+    /// resource's stored typed payload retains (§7.6).
+    #[must_use]
+    pub fn extended_info(&self) -> &[ResourceExtendedInfoResponse] {
+        &self.extended_info
+    }
+
+    /// Borrows the endpoint's current Generation member decode-failure
+    /// records (§12.4 decode-error path).
+    #[must_use]
+    pub fn decode_failures(&self) -> &[ResourceDecodeFailureResponse] {
+        &self.decode_failures
+    }
+}
+
+/// One Redfish `@Message.ExtendedInfo` entry retained by a gateway-mapped
+/// snapshot, exposed for §12.4 diagnostics display.
+///
+/// The wire shape mirrors the Redfish-defined fields (`MessageId`, `Message`,
+/// `Severity`, `Resolution`, `RelatedProperties`) with the product API's
+/// `snake_case` names; every optional field is `null` when the entry did not
+/// publish it, so absence stays distinguishable from an empty value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceExtendedInfoResponse {
+    message_id: String,
+    message: Option<String>,
+    severity: Option<String>,
+    resolution: Option<String>,
+    related_properties: Vec<String>,
+}
+
+impl ResourceExtendedInfoResponse {
+    #[must_use]
+    pub const fn new(
+        message_id: String,
+        message: Option<String>,
+        severity: Option<String>,
+        resolution: Option<String>,
+        related_properties: Vec<String>,
+    ) -> Self {
+        Self {
+            message_id,
+            message,
+            severity,
+            resolution,
+            related_properties,
+        }
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    #[must_use]
+    pub fn severity(&self) -> Option<&str> {
+        self.severity.as_deref()
+    }
+
+    #[must_use]
+    pub fn resolution(&self) -> Option<&str> {
+        self.resolution.as_deref()
+    }
+
+    #[must_use]
+    pub fn related_properties(&self) -> &[String] {
+        &self.related_properties
+    }
+}
+
+/// One member whose typed Schema decoding failed during the endpoint's
+/// current refresh Generation, exposed for §12.4 diagnostics display.
+///
+/// The record is a sibling of the decoded snapshots, not a replacement: the
+/// member was skipped as one odd member (§0.2.0) and the endpoint stays fully
+/// usable, so this contract distinguishes the member-level decode failure
+/// from a whole-endpoint unavailability by construction — the diagnostics
+/// view still serves 200 with the endpoint's current Generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDecodeFailureResponse {
+    odata_uri: String,
+    odata_type: Option<String>,
+    feature: String,
+    oem_namespace: Option<String>,
+    error_summary: String,
+    extended_info: Vec<ResourceExtendedInfoResponse>,
+}
+
+impl ResourceDecodeFailureResponse {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        odata_uri: String,
+        odata_type: Option<String>,
+        feature: String,
+        oem_namespace: Option<String>,
+        error_summary: String,
+        extended_info: Vec<ResourceExtendedInfoResponse>,
+    ) -> Self {
+        Self {
+            odata_uri,
+            odata_type,
+            feature,
+            oem_namespace,
+            error_summary,
+            extended_info,
+        }
+    }
+
+    #[must_use]
+    pub fn odata_uri(&self) -> &str {
+        &self.odata_uri
+    }
+
+    #[must_use]
+    pub fn odata_type(&self) -> Option<&str> {
+        self.odata_type.as_deref()
+    }
+
+    #[must_use]
+    pub fn feature(&self) -> &str {
+        &self.feature
+    }
+
+    #[must_use]
+    pub fn oem_namespace(&self) -> Option<&str> {
+        self.oem_namespace.as_deref()
+    }
+
+    #[must_use]
+    pub fn error_summary(&self) -> &str {
+        &self.error_summary
+    }
+
+    #[must_use]
+    pub fn extended_info(&self) -> &[ResourceExtendedInfoResponse] {
+        &self.extended_info
     }
 }
 
@@ -6047,9 +6207,36 @@ mod tests {
         );
     }
 
+    // The full diagnostics wire surface (the typed payload, the
+    // ExtendedInfo entries, and the decode-error paths) is asserted in one
+    // test so the round trip stays one contract; the exhaustive assertions
+    // exceed the pedantic line budget, so the lint is scoped here exactly
+    // like the other contract tests.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn resource_diagnostics_contract_preserves_the_typed_payload_verbatim()
     -> Result<(), Box<dyn Error>> {
+        let extended_info = vec![ResourceExtendedInfoResponse::new(
+            "Base.1.13.Success".to_owned(),
+            None,
+            Some("OK".to_owned()),
+            Some("No action required".to_owned()),
+            vec!["Id".to_owned()],
+        )];
+        let decode_failures = vec![ResourceDecodeFailureResponse::new(
+            "/redfish/v1/Systems/2".to_owned(),
+            Some("#ComputerSystem.v1_20_0.ComputerSystem".to_owned()),
+            "systems".to_owned(),
+            Some("Vendor".to_owned()),
+            "schema decode failed: missing required field".to_owned(),
+            vec![ResourceExtendedInfoResponse::new(
+                "Base.1.13.ResourceNotFound".to_owned(),
+                Some("The requested resource could not be found.".to_owned()),
+                Some("Critical".to_owned()),
+                Some("Remove and re-add the resource.".to_owned()),
+                vec!["MemberId".to_owned()],
+            )],
+        )];
         let response = ResourceDiagnosticsResponse::new(
             uuid!("01989abc-def0-7abc-8def-0123456789ab"),
             "/redfish/v1/Systems/1".to_owned(),
@@ -6062,6 +6249,8 @@ mod tests {
                 "Name": "System One",
                 "Oem": { "Vendor": { "OemFlag": true } }
             }),
+            extended_info,
+            decode_failures,
         );
         let encoded = serde_json::to_value(&response)?;
         let decoded: ResourceDiagnosticsResponse = serde_json::from_value(encoded.clone())?;
@@ -6086,6 +6275,26 @@ mod tests {
             decoded.typed_payload(),
             &json!({ "Id": "1", "Name": "System One", "Oem": { "Vendor": { "OemFlag": true } } })
         );
+        assert_eq!(decoded.extended_info().len(), 1);
+        assert_eq!(decoded.extended_info()[0].message_id(), "Base.1.13.Success");
+        assert_eq!(decoded.extended_info()[0].severity(), Some("OK"));
+        assert_eq!(
+            decoded.extended_info()[0].resolution(),
+            Some("No action required")
+        );
+        assert_eq!(decoded.decode_failures().len(), 1);
+        assert_eq!(
+            decoded.decode_failures()[0].odata_uri(),
+            "/redfish/v1/Systems/2"
+        );
+        assert_eq!(
+            decoded.decode_failures()[0].error_summary(),
+            "schema decode failed: missing required field"
+        );
+        assert_eq!(
+            decoded.decode_failures()[0].extended_info()[0].message_id(),
+            "Base.1.13.ResourceNotFound"
+        );
         assert_eq!(
             encoded,
             json!({
@@ -6099,7 +6308,28 @@ mod tests {
                     "Id": "1",
                     "Name": "System One",
                     "Oem": { "Vendor": { "OemFlag": true } }
-                }
+                },
+                "extended_info": [{
+                    "message_id": "Base.1.13.Success",
+                    "message": null,
+                    "severity": "OK",
+                    "resolution": "No action required",
+                    "related_properties": ["Id"]
+                }],
+                "decode_failures": [{
+                    "odata_uri": "/redfish/v1/Systems/2",
+                    "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+                    "feature": "systems",
+                    "oem_namespace": "Vendor",
+                    "error_summary": "schema decode failed: missing required field",
+                    "extended_info": [{
+                        "message_id": "Base.1.13.ResourceNotFound",
+                        "message": "The requested resource could not be found.",
+                        "severity": "Critical",
+                        "resolution": "Remove and re-add the resource.",
+                        "related_properties": ["MemberId"]
+                    }]
+                }]
             })
         );
         assert!(
@@ -6111,7 +6341,7 @@ mod tests {
                 "feature": "systems",
                 "generation": 7,
                 "typed_payload": { "Id": "1" },
-                "extended_info": []
+                "unknown_field": true
             }))
             .is_err(),
             "unknown diagnostics fields must be rejected"
@@ -6127,6 +6357,26 @@ mod tests {
             .is_err(),
             "a zero generation must be rejected like every other refresh snapshot"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resource_diagnostics_contract_defaults_absent_error_paths_to_empty_lists()
+    -> Result<(), Box<dyn Error>> {
+        // A response produced before the decode-error / ExtendedInfo fields
+        // existed stays parseable: both lists default to empty, so older
+        // readers and newer writers stay compatible.
+        let decoded: ResourceDiagnosticsResponse = serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+            "odata_uri": "/redfish/v1/Systems/1",
+            "odata_type": null,
+            "etag": null,
+            "feature": "systems",
+            "generation": 7,
+            "typed_payload": { "Id": "1" }
+        }))?;
+        assert!(decoded.extended_info().is_empty());
+        assert!(decoded.decode_failures().is_empty());
         Ok(())
     }
 

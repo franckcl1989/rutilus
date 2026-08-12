@@ -18,9 +18,9 @@ use rutilus_application::{
     CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
     CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
     EndpointInventoryRepository, EndpointRefreshRepository, EventRepository, OperationStore,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceObservation,
-    StoredCapability, SystemCaEvaluation, TelemetryRepository, TlsIdentityObservation,
-    TlsIdentityProbe,
+    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceDecodeFailure,
+    ResourceExtendedInfo, ResourceObservation, StoredCapability, SystemCaEvaluation,
+    TelemetryRepository, TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, Credential, CredentialId,
@@ -600,6 +600,21 @@ fn current_item(
     endpoint: Endpoint,
     resource_id: ResourceId,
 ) -> Result<EndpointInventoryItem, Box<dyn Error>> {
+    current_item_with_payload(
+        endpoint,
+        resource_id,
+        r#"{"Id":"1","Name":"System One","Description":"Primary compute system","SystemType":"Physical","Oem":{"Vendor":{"OemFlag":true}}}"#,
+    )
+}
+
+/// Builds one complete current Generation with the System snapshot carrying
+/// the given stored payload, for the tests that vary what the gateway-mapped
+/// snapshot retains (e.g. `@Message.ExtendedInfo`).
+fn current_item_with_payload(
+    endpoint: Endpoint,
+    resource_id: ResourceId,
+    system_payload: &str,
+) -> Result<EndpointInventoryItem, Box<dyn Error>> {
     let endpoint_id = endpoint.id();
     let observed_at = endpoint.updated_at();
     let generation = RefreshGeneration::new(7)?;
@@ -620,9 +635,7 @@ fn current_item(
                 endpoint_id,
                 ResourceFeature::Systems,
                 ResourceODataId::parse("/redfish/v1/Systems/1")?,
-                ResourceSnapshotPayload::parse(
-                    r#"{"Id":"1","Name":"System One","Description":"Primary compute system","SystemType":"Physical","Oem":{"Vendor":{"OemFlag":true}}}"#,
-                )?,
+                ResourceSnapshotPayload::parse(system_payload)?,
                 observed_at,
                 generation,
             )
@@ -664,8 +677,8 @@ async fn serves_diagnostics_for_a_current_snapshot() -> Result<(), Box<dyn Error
     let object = body.as_object().ok_or("body must be an object")?;
     assert_eq!(
         object.len(),
-        7,
-        "the diagnostics wire shape must stay the stable seven fields"
+        9,
+        "the diagnostics wire shape must stay the stable nine fields"
     );
     assert_eq!(body["endpoint_id"], endpoint_id.to_string());
     assert_eq!(body["odata_uri"], "/redfish/v1/Systems/1");
@@ -681,6 +694,115 @@ async fn serves_diagnostics_for_a_current_snapshot() -> Result<(), Box<dyn Error
         serde_json::from_str::<Value>(
             r#"{"Id":"1","Name":"System One","Description":"Primary compute system","SystemType":"Physical","Oem":{"Vendor":{"OemFlag":true}}}"#
         )?
+    );
+    // The snapshot carries no `@Message.ExtendedInfo` and the Generation
+    // recorded no decode failure: both lists are empty and still present.
+    assert_eq!(body["extended_info"], serde_json::json!([]));
+    assert_eq!(body["decode_failures"], serde_json::json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn serves_extended_info_from_the_stored_payload() -> Result<(), Box<dyn Error>> {
+    let endpoint = known_endpoint()?;
+    let endpoint_id = endpoint.id();
+    let resource_id = ResourceId::generate();
+    let item = current_item_with_payload(
+        endpoint,
+        resource_id,
+        r#"{"Id":"1","Name":"System One","Description":"Primary compute system","SystemType":"Physical","@Message.ExtendedInfo":[{"MessageId":"Base.1.13.Success","Severity":"OK","Resolution":"No action required","RelatedProperties":["Id"],"VendorExtra":true}]}"#,
+    )?;
+    let router = test_router(
+        MockServices::ok(vec![item]),
+        MockGateway::verified(TlsCertificate::from_der(
+            b"diagnostics extended info certificate".to_vec(),
+        )?),
+    );
+
+    let response = get(
+        &router,
+        &format!("/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics"),
+    )
+    .await?;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    // The gateway-mapped snapshot is the data source: the entry arrives from
+    // the stored payload, with the Redfish-defined fields projected and the
+    // vendor-added property ignored by the strict entry shape.
+    assert_eq!(
+        body["extended_info"],
+        serde_json::json!([{
+            "message_id": "Base.1.13.Success",
+            "message": null,
+            "severity": "OK",
+            "resolution": "No action required",
+            "related_properties": ["Id"]
+        }])
+    );
+    assert_eq!(body["decode_failures"], serde_json::json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn serves_decode_failure_records_while_the_endpoint_stays_usable()
+-> Result<(), Box<dyn Error>> {
+    let endpoint = known_endpoint()?;
+    let endpoint_id = endpoint.id();
+    let resource_id = ResourceId::generate();
+    let decode_failure = ResourceDecodeFailure::try_new(
+        ResourceODataId::parse("/redfish/v1/Systems/2")?,
+        Some(ResourceODataType::parse(
+            "#ComputerSystem.v1_20_0.ComputerSystem",
+        )?),
+        ResourceFeature::Systems,
+        Some("Vendor".to_owned()),
+        "schema decode failed: missing required field".to_owned(),
+        vec![ResourceExtendedInfo::new(
+            "Base.1.13.ResourceNotFound".to_owned(),
+            Some("The requested resource could not be found.".to_owned()),
+            Some("Critical".to_owned()),
+            Some("Remove and re-add the resource.".to_owned()),
+            vec!["MemberId".to_owned()],
+        )],
+    )?;
+    let item = current_item(endpoint, resource_id)?.with_decode_failures(vec![decode_failure]);
+    let router = test_router(
+        MockServices::ok(vec![item]),
+        MockGateway::verified(TlsCertificate::from_der(
+            b"diagnostics decode failure certificate".to_vec(),
+        )?),
+    );
+
+    let response = get(
+        &router,
+        &format!("/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics"),
+    )
+    .await?;
+
+    // The member decode failure is a sibling record, not an endpoint-wide
+    // condition (§0.2.0 / §2.0): the diagnostics view still serves the
+    // endpoint's current Generation with 200, and the record is displayed.
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = json_body(response).await?;
+    assert_eq!(body["odata_uri"], "/redfish/v1/Systems/1");
+    assert_eq!(body["generation"], 7);
+    assert_eq!(
+        body["decode_failures"],
+        serde_json::json!([{
+            "odata_uri": "/redfish/v1/Systems/2",
+            "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+            "feature": "systems",
+            "oem_namespace": "Vendor",
+            "error_summary": "schema decode failed: missing required field",
+            "extended_info": [{
+                "message_id": "Base.1.13.ResourceNotFound",
+                "message": "The requested resource could not be found.",
+                "severity": "Critical",
+                "resolution": "Remove and re-add the resource.",
+                "related_properties": ["MemberId"]
+            }]
+        }])
     );
     Ok(())
 }

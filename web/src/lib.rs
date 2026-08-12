@@ -44,10 +44,10 @@ use rutilus_api::{
     OverviewFirmwareSummaryResponse, OverviewFreshnessBucketResponse,
     OverviewFreshnessCountResponse, OverviewHealthCountResponse, OverviewHealthLevelResponse,
     OverviewResponse, OverviewVendorCountResponse, RefreshEndpointsRequest,
-    ResourceDiagnosticsResponse, ResourceStatusResponse, TagListResponse, TagResponse,
-    TelemetrySampleListResponse, TelemetrySampleResponse, TelemetrySeriesListResponse,
-    TelemetrySeriesResponse, TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse,
-    UiLocationResponse,
+    ResourceDecodeFailureResponse, ResourceDiagnosticsResponse, ResourceExtendedInfoResponse,
+    ResourceStatusResponse, TagListResponse, TagResponse, TelemetrySampleListResponse,
+    TelemetrySampleResponse, TelemetrySeriesListResponse, TelemetrySeriesResponse,
+    TlsTrustModeResponse, TrustRejectedResponse, TrustedEndpointResponse, UiLocationResponse,
 };
 use rutilus_application::{
     ARTIFACT_CHUNK_BASE64_MAX_BYTES, ArtifactProgress, ArtifactRepository, ArtifactStore,
@@ -68,9 +68,10 @@ use rutilus_application::{
     EnvironmentMetricsReadingSummary, EventRepository, GroupManagement, GroupManagementError,
     GroupRepository, NewCredentialRequest, OnboardEndpointError, OnboardEndpointRequest,
     OperationStore, OperationSubmission, OverviewAggregate, OverviewQuery, RedfishDiscovery,
-    ResourceDiagnostics, ResourceDiagnosticsQuery, ResourceDiagnosticsQueryError,
-    ResourceStatusSummary, SubmissionError, TagManagement, TagManagementError, TagRepository,
-    TelemetryRepository, TlsIdentityProbe, TrustedEndpoint, parse_endpoint_csv,
+    ResourceDecodeFailure, ResourceDiagnostics, ResourceDiagnosticsQuery,
+    ResourceDiagnosticsQueryError, ResourceExtendedInfo, ResourceStatusSummary, SubmissionError,
+    TagManagement, TagManagementError, TagRepository, TelemetryRepository, TlsIdentityProbe,
+    TrustedEndpoint, parse_endpoint_csv,
 };
 use rutilus_domain::{
     Artifact, ArtifactId, ArtifactState, AuditAction, AuditActor, AuditEvent, AuditFailure,
@@ -1297,6 +1298,13 @@ where
             Err(ResourceDiagnosticsQueryError::Inventory(
                 EndpointInventoryQueryError::DuplicateEndpoint { .. },
             )) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
+            // A stored snapshot whose typed payload does not round-trip the
+            // defined `@Message.ExtendedInfo` shape is a store fault, exactly
+            // like a payload that does not re-parse: the view never
+            // fabricates an entry.
+            Err(ResourceDiagnosticsQueryError::ExtendedInfo(_)) => {
+                return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         };
     let Ok(response) = project_resource_diagnostics(&diagnostics) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -3941,6 +3949,18 @@ fn project_endpoint_resources(
 fn project_resource_diagnostics(
     diagnostics: &ResourceDiagnostics,
 ) -> Result<ResourceDiagnosticsResponse, EndpointInventoryProjectionError> {
+    // The persisted payload is guaranteed JSON by snapshot construction, so
+    // this parse only fails on a corrupted store; the honest mapping is an
+    // internal fault rather than a fabricated diagnostics view. The one
+    // parse feeds both the verbatim `typed_payload` and the strict
+    // `@Message.ExtendedInfo` extraction, so the two can never disagree.
+    let typed_payload: serde_json::Value = serde_json::from_str(diagnostics.typed_payload())
+        .map_err(|_| EndpointInventoryProjectionError::InvalidTypedPayload)?;
+    let extended_info = ResourceExtendedInfo::from_value(&typed_payload)
+        .map_err(|_| EndpointInventoryProjectionError::InvalidExtendedInfo)?
+        .iter()
+        .map(project_extended_info)
+        .collect();
     Ok(ResourceDiagnosticsResponse::new(
         diagnostics.endpoint_id().into_uuid(),
         diagnostics.odata_id().to_string(),
@@ -3949,12 +3969,47 @@ fn project_resource_diagnostics(
         diagnostics.feature().as_str().to_owned(),
         NonZeroU64::new(diagnostics.generation().get())
             .ok_or(EndpointInventoryProjectionError::ZeroGeneration)?,
-        // The persisted payload is guaranteed JSON by snapshot construction,
-        // so this parse only fails on a corrupted store; the honest mapping
-        // is an internal fault rather than a fabricated diagnostics view.
-        serde_json::from_str(diagnostics.typed_payload())
-            .map_err(|_| EndpointInventoryProjectionError::InvalidTypedPayload)?,
+        typed_payload,
+        extended_info,
+        diagnostics
+            .decode_failures()
+            .iter()
+            .map(project_decode_failure)
+            .collect(),
     ))
+}
+
+fn project_extended_info(entry: &ResourceExtendedInfo) -> ResourceExtendedInfoResponse {
+    ResourceExtendedInfoResponse::new(
+        entry.message_id().to_owned(),
+        entry.message().map(str::to_owned),
+        entry.severity().map(str::to_owned),
+        entry.resolution().map(str::to_owned),
+        entry.related_properties().to_vec(),
+    )
+}
+
+fn project_decode_failure(failure: &ResourceDecodeFailure) -> ResourceDecodeFailureResponse {
+    ResourceDecodeFailureResponse::new(
+        failure.odata_uri().to_string(),
+        failure.odata_type().map(ToString::to_string),
+        failure.feature().as_str().to_owned(),
+        failure.oem_namespace().map(str::to_owned),
+        failure.error_summary().to_owned(),
+        failure
+            .extended_info()
+            .iter()
+            .map(|entry| {
+                ResourceExtendedInfoResponse::new(
+                    entry.message_id().to_owned(),
+                    entry.message().map(str::to_owned),
+                    entry.severity().map(str::to_owned),
+                    entry.resolution().map(str::to_owned),
+                    entry.related_properties().to_vec(),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn project_endpoint_identity(endpoint: &Endpoint) -> EndpointIdentityResponse {
@@ -5872,6 +5927,7 @@ enum EndpointInventoryProjectionError {
     ResourceCountOverflow,
     IncoherentResourceSnapshot,
     InvalidTypedPayload,
+    InvalidExtendedInfo,
 }
 
 pub(crate) fn uncached_status(status: StatusCode) -> Response {
@@ -9185,8 +9241,8 @@ mod tests {
         next_token: u64,
         /// How many times the mock `verify_password` boundary ran. The
         /// MINOR-1 tests assert the unknown-username sign-in path performs
-        /// its dummy verification 鈥?one call per attempted failure and none
-        /// on the rate-limited refusal 鈥?so a regression that skips the
+        /// its dummy verification — one call per attempted failure and none
+        /// on the rate-limited refusal — so a regression that skips the
         /// dummy fails the count assertions.
         password_verifications: u64,
     }
@@ -9238,7 +9294,7 @@ mod tests {
             ));
         }
 
-        /// How many times the verify-password boundary ran 鈥?the MINOR-1
+        /// How many times the verify-password boundary ran — the MINOR-1
         /// tests use the count to prove the unknown-username path performs
         /// its dummy verification (a wall-clock timing assertion would be
         /// too flaky; the call-count symmetry is the structural guarantee).
@@ -10311,6 +10367,99 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn diagnostics_projection_maps_extended_info_and_decode_failures() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint_id = EndpointId::generate();
+        let extended_info = vec![ResourceExtendedInfo::new(
+            "Base.1.13.Success".to_owned(),
+            None,
+            Some("OK".to_owned()),
+            Some("No action required".to_owned()),
+            vec!["Id".to_owned()],
+        )];
+        let decode_failures = vec![ResourceDecodeFailure::try_new(
+            ResourceODataId::parse("/redfish/v1/Systems/2")?,
+            None,
+            ResourceFeature::Systems,
+            Some("Vendor".to_owned()),
+            "schema decode failed: missing required field".to_owned(),
+            vec![ResourceExtendedInfo::new(
+                "Base.1.13.ResourceNotFound".to_owned(),
+                Some("The requested resource could not be found.".to_owned()),
+                Some("Critical".to_owned()),
+                Some("Remove and re-add the resource.".to_owned()),
+                vec![],
+            )],
+        )?];
+        let diagnostics = ResourceDiagnostics::new(
+            endpoint_id,
+            ResourceId::generate(),
+            ResourceODataId::parse("/redfish/v1/Systems/1")?,
+            Some(ResourceODataType::parse(
+                "#ComputerSystem.v1_20_0.ComputerSystem",
+            )?),
+            Some(ResourceEtag::parse("W/\"system-1\"")?),
+            ResourceFeature::Systems,
+            r#"{"Id":"1","Name":"System One","@Message.ExtendedInfo":[{"MessageId":"Base.1.13.Success","Severity":"OK","Resolution":"No action required","RelatedProperties":["Id"]}]}"#.to_owned(),
+            RefreshGeneration::new(7)?,
+        )
+        .with_extended_info(extended_info)
+        .with_decode_failures(decode_failures);
+
+        let projected = project_resource_diagnostics(&diagnostics)
+            .map_err(|_| "valid diagnostics projection must succeed")?;
+
+        assert_eq!(projected.extended_info().len(), 1);
+        assert_eq!(
+            projected.extended_info()[0].message_id(),
+            "Base.1.13.Success"
+        );
+        assert_eq!(projected.extended_info()[0].severity(), Some("OK"));
+        assert_eq!(projected.decode_failures().len(), 1);
+        assert_eq!(
+            projected.decode_failures()[0].odata_uri(),
+            "/redfish/v1/Systems/2"
+        );
+        assert_eq!(projected.decode_failures()[0].feature(), "systems");
+        assert_eq!(
+            projected.decode_failures()[0].oem_namespace(),
+            Some("Vendor")
+        );
+        assert_eq!(
+            projected.decode_failures()[0].extended_info()[0].message_id(),
+            "Base.1.13.ResourceNotFound"
+        );
+        assert_eq!(
+            projected.decode_failures()[0].extended_info()[0].severity(),
+            Some("Critical")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_projection_maps_a_corrupt_extended_info_payload_to_an_internal_fault()
+    -> Result<(), Box<dyn Error>> {
+        // A stored payload carrying a `@Message.ExtendedInfo` entry that does
+        // not round-trip the defined shape is a store fault: the projection
+        // must refuse to fabricate an entry.
+        let corrupt = ResourceDiagnostics::new(
+            EndpointId::generate(),
+            ResourceId::generate(),
+            ResourceODataId::parse("/redfish/v1/Systems/1")?,
+            None,
+            None,
+            ResourceFeature::Systems,
+            r#"{"Id":"1","@Message.ExtendedInfo":[{"MessageId":7}]}"#.to_owned(),
+            RefreshGeneration::new(7)?,
+        );
+        assert_eq!(
+            project_resource_diagnostics(&corrupt),
+            Err(EndpointInventoryProjectionError::InvalidExtendedInfo)
+        );
+        Ok(())
+    }
+
     /// Builds the router under one §16.2 session policy over the auth test
     /// state.
     fn test_router_with_policy(auth_state: AuthTestState, policy: AuthPolicy) -> Router {
@@ -10491,8 +10640,8 @@ mod tests {
         Ok(())
     }
 
-    /// The unknown-username sign-in keeps the 搂16.2 failure contract
-    /// (unified error, rate-limit budget) and 鈥?security-review MINOR-1 鈥?
+    /// The unknown-username sign-in keeps the §16.2 failure contract
+    /// (unified error, rate-limit budget) and — security-review MINOR-1 —
     /// runs exactly one dummy password verification per attempted failure,
     /// the cost equalizer that makes the branch indistinguishable from the
     /// wrong-password branch by timing.
@@ -10525,8 +10674,8 @@ mod tests {
         assert_eq!(state.password_verifications(), 1);
 
         // The dummy stays inside the existing budgets: each of the
-        // remaining attempts verifies once, and the sixth 鈥?refused before
-        // any verification 鈥?verifies nothing.
+        // remaining attempts verifies once, and the sixth — refused before
+        // any verification — verifies nothing.
         for _ in 0..4 {
             let refused = router
                 .clone()
@@ -10557,7 +10706,7 @@ mod tests {
     }
 
     /// The wrong-password path runs exactly one verification per attempted
-    /// failure 鈥?the same count the unknown-username path produces 鈥?so the
+    /// failure — the same count the unknown-username path produces — so the
     /// two failure branches are structurally indistinguishable in cost (the
     /// MINOR-1 property the dummy verification restores).
     #[tokio::test]
@@ -10582,8 +10731,8 @@ mod tests {
         Ok(())
     }
 
-    /// The unknown-username sign-in still records the 搂16.3 login-failure
-    /// audit pair (started + failed, action `login`) 鈥?the MINOR-1 dummy
+    /// The unknown-username sign-in still records the §16.3 login-failure
+    /// audit pair (started + failed, action `login`) — the MINOR-1 dummy
     /// verification must not change the audit semantics.
     #[tokio::test]
     async fn unknown_username_sign_in_records_the_login_failure_audit_pair()

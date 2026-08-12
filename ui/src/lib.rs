@@ -31,11 +31,12 @@ use rutilus_api::{
     NvidiaDebugTokenCommand, NvidiaPowerSmoothingCommand, NvidiaSystemConfigProfileCommand,
     OemCommand, OperationResponse, OperationSourceResponse, OperationStateResponse,
     OverviewFreshnessBucketResponse, OverviewHealthLevelResponse, OverviewResponse, ProfileFile,
-    ProfileId, RedfishCommand, ResetKeysType, ResetType, ResourceDiagnosticsResponse,
-    ResourceStatusResponse, RoleId, RoleResponse, SecureBootCommand, SetBootSourceOverride,
-    StartUpdate, SystemCommand, TagListResponse, TelemetryCommand, TelemetrySampleListResponse,
-    TelemetrySampleResponse, TelemetrySeriesResponse, TlsTrustModeResponse, TokenData, TokenType,
-    UiLocationResponse, UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
+    ProfileId, RedfishCommand, ResetKeysType, ResetType, ResourceDecodeFailureResponse,
+    ResourceDiagnosticsResponse, ResourceExtendedInfoResponse, ResourceStatusResponse, RoleId,
+    RoleResponse, SecureBootCommand, SetBootSourceOverride, StartUpdate, SystemCommand,
+    TagListResponse, TelemetryCommand, TelemetrySampleListResponse, TelemetrySampleResponse,
+    TelemetrySeriesResponse, TlsTrustModeResponse, TokenData, TokenType, UiLocationResponse,
+    UpdateAccount, UpdateAccountPassword, UpdateAccountUserName, UpdateCommand,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -3235,7 +3236,10 @@ impl DiagnosticsLoadFailure {
 enum DiagnosticsState {
     Idle,
     Loading,
-    Ready(DiagnosticsProjection),
+    /// The projection grew past clippy's pedantic large-enum-variant budget
+    /// when the two error-path record lists were added; the box keeps the
+    /// state enum small while the projection API stays unchanged.
+    Ready(Box<DiagnosticsProjection>),
     Failed(DiagnosticsLoadFailure),
 }
 
@@ -3262,7 +3266,7 @@ impl DiagnosticsState {
 
     fn projection(&self) -> Option<DiagnosticsProjection> {
         match self {
-            Self::Ready(projection) => Some(projection.clone()),
+            Self::Ready(projection) => Some((**projection).clone()),
             Self::Idle | Self::Loading | Self::Failed(_) => None,
         }
     }
@@ -3271,7 +3275,8 @@ impl DiagnosticsState {
 #[cfg(any(target_arch = "wasm32", test))]
 /// The read-only §12.4 diagnostics snapshot of one resource, projected for
 /// the panel: every field the route exposes, plus the canonical rendering of
-/// the decoded typed payload.
+/// the decoded typed payload and the error-path records the current
+/// `Generation` retained (decode failures and their `ExtendedInfo`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiagnosticsProjection {
     endpoint_id: String,
@@ -3285,6 +3290,12 @@ struct DiagnosticsProjection {
     /// to reproduce verbatim; the deterministic 2-space rendering preserves
     /// every field while staying readable and diffable.
     typed_payload_json: String,
+    /// The Redfish `@Message.ExtendedInfo` entries the resource's stored
+    /// typed payload retains (§7.6), in response order.
+    extended_info: Vec<ExtendedInfoProjection>,
+    /// The endpoint's current Generation member decode failures (§12.4
+    /// decode-error path), in response order.
+    decode_failures: Vec<DecodeFailureProjection>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -3298,6 +3309,72 @@ impl From<&ResourceDiagnosticsResponse> for DiagnosticsProjection {
             feature: diagnostics.feature().to_owned(),
             generation: diagnostics.generation().get().to_string(),
             typed_payload_json: format_typed_payload_json(diagnostics.typed_payload()),
+            extended_info: diagnostics
+                .extended_info()
+                .iter()
+                .map(ExtendedInfoProjection::from)
+                .collect(),
+            decode_failures: diagnostics
+                .decode_failures()
+                .iter()
+                .map(DecodeFailureProjection::from)
+                .collect(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One Redfish `@Message.ExtendedInfo` entry rendered in the diagnostics
+/// panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExtendedInfoProjection {
+    message_id: String,
+    message: Option<String>,
+    severity: Option<String>,
+    resolution: Option<String>,
+    related_properties: Vec<String>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&ResourceExtendedInfoResponse> for ExtendedInfoProjection {
+    fn from(entry: &ResourceExtendedInfoResponse) -> Self {
+        Self {
+            message_id: entry.message_id().to_owned(),
+            message: entry.message().map(str::to_owned),
+            severity: entry.severity().map(str::to_owned),
+            resolution: entry.resolution().map(str::to_owned),
+            related_properties: entry.related_properties().to_vec(),
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+/// One member whose typed decoding failed during the current refresh
+/// Generation, rendered in the diagnostics panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodeFailureProjection {
+    odata_uri: String,
+    odata_type: Option<String>,
+    feature: String,
+    oem_namespace: Option<String>,
+    error_summary: String,
+    extended_info: Vec<ExtendedInfoProjection>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&ResourceDecodeFailureResponse> for DecodeFailureProjection {
+    fn from(failure: &ResourceDecodeFailureResponse) -> Self {
+        Self {
+            odata_uri: failure.odata_uri().to_owned(),
+            odata_type: failure.odata_type().map(str::to_owned),
+            feature: failure.feature().to_owned(),
+            oem_namespace: failure.oem_namespace().map(str::to_owned),
+            error_summary: failure.error_summary().to_owned(),
+            extended_info: failure
+                .extended_info()
+                .iter()
+                .map(ExtendedInfoProjection::from)
+                .collect(),
         }
     }
 }
@@ -3337,9 +3414,9 @@ fn diagnostics_optional_text(value: Option<&str>) -> String {
 /// Honest boundary of the §12.4 diagnostics surface, shown as the panel
 /// footnote. The wording mirrors the backend contract (api §12.4 view): the
 /// payload is the persisted decoded snapshot of the latest complete refresh,
-/// and decode-error paths left no record, so no diagnostics can exist for
-/// resources that never entered the snapshot store.
-const DIAGNOSTICS_FOOTER_NOTE: &str = "Diagnostics show the decoded snapshot of the latest complete refresh; decode-error paths are not persisted and have no diagnostics.";
+/// and the decode-error / `ExtendedInfo` sections appear only when the refresh
+/// recorded them — absence is information, not a fabricated state.
+const DIAGNOSTICS_FOOTER_NOTE: &str = "Diagnostics show the decoded snapshot of the latest complete refresh; decode-error paths and ExtendedInfo are shown when the refresh recorded them.";
 
 #[cfg(any(target_arch = "wasm32", test))]
 /// Static label for a capability that has never been observed on this
@@ -15208,6 +15285,8 @@ mod browser {
             feature,
             generation,
             typed_payload_json,
+            extended_info,
+            decode_failures,
         } = projection;
         // An absent optional field is information: the BMC did not publish
         // it. The muted placeholder keeps the row visible instead of hiding
@@ -15215,6 +15294,98 @@ mod browser {
         // testable outside the wasm component.
         let odata_type_text = diagnostics_optional_text(odata_type.as_deref());
         let etag_text = diagnostics_optional_text(etag.as_deref());
+        let extended_info_is_empty = extended_info.is_empty();
+        let decode_failures_is_empty = decode_failures.is_empty();
+
+        // The resource's own `@Message.ExtendedInfo` entries (§7.6): one
+        // fact row per Redfish-defined field, rendered read-only like every
+        // diagnostics field.
+        let extended_info_rows = extended_info
+            .into_iter()
+            .map(|entry| {
+                view! {
+                    <dl class="diagnostics-extended-info-entry">
+                        <div>
+                            <dt>"MessageId"</dt>
+                            <dd><code>{entry.message_id}</code></dd>
+                        </div>
+                        <div>
+                            <dt>"Severity"</dt>
+                            <dd>{diagnostics_optional_text(entry.severity.as_deref())}</dd>
+                        </div>
+                        <div>
+                            <dt>"Message"</dt>
+                            <dd>{diagnostics_optional_text(entry.message.as_deref())}</dd>
+                        </div>
+                        <div>
+                            <dt>"Resolution"</dt>
+                            <dd>{diagnostics_optional_text(entry.resolution.as_deref())}</dd>
+                        </div>
+                    </dl>
+                }
+            })
+            .collect_view();
+
+        // The current Generation's member decode failures (§12.4
+        // decode-error path): each record is one read-only fact block, with
+        // its own ExtendedInfo entries underneath, so a member whose typed
+        // decoding failed is visible without ever disabling the endpoint.
+        let decode_failure_rows = decode_failures
+            .into_iter()
+            .map(|failure| {
+                let failure_extended_info_rows = failure
+                    .extended_info
+                    .into_iter()
+                    .map(|entry| {
+                        view! {
+                            <dl class="diagnostics-extended-info-entry">
+                                <div>
+                                    <dt>"MessageId"</dt>
+                                    <dd><code>{entry.message_id}</code></dd>
+                                </div>
+                                <div>
+                                    <dt>"Severity"</dt>
+                                    <dd>{diagnostics_optional_text(entry.severity.as_deref())}</dd>
+                                </div>
+                                <div>
+                                    <dt>"Message"</dt>
+                                    <dd>{diagnostics_optional_text(entry.message.as_deref())}</dd>
+                                </div>
+                                <div>
+                                    <dt>"Resolution"</dt>
+                                    <dd>{diagnostics_optional_text(entry.resolution.as_deref())}</dd>
+                                </div>
+                            </dl>
+                        }
+                    })
+                    .collect_view();
+                view! {
+                    <dl class="diagnostics-decode-failure">
+                        <div>
+                            <dt>"OData URI"</dt>
+                            <dd><code>{failure.odata_uri}</code></dd>
+                        </div>
+                        <div>
+                            <dt>"OData Type"</dt>
+                            <dd><code>{diagnostics_optional_text(failure.odata_type.as_deref())}</code></dd>
+                        </div>
+                        <div>
+                            <dt>"nv-redfish feature"</dt>
+                            <dd><code>{failure.feature}</code></dd>
+                        </div>
+                        <div>
+                            <dt>"OEM Namespace"</dt>
+                            <dd><code>{diagnostics_optional_text(failure.oem_namespace.as_deref())}</code></dd>
+                        </div>
+                        <div>
+                            <dt>"Decode error"</dt>
+                            <dd><code>{failure.error_summary}</code></dd>
+                        </div>
+                    </dl>
+                    {failure_extended_info_rows}
+                }
+            })
+            .collect_view();
 
         view! {
             <dl class="diagnostics-facts">
@@ -15243,6 +15414,22 @@ mod browser {
                     <dd>{generation}</dd>
                 </div>
             </dl>
+            {(!extended_info_is_empty).then(|| {
+                view! {
+                    <section class="diagnostics-extended-info">
+                        <h3>"ExtendedInfo"</h3>
+                        {extended_info_rows}
+                    </section>
+                }
+            })}
+            {(!decode_failures_is_empty).then(|| {
+                view! {
+                    <section class="diagnostics-decode-failures">
+                        <h3>"Decode failures in this refresh"</h3>
+                        {decode_failure_rows}
+                    </section>
+                }
+            })}
             // The decoded payload is read-only (§12.4 forbids submitting
             // arbitrary JSON): a native collapsible keeps the raw JSON one
             // click away without any edit surface, and the pre scrolls
@@ -15278,7 +15465,9 @@ mod browser {
             return DiagnosticsState::Failed(DiagnosticsLoadFailure::Unavailable);
         }
         match response.json::<ResourceDiagnosticsResponse>().await {
-            Ok(diagnostics) => DiagnosticsState::Ready(DiagnosticsProjection::from(&diagnostics)),
+            Ok(diagnostics) => {
+                DiagnosticsState::Ready(Box::new(DiagnosticsProjection::from(&diagnostics)))
+            }
             Err(_) => DiagnosticsState::Failed(DiagnosticsLoadFailure::Malformed),
         }
     }
@@ -24029,6 +24218,10 @@ mod tests {
         assert_eq!(projection.etag.as_deref(), Some("W/\"system-7\""));
         assert_eq!(projection.feature, "std-redfish");
         assert_eq!(projection.generation, "7");
+        // The fixture carries no error-path records: both sections stay
+        // empty, so the panel renders neither.
+        assert!(projection.extended_info.is_empty());
+        assert!(projection.decode_failures.is_empty());
         // The rendering decision is pinned: canonical 2-space pretty JSON.
         // `serde_json::Value` objects sort keys, so the output is
         // deterministic for a given payload (no original text survives the
@@ -24074,6 +24267,89 @@ mod tests {
         assert_eq!(projection.feature, "oem-dell");
         assert_eq!(projection.generation, "3");
         assert_eq!(projection.typed_payload_json, "{\n  \"Temperature\": []\n}");
+        // A response that predates the error-path fields defaults both lists
+        // to empty: absence is information, not a malformed response.
+        assert!(projection.extended_info.is_empty());
+        assert!(projection.decode_failures.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_projection_projects_extended_info_and_decode_failures()
+    -> Result<(), Box<dyn Error>> {
+        let diagnostics: ResourceDiagnosticsResponse = serde_json::from_value(json!({
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+            "odata_uri": "/redfish/v1/Systems/1",
+            "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+            "etag": "W/\"system-1\"",
+            "feature": "systems",
+            "generation": 7,
+            "typed_payload": {
+                "Id": "1",
+                "Name": "System One",
+                "@Message.ExtendedInfo": [{
+                    "MessageId": "Base.1.13.Success",
+                    "Severity": "OK",
+                    "Resolution": "No action required",
+                    "RelatedProperties": ["Id"]
+                }]
+            },
+            "extended_info": [{
+                "message_id": "Base.1.13.Success",
+                "message": null,
+                "severity": "OK",
+                "resolution": "No action required",
+                "related_properties": ["Id"]
+            }],
+            "decode_failures": [{
+                "odata_uri": "/redfish/v1/Systems/2",
+                "odata_type": "#ComputerSystem.v1_20_0.ComputerSystem",
+                "feature": "systems",
+                "oem_namespace": "Vendor",
+                "error_summary": "schema decode failed: missing required field",
+                "extended_info": [{
+                    "message_id": "Base.1.13.ResourceNotFound",
+                    "message": "The requested resource could not be found.",
+                    "severity": "Critical",
+                    "resolution": "Remove and re-add the resource.",
+                    "related_properties": ["MemberId"]
+                }]
+            }]
+        }))?;
+
+        let projection = DiagnosticsProjection::from(&diagnostics);
+        assert_eq!(projection.extended_info.len(), 1);
+        assert_eq!(projection.extended_info[0].message_id, "Base.1.13.Success");
+        assert_eq!(projection.extended_info[0].severity.as_deref(), Some("OK"));
+        assert_eq!(
+            projection.extended_info[0].related_properties,
+            vec!["Id".to_owned()]
+        );
+        assert_eq!(projection.decode_failures.len(), 1);
+        assert_eq!(
+            projection.decode_failures[0].odata_uri,
+            "/redfish/v1/Systems/2"
+        );
+        assert_eq!(projection.decode_failures[0].feature, "systems");
+        assert_eq!(
+            projection.decode_failures[0].oem_namespace.as_deref(),
+            Some("Vendor")
+        );
+        assert_eq!(
+            projection.decode_failures[0].error_summary,
+            "schema decode failed: missing required field"
+        );
+        assert_eq!(projection.decode_failures[0].extended_info.len(), 1);
+        assert_eq!(
+            projection.decode_failures[0].extended_info[0].message_id,
+            "Base.1.13.ResourceNotFound"
+        );
+        assert_eq!(
+            projection.decode_failures[0].extended_info[0]
+                .resolution
+                .as_deref(),
+            Some("Remove and re-add the resource.")
+        );
         Ok(())
     }
 
@@ -24125,8 +24401,10 @@ mod tests {
             feature: "std-redfish".to_owned(),
             generation: "7".to_owned(),
             typed_payload_json: "{}".to_owned(),
+            extended_info: Vec::new(),
+            decode_failures: Vec::new(),
         };
-        let ready = DiagnosticsState::Ready(projection.clone());
+        let ready = DiagnosticsState::Ready(Box::new(projection.clone()));
         assert!(ready.is_ready());
         assert_eq!(ready.projection(), Some(projection));
         assert_eq!(ready.failure_message(), "");
@@ -24167,14 +24445,15 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_footer_note_discloses_decoded_snapshot_and_unpersisted_decode_errors() {
+    fn diagnostics_footer_note_discloses_recorded_error_paths() {
         // The footnote is the honest boundary of §12.4 (mirroring the api
         // contract): the panel shows the decoded snapshot of the latest
-        // complete refresh, and decode-error paths are not persisted, so the
-        // panel must never imply it covers failed decodes.
+        // complete refresh, and the decode-error / ExtendedInfo sections
+        // appear only when the refresh recorded them — the panel never
+        // implies coverage it does not have.
         assert!(DIAGNOSTICS_FOOTER_NOTE.contains("decoded snapshot"));
         assert!(DIAGNOSTICS_FOOTER_NOTE.contains("latest complete refresh"));
-        assert!(DIAGNOSTICS_FOOTER_NOTE.contains("not persisted"));
+        assert!(DIAGNOSTICS_FOOTER_NOTE.contains("when the refresh recorded them"));
     }
 
     #[test]
