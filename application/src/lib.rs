@@ -82,7 +82,8 @@ pub use endpoint_csv_import::{
     EndpointCsvImportReport, EndpointCsvRowOutcome, EndpointCsvRowResult,
 };
 pub use endpoint_enrollment::{
-    EndpointEnroller, EndpointEnrollment, EndpointEnrollmentError, EnrolledEndpoint,
+    EndpointEnroller, EndpointEnrollment, EndpointEnrollmentError, EndpointReadGateError,
+    EnrolledEndpoint,
 };
 pub use endpoint_inventory::{
     EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryQuery,

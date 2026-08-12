@@ -8,7 +8,7 @@ use crate::{
     AuditedEndpointRefreshError, AuditedOnboardEndpointError, BoundaryFuture,
     CapabilitySnapshotRepository, Clock, CoreResourceReader, CredentialResolver,
     DiscoveredEndpointRepository, EndpointRefreshRepository, OnboardEndpointRequest,
-    OnboardedEndpoint, RedfishDiscovery,
+    OnboardedEndpoint, RedfishDiscovery, batch_refresh::endpoint_read_gate,
 };
 
 /// Enrolls one already trusted endpoint and returns its stable identity.
@@ -113,8 +113,10 @@ where
     /// Returns [`EndpointEnrollmentError::Onboarding`] before an endpoint
     /// exists, [`EndpointEnrollmentError::OnboardingAuditAfterCreation`] when
     /// endpoint persistence precedes an onboarding-audit failure,
-    /// [`EndpointEnrollmentError::InitialRefresh`] when the first refresh does
-    /// not commit, or
+    /// [`EndpointEnrollmentError::InitialRefreshCoordination`] when the
+    /// process-wide endpoint read gate cannot be acquired before the first
+    /// refresh starts, [`EndpointEnrollmentError::InitialRefresh`] when the
+    /// first refresh does not commit, or
     /// [`EndpointEnrollmentError::InitialRefreshAuditAfterCommit`] when the
     /// Generation commits but its audit cannot be finalized.
     pub async fn execute(
@@ -153,6 +155,28 @@ where
             }
         })?;
         let endpoint_id = onboarded.endpoint().id();
+        // The initial refresh is a refresh like any other, so it passes
+        // through the process-wide endpoint-level read gate (design §7.8)
+        // before it starts: one permit per endpoint, held for the whole
+        // refresh exactly like the batch refresh entrance, so an enrollment
+        // first refresh and a concurrent batch refresh of the same endpoint
+        // can never overlap and race the §9.5 Generation order. The gate is
+        // never closed, so a failed acquire is the same process-level break
+        // the batch reports as its Coordination outcome — the enrollment
+        // reports its own classified coordination failure instead of
+        // starting an uncoordinated refresh.
+        let Some(gate) = endpoint_read_gate(endpoint_id) else {
+            return Err(EndpointEnrollmentError::InitialRefreshCoordination {
+                endpoint_id,
+                source: EndpointReadGateError::RegistryUnavailable,
+            });
+        };
+        let Ok(_endpoint_permit) = gate.acquire().await else {
+            return Err(EndpointEnrollmentError::InitialRefreshCoordination {
+                endpoint_id,
+                source: EndpointReadGateError::GateClosed,
+            });
+        };
         let refresh = AuditedEndpointRefresh::new(
             &self.repository,
             &self.credentials,
@@ -262,6 +286,14 @@ pub enum EndpointEnrollmentError<
             >,
         >,
     },
+    #[error(
+        "endpoint {endpoint_id} was created but its initial complete refresh could not be scheduled: {source}"
+    )]
+    InitialRefreshCoordination {
+        endpoint_id: EndpointId,
+        #[source]
+        source: EndpointReadGateError,
+    },
     #[error("endpoint {endpoint_id} was created but its initial complete refresh failed: {source}")]
     InitialRefresh {
         endpoint_id: EndpointId,
@@ -296,9 +328,31 @@ pub enum EndpointEnrollmentError<
     },
 }
 
+/// A controlled failure to acquire the process-wide endpoint read gate
+/// before the initial refresh could start (design §7.8).
+///
+/// Mirrors the batch refresh entrance's Coordination outcome: the gate is
+/// process-wide and never closed, so both variants are controlled dead-ends
+/// reported as classified coordination failures instead of panics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum EndpointReadGateError {
+    /// The gate registry could not be locked.
+    #[error("the endpoint refresh gate registry is unavailable")]
+    RegistryUnavailable,
+    /// The endpoint's one-permit read gate is closed.
+    #[error("the endpoint refresh gate is closed")]
+    GateClosed,
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::{
+        sync::{
+            Arc, Mutex, MutexGuard,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use rutilus_domain::{
         AuditAction, AuditEvent, CapabilityState, CredentialId, CredentialUsername, Endpoint,
@@ -310,8 +364,9 @@ mod tests {
     use time::OffsetDateTime;
 
     use crate::{
-        AuditRecordError, BoundaryFuture, EndpointDiscovery, EndpointRefreshError,
-        OnboardEndpointError, ResolvedCredential, ResourceObservation, TrustedEndpoint,
+        AuditRecordError, BatchEndpointRefresh, BoundaryFuture, EndpointDiscovery,
+        EndpointRefreshError, OnboardEndpointError, ResolvedCredential, ResourceObservation,
+        TrustedEndpoint,
     };
 
     use super::*;
@@ -580,6 +635,108 @@ mod tests {
         Ok(())
     }
 
+    // The test drives an enrollment initial refresh and a concurrent batch
+    // refresh through a blocked read and asserts the full serialized
+    // lifecycle, so the line count is the coverage, not a signal.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn initial_refresh_and_concurrent_batch_refresh_of_the_same_endpoint_never_overlap()
+    -> Result<(), Box<dyn Error>> {
+        // The enrollment first refresh and a concurrent batch refresh of the
+        // same endpoint must never overlap (design §7.8 endpoint-level gate):
+        // the initial refresh passes through the same process-wide one-permit
+        // gate as every batch refresh, so a batch started while the initial
+        // refresh is in flight must wait at the gate instead of reading, and
+        // the two refreshes then run back to back with no interleaved phase.
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let now = OffsetDateTime::now_utc();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let block = Arc::new(FirstReadBlock::new(reached_tx, release_rx));
+        let request = request(CredentialId::generate(), now)?;
+
+        let enrollment = EndpointEnrollment::new(
+            MockRepository::new(Arc::clone(&state)),
+            MockCredentials::available(Arc::clone(&state)),
+            MockGateway::succeed(Arc::clone(&state)).with_first_read_block(Arc::clone(&block)),
+            FixedClock(now),
+            AuditActor::LocalOperator,
+            None,
+            DeploymentPosture::Standalone,
+        );
+        // The batch shares the enrollment's mocks — the repository doubles
+        // as its audit writer and the gateway as its reader — so both
+        // entrances observe the same events and the same persisted endpoint.
+        let batch = BatchEndpointRefresh::new(
+            MockRepository::new(Arc::clone(&state)),
+            MockCredentials::available(Arc::clone(&state)),
+            MockGateway::succeed(Arc::clone(&state)),
+            MockRepository::new(Arc::clone(&state)),
+            FixedClock(now),
+            AuditActor::System,
+            None,
+            DeploymentPosture::Site,
+        );
+
+        let enrollment_task = tokio::spawn(async move { enrollment.execute(request).await });
+        // The enrollment first refresh is now provably in flight inside its
+        // read.
+        reached_rx.await.map_err(|_| MockError::State)?;
+        let endpoint_id = lock_state(&state)?
+            .endpoint
+            .as_ref()
+            .map(Endpoint::id)
+            .ok_or(MockError::State)?;
+        let batch_task = tokio::spawn(async move { batch.execute(vec![endpoint_id]).await });
+        // Give the batch time to reach the endpoint-level gate. While the
+        // initial refresh's observation is still in flight there must be
+        // exactly one read and no commit: the batch waits at the gate
+        // instead of overlapping the enrollment's initial refresh.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let events = events(&state)?;
+            assert_eq!(
+                events.iter().filter(|event| **event == "read").count(),
+                1,
+                "the batch refresh must wait at the endpoint gate instead of reading"
+            );
+            assert_eq!(
+                events.iter().filter(|event| **event == "commit").count(),
+                0,
+                "no Generation may commit while an observation is still in flight"
+            );
+        }
+        let _ = release_tx.send(());
+        let enrolled = enrollment_task.await.map_err(|_| MockError::State)??;
+        let outcomes = batch_task.await.map_err(|_| MockError::State)??;
+        assert_eq!(enrolled.snapshots().len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_success());
+
+        // Serialization proof: from the first read onward, the two refresh
+        // phases are contiguous blocks — read, Generation commit, capability
+        // re-probe, snapshot replace — with the batch's read starting only
+        // after the initial refresh's whole phase completed. The gate is
+        // held for the entire refresh, not just for the read.
+        let events = events(&state)?;
+        let first_read = events
+            .iter()
+            .position(|event| *event == "read")
+            .ok_or(MockError::State)?;
+        let refresh_tail = events[first_read..]
+            .iter()
+            .filter(|event| matches!(**event, "read" | "commit" | "discover" | "snapshot"))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refresh_tail,
+            [
+                "read", "commit", "discover", "snapshot", "read", "commit", "discover", "snapshot",
+            ]
+        );
+        Ok(())
+    }
+
     #[derive(Debug, Default)]
     struct MockState {
         events: Vec<&'static str>,
@@ -749,9 +906,33 @@ mod tests {
         }
     }
 
+    /// Deterministically holds one test's first read in flight until the
+    /// test releases it: the armed read signals `reached` and then waits on
+    /// `release`, so the test can pin one refresh inside its read while a
+    /// second refresh is expected to wait at the endpoint-level gate.
+    struct FirstReadBlock {
+        armed: AtomicBool,
+        reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl FirstReadBlock {
+        fn new(
+            reached: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        ) -> Self {
+            Self {
+                armed: AtomicBool::new(true),
+                reached: Mutex::new(Some(reached)),
+                release: Mutex::new(Some(release)),
+            }
+        }
+    }
+
     struct MockGateway {
         state: Arc<Mutex<MockState>>,
         read_succeeds: bool,
+        first_read_block: Option<Arc<FirstReadBlock>>,
     }
 
     impl MockGateway {
@@ -759,6 +940,7 @@ mod tests {
             Self {
                 state,
                 read_succeeds: true,
+                first_read_block: None,
             }
         }
 
@@ -766,7 +948,15 @@ mod tests {
             Self {
                 state,
                 read_succeeds: false,
+                first_read_block: None,
             }
+        }
+
+        /// Holds the first read of this gateway in flight until the test
+        /// releases it.
+        fn with_first_read_block(mut self, block: Arc<FirstReadBlock>) -> Self {
+            self.first_read_block = Some(block);
+            self
         }
     }
 
@@ -802,9 +992,25 @@ mod tests {
             _username: &'a CredentialUsername,
             _password: &'a SecretString,
         ) -> BoundaryFuture<'a, Result<crate::CoreResourceReadOutcome, Self::Error>> {
+            let state = Arc::clone(&self.state);
+            let read_succeeds = self.read_succeeds;
+            let first_read_block = self.first_read_block.clone();
             Box::pin(async move {
-                lock_state(&self.state)?.events.push("read");
-                if !self.read_succeeds {
+                lock_state(&state)?.events.push("read");
+                if let Some(block) = &first_read_block
+                    && block.armed.swap(false, Ordering::SeqCst)
+                {
+                    if let Some(reached) =
+                        block.reached.lock().map_err(|_| MockError::State)?.take()
+                    {
+                        let _ = reached.send(());
+                    }
+                    let release = block.release.lock().map_err(|_| MockError::State)?.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                }
+                if !read_succeeds {
                     return Err(MockError::Read);
                 }
                 Ok(crate::CoreResourceReadOutcome::new(

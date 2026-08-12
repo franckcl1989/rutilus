@@ -3039,6 +3039,15 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("endpoint {endpoint_id} was created but its onboarding audit failed"),
         ),
+        EndpointEnrollmentError::InitialRefreshCoordination {
+            endpoint_id,
+            source,
+        } => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "endpoint {endpoint_id} was created but its initial refresh could not be scheduled: {source}"
+            ),
+        ),
         EndpointEnrollmentError::InitialRefresh {
             endpoint_id,
             source,

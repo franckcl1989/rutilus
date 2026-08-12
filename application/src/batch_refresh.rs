@@ -89,13 +89,17 @@ static ENDPOINT_READ_GATES: OnceLock<Mutex<HashMap<EndpointId, Arc<Semaphore>>>>
 /// Returns the process-wide one-permit read gate of one endpoint, or `None`
 /// when the registry cannot be locked.
 ///
-/// The gate is created on first use and shared by every concurrent refresh
-/// of the endpoint; the permit is held for the whole refresh (read,
-/// Generation commit, capability re-probe, and snapshot replace), exactly
-/// like the batch permit. A poisoned registry is the same process-level
-/// break as a closed semaphore, so the caller reports it as the endpoint's
-/// own classified coordination failure instead of panicking.
-fn endpoint_read_gate(endpoint_id: EndpointId) -> Option<Arc<Semaphore>> {
+/// The gate is created on first use and shared by every refresh of the
+/// endpoint — the batch entrance ([`BatchEndpointRefresh::execute`]) and the
+/// enrollment first-refresh entrance (`crate::EndpointEnrollment`) pass
+/// through the same gate, so an enrollment initial refresh can never overlap
+/// a concurrent batch refresh of the same endpoint. The permit is held for
+/// the whole refresh (read, Generation commit, capability re-probe, and
+/// snapshot replace), exactly like the batch permit. A poisoned registry is
+/// the same process-level break as a closed semaphore, so the caller reports
+/// it as the endpoint's own classified coordination failure instead of
+/// panicking.
+pub(crate) fn endpoint_read_gate(endpoint_id: EndpointId) -> Option<Arc<Semaphore>> {
     let mut gates = ENDPOINT_READ_GATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
