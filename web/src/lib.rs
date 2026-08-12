@@ -1209,6 +1209,18 @@ where
 {
     // The bounded §14.2 homepage recent-event tail; mirrors
     // `rutilus_api::OVERVIEW_RECENT_EVENTS`.
+    //
+    // Totality guard (security review N5, registered §7.7 exception):
+    // `OVERVIEW_RECENT_EVENTS` is a compile-time constant (`pub const
+    // OVERVIEW_RECENT_EVENTS: u64 = 5` in `rutilus-api`), and
+    // `NonZeroU64::new` returns `None` only for zero, so the `None` arm is
+    // unreachable by construction — every value the constant can take is
+    // covered by the `Some` arm. The compiler cannot const-fold the match
+    // over the `const fn` call, hence the runtime guard; the compile-time
+    // assertion below machine-checks the same invariant (mirrored by
+    // `application::overview`'s `limit()` test helper), so this branch can
+    // never be taken.
+    const _: () = assert!(rutilus_api::OVERVIEW_RECENT_EVENTS > 0);
     let Some(recent_events_limit) = NonZeroU64::new(rutilus_api::OVERVIEW_RECENT_EVENTS) else {
         unreachable!("the recent-events limit constant is positive");
     };
