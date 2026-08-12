@@ -21,7 +21,12 @@
 //! `SqliteStore::consistent_snapshot` on its own store. `backup restore` is
 //! offline by construction (§20.2): stop the instance, verify and decrypt
 //! the package, check the product and schema versions, restore the data,
-//! and let the operator start the instance.
+//! and let the operator start the instance. A restore never destroys the
+//! only copy of the pre-restore state: before the first overwrite the
+//! current data directory is copied into a sibling temporary directory (the
+//! pre-restore rollback snapshot), which is removed when the restore
+//! completes and preserved — with its location reported in the error — when
+//! a restore fails mid-overwrite.
 //!
 //! # Cross-machine restore (§20.2)
 //!
@@ -47,7 +52,7 @@
 
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
 };
@@ -69,7 +74,7 @@ use rutilus_security::{
     recover_master_key, recover_master_key_system,
 };
 use secrecy::SecretString;
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 use tracing::instrument;
 use uuid::Uuid;
@@ -86,6 +91,13 @@ const ENTRY_INSTANCE_MARKER: &str = "instance";
 const ENTRY_TLS_CERTIFICATE: &str = "tls-certificate";
 const ENTRY_TLS_PRIVATE_KEY: &str = "tls-private-key";
 const ARTIFACT_ENTRY_PREFIX: &str = "artifact-";
+
+/// The default backup directory below the data directory.
+const BACKUP_DIRECTORY_NAME: &str = "backups";
+/// The sibling-temporary-directory prefix of the pre-restore rollback
+/// snapshot (the copy of the current data taken before a restore overwrites
+/// it, see `create_pre_restore_snapshot`).
+const PRE_RESTORE_PREFIX: &str = "rutilus-restore-pre-";
 
 /// How the instance master key is unlocked for one backup command.
 #[derive(Clone, Debug)]
@@ -209,6 +221,14 @@ pub async fn create_backup(
 /// database is then opened read-only and verified against the package
 /// snapshot before the outcome is reported.
 ///
+/// A failed restore never destroys the only copy of the pre-restore data
+/// (§20.2 "失败不破坏现状"): only after every validation has passed is the
+/// current data directory copied into a sibling temporary directory, and
+/// only then does the overwrite begin. The copy is removed when the restore
+/// completes; when the restore fails mid-overwrite, the copy is preserved
+/// and its location is reported by the returned error, so the operator can
+/// roll the data directory back.
+///
 /// Cross-machine restores are supported only with a carried passphrase
 /// envelope (see the module documentation): a key mismatch here — the
 /// envelope cannot be unlocked, or the package refuses the recovered key —
@@ -219,7 +239,9 @@ pub async fn create_backup(
 ///
 /// Returns [`BackupError`] when the instance is running, the master key is
 /// unrecoverable or does not match the package, the package is invalid, the
-/// versions are incompatible, or any file cannot be written or verified.
+/// versions are incompatible, the pre-restore snapshot cannot be created
+/// (in which case the data directory is untouched), or any file cannot be
+/// written or verified.
 #[instrument(skip_all, fields(data_directory = %paths.data_directory().display(), package = %package_path.display()))]
 pub async fn restore_backup(
     paths: &RuntimePaths,
@@ -275,8 +297,56 @@ pub async fn restore_backup(
         }
     };
 
-    restore_database_files(paths.database_path(), &snapshot).map_err(BackupError::RestoreFiles)?;
-    let restored = restore_data_directory_files(paths, &backup)?;
+    // §20.2 "失败不破坏现状": every validation above passed without touching
+    // the data directory. Before the first overwrite, the current data
+    // directory is copied into a sibling temporary directory — the
+    // pre-restore rollback snapshot, same volume, mirroring the pre-migration
+    // recovery-copy discipline (length-verified copies, synchronized). It
+    // omits the transient runtime lock (held open by this restore) and the
+    // `backups/` directory (never overwritten by a restore). A failure to
+    // create the copy aborts the restore with the data directory untouched.
+    let pre_restore = create_pre_restore_snapshot(paths)?;
+    match restore_data_phase(paths, &backup, &snapshot, pending_migrations).await {
+        Ok(outcome) => {
+            // The restore replaced and verified the whole data set; the
+            // pre-restore copy is no longer needed and is removed with the
+            // temporary directory.
+            drop(pre_restore);
+            Ok(outcome)
+        }
+        Err(source) => {
+            // The overwrite already started, so the failure keeps the
+            // pre-restore copy for the operator's rollback and reports its
+            // location in the error.
+            Err(BackupError::RestoreFailedPreservingSnapshot {
+                snapshot: pre_restore.keep(),
+                source: Box::new(source),
+            })
+        }
+    }
+}
+
+/// Runs the overwriting and verification stages of a restore.
+///
+/// Called only after every validation (package authentication, product and
+/// schema versions) has passed and the caller has copied the current data
+/// directory ahead of the restore (`create_pre_restore_snapshot`): this is
+/// the stage that replaces the live files, so a failure here must not be the
+/// only copy of the pre-restore state.
+///
+/// # Errors
+///
+/// Returns [`BackupError`] when any file cannot be written, read back, or
+/// verified against the package snapshot.
+#[instrument(skip_all)]
+async fn restore_data_phase(
+    paths: &RuntimePaths,
+    backup: &DecryptedBackup,
+    snapshot: &DatabaseSnapshot,
+    pending_migrations: usize,
+) -> Result<RestoreOutcome, BackupError> {
+    restore_database_files(paths.database_path(), snapshot).map_err(BackupError::RestoreFiles)?;
+    let restored = restore_data_directory_files(paths, backup)?;
 
     // §20.2 verification: the restored database must be byte-identical to
     // the verified package snapshot and must open read-only with a known
@@ -528,6 +598,143 @@ fn restore_data_directory_files(
     Ok(restored)
 }
 
+/// Copies the current data directory into a sibling temporary directory
+/// before a restore overwrites it (the pre-restore rollback snapshot).
+///
+/// The copy stays on the same volume as the data directory (its sibling
+/// temporary directory) and mirrors the pre-migration recovery-copy
+/// discipline of `MigrationBackup`: every copied file's length is verified
+/// and the copy is synchronized, so the snapshot is complete and durable
+/// before the first overwrite can start. The transient runtime lock — held
+/// open by this restore — and the `backups/` directory are deliberately
+/// omitted: the lock is runtime state, not data, and `backups/` is never
+/// overwritten by a restore (its packages already are the recovery source).
+///
+/// # Errors
+///
+/// Returns [`PreRestoreSnapshotError`] when the data directory has no usable
+/// parent, the temporary directory cannot be created, or any source cannot
+/// be listed, copied, or synchronized.
+#[instrument(skip_all)]
+fn create_pre_restore_snapshot(
+    paths: &RuntimePaths,
+) -> Result<tempfile::TempDir, PreRestoreSnapshotError> {
+    let data_directory = paths.data_directory();
+    let parent = data_directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| PreRestoreSnapshotError::InvalidPath {
+            path: data_directory.to_path_buf(),
+        })?;
+    let directory = Builder::new()
+        .prefix(PRE_RESTORE_PREFIX)
+        .tempdir_in(parent)
+        .map_err(|source| PreRestoreSnapshotError::CreateRoot {
+            directory: parent.to_path_buf(),
+            source,
+        })?;
+    copy_data_directory(
+        data_directory,
+        directory.path(),
+        paths.runtime_lock_path(),
+        &data_directory.join(BACKUP_DIRECTORY_NAME),
+    )?;
+    Ok(directory)
+}
+
+/// Copies every entry of one directory into the snapshot destination,
+/// recursing into subdirectories and skipping the transient runtime lock and
+/// the `backups/` directory.
+///
+/// # Errors
+///
+/// Returns [`PreRestoreSnapshotError`] when the source cannot be listed or
+/// any destination directory or file cannot be created or copied.
+fn copy_data_directory(
+    source: &Path,
+    destination: &Path,
+    runtime_lock_path: &Path,
+    backup_directory_path: &Path,
+) -> Result<(), PreRestoreSnapshotError> {
+    for entry in
+        fs::read_dir(source).map_err(|source_error| PreRestoreSnapshotError::ReadDirectory {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+    {
+        let entry = entry.map_err(|source_error| PreRestoreSnapshotError::ReadDirectory {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+        let from = entry.path();
+        if from.as_path() == runtime_lock_path || from.as_path() == backup_directory_path {
+            continue;
+        }
+        let to = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|source_error| PreRestoreSnapshotError::ReadSourceMetadata {
+                path: from.clone(),
+                source: source_error,
+            })?
+            .is_dir()
+        {
+            fs::create_dir(&to).map_err(|source_error| {
+                PreRestoreSnapshotError::CreateDirectory {
+                    path: to.clone(),
+                    source: source_error,
+                }
+            })?;
+            copy_data_directory(&from, &to, runtime_lock_path, backup_directory_path)?;
+        } else {
+            copy_snapshot_file(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies one file into the pre-restore snapshot with the migration-backup
+/// discipline: the copied length must match the source and the copy is
+/// synchronized before the restore may start.
+///
+/// # Errors
+///
+/// Returns [`PreRestoreSnapshotError`] when the source cannot be inspected
+/// or copied, the copy's length does not match the source, or the copy
+/// cannot be synchronized.
+fn copy_snapshot_file(source: &Path, destination: &Path) -> Result<(), PreRestoreSnapshotError> {
+    let expected = fs::metadata(source)
+        .map_err(|source_error| PreRestoreSnapshotError::ReadSourceMetadata {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?
+        .len();
+    let copied =
+        fs::copy(source, destination).map_err(|source_error| PreRestoreSnapshotError::Copy {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            source: source_error,
+        })?;
+    if copied != expected {
+        return Err(PreRestoreSnapshotError::CopyLengthMismatch {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            expected,
+            copied,
+        });
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| PreRestoreSnapshotError::SynchronizeCopy {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
 /// Rejects a backup created by a different product version.
 fn check_product_version(backup: &DecryptedBackup) -> Result<(), BackupError> {
     if backup.product_version() == PRODUCT_VERSION {
@@ -575,7 +782,7 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
 fn default_backup_path(paths: &RuntimePaths) -> PathBuf {
     paths
         .data_directory()
-        .join("backups")
+        .join(BACKUP_DIRECTORY_NAME)
         .join(format!("backup-{}.rut", Uuid::now_v7()))
 }
 
@@ -583,6 +790,70 @@ impl From<BackupPackageError> for BackupError {
     fn from(source: BackupPackageError) -> Self {
         Self::Package(source)
     }
+}
+
+impl From<PreRestoreSnapshotError> for BackupError {
+    fn from(source: PreRestoreSnapshotError) -> Self {
+        Self::PreRestoreSnapshot(source)
+    }
+}
+
+/// A controlled failure while copying the current data directory ahead of a
+/// restore (the pre-restore rollback snapshot).
+#[derive(Debug, Error)]
+pub enum PreRestoreSnapshotError {
+    #[error(
+        "the data directory has no usable parent directory for the pre-restore snapshot: {path}"
+    )]
+    InvalidPath { path: PathBuf },
+    #[error("failed to create the pre-restore snapshot directory in {directory}: {source}")]
+    CreateRoot {
+        directory: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to list the data directory {path} for the pre-restore snapshot: {source}")]
+    ReadDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to inspect pre-restore snapshot source {path}: {source}")]
+    ReadSourceMetadata {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create the pre-restore snapshot directory {path}: {source}")]
+    CreateDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to copy {source_path} into the pre-restore snapshot at {destination}: {source}"
+    )]
+    Copy {
+        source_path: PathBuf,
+        destination: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "pre-restore snapshot copy length mismatch for {source_path} at {destination}: expected {expected}, copied {copied}"
+    )]
+    CopyLengthMismatch {
+        source_path: PathBuf,
+        destination: PathBuf,
+        expected: u64,
+        copied: u64,
+    },
+    #[error("failed to synchronize the pre-restore snapshot copy {path}: {source}")]
+    SynchronizeCopy {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// A controlled failure of one backup or restore command.
@@ -664,6 +935,21 @@ pub enum BackupError {
     RestoreCheck(#[source] RestoreCheckError),
     #[error("failed to restore the database files: {0}")]
     RestoreFiles(#[source] RestoreError),
+    #[error(
+        "failed to snapshot the current data directory before the restore; the restore was not \
+         started and the data directory is untouched: {0}"
+    )]
+    PreRestoreSnapshot(#[source] PreRestoreSnapshotError),
+    #[error(
+        "restore failed after it had already started replacing the data directory; a complete \
+         copy of the previous data is preserved for rollback at {snapshot} — roll back by \
+         replacing the data directory contents with that copy: {source}"
+    )]
+    RestoreFailedPreservingSnapshot {
+        snapshot: PathBuf,
+        #[source]
+        source: Box<BackupError>,
+    },
     #[error("failed to read the restored database at {path} for verification: {source}")]
     ReadRestored {
         path: PathBuf,
@@ -1014,6 +1300,144 @@ mod tests {
             result,
             Err(BackupError::ProductVersionMismatch { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_restore_preserves_the_pre_restore_data_for_rollback()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (paths, unlock) = initialized_instance(directory.path()).await?;
+        let output = directory.path().join("source.rut");
+        create_backup(&paths, &unlock, Some(&output)).await?;
+
+        // Damage the live data after the backup, then sabotage the restore
+        // destination: a directory squatting on the WAL sidecar makes
+        // `restore_database_files` fail after the main database was already
+        // replaced — a mid-overwrite failure of exactly the kind the
+        // pre-restore snapshot must survive.
+        let store = SqliteStore::open(paths.database_path()).await?;
+        store
+            .create_credential(protected_credential("second-seed")?)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        store.close().await?;
+        let wal_path = paths.database_path().with_extension("db-wal");
+        std::fs::remove_file(&wal_path).ok();
+        std::fs::create_dir(&wal_path)?;
+        let pre_restore_database = std::fs::read(paths.database_path())?;
+        let pre_restore_envelope = std::fs::read(paths.master_key_path())?;
+
+        let result = restore_backup(&paths, &unlock, &output).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(outcome) => {
+                return Err(io::Error::other(format!(
+                    "expected a failed restore, got: {outcome:?}"
+                ))
+                .into());
+            }
+        };
+        let snapshot_path = match &error {
+            BackupError::RestoreFailedPreservingSnapshot { snapshot, .. } => snapshot.clone(),
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected a preserved-snapshot failure, got: {other}"
+                ))
+                .into());
+            }
+        };
+
+        // The failure keeps the pre-restore copy — complete and faithful —
+        // and names its location, so the operator can roll back.
+        assert!(snapshot_path.is_dir());
+        assert_eq!(
+            std::fs::read(snapshot_path.join("rutilus.db"))?,
+            pre_restore_database
+        );
+        assert_eq!(
+            std::fs::read(snapshot_path.join("master-key.rut"))?,
+            pre_restore_envelope
+        );
+        assert!(snapshot_path.join("instance.rut").is_file());
+        assert!(!snapshot_path.join(".rutilus.lock").exists());
+        assert!(!snapshot_path.join("backups").exists());
+        assert!(
+            error
+                .to_string()
+                .contains(&snapshot_path.to_string_lossy().into_owned()),
+            "the error must name the preserved snapshot location"
+        );
+
+        // Roll back through the preserved snapshot: replace the partially
+        // restored database with the snapshot's copy and reopen — the
+        // pre-restore data must be intact.
+        std::fs::remove_dir_all(&wal_path)?;
+        std::fs::copy(snapshot_path.join("rutilus.db"), paths.database_path())?;
+        let mut names = stored_credential_names(&paths).await?;
+        names.sort();
+        assert_eq!(names, vec!["first-seed", "second-seed"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_successful_restore_cleans_up_the_pre_restore_snapshot() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let (paths, unlock) = initialized_instance(directory.path()).await?;
+        let output = directory.path().join("source.rut");
+        create_backup(&paths, &unlock, Some(&output)).await?;
+
+        restore_backup(&paths, &unlock, &output).await?;
+
+        for entry in std::fs::read_dir(directory.path())? {
+            let name = entry?.file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(PRE_RESTORE_PREFIX),
+                "a successful restore left a pre-restore snapshot behind"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_pre_restore_copy_leaves_the_source_untouched() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let data_directory = directory.path().join("instance");
+        std::fs::create_dir_all(data_directory.join("tls"))?;
+        std::fs::write(data_directory.join("rutilus.db"), b"pre-restore database")?;
+        std::fs::write(data_directory.join("master-key.rut"), b"protected envelope")?;
+        std::fs::write(data_directory.join("tls").join("key.pem"), b"private key")?;
+
+        // The snapshot destination cannot be created (its parent is a
+        // regular file), so the copy must abort with a controlled error and
+        // leave the source byte-for-byte untouched — a snapshot failure
+        // never starts the overwrite.
+        let blocker = directory.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory")?;
+        let result = copy_data_directory(
+            &data_directory,
+            &blocker.join("snapshot"),
+            &data_directory.join(".rutilus.lock"),
+            &data_directory.join("backups"),
+        );
+        assert!(matches!(
+            result,
+            Err(PreRestoreSnapshotError::CreateDirectory { .. }
+                | PreRestoreSnapshotError::Copy { .. })
+        ));
+        assert_eq!(
+            std::fs::read(data_directory.join("rutilus.db"))?,
+            b"pre-restore database"
+        );
+        assert_eq!(
+            std::fs::read(data_directory.join("master-key.rut"))?,
+            b"protected envelope"
+        );
+        assert_eq!(
+            std::fs::read(data_directory.join("tls").join("key.pem"))?,
+            b"private key"
+        );
         Ok(())
     }
 }
