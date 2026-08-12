@@ -1,5 +1,14 @@
 use std::process::Command;
 
+/// The build git commit the binary embeds (§5.4), derived the same way the
+/// binary itself derives it: `RUTILUS_GIT_COMMIT` when CI injected it, the
+/// `dev` fallback otherwise. The binary and this test compile in the same
+/// build under the same environment, so their embedded values always agree.
+const EMBEDDED_GIT_COMMIT: &str = match option_env!("RUTILUS_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "dev",
+};
+
 /// The `--log-format` flag is a global CLI option: it is accepted in any
 /// position, and the JSON layer only changes the stderr diagnostics — the
 /// user-facing stdout output of a command stays byte-identical (the version
@@ -7,13 +16,15 @@ use std::process::Command;
 #[test]
 fn json_log_format_is_accepted_and_keeps_user_visible_output() -> std::io::Result<()> {
     // Derived from the same single sources as the binary: the workspace
-    // `[workspace.package] version` and the infra-redfish upstream-baseline
-    // constant (§7.2-A unified versioning), so a version bump needs no
-    // test edit.
+    // `[workspace.package] version`, the infra-redfish upstream-baseline
+    // constant, and the compile-time `RUTILUS_GIT_COMMIT` git commit
+    // (§7.2-A unified versioning, §5.4 build-result embedding), so a
+    // version bump needs no test edit.
     let expected_stdout = format!(
-        "rutilus {}\nnv-redfish development baseline {}\n",
+        "rutilus {}\nnv-redfish development baseline {}\ngit commit {}\n",
         env!("CARGO_PKG_VERSION"),
-        rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE
+        rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE,
+        EMBEDDED_GIT_COMMIT
     );
     for argv in [
         vec!["--log-format", "json", "version"],

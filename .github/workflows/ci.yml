@@ -38,6 +38,18 @@ jobs:
   ci:
     name: ci (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # §5.4 build-result embedding: the git commit of the built tree,
+      # injected at the job level so every build and test step derives the
+      # same value — the version/log-format integration tests assert the
+      # binary's `git commit` line equals their own compile-time
+      # RUTILUS_GIT_COMMIT, so any inconsistency between steps would fail
+      # the suite. `github.sha` is the exact commit actions/checkout
+      # checked out (the merge commit on pull_request events), so the
+      # embedded commit is the tree being built; the app falls back to
+      # `dev` when the variable is absent (local builds, no git
+      # subprocess).
+      RUTILUS_GIT_COMMIT: ${{ github.sha }}
     strategy:
       fail-fast: false
       matrix:

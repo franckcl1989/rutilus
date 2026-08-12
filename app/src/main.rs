@@ -26,6 +26,20 @@ use tracing::instrument;
 /// version/log-format integration tests — follows automatically.
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The git commit this build was produced from — one of the four §5.4
+/// build-result values (product version, git commit, `nv-redfish` baseline,
+/// and capability-ledger hash). CI injects `RUTILUS_GIT_COMMIT` (the
+/// `github.sha` workflow context, i.e. the exact commit `actions/checkout`
+/// checked out) into every job step, so the embedded value and the
+/// version/log-format integration test assertions always derive from the
+/// same source. A build without the variable — a local checkout, where no
+/// git is assumed available — degrades to the explicit `dev` marker instead
+/// of spawning a git subprocess; the tests tolerate both paths.
+const GIT_COMMIT: &str = match option_env!("RUTILUS_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "dev",
+};
+
 #[derive(Debug, Parser)]
 #[command(name = "rutilus", about = "Unified multi-vendor Redfish management")]
 struct Cli {
@@ -104,7 +118,8 @@ enum Command {
     },
     /// Print the third-party licenses of this build.
     Licenses,
-    /// Print the product and upstream development-baseline versions.
+    /// Print the product and upstream development-baseline versions and the
+    /// build git commit (§5.4).
     Version,
 }
 
@@ -718,6 +733,7 @@ fn prompt_secret(terminal: &Term, prompt: &str) -> io::Result<SecretString> {
 fn print_version() {
     println!("rutilus {PRODUCT_VERSION}");
     println!("nv-redfish development baseline {NV_REDFISH_DEVELOPMENT_BASELINE}");
+    println!("git commit {GIT_COMMIT}");
 }
 
 #[cfg(test)]
