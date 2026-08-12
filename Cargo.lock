@@ -3718,6 +3718,7 @@ dependencies = [
 name = "rutilus-migration"
 version = "0.9.0"
 dependencies = [
+ "rutilus-domain",
  "rutilus-entity",
  "sea-orm",
  "sea-orm-migration",
