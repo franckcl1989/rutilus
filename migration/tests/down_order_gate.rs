@@ -619,8 +619,15 @@ fn foreign_key_edges(
 /// `<table> → <other>`. This is the only way `SQLite` adds a live foreign
 /// key (`m20260805_000011`'s `operations.batch_id` link,
 /// `m20260810_000001`'s `endpoints.site_id`); the `REFERENCES` clauses of
-/// raw `CREATE TABLE` rebuild DDL name the `*_rebuild` staging tables, not
-/// the live schema, so they are deliberately not read.
+/// raw `CREATE TABLE` rebuild DDL are deliberately not read — they usually
+/// name the `*_rebuild` staging tables, but the blind spot includes live
+/// cases: `m20260810_000002`'s `role_assignments_rebuild` references
+/// `instances(id)`/`principals(id)`, so the `role_assignments →
+/// instances`/`principals` edges are not scanned. Currently harmless (that
+/// file's `down` only drops `role_assignments` and renames the rebuild
+/// table, never `instances`/`principals`); a future migration whose down
+/// order depends on such an edge would require extending the scan to raw
+/// `CREATE TABLE` rebuild DDL.
 fn raw_alter_references(
     tokens: &[Token],
     consts: &HashMap<String, (usize, String)>,

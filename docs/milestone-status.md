@@ -38,7 +38,7 @@
 > 会话复跑**（人工依赖项）。发布级容量建议已发布（提交 9f9606e 已在容量主题提交，见 §六与
 > §7.1「性能容量测试」行）；详见 §7.1「故障注入」行与 §7.2-B。
 > **迭代十已落地（2026-08-12，HEAD = 7533c03，3 个提交）**：`c607ae9`（test(migration)：迁移
-> down 顺序机械门禁 `migration/tests/down_order_gate.rs`（1264 行）——FK 边跨文件静态提取
+> down 顺序机械门禁 `migration/tests/down_order_gate.rs`（1286 行，迭代十二修复后）——FK 边跨文件静态提取
 > （`ForeignKey::create` from/to + `DeriveIden` iden 解析 + raw `ALTER TABLE REFERENCES`）、
 > 双序列检查（down 函数体内 drop 序 + 全文件 raw `DROP TABLE` 序）、循环对豁免
 > （credentials↔credential_versions 由 `m20260805_000001` 的 NULL-out update 破环）、8 测试

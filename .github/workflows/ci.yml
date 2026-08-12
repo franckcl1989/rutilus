@@ -454,6 +454,14 @@ jobs:
       # tag (v1.0.0) -> rutilus-v1.0.0-<suffix>; on workflow_dispatch it is
       # the branch name. `release/` is the staging dir for checksums,
       # signing, and upload.
+      #
+      # Boundary: a `github.ref_name` containing `/` — a `v1.0/rc1`-style tag
+      # or a `release/0.9`-style dispatch branch — breaks the stage/upload
+      # (`cp` into a missing parent dir; upload-artifact artifact names may
+      # not contain `/`): a visible failure, not a silent one. The release
+      # path promises the slash-free `v*` tag convention; on workflow_dispatch
+      # use a slash-free branch name or accept the failure. No sanitize, by
+      # design.
       - name: Stage release artifacts
         shell: bash
         run: |

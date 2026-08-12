@@ -86,6 +86,12 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
   （"local unlock requires an interactive terminal"），非产品问题；该问题同时暴露套件硬挂起
   缺陷，挂起防护修复后快速 FAIL 路径已验证），**功能验证待真实交互控制台会话复跑**；
   **磁盘空间不足场景未覆盖**（无管理员权限的可靠模拟手段受限）。
+  另登记两项 drill 已知限制（实跑前可不修）：`Get-FreeTcpPort`
+  （`drill-lib.ps1:90-96`）为 bind-0/释放/重绑模式——探测与真实绑定之间端口可能被
+  抢占（TOCTOU），串行执行下概率极低，仅偶发伪 FAIL；`drill-large-file-interruption`
+  的「chunk 6 在飞」由固定 400ms 睡眠启发式保证
+  （`drill-large-file-interruption.ps1:129-133`），快/慢机器上时序漂移可能
+  伪 FAIL/伪 PASS。
 
 ## 六、发布级容量建议已发布（release 构建数据，正式规模环境复核仍待做）
 
@@ -135,6 +141,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | §0.9.0 性能容量测试与真实容量建议 | 部分：合成规模压力容量套件已落地并实测（`persistence/tests/stress_capacity.rs` 3 个测试：200 Endpoint Generation 一致刷新 / 100 Site outbox-inbox-cursor / 5,000 Endpoint 中心投影幂等重投，2026-08-12）；实测数据为**开发机 debug 构建合成数据**（5,000 投影写入 ≈865 行/s、清单查询 0.482s；写路径受 `write_gate`（`Semaphore(1)`）全局串行化，`persistence/src/lib.rs:101, 240`）；**发布级容量建议已发布（release 构建数据，2026-08-12，见 `docs/operations-manual.md` §九）**——设计 §0.9.0 要求"测试后发布真实容量建议"（`redfish-management-product-final-design.md:2810`），正式规模环境复核仍待 |
 | §6.2 tracing 日志选型 | 已实现（app 诊断日志 + `RUST_LOG` 过滤的 stderr subscriber）；用户可见输出仍为 `println!`，测试/工具输出仍为 `eprintln!`（见 §七"日志设施范围受限"）；运行路径已接入 span/`#[instrument]`，`--log-format json`（`LogFormat`/`init_tracing`）输出结构化 JSON，`RUST_LOG` 过滤不变 |
 | §14.4 遥测保留周期可配置 | 已实现：`--telemetry-retention-days`（默认 7 天，范围 1–365，`TelemetryRetention` 在边界校验）；设置页形态为后续迭代 |
+| §14.4 Event 存储增长（展示有界、存储无界） | `events` 表仅有查询层有界（`migration/src/m20260805_000008_events.rs:84-86` 所注 bounded recent-event listing，console 展示「最新 5 条」有界，与设计 §14.4 一致），**无存储级删除路径**，表随运行时长增长——存储增长为已知边界（设计 §14.4 仅 Telemetry 要求「有界历史 + 保留周期可配置」，Event 项未要求保留周期），未来引入保留周期配置时处理 |
 | §12.4 诊断中的解码错误路径 / ExtendedInfo 展示 | ✅ 已实现（E1，commit ce2b8b3）：记录层——`ResourceExtendedInfo`/`ResourceDecodeFailure`（`application/src/resource_diagnostics.rs:36, 249`）、api 契约 9 字段（`api/src/lib.rs:1894-1905`）、web 投影（`web/src/lib.rs:3970-4001`）、ui 只读区块（`ui/src/lib.rs:15491`）、端到端测试（`web/tests/diagnostics_path.rs` 7 个测试，含 `:998` `refresh_capture_flows_into_the_diagnostics_response`）；**生产捕获点已实现**：刷新解码失败由 gateway 捕获（`DecodeFailureObservation`，`infra-redfish/src/redfish_gateway.rs:8720`；捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure` `:8904/:8931/:8977`），经刷新结果 `outcome.decode_failures()`（`:8831`）流入同代事务提交（`persistence/src/resource_snapshot_repository.rs:81-147`），生产链路直连（`application/src/endpoint_refresh.rs:350-355`），持久化于新表 `resource_decode_failures`（entity `entity/src/lib.rs:28`、`entity/src/resource_decode_failure.rs:13`；迁移 `migration/src/m20260812_000001`）——真实解码失败会出现在诊断视图中。**如实注记**：① 捕获时 `odata_type` 为 `None`（`capture_fetch_failure` 恒传 None，`redfish_gateway.rs:8915-8922`，解码失败记录不带 OData 类型）；② 表约束经 E4 修复（`migration/src/m20260812_000002` 重建 `resources`/`resource_decode_failures` 两表，`ck_*_feature` 允许域 = 领域枚举全部 47 码，此前 resources 37 / resource_decode_failures 36 且互相不一致；`down` 对称恢复 37/36；防回归机械测试 `migration/tests/resource_feature_lists.rs`）；③ 真实设备上的解码失败形态仍需实测（B 类演练项）；④ 贯通测试已补齐（T-G 8482d85，见 §九该行） |
 
 ## 九、深度审查遗留项登记（2026-08-12，LOW/NOTE）
