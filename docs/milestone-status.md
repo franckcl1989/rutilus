@@ -1,7 +1,9 @@
-# Rutilus 里程碑状态（0.8.0 能力冻结）
+# Rutilus 里程碑状态（0.8.0 能力冻结 + 0.9.0 进展）
 
-> 本文档记录 0.8.0「1.0 能力冻结」里程碑的达成状态与证据链，供 0.9.0/1.0.0 评审使用。
-> 所有条目均基于当前 master（commit 4ad8c4a）的真实代码/测试事实，标注来源文件与测试名；
+> 本文档记录 0.8.0「1.0 能力冻结」里程碑的达成状态与证据链，并逐项盘点 0.9.0「生产候选」
+> 进展，供 0.9.0/1.0.0 评审使用。
+> §一-§六（0.8.0 冻结事实）基于冻结时 master（commit 4ad8c4a）；§七（0.9.0 进展盘点）
+> 基于 master 182a267。所有条目均基于真实代码/测试事实，标注来源文件与测试名；
 > 不写设计文档没有且代码不支持的内容。设计基线见仓库根目录
 > `redfish-management-product-final-design.md`（修订冻结版）。
 
@@ -163,3 +165,84 @@
 | tracing 深化 | app 诊断日志已引入（§6.2：`tracing` + `tracing-subscriber`，`RUST_LOG` 过滤的 stderr subscriber，见 `docs/operations-manual.md` §8.1）；span/`#[instrument]`、结构化输出、其余诊断点的进一步接入为后续迭代 | `docs/known-limitations.md` §七、§八 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
 | 其他 | `cargo audit` 独立门禁、诊断解码错误路径展示（§12.4）、产品版本号统一策略、UI 本地化等 | `docs/known-limitations.md` §七、§八 |
+
+## 七、0.9.0 进展盘点（2026-08-12，master 182a267）
+
+> 对照设计文档 §0.9.0「内容」（`redfish-management-product-final-design.md:2778-2798`）
+> 逐项标注状态。0.8.0 冻结后与 0.9.0 相关的新事实：故障注入与 Supermicro E2E 覆盖落地
+> （commit 4ad8c4a）、x86_64 musl 发布构建进入 CI（commit 3b1ab30）。
+> **§六「发布构建验证」行已过时**：musl x86_64 已由 CI 编译验证（`.github/workflows/ci.yml:178-183`），
+> 尚未验证的只剩 aarch64 musl、Windows ARM64、macOS Universal 2——以本节为准。
+> 另：`docs/known-limitations.md` §七「CI 与发布目标差异」行与 `docs/operations-manual.md` §十的 musl
+> 表述同样早于该 commit（待后续修订，以本节为准）。
+
+### 7.1 逐项盘点
+
+| 0.9.0 内容 | 状态 | 证据 |
+|---|---|---|
+| 五厂商实验室 | ⏳ 待做（依赖物理设备） | Mock 层已覆盖五厂商 profile（Dell/HPE/Lenovo/xFusion/Inspur，外加 NVIDIA/AMI/LiteOn/Delta/Supermicro，共 11 个 `MockProfile`，`test-support/src/mock_bmc/profile.rs:47-134`）；§19.1 Physical Device Test「五厂商至少各一台真实设备进入 1.0.0 认证矩阵」未达成（`docs/known-limitations.md` §五） |
+| 所有 Fixture 回归 | 🟡 部分 | 合成 fixture（Mock BMC 固定资源树 + 确定性证书）回归已有：`test-support/tests/gateway_mock_bmc.rs` 23 个测试（Service Root 读取/47 能力探测/核心资源读取/会话生命周期/各厂商 profile）、`test-support/src/mock_bmc/tests.rs` 21 个；§19.1 Fixture Test 要求的**脱敏真实响应 fixture 目录**（五厂商各固件版本，随 nv-redfish 升级回归）尚无（`known-limitations.md` §五） |
+| 故障注入 | 🟡 部分 | §19.3 多数场景已有单进程自动化覆盖：BMC 慢响应（`redfish_gateway.rs:22832, 27486`、`tls_probe.rs:568`）、TLS 证书变化（`domain/src/endpoint.rs:327` `verify_identity`/`TlsIdentityChanged`）、JSON 字段类型错误（`redfish_gateway.rs:18221, 18263` undecodable 成员跳过）、Action 响应丢失/写连接丢弃（`redfish_gateway.rs:27439, 30321`）、Task 消失（`redfish_gateway.rs:21986`）、SSE 流中断/解码失败（`redfish_gateway.rs:31237, 31306`）、重复消息/重复 Operation（`center_sync.rs:3461, 3511`、`operation_engine.rs:1332` 批量重投 no-op、`event_repository.rs:328` 事件去重）、大文件上传中断（`web/tests/artifact_path.rs:733`）、系统时间变化（`telemetry_sampler.rs:1050, 1076`、`operation_engine.rs:986` 时钟回拨如实记录）、文件写失败（`artifact_store.rs:1476`）；**未覆盖**：产品进程在任务中终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（跨进程演练形态，见 7.2-B） |
+| 跨平台 E2E | 🟡 部分 | CI 编译矩阵覆盖 linux-gnu / windows-msvc / darwin x86_64 + wasm32 UI 产物 diff + x86_64 musl release 构建（`ci.yml:35-53, 153-183`）；但 E2E 测试套件（`web/tests/` 9 个路径文件、`app/tests/`、应用层集成测试）只在 ubuntu 默认任务运行，windows/macos 任务仅 `cargo check`——三平台 E2E **运行**未达成 |
+| 数据库压力 | ⏳ 待做 | 无压力/规模测试；workspace 无 `[[bench]]`（Cargo.toml 全量核查无 bench 段），现有覆盖仅为仓库级功能测试（`persistence/`、`migration/tests/`） |
+| 中心重连风暴 | 🟡 部分 | 单连接重连语义已覆盖：`center_sync.rs:2783`（failed_connects_keep_the_site_local_and_the_loop_alive）、`:2836`（a_closed_connection_reconnects_after_the_backoff）、`:2715`（heartbeats）、`app/src/center_client.rs:858, 945`（connect_with_retry）、`app/src/event_listener.rs:1303`（退避指数增长并封顶）；多连接**并发**重连风暴演练未做 |
+| 大文件更新 | 🟡 部分 | 分块上传机制全链路覆盖：4 MiB chunk 上限（`application/src/artifact_store.rs:64` `ARTIFACT_CHUNK_BASE64_MAX_BYTES`）、断点续传（`artifact_store.rs:1364`、`web/tests/artifact_path.rs:733`）、digest 校验（`artifact_path.rs:937`）、multipart 更新（`redfish_gateway.rs:30287, 30321, 30372`）、中心 manifest+chunk 分发（`center_sync.rs:3676`、`application/src/center/projection.rs:1729`）、8 MiB 帧上限（`center-protocol/src/framing.rs:18-31`）；真实大固件文件的端到端更新演练未做 |
+| Secret 泄漏检查 | 🟡 部分 | 结构性防护已有：API 永不回声秘密（`web/tests/write_path.rs:783, 815, 917`、`web/src/lib.rs:6156` secret-free 端点清单、`persistence/src/credential_repository.rs:604`）、审计类型**构造上**不能携带秘密（`domain/src/audit.rs:318, 383`：非秘密身份数据/封闭类型参数摘要）、Center 投影排除凭据与会话（`application/src/center/projection.rs:55`）、命令载荷 at-rest 加密（`security/src/command_cipher.rs`）；独立泄漏扫描/专门审查演练未做（1.0.0「Center 不保存 BMC Secret」路径已由上述结构支撑） |
+| 权限测试 | ✅ 已完成 | `role_masks_are_enforced_on_guarded_routes`（`web/src/lib.rs:10525`）、中心角色站点作用域（`web/src/lib.rs:11398, 11442`）、登录限速预算（`web/src/auth.rs:2484` rate_limiter_enforces_per_username_and_per_ip_budgets）、BMC 写权限拒绝（`redfish_gateway.rs:27328`） |
+| 安全审查 | ⏳ 待做（流程项） | 仓库无安全审查记录/文档证据；可先做代码级自查（7.2-A） |
+| Migration 回归 | ✅ 已完成 | `migration/tests/` 19 个测试文件（initial_storage/operations/batch_operations/telemetry/events/groups_tags/center_tables/center_data_sites/center_role_sites/product_users/remote_tasks/artifacts/operation_failure_kinds/nvidia_families/nvidia_power_families/lenovo_families/bare_sql_gate/audit_action_shapes/audit_execute_operation）；迁移前自动备份（`persistence/src/lib.rs:510` backs_up_a_closed_database_before_applying_pending_migrations）；CI 独立 Migration Test 门禁（`ci.yml:187-189`） |
+| 备份恢复演练 | 🟡 部分 | 自动化往返覆盖完整：`app/src/backup.rs:759`（往返保数据）、`:793`（拒绝他实例包）、`:819`（跨机恢复需源信封）、`:906`（源口令对全新信封）、`:938`（需停止实例）、`:975`（拒绝不同产品版本）、`:964`（拒绝未初始化目录）；CLI `rutilus backup`/`restore`（`app/src/main.rs:245`）；0.9.0 验收「三平台安装、升级、备份、恢复通过」的演练未执行 |
+| 签名构建 | ⏳ 待做（发布管道） | 仓库无 Authenticode / macOS 公证 / Linux 签名工具链证据（CI 无签名步骤；现有「signing」匹配均为 TLS/CA 证书签名代码，非发布二进制签名）；§5.4 发布配置 |
+| SBOM | ⏳ 待做（发布管道） | 无 SBOM 生成工具（cargo-cyclonedx 等）与产物证据 |
+| 用户手册 | ✅ 已完成 | `docs/user-manual.md`（420 行，条目后标注来源文件） |
+| 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（306 行：数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状） |
+| 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（186 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；注：其 §三「CI 现状」同样早于 musl 构建步骤，与 §七开头更正一致 |
+| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（118 行：OutOfScope 3 项/依赖风险登记/测试基建局限/容量未实测等） |
+| 性能容量测试 | ⏳ 待做 | 无 benchmark/压力测试；§0.9.0 最低验证规模（单 Site 200 / 单 Center 100 Site / 中心汇总 5,000 Endpoint）仍是测试目标而非实测能力（`known-limitations.md` §六、`operations-manual.md` §九） |
+
+### 7.2 剩余工作精确分类
+
+**A. 代码/CI 可做（不依赖外部资源，可直接进入迭代）**
+
+| 工作项 | 说明 | 证据/来源 |
+|---|---|---|
+| 数据库压力测试套件 | 合成 200 Endpoint / 100 Site / 5,000 Endpoint 规模的自动化压力与容量测试（persistence/application 层） | `known-limitations.md` §六 |
+| 中心重连风暴测试 | 多连接并发断线重连自动化测试（现有为单连接语义覆盖） | `center_sync.rs` 测试清单 |
+| 跨平台 E2E 运行 | 把 `web/tests` 与 `app/tests` 套件纳入 CI windows/macos 任务（当前仅 `cargo check`） | `ci.yml:98-100` |
+| §12.4 诊断解码错误路径 / ExtendedInfo 展示 | 解码失败成员目前跳过且不留记录（`resource_diagnostics.rs:28-30` 明确缺席） | `known-limitations.md` §八 |
+| `cargo audit` 独立门禁 | `ci.yml:140-143` 注释预留启用点 | `ci.yml` |
+| 产品版本号统一策略 | workspace 版本仍 `0.1.0`，里程碑编号独立 | `known-limitations.md` §七 |
+| tracing 深化 | span/`#[instrument]`、结构化 JSON 输出、其余诊断点接入 | `known-limitations.md` §七 |
+| UI 本地化 | 界面静态英文（later iteration） | `known-limitations.md` §七 |
+| 安全审查（启动） | 基于现有代码的审查与记录（流程启动项） | 设计文档 §0.9.0 |
+| 发布构建矩阵补齐 | aarch64 musl、Windows ARM64、macOS Universal 2 合并构建进 CI（x86_64 musl 已入 CI） | `support-matrix.md` §三 |
+
+**B. 依赖演练环境（物理设备 / 规模环境 / 三平台流程）**
+
+| 工作项 | 说明 | 来源 |
+|---|---|---|
+| 五厂商实验室 | Dell/HPE/Lenovo/xFusion/Inspur 各至少一台真实设备进入 1.0.0 认证矩阵 | 设计文档 §19.1 |
+| 真实响应 fixture 目录 | 五厂商各固件版本脱敏真实响应 + 随 nv-redfish 升级回归（fixture 抓取依赖设备） | 设计文档 §19.1 Fixture Test |
+| 进程级故障注入演练 | 产品进程在任务中被终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（§19.3 剩余项） | 设计文档 §19.3 |
+| 大文件更新演练 | 真实大固件文件的端到端更新（当前为分块机制级覆盖） | 设计文档 §0.9.0 |
+| 备份恢复演练 | 三平台安装/升级/备份/恢复（0.9.0 验收） | 设计文档 §0.9.0 验收 |
+| 性能容量测试 | 单 Site 200 / 单 Center 100 Site / 中心汇总 5,000 Endpoint，测试后发布真实容量建议 | 设计文档 §0.9.0（2800-2810） |
+| Center/Site 长时间断线重连演练 | 0.9.0 验收项；现有为单连接自动化覆盖 | 设计文档 §0.9.0 验收 |
+
+**C. 依赖发布管道（外部证书 / 签名服务 / 发布流程）**
+
+| 工作项 | 说明 | 来源 |
+|---|---|---|
+| 签名构建 | Windows Authenticode、macOS 签名与公证、Linux 独立签名（§5.4 发布配置） | 设计文档 §0.9.0、§1.0.0 |
+| SBOM | 生成并随发布产物发布 | 设计文档 §0.9.0、§1.0.0 |
+
+### 7.3 0.9.0 验收对照（设计文档 §0.9.0「验收」，2812-2819 行）
+
+| 验收项 | 现状 |
+|---|---|
+| P0/P1 缺陷清零 | ⏳ 发布评审流程项，无公开缺陷台账证据 |
+| 无已知凭据泄漏 | 🟡 结构性证据充分（API 不回声/审计类型禁秘密/Center 投影排除/at-rest 加密），独立泄漏扫描未做 |
+| 无已知重复执行 | ✅ 事件去重（`domain/src/event.rs:383`）、批量重投 no-op（`operation_engine.rs:1332`）、重复 offer 幂等（`center_sync.rs:3461, 3511`） |
+| 无已知错误成功报告 | 🟡 写后重读验证（`redfish_gateway.rs:28553` 等 `verifies_*` 系列）、响应丢失→Unknown（`redfish_gateway.rs:30321`）；整体清零结论待评审 |
+| 三平台安装、升级、备份、恢复通过 | ⏳ 演练未执行（7.2-B） |
+| Center/Site 长时间断线重连通过 | 🟡 单连接自动化覆盖（`center_sync.rs:2836` 等），长时间演练未执行 |
