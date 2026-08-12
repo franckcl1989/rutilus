@@ -3,9 +3,10 @@
 > 本文档记录 0.8.0「1.0 能力冻结」里程碑的达成状态与证据链，并逐项盘点 0.9.0「生产候选」
 > 进展，供 0.9.0/1.0.0 评审使用。
 > §一-§五（0.8.0 冻结事实）基于冻结时 master（commit 4ad8c4a）；§六（0.9.0 剩余工作清单）
-> 与 §七（0.9.0 进展盘点）基于 master bfb001e（本轮 HEAD，迭代三+四已合入：E1 §12.4 生产
+> 与 §七（0.9.0 进展盘点）基于 master 53b6402（本轮 HEAD，迭代三+四已合入：E1 §12.4 生产
 > 捕获点 ce2b8b3、E3a Git Commit 嵌入 99d5670、E3b Secret 扫描门禁 eefde7e、E3c N5 处置
-> 8a9ab82/34315c8、E4 约束修复 76af80f + bfb001e）。所有条目均基于真实代码/测试事实，标注
+> 8a9ab82/34315c8、E4 约束修复 76af80f + bfb001e；迭代五已合入：H1 UI 本地化基础层 8e8ac6f、
+> H2 web/assets UI 产物再生成 53b6402）。所有条目均基于真实代码/测试事实，标注
 > 来源文件与测试名；不写设计文档没有且代码不支持的内容。设计基线见仓库根目录
 > `redfish-management-product-final-design.md`（修订冻结版）。全文「file:line」引用已逐一核对
 > 当前 master 实际行号（2026-08-12 复核）：§一-§五 的事实锚定冻结时 commit 4ad8c4a，行号
@@ -151,7 +152,7 @@
 |---|---|---|
 | OutOfScope 3 项 | `system.set-boot-order`（Boot 家族只提供 `BootSourceOverride` 一次性/连续覆盖，永不提供持久 boot-order 变更）；`update.simple`（SimpleUpdate 接受远程镜像 URI，§14.3 只上传制品字节、不接受用户 URI）；`update.start`（完整上传即应用路径已由 `RedfishCommand::Update(UpdateCommand::StartUpdate)` 覆盖，独立 StartUpdate 入口不提供）——均为显式产品决策，区别于"应该实现但尚未实现"的 Unmapped | `docs/known-limitations.md` §一 |
 | probe-only 的 OEM 项 | `oem-nvidia-cper` / `oem-nvidia-fabrics`：能力状态在命名空间广告粒度判定（Nvidia 命名空间存在即 Supported）；CPER 记录与 fabric 数据子面"only distinguishable when the read slice actually reads the OEM resource"，当前读取面不呈现记录数据 | `infra-redfish/src/redfish_gateway.rs:13311-13317`（`OemNamespaceProbe` 文档，`domain/src/capability.rs:105-115`） |
-| UI 表单 later-milestone | telemetry 写表单明确 later milestone（`CommandFamilyView::ALL` 不含 Telemetry，表单选择器返回 `OperationFormError::FamilyRequired`，界面提示 "The telemetry write form is a later milestone."）；log/control 无专用表单；命令执行面本身已完整映射 | `ui/src/lib.rs:5032, 6290-6296, 11134-11141`（`CommandFamilyView::ALL` 9 家族 `:5032`、Telemetry 拒绝 `:6290-6296`、提示文案 `:11134-11141`）；`docs/known-limitations.md` §二 |
+| UI 表单 later-milestone | telemetry 写表单明确 later milestone（`CommandFamilyView::ALL` 不含 Telemetry，表单选择器返回 `OperationFormError::FamilyRequired`，界面提示 "The telemetry write form is a later milestone."）；log/control 无专用表单；命令执行面本身已完整映射 | `ui/src/lib.rs:5032, 6290-6296, 11132-11141`（`CommandFamilyView::ALL` 9 家族 `:5032`、Telemetry 拒绝 `:6290-6296`、提示文案串 `:11139`）；`docs/known-limitations.md` §二 |
 | 依赖风险登记 | quick-xml 0.38.4 两个 advisory（RUSTSEC-2026-0194 / 0195）在 `deny.toml [advisories] ignore`，每条带 **TRIGGER** 注释：一旦上游 csdl-compiler 接受 quick-xml >= 0.41.0，必须删除该条目并升级 nv-redfish；产品侧风险评估为低（仅编译期处理可信 CSDL 输入，csdl-compiler 从不调用 `NsReader`） | `deny.toml:29-34` |
 
 ## 六、0.9.0 剩余工作清单
@@ -168,9 +169,9 @@
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
 | tracing 深化 | ✅ 已落地：`#[instrument]` span 接入 main/backup/center_client/center_runtime/event_listener/scheduler/site_runtime/standalone_runtime/telemetry_sampler（口令等敏感值 `skip_all`）；`--log-format <text|json>` 全局选项与 `init_tracing` 双格式层（默认 text，stderr + `RUST_LOG` 过滤不变） | `app/src/main.rs:27-41, 255-273`；`docs/operations-manual.md` §8.1 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
-| 其他 | UI 本地化（界面静态英文，later iteration）；诊断解码错误路径展示（§12.4）与产品版本号统一策略已从本行移出（记录层已完成、捕获点待做与策略落地分别见 §7.1/§7.2-A） | `docs/known-limitations.md` §七、§八 |
+| 其他 | UI 本地化（🟡 部分：基础层已落地——81 键字符串目录与 `Lang` 骨架、导航/公共元素文案抽取，见 §7.2-A「UI 本地化」行；深度翻译与语言选择器为后续迭代）；诊断解码错误路径展示（§12.4）与产品版本号统一策略已从本行移出（记录层已完成、捕获点待做与策略落地分别见 §7.1/§7.2-A） | `docs/known-limitations.md` §七、§八 |
 
-## 七、0.9.0 进展盘点（2026-08-12，master bfb001e）
+## 七、0.9.0 进展盘点（2026-08-12，master 53b6402）
 
 > 对照设计文档 §0.9.0「内容」（`redfish-management-product-final-design.md:2778-2798`）
 > 逐项标注状态。0.8.0 冻结后与 0.9.0 相关的新事实：故障注入与 Supermicro E2E 覆盖落地
@@ -178,7 +179,7 @@
 > 迭代二（master edead80）落地：产品版本号统一策略（commit 2de4351）、§12.4 诊断记录层
 > （commit edead80）、NOTE 收尾（JoinError 记录、center_sync 重连进度重发测试、lipo
 > verify_arch，commit f9a2da2/283e583/c017b7f）、安全审查 M1 修复（commit 72eccb5）。
-> 迭代三+四（master bfb001e，本轮）落地：**E1 §12.4 生产捕获点**（gateway 捕获 + SQLite
+> 迭代三+四（master bfb001e）落地：**E1 §12.4 生产捕获点**（gateway 捕获 + SQLite
 > 同代事务持久化 + 新表，commit ce2b8b3）、**E3a Git Commit 嵌入**（`RUTILUS_GIT_COMMIT`
 > job 级注入 + `dev` 降级，`rutilus version` 三行输出，commit 99d5670）、**E3b Secret 泄漏
 > 扫描门禁**（commit eefde7e）、**E3c N5 处置**（编译期 const assert，commit 8a9ab82/34315c8）、
@@ -217,7 +218,7 @@
 
 **A. 代码/CI 可做（不依赖外部资源，可直接进入迭代）**
 
-本轮已落地并从下表移出（详见 §7.1 与 §六）：数据库压力测试套件（`stress_capacity.rs`）、
+迭代三+四（master bfb001e）已落地并从下表移出（详见 §7.1 与 §六）：数据库压力测试套件（`stress_capacity.rs`）、
 中心重连风暴测试（`center_sync.rs` 并发测试）、跨平台 E2E 运行（`ci.yml:122-138`）、
 `cargo audit` 独立门禁（`ci.yml:188-196`）、tracing 深化（`app/src/main.rs:255-273`）。
 迭代二（master edead80）落地：产品版本号统一策略（✅，下表该行已标证据）、安全审查
@@ -225,13 +226,14 @@ M1 修复（✅，下表「安全审查（启动）」行）；§12.4 诊断记�
 生产捕获点待做，下表该行标 🟡）。迭代三+四（master bfb001e）落地：**§12.4 生产捕获点**
 （E1，下表该行已转 ✅）、**Git Commit 嵌入**（E3a，并入「产品版本号统一策略」行）、
 **Secret 泄漏扫描门禁**（E3b，并入「安全审查（启动）」行）、**N5 处置**（E3c）、**约束
-修复**（E4）——详见下表各行的 ✅ 证据。
+修复**（E4）——详见下表各行的 ✅ 证据。迭代五（master 53b6402，本轮）落地：**UI 本地化
+基础层**（H1 8e8ac6f + H2 53b6402，下表「UI 本地化」行已转 🟡，后续项登记于该行）。
 
 | 工作项 | 说明 | 证据/来源 |
 |---|---|---|
-| §12.4 诊断解码错误路径 / ExtendedInfo 展示 | ✅ 已实现（E1，commit ce2b8b3）：记录层——`ResourceExtendedInfo`/`ResourceDecodeFailure`（`resource_diagnostics.rs:36, 249`）、api 契约 9 字段（`api/src/lib.rs:1894-1905`）、web 投影（`web/src/lib.rs:3961-3991`）、ui 只读区块（`ui/src/lib.rs:15279-15290`）、端到端测试（`web/tests/diagnostics_path.rs` 7 个测试，含 E1 新增 `:998` `refresh_capture_flows_into_the_diagnostics_response`）；**生产捕获点已实现**——gateway 捕获（`redfish_gateway.rs:8720` `DecodeFailureObservation`、`:8904/:8931/:8977` 捕获函数）、同代事务提交（`persistence/src/resource_snapshot_repository.rs:81-147`）、生产链路直连（`application/src/endpoint_refresh.rs:350-355`）、新表 + entity + 迁移（`migration/src/m20260812_000001`，E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；如实注记：捕获时 `odata_type` 为 `None`（`redfish_gateway.rs:8915-8922` `capture_fetch_failure` 恒传 None，解码失败记录不带类型） | `known-limitations.md` §八 |
+| §12.4 诊断解码错误路径 / ExtendedInfo 展示 | ✅ 已实现（E1，commit ce2b8b3）：记录层——`ResourceExtendedInfo`/`ResourceDecodeFailure`（`resource_diagnostics.rs:36, 249`）、api 契约 9 字段（`api/src/lib.rs:1894-1905`）、web 投影（`web/src/lib.rs:3961-3991`）、ui 只读区块（`ui/src/lib.rs:15277-15288`）、端到端测试（`web/tests/diagnostics_path.rs` 7 个测试，含 E1 新增 `:998` `refresh_capture_flows_into_the_diagnostics_response`）；**生产捕获点已实现**——gateway 捕获（`redfish_gateway.rs:8720` `DecodeFailureObservation`、`:8904/:8931/:8977` 捕获函数）、同代事务提交（`persistence/src/resource_snapshot_repository.rs:81-147`）、生产链路直连（`application/src/endpoint_refresh.rs:350-355`）、新表 + entity + 迁移（`migration/src/m20260812_000001`，E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；如实注记：捕获时 `odata_type` 为 `None`（`redfish_gateway.rs:8915-8922` `capture_fetch_failure` 恒传 None，解码失败记录不带类型） | `known-limitations.md` §八 |
 | 产品版本号统一策略 + Git Commit 嵌入 | ✅ 已落地（commit 2de4351 + E3a 99d5670）：workspace 版本 = `0.9.0`（生产候选，与里程碑对齐），单一来源 = 根 `Cargo.toml` `[workspace.package] version`（`Cargo.toml:14`）；`rutilus version` 输出**三行**（`app/src/main.rs:733-737`）：产品版本 / `nv-redfish` 基线 / `git commit`（CI 注入 `RUTILUS_GIT_COMMIT`，`ci.yml:45-55`；`GIT_COMMIT` 常量 `main.rs:38-40`；本地无变量降级 `dev`）；`app/tests/version.rs:8-11, 27-36` 与 `app/tests/log_format.rs:7-10, 23-28` 派生断言（三行）；升级只改一处 | 根 `Cargo.toml:6-14`；`app/tests/version.rs`；`app/tests/log_format.rs` |
-| UI 本地化 | 界面静态英文（later iteration） | `known-limitations.md` §七 |
+| UI 本地化 | 🟡 部分：**基础层已落地**（H1，commit 8e8ac6f）——`ui/src/i18n.rs` 新增 `strings_catalog!` 宏（字段声明 + 英文构造器 + 完整性测试表单一来源，`i18n.rs:34-63`）、`Strings` 81 键（导航 17 / 角色 3 / header 8 / auth 3 / 动作 7 / 状态 17 / 错误 10 / 字段 16，`i18n.rs:65-235`）、`Lang` 枚举（含 `En`）与 `Lang::strings` 选择入口（`i18n.rs:237-251`）、`const L`（`i18n.rs:259`）；lib.rs 全部导航/角色/公共操作/状态/错误/字段文案从 `view!` 模板字面量改为 `{L.x}` 引用（`mod i18n;` `lib.rs:45`；模板 `{L.` 引用 77 处，含测试内 `L.` 引用共 164 处）；3 个 i18n 测试（目录无空串/占位符、`Lang::En.strings() == Strings::en()`、导航标签全部来自目录，`i18n.rs:268-308`）；ui 127 测试全过（含 3 个 i18n 测试）、clippy/fmt/wasm32 干净。H2（53b6402）：`web/assets/rutilus_ui.js/.wasm` 再生成、二次生成字节一致。**未做（后续迭代）**：深度翻译（视图标题/空态/不可用消息/`CommandFamilyView` 标签/facts 词汇表/健康词汇/`OEM_UNSUPPORTED_NOTICE` 等，如 `lib.rs:524, 222-226, 405`）、语言选择器与 `Translations` trait（刻意推迟，`i18n.rs:19-21`）。**后续项**（审计 I1 登记）：① 翻译敏感测试断言清单——lib.rs tests 模块 40 处字面量断言与目录值同串，改英文值或加语言后需改断言目录引用（如 `lib.rs:20265, 22430-22432, 22466-22475`）；② 残留 210 个文本节点抽取候选（NOTE）；③ 3 条 MINOR：`i18n.rs:1` 头注释 §5.1 引用不可核验（设计文档全文无「本地化/i18n」条目，§5.1 为「单二进制」定义 `design:530`）、`L.action_delete`/`L.field_role` 语义复用、`aria-label="Loading"` 未抽取（`lib.rs:11729`） | `ui/src/i18n.rs`；`ui/src/lib.rs:45, 2773, 11729`；`web/assets/`；`known-limitations.md` §七 |
 | 安全审查（启动） | ✅ 已交付：`docs/security-review.md`（8 个审查范围 + §7.7 扫描全完成，无 BLOCKER）；MINOR-1（登录时间侧信道）已修复（commit 72eccb5：`web/src/auth.rs:1242-1253` 哑 Argon2id 验证 + `:1305` 未知用户名分支调用），验证方式 = 调用计数对称断言而非墙钟计时（`web/src/lib.rs:9316` 计数、`:10666` 与 `:10730` 两分支各 1 次/失败、限速拒绝 0 次）；**N5 已关闭**（E3c：`web/src/lib.rs:1223` 编译期 const assert 钉死常量正性）；**独立 Secret 泄漏扫描门禁已落地**（E3b：`security/tests/secret_leak_gate.rs` 3 规则、7 测试；CI 独立步骤 `ci.yml:216-218` Secret leak gate）；剩余：运行时抓包/日志复核与外部评估（1.0.0 发布评审建议项） | `docs/security-review.md`；设计文档 §0.9.0 |
 | 约束修复（E4） | ✅ 已落地（commit 76af80f + bfb001e）：`migration/src/m20260812_000002_resource_feature_lists.rs` 重建 `resources`/`resource_decode_failures` 两表，`ck_resources_feature`/`ck_resource_decode_failures_feature` 允许域 = 领域枚举全部 47 码（此前 resources 37 / resource_decode_failures 36 且互相不一致）；`down` 对称恢复 37/36；防回归机械测试 `migration/tests/resource_feature_lists.rs`（`:248` 单测试，域码与约束逐字符双向钉死，不触库）；备份快照计数钉死 `persistence/src/backup_snapshot.rs:624-627`（backup_applied 24 / supported 23） | `migration/src/m20260812_000002`；`migration/tests/resource_feature_lists.rs` |
 | 发布构建矩阵补齐（剩余部分） | aarch64 musl（cargo-zigbuild）与 macOS Universal 2（lipo）已入 CI（`ci.yml:257-261, 280-295`）；Windows ARM64 明确不入 CI——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库（`ci.yml:263-270` 注释），需原生 ARM64 Windows runner 或本地验证后另行处理 | `ci.yml` |

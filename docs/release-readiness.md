@@ -12,12 +12,16 @@
 > 状态标记沿用仓库文档：✅ 达成（结构或实测，表中注明性质）；🟡 部分（有结构证据，演练/
 > 评估/发布级验证未做）；⏳ 待做（无代码或文档证据）。
 >
-> 修订说明：本版为 **E1 捕获点合并后复核版**（HEAD = bfb001e）。E1（commit ce2b8b3，§12.4
+> 修订说明：本版为 **E1 捕获点合并后复核版**（HEAD = 53b6402）。E1（commit ce2b8b3，§12.4
 > 诊断解码失败生产捕获点：gateway 捕获 + SQLite 同代事务持久化）已合入，本文档先前标注
 > 「E1 合并后需复验」的全部行号已逐条重核为当前 master 实际值（见 §五、§六）；迭代三/四
 > 其余合并项（E3a Git Commit 嵌入、E3b Secret 扫描门禁、E3c N5 处置、E4 约束修复）已一并
-> 登记。全仓门禁复跑全绿：migration 30 / persistence 190+3 / application 293 / infra 291 /
-> web 全过 / rutilus 141 / security 门禁 7，clippy 全 crate 零警告、fmt 干净（2026-08-12）。
+> 登记。迭代五（H1/H2）已合入：UI 本地化基础层（commit 8e8ac6f：`ui/src/i18n.rs` 新增
+> `strings_catalog!` 宏 / `Strings` 81 键 / `Lang` 骨架 / `const L`，lib.rs 导航与公共元素
+> 文案改 `{L.x}` 引用）+ `web/assets/rutilus_ui.js/.wasm` 再生成（commit 53b6402，二次生成
+> 字节一致），§三-A「UI 本地化」行已同步为 🟡 部分。全仓门禁复跑全绿：migration 30 /
+> persistence 190+3 / application 293 / infra 291 / web 全过 / **ui 127** / rutilus 141 /
+> security 门禁 7，clippy 全 crate 零警告、fmt 干净（2026-08-12）。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
 
@@ -103,7 +107,7 @@
 |---|---|---|---|---|
 | §12.4 诊断解码失败**生产捕获点**（gateway 捕获 + SQLite 持久化） | ✅ 已合入（E1，commit ce2b8b3） | 全组评审复验（证据链见下） | 无（已合并，全部门禁复跑通过） | 网关捕获：`DecodeFailureObservation`（`infra-redfish/src/redfish_gateway.rs:8720`），捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure`（`:8904, :8931, :8977`），刷新结果经 `outcome.decode_failures()` 流出（`:8831`）；同代事务提交：`persistence/src/resource_snapshot_repository.rs:81-147`（`commit_resource_generation` 在快照同一事务内写 `resource_decode_failures`），生产链路 `application/src/endpoint_refresh.rs:350-355` 直连；新表 + entity（`entity/src/lib.rs:28`、`entity/src/resource_decode_failures.rs:13`）+ 迁移 `m20260812_000001`（E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；web 端到端 7 测试（`web/tests/diagnostics_path.rs:838-1175`，含 `refresh_capture_flows_into_the_diagnostics_response` `:998`）；现状登记见 `known-limitations.md` §八「§12.4」行 |
 | 独立 Secret 泄漏扫描（仓库级自动扫描 + 运行时抓包/日志复核） | ✅ 仓库级已落地（E3b）/ 运行时复核待做 | 安全评审 + CI | 无（仓库级部分）；运行时复核需三平台演示环境（可并入 B） | `security/tests/secret_leak_gate.rs`：3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM / R3 明文输出宏泄露）、7 测试（`:974, :985, :996, :1006, :1062, :1096, :1130`）、白名单 = `ALLOWED_CONSTANT_HITS` 2 处（path+line+name+literal 四元组绑定，`app/src/backup.rs:83, 84` 备份条目名）；门禁为 CI 独立步骤（`ci.yml:216-218` Secret leak gate，`cargo test --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前；header 注记 `ci.yml:15-17`）；运行时抓包/日志复核仍为 §四-B 项（`security-review.md:110, 128-135`） |
-| UI 本地化 | ⏳ later iteration | 前端组 | 另行立项；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:106`；`milestone-status.md:234` |
+| UI 本地化 | 🟡 部分：基础层已落地（H1 8e8ac6f：`ui/src/i18n.rs` 的 `strings_catalog!` 宏 + `Strings` 81 键 + `Lang` 骨架（含 `En`）+ `const L`，lib.rs 导航/公共元素文案改 `{L.x}` 引用；H2 53b6402：`web/assets` 产物再生成字节一致） | 前端组 | 深度翻译（视图标题/空态/不可用消息/`CommandFamilyView` 标签/facts 词汇表/健康词汇/`OEM_UNSUPPORTED_NOTICE`）与语言选择器为后续迭代；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:106`；`milestone-status.md:236` |
 | N5 `unreachable!` 处置（可选，NOTE 级） | ✅ 已完成（E3c） | — | 无 | `security-review.md` §三 N5 已关闭：`web/src/lib.rs:1223` 编译期 `const _: () = assert!(rutilus_api::OVERVIEW_RECENT_EVENTS > 0);` 钉死常量正性（注释 `:1213-1222`），运行时 guard 保留为已被断言证明不可达的防御分支（`:1224-1226`） |
 | 发布级 CI 扩展（Windows ARM64 原生 runner） | 🟡 | CI/基础设施 | 原生 ARM64 Windows runner 或本地 ARM64 主机验证后另行处理 | `ci.yml:263-270` 注释 |
 
@@ -160,7 +164,7 @@ Migration 门禁已复跑通过（`ci.yml:297-320`），本版行号均按合并
 | 评审前须完成 | 0.9.0 验收第 1/4 项评审结论（P0/P1 清零、错误成功报告清零） | 评审流程 | 上述证据链 |
 | 评审建议完成 | Secret 泄漏扫描的运行时复核（仓库级门禁已落地，E3b） | A（运行时复核并入 B） | 三平台演示环境 |
 | 评审建议完成 | 发布级容量建议 | B | release 构建 + 正式规模环境 |
-| 不阻塞 | UI 本地化（later iteration） | A | 另行立项 |
+| 不阻塞 | UI 本地化（基础层已落地，深度翻译与语言选择器为后续迭代） | A | 后续迭代 |
 
 **4. 结论：** 0.9.0 六项验收中 1 项 ✅、3 项 🟡、2 项 ⏳，**尚不满足 0.9.0 发布条件**——
 缺口全部集中在「评审流程结论」与「B/C 类演练/管道」，无结构性缺陷登记（安全审查无
@@ -172,7 +176,7 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
 
 ## 五、引用与复验纪律
 
-- 本版（HEAD = bfb001e）已消除全部「E1 合并后需复验」标注：E1（commit ce2b8b3）合入后，
+- 本版（HEAD = 53b6402）已消除全部「E1 合并后需复验」标注：E1（commit ce2b8b3）合入后，
   原标注项已逐条按合并后 master 重核（§六记录）。E1/E3a/E3b/E3c/E4 触面（infra-redfish /
   persistence / entity / migration / application / web / app / ci.yml）的每个 file:line 均在
   本轮打开文件核实。
@@ -181,7 +185,7 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
   293 / infra 291 / web 全过 / rutilus 141 / security 门禁 7），clippy 全 crate 零警告、fmt 干净。
 - 引用自检记录见下节（每个 file:line 均在本轮打开核实）。
 
-## 六、引用自检记录（2026-08-12，HEAD bfb001e 复核）
+## 六、引用自检记录（2026-08-12，HEAD 53b6402 复核）
 
 本轮逐一打开核实的引用（含全部 E1/E3a/E3b/E3c/E4 触面）：
 
@@ -200,7 +204,8 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
 | `web/src/lib.rs:108`（ARTIFACT_CHUNK_BODY_LIMIT）、`:911`（DefaultBodyLimit）、`:1223`（N5 编译期 const assert，E3c）、`:1368`（AUDIT_QUERY_MAX_LIMIT）、`:1374`（credential_inventory）、`:1454`（begin_endpoint_trust）、`:3961-3991`（资源诊断投影含 decode_failures）、`:9316`（password_verifications 计数）、`:10666, :10730`（两分支计数断言）、`:10856`（role_masks 测试）、`:11729, :11773`（中心站点作用域）、`:6225`（secret-free 清单测试） | 打开核实（旧 97-107/908-911/1347-1350/1352-1379/1432-1456/3949/9247/10649/10713/10525/11398/11442/6156 漂移，已按实际值引用） |
 | `web/tests/write_path.rs:784, 816, 918`（secret-free 测试） | 打开核实（旧 783/815/917 各 +1） |
 | `web/tests/diagnostics_path.rs`（7 个测试：`:838, :893, :935, :998, :1076, :1143, :1175`，E1 新增 `refresh_capture_flows_into_the_diagnostics_response` `:998`） | 打开核实（旧 6 个测试 651/706/748/811/878/910 漂移） |
-| `ui/src/lib.rs:2773`（ConsoleView::ALL 17 视图）、`:5032`（CommandFamilyView::ALL 9 家族）、`:6290-6296`（telemetry 表单拒绝）、`:11134-11141`（later-milestone 文案）、`:15279-15290`（DiagnosticsReady 只读区块，含 decode_failures 投影） | 打开核实（旧 2772/4955/6219/11064 漂移，已按实际值引用） |
+| `ui/src/lib.rs:2773`（ConsoleView::ALL 17 视图）、`:5032`（CommandFamilyView::ALL 9 家族）、`:6290-6296`（telemetry 表单拒绝）、`:11132-11141`（later-milestone 文案串 `:11139`）、`:15277-15288`（DiagnosticsReady 只读区块，含 decode_failures 投影） | 打开核实（旧 2772/4955/6219/11064 漂移，已按实际值引用；H1 合入后该文件行内替换净 -2，文案串 `:11141`→`:11139`、诊断区块 `:15279-15290`→`:15277-15288`） |
+| `ui/src/i18n.rs`（`strings_catalog!` 宏 `:34-63`、81 键 `:65-235`、`Lang` `:237-251`、`const L` `:259`、3 测试 `:268-308`）、`ui/src/lib.rs:45`（`mod i18n`）、`:11729`（`aria-label="Loading"` 未抽取）、tests 模块 40 处翻译敏感字面量断言（与目录值同串，如 `:20265, :22430-22432, :22466-22475`）、`web/assets/rutilus_ui.js` + `rutilus_ui_bg.wasm`（H2 再生成字节一致） | 打开核实（H1/H2 新引用；设计文档全文无「本地化/i18n」条目、§5.1 为「单二进制」定义——印证 i18n.rs 头注释 §5.1 引用不可核验的 MINOR） |
 | `center-protocol/src/lib.rs:50, 59, 62, 67, 75, 383`、`negotiation.rs:162, 269`、`framing.rs:18-31, 176-199, 219-238` | 打开核实，行号一致 |
 | `Cargo.toml:14`（workspace 版本 0.9.0）、`:35`（16 个 nv-redfish feature）、`:110-116`（§5.4 发布配置一致）、`infra-redfish/Cargo.toml:14`、`Cargo.lock:2486-2490`、`deny.toml:21-24, 29-34` | 打开核实，行号一致 |
 | `rust-toolchain.toml` 存在、Cargo.lock 已提交 | 打开核实 |
