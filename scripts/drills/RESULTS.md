@@ -11,7 +11,7 @@
 ## 复测小节（2026-08-12，挂起防护修复后）
 
 - 原 6 SKIP 根因回顾：本执行上下文（Claude Code 工具进程 spawn）中 ConPTY 不可用——伪控制台子进程一律以 0xC0000142 启动失败、零输出；且原实现的故障形态是硬挂起而非 FAIL（Wait-ConPtyOutput 后置清理中的 ClosePseudoConsole 永久阻塞，首跑 >20 分钟无 FAIL 行）。
-- 防护修复（仅改 scripts/drills/drill-lib.ps1）：(1) Start-ConPtyProcess 新增启动探测——子进程在探测窗口内退出且零输出即判定 ConPTY 启动失败，有界清理后抛错，使 drill 秒级 FAIL；(2) Wait-ConPtyOutput 超时后清理会话并记录诊断事实（进程存活/退出码/输出长度），返回可判定失败信号；(3) 清理路径全程有界——Ctrl-C 仅在子进程存活时发送、WaitExit 硬超时、Dispose 的 ClosePseudoConsole 与挂起句柄关闭交由看门狗线程限时 4s，永不永久阻塞。语法检查 Parser.ParseFile PARSE OK；文件保持纯 ASCII（PS 5.1 无 BOM 解析兼容）。
+- 防护修复（仅改 scripts/drills/drill-lib.ps1）：(1) Start-ConPtyProcess 新增启动探测——子进程在探测窗口内退出且零输出即判定 ConPTY 启动失败，有界清理后抛错，使 drill 秒级 FAIL；(2) Wait-ConPtyOutput 超时后清理会话并记录诊断事实（进程存活/退出码/输出长度），返回可判定失败信号；(3) 清理路径全程有界——Ctrl-C 仅在子进程存活时发送、WaitExit 硬超时、Dispose 的 ClosePseudoConsole 与挂起句柄关闭交由看门狗线程限时 4s，永不永久阻塞。语法检查 Parser.ParseFile PARSE OK；drill-lib.ps1 保持纯 ASCII（PS 5.1 无 BOM 解析兼容）；套件其余 6 个 .ps1 含非 ASCII 消息文本（em-dash、§ 等，多处位于字符串字面量），在非中文 locale 控制台下可能显示为乱码，但 drill 的 PASS/FAIL 判定基于正则/精确文本匹配，与显示编码无关，不影响断言。
 - 复测结果（同环境）：drill-backup-restore-cycle 实跑 3 次均快速 FAIL（每次 0.6s，退出码 1），FAIL 行含 exitCode=-1073741502（0xC0000142）与 outputLen=0 诊断事实；另直接构造死进程会话验证 Wait-ConPtyOutput 超时分支：3s 超时有界返回单值 $false 并完成清理（总 3.2s），Stop-ConPtySession -Force 清理 0s 返回——清理路径不再永久阻塞。环境根因未变，本环境复测只能验证防护路径；套件功能验证仍需在有真实交互控制台的会话中复跑。
 
 本表在每次实跑后由执行者如实登记；未实跑前保持留空。

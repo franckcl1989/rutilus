@@ -320,12 +320,24 @@ public sealed class ConPtySession
         // background state that the OS reclaims when the process exits.
         Thread cleanup = new Thread(() =>
         {
-            try { ConPtyNative.CloseHandle(_outRead); } catch { }
-            try { ConPtyNative.CloseHandle(_inWrite); } catch { }
-            try { ConPtyNative.ClosePseudoConsole(_pc); } catch { }
-            try { ConPtyNative.DeleteProcThreadAttributeList(_attrList); } catch { }
-            try { Marshal.FreeHGlobal(_attrList); } catch { }
-            try { ConPtyNative.CloseHandle(_procHandle); } catch { }
+            // Snapshot the handles into locals and zero the fields before
+            // closing: a second Dispose (the timeout path stops the session,
+            // then the caller's catch/finally stops it again) then finds
+            // IntPtr.Zero everywhere and is a no-op - no repeated CloseHandle
+            // on an already-closed handle (bounded but not handle-level
+            // idempotent: a closed handle value could in theory be reused),
+            // and no NULL attribute-list delete. The snapshot also keeps a
+            // still-running watchdog immune to a concurrent Dispose.
+            IntPtr pc = _pc, inWrite = _inWrite, outRead = _outRead,
+                   procHandle = _procHandle, attrList = _attrList;
+            _pc = IntPtr.Zero; _inWrite = IntPtr.Zero; _outRead = IntPtr.Zero;
+            _procHandle = IntPtr.Zero; _attrList = IntPtr.Zero;
+            try { if (outRead != IntPtr.Zero) ConPtyNative.CloseHandle(outRead); } catch { }
+            try { if (inWrite != IntPtr.Zero) ConPtyNative.CloseHandle(inWrite); } catch { }
+            try { if (pc != IntPtr.Zero) ConPtyNative.ClosePseudoConsole(pc); } catch { }
+            try { if (attrList != IntPtr.Zero) ConPtyNative.DeleteProcThreadAttributeList(attrList); } catch { }
+            try { if (attrList != IntPtr.Zero) Marshal.FreeHGlobal(attrList); } catch { }
+            try { if (procHandle != IntPtr.Zero) ConPtyNative.CloseHandle(procHandle); } catch { }
         });
         cleanup.IsBackground = true;
         cleanup.Start();
@@ -365,7 +377,7 @@ function Start-ConPtyProcess {
         $code = -1
         try { $code = $session.ExitCode() } catch { }
         Write-Drill -Level WARN -Message ("ConPTY startup probe: {0} {1} exited within {2}s before producing console output (exitCode={3}, outputLen=0) - pseudo-console launch failure in this context" -f $ExePath, $Arguments, $StartupProbeSeconds, $code)
-        try { Stop-ConPtySession $session -Force $true } catch { }
+        try { $null = Stop-ConPtySession $session -Force $true } catch { }
         throw "ConPTY launch failed: $ExePath exited with code $code before producing console output (outputLen=0); pseudo-console children cannot start in this execution context"
     }
     return $session
@@ -667,7 +679,7 @@ function Invoke-RutilusInit {
         return [pscustomobject]@{ BootstrapCode = $codeMatch.Groups[1].Value; Output = $session.Output }
     }
     finally {
-        Stop-ConPtySession $session -Force $true
+        $null = Stop-ConPtySession $session -Force $true
     }
 }
 
@@ -696,7 +708,7 @@ function Start-RutilusRun {
         return [pscustomobject]@{ Session = $session; Url = $urlMatch.Groups[1].Value }
     }
     catch {
-        Stop-ConPtySession $session -Force $true
+        $null = Stop-ConPtySession $session -Force $true
         throw
     }
 }
