@@ -3582,7 +3582,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rutilus"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "base64",
@@ -3620,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-api"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "getrandom 0.4.3",
  "rutilus-domain",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-application"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64",
  "csv",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-center-protocol"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-domain"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "hmac",
@@ -3684,14 +3684,14 @@ dependencies = [
 
 [[package]]
 name = "rutilus-entity"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "sea-orm",
 ]
 
 [[package]]
 name = "rutilus-infra-redfish"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "futures-util",
  "nv-redfish",
@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-migration"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "rutilus-entity",
  "sea-orm",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-operation-engine"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "rutilus-domain",
  "thiserror 2.0.19",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-persistence"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64",
  "rutilus-application",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-platform"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "fs4",
  "rutilus-security",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-security"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "base32",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-test-support"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "base64",
  "clap",
@@ -3815,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-ui"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "gloo-net",
  "leptos",
@@ -3829,7 +3829,7 @@ dependencies = [
 
 [[package]]
 name = "rutilus-web"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "axum",
  "base32",

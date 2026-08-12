@@ -17,6 +17,13 @@ use rutilus_platform::{
 use secrecy::SecretString;
 use tracing::instrument;
 
+/// The product version, derived from the single source of truth: the
+/// workspace `[workspace.package] version` (root `Cargo.toml`). The
+/// 0.1.0→1.0.0 numbers of design §二十一 are product release phases and the
+/// workspace version tracks the current phase (0.9.0 production candidate,
+/// 1.0.0 formal release), so a release bump touches exactly one file and
+/// every consumer — this output, the build-embedded version, and the
+/// version/log-format integration tests — follows automatically.
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]

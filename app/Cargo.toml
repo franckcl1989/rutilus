@@ -59,6 +59,10 @@ uuid = { workspace = true, features = ["v7"] }
 webbrowser.workspace = true
 
 [dev-dependencies]
+# The upstream-baseline constant consumed by the version/log-format
+# integration tests (the `rutilus version` second line), so their expected
+# output derives from the same single sources as the binary itself.
+rutilus-infra-redfish.workspace = true
 rutilus-test-support.workspace = true
 tokio.workspace = true
 

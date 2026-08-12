@@ -6,6 +6,15 @@ use std::process::Command;
 /// command emits no diagnostics, so stderr stays empty either way).
 #[test]
 fn json_log_format_is_accepted_and_keeps_user_visible_output() -> std::io::Result<()> {
+    // Derived from the same single sources as the binary: the workspace
+    // `[workspace.package] version` and the infra-redfish upstream-baseline
+    // constant (§7.2-A unified versioning), so a version bump needs no
+    // test edit.
+    let expected_stdout = format!(
+        "rutilus {}\nnv-redfish development baseline {}\n",
+        env!("CARGO_PKG_VERSION"),
+        rutilus_infra_redfish::NV_REDFISH_DEVELOPMENT_BASELINE
+    );
     for argv in [
         vec!["--log-format", "json", "version"],
         vec!["version", "--log-format", "json"],
@@ -14,10 +23,7 @@ fn json_log_format_is_accepted_and_keeps_user_visible_output() -> std::io::Resul
             .args(argv)
             .output()?;
         assert!(output.status.success());
-        assert_eq!(
-            output.stdout,
-            b"rutilus 0.1.0\nnv-redfish development baseline 0.13.0\n"
-        );
+        assert_eq!(output.stdout, expected_stdout.as_bytes());
         assert!(output.stderr.is_empty());
     }
 

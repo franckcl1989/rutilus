@@ -3,8 +3,15 @@ members = ["api", "app", "application", "center-protocol", "domain", "entity", "
 default-members = ["app"]
 resolver = "3"
 
+# The single product-version source (§7.2-A unified versioning): every
+# consumer — the `rutilus version` output, the build-embedded version, and
+# the version/log-format test assertions — derives from `CARGO_PKG_VERSION`,
+# which reads this one value. The 0.1.0→1.0.0 numbers of design §二十一 are
+# product release phases (0.9.0 = production candidate, 1.0.0 = formal
+# release); the workspace version tracks the current phase, so a release
+# bump here is the only version change any release requires.
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
@@ -35,19 +42,19 @@ rust-embed = { version = "=8.11.0", features = ["debug-embed", "deterministic-ti
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.4"
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["alloc", "std"] }
-rutilus-api = { path = "api", version = "0.1.0" }
-rutilus-domain = { path = "domain", version = "0.1.0" }
-rutilus-application = { path = "application", version = "0.1.0" }
-rutilus-center-protocol = { path = "center-protocol", version = "0.1.0" }
-rutilus-infra-redfish = { path = "infra-redfish", version = "0.1.0" }
-rutilus-entity = { path = "entity", version = "0.1.0" }
-rutilus-migration = { path = "migration", version = "0.1.0" }
-rutilus-operation-engine = { path = "operation-engine", version = "0.1.0" }
-rutilus-persistence = { path = "persistence", version = "0.1.0" }
-rutilus-platform = { path = "platform", version = "0.1.0" }
-rutilus-security = { path = "security", version = "0.1.0" }
-rutilus-test-support = { path = "test-support", version = "0.1.0" }
-rutilus-web = { path = "web", version = "0.1.0" }
+rutilus-api = { path = "api", version = "0.9.0" }
+rutilus-domain = { path = "domain", version = "0.9.0" }
+rutilus-application = { path = "application", version = "0.9.0" }
+rutilus-center-protocol = { path = "center-protocol", version = "0.9.0" }
+rutilus-infra-redfish = { path = "infra-redfish", version = "0.9.0" }
+rutilus-entity = { path = "entity", version = "0.9.0" }
+rutilus-migration = { path = "migration", version = "0.9.0" }
+rutilus-operation-engine = { path = "operation-engine", version = "0.9.0" }
+rutilus-persistence = { path = "persistence", version = "0.9.0" }
+rutilus-platform = { path = "platform", version = "0.9.0" }
+rutilus-security = { path = "security", version = "0.9.0" }
+rutilus-test-support = { path = "test-support", version = "0.9.0" }
+rutilus-web = { path = "web", version = "0.9.0" }
 sea-orm = { version = "2.0.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 sea-orm-migration = { version = "2.0.1", default-features = false, features = ["runtime-tokio", "sqlx-sqlite", "with-time", "with-uuid"] }
 secrecy = "0.10.3"
