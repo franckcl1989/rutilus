@@ -1130,8 +1130,8 @@ async fn mock_serves_the_complete_demo_flow_and_cleans_up() -> Result<(), Box<dy
         .read_core_resources(&address, &trust, &username, &password)
         .await?;
     let resources = outcome.projections();
-    assert_resource_order(&resources);
-    assert_surface_payloads(&resources)?;
+    assert_resource_order(resources);
+    assert_surface_payloads(resources)?;
     for resource in resources {
         assert!(
             resource.etag().is_some(),

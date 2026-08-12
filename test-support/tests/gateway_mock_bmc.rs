@@ -266,8 +266,8 @@ async fn reads_core_resource_snapshots_across_all_families() -> Result<(), Box<d
         ]
     );
 
-    assert_family_payloads(&resources)?;
-    assert_resource_identifiers(&resources);
+    assert_family_payloads(resources)?;
+    assert_resource_identifiers(resources);
     Ok(())
 }
 
@@ -2088,7 +2088,7 @@ async fn no_oem_profiles_read_the_default_core_tree_without_oem_snapshots()
                 ResourceFeature::Task,
             ]
         );
-        assert_resource_identifiers(&resources);
+        assert_resource_identifiers(resources);
 
         // The gateway fetches no document beyond the default flow, through
         // the Session token transport like every other read, and deletes its
