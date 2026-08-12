@@ -173,13 +173,15 @@
 > （commit 4ad8c4a）、x86_64 musl 发布构建进入 CI（commit 3b1ab30）。
 > **§六「发布构建验证」行已过时**：musl x86_64 已由 CI 编译验证（`.github/workflows/ci.yml:178-183`），
 > 尚未验证的只剩 aarch64 musl、Windows ARM64、macOS Universal 2——以本节为准。
+> 另：`docs/known-limitations.md` §七「CI 与发布目标差异」行与 `docs/operations-manual.md` §十的 musl
+> 表述同样早于该 commit（待后续修订，以本节为准）。
 
 ### 7.1 逐项盘点
 
 | 0.9.0 内容 | 状态 | 证据 |
 |---|---|---|
 | 五厂商实验室 | ⏳ 待做（依赖物理设备） | Mock 层已覆盖五厂商 profile（Dell/HPE/Lenovo/xFusion/Inspur，外加 NVIDIA/AMI/LiteOn/Delta/Supermicro，共 11 个 `MockProfile`，`test-support/src/mock_bmc/profile.rs:47-134`）；§19.1 Physical Device Test「五厂商至少各一台真实设备进入 1.0.0 认证矩阵」未达成（`docs/known-limitations.md` §五） |
-| 所有 Fixture 回归 | 🟡 部分 | 合成 fixture（Mock BMC 固定资源树 + 确定性证书）回归已有：`test-support/tests/gateway_mock_bmc.rs` 31 个测试（Service Root 读取/47 能力探测/核心资源读取/会话生命周期/各厂商 profile）、`test-support/src/mock_bmc/tests.rs` 25 个；§19.1 Fixture Test 要求的**脱敏真实响应 fixture 目录**（五厂商各固件版本，随 nv-redfish 升级回归）尚无（`known-limitations.md` §五） |
+| 所有 Fixture 回归 | 🟡 部分 | 合成 fixture（Mock BMC 固定资源树 + 确定性证书）回归已有：`test-support/tests/gateway_mock_bmc.rs` 23 个测试（Service Root 读取/47 能力探测/核心资源读取/会话生命周期/各厂商 profile）、`test-support/src/mock_bmc/tests.rs` 21 个；§19.1 Fixture Test 要求的**脱敏真实响应 fixture 目录**（五厂商各固件版本，随 nv-redfish 升级回归）尚无（`known-limitations.md` §五） |
 | 故障注入 | 🟡 部分 | §19.3 多数场景已有单进程自动化覆盖：BMC 慢响应（`redfish_gateway.rs:22832, 27486`、`tls_probe.rs:568`）、TLS 证书变化（`domain/src/endpoint.rs:327` `verify_identity`/`TlsIdentityChanged`）、JSON 字段类型错误（`redfish_gateway.rs:18221, 18263` undecodable 成员跳过）、Action 响应丢失/写连接丢弃（`redfish_gateway.rs:27439, 30321`）、Task 消失（`redfish_gateway.rs:21986`）、SSE 流中断/解码失败（`redfish_gateway.rs:31237, 31306`）、重复消息/重复 Operation（`center_sync.rs:3461, 3511`、`operation_engine.rs:1332` 批量重投 no-op、`event_repository.rs:328` 事件去重）、大文件上传中断（`web/tests/artifact_path.rs:733`）、系统时间变化（`telemetry_sampler.rs:1050, 1076`、`operation_engine.rs:986` 时钟回拨如实记录）、文件写失败（`artifact_store.rs:1476`）；**未覆盖**：产品进程在任务中终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（跨进程演练形态，见 7.2-B） |
 | 跨平台 E2E | 🟡 部分 | CI 编译矩阵覆盖 linux-gnu / windows-msvc / darwin x86_64 + wasm32 UI 产物 diff + x86_64 musl release 构建（`ci.yml:35-53, 153-183`）；但 E2E 测试套件（`web/tests/` 9 个路径文件、`app/tests/`、应用层集成测试）只在 ubuntu 默认任务运行，windows/macos 任务仅 `cargo check`——三平台 E2E **运行**未达成 |
 | 数据库压力 | ⏳ 待做 | 无压力/规模测试；workspace 无 `[[bench]]`（Cargo.toml 全量核查无 bench 段），现有覆盖仅为仓库级功能测试（`persistence/`、`migration/tests/`） |
@@ -188,14 +190,14 @@
 | Secret 泄漏检查 | 🟡 部分 | 结构性防护已有：API 永不回声秘密（`web/tests/write_path.rs:783, 815, 917`、`web/src/lib.rs:6156` secret-free 端点清单、`persistence/src/credential_repository.rs:604`）、审计类型**构造上**不能携带秘密（`domain/src/audit.rs:318, 383`：非秘密身份数据/封闭类型参数摘要）、Center 投影排除凭据与会话（`application/src/center/projection.rs:55`）、命令载荷 at-rest 加密（`security/src/command_cipher.rs`）；独立泄漏扫描/专门审查演练未做（1.0.0「Center 不保存 BMC Secret」路径已由上述结构支撑） |
 | 权限测试 | ✅ 已完成 | `role_masks_are_enforced_on_guarded_routes`（`web/src/lib.rs:10525`）、中心角色站点作用域（`web/src/lib.rs:11398, 11442`）、登录限速预算（`web/src/auth.rs:2484` rate_limiter_enforces_per_username_and_per_ip_budgets）、BMC 写权限拒绝（`redfish_gateway.rs:27328`） |
 | 安全审查 | ⏳ 待做（流程项） | 仓库无安全审查记录/文档证据；可先做代码级自查（7.2-A） |
-| Migration 回归 | ✅ 已完成 | `migration/tests/` 17 个测试文件（initial_storage/operations/batch_operations/telemetry/events/groups_tags/center_tables/center_data_sites/center_role_sites/product_users/remote_tasks/artifacts/operation_failure_kinds/nvidia_families/nvidia_power_families/lenovo_families/bare_sql_gate）；迁移前自动备份（`persistence/src/lib.rs:510` backs_up_a_closed_database_before_applying_pending_migrations）；CI 独立 Migration Test 门禁（`ci.yml:187-189`） |
+| Migration 回归 | ✅ 已完成 | `migration/tests/` 19 个测试文件（initial_storage/operations/batch_operations/telemetry/events/groups_tags/center_tables/center_data_sites/center_role_sites/product_users/remote_tasks/artifacts/operation_failure_kinds/nvidia_families/nvidia_power_families/lenovo_families/bare_sql_gate/audit_action_shapes/audit_execute_operation）；迁移前自动备份（`persistence/src/lib.rs:510` backs_up_a_closed_database_before_applying_pending_migrations）；CI 独立 Migration Test 门禁（`ci.yml:187-189`） |
 | 备份恢复演练 | 🟡 部分 | 自动化往返覆盖完整：`app/src/backup.rs:759`（往返保数据）、`:793`（拒绝他实例包）、`:819`（跨机恢复需源信封）、`:906`（源口令对全新信封）、`:938`（需停止实例）、`:975`（拒绝不同产品版本）、`:964`（拒绝未初始化目录）；CLI `rutilus backup`/`restore`（`app/src/main.rs:245`）；0.9.0 验收「三平台安装、升级、备份、恢复通过」的演练未执行 |
 | 签名构建 | ⏳ 待做（发布管道） | 仓库无 Authenticode / macOS 公证 / Linux 签名工具链证据（CI 无签名步骤；现有「signing」匹配均为 TLS/CA 证书签名代码，非发布二进制签名）；§5.4 发布配置 |
 | SBOM | ⏳ 待做（发布管道） | 无 SBOM 生成工具（cargo-cyclonedx 等）与产物证据 |
-| 用户手册 | ✅ 已完成 | `docs/user-manual.md`（266 行，条目后标注来源文件） |
-| 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（192 行：数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状） |
-| 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（114 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；注：其 §三「CI 现状」同样早于 musl 构建步骤，与 §七开头更正一致 |
-| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（70 行：OutOfScope 3 项/依赖风险登记/测试基建局限/容量未实测等） |
+| 用户手册 | ✅ 已完成 | `docs/user-manual.md`（420 行，条目后标注来源文件） |
+| 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（306 行：数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状） |
+| 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（186 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；注：其 §三「CI 现状」同样早于 musl 构建步骤，与 §七开头更正一致 |
+| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（118 行：OutOfScope 3 项/依赖风险登记/测试基建局限/容量未实测等） |
 | 性能容量测试 | ⏳ 待做 | 无 benchmark/压力测试；§0.9.0 最低验证规模（单 Site 200 / 单 Center 100 Site / 中心汇总 5,000 Endpoint）仍是测试目标而非实测能力（`known-limitations.md` §六、`operations-manual.md` §九） |
 
 ### 7.2 剩余工作精确分类
