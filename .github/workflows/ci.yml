@@ -560,14 +560,19 @@ jobs:
       # --- SBOM (workspace-wide; generated once on the x86_64 linux job) ----
       # cargo-cyclonedx (pinned to 0.5.9, the latest stable on crates.io as
       # of 2026-08-12) from taiki-e/install-action, same pattern as the ci
-      # job's gate tools. Real CLI, verified against the upstream README
-      # (CycloneDX/cyclonedx-rust-cargo, 2026-08-12): the only subcommand is
-      # `cargo cyclonedx` — there is NO --locked and NO --output-dir, and
-      # the output is one bom.json written ADJACENT TO EVERY Cargo.toml in
-      # the workspace, not a single file (H4 audit BLOCKER 2). The step
-      # therefore collects the per-crate BOMs under release/ with
-      # crate-qualified names. `--all` lists every dependency (it is the
-      # default; kept explicit).
+      # job's gate tools. Real CLI: the only subcommand is `cargo cyclonedx`
+      # — there is NO --locked and NO --output-dir. The tool writes one
+      # <package>.cdx.json into EVERY workspace member's own directory — one
+      # per Cargo.toml dir, e.g. api/rutilus-api.cdx.json and
+      # app/rutilus.cdx.json (the virtual workspace root has no [package],
+      # hence no output). Filename and per-crate layout verified by a local
+      # trial run on 2026-08-12 (cargo-cyclonedx 0.5.9, Windows; the naming
+      # is baked into the tool, platform-independent); the ubuntu CI first
+      # run remains the confirmation point. The step therefore collects the
+      # 15 per-crate BOMs under release/ with crate-qualified names, and the
+      # find keeps its existing exclusions of ./target/ and ./release/ so
+      # only the freshly generated per-crate files are picked up. `--all`
+      # lists every dependency (it is the default; kept explicit).
       - name: Install cargo-cyclonedx
         if: matrix.sbom
         uses: taiki-e/install-action@v2
@@ -577,11 +582,12 @@ jobs:
         if: matrix.sbom
         run: |
           cargo cyclonedx --format json --all
-          # One bom.json per workspace member crate (every Cargo.toml dir is
-          # a unique top-level name, so the parent dir identifies the crate;
-          # the virtual workspace root has no [package], hence no BOM).
+          # One <package>.cdx.json per workspace member crate (every
+          # Cargo.toml dir is a unique top-level name, so the parent dir
+          # identifies the crate; the virtual workspace root has no
+          # [package], hence no BOM).
           mkdir -p release
-          find . -name bom.json -not -path './target/*' -not -path './release/*' | sort | while read -r f; do
+          find . -name '*.cdx.json' -not -path './target/*' -not -path './release/*' | sort | while read -r f; do
             mv "$f" "release/rutilus-${{ github.ref_name }}-sbom-$(basename "$(dirname "$f")").json"
           done
           ls -1 release/rutilus-${{ github.ref_name }}-sbom-*.json
