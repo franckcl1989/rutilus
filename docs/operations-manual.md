@@ -243,30 +243,60 @@ rutilus doctor [--portable]
 
 ### 8.1 日志与诊断现状（如实）
 
-- **统一日志设施已引入（最小可用版）**：设计文档 §6.2 选型清单中的 `tracing` + `tracing-subscriber` 已进入
-  workspace（根 `Cargo.toml` 的 `[workspace.dependencies]`）；app 二进制在启动时初始化 `fmt` subscriber，
-  输出到 stderr，过滤级别来自 `RUST_LOG`（未设置或非法时默认 `info`，例如 `RUST_LOG=debug rutilus run`）；
+- **统一日志设施已引入**：设计文档 §6.2 选型清单中的 `tracing` + `tracing-subscriber` 已进入
+  workspace（根 `Cargo.toml` 的 `[workspace.dependencies]`）；app 二进制在启动时经 `init_tracing`
+  初始化 stderr subscriber（`app/src/main.rs:233-251`）；
+- **输出格式可选**：全局 `--log-format <text|json>`（默认 `text`，`main.rs:27-32` 的 `LogFormat`
+  枚举 `:37-43`）——`text` 为人类可读行，`json` 为每行一条 newline-delimited 结构化 JSON 记录；
+  两种格式都输出到 stderr，过滤级别都来自 `RUST_LOG`（未设置或非法时默认 `info`，例如
+  `RUST_LOG=debug rutilus run --log-format json`），**`RUST_LOG` 过滤行为不变**；CLI 解析失败时
+  `--log-format` 在命令运行前被拒绝（`app/tests/log_format.rs`）；
+- **运行路径已接入 span 上下文**：`#[instrument]` 覆盖 main 命令入口、backup、center_client、
+  center_runtime、event_listener、scheduler、site_runtime、standalone_runtime、telemetry_sampler
+  的入口函数（口令等敏感参数一律 `skip_all` 不进入 span 字段，`app/src/center_client.rs:162, 179`
+  等）；JSON 格式下 span 字段（如 `command`、`data_directory`、`endpoint_id`）随记录输出，便于
+  按请求/端点聚合排查；
 - 运行中的操作性失败现经 `tracing::error!` / `tracing::warn!` 记录（事件监听器、遥测采样循环、调度循环、
   中心同步引擎、服务激活命令失败等，见 `app/src/event_listener.rs`、`app/src/telemetry_sampler.rs`、
   `application/src/center_sync.rs`、`platform/src/service.rs`）；
 - **CLI 用户可见输出仍走 stdout `println!`**（init 向导、backup 结果、doctor 报告、console 横幅、
-  bootstrap code 显示），与 stderr 诊断分离（§7.6 用户信息与诊断信息分离）；
+  bootstrap code 显示），与 stderr 诊断分离（§7.6 用户信息与诊断信息分离）——`--log-format json`
+  只影响 stderr 诊断，stdout 用户可见输出字节不变（`app/tests/log_format.rs` 断言）；
 - 测试基础设施与测试内诊断（`test-support` mock、`mock-bmc` 工具、`infra-redfish` 测试）仍用
   `eprintln!`/`println!`（测试上下文无 subscriber）；
-- 因此生产排查目前依赖：stderr 诊断日志（`RUST_LOG` 可调级别）、审计记录（界面 Audit 视图）、
-  端点级 Advanced Diagnostics 与 Capabilities 页面。
+- 因此生产排查目前依赖：stderr 诊断日志（`RUST_LOG` 可调级别、`--log-format json` 结构化输出）、
+  审计记录（界面 Audit 视图）、端点级 Advanced Diagnostics 与 Capabilities 页面。
 
 ## 九、性能与容量现状（如实）
 
-设计文档 §0.9.0 的"最低验证规模"是**测试目标，不是当前已实测能力**：
+设计文档 §0.9.0 的"最低验证规模"（单 Site 200 Endpoint / 单 Center 100 Site / 中心汇总
+5,000 Endpoint）已由合成规模压力套件落地并实测（`persistence/tests/stress_capacity.rs`，
+2026-08-12）。**下面的数字是本机（Windows 开发机）debug 构建 + WAL 下的合成数据，不是最终发布
+容量建议**——设计 §0.9.0 要求"测试后发布真实容量建议"（`redfish-management-product-final-design.md:2810`），
+正式容量建议需在 release 构建与正式规模环境复核后发布。
 
-```text
-单个 Site：至少 200 个 Endpoint      ← 0.9.0 测试目标
-单个 Center：至少 100 个 Site        ← 0.9.0 测试目标
-中心汇总：至少 5,000 个 Endpoint     ← 0.9.0 测试目标
-```
+**合成规模实测数据（2026-08-12，开发机 debug 构建、WAL）**
 
-测试完成后才会发布真实容量建议（§0.9.0）。当前没有任何已发布、已实测的容量数字。
+压力套件 3 个测试全部断言正确性不变量（行数、设计 §9.5 Generation 一致、§17 队列与游标有序、
+§15.4 at-least-once 重投 no-op），**不断言任何墙钟时间**（CI 方差不是测试输入，
+`stress_capacity.rs:11-12`）；`println!` 计时即设计要求发布的实测容量证据（`:10`）。本机复跑结果：
+
+| 规模场景 | 实测耗时 | 折算吞吐 | 计时点 |
+|---|---|---|---|
+| 5,000 Endpoint 投影首次写入（100 Site x 50） | 5.78s | ≈865 行/s | `stress_capacity.rs:862-865` |
+| 5,000 Endpoint 投影幂等重投（at-least-once） | 9.72s | ≈515 行/s（更新路径） | `stress_capacity.rs:921-924` |
+| 5,000 行投影清单查询（含 100 个 per-site 视图） | 0.482s | ≈10,400 行/s | `stress_capacity.rs:903-906` |
+| 200 Endpoint 首轮 Generation 提交（7 snapshot/Endpoint） | 0.30s | — | `stress_capacity.rs:440-443` |
+| 200 Endpoint 二轮 Generation 提交 + 当前视图重载 | 0.32s | — | `stress_capacity.rs:489-492` |
+| 100 Site 建库 + 1,000 outbox 入队 | 0.01s / 0.53s | — | `stress_capacity.rs:599-602, 623-627` |
+| 500 outbox Ack（含重复 Ack no-op） | 0.141s | — | `stress_capacity.rs:649-653` |
+| 400 inbox 幂等生命周期（100 Site x 4） | 0.31s | — | `stress_capacity.rs:757-760` |
+| 800 sync cursor 推进（100 Site x 4 流 x 2） | 0.28s | — | `stress_capacity.rs:792-797` |
+
+**关键观察（发布容量建议时最有价值的记录）**：persistence 的写路径被 `write_gate`
+（`Semaphore(1)` 全局应用级写信号量，`persistence/src/lib.rs:101, 240`）串行化——同一时刻全库
+只有一个写事务。因此 5,000 规模的写耗时 ≈ **事务数 × 单事务成本**，与并发数无关；扩容方向是
+减少事务数（批量合并）或放宽串行化（需先评估设计 §9.2 的写门语义与备份一致性依赖），而不是堆并发。
 
 当前代码中可确认的规模相关事实：
 
@@ -292,15 +322,17 @@ CI 门禁与 §19.4 的对照（`.github/workflows/ci.yml`）：
 
 | 门禁 | 现状 |
 |---|---|
-| fmt / clippy（`-D warnings`）/ 全 workspace 测试 | 已启用（ubuntu-latest 默认 job；windows/macos 跑全目标编译） |
+| fmt / clippy（`-D warnings`）/ 全 workspace 测试 | 已启用（ubuntu-latest 默认 job；windows/macos 跑全目标编译 + 跨平台 E2E 套件） |
+| 跨平台 E2E 套件（windows/macos） | 已启用：`cargo test --locked -p rutilus-web`（9 个路径套件，内存假件）+ `cargo test --locked -p rutilus --test version`（`ci.yml:107-123`）；`app/tests/mock_center_client.rs`（回环 mTLS/WebSocket 互操作）因真实 socket 与握手时序不纳入（`ci.yml:113-118` 注释） |
 | nextest（`--test-threads 4`）/ llvm-cov（行覆盖 ≥ 80%，本地实测 90.14%，2026-08-12） | 已启用 |
 | cargo deny（advisories/bans/licenses/sources） | 已启用（版本 0.20.2） |
-| cargo audit 独立门禁 | **未启用**——advisory 扫描已由 `cargo deny check` 覆盖，注释注明为后续独立门禁 |
+| cargo audit 独立门禁 | **已启用**（2026-08-12，`ci.yml:163-181`）：`cargo audit --deny warnings`，`--ignore` 镜像 deny.toml `[advisories]` 全部 4 条（quick-xml 0194/0195 两条 TRIGGER、unmaintained 0436/0173）+ 重新登记的 rkyv RUSTSEC-2026-0235（deny.toml 注释预言 cargo-audit 启用时会重新登记，`deny.toml:21-24`）；cargo-audit 只读 audit.toml、不读 deny.toml，故以 CLI 旗标镜像，需与 deny.toml 同步维护（`ci.yml:163-172` 注释） |
 | cargo machete | 已启用（3 处误报均在忽略清单中注明） |
-| 跨平台构建 | CI 编译 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` + `wasm32-unknown-unknown` UI 产物并 diff 校验 |
+| 跨平台构建与发布矩阵 | CI 编译 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` + `wasm32-unknown-unknown` UI 产物并 diff 校验（ubuntu 默认 job）；发布构建：x86_64 musl（`ci.yml:216-221`）与 aarch64 musl（cargo-zigbuild 交叉链接，`ci.yml:228-232`）在 ubuntu 任务构建，macOS Universal 2 由 macos 任务构建两个 darwin 目标并经 lipo 合并（`ci.yml:243-260`）；**`aarch64-pc-windows-msvc` 明确不入 CI**——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库，注释注明需原生 ARM64 runner 或本地验证后处理（`ci.yml:234-241`） |
 | Migration / 能力账本 / 发布基线检查 | 已启用 |
 
 发布目标矩阵（§5.2）为 Linux `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`、
 Windows `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`、macOS Universal 2（Intel + Apple Silicon）；
-`deny.toml` 的 `[graph] targets` 已列出全部发布目标，但 CI 当前 Linux 门禁跑的是 gnu 目标，
-musl 与 aarch64/ARM64/macOS 合并构建属于 0.9.0 发布流水线工作（如实标注，尚未在 CI 中编译验证）。
+`deny.toml` 的 `[graph] targets` 已列出全部发布目标。CI 现状（2026-08-12）：musl x86_64/aarch64 与
+macOS Universal 2 的构建步骤均已入 CI（见上表），Linux 门禁本身仍跑 gnu 目标；Windows ARM64 构建
+未入 CI（真实原因见上表注释引用）。
