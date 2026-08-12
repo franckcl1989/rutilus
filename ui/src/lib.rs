@@ -45,7 +45,17 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 mod i18n;
 
 #[cfg(any(target_arch = "wasm32", test))]
-use i18n::L;
+use i18n::{L, Lang};
+
+/// The ergonomic wrapper over [`i18n::format_catalog`]: each argument is
+/// automatically passed by reference, so mixed argument types (numbers,
+/// strings, references) all work in one call.
+#[cfg(any(target_arch = "wasm32", test))]
+macro_rules! catalog_format {
+    ($template:expr $(, $argument:expr)* $(,)?) => {{
+        crate::i18n::format_catalog($template, &[$( &$argument ),*])
+    }};
+}
 
 // Production wasm builds reach `serde_json` through the leptos re-export:
 // leptos is the wasm-only UI dependency that already carries the crate, so
@@ -103,13 +113,17 @@ impl ConsoleLoadState {
         })
     }
 
-    const fn status_message(&self) -> &'static str {
+    fn status_message(&self) -> &'static str {
         match self {
-            Self::Loading => L.header_status_loading,
-            Self::Ready(_) => L.header_status_ready,
-            Self::Failed(ConsoleLoadFailure::ProductMetadata) => L.header_status_failed_metadata,
-            Self::Failed(ConsoleLoadFailure::EndpointInventory) => L.header_status_failed_inventory,
-            Self::Failed(ConsoleLoadFailure::EndpointResources) => L.header_status_failed_resources,
+            Self::Loading => L().header_status_loading,
+            Self::Ready(_) => L().header_status_ready,
+            Self::Failed(ConsoleLoadFailure::ProductMetadata) => L().header_status_failed_metadata,
+            Self::Failed(ConsoleLoadFailure::EndpointInventory) => {
+                L().header_status_failed_inventory
+            }
+            Self::Failed(ConsoleLoadFailure::EndpointResources) => {
+                L().header_status_failed_resources
+            }
         }
     }
 
@@ -141,8 +155,8 @@ impl ConsoleLoadState {
             Self::Loading | Self::Failed(_) => 0,
         };
         match count {
-            1 => "1 managed endpoint".to_owned(),
-            _ => format!("{count} managed endpoints"),
+            1 => L().count_endpoints_one.to_owned(),
+            _ => catalog_format!(L().count_endpoints_many, count),
         }
     }
 
@@ -236,12 +250,12 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
     fn from(endpoint: &EndpointResourceInventoryResponse) -> Self {
         let identity = endpoint.endpoint();
         let trust_label = match identity.tls_trust_mode() {
-            TlsTrustModeResponse::SystemCa => "System CA",
-            TlsTrustModeResponse::PinnedCertificate => "Pinned certificate",
+            TlsTrustModeResponse::SystemCa => L().notice_system_ca,
+            TlsTrustModeResponse::PinnedCertificate => L().notice_pinned_certificate,
         };
         let (snapshot_label, resource_counts, resources, oem_section) = match endpoint.snapshot() {
             EndpointResourceSnapshotResponse::AwaitingFirstRefresh => (
-                "Awaiting first refresh".to_owned(),
+                L().notice_awaiting_first_refresh.to_owned(),
                 None,
                 Vec::new(),
                 OemSectionProjection::UnsupportedByNvRedfishBaseline,
@@ -253,8 +267,8 @@ impl From<&EndpointResourceInventoryResponse> for EndpointCardProjection {
             } => {
                 let endpoint_id_text = identity.endpoint_id().to_string();
                 (
-                    format!(
-                        "Generation {} · observed {}",
+                    catalog_format!(
+                        L().fmt_generation_observed,
                         generation.get(),
                         format_observed_at(observed_at)
                     ),
@@ -420,7 +434,7 @@ impl CoreResourceCardProjection {
     /// `From` impl.
     fn from_resource(endpoint_id: &str, resource: &CoreResourceResponse) -> Self {
         let mut facts = vec![ResourceFactProjection {
-            label: "Redfish ID",
+            label: L().fact_redfish_id,
             value: resource.common().id().to_owned(),
         }];
         let (type_label, family_facts) = card_facts(resource.resource());
@@ -517,12 +531,11 @@ impl OemSectionProjection {
 }
 
 /// The §11.5 honest notice shown when the nv-redfish baseline has no
-/// strong-typed OEM surface for the endpoint's vendor. Pinned so the
-/// `UnsupportedByNvRedfishBaseline` rendering cannot drift from the §11.5
-/// contract wording.
-#[cfg(any(target_arch = "wasm32", test))]
-const OEM_UNSUPPORTED_NOTICE: &str =
-    "OEM data is not available in the nv-redfish baseline for this vendor";
+/// strong-typed OEM surface for the endpoint's vendor. The rendering reads
+/// `L().notice_oem_unsupported` so the notice translates with the console;
+/// this test-only alias pins the English wording against the §11.5 contract.
+#[cfg(test)]
+const OEM_UNSUPPORTED_NOTICE: &str = Lang::En.strings().notice_oem_unsupported;
 
 /// Projects one resource as an OEM section card, or `None` when it belongs
 /// to a standard family.
@@ -753,13 +766,17 @@ fn service_root_card_facts(
         redfish_version,
     } = resource
     else {
-        return ("Service Root", Vec::new());
+        return (L().type_service_root, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Vendor", vendor.as_deref());
-    push_fact(&mut facts, "Product", product.as_deref());
-    push_fact(&mut facts, "Redfish version", redfish_version.as_deref());
-    ("Service Root", facts)
+    push_fact(&mut facts, L().fact_vendor, vendor.as_deref());
+    push_fact(&mut facts, L().fact_product, product.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_redfish_version,
+        redfish_version.as_deref(),
+    );
+    (L().type_service_root, facts)
 }
 
 /// Facts for the System card.
@@ -784,10 +801,10 @@ fn system_card_facts(
         status,
     } = resource
     else {
-        return ("System", Vec::new());
+        return (L().type_system, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "System type", system_type.as_deref());
+    push_fact(&mut facts, L().fact_system_type, system_type.as_deref());
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -795,12 +812,12 @@ fn system_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "SKU", sku.as_deref());
-    push_fact(&mut facts, L.field_host_name, host_name.as_deref());
-    push_fact(&mut facts, "BIOS version", bios_version.as_deref());
-    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_fact(&mut facts, L().fact_sku, sku.as_deref());
+    push_fact(&mut facts, L().field_host_name, host_name.as_deref());
+    push_fact(&mut facts, L().fact_bios_version, bios_version.as_deref());
+    push_fact(&mut facts, L().fact_power_state, power_state.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("System", facts)
+    (L().type_system, facts)
 }
 
 /// Facts for the Chassis card.
@@ -824,10 +841,14 @@ fn chassis_card_facts(
         status,
     } = resource
     else {
-        return ("Chassis", Vec::new());
+        return (L().page_chassis, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Chassis type", Some(chassis_type.as_str()));
+    push_fact(
+        &mut facts,
+        L().fact_chassis_type,
+        Some(chassis_type.as_str()),
+    );
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -835,11 +856,11 @@ fn chassis_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "SKU", sku.as_deref());
-    push_fact(&mut facts, "Asset tag", asset_tag.as_deref());
-    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_fact(&mut facts, L().fact_sku, sku.as_deref());
+    push_fact(&mut facts, L().fact_asset_tag, asset_tag.as_deref());
+    push_fact(&mut facts, L().fact_power_state, power_state.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("Chassis", facts)
+    (L().page_chassis, facts)
 }
 
 /// Facts for the Manager card.
@@ -863,10 +884,10 @@ fn manager_card_facts(
         status,
     } = resource
     else {
-        return ("Manager", Vec::new());
+        return (L().type_manager, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Manager type", manager_type.as_deref());
+    push_fact(&mut facts, L().fact_manager_type, manager_type.as_deref());
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -874,11 +895,15 @@ fn manager_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
-    push_fact(&mut facts, "Version", version.as_deref());
-    push_fact(&mut facts, "Power state", power_state.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_firmware_version,
+        firmware_version.as_deref(),
+    );
+    push_fact(&mut facts, L().fact_version, version.as_deref());
+    push_fact(&mut facts, L().fact_power_state, power_state.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("Manager", facts)
+    (L().type_manager, facts)
 }
 
 /// Facts for a §2.1 processor card; part and serial numbers are not part of
@@ -900,11 +925,15 @@ fn processor_card_facts(
         status,
     } = resource
     else {
-        return ("Processor", Vec::new());
+        return (L().type_processor, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Processor type", processor_type.as_deref());
-    push_fact(&mut facts, "Socket", socket.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_processor_type,
+        processor_type.as_deref(),
+    );
+    push_fact(&mut facts, L().fact_socket, socket.as_deref());
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -912,9 +941,9 @@ fn processor_card_facts(
         None,
         None,
     );
-    push_u64_fact(&mut facts, "Total cores", *total_cores);
+    push_u64_fact(&mut facts, L().fact_total_cores, *total_cores);
     push_status_facts(&mut facts, status.as_ref());
-    ("Processor", facts)
+    (L().type_processor, facts)
 }
 
 /// Facts for a §2.1 memory card; part and serial numbers are not part of the
@@ -935,15 +964,15 @@ fn memory_card_facts(
         status,
     } = resource
     else {
-        return ("Memory", Vec::new());
+        return (L().page_memory, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Memory device type",
+        L().fact_memory_device_type,
         memory_device_type.as_deref(),
     );
-    push_u64_fact(&mut facts, "Capacity (MiB)", *capacity_mib);
+    push_u64_fact(&mut facts, L().fact_capacity_mib, *capacity_mib);
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -952,7 +981,7 @@ fn memory_card_facts(
         None,
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Memory", facts)
+    (L().page_memory, facts)
 }
 
 /// Facts for a §2.1 storage card; the numeric controller and drive counts
@@ -972,13 +1001,13 @@ fn storage_card_facts(
         status,
     } = resource
     else {
-        return ("Storage", Vec::new());
+        return (L().type_storage, Vec::new());
     };
     let mut facts = Vec::new();
-    push_u64_fact(&mut facts, "Controller count", *controller_count);
-    push_u64_fact(&mut facts, "Drive count", *drive_count);
+    push_u64_fact(&mut facts, L().fact_controller_count, *controller_count);
+    push_u64_fact(&mut facts, L().fact_drive_count, *drive_count);
     push_status_facts(&mut facts, status.as_ref());
-    ("Storage", facts)
+    (L().type_storage, facts)
 }
 
 /// Facts for a §2.1 network-adapter card; part and serial numbers are not
@@ -998,7 +1027,7 @@ fn network_adapter_card_facts(
         status,
     } = resource
     else {
-        return ("Network adapter", Vec::new());
+        return (L().type_network_adapter, Vec::new());
     };
     let mut facts = Vec::new();
     push_hardware_facts(
@@ -1009,7 +1038,7 @@ fn network_adapter_card_facts(
         None,
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Network adapter", facts)
+    (L().type_network_adapter, facts)
 }
 
 /// Facts for a §2.1 network-device-function card; the `NetDevFuncType`
@@ -1030,17 +1059,21 @@ fn network_device_function_card_facts(
         status,
     } = resource
     else {
-        return ("Network device function", Vec::new());
+        return (L().type_network_device_function, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Function type", net_dev_func_type.as_deref());
     push_fact(
         &mut facts,
-        "Device enabled",
+        L().fact_function_type,
+        net_dev_func_type.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        L().fact_device_enabled,
         device_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Network device function", facts)
+    (L().type_network_device_function, facts)
 }
 
 /// Facts for a §2.1 ethernet-interface card; `speed_mbps` stays numeric so
@@ -1061,18 +1094,18 @@ fn ethernet_interface_card_facts(
         status,
     } = resource
     else {
-        return ("Ethernet interface", Vec::new());
+        return (L().type_ethernet_interface, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "MAC address", mac_address.as_deref());
-    push_u64_fact(&mut facts, "Speed (Mbps)", *speed_mbps);
+    push_fact(&mut facts, L().fact_mac_address, mac_address.as_deref());
+    push_u64_fact(&mut facts, L().fact_speed_mbps, *speed_mbps);
     push_fact(
         &mut facts,
-        "Interface enabled",
+        L().fact_interface_enabled,
         interface_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Ethernet interface", facts)
+    (L().type_ethernet_interface, facts)
 }
 
 /// Facts for a §2.1 accounts card (a `ManagerAccount`); the enabled and
@@ -1092,21 +1125,21 @@ fn account_card_facts(
         locked,
     } = resource
     else {
-        return ("Account", Vec::new());
+        return (L().type_account, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Enabled",
+        L().fact_enabled,
         enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
-    push_fact(&mut facts, L.field_role, role_id.as_deref());
+    push_fact(&mut facts, L().field_role, role_id.as_deref());
     push_fact(
         &mut facts,
-        "Locked",
+        L().fact_locked,
         locked.map(|locked| if locked { "Yes" } else { "No" }),
     );
-    ("Account", facts)
+    (L().type_account, facts)
 }
 
 /// Facts for a §2.1 bios card; only the attribute-registry metadata that
@@ -1121,15 +1154,15 @@ fn bios_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::Bios { attribute_registry } = resource else {
-        return ("BIOS", Vec::new());
+        return (L().page_bios, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Attribute registry",
+        L().fact_attribute_registry,
         attribute_registry.as_deref(),
     );
-    ("BIOS", facts)
+    (L().page_bios, facts)
 }
 
 /// Facts for a §2.1 boot-option card; `boot_option_enabled` stays a Boolean
@@ -1148,17 +1181,21 @@ fn boot_option_card_facts(
         uefi_device_path,
     } = resource
     else {
-        return ("Boot option", Vec::new());
+        return (L().type_boot_option, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, L.field_display_name, display_name.as_deref());
+    push_fact(&mut facts, L().field_display_name, display_name.as_deref());
     push_fact(
         &mut facts,
-        "Enabled",
+        L().fact_enabled,
         boot_option_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
-    push_fact(&mut facts, "UEFI device path", uefi_device_path.as_deref());
-    ("Boot option", facts)
+    push_fact(
+        &mut facts,
+        L().fact_uefi_device_path,
+        uefi_device_path.as_deref(),
+    );
+    (L().type_boot_option, facts)
 }
 
 /// Facts for a §2.1 secure-boot card; `secure_boot_mode` stays the original
@@ -1176,16 +1213,20 @@ fn secure_boot_card_facts(
         secure_boot_mode,
     } = resource
     else {
-        return ("Secure Boot", Vec::new());
+        return (L().page_secure_boot, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Secure boot enabled",
+        L().fact_secure_boot_enabled,
         secure_boot_enable.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
-    push_fact(&mut facts, "Secure boot mode", secure_boot_mode.as_deref());
-    ("Secure Boot", facts)
+    push_fact(
+        &mut facts,
+        L().fact_secure_boot_mode,
+        secure_boot_mode.as_deref(),
+    );
+    (L().page_secure_boot, facts)
 }
 
 /// Facts for a §2.1 power card. The `Power_v1` projection carries no
@@ -1200,7 +1241,7 @@ fn power_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::Power {} = resource else {
-        return ("Power", Vec::new());
+        return (L().page_power, Vec::new());
     };
     ("Power", Vec::new())
 }
@@ -1227,10 +1268,14 @@ fn power_equipment_card_facts(
         status,
     } = resource
     else {
-        return ("Power equipment", Vec::new());
+        return (L().type_power_equipment, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Equipment type", equipment_type.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_equipment_type,
+        equipment_type.as_deref(),
+    );
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -1238,10 +1283,14 @@ fn power_equipment_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "Version", version.as_deref());
-    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_fact(&mut facts, L().fact_version, version.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_firmware_version,
+        firmware_version.as_deref(),
+    );
     push_status_facts(&mut facts, status.as_ref());
-    ("Power equipment", facts)
+    (L().type_power_equipment, facts)
 }
 
 /// Facts for a §2.1 power-supply card; the `PowerSupplyType` enumeration and
@@ -1266,11 +1315,15 @@ fn power_supply_card_facts(
         status,
     } = resource
     else {
-        return ("Power supply", Vec::new());
+        return (L().type_power_supply, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Supply type", power_supply_type.as_deref());
-    push_f64_fact(&mut facts, "Capacity (W)", *power_capacity_watts);
+    push_fact(
+        &mut facts,
+        L().fact_supply_type,
+        power_supply_type.as_deref(),
+    );
+    push_f64_fact(&mut facts, L().fact_capacity_w, *power_capacity_watts);
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -1278,9 +1331,13 @@ fn power_supply_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_firmware_version,
+        firmware_version.as_deref(),
+    );
     push_status_facts(&mut facts, status.as_ref());
-    ("Power supply", facts)
+    (L().type_power_supply, facts)
 }
 
 /// Facts for a §2.1 thermal card; only the resource-level status values are
@@ -1295,11 +1352,11 @@ fn thermal_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::Thermal { status } = resource else {
-        return ("Thermal", Vec::new());
+        return (L().page_thermal, Vec::new());
     };
     let mut facts = Vec::new();
     push_status_facts(&mut facts, status.as_ref());
-    ("Thermal", facts)
+    (L().page_thermal, facts)
 }
 
 /// Facts for a §2.1 sensors card; the reading and its UCUM units stay as
@@ -1319,14 +1376,14 @@ fn sensor_card_facts(
         status,
     } = resource
     else {
-        return ("Sensor", Vec::new());
+        return (L().type_sensor, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Reading type", reading_type.as_deref());
-    push_f64_fact(&mut facts, "Reading", *reading);
-    push_fact(&mut facts, "Reading units", reading_units.as_deref());
+    push_fact(&mut facts, L().fact_reading_type, reading_type.as_deref());
+    push_f64_fact(&mut facts, L().fact_reading, *reading);
+    push_fact(&mut facts, L().fact_reading_units, reading_units.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("Sensor", facts)
+    (L().type_sensor, facts)
 }
 
 /// Facts for a §2.1 controls card; the set point stays numeric as published
@@ -1345,13 +1402,13 @@ fn control_card_facts(
         status,
     } = resource
     else {
-        return ("Control", Vec::new());
+        return (L().type_control, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Control type", control_type.as_deref());
-    push_f64_fact(&mut facts, "Set point", *set_point);
+    push_fact(&mut facts, L().fact_control_type, control_type.as_deref());
+    push_f64_fact(&mut facts, L().fact_set_point, *set_point);
     push_status_facts(&mut facts, status.as_ref());
-    ("Control", facts)
+    (L().type_control, facts)
 }
 
 /// Facts for a §2.1 environment-metrics card; every embedded measurement the
@@ -1383,33 +1440,53 @@ fn environment_metrics_card_facts(
         current_amps,
     } = resource
     else {
-        return ("Environment metrics", Vec::new());
+        return (L().type_environment_metrics, Vec::new());
     };
     let mut facts = Vec::new();
-    push_environment_reading_fact(&mut facts, "Temperature (C)", temperature_celsius.as_ref());
-    push_environment_reading_fact(&mut facts, "Humidity (%)", humidity_percent.as_ref());
+    push_environment_reading_fact(
+        &mut facts,
+        L().fact_temperature_c,
+        temperature_celsius.as_ref(),
+    );
+    push_environment_reading_fact(
+        &mut facts,
+        L().fact_humidity_percent,
+        humidity_percent.as_ref(),
+    );
     push_u64_fact(
         &mut facts,
-        "Fan readings",
+        L().fact_fan_readings,
         fan_speeds_percent
             .as_ref()
             .map(|speeds| speeds.len() as u64),
     );
-    push_environment_reading_fact(&mut facts, "Power (W)", power_watts.as_ref());
-    push_environment_reading_fact(&mut facts, "Energy (kWh)", energyk_wh.as_ref());
-    push_environment_reading_fact(&mut facts, "Power load (%)", power_load_percent.as_ref());
-    push_environment_control_fact(&mut facts, "Power limit (W)", power_limit_watts.as_ref());
-    push_environment_reading_fact(&mut facts, "Dew point (C)", dew_point_celsius.as_ref());
-    push_environment_reading_fact(&mut facts, "Absolute humidity", absolute_humidity.as_ref());
-    push_environment_reading_fact(&mut facts, "Energy (J)", energy_joules.as_ref());
+    push_environment_reading_fact(&mut facts, L().fact_power_w, power_watts.as_ref());
+    push_environment_reading_fact(&mut facts, L().fact_energy_kwh, energyk_wh.as_ref());
     push_environment_reading_fact(
         &mut facts,
-        "Ambient temperature (C)",
+        L().fact_power_load_percent,
+        power_load_percent.as_ref(),
+    );
+    push_environment_control_fact(
+        &mut facts,
+        L().fact_power_limit_w,
+        power_limit_watts.as_ref(),
+    );
+    push_environment_reading_fact(&mut facts, L().fact_dew_point_c, dew_point_celsius.as_ref());
+    push_environment_reading_fact(
+        &mut facts,
+        L().fact_absolute_humidity,
+        absolute_humidity.as_ref(),
+    );
+    push_environment_reading_fact(&mut facts, L().fact_energy_j, energy_joules.as_ref());
+    push_environment_reading_fact(
+        &mut facts,
+        L().fact_ambient_temperature,
         ambient_temperature_celsius.as_ref(),
     );
-    push_environment_reading_fact(&mut facts, "Voltage (V)", voltage.as_ref());
-    push_environment_reading_fact(&mut facts, "Current (A)", current_amps.as_ref());
-    ("Environment metrics", facts)
+    push_environment_reading_fact(&mut facts, L().fact_voltage_v, voltage.as_ref());
+    push_environment_reading_fact(&mut facts, L().fact_current_a, current_amps.as_ref());
+    (L().type_environment_metrics, facts)
 }
 
 /// Pushes one environment-metrics sensor-excerpt reading as a fact, keeping
@@ -1460,17 +1537,17 @@ fn log_service_card_facts(
         status,
     } = resource
     else {
-        return ("Log Service", Vec::new());
+        return (L().type_log_service, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Service enabled",
+        L().fact_service_enabled,
         service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
-    push_u64_fact(&mut facts, "Max records", *max_log_entries);
+    push_u64_fact(&mut facts, L().fact_max_records, *max_log_entries);
     push_status_facts(&mut facts, status.as_ref());
-    ("Log Service", facts)
+    (L().type_log_service, facts)
 }
 
 /// Facts for a §2.1 manager-network-protocol card; the direct `HostName` and
@@ -1490,13 +1567,13 @@ fn manager_network_protocol_card_facts(
         status,
     } = resource
     else {
-        return ("Manager Network Protocol", Vec::new());
+        return (L().type_manager_network_protocol, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, L.field_host_name, host_name.as_deref());
-    push_fact(&mut facts, "FQDN", fqdn.as_deref());
+    push_fact(&mut facts, L().field_host_name, host_name.as_deref());
+    push_fact(&mut facts, L().fact_fqdn, fqdn.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("Manager Network Protocol", facts)
+    (L().type_manager_network_protocol, facts)
 }
 
 /// Facts for a §2.1 host-interface card; the interface-enabled flag renders
@@ -1517,16 +1594,16 @@ fn host_interface_card_facts(
         status,
     } = resource
     else {
-        return ("Host Interface", Vec::new());
+        return (L().type_host_interface, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Interface enabled",
+        L().fact_interface_enabled,
         interface_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Host Interface", facts)
+    (L().type_host_interface, facts)
 }
 
 /// Facts for a §2.1 pcie-device card; the `DeviceType` enumeration and the
@@ -1546,10 +1623,10 @@ fn pcie_device_card_facts(
         status,
     } = resource
     else {
-        return ("PCIe device", Vec::new());
+        return (L().type_pcie_device, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Device type", device_type.as_deref());
+    push_fact(&mut facts, L().fact_device_type, device_type.as_deref());
     push_hardware_facts(
         &mut facts,
         manufacturer.as_deref(),
@@ -1558,7 +1635,7 @@ fn pcie_device_card_facts(
         None,
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("PCIe device", facts)
+    (L().type_pcie_device, facts)
 }
 
 /// Facts for a §2.1 assembly card (one `AssemblyData` member); the `Producer`
@@ -1573,12 +1650,12 @@ fn assembly_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::Assembly { producer, status } = resource else {
-        return ("Assembly", Vec::new());
+        return (L().page_assembly, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Producer", producer.as_deref());
+    push_fact(&mut facts, L().fact_producer, producer.as_deref());
     push_status_facts(&mut facts, status.as_ref());
-    ("Assembly", facts)
+    (L().page_assembly, facts)
 }
 
 /// Facts for a `software-inventory` card under the §2.1 `update-service`
@@ -1599,21 +1676,21 @@ fn software_inventory_card_facts(
         status,
     } = resource
     else {
-        return ("Software inventory", Vec::new());
+        return (L().type_software_inventory, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Software ID", software_id.as_deref());
-    push_fact(&mut facts, "Version", version.as_deref());
+    push_fact(&mut facts, L().fact_software_id, software_id.as_deref());
+    push_fact(&mut facts, L().fact_version, version.as_deref());
     push_fact(
         &mut facts,
-        "Release date",
+        L().fact_release_date,
         release_date
             .as_ref()
             .and_then(|value| value.format(&Rfc3339).ok())
             .as_deref(),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Software inventory", facts)
+    (L().type_software_inventory, facts)
 }
 
 /// Facts for a §2.1 event-service card; the service-enabled flag renders as
@@ -1633,16 +1710,16 @@ fn event_service_card_facts(
         status,
     } = resource
     else {
-        return ("Event Service", Vec::new());
+        return (L().type_event_service, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Service enabled",
+        L().fact_service_enabled,
         service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Event Service", facts)
+    (L().type_event_service, facts)
 }
 
 /// Facts for one subscription under the §2.1 `event-service` family; the
@@ -1664,22 +1741,22 @@ fn event_subscription_card_facts(
         status,
     } = resource
     else {
-        return ("Event subscription", Vec::new());
+        return (L().type_event_subscription, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, L.field_destination, destination.as_deref());
-    push_fact(&mut facts, L.field_protocol, protocol.as_deref());
-    push_fact(&mut facts, "Context", context.as_deref());
+    push_fact(&mut facts, L().field_destination, destination.as_deref());
+    push_fact(&mut facts, L().field_protocol, protocol.as_deref());
+    push_fact(&mut facts, L().fact_context, context.as_deref());
     push_fact(
         &mut facts,
-        L.field_event_types,
+        L().field_event_types,
         event_types
             .as_deref()
             .map(|types| types.join(", "))
             .as_deref(),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Event subscription", facts)
+    (L().type_event_subscription, facts)
 }
 
 /// Facts for a §2.1 telemetry-service card; the compiled `TelemetryService`
@@ -1695,11 +1772,11 @@ fn telemetry_service_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::TelemetryService { status } = resource else {
-        return ("Telemetry Service", Vec::new());
+        return (L().type_telemetry_service, Vec::new());
     };
     let mut facts = Vec::new();
     push_status_facts(&mut facts, status.as_ref());
-    ("Telemetry Service", facts)
+    (L().type_telemetry_service, facts)
 }
 
 /// Facts for one metric definition under the §2.1 `telemetry-service` family;
@@ -1714,12 +1791,12 @@ fn metric_definition_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::MetricDefinition { units, metric_type } = resource else {
-        return ("Metric definition", Vec::new());
+        return (L().type_metric_definition, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Units", units.as_deref());
-    push_fact(&mut facts, "Metric type", metric_type.as_deref());
-    ("Metric definition", facts)
+    push_fact(&mut facts, L().fact_units, units.as_deref());
+    push_fact(&mut facts, L().fact_metric_type, metric_type.as_deref());
+    (L().type_metric_definition, facts)
 }
 
 /// Facts for one metric report under the §2.1 `telemetry-service` family; the
@@ -1740,20 +1817,20 @@ fn metric_report_card_facts(
         metric_values,
     } = resource
     else {
-        return ("Metric report", Vec::new());
+        return (L().type_metric_report, Vec::new());
     };
     let mut facts = Vec::new();
-    push_u64_fact(&mut facts, "Metric values", *metric_values_count);
+    push_u64_fact(&mut facts, L().fact_metric_values, *metric_values_count);
     // The latest reading is the newest entry that still carries a value;
     // readings without a value (explicit null) are skipped.
     push_fact(
         &mut facts,
-        "Latest value",
+        L().fact_latest_value,
         metric_values
             .as_ref()
             .and_then(|values| values.iter().rev().find_map(MetricValueResponse::value)),
     );
-    ("Metric report", facts)
+    (L().type_metric_report, facts)
 }
 
 /// Facts for a §2.1 task-service card; the service-enabled flag renders as
@@ -1773,21 +1850,21 @@ fn task_service_card_facts(
         status,
     } = resource
     else {
-        return ("Task Service", Vec::new());
+        return (L().type_task_service, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Service enabled",
+        L().fact_service_enabled,
         service_enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
     push_fact(
         &mut facts,
-        "Completed task policy",
+        L().fact_completed_task_policy,
         completed_task_overwrite_policy.as_deref(),
     );
     push_status_facts(&mut facts, status.as_ref());
-    ("Task Service", facts)
+    (L().type_task_service, facts)
 }
 
 /// Facts for one task under the §2.1 `task-service` family; the state and
@@ -1810,15 +1887,15 @@ fn task_card_facts(
         end_time,
     } = resource
     else {
-        return ("Task", Vec::new());
+        return (L().type_task, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Task state", task_state.as_deref());
-    push_fact(&mut facts, "Task status", task_status.as_deref());
-    push_u64_fact(&mut facts, "Percent complete", *percent_complete);
+    push_fact(&mut facts, L().fact_task_state, task_state.as_deref());
+    push_fact(&mut facts, L().fact_task_status, task_status.as_deref());
+    push_u64_fact(&mut facts, L().fact_percent_complete, *percent_complete);
     push_fact(
         &mut facts,
-        "Start time",
+        L().fact_start_time,
         start_time
             .as_ref()
             .and_then(|value| value.format(&Rfc3339).ok())
@@ -1826,13 +1903,13 @@ fn task_card_facts(
     );
     push_fact(
         &mut facts,
-        "End time",
+        L().fact_end_time,
         end_time
             .as_ref()
             .and_then(|value| value.format(&Rfc3339).ok())
             .as_deref(),
     );
-    ("Task", facts)
+    (L().type_task, facts)
 }
 
 /// Facts for the Dell OEM card under the §0.5.0 `oem-dell-attributes`
@@ -1859,19 +1936,27 @@ fn oem_dell_card_facts(
         server_name,
     } = resource
     else {
-        return ("Dell OEM", Vec::new());
+        return (L().type_dell_oem, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Model", server_model.as_deref());
-    push_fact(&mut facts, "Service tag", server_service_tag.as_deref());
-    push_fact(&mut facts, "Generation", server_generation.as_deref());
+    push_fact(&mut facts, L().fact_model, server_model.as_deref());
     push_fact(
         &mut facts,
-        "BMC MAC address",
+        L().fact_service_tag,
+        server_service_tag.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        L().label_generation,
+        server_generation.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        L().fact_bmc_mac_address,
         server_bmc_mac_address.as_deref(),
     );
-    push_fact(&mut facts, "Server name", server_name.as_deref());
-    ("Dell OEM", facts)
+    push_fact(&mut facts, L().fact_server_name, server_name.as_deref());
+    (L().type_dell_oem, facts)
 }
 
 /// Facts for the Supermicro `SysLockdown` OEM card under the §0.5.0
@@ -1894,15 +1979,15 @@ fn oem_smc_sys_lockdown_card_facts(
         sys_lockdown_enabled,
     } = resource
     else {
-        return ("Supermicro SysLockdown", Vec::new());
+        return (L().type_smc_sys_lockdown, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "SysLockdown enabled",
+        L().fact_sys_lockdown_enabled,
         sys_lockdown_enabled.map(|enabled| if enabled { "true" } else { "false" }),
     );
-    ("Supermicro SysLockdown", facts)
+    (L().type_smc_sys_lockdown, facts)
 }
 
 /// Facts for the Supermicro `KcsInterface` OEM card under the §0.5.0
@@ -1921,11 +2006,11 @@ fn oem_smc_kcs_interface_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::OemSmcKcsInterface { privilege } = resource else {
-        return ("Supermicro KCS Interface", Vec::new());
+        return (L().type_smc_kcs_interface, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Privilege", privilege.as_deref());
-    ("Supermicro KCS Interface", facts)
+    push_fact(&mut facts, L().fact_privilege, privilege.as_deref());
+    (L().type_smc_kcs_interface, facts)
 }
 
 /// Facts for the NVIDIA `SystemConfigProfile` chain-root card under the
@@ -1944,22 +2029,22 @@ fn oem_nvidia_system_config_profile_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::OemNvidiaSystemConfigProfile { truststore } = resource else {
-        return ("NVIDIA System Config Profile", Vec::new());
+        return (L().type_nvidia_system_config_profile, Vec::new());
     };
     let mut facts = Vec::new();
     if let Some(truststore) = truststore {
         push_boolean_fact(
             &mut facts,
-            "NVIDIA certificates",
+            L().fact_nvidia_certificates,
             truststore.nvidia_certificates(),
         );
         push_boolean_fact(
             &mut facts,
-            "OEM certificates",
+            L().fact_oem_certificates,
             truststore.oem_certificates(),
         );
     }
-    ("NVIDIA System Config Profile", facts)
+    (L().type_nvidia_system_config_profile, facts)
 }
 
 /// Facts for the NVIDIA `SystemConfigProfileStatus` card under the §0.5.0
@@ -1985,23 +2070,35 @@ fn oem_nvidia_system_config_profile_status_card_facts(
         default_profile_index,
     } = resource
     else {
-        return ("NVIDIA Profile Status", Vec::new());
+        return (L().type_nvidia_profile_status, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Pending activation",
+        L().fact_pending_activation,
         pending_list_activation.as_deref(),
     );
-    push_i64_fact(&mut facts, "Active profile index", *active_profile_index);
-    push_i64_fact(&mut facts, "BMC profile version", *bmc_profile_version);
+    push_i64_fact(
+        &mut facts,
+        L().fact_active_profile_index,
+        *active_profile_index,
+    );
+    push_i64_fact(
+        &mut facts,
+        L().fact_bmc_profile_version,
+        *bmc_profile_version,
+    );
     push_fact(
         &mut facts,
-        "Factory reset status",
+        L().fact_factory_reset_status,
         factory_reset_status.as_deref(),
     );
-    push_i64_fact(&mut facts, "Default profile index", *default_profile_index);
-    ("NVIDIA Profile Status", facts)
+    push_i64_fact(
+        &mut facts,
+        L().fact_default_profile_index,
+        *default_profile_index,
+    );
+    (L().type_nvidia_profile_status, facts)
 }
 
 /// Facts for the NVIDIA `SystemProfile` card under the §0.5.0
@@ -2027,15 +2124,15 @@ fn oem_nvidia_system_profile_card_facts(
         profile_name,
     } = resource
     else {
-        return ("NVIDIA System Profile", Vec::new());
+        return (L().type_nvidia_system_profile, Vec::new());
     };
     let mut facts = Vec::new();
-    push_boolean_fact(&mut facts, "Default", *default);
-    push_fact(&mut facts, "Owner", owner.as_deref());
-    push_fact(&mut facts, "UUID", uuid.as_deref());
-    push_i64_fact(&mut facts, "Version", *version);
-    push_fact(&mut facts, "Profile name", profile_name.as_deref());
-    ("NVIDIA System Profile", facts)
+    push_boolean_fact(&mut facts, L().fact_default, *default);
+    push_fact(&mut facts, L().fact_owner, owner.as_deref());
+    push_fact(&mut facts, L().fact_uuid, uuid.as_deref());
+    push_i64_fact(&mut facts, L().fact_version, *version);
+    push_fact(&mut facts, L().fact_profile_name, profile_name.as_deref());
+    (L().type_nvidia_system_profile, facts)
 }
 
 /// Facts for the NVIDIA `SystemProfileFile` card under the §0.5.0
@@ -2062,21 +2159,25 @@ fn oem_nvidia_system_profile_file_card_facts(
         profile,
     } = resource
     else {
-        return ("NVIDIA Profile File", Vec::new());
+        return (L().type_nvidia_profile_file, Vec::new());
     };
     let mut facts = Vec::new();
-    push_boolean_fact(&mut facts, "Activate", *metadata_activate);
-    push_boolean_fact(&mut facts, L.action_delete, *metadata_delete);
+    push_boolean_fact(&mut facts, L().fact_activate, *metadata_activate);
+    push_boolean_fact(&mut facts, L().action_delete, *metadata_delete);
     push_fact(
         &mut facts,
-        "Origin profile UUID",
+        L().fact_origin_profile_uuid,
         metadata_origin_profile_uuid.as_deref(),
     );
-    push_boolean_fact(&mut facts, "More profiles", *metadata_more_profiles);
-    push_fact(&mut facts, "Project name", metadata_project_name.as_deref());
-    push_fact(&mut facts, "UUID", metadata_uuid.as_deref());
-    push_fact(&mut facts, "Profile", profile.as_deref());
-    ("NVIDIA Profile File", facts)
+    push_boolean_fact(&mut facts, L().fact_more_profiles, *metadata_more_profiles);
+    push_fact(
+        &mut facts,
+        L().fact_project_name,
+        metadata_project_name.as_deref(),
+    );
+    push_fact(&mut facts, L().fact_uuid, metadata_uuid.as_deref());
+    push_fact(&mut facts, L().fact_profile, profile.as_deref());
+    (L().type_nvidia_profile_file, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPowerComplianceManager` chain-root card under
@@ -2094,11 +2195,11 @@ fn oem_nvidia_power_compliance_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::OemNvidiaPowerCompliance { manager_type } = resource else {
-        return ("NVIDIA Power Compliance", Vec::new());
+        return (L().type_nvidia_power_compliance, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Manager type", manager_type.as_deref());
-    ("NVIDIA Power Compliance", facts)
+    push_fact(&mut facts, L().fact_manager_type, manager_type.as_deref());
+    (L().type_nvidia_power_compliance, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPowerDomain` card under the §0.5.0
@@ -2124,19 +2225,23 @@ fn oem_nvidia_power_domain_card_facts(
         sensor_impl,
     } = resource
     else {
-        return ("NVIDIA Power Domain", Vec::new());
+        return (L().type_nvidia_power_domain, Vec::new());
     };
     let mut facts = Vec::new();
-    push_i64_fact(&mut facts, "Value", *value);
-    push_fact(&mut facts, "Type", r#type.as_deref());
-    push_fact(&mut facts, "Unit", unit.as_deref());
+    push_i64_fact(&mut facts, L().fact_value, *value);
+    push_fact(&mut facts, L().fact_type, r#type.as_deref());
+    push_fact(&mut facts, L().fact_unit, unit.as_deref());
     push_fact(
         &mut facts,
-        "Sensor reading type",
+        L().fact_sensor_reading_type,
         sensor_reading_type.as_deref(),
     );
-    push_fact(&mut facts, "Sensor implementation", sensor_impl.as_deref());
-    ("NVIDIA Power Domain", facts)
+    push_fact(
+        &mut facts,
+        L().fact_sensor_implementation,
+        sensor_impl.as_deref(),
+    );
+    (L().type_nvidia_power_domain, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPowerPolicy` card under the §0.5.0
@@ -2165,20 +2270,24 @@ fn oem_nvidia_power_policy_card_facts(
         policy_actions,
     } = resource
     else {
-        return ("NVIDIA Power Policy", Vec::new());
+        return (L().type_nvidia_power_policy, Vec::new());
     };
     let mut facts = Vec::new();
     push_boolean_fact(
         &mut facts,
-        "Auto deassert power brake",
+        L().fact_auto_deassert_power_brake,
         *auto_deassert_power_brake,
     );
-    push_i64_fact(&mut facts, "Min", *min);
-    push_i64_fact(&mut facts, "Max", *max);
-    push_fact(&mut facts, "Type", r#type.as_deref());
-    push_fact(&mut facts, "Unit", unit.as_deref());
-    push_fact(&mut facts, "Policy actions", policy_actions.as_deref());
-    ("NVIDIA Power Policy", facts)
+    push_i64_fact(&mut facts, L().fact_min, *min);
+    push_i64_fact(&mut facts, L().fact_max, *max);
+    push_fact(&mut facts, L().fact_type, r#type.as_deref());
+    push_fact(&mut facts, L().fact_unit, unit.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_policy_actions,
+        policy_actions.as_deref(),
+    );
+    (L().type_nvidia_power_policy, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaManagedEntityGroup` card under the §0.5.0
@@ -2198,15 +2307,15 @@ fn oem_nvidia_managed_entity_group_card_facts(
         current_managed_entity_id,
     } = resource
     else {
-        return ("NVIDIA Managed Entity Group", Vec::new());
+        return (L().type_nvidia_managed_entity_group, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Current managed entity",
+        L().fact_current_managed_entity,
         current_managed_entity_id.as_deref(),
     );
-    ("NVIDIA Managed Entity Group", facts)
+    (L().type_nvidia_managed_entity_group, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPowerStateGroup` card under the §0.5.0
@@ -2231,14 +2340,18 @@ fn oem_nvidia_power_state_group_card_facts(
         number_of_local_psus,
     } = resource
     else {
-        return ("NVIDIA Power State Group", Vec::new());
+        return (L().type_nvidia_power_state_group, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "PSC ID", psc_id.as_deref());
-    push_i64_fact(&mut facts, "Generated watts", *generated_watts);
-    push_i64_fact(&mut facts, "Number of PSCs", *number_of_pscs);
-    push_i64_fact(&mut facts, "Number of local PSUs", *number_of_local_psus);
-    ("NVIDIA Power State Group", facts)
+    push_fact(&mut facts, L().fact_psc_id, psc_id.as_deref());
+    push_i64_fact(&mut facts, L().fact_generated_watts, *generated_watts);
+    push_i64_fact(&mut facts, L().fact_number_of_pscs, *number_of_pscs);
+    push_i64_fact(
+        &mut facts,
+        L().fact_number_of_local_psus,
+        *number_of_local_psus,
+    );
+    (L().type_nvidia_power_state_group, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPscState` card under the §0.5.0
@@ -2265,19 +2378,23 @@ fn oem_nvidia_psc_state_card_facts(
         status,
     } = resource
     else {
-        return ("NVIDIA PSC State", Vec::new());
+        return (L().type_nvidia_psc_state, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "PSC ID", psc_id.as_deref());
-    push_i64_fact(&mut facts, "Operational PSUs", *num_of_operational_psus);
-    push_boolean_fact(&mut facts, "Power brake assert", *power_brake_assert);
+    push_fact(&mut facts, L().fact_psc_id, psc_id.as_deref());
     push_i64_fact(
         &mut facts,
-        "Milliseconds since last heartbeat",
+        L().fact_operational_psus,
+        *num_of_operational_psus,
+    );
+    push_boolean_fact(&mut facts, L().fact_power_brake_assert, *power_brake_assert);
+    push_i64_fact(
+        &mut facts,
+        L().fact_ms_since_last_heartbeat,
         *milliseconds_since_last_heartbeat,
     );
-    push_fact(&mut facts, "Status", status.as_deref());
-    ("NVIDIA PSC State", facts)
+    push_fact(&mut facts, L().fact_status, status.as_deref());
+    (L().type_nvidia_psc_state, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPsuState` card under the §0.5.0
@@ -2302,14 +2419,14 @@ fn oem_nvidia_psu_state_card_facts(
         input2active,
     } = resource
     else {
-        return ("NVIDIA PSU State", Vec::new());
+        return (L().type_nvidia_psu_state, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "PSU ID", psu_id.as_deref());
-    push_boolean_fact(&mut facts, "Presence", *presence);
-    push_boolean_fact(&mut facts, "Input 1 active", *input1active);
-    push_boolean_fact(&mut facts, "Input 2 active", *input2active);
-    ("NVIDIA PSU State", facts)
+    push_fact(&mut facts, L().fact_psu_id, psu_id.as_deref());
+    push_boolean_fact(&mut facts, L().fact_presence, *presence);
+    push_boolean_fact(&mut facts, L().fact_input_1_active, *input1active);
+    push_boolean_fact(&mut facts, L().fact_input_2_active, *input2active);
+    (L().type_nvidia_psu_state, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaPsuRedundancy` card under the §0.5.0
@@ -2333,21 +2450,25 @@ fn oem_nvidia_psu_redundancy_card_facts(
         redundancy_setting,
     } = resource
     else {
-        return ("NVIDIA PSU Redundancy", Vec::new());
+        return (L().type_nvidia_psu_redundancy, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Max PSUs supported",
+        L().fact_max_psus_supported,
         max_num_supported.as_deref(),
     );
-    push_fact(&mut facts, "Min PSUs needed", min_num_needed.as_deref());
     push_fact(
         &mut facts,
-        "Redundancy setting",
+        L().fact_min_psus_needed,
+        min_num_needed.as_deref(),
+    );
+    push_fact(
+        &mut facts,
+        L().fact_redundancy_setting,
         redundancy_setting.as_deref(),
     );
-    ("NVIDIA PSU Redundancy", facts)
+    (L().type_nvidia_psu_redundancy, facts)
 }
 
 /// Facts for the NVIDIA `NvidiaManagedEntity` card under the §0.5.0
@@ -2372,18 +2493,18 @@ fn oem_nvidia_managed_entity_card_facts(
         port,
     } = resource
     else {
-        return ("NVIDIA Managed Entity", Vec::new());
+        return (L().type_nvidia_managed_entity, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Transport protocol",
+        L().fact_transport_protocol,
         transport_protocol.as_deref(),
     );
-    push_fact(&mut facts, "IPv4 address", ipv4_address.as_deref());
-    push_fact(&mut facts, "IPv6 address", ipv6_address.as_deref());
-    push_i64_fact(&mut facts, "Port", *port);
-    ("NVIDIA Managed Entity", facts)
+    push_fact(&mut facts, L().fact_ipv4_address, ipv4_address.as_deref());
+    push_fact(&mut facts, L().fact_ipv6_address, ipv6_address.as_deref());
+    push_i64_fact(&mut facts, L().fact_port, *port);
+    (L().type_nvidia_managed_entity, facts)
 }
 
 /// Facts for the Lenovo `SecurityService` OEM card under the §0.5.0
@@ -2402,11 +2523,15 @@ fn oem_lenovo_security_service_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::OemLenovoSecurityService { fw_rollback } = resource else {
-        return ("Lenovo Security Service", Vec::new());
+        return (L().type_lenovo_security_service, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Firmware rollback", fw_rollback.as_deref());
-    ("Lenovo Security Service", facts)
+    push_fact(
+        &mut facts,
+        L().fact_firmware_rollback,
+        fw_rollback.as_deref(),
+    );
+    (L().type_lenovo_security_service, facts)
 }
 
 /// The §12.2 AMI `AmiServiceRoot` OEM card facts: the Redfish Technology
@@ -2421,15 +2546,15 @@ fn oem_ami_service_root_card_facts(
     resource: &CoreResourceDetailsResponse,
 ) -> (&'static str, Vec<ResourceFactProjection>) {
     let CoreResourceDetailsResponse::OemAmiServiceRoot { rtp_version } = resource else {
-        return ("AMI Service Root", Vec::new());
+        return (L().type_ami_service_root, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Redfish Technology Pack version",
+        L().fact_redfish_tech_pack_version,
         rtp_version.as_deref(),
     );
-    ("AMI Service Root", facts)
+    (L().type_ami_service_root, facts)
 }
 
 /// The §12.2 AMI `ConfigBmc` OEM card facts: the four BIOS lockout/lockdown
@@ -2452,30 +2577,30 @@ fn oem_ami_config_bmc_card_facts(
         lockdown_bios_upgrade_downgrade,
     } = resource
     else {
-        return ("AMI Config BMC", Vec::new());
+        return (L().type_ami_config_bmc, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Host control lockout",
+        L().fact_host_control_lockout,
         lockout_host_control.as_deref(),
     );
     push_fact(
         &mut facts,
-        "BIOS variable write lockout",
+        L().fact_bios_variable_write_lockout,
         lockout_bios_variable_write_mode.as_deref(),
     );
     push_fact(
         &mut facts,
-        "BIOS settings-change lockdown",
+        L().fact_bios_settings_change_lockdown,
         lockdown_bios_settings_change.as_deref(),
     );
     push_fact(
         &mut facts,
-        "BIOS upgrade/downgrade lockdown",
+        L().fact_bios_upgrade_downgrade_lockdown,
         lockdown_bios_upgrade_downgrade.as_deref(),
     );
-    ("AMI Config BMC", facts)
+    (L().type_ami_config_bmc, facts)
 }
 
 /// The §12.2 HPE `HpeiLoServiceExt` OEM card facts: the iLO manager type and
@@ -2495,16 +2620,16 @@ fn oem_hpe_ilo_service_ext_card_facts(
         manager_firmware_version,
     } = resource
     else {
-        return ("HPE iLO Service Extension", Vec::new());
+        return (L().type_hpe_ilo_service_ext, Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Manager type", manager_type.as_deref());
+    push_fact(&mut facts, L().fact_manager_type, manager_type.as_deref());
     push_fact(
         &mut facts,
-        "Manager firmware version",
+        L().fact_manager_firmware_version,
         manager_firmware_version.as_deref(),
     );
-    ("HPE iLO Service Extension", facts)
+    (L().type_hpe_ilo_service_ext, facts)
 }
 
 /// The §12.2 HPE `HpeiLo` OEM card facts: the host-side virtual NIC support
@@ -2522,16 +2647,16 @@ fn oem_hpe_manager_card_facts(
         virtual_nic_enabled,
     } = resource
     else {
-        return ("HPE iLO Manager", Vec::new());
+        return (L().type_hpe_ilo_manager, Vec::new());
     };
     let mut facts = Vec::new();
     if let Some(virtual_nic_enabled) = virtual_nic_enabled {
         facts.push(ResourceFactProjection {
-            label: "Virtual NIC enabled",
+            label: L().fact_virtual_nic_enabled,
             value: virtual_nic_enabled.to_string(),
         });
     }
-    ("HPE iLO Manager", facts)
+    (L().type_hpe_ilo_manager, facts)
 }
 
 /// The §12.2 `LiteOn` power-supply OEM card facts: the `PowerSupplyType`
@@ -2557,17 +2682,17 @@ fn oem_liteon_power_supply_card_facts(
         status,
     } = resource
     else {
-        return ("LiteOn Power Supply", Vec::new());
+        return (L().type_liteon_power_supply, Vec::new());
     };
     let mut facts = Vec::new();
     push_fact(
         &mut facts,
-        "Power supply type",
+        L().fact_power_supply_type,
         power_supply_type.as_deref(),
     );
     if let Some(power_capacity_watts) = power_capacity_watts {
         facts.push(ResourceFactProjection {
-            label: "Power capacity (watts)",
+            label: L().fact_power_capacity_watts,
             value: power_capacity_watts.to_string(),
         });
     }
@@ -2578,9 +2703,13 @@ fn oem_liteon_power_supply_card_facts(
         part_number.as_deref(),
         serial_number.as_deref(),
     );
-    push_fact(&mut facts, "Firmware version", firmware_version.as_deref());
+    push_fact(
+        &mut facts,
+        L().fact_firmware_version,
+        firmware_version.as_deref(),
+    );
     push_status_facts(&mut facts, status.as_ref());
-    ("LiteOn Power Supply", facts)
+    (L().type_liteon_power_supply, facts)
 }
 
 /// The §12.2 Delta power-supply OEM card facts: the `Power` flag and the
@@ -2600,22 +2729,22 @@ fn oem_delta_power_supply_card_facts(
         fan_speed_target,
     } = resource
     else {
-        return ("Delta Power Supply", Vec::new());
+        return (L().type_delta_power_supply, Vec::new());
     };
     let mut facts = Vec::new();
     if let Some(power) = power {
         facts.push(ResourceFactProjection {
-            label: "Power",
+            label: L().fact_power_flag,
             value: power.to_string(),
         });
     }
     if let Some(fan_speed_target) = fan_speed_target {
         facts.push(ResourceFactProjection {
-            label: "Fan speed target",
+            label: L().fact_fan_speed_target,
             value: fan_speed_target.to_string(),
         });
     }
-    ("Delta Power Supply", facts)
+    (L().type_delta_power_supply, facts)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -2626,10 +2755,10 @@ fn push_hardware_facts(
     part_number: Option<&str>,
     serial_number: Option<&str>,
 ) {
-    push_fact(facts, "Manufacturer", manufacturer);
-    push_fact(facts, "Model", model);
-    push_fact(facts, "Part number", part_number);
-    push_fact(facts, "Serial number", serial_number);
+    push_fact(facts, L().fact_manufacturer, manufacturer);
+    push_fact(facts, L().fact_model, model);
+    push_fact(facts, L().fact_part_number, part_number);
+    push_fact(facts, L().fact_serial_number, serial_number);
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -2638,9 +2767,9 @@ fn push_status_facts(
     status: Option<&ResourceStatusResponse>,
 ) {
     if let Some(status) = status {
-        push_fact(facts, "State", status.state());
-        push_fact(facts, "Health", status.health());
-        push_fact(facts, "Health rollup", status.health_rollup());
+        push_fact(facts, L().fact_state, status.state());
+        push_fact(facts, L().fact_health, status.health());
+        push_fact(facts, L().fact_health_rollup, status.health_rollup());
     }
 }
 
@@ -2728,11 +2857,11 @@ impl RoleView {
         }
     }
 
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::Administrator => L.role_administrator,
-            Self::Operator => L.role_operator,
-            Self::Viewer => L.role_viewer,
+            Self::Administrator => L().role_administrator,
+            Self::Operator => L().role_operator,
+            Self::Viewer => L().role_viewer,
         }
     }
 }
@@ -2790,25 +2919,25 @@ impl ConsoleView {
         Self::CenterBindings,
     ];
 
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::Overview => L.nav_overview,
-            Self::Groups => L.nav_groups,
-            Self::Credentials => L.nav_credentials,
-            Self::AddEndpoint => L.nav_add_endpoint,
-            Self::Import => L.nav_import,
-            Self::Audit => L.nav_audit,
-            Self::Capabilities => L.nav_capabilities,
-            Self::Operations => L.nav_operations,
-            Self::Events => L.nav_events,
-            Self::Artifacts => L.nav_artifacts,
-            Self::Telemetry => L.nav_telemetry,
-            Self::Diagnostics => L.nav_diagnostics,
-            Self::Users => L.nav_users,
-            Self::Sessions => L.nav_sessions,
-            Self::CenterSites => L.nav_center_sites,
-            Self::CenterOperations => L.nav_center_operations,
-            Self::CenterBindings => L.nav_center_bindings,
+            Self::Overview => L().nav_overview,
+            Self::Groups => L().nav_groups,
+            Self::Credentials => L().nav_credentials,
+            Self::AddEndpoint => L().nav_add_endpoint,
+            Self::Import => L().nav_import,
+            Self::Audit => L().nav_audit,
+            Self::Capabilities => L().nav_capabilities,
+            Self::Operations => L().nav_operations,
+            Self::Events => L().nav_events,
+            Self::Artifacts => L().nav_artifacts,
+            Self::Telemetry => L().nav_telemetry,
+            Self::Diagnostics => L().nav_diagnostics,
+            Self::Users => L().nav_users,
+            Self::Sessions => L().nav_sessions,
+            Self::CenterSites => L().nav_center_sites,
+            Self::CenterOperations => L().nav_center_operations,
+            Self::CenterBindings => L().nav_center_bindings,
         }
     }
 
@@ -3093,11 +3222,11 @@ enum CapabilityLoadFailure {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl CapabilityLoadFailure {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::EndpointNotFound => "This endpoint no longer exists.",
-            Self::Unavailable => "The capability list is temporarily unavailable.",
-            Self::Malformed => L.error_server_unparsable,
+            Self::EndpointNotFound => L().error_endpoint_missing,
+            Self::Unavailable => L().unavailable_capabilities,
+            Self::Malformed => L().error_server_unparsable,
         }
     }
 }
@@ -3126,7 +3255,7 @@ impl CapabilityMatrixState {
         matches!(self, Self::Failed(_))
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
             Self::Failed(failure) => failure.message(),
             Self::Idle | Self::Loading | Self::Ready(_) => "",
@@ -3221,11 +3350,11 @@ enum DiagnosticsLoadFailure {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl DiagnosticsLoadFailure {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::ResourceNotFound => L.error_resource_missing,
-            Self::Unavailable => "The diagnostics snapshot is temporarily unavailable.",
-            Self::Malformed => L.error_server_unparsable,
+            Self::ResourceNotFound => L().error_resource_missing,
+            Self::Unavailable => L().unavailable_diagnostics,
+            Self::Malformed => L().error_server_unparsable,
         }
     }
 }
@@ -3257,7 +3386,7 @@ impl DiagnosticsState {
         matches!(self, Self::Failed(_))
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
             Self::Failed(failure) => failure.message(),
             Self::Idle | Self::Loading | Self::Ready(_) => "",
@@ -3390,13 +3519,15 @@ fn format_typed_payload_json(payload: &json::Value) -> String {
     json::to_string_pretty(payload).unwrap_or_default()
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
 /// The muted placeholder shown when a BMC did not publish an optional
 /// diagnostics field. Absence is information (§12.4 exposes what the BMC
 /// published and did not publish), so the row stays visible instead of
-/// hiding what is missing. Pinned like the capability `NOT_OBSERVED` label
-/// so the rendering decision cannot drift.
-const DIAGNOSTICS_ABSENT_FIELD_LABEL: &str = "Not published";
+/// hiding what is missing. The rendering reads `L().notice_diagnostics_absent`
+/// so the placeholder translates with the console; this test-only alias pins
+/// the English wording like the capability `NOT_OBSERVED` label so the
+/// rendering decision cannot drift.
+#[cfg(test)]
+const DIAGNOSTICS_ABSENT_FIELD_LABEL: &str = Lang::En.strings().notice_diagnostics_absent;
 
 #[cfg(any(target_arch = "wasm32", test))]
 /// Renders one optional diagnostics field for the panel: the published
@@ -3406,34 +3537,35 @@ const DIAGNOSTICS_ABSENT_FIELD_LABEL: &str = "Not published";
 fn diagnostics_optional_text(value: Option<&str>) -> String {
     match value {
         Some(value) => value.to_owned(),
-        None => DIAGNOSTICS_ABSENT_FIELD_LABEL.to_owned(),
+        None => L().notice_diagnostics_absent.to_owned(),
     }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 /// Honest boundary of the §12.4 diagnostics surface, shown as the panel
-/// footnote. The wording mirrors the backend contract (api §12.4 view): the
-/// payload is the persisted decoded snapshot of the latest complete refresh,
-/// and the decode-error / `ExtendedInfo` sections appear only when the refresh
-/// recorded them — absence is information, not a fabricated state.
-const DIAGNOSTICS_FOOTER_NOTE: &str = "Diagnostics show the decoded snapshot of the latest complete refresh; decode-error paths and ExtendedInfo are shown when the refresh recorded them.";
+/// footnote. The rendering reads `L().notice_diagnostics_footer` so the note
+/// translates with the console; this test-only alias pins the English
+/// wording against the api §12.4 view contract.
+#[cfg(test)]
+const DIAGNOSTICS_FOOTER_NOTE: &str = Lang::En.strings().notice_diagnostics_footer;
 
-#[cfg(any(target_arch = "wasm32", test))]
 /// Static label for a capability that has never been observed on this
-/// endpoint. Kept distinct from the `not_advertised` label so missing data
-/// is never disguised as a probe result.
-const NOT_OBSERVED_STATE_LABEL: &str = "Not yet observed";
+/// endpoint, read from `L().notice_not_observed`. Kept distinct from the
+/// `not_advertised` label so missing data is never disguised as a probe
+/// result; the test-only alias pins the English wording.
+#[cfg(test)]
+const NOT_OBSERVED_STATE_LABEL: &str = Lang::En.strings().notice_not_observed;
 
 #[cfg(any(target_arch = "wasm32", test))]
-const fn capability_state_label(state: CapabilityStateResponse) -> &'static str {
+fn capability_state_label(state: CapabilityStateResponse) -> &'static str {
     match state {
-        CapabilityStateResponse::Supported => L.state_supported,
-        CapabilityStateResponse::ReadOnly => L.state_read_only,
-        CapabilityStateResponse::Unauthorized => L.state_unauthorized,
-        CapabilityStateResponse::TemporarilyUnavailable => L.state_temporarily_unavailable,
-        CapabilityStateResponse::SchemaIncompatible => L.state_schema_incompatible,
-        CapabilityStateResponse::NotAdvertised => L.state_not_advertised,
-        CapabilityStateResponse::NotCompiled => L.state_not_compiled,
+        CapabilityStateResponse::Supported => L().state_supported,
+        CapabilityStateResponse::ReadOnly => L().state_read_only,
+        CapabilityStateResponse::Unauthorized => L().state_unauthorized,
+        CapabilityStateResponse::TemporarilyUnavailable => L().state_temporarily_unavailable,
+        CapabilityStateResponse::SchemaIncompatible => L().state_schema_incompatible,
+        CapabilityStateResponse::NotAdvertised => L().state_not_advertised,
+        CapabilityStateResponse::NotCompiled => L().state_not_compiled,
     }
 }
 
@@ -3471,7 +3603,7 @@ impl From<&CapabilityEntryResponse> for CapabilityEntryProjection {
     fn from(entry: &CapabilityEntryResponse) -> Self {
         let (state_label, state_class) = match entry.state() {
             Some(state) => (capability_state_label(state), capability_state_class(state)),
-            None => (NOT_OBSERVED_STATE_LABEL, "capability-state capability-none"),
+            None => (L().notice_not_observed, "capability-state capability-none"),
         };
         Self {
             product_code: entry.capability().to_owned(),
@@ -3492,31 +3624,31 @@ impl From<&CapabilityEntryResponse> for CapabilityEntryProjection {
 /// grouping by `ui_location`.
 fn page_title(ui_location: UiLocationResponse) -> &'static str {
     match ui_location {
-        UiLocationResponse::Overview => "Overview",
-        UiLocationResponse::Systems => "Systems",
-        UiLocationResponse::Chassis => "Chassis",
-        UiLocationResponse::Managers => "Managers",
-        UiLocationResponse::Assembly => "Assembly",
-        UiLocationResponse::Processors => "Processors",
-        UiLocationResponse::Memory => "Memory",
-        UiLocationResponse::Pcie => "PCIe",
-        UiLocationResponse::Network => "Network",
-        UiLocationResponse::Power => "Power",
-        UiLocationResponse::Thermal => "Thermal",
-        UiLocationResponse::Sensors => "Sensors",
-        UiLocationResponse::Bios => "BIOS",
-        UiLocationResponse::Boot => "Boot",
-        UiLocationResponse::SecureBoot => "Secure Boot",
-        UiLocationResponse::Storage => "Storage",
-        UiLocationResponse::Accounts => "Accounts",
-        UiLocationResponse::Logs => "Logs",
-        UiLocationResponse::Events => "Events",
-        UiLocationResponse::Telemetry => "Telemetry",
-        UiLocationResponse::Update => "Update",
-        UiLocationResponse::Tasks => "Tasks",
-        UiLocationResponse::Oem => "OEM",
-        UiLocationResponse::Diagnostics => "Diagnostics",
-        UiLocationResponse::Infrastructure => "Infrastructure",
+        UiLocationResponse::Overview => L().nav_overview,
+        UiLocationResponse::Systems => L().page_systems,
+        UiLocationResponse::Chassis => L().page_chassis,
+        UiLocationResponse::Managers => L().page_managers,
+        UiLocationResponse::Assembly => L().page_assembly,
+        UiLocationResponse::Processors => L().page_processors,
+        UiLocationResponse::Memory => L().page_memory,
+        UiLocationResponse::Pcie => L().page_pcie,
+        UiLocationResponse::Network => L().page_network,
+        UiLocationResponse::Power => L().page_power,
+        UiLocationResponse::Thermal => L().page_thermal,
+        UiLocationResponse::Sensors => L().page_sensors,
+        UiLocationResponse::Bios => L().page_bios,
+        UiLocationResponse::Boot => L().page_boot,
+        UiLocationResponse::SecureBoot => L().page_secure_boot,
+        UiLocationResponse::Storage => L().page_storage,
+        UiLocationResponse::Accounts => L().page_accounts,
+        UiLocationResponse::Logs => L().page_logs,
+        UiLocationResponse::Events => L().nav_events,
+        UiLocationResponse::Telemetry => L().nav_telemetry,
+        UiLocationResponse::Update => L().page_update,
+        UiLocationResponse::Tasks => L().page_tasks,
+        UiLocationResponse::Oem => L().page_oem,
+        UiLocationResponse::Diagnostics => L().nav_diagnostics,
+        UiLocationResponse::Infrastructure => L().page_infrastructure,
     }
 }
 
@@ -3662,16 +3794,16 @@ enum CredentialDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl CredentialDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::NameRequired => "A credential name is required.",
-            Self::NameControlCharacter => "The credential name cannot contain control characters.",
-            Self::NameTooLong => "The credential name cannot exceed 128 characters.",
-            Self::UsernameRequired => "A BMC username is required.",
-            Self::UsernameControlCharacter => "The username cannot contain control characters.",
-            Self::UsernameTooLong => "The username cannot exceed 256 characters.",
-            Self::PasswordRequired => L.error_password_required,
-            Self::PasswordTooLarge => "The password cannot exceed 4 KiB.",
+            Self::NameRequired => L().error_credential_name_required,
+            Self::NameControlCharacter => L().error_credential_name_control,
+            Self::NameTooLong => L().error_credential_name_too_long,
+            Self::UsernameRequired => L().error_bmc_username_required,
+            Self::UsernameControlCharacter => L().error_bmc_username_control,
+            Self::UsernameTooLong => L().error_bmc_username_too_long,
+            Self::PasswordRequired => L().error_password_required,
+            Self::PasswordTooLarge => L().error_password_too_large,
         }
     }
 }
@@ -3690,16 +3822,14 @@ enum EndpointAddressDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl EndpointAddressDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::Required => "An endpoint address is required.",
-            Self::HttpsRequired => "The endpoint address must use https://.",
-            Self::HostRequired => "The endpoint address must include a host.",
-            Self::Whitespace => "The endpoint address cannot contain whitespace.",
-            Self::EmbeddedCredentials => "The endpoint address must not embed credentials.",
-            Self::QueryOrFragmentNotAllowed => {
-                "The endpoint address must not contain a query or fragment."
-            }
+            Self::Required => L().error_address_required,
+            Self::HttpsRequired => L().error_address_scheme,
+            Self::HostRequired => L().error_address_host,
+            Self::Whitespace => L().error_address_whitespace,
+            Self::EmbeddedCredentials => L().error_address_credentials,
+            Self::QueryOrFragmentNotAllowed => L().error_address_query_fragment,
         }
     }
 }
@@ -3742,11 +3872,11 @@ enum DisplayNameDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl DisplayNameDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::Required => "A display name is required.",
-            Self::ControlCharacter => "The display name cannot contain control characters.",
-            Self::TooLong => L.error_display_name_too_long,
+            Self::Required => L().error_display_name_required,
+            Self::ControlCharacter => L().error_display_name_control,
+            Self::TooLong => L().error_display_name_too_long,
         }
     }
 }
@@ -3804,10 +3934,10 @@ enum EnrollmentDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl EnrollmentDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
             Self::DisplayName(error) => error.message(),
-            Self::CredentialRequired => "Select or create a credential before enrolling.",
+            Self::CredentialRequired => L().error_enrollment_credential_required,
         }
     }
 }
@@ -3841,11 +3971,13 @@ impl TrustChallengeProjection {
         )
     }
 
-    const fn state_label(&self) -> &'static str {
+    fn state_label(&self) -> &'static str {
         match self.state {
-            EndpointTrustChallengeStateResponse::SystemCaTrusted => "Verified by system CA roots",
+            EndpointTrustChallengeStateResponse::SystemCaTrusted => {
+                L().notice_verified_by_system_ca
+            }
             EndpointTrustChallengeStateResponse::ExplicitPinRequired => {
-                "Not trusted by system CA roots; an explicit pin is required"
+                L().notice_explicit_pin_required
             }
         }
     }
@@ -3936,19 +4068,13 @@ enum OnboardingFailure {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl OnboardingFailure {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::TrustObservation => {
-                "The TLS identity could not be observed. Check that the address is reachable over HTTPS."
-            }
-            Self::TrustExpectationRejected => {
-                "The confirmed trust policy could not be verified. The observed certificate may have changed."
-            }
-            Self::CredentialsUnavailable => "The credential inventory is temporarily unavailable.",
-            Self::CredentialCreateRejected => "The credential could not be created.",
-            Self::EnrollmentRejected => {
-                "The endpoint could not be enrolled with the selected credential."
-            }
+            Self::TrustObservation => L().error_tls_unobservable,
+            Self::TrustExpectationRejected => L().error_tls_policy_unverified,
+            Self::CredentialsUnavailable => L().unavailable_credentials,
+            Self::CredentialCreateRejected => L().error_credential_create_rejected,
+            Self::EnrollmentRejected => L().error_enrollment_failed,
         }
     }
 }
@@ -3957,9 +4083,9 @@ impl OnboardingFailure {
 /// Human label for an already-declared trust expectation.
 fn trust_mode_label(trust: &EndpointTrustExpectationRequest) -> &'static str {
     if trust.fingerprint_sha256().is_some() {
-        "Pinned certificate"
+        L().notice_pinned_certificate
     } else {
-        "System CA"
+        L().notice_system_ca
     }
 }
 
@@ -3979,19 +4105,25 @@ impl From<&EndpointCsvImportRowResponse> for CsvImportRowProjection {
     fn from(row: &EndpointCsvImportRowResponse) -> Self {
         let (status_label, is_success, detail) = match row.status() {
             EndpointCsvImportRowStatusResponse::Enrolled => (
-                "Enrolled",
+                L().status_enrolled,
                 true,
                 row.endpoint_id().map(|endpoint_id| endpoint_id.to_string()),
             ),
-            EndpointCsvImportRowStatusResponse::TlsProbeFailed => {
-                ("TLS probe failed", false, row.message().map(str::to_owned))
-            }
-            EndpointCsvImportRowStatusResponse::TrustRejected => {
-                ("Trust rejected", false, row.message().map(str::to_owned))
-            }
-            EndpointCsvImportRowStatusResponse::EnrollmentFailed => {
-                ("Enrollment failed", false, row.message().map(str::to_owned))
-            }
+            EndpointCsvImportRowStatusResponse::TlsProbeFailed => (
+                L().status_tls_probe_failed,
+                false,
+                row.message().map(str::to_owned),
+            ),
+            EndpointCsvImportRowStatusResponse::TrustRejected => (
+                L().status_trust_rejected,
+                false,
+                row.message().map(str::to_owned),
+            ),
+            EndpointCsvImportRowStatusResponse::EnrollmentFailed => (
+                L().status_enrollment_failed,
+                false,
+                row.message().map(str::to_owned),
+            ),
         };
         Self {
             record_number: row.record_number(),
@@ -4029,9 +4161,11 @@ impl CsvImportReportProjection {
     }
 
     fn summary_text(&self) -> String {
-        format!(
-            "{} of {} rows enrolled; {} failed",
-            self.succeeded_count, self.total_rows, self.failed_count
+        catalog_format!(
+            L().fmt_rows_enrolled,
+            self.succeeded_count,
+            self.total_rows,
+            self.failed_count
         )
     }
 }
@@ -4056,20 +4190,22 @@ impl RefreshResultRowProjection {
         let endpoint_id = row.endpoint_id().to_string();
         let (status_label, is_success, detail) = match row.status() {
             EndpointRefreshStatusResponse::Refreshed => (
-                "Refreshed",
+                L().status_refreshed,
                 true,
-                Some(format!(
-                    "Generation {} — {} snapshots",
+                Some(catalog_format!(
+                    L().fmt_generation_snapshots,
                     row.generation().unwrap_or_default(),
                     row.snapshot_count().unwrap_or_default(),
                 )),
             ),
             EndpointRefreshStatusResponse::Failed => {
-                ("Failed", false, row.message().map(str::to_owned))
+                (L().state_failed, false, row.message().map(str::to_owned))
             }
-            EndpointRefreshStatusResponse::NotFound => {
-                ("Not found", false, row.message().map(str::to_owned))
-            }
+            EndpointRefreshStatusResponse::NotFound => (
+                L().status_not_found,
+                false,
+                row.message().map(str::to_owned),
+            ),
         };
         Self {
             display_name: endpoint_display_name(inventory, &endpoint_id),
@@ -4110,9 +4246,11 @@ impl RefreshBatchReportProjection {
     }
 
     fn summary_text(&self) -> String {
-        format!(
-            "{} of {} endpoints refreshed; {} failed",
-            self.succeeded_count, self.total, self.failed_count
+        catalog_format!(
+            L().fmt_endpoints_refreshed,
+            self.succeeded_count,
+            self.total,
+            self.failed_count
         )
     }
 }
@@ -4150,8 +4288,8 @@ impl CredentialsListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 stored credential".to_owned(),
-            _ => format!("{count} stored credentials"),
+            1 => L().count_credentials_one.to_owned(),
+            _ => catalog_format!(L().count_credentials_many, count),
         }
     }
 
@@ -4257,12 +4395,12 @@ enum ImportFailure {
 impl ImportFailure {
     fn message(&self) -> String {
         match self {
-            Self::FileUnreadable => L.error_file_unreadable.to_owned(),
-            Self::FileEmpty => L.error_file_empty.to_owned(),
-            Self::Unavailable => "The import service is temporarily unavailable.".to_owned(),
-            Self::MalformedReport => L.error_server_unreadable.to_owned(),
+            Self::FileUnreadable => L().error_file_unreadable.to_owned(),
+            Self::FileEmpty => L().error_file_empty.to_owned(),
+            Self::Unavailable => L().unavailable_import.to_owned(),
+            Self::MalformedReport => L().error_server_unreadable.to_owned(),
             Self::Rejected { status } => {
-                format!("The server rejected the import request (HTTP {status}).")
+                catalog_format!(L().error_import_rejected, status)
             }
         }
     }
@@ -4302,10 +4440,10 @@ enum RefreshFailure {
 impl RefreshFailure {
     fn message(&self) -> String {
         match self {
-            Self::Unavailable => "The refresh service is temporarily unavailable.".to_owned(),
-            Self::MalformedReport => L.error_server_unreadable.to_owned(),
+            Self::Unavailable => L().unavailable_refresh.to_owned(),
+            Self::MalformedReport => L().error_server_unreadable.to_owned(),
             Self::Rejected { status } => {
-                format!("The server rejected the refresh request (HTTP {status}).")
+                catalog_format!(L().error_refresh_rejected, status)
             }
         }
     }
@@ -4345,8 +4483,8 @@ impl AuditListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 audit event".to_owned(),
-            _ => format!("{count} audit events"),
+            1 => L().count_audit_events_one.to_owned(),
+            _ => catalog_format!(L().count_audit_events_many, count),
         }
     }
 
@@ -4447,8 +4585,8 @@ impl EventsListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 event".to_owned(),
-            _ => format!("{count} events"),
+            1 => L().count_events_one.to_owned(),
+            _ => catalog_format!(L().count_events_many, count),
         }
     }
 
@@ -4461,15 +4599,15 @@ impl EventsListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "Showing the latest 1 event".to_owned(),
-            _ => format!("Showing the latest {count} events"),
+            1 => L().count_events_latest_one.to_owned(),
+            _ => catalog_format!(L().count_events_latest_many, count),
         }
     }
 
     /// Static failure copy for the whole-section error state.
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The event history is temporarily unavailable.",
+            Self::Failed => L().unavailable_events,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -4506,9 +4644,9 @@ impl EventsListState {
 #[cfg(any(target_arch = "wasm32", test))]
 fn severity_label(severity: &str) -> String {
     match severity {
-        "ok" => "OK".to_owned(),
-        "warning" => "Warning".to_owned(),
-        "critical" => "Critical".to_owned(),
+        "ok" => L().health_ok.to_owned(),
+        "warning" => L().health_warning.to_owned(),
+        "critical" => L().health_critical.to_owned(),
         _ => severity.to_owned(),
     }
 }
@@ -4612,9 +4750,9 @@ impl OverviewState {
     }
 
     /// Static failure copy for the whole-section error state.
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The overview is temporarily unavailable.",
+            Self::Failed => L().unavailable_overview,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -4771,11 +4909,11 @@ fn overview_health_level(level: OverviewHealthLevelResponse) -> HealthLevel {
 #[cfg(any(target_arch = "wasm32", test))]
 fn freshness_bucket_label(bucket: OverviewFreshnessBucketResponse) -> String {
     match bucket {
-        OverviewFreshnessBucketResponse::NeverRefreshed => "Never refreshed",
-        OverviewFreshnessBucketResponse::WithinOneHour => "Within 1 hour",
-        OverviewFreshnessBucketResponse::WithinOneDay => "Within 1 day",
-        OverviewFreshnessBucketResponse::WithinSevenDays => "Within 7 days",
-        OverviewFreshnessBucketResponse::OlderThanSevenDays => "Older than 7 days",
+        OverviewFreshnessBucketResponse::NeverRefreshed => L().freshness_never,
+        OverviewFreshnessBucketResponse::WithinOneHour => L().freshness_hour,
+        OverviewFreshnessBucketResponse::WithinOneDay => L().freshness_day,
+        OverviewFreshnessBucketResponse::WithinSevenDays => L().freshness_week,
+        OverviewFreshnessBucketResponse::OlderThanSevenDays => L().freshness_older,
     }
     .to_owned()
 }
@@ -4900,15 +5038,15 @@ impl TelemetryListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 series".to_owned(),
-            _ => format!("{count} series"),
+            1 => L().count_series_one.to_owned(),
+            _ => catalog_format!(L().count_series_many, count),
         }
     }
 
     /// Static failure copy for the whole-section error state.
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The telemetry history is temporarily unavailable.",
+            Self::Failed => L().unavailable_telemetry,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -4944,17 +5082,17 @@ enum OperationStateView {
 impl OperationStateView {
     /// Static English badge label for one phase.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Queued => L.state_queued,
-            Self::Validating => L.state_validating,
-            Self::Running => L.state_running,
-            Self::WaitingRemote => L.state_waiting_bmc,
-            Self::Verifying => L.state_verifying,
-            Self::Succeeded => L.state_succeeded,
-            Self::Failed => L.state_failed,
-            Self::Unknown => L.state_unknown,
-            Self::Cancelled => L.state_cancelled,
+            Self::Queued => L().state_queued,
+            Self::Validating => L().state_validating,
+            Self::Running => L().state_running,
+            Self::WaitingRemote => L().state_waiting_bmc,
+            Self::Verifying => L().state_verifying,
+            Self::Succeeded => L().state_succeeded,
+            Self::Failed => L().state_failed,
+            Self::Unknown => L().state_unknown,
+            Self::Cancelled => L().state_cancelled,
         }
     }
 
@@ -4991,13 +5129,13 @@ enum OperationSourceView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl OperationSourceView {
-    /// Static English label for one operation origin.
+    /// Static label for one operation origin.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Standalone => "Standalone",
-            Self::Site => "Site",
-            Self::Center => "Center",
+            Self::Standalone => L().label_standalone,
+            Self::Site => L().label_site,
+            Self::Center => L().label_center,
         }
     }
 }
@@ -5058,20 +5196,20 @@ impl CommandFamilyView {
         }
     }
 
-    /// Static English label for one command family.
+    /// Static label for one command family.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Account => "Account",
-            Self::SystemReset => "System reset",
-            Self::ManagerReset => "Manager reset",
-            Self::ChassisReset => "Chassis reset",
-            Self::BootOverride => "Boot source override",
-            Self::SecureBoot => "Secure Boot",
-            Self::EventSubscription => "Event subscription",
-            Self::Telemetry => "Telemetry",
-            Self::FirmwareUpdate => "Firmware update",
-            Self::Oem => "OEM (NVIDIA)",
+            Self::Account => L().family_account,
+            Self::SystemReset => L().family_system_reset,
+            Self::ManagerReset => L().family_manager_reset,
+            Self::ChassisReset => L().family_chassis_reset,
+            Self::BootOverride => L().family_boot_override,
+            Self::SecureBoot => L().family_secure_boot,
+            Self::EventSubscription => L().family_event_subscription,
+            Self::Telemetry => L().family_telemetry,
+            Self::FirmwareUpdate => L().family_firmware_update,
+            Self::Oem => L().family_oem,
         }
     }
 }
@@ -5097,13 +5235,13 @@ impl OemFaceView {
         Self::PowerSmoothing,
     ];
 
-    /// Static English label for one OEM face.
+    /// Static label for one OEM face.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::SystemConfigProfile => "System config profile",
-            Self::DebugToken => "Debug token",
-            Self::PowerSmoothing => "Power smoothing",
+            Self::SystemConfigProfile => L().face_system_config_profile,
+            Self::DebugToken => L().face_debug_token,
+            Self::PowerSmoothing => L().face_power_smoothing,
         }
     }
 }
@@ -5152,19 +5290,19 @@ impl OemActionView {
         }
     }
 
-    /// Static English label for one OEM action.
+    /// Static label for one OEM action.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::ProfileUpdate => "Update profile",
-            Self::ProfileFactoryReset => "Factory reset",
-            Self::ProfileActivate => "Activate profile",
-            Self::TokenGenerate => "Generate token",
-            Self::TokenInstall => "Install token",
-            Self::TokenDisable => "Disable token",
-            Self::TokenErase => "Erase tokens",
-            Self::PowerActivatePreset => "Activate preset profile",
-            Self::PowerApplyOverrides => "Apply admin overrides",
+            Self::ProfileUpdate => L().action_update_profile,
+            Self::ProfileFactoryReset => L().action_factory_reset,
+            Self::ProfileActivate => L().action_activate_profile,
+            Self::TokenGenerate => L().action_generate_token,
+            Self::TokenInstall => L().action_install_token,
+            Self::TokenDisable => L().action_disable_token,
+            Self::TokenErase => L().action_erase_tokens,
+            Self::PowerActivatePreset => L().action_activate_preset,
+            Self::PowerApplyOverrides => L().action_apply_admin_overrides,
         }
     }
 }
@@ -5521,13 +5659,13 @@ enum SecureBootActionView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl SecureBootActionView {
-    /// Static English label for one Secure Boot action.
+    /// Static label for one Secure Boot action.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Enable => L.action_enable,
-            Self::Disable => L.action_disable,
-            Self::ResetKeys(_) => "Reset keys",
+            Self::Enable => L().action_enable,
+            Self::Disable => L().action_disable,
+            Self::ResetKeys(_) => L().action_reset_keys,
         }
     }
 }
@@ -5545,12 +5683,12 @@ impl EventActionView {
     /// Every action in §7.5 order.
     const ALL: [Self; 2] = [Self::CreateSubscription, Self::DeleteSubscription];
 
-    /// Static English label for one event action.
+    /// Static label for one event action.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::CreateSubscription => "Create subscription",
-            Self::DeleteSubscription => "Delete subscription",
+            Self::CreateSubscription => L().action_create_subscription,
+            Self::DeleteSubscription => L().action_delete_subscription,
         }
     }
 }
@@ -5671,13 +5809,13 @@ enum ResetResourceView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ResetResourceView {
-    /// Static English label for one reset target.
+    /// Static label for one reset target.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::System => "System reset",
-            Self::Manager => "Manager reset",
-            Self::Chassis => "Chassis reset",
+            Self::System => L().family_system_reset,
+            Self::Manager => L().family_manager_reset,
+            Self::Chassis => L().family_chassis_reset,
         }
     }
 }
@@ -5817,15 +5955,15 @@ impl AccountActionView {
         Self::Delete,
     ];
 
-    /// Static English label for one account action.
+    /// Static label for one account action.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Create => "Create account",
-            Self::UpdateRole => "Change role",
-            Self::UpdatePassword => "Change password",
-            Self::UpdateUserName => "Rename account",
-            Self::Delete => "Delete account",
+            Self::Create => L().action_create_account,
+            Self::UpdateRole => L().action_change_role,
+            Self::UpdatePassword => L().action_change_password,
+            Self::UpdateUserName => L().action_rename_account,
+            Self::Delete => L().action_delete_account,
         }
     }
 }
@@ -5891,6 +6029,7 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
             mode,
         } => CommandSummaryProjection {
             family: CommandFamilyView::BootOverride.label(),
+            // The three arguments are the CSDL wire values, joined verbatim.
             payload: format!(
                 "{} · {} · {}",
                 source.as_str(),
@@ -5900,10 +6039,10 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
         },
         OperationCommandDraft::SecureBoot(action) => {
             let payload = match action {
-                SecureBootActionView::Enable => L.action_enable.to_owned(),
-                SecureBootActionView::Disable => L.action_disable.to_owned(),
+                SecureBootActionView::Enable => L().action_enable.to_owned(),
+                SecureBootActionView::Disable => L().action_disable.to_owned(),
                 SecureBootActionView::ResetKeys(kind) => {
-                    format!("Reset keys · {}", kind.as_str())
+                    catalog_format!(L().fmt_reset_keys_payload, kind.as_str())
                 }
             };
             CommandSummaryProjection {
@@ -5917,8 +6056,8 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
                     destination,
                     protocol,
                     event_types,
-                } => format!(
-                    "Create · {} · {} · {}",
+                } => catalog_format!(
+                    L().fmt_event_create_payload,
                     destination,
                     protocol.as_str(),
                     event_types
@@ -5928,7 +6067,7 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
                         .join(", ")
                 ),
                 EventActionDraft::DeleteSubscription { subscription_id } => {
-                    format!("Delete · {subscription_id}")
+                    catalog_format!(L().fmt_delete_payload, subscription_id)
                 }
             };
             CommandSummaryProjection {
@@ -5942,8 +6081,8 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
             // update agree on how the artifact is identified.
             let artifact_short_id = short_sha256(&update.artifact_id);
             let payload = match update.push_uri.as_deref() {
-                Some(uri) => format!("Start · {artifact_short_id} · push {uri}"),
-                None => format!("Start · {artifact_short_id} · multipart"),
+                Some(uri) => catalog_format!(L().fmt_start_push_payload, artifact_short_id, uri),
+                None => catalog_format!(L().fmt_start_multipart_payload, artifact_short_id),
             };
             CommandSummaryProjection {
                 family: CommandFamilyView::FirmwareUpdate.label(),
@@ -5966,23 +6105,25 @@ fn account_action_summary(draft: &AccountActionDraft) -> String {
     match draft {
         AccountActionDraft::Create {
             user_name, role_id, ..
-        } => format!("Create · {user_name} · {role_id}"),
+        } => catalog_format!(L().fmt_account_create_payload, user_name, role_id),
         AccountActionDraft::UpdateRole {
             account_id,
             role_id,
         } => {
-            format!("Change role · {account_id} · {role_id}")
+            catalog_format!(L().fmt_change_role_payload, account_id, role_id)
         }
         AccountActionDraft::UpdatePassword { account_id, .. } => {
-            format!("Change password · {account_id}")
+            catalog_format!(L().fmt_change_password_payload, account_id)
         }
         AccountActionDraft::UpdateUserName {
             account_id,
             user_name,
         } => {
-            format!("Rename · {account_id} · {user_name}")
+            catalog_format!(L().fmt_rename_payload, account_id, user_name)
         }
-        AccountActionDraft::Delete { account_id } => format!("Delete · {account_id}"),
+        AccountActionDraft::Delete { account_id } => {
+            catalog_format!(L().fmt_delete_payload, account_id)
+        }
     }
 }
 
@@ -5990,26 +6131,26 @@ fn account_action_summary(draft: &AccountActionDraft) -> String {
 #[cfg(any(target_arch = "wasm32", test))]
 fn oem_draft_summary(draft: &OemCommandDraft) -> String {
     match draft {
-        OemCommandDraft::ProfileUpdate { .. } => "Profile · Update".to_owned(),
-        OemCommandDraft::ProfileFactoryReset => "Profile · Factory reset".to_owned(),
-        OemCommandDraft::ProfileActivate => "Profile · Activate".to_owned(),
+        OemCommandDraft::ProfileUpdate { .. } => L().summary_profile_update.to_owned(),
+        OemCommandDraft::ProfileFactoryReset => L().summary_profile_factory_reset.to_owned(),
+        OemCommandDraft::ProfileActivate => L().summary_profile_activate.to_owned(),
         OemCommandDraft::TokenGenerate { token_type } => {
-            format!("Token · Generate · {}", token_type.as_str())
+            catalog_format!(L().fmt_token_generate_payload, token_type.as_str())
         }
-        OemCommandDraft::TokenInstall { .. } => "Token · Install".to_owned(),
-        OemCommandDraft::TokenDisable => "Token · Disable".to_owned(),
+        OemCommandDraft::TokenInstall { .. } => L().summary_token_install.to_owned(),
+        OemCommandDraft::TokenDisable => L().summary_token_disable.to_owned(),
         OemCommandDraft::TokenErase {
             erase_type,
             token_type,
-        } => format!(
-            "Token · Erase · {} · {}",
+        } => catalog_format!(
+            L().fmt_token_erase_payload,
             erase_type.as_str(),
             token_type.as_str()
         ),
         OemCommandDraft::PowerActivatePreset { profile_id } => {
-            format!("Power smoothing · Activate preset · {profile_id}")
+            catalog_format!(L().fmt_power_activate_payload, profile_id)
         }
-        OemCommandDraft::PowerApplyOverrides => "Power smoothing · Apply overrides".to_owned(),
+        OemCommandDraft::PowerApplyOverrides => L().summary_power_overrides.to_owned(),
     }
 }
 
@@ -6421,41 +6562,39 @@ enum OperationFormError {
 impl OperationFormError {
     /// Static message shown under the offending field.
     #[must_use]
-    pub const fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self {
-            Self::EndpointsRequired => "Select at least one endpoint.",
-            Self::FamilyRequired => "Choose a command family.",
-            Self::AccountActionRequired => "Choose an account action.",
-            Self::AccountIdRequired => "An account ID is required.",
-            Self::AccountIdInvalid => {
-                "The account ID can only contain letters, digits, '-', and '_'."
-            }
-            Self::AccountUserNameRequired => "A user name is required.",
-            Self::AccountUserNameInvalid => "The user name contains unsupported characters.",
-            Self::AccountPasswordRequired => L.error_password_required,
-            Self::AccountPasswordInvalid => "The password is too long.",
-            Self::RoleIdRequired => "A role ID is required.",
-            Self::RoleIdInvalid => "The role ID contains unsupported characters.",
-            Self::ResetTypeRequired => "Choose a reset type.",
-            Self::BootSourceRequired => "Choose a boot source.",
-            Self::BootEnabledRequired => "Choose how long the override applies.",
-            Self::BootModeRequired => "Choose a boot mode.",
-            Self::SecureBootActionRequired => "Choose a Secure Boot action.",
-            Self::ResetKeysTypeRequired => "Choose the key set to reset.",
-            Self::EventActionRequired => "Choose an event action.",
-            Self::DestinationRequired => "A destination URL is required.",
-            Self::DestinationInvalid => "The destination must be a URL with a host.",
-            Self::ProtocolRequired => "Choose a delivery protocol.",
-            Self::EventTypesRequired => "Select at least one event type.",
-            Self::SubscriptionIdRequired => "A subscription ID is required.",
-            Self::ArtifactRequired => "Choose a ready firmware artifact.",
-            Self::PushUriInvalid => "The push URI must be an http(s) URL.",
-            Self::OemActionRequired => "Choose an OEM action.",
-            Self::ProfileFileRequired => "The profile file JSON is required.",
-            Self::TokenTypeRequired => "Choose a token type.",
-            Self::TokenDataRequired => "The Base64 token data is required.",
-            Self::EraseTypeRequired => "Choose the erase scope.",
-            Self::ProfileIdInvalid => "The profile id must be a whole number.",
+            Self::EndpointsRequired => L().error_endpoints_required,
+            Self::FamilyRequired => L().error_family_required,
+            Self::AccountActionRequired => L().error_account_action_required,
+            Self::AccountIdRequired => L().error_account_id_required,
+            Self::AccountIdInvalid => L().error_account_id_invalid,
+            Self::AccountUserNameRequired => L().error_account_user_name_required,
+            Self::AccountUserNameInvalid => L().error_account_user_name_invalid,
+            Self::AccountPasswordRequired => L().error_password_required,
+            Self::AccountPasswordInvalid => L().error_account_password_invalid,
+            Self::RoleIdRequired => L().error_role_id_required,
+            Self::RoleIdInvalid => L().error_role_id_invalid,
+            Self::ResetTypeRequired => L().error_reset_type_required,
+            Self::BootSourceRequired => L().error_boot_source_required,
+            Self::BootEnabledRequired => L().error_boot_enabled_required,
+            Self::BootModeRequired => L().error_boot_mode_required,
+            Self::SecureBootActionRequired => L().error_secure_boot_action_required,
+            Self::ResetKeysTypeRequired => L().error_reset_keys_type_required,
+            Self::EventActionRequired => L().error_event_action_required,
+            Self::DestinationRequired => L().error_destination_required,
+            Self::DestinationInvalid => L().error_destination_invalid,
+            Self::ProtocolRequired => L().error_protocol_required,
+            Self::EventTypesRequired => L().error_event_types_required,
+            Self::SubscriptionIdRequired => L().error_subscription_id_required,
+            Self::ArtifactRequired => L().error_artifact_required,
+            Self::PushUriInvalid => L().error_push_uri_invalid,
+            Self::OemActionRequired => L().error_oem_action_required,
+            Self::ProfileFileRequired => L().error_profile_file_required,
+            Self::TokenTypeRequired => L().error_token_type_required,
+            Self::TokenDataRequired => L().error_token_data_required,
+            Self::EraseTypeRequired => L().error_erase_type_required,
+            Self::ProfileIdInvalid => L().error_profile_id_invalid,
         }
     }
 }
@@ -6529,9 +6668,11 @@ enum OperationSubmitState {
 impl OperationSubmitState {
     /// Static message for a rejected submission; the route may have refused
     /// the request or the network may have failed, so the fields are the
-    /// only actionable advice.
-    const FAILURE_MESSAGE: &'static str =
-        "The operation could not be submitted. Check the fields and try again.";
+    /// only actionable advice. Read through [`L()`] so a rejected
+    /// submission renders in the active language.
+    fn failure_message_value() -> &'static str {
+        L().error_operation_submit
+    }
 
     const fn is_in_flight(&self) -> bool {
         matches!(self, Self::InFlight)
@@ -6541,7 +6682,7 @@ impl OperationSubmitState {
         matches!(self, Self::Succeeded)
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
             Self::Failed(message) => message,
             Self::Idle | Self::InFlight | Self::Succeeded => "",
@@ -6583,8 +6724,8 @@ impl OperationsListState {
             Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 operation".to_owned(),
-            _ => format!("{count} operations"),
+            1 => L().count_operations_one.to_owned(),
+            _ => catalog_format!(L().count_operations_many, count),
         }
     }
 
@@ -6614,7 +6755,7 @@ struct OperationCardProjection {
 impl OperationCardProjection {
     /// Static badge label of the current phase.
     #[must_use]
-    pub const fn state_label(&self) -> &'static str {
+    pub fn state_label(&self) -> &'static str {
         self.state.label()
     }
 
@@ -6626,7 +6767,7 @@ impl OperationCardProjection {
 
     /// Static label of the operation origin.
     #[must_use]
-    pub const fn source_label(&self) -> &'static str {
+    pub fn source_label(&self) -> &'static str {
         self.source.label()
     }
 }
@@ -6735,7 +6876,7 @@ impl ArtifactCardProjection {
     }
 
     #[must_use]
-    pub const fn status_label(&self) -> &'static str {
+    pub fn status_label(&self) -> &'static str {
         self.status.label()
     }
 
@@ -6760,13 +6901,13 @@ enum ArtifactStatusView {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ArtifactStatusView {
-    /// Static English badge label for one artifact lifecycle state.
+    /// Static badge label for one artifact lifecycle state.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Uploading => "Uploading",
-            Self::Ready => "Ready",
-            Self::Failed => "Failed",
+            Self::Uploading => L().status_uploading,
+            Self::Ready => L().status_ready,
+            Self::Failed => L().state_failed,
         }
     }
 
@@ -6855,8 +6996,8 @@ impl ArtifactsListState {
             Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 artifact".to_owned(),
-            _ => format!("{count} artifacts"),
+            1 => L().count_artifacts_one.to_owned(),
+            _ => catalog_format!(L().count_artifacts_many, count),
         }
     }
 
@@ -6896,19 +7037,19 @@ enum ArtifactUploadFailure {
 impl ArtifactUploadFailure {
     fn message(self) -> String {
         match self {
-            Self::FileUnreadable => L.error_file_unreadable.to_owned(),
-            Self::FileEmpty => L.error_file_empty.to_owned(),
+            Self::FileUnreadable => L().error_file_unreadable.to_owned(),
+            Self::FileEmpty => L().error_file_empty.to_owned(),
             Self::CreateRejected { status } => {
-                format!("The server rejected the artifact creation (HTTP {status}).")
+                catalog_format!(L().error_artifact_create_rejected, status)
             }
             Self::ChunkRejected { status } => {
-                format!("The server rejected an upload chunk (HTTP {status}).")
+                catalog_format!(L().error_artifact_chunk_rejected, status)
             }
             Self::FinalizeRejected { status } => {
-                format!("The server rejected the upload finalize (HTTP {status}).")
+                catalog_format!(L().error_artifact_finalize_rejected, status)
             }
-            Self::Unavailable => "The artifact store is temporarily unavailable.".to_owned(),
-            Self::MalformedResponse => L.error_server_unreadable.to_owned(),
+            Self::Unavailable => L().unavailable_artifacts.to_owned(),
+            Self::MalformedResponse => L().error_server_unreadable.to_owned(),
         }
     }
 }
@@ -6947,7 +7088,7 @@ fn artifact_upload_status_text(state: &ArtifactUploadState) -> String {
         ArtifactUploadState::Idle
         | ArtifactUploadState::Succeeded
         | ArtifactUploadState::Failed(_) => String::new(),
-        ArtifactUploadState::Creating => "Creating artifact...".to_owned(),
+        ArtifactUploadState::Creating => L().loading_artifact_create.to_owned(),
         ArtifactUploadState::Uploading {
             uploaded_bytes,
             total_bytes,
@@ -6955,12 +7096,14 @@ fn artifact_upload_status_text(state: &ArtifactUploadState) -> String {
         } => {
             let chunk_index = uploaded_bytes / ARTIFACT_CHUNK_BYTES + 1;
             let total_chunks = artifact_chunk_ranges(*total_bytes).len().max(1);
-            format!(
-                "Uploading chunk {chunk_index} of {total_chunks} · {}%",
+            catalog_format!(
+                L().fmt_uploading_chunk,
+                chunk_index,
+                total_chunks,
                 upload_progress_percent(*uploaded_bytes, *total_bytes)
             )
         }
-        ArtifactUploadState::Finalizing { .. } => "Verifying the uploaded digest...".to_owned(),
+        ArtifactUploadState::Finalizing { .. } => L().loading_verify_digest.to_owned(),
     }
 }
 
@@ -7776,23 +7919,31 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             // label, never the stored value.
             payload: match account {
                 AccountCommand::CreateAccount(create) => {
-                    format!("Create · {} · {}", create.user_name(), create.role_id())
+                    catalog_format!(
+                        L().fmt_account_create_payload,
+                        create.user_name(),
+                        create.role_id()
+                    )
                 }
                 AccountCommand::UpdateAccount(update) => {
-                    format!(
-                        "Change role · {} · {}",
+                    catalog_format!(
+                        L().fmt_change_role_payload,
                         update.account_id(),
                         update.role_id()
                     )
                 }
                 AccountCommand::UpdateAccountPassword(password) => {
-                    format!("Change password · {}", password.account_id())
+                    catalog_format!(L().fmt_change_password_payload, password.account_id())
                 }
                 AccountCommand::UpdateAccountUserName(rename) => {
-                    format!("Rename · {} · {}", rename.account_id(), rename.user_name())
+                    catalog_format!(
+                        L().fmt_rename_payload,
+                        rename.account_id(),
+                        rename.user_name()
+                    )
                 }
                 AccountCommand::DeleteAccount(deletion) => {
-                    format!("Delete · {}", deletion.account_id())
+                    catalog_format!(L().fmt_delete_payload, deletion.account_id())
                 }
             },
         },
@@ -7807,7 +7958,7 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
         RedfishCommand::Manager(ManagerCommand::ResetToDefaults(kind)) => {
             CommandSummaryProjection {
                 family: ResetResourceView::Manager.label(),
-                payload: format!("Reset to defaults · {kind}"),
+                payload: catalog_format!(L().fmt_reset_to_defaults_payload, kind),
             }
         }
         RedfishCommand::Chassis(ChassisCommand::Reset(reset_type)) => CommandSummaryProjection {
@@ -7818,8 +7969,8 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             CommandSummaryProjection {
                 family: ResetResourceView::Chassis.label(),
                 payload: match payload.power_supply_id() {
-                    Some(id) => format!("Power supply reset · {id}"),
-                    None => "Power supply reset · first member".to_owned(),
+                    Some(id) => catalog_format!(L().fmt_power_supply_reset_payload, id),
+                    None => L().summary_power_supply_reset_first.to_owned(),
                 },
             }
         }
@@ -7836,23 +7987,23 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
         }
         RedfishCommand::SecureBoot(SecureBootCommand::Enable) => CommandSummaryProjection {
             family: CommandFamilyView::SecureBoot.label(),
-            payload: L.action_enable.to_owned(),
+            payload: L().action_enable.to_owned(),
         },
         RedfishCommand::SecureBoot(SecureBootCommand::Disable) => CommandSummaryProjection {
             family: CommandFamilyView::SecureBoot.label(),
-            payload: L.action_disable.to_owned(),
+            payload: L().action_disable.to_owned(),
         },
         RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(kind)) => {
             CommandSummaryProjection {
                 family: CommandFamilyView::SecureBoot.label(),
-                payload: format!("Reset keys · {kind}"),
+                payload: catalog_format!(L().fmt_reset_keys_payload, kind),
             }
         }
         RedfishCommand::Event(EventCommand::CreateSubscription(subscription)) => {
             CommandSummaryProjection {
                 family: CommandFamilyView::EventSubscription.label(),
-                payload: format!(
-                    "Create · {} · {} · {}",
+                payload: catalog_format!(
+                    L().fmt_event_create_payload,
                     subscription.destination(),
                     subscription.protocol(),
                     subscription
@@ -7867,7 +8018,7 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
         RedfishCommand::Event(EventCommand::DeleteSubscription(deletion)) => {
             CommandSummaryProjection {
                 family: CommandFamilyView::EventSubscription.label(),
-                payload: format!("Delete · {}", deletion.subscription_id()),
+                payload: catalog_format!(L().fmt_delete_payload, deletion.subscription_id()),
             }
         }
         // The log-service and control families have no operation form yet
@@ -7875,42 +8026,44 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
         // cards render static family labels instead of a `CommandFamilyView`
         // variant that no form could produce.
         RedfishCommand::Log(LogCommand::ClearLog(payload)) => CommandSummaryProjection {
-            family: "Log service",
+            family: L().family_log_service,
             payload: match payload.log_service_id() {
-                Some(id) => format!("Clear · {id}"),
-                None => "Clear · first log service".to_owned(),
+                Some(id) => catalog_format!(L().fmt_clear_payload, id),
+                None => L().summary_clear_first.to_owned(),
             },
         },
         RedfishCommand::Control(ControlCommand::Update(payload)) => CommandSummaryProjection {
-            family: "Control",
+            family: L().family_control,
             payload: match payload.set_point() {
-                Some(set_point) => format!("Set point · {set_point}"),
-                None => "Set point".to_owned(),
+                Some(set_point) => catalog_format!(L().fmt_set_point_payload, set_point),
+                None => L().summary_set_point.to_owned(),
             },
         },
         RedfishCommand::Telemetry(telemetry) => CommandSummaryProjection {
             family: CommandFamilyView::Telemetry.label(),
             payload: match telemetry {
-                TelemetryCommand::SetEnabled { enabled } => format!("Set enabled · {enabled}"),
-                TelemetryCommand::CreateMetricDefinition(create) => format!(
-                    "Metric definition · Create · {} · {}",
+                TelemetryCommand::SetEnabled { enabled } => {
+                    catalog_format!(L().fmt_set_enabled_payload, enabled)
+                }
+                TelemetryCommand::CreateMetricDefinition(create) => catalog_format!(
+                    L().fmt_metric_definition_create,
                     create.metric_type(),
                     create.units()
                 ),
-                TelemetryCommand::UpdateMetricDefinition(update) => format!(
-                    "Metric definition · Update · {} · {} · {}",
+                TelemetryCommand::UpdateMetricDefinition(update) => catalog_format!(
+                    L().fmt_metric_definition_update,
                     update.metric_definition_id(),
                     update.metric_type(),
                     update.units()
                 ),
                 TelemetryCommand::DeleteMetricDefinition(deletion) => {
-                    format!(
-                        "Metric definition · Delete · {}",
+                    catalog_format!(
+                        L().fmt_metric_definition_delete,
                         deletion.metric_definition_id()
                     )
                 }
-                TelemetryCommand::CreateMetricReportDefinition(create) => format!(
-                    "Report definition · Create · {} · {}",
+                TelemetryCommand::CreateMetricReportDefinition(create) => catalog_format!(
+                    L().fmt_report_definition_create,
                     create.metric_report_definition_type(),
                     create
                         .metrics()
@@ -7920,8 +8073,8 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                TelemetryCommand::UpdateMetricReportDefinition(update) => format!(
-                    "Report definition · Update · {} · {} · {}",
+                TelemetryCommand::UpdateMetricReportDefinition(update) => catalog_format!(
+                    L().fmt_report_definition_update,
                     update.metric_report_definition_id(),
                     update.metric_report_definition_type(),
                     update
@@ -7932,8 +8085,8 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                TelemetryCommand::DeleteMetricReportDefinition(deletion) => format!(
-                    "Report definition · Delete · {}",
+                TelemetryCommand::DeleteMetricReportDefinition(deletion) => catalog_format!(
+                    L().fmt_report_definition_delete,
                     deletion.metric_report_definition_id()
                 ),
             },
@@ -7944,8 +8097,8 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             // update agrees with both on how the artifact is identified.
             let artifact_short_id = short_sha256(&payload.artifact_id().to_string());
             let payload_text = match payload.push_uri() {
-                Some(uri) => format!("Start · {artifact_short_id} · push {uri}"),
-                None => format!("Start · {artifact_short_id} · multipart"),
+                Some(uri) => catalog_format!(L().fmt_start_push_payload, artifact_short_id, uri),
+                None => catalog_format!(L().fmt_start_multipart_payload, artifact_short_id),
             };
             CommandSummaryProjection {
                 family: CommandFamilyView::FirmwareUpdate.label(),
@@ -7953,55 +8106,55 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             }
         }
         RedfishCommand::Update(UpdateCommand::Patch(payload)) => {
+            // The enabled/targets members are the wire field names rendered
+            // as key=value pairs (data vocabulary); only the "no members"
+            // fallback and the "Patch ·" head are copy.
             let members = match (payload.service_enabled(), payload.targets()) {
                 (Some(enabled), Some(targets)) => {
                     format!("enabled={enabled}, targets={}", targets.join(", "))
                 }
                 (Some(enabled), None) => format!("enabled={enabled}"),
                 (None, Some(targets)) => format!("targets={}", targets.join(", ")),
-                (None, None) => "no members".to_owned(),
+                (None, None) => L().summary_patch_no_members.to_owned(),
             };
             CommandSummaryProjection {
                 family: CommandFamilyView::FirmwareUpdate.label(),
-                payload: format!("Patch · {members}"),
+                payload: catalog_format!(L().fmt_patch_payload, members),
             }
         }
         RedfishCommand::Oem(oem) => CommandSummaryProjection {
             family: CommandFamilyView::Oem.label(),
             payload: match oem {
                 OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::Update(_)) => {
-                    "Profile · Update".to_owned()
+                    L().summary_profile_update.to_owned()
                 }
                 OemCommand::SystemConfigProfile(NvidiaSystemConfigProfileCommand::FactoryReset) => {
-                    "Profile · Factory reset".to_owned()
+                    L().summary_profile_factory_reset.to_owned()
                 }
                 OemCommand::SystemConfigProfile(
                     NvidiaSystemConfigProfileCommand::ActivateProfile,
-                ) => "Profile · Activate".to_owned(),
+                ) => L().summary_profile_activate.to_owned(),
                 OemCommand::DebugToken(NvidiaDebugTokenCommand::GenerateToken(token_type)) => {
-                    format!("Token · Generate · {token_type}")
+                    catalog_format!(L().fmt_token_generate_payload, token_type)
                 }
                 OemCommand::DebugToken(NvidiaDebugTokenCommand::InstallToken(_)) => {
-                    "Token · Install".to_owned()
+                    L().summary_token_install.to_owned()
                 }
                 OemCommand::DebugToken(NvidiaDebugTokenCommand::DisableToken) => {
-                    "Token · Disable".to_owned()
+                    L().summary_token_disable.to_owned()
                 }
                 OemCommand::DebugToken(NvidiaDebugTokenCommand::EraseToken(erase)) => {
-                    format!(
-                        "Token · Erase · {} · {}",
+                    catalog_format!(
+                        L().fmt_token_erase_payload,
                         erase.erase_type(),
                         erase.token_type()
                     )
                 }
                 OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ActivatePresetProfile(
                     profile_id,
-                )) => format!(
-                    "Power smoothing · Activate preset · {}",
-                    profile_id.profile_id()
-                ),
+                )) => catalog_format!(L().fmt_power_activate_payload, profile_id.profile_id()),
                 OemCommand::PowerSmoothing(NvidiaPowerSmoothingCommand::ApplyAdminOverrides) => {
-                    "Power smoothing · Apply overrides".to_owned()
+                    L().summary_power_overrides.to_owned()
                 }
             },
         },
@@ -8047,14 +8200,14 @@ enum BatchStateView {
 impl BatchStateView {
     /// Static English badge label for one derived batch phase.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Queued => L.state_queued,
-            Self::Running => L.state_running,
-            Self::Succeeded => L.state_succeeded,
-            Self::Failed => L.state_failed,
-            Self::Unknown => L.state_unknown,
-            Self::Cancelled => L.state_cancelled,
+            Self::Queued => L().state_queued,
+            Self::Running => L().state_running,
+            Self::Succeeded => L().state_succeeded,
+            Self::Failed => L().state_failed,
+            Self::Unknown => L().state_unknown,
+            Self::Cancelled => L().state_cancelled,
         }
     }
 
@@ -8121,30 +8274,30 @@ impl BatchOutcomeChips {
     /// distinct known outcome, not an ordinary failure the operator would
     /// retry against the same endpoint.
     #[must_use]
-    pub const fn chips(self) -> [BatchOutcomeChip; 5] {
+    pub fn chips(self) -> [BatchOutcomeChip; 5] {
         [
             BatchOutcomeChip {
-                label: L.state_succeeded,
+                label: L().state_succeeded,
                 count: self.succeeded,
                 class: "operation-state operation-ok",
             },
             BatchOutcomeChip {
-                label: L.state_failed,
+                label: L().state_failed,
                 count: self.failed,
                 class: "operation-state operation-error",
             },
             BatchOutcomeChip {
-                label: L.state_unknown,
+                label: L().state_unknown,
                 count: self.unknown,
                 class: "operation-state operation-off",
             },
             BatchOutcomeChip {
-                label: L.state_unsupported,
+                label: L().state_unsupported,
                 count: self.unsupported,
                 class: "operation-state operation-off",
             },
             BatchOutcomeChip {
-                label: L.state_cancelled,
+                label: L().state_cancelled,
                 count: self.cancelled,
                 class: "operation-state operation-off",
             },
@@ -8197,7 +8350,7 @@ struct BatchCardProjection {
 impl BatchCardProjection {
     /// Static badge label of the derived batch verdict.
     #[must_use]
-    pub const fn state_label(&self) -> &'static str {
+    pub fn state_label(&self) -> &'static str {
         self.state.label()
     }
 
@@ -8307,8 +8460,8 @@ impl BatchesListState {
             Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 batch".to_owned(),
-            _ => format!("{count} batches"),
+            1 => L().count_batches_one.to_owned(),
+            _ => catalog_format!(L().count_batches_many, count),
         }
     }
 
@@ -8340,12 +8493,12 @@ enum HealthLevel {
 /// health filter chips. The endpoint-card badge instead shows the vendor's
 /// raw text (§12.3 保留厂商原始值), so the two surfaces stay distinct.
 #[must_use]
-const fn health_level_label(level: HealthLevel) -> &'static str {
+fn health_level_label(level: HealthLevel) -> &'static str {
     match level {
-        HealthLevel::Unknown => "Unknown",
-        HealthLevel::Ok => "OK",
-        HealthLevel::Warning => "Warning",
-        HealthLevel::Critical => "Critical",
+        HealthLevel::Unknown => L().state_unknown,
+        HealthLevel::Ok => L().health_ok,
+        HealthLevel::Warning => L().health_warning,
+        HealthLevel::Critical => L().health_critical,
     }
 }
 
@@ -8658,8 +8811,8 @@ impl From<&GroupResponse> for GroupCardProjection {
             group_id: group.group_id().to_string(),
             name: group.name().to_owned(),
             member_count_text: match members.len() {
-                1 => "1 member".to_owned(),
-                _ => format!("{} members", members.len()),
+                1 => L().count_members_one.to_owned(),
+                _ => catalog_format!(L().count_members_many, members.len()),
             },
             member_short_ids: members
                 .iter()
@@ -8703,14 +8856,14 @@ impl GroupsListState {
             Self::Idle | Self::Loading | Self::Failed => 0,
         };
         match count {
-            1 => "1 group".to_owned(),
-            _ => format!("{count} groups"),
+            1 => L().count_groups_one.to_owned(),
+            _ => catalog_format!(L().count_groups_many, count),
         }
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The group list is temporarily unavailable.",
+            Self::Failed => L().unavailable_groups,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -8765,7 +8918,7 @@ impl GroupDetailProjection {
                     // still renders its row defensively instead of dropping
                     // it from the group.
                     display_name: summary.map_or_else(
-                        || "Unknown endpoint".to_owned(),
+                        || L().label_unknown_endpoint.to_owned(),
                         |summary| summary.identity().display_name().to_owned(),
                     ),
                     address: summary.map_or_else(String::new, |summary| {
@@ -8842,9 +8995,9 @@ impl GroupDetailState {
         matches!(self, Self::Failed)
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The group detail is temporarily unavailable.",
+            Self::Failed => L().unavailable_group_detail,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -8883,8 +9036,8 @@ impl TagCardProjection {
         Self {
             name: tag.name().to_owned(),
             endpoint_count_text: match endpoints.len() {
-                1 => "1 endpoint".to_owned(),
-                _ => format!("{} endpoints", endpoints.len()),
+                1 => L().count_tag_endpoints_one.to_owned(),
+                _ => catalog_format!(L().count_tag_endpoints_many, endpoints.len()),
             },
             endpoints: endpoints
                 .iter()
@@ -8928,9 +9081,9 @@ impl TagsListState {
         matches!(self, Self::Ready(tags) if tags.is_empty())
     }
 
-    const fn failure_message(&self) -> &'static str {
+    fn failure_message(&self) -> &'static str {
         match self {
-            Self::Failed => "The tag inventory is temporarily unavailable.",
+            Self::Failed => L().unavailable_tag_inventory,
             Self::Idle | Self::Loading | Self::Ready(_) => "",
         }
     }
@@ -8984,11 +9137,11 @@ enum GroupNameDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl GroupNameDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::Required => "A group name is required.",
-            Self::ControlCharacter => "The group name cannot contain control characters.",
-            Self::TooLong => "The group name cannot exceed 64 characters.",
+            Self::Required => L().error_group_name_required,
+            Self::ControlCharacter => L().error_group_name_control,
+            Self::TooLong => L().error_group_name_too_long,
         }
     }
 }
@@ -9047,12 +9200,12 @@ enum TagDraftError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl TagDraftError {
-    const fn message(self) -> &'static str {
+    fn message(self) -> &'static str {
         match self {
-            Self::EndpointRequired => "Select the endpoint to tag.",
-            Self::NameRequired => "A tag name is required.",
-            Self::ControlCharacter => "A tag name cannot contain control characters.",
-            Self::TooLong => "A tag name cannot exceed 64 characters.",
+            Self::EndpointRequired => L().error_tag_endpoint_required,
+            Self::NameRequired => L().error_tag_name_required,
+            Self::ControlCharacter => L().error_tag_name_control,
+            Self::TooLong => L().error_tag_name_too_long,
         }
     }
 }
@@ -9172,11 +9325,11 @@ fn acknowledge_submission(target_count: usize, body: &str) -> Result<(), &'stati
     if target_count > 1 {
         json::from_str::<BatchOperationResponse>(body)
             .map(|_| ())
-            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)
+            .map_err(|_| OperationSubmitState::failure_message_value())
     } else {
         json::from_str::<OperationResponse>(body)
             .map(|_| ())
-            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)
+            .map_err(|_| OperationSubmitState::failure_message_value())
     }
 }
 
@@ -9248,8 +9401,8 @@ mod browser {
                 Self::Idle | Self::Loading | Self::Failed => 0,
             };
             match count {
-                1 => "1 center operation".to_owned(),
-                _ => format!("{count} center operations"),
+                1 => L().fmt_center_operations_one.to_owned(),
+                _ => catalog_format!(L().fmt_center_operations_many, count),
             }
         }
     }
@@ -9279,8 +9432,8 @@ mod browser {
                 Self::Idle | Self::Loading | Self::Failed => 0,
             };
             match count {
-                1 => "1 registered site".to_owned(),
-                _ => format!("{count} registered sites"),
+                1 => L().count_registered_sites_one.to_owned(),
+                _ => catalog_format!(L().count_registered_sites_many, count),
             }
         }
     }
@@ -9341,11 +9494,11 @@ mod browser {
     impl CenterOperationDraftError {
         /// Static English message of one invalid field.
         #[must_use]
-        pub const fn message(self) -> &'static str {
+        pub fn message(self) -> &'static str {
             match self {
-                Self::SiteRequired => "A site must be selected.",
-                Self::EndpointRequired => "An endpoint must be selected.",
-                Self::TargetRequired => "A Redfish target is required.",
+                Self::SiteRequired => L().error_site_required,
+                Self::EndpointRequired => L().error_endpoint_required,
+                Self::TargetRequired => L().error_target_required,
                 Self::Command(error) => error.message(),
             }
         }
@@ -9420,15 +9573,14 @@ mod browser {
         CenterOperationSubmission, CenterSiteCardProjection, CommandFamilyView, ConsoleLoadFailure,
         ConsoleLoadState, ConsoleView, CoreResourceCardProjection, CreateCredentialState,
         CredentialCardProjection, CredentialDraft, CredentialDraftError, CredentialsListState,
-        CsvImportReportProjection, DIAGNOSTICS_FOOTER_NOTE, DiagnosticsLoadFailure,
-        DiagnosticsProjection, DiagnosticsState, DiagnosticsTargetProjection,
-        EndpointAddressDraftError, EndpointCardProjection, EnrollmentDraft, EnrollmentDraftError,
-        EraseTypeView, EventActionView, EventCardProjection, EventProtocolView, EventTypeView,
-        EventsListState, GroupCardProjection, GroupCreateState, GroupDetailProjection,
-        GroupDetailState, GroupDraft, GroupMemberActionState, GroupNameDraftError, GroupsListState,
-        HealthLevel, ImportFailure, ImportState, L, OEM_UNSUPPORTED_NOTICE, OemActionView,
-        OemFaceView, OffsetDateTime, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
-        OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
+        CsvImportReportProjection, DiagnosticsLoadFailure, DiagnosticsProjection, DiagnosticsState,
+        DiagnosticsTargetProjection, EndpointAddressDraftError, EndpointCardProjection,
+        EnrollmentDraft, EnrollmentDraftError, EraseTypeView, EventActionView, EventCardProjection,
+        EventProtocolView, EventTypeView, EventsListState, GroupCardProjection, GroupCreateState,
+        GroupDetailProjection, GroupDetailState, GroupDraft, GroupMemberActionState,
+        GroupNameDraftError, GroupsListState, HealthLevel, ImportFailure, ImportState, L, Lang,
+        OemActionView, OemFaceView, OffsetDateTime, OnboardingCredentialsState, OnboardingFailure,
+        OnboardingStep, OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
         OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
         OverviewFilterSelections, OverviewProjection, OverviewState, RefreshBatchReportProjection,
         RefreshBatchState, RefreshFailure, ResetKeysTypeView, ResetTypeView, RoleView,
@@ -9443,6 +9595,7 @@ mod browser {
         percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
         trust_mode_label, update_artifact_choices, vendor_choices,
     };
+    use crate::i18n::{current_lang, lang_code, parse_lang, set_lang};
 
     /// The first screen decision of the console (§16.2).
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9536,18 +9689,18 @@ mod browser {
             totp_code.map(str::to_owned),
         );
         let Ok(request) = Request::post("/api/v1/auth/login").json(&request) else {
-            return Err("the sign-in request could not be prepared".to_owned());
+            return Err(L().error_sign_in_unprepared.to_owned());
         };
         let Ok(response) = request.send().await else {
-            return Err("the sign-in request could not be sent".to_owned());
+            return Err(L().error_sign_in_unsent.to_owned());
         };
         if !response_ok(&response) {
-            return Err("sign-in failed".to_owned());
+            return Err(L().error_sign_in_failed.to_owned());
         }
         response
             .json::<LoginResponse>()
             .await
-            .map_err(|_| "the sign-in response could not be parsed".to_owned())
+            .map_err(|_| L().error_sign_in_unparsable.to_owned())
     }
 
     /// Claims the product with the one-time code and the first password.
@@ -9564,18 +9717,18 @@ mod browser {
             totp_code.map(str::to_owned),
         );
         let Ok(request) = Request::post("/api/v1/auth/bootstrap").json(&request) else {
-            return Err("the bootstrap request could not be prepared".to_owned());
+            return Err(L().error_bootstrap_unprepared.to_owned());
         };
         let Ok(response) = request.send().await else {
-            return Err("the bootstrap request could not be sent".to_owned());
+            return Err(L().error_bootstrap_unsent.to_owned());
         };
         if !response_ok(&response) {
-            return Err("bootstrap failed — check the one-time code".to_owned());
+            return Err(L().error_bootstrap_code.to_owned());
         }
         response
             .json::<BootstrapCompleteResponse>()
             .await
-            .map_err(|_| "the bootstrap response could not be parsed".to_owned())
+            .map_err(|_| L().error_bootstrap_unparsable.to_owned())
     }
 
     /// Signs the presenting session out.
@@ -9704,12 +9857,12 @@ mod browser {
         };
 
         view! {
-            <section class="auth-screen" aria-label={L.auth_sign_in}>
+            <section class="auth-screen" aria-label={L().auth_sign_in}>
                 <div class="auth-card">
-                    <p class="eyebrow">{L.header_eyebrow}</p>
-                    <h2>{L.auth_sign_in}</h2>
+                    <p class="eyebrow">{L().header_eyebrow}</p>
+                    <h2>{L().auth_sign_in}</h2>
                     <label>
-                        {L.field_username}
+                        {L().field_username}
                         <input
                             type="text"
                             autocomplete="username"
@@ -9718,7 +9871,7 @@ mod browser {
                         />
                     </label>
                     <label>
-                        {L.field_password}
+                        {L().field_password}
                         <input
                             type="password"
                             autocomplete="current-password"
@@ -9727,12 +9880,12 @@ mod browser {
                         />
                     </label>
                     <label>
-                        {L.auth_totp_code}
+                        {L().auth_totp_code}
                         <input
                             type="text"
                             inputmode="numeric"
                             autocomplete="one-time-code"
-                            placeholder={L.auth_totp_placeholder}
+                            placeholder={L().auth_totp_placeholder}
                             prop:value=totp_code
                             on:input=move |event| set_totp_code.set(event_target_value(&event))
                         />
@@ -9741,8 +9894,9 @@ mod browser {
                         {move || error.get().unwrap_or_default()}
                     </p>
                     <button type="button" class="btn btn-primary" disabled=move || busy.get() on:click=submit>
-                        {L.auth_sign_in}
+                        {L().auth_sign_in}
                     </button>
+                    <LanguageSelector />
                 </div>
             </section>
         }
@@ -9767,11 +9921,11 @@ mod browser {
             }
             set_error.set(None);
             if password.get() != confirmation.get() {
-                set_error.set(Some(L.error_passwords_mismatch.to_owned()));
+                set_error.set(Some(L().error_passwords_mismatch.to_owned()));
                 return;
             }
             if password.get().chars().count() < 12 {
-                set_error.set(Some(L.error_password_too_short.to_owned()));
+                set_error.set(Some(L().error_password_too_short.to_owned()));
                 return;
             }
             set_busy.set(true);
@@ -9801,15 +9955,15 @@ mod browser {
         };
 
         view! {
-            <section class="auth-screen" aria-label="First-run setup">
+            <section class="auth-screen" aria-label={L().label_first_run_setup}>
                 <div class="auth-card">
-                    <p class="eyebrow">{L.header_eyebrow}</p>
-                    <h2>"First-run setup"</h2>
+                    <p class="eyebrow">{L().header_eyebrow}</p>
+                    <h2>{L().label_first_run_setup}</h2>
                     <p class="auth-note">
-                        "Enter the one-time bootstrap code printed by the console to set the administrator password."
+                        {L().hint_bootstrap_intro}
                     </p>
                     <label>
-                        "Bootstrap code"
+                        {L().label_bootstrap_code}
                         <input
                             type="text"
                             autocomplete="off"
@@ -9819,7 +9973,7 @@ mod browser {
                         />
                     </label>
                     <label>
-                        "New password"
+                        {L().label_new_password}
                         <input
                             type="password"
                             autocomplete="new-password"
@@ -9828,7 +9982,7 @@ mod browser {
                         />
                     </label>
                     <label>
-                        "Confirm password"
+                        {L().label_confirm_password}
                         <input
                             type="password"
                             autocomplete="new-password"
@@ -9842,11 +9996,11 @@ mod browser {
                             prop:checked=want_totp
                             on:change=move |event| set_want_totp.set(event_target_checked(&event))
                         />
-                        "Set up TOTP now (optional)"
+                        {L().label_totp_optional}
                     </label>
                     <div hidden=move || !want_totp.get()>
                         <label>
-                            "Secret from your authenticator app"
+                            {L().label_totp_secret}
                             <input
                                 type="text"
                                 autocomplete="off"
@@ -9856,12 +10010,12 @@ mod browser {
                             />
                         </label>
                         <label>
-                            "Activation code"
+                            {L().label_activation_code}
                             <input
                                 type="text"
                                 inputmode="numeric"
                                 autocomplete="one-time-code"
-                                placeholder={L.auth_totp_placeholder}
+                                placeholder={L().auth_totp_placeholder}
                                 prop:value=totp_code
                                 on:input=move |event| set_totp_code.set(event_target_value(&event))
                             />
@@ -9871,8 +10025,9 @@ mod browser {
                         {move || error.get().unwrap_or_default()}
                     </p>
                     <button type="button" class="btn btn-primary" disabled=move || busy.get() on:click=submit>
-                        "Set up"
+                        {L().action_set_up}
                     </button>
+                    <LanguageSelector />
                 </div>
             </section>
         }
@@ -9916,7 +10071,7 @@ mod browser {
 
         let on_create = move |_| {
             if draft_name.get().trim().is_empty() {
-                set_draft_error.set(Some("the user name is required".to_owned()));
+                set_draft_error.set(Some({ L().error_user_name_required }.to_owned()));
                 return;
             }
             set_create_state.set(CreateUserState::InFlight);
@@ -9958,24 +10113,24 @@ mod browser {
             <section class="auth-admin" hidden=move || !active()>
                 <div class="section-heading">
                     <div>
-                        <p class="section-label">"Administration"</p>
-                        <h2>"Users"</h2>
+                        <p class="section-label">{L().section_administration}</p>
+                        <h2>{L().nav_users}</h2>
                     </div>
                     <button type="button" class="btn" on:click=on_reload>
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <div class="auth-admin-form">
                     <input
                         type="text"
-                        placeholder={L.field_user_name}
+                        placeholder={L().field_user_name}
                         autocomplete="off"
                         spellcheck="false"
                         prop:value=draft_name
                         on:input=move |event| set_draft_name.set(event_target_value(&event))
                     />
                     <select
-                        aria-label="New user role"
+                        aria-label={L().label_new_user_role}
                         on:change=move |event| {
                             let value = event_target_value(&event);
                             set_draft_role.set(match value.as_str() {
@@ -9985,19 +10140,19 @@ mod browser {
                             });
                         }
                     >
-                        <option value="Administrator">"Administrator"</option>
-                        <option value="Operator">"Operator"</option>
-                        <option value="Viewer">"Viewer"</option>
+                        <option value="Administrator">{L().role_administrator}</option>
+                        <option value="Operator">{L().role_operator}</option>
+                        <option value="Viewer">{L().role_viewer}</option>
                     </select>
                     <button type="button" class="btn btn-primary" on:click=on_create>
-                        "Create user"
+                        {L().action_create_user}
                     </button>
                 </div>
                 <p class="auth-error" hidden=move || draft_error.get().is_none()>
                     {move || draft_error.get().unwrap_or_default()}
                 </p>
                 <p class="auth-note" hidden=move || create_state.get() != CreateUserState::Failed>
-                    "The user could not be created."
+                    {L().error_user_create}
                 </p>
                 <div class="auth-table" hidden=move || !matches!(list_state.get(), UsersListState::Ready(_))>
                     {move || {
@@ -10019,14 +10174,14 @@ mod browser {
                                     .to_owned();
                                 let name = user.name().to_owned();
                                 let state_label = if enabled {
-                                    "enabled".to_owned()
+                                    {L().chip_enabled}.to_owned()
                                 } else {
-                                    "disabled".to_owned()
+                                    {L().chip_disabled}.to_owned()
                                 };
                                 let action_label = if enabled {
-                                    L.action_disable.to_owned()
+                                    L().action_disable.to_owned()
                                 } else {
-                                    L.action_enable.to_owned()
+                                    L().action_enable.to_owned()
                                 };
                                 view! {
                                     <div class="auth-table-row">
@@ -10034,7 +10189,7 @@ mod browser {
                                         <span class="auth-table-role">{role_label}</span>
                                         <span class="auth-table-state">{state_label}</span>
                                         <select
-                                            aria-label={L.field_role}
+                                            aria-label={L().field_role}
                                             on:change=move |event| {
                                                 let value = event_target_value(&event);
                                                 let role = match value.as_str() {
@@ -10045,9 +10200,9 @@ mod browser {
                                                 on_assign_role(principal_id_for_select.clone(), role);
                                             }
                                         >
-                                            <option value="Administrator">{L.role_administrator}</option>
-                                            <option value="Operator">{L.role_operator}</option>
-                                            <option value="Viewer">{L.role_viewer}</option>
+                                            <option value="Administrator">{L().role_administrator}</option>
+                                            <option value="Operator">{L().role_operator}</option>
+                                            <option value="Viewer">{L().role_viewer}</option>
                                         </select>
                                         <button
                                             type="button"
@@ -10070,7 +10225,7 @@ mod browser {
                     }}
                 </div>
                 <p class="auth-note" hidden=move || !list_state.get().is_failed()>
-                    "The user list is temporarily unavailable."
+                    {L().unavailable_users}
                 </p>
             </section>
         }
@@ -10120,11 +10275,11 @@ mod browser {
             <section class="auth-admin" hidden=move || !active()>
                 <div class="section-heading">
                     <div>
-                        <p class="section-label">"Administration"</p>
-                        <h2>"Sessions"</h2>
+                        <p class="section-label">{L().section_administration}</p>
+                        <h2>{L().nav_sessions}</h2>
                     </div>
                     <button type="button" class="btn" on:click=on_reload>
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <div class="auth-table" hidden=move || !matches!(list_state.get(), SessionsListState::Ready(_))>
@@ -10146,11 +10301,11 @@ mod browser {
                                 view! {
                                     <div class="auth-table-row">
                                         <span class="auth-table-name">{name.clone()}</span>
-                                        <span class="auth-table-time">"created " {created}</span>
-                                        <span class="auth-table-time">"used " {last_used}</span>
-                                        <span class="auth-table-time">"expires " {expires}</span>
+                                        <span class="auth-table-time">{L().label_suffix_created} {created}</span>
+                                        <span class="auth-table-time">{L().label_suffix_used} {last_used}</span>
+                                        <span class="auth-table-time">{L().label_suffix_expires} {expires}</span>
                                         <span class="auth-table-state">
-                                            {if revoked { "revoked" } else if current { "current" } else { "active" }}
+                                            {if revoked { {L().chip_revoked} } else if current { {L().chip_current} } else { {L().chip_active} }}
                                         </span>
                                         <button
                                             type="button"
@@ -10158,7 +10313,7 @@ mod browser {
                                             disabled=revoked || current
                                             on:click=move |_| on_revoke(session_id.clone())
                                         >
-                                            "Revoke"
+                                            {L().action_revoke}
                                         </button>
                                     </div>
                                 }
@@ -10167,7 +10322,7 @@ mod browser {
                     }}
                 </div>
                 <p class="auth-note" hidden=move || !list_state.get().is_failed()>
-                    "The session list is temporarily unavailable."
+                    {L().unavailable_sessions}
                 </p>
             </section>
         }
@@ -10222,146 +10377,146 @@ mod browser {
         };
 
         view! {
-            <section class="view-section" hidden=move || !active()>
-                <div class="inventory-heading">
-                    <div>
-                        <p class="section-label">"Center connection"</p>
-                        <h2>{move || list_state.get().count_text()}</h2>
-                    </div>
-                    <p>"The §15.5 registered-site view: bindings, presence, and aggregated endpoints."</p>
-                </div>
-                <div class="inventory-actions">
-                    <button
-                        type="button"
-                        class="btn"
-                        disabled=move || matches!(list_state.get(), CenterSitesListState::Loading)
-                        on:click=on_refresh
-                    >
-                        {L.action_refresh}
-                    </button>
-                </div>
-                <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterSitesListState::Loading)>
-                    "Loading registered sites..."
-                </p>
-                <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                    "The registered-site list is temporarily unavailable."
-                </p>
-                <p
-                    class="empty-inventory"
-                    hidden=move || !list_state.get().is_ready() || list_state.get().count_text() != "0 registered sites"
-                >
-                    "No sites are registered yet. Register a site on the Center bindings page."
-                </p>
-                <div class="endpoint-grid">
-                    {move || {
-                        let CenterSitesListState::Ready(sites) = list_state.get() else {
-                            return Vec::new();
-                        };
-                        sites
-                            .into_iter()
-                            .map(|site| {
-                                let site_id = site.site_id.clone();
-                                let site_id_for_click = site_id.clone();
-                                let display_name = site.display_name.clone();
-                                let binding_label = site.binding.map(|binding| binding.label().to_owned());
-                                let online = site.online;
-                                let endpoint_count = site.endpoint_count;
-                                let last_refresh = site.last_refresh_at.as_ref().map(format_observed_at);
-                                view! {
-                                    <button
-                                        type="button"
-                                        class="center-site-card"
-                                        on:click=move |_| on_select_site.run(site_id_for_click.clone())
-                                    >
-                                        <div class="endpoint-title">
-                                            <div>
-                                                <h3>{display_name}</h3>
-                                                <p class="endpoint-address">{site_id}</p>
-                                            </div>
-                                            <span class="trust-badge">
-                                                {move || binding_label.clone().unwrap_or_else(|| "no binding".to_owned())}
-                                            </span>
-                                            <span
-                                                class="status-dot"
-                                                class:status-dot-waiting=move || !online
-                                                title=move || if online { "online" } else { "offline" }
-                                            ></span>
-                                        </div>
-                                        <div class="snapshot-heading">
-                                            <span>{move || match endpoint_count {
-                                                1 => "1 aggregated endpoint".to_owned(),
-                                                count => format!("{count} aggregated endpoints"),
-                                            }}</span>
-                                        </div>
-                                        <p class="endpoint-address">
-                                            {move || last_refresh.clone().map_or_else(|| "no refresh yet".to_owned(), |text| format!("last refresh {text}"))}
-                                        </p>
-                                    </button>
-                                }
-                            })
-                            .collect_view()
-                    }}
-                </div>
-                <div class="form-panel result-panel" hidden=move || selected_site.get().is_none()>
-                    <div class="section-heading">
-                        <div>
-                            <p class="section-label">"Site detail"</p>
-                            <h2>{move || selected_site.get().unwrap_or_default()}</h2>
+                    <section class="view-section" hidden=move || !active()>
+                        <div class="inventory-heading">
+                            <div>
+                                <p class="section-label">{L().section_center_connection}</p>
+                                <h2>{move || list_state.get().count_text()}</h2>
+                            </div>
+                            <p>{L().hint_center_sites}</p>
                         </div>
-                        <button type="button" class="btn" on:click=on_clear_site>
-                            "Close detail"
-                        </button>
-                    </div>
-                    <p class="inline-status" hidden=move || !matches!(detail_state.get(), CenterEndpointsDetailState::Loading)>
-                        "Loading aggregated endpoints..."
-                    </p>
-                    <p class="form-error" hidden=move || !detail_state.get().is_failed()>
-                        "The aggregated endpoint list is temporarily unavailable."
-                    </p>
-                    <p
-                        class="empty-inventory"
-                        hidden=move || {
-                            !matches!(detail_state.get(), CenterEndpointsDetailState::Ready(ref rows) if rows.is_empty())
-                        }
-                    >
-                        "This site has not projected any endpoints yet."
-                    </p>
-                    <table class="results-table" hidden=move || !detail_state.get().is_ready()>
-                        <thead>
-                            <tr>
-                                <th>"Endpoint"</th>
-                                <th>{L.field_address}</th>
-                                <th>"Health"</th>
-                                <th>"Generation"</th>
-                            </tr>
-                        </thead>
-                        <tbody>
+                        <div class="inventory-actions">
+                            <button
+                                type="button"
+                                class="btn"
+                                disabled=move || matches!(list_state.get(), CenterSitesListState::Loading)
+                                on:click=on_refresh
+                            >
+                                {L().action_refresh}
+                            </button>
+                        </div>
+                        <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterSitesListState::Loading)>
+                            {L().loading_center_sites}
+                        </p>
+                        <p class="form-error" hidden=move || !list_state.get().is_failed()>
+                            {L().unavailable_center_sites}
+                        </p>
+                        <p
+                            class="empty-inventory"
+                            hidden=move || !list_state.get().is_ready() || list_state.get().count_text() != {L().count_registered_sites_zero}
+                        >
+                            {L().empty_center_sites}
+                        </p>
+                        <div class="endpoint-grid">
                             {move || {
-                                let CenterEndpointsDetailState::Ready(endpoints) = detail_state.get()
-                                else {
+                                let CenterSitesListState::Ready(sites) = list_state.get() else {
                                     return Vec::new();
                                 };
-                                endpoints
+                                sites
                                     .into_iter()
-                                    .map(|endpoint| {
+                                    .map(|site| {
+                                        let site_id = site.site_id.clone();
+                                        let site_id_for_click = site_id.clone();
+                                        let display_name = site.display_name.clone();
+                                        let binding_label = site.binding.map(|binding| binding.label().to_owned());
+                                        let online = site.online;
+                                        let endpoint_count = site.endpoint_count;
+                                        let last_refresh = site.last_refresh_at.as_ref().map(format_observed_at);
                                         view! {
-                                            <tr>
-                                                <td class="result-address">{endpoint.display_name}</td>
-                                                <td class="result-detail">{endpoint.address}</td>
-                                                <td class="result-detail">{endpoint.health}</td>
-                                                <td class="result-detail">
-                                                    {move || endpoint.refresh_generation.to_string()}
-                                                </td>
-                                            </tr>
+                                            <button
+                                                type="button"
+                                                class="center-site-card"
+                                                on:click=move |_| on_select_site.run(site_id_for_click.clone())
+                                            >
+                                                <div class="endpoint-title">
+                                                    <div>
+                                                        <h3>{display_name}</h3>
+                                                        <p class="endpoint-address">{site_id}</p>
+                                                    </div>
+                                                    <span class="trust-badge">
+                                                        {move || binding_label.clone().unwrap_or_else(|| {L().chip_no_binding}.to_owned())}
+                                                    </span>
+                                                    <span
+                                                        class="status-dot"
+                                                        class:status-dot-waiting=move || !online
+                                                        title=move || if online { {L().chip_online} } else { {L().chip_offline} }
+                                                    ></span>
+                                                </div>
+                                                <div class="snapshot-heading">
+                                                    <span>{move || match endpoint_count {
+        1 => L().fmt_aggregated_endpoints_one.to_owned(),
+        count => catalog_format!(L().fmt_aggregated_endpoints_many,  count),
+                                                    }}</span>
+                                                </div>
+                                                <p class="endpoint-address">
+                                                    {move || last_refresh.clone().map_or_else(|| {L().chip_no_refresh_yet}.to_owned(), |text| catalog_format!(L().fmt_last_refresh, text))}
+                                                </p>
+                                            </button>
                                         }
                                     })
                                     .collect_view()
                             }}
-                        </tbody>
-                    </table>
-                </div>
-            </section>
-        }
+                        </div>
+                        <div class="form-panel result-panel" hidden=move || selected_site.get().is_none()>
+                            <div class="section-heading">
+                                <div>
+                                    <p class="section-label">{L().section_site_detail}</p>
+                                    <h2>{move || selected_site.get().unwrap_or_default()}</h2>
+                                </div>
+                                <button type="button" class="btn" on:click=on_clear_site>
+                                    {L().action_close_detail}
+                                </button>
+                            </div>
+                            <p class="inline-status" hidden=move || !matches!(detail_state.get(), CenterEndpointsDetailState::Loading)>
+                                {L().loading_aggregated_endpoints}
+                            </p>
+                            <p class="form-error" hidden=move || !detail_state.get().is_failed()>
+                                {L().unavailable_aggregated_endpoints}
+                            </p>
+                            <p
+                                class="empty-inventory"
+                                hidden=move || {
+                                    !matches!(detail_state.get(), CenterEndpointsDetailState::Ready(ref rows) if rows.is_empty())
+                                }
+                            >
+                                {L().empty_site_endpoints}
+                            </p>
+                            <table class="results-table" hidden=move || !detail_state.get().is_ready()>
+                                <thead>
+                                    <tr>
+                                        <th>{L().label_endpoint}</th>
+                                        <th>{L().field_address}</th>
+                                        <th>{L().fact_health}</th>
+                                        <th>{L().label_generation}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {move || {
+                                        let CenterEndpointsDetailState::Ready(endpoints) = detail_state.get()
+                                        else {
+                                            return Vec::new();
+                                        };
+                                        endpoints
+                                            .into_iter()
+                                            .map(|endpoint| {
+                                                view! {
+                                                    <tr>
+                                                        <td class="result-address">{endpoint.display_name}</td>
+                                                        <td class="result-detail">{endpoint.address}</td>
+                                                        <td class="result-detail">{endpoint.health}</td>
+                                                        <td class="result-detail">
+                                                            {move || endpoint.refresh_generation.to_string()}
+                                                        </td>
+                                                    </tr>
+                                                }
+                                            })
+                                            .collect_view()
+                                    }}
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+                }
     }
 
     #[component]
@@ -10512,21 +10667,21 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Center connection"</p>
+                        <p class="section-label">{L().section_center_connection}</p>
                         <h2>{move || list_state.get().count_text()}</h2>
                     </div>
-                    <p>"The §15.6 tracking view and the typed dispatch form."</p>
+                    <p>{L().hint_center_operations}</p>
                 </div>
                 <div class="inventory-actions">
                     <button type="button" class="btn" on:click=reload>
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
-                    "Loading center operations..."
+                    {L().loading_center_operations}
                 </p>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                    "The center operation list is temporarily unavailable."
+                    {L().unavailable_center_operations}
                 </p>
                 <p
                     class="empty-inventory"
@@ -10534,7 +10689,7 @@ mod browser {
                         !list_state.get().is_ready() || !matches!(list_state.get(), CenterOperationsListState::Ready(ref rows) if rows.is_empty())
                     }
                 >
-                    "No center operations have been dispatched yet."
+                    {L().empty_center_operations}
                 </p>
                 <div class="form-panel" hidden=move || !list_state.get().is_ready()>
                     {move || {
@@ -10545,9 +10700,14 @@ mod browser {
                         operations
                             .into_iter()
                             .map(|operation| {
-                                let state_class = if operation.state == "succeeded" {
+                                // The projected state is the localized label,
+                                // so the classification compares against the
+                                // catalog values, not English literals.
+                                let state_class = if operation.state == L().state_succeeded {
                                     "result-success"
-                                } else if operation.state == "failed" || operation.state == "cancelled" {
+                                } else if operation.state == L().state_failed
+                                    || operation.state == L().state_cancelled
+                                {
                                     "result-failure"
                                 } else {
                                     "result-detail"
@@ -10556,7 +10716,7 @@ mod browser {
                                     <div class="auth-table-row">
                                         <span class="auth-table-name">{operation.command}</span>
                                         <span class="auth-table-time">
-                                            {move || operation.target.clone().unwrap_or_else(|| "no target on record".to_owned())}
+                                            {move || operation.target.clone().unwrap_or_else(|| {L().chip_no_target_on_record}.to_owned())}
                                         </span>
                                         <span class="auth-table-time">
                                             {move || operation.actor.clone().unwrap_or_else(|| "system".to_owned())}
@@ -10572,12 +10732,12 @@ mod browser {
                     }}
                 </div>
                 <div class="form-panel">
-                    <p class="section-label">"Dispatch a center operation"</p>
+                    <p class="section-label">{L().section_dispatch_center_operation}</p>
                     <p class="form-hint">
-                        "The site re-checks every precondition and only accepts what it can execute (§15.6)."
+                        {L().hint_site_rechecks}
                     </p>
                     <div class="form-row">
-                        <label for="center-op-site">"Site"</label>
+                        <label for="center-op-site">{L().label_site}</label>
                         <select
                             id="center-op-site"
                             prop:value=move || draft.get().site_id
@@ -10585,7 +10745,7 @@ mod browser {
                                 on_select_site.run(event_target_value(&event));
                             }
                         >
-                            <option value="">"Choose a site..."</option>
+                            <option value="">{L().choose_site}</option>
                             {move || {
                                 site_choices()
                                     .into_iter()
@@ -10604,7 +10764,7 @@ mod browser {
                         </select>
                     </div>
                     <div class="form-row">
-                        <label for="center-op-endpoint">"Endpoint"</label>
+                        <label for="center-op-endpoint">{L().label_endpoint}</label>
                         <select
                             id="center-op-endpoint"
                             prop:value=move || draft.get().endpoint_id
@@ -10612,7 +10772,7 @@ mod browser {
                                 on_select_endpoint.run(event_target_value(&event));
                             }
                         >
-                            <option value="">"Choose an endpoint..."</option>
+                            <option value="">{L().choose_endpoint}</option>
                             {move || {
                                 let site = draft.get().site_id;
                                 endpoint_choices()
@@ -10631,7 +10791,7 @@ mod browser {
                         </select>
                     </div>
                     <div class="form-row">
-                        <label for="center-op-target">"Target"</label>
+                        <label for="center-op-target">{L().label_target}</label>
                         <input
                             id="center-op-target"
                             type="text"
@@ -10642,7 +10802,7 @@ mod browser {
                         />
                     </div>
                     <div class="form-row">
-                        <label for="center-op-family">"Command family"</label>
+                        <label for="center-op-family">{L().label_command_family}</label>
                         <select
                             id="center-op-family"
                             prop:value=move || draft.get().family.map(|family| family.as_str()).unwrap_or("")
@@ -10656,7 +10816,7 @@ mod browser {
                                 }
                             }
                         >
-                            <option value="">"Choose a family..."</option>
+                            <option value="">{L().choose_family}</option>
                             {CommandFamilyView::ALL
                                 .into_iter()
                                 .map(|family| {
@@ -10677,7 +10837,7 @@ mod browser {
                             ) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-reset">"Reset type"</label>
+                                        <label for="center-op-reset">{L().label_reset_type}</label>
                                         <select
                                             id="center-op-reset"
                                             on:change=move |event| {
@@ -10692,7 +10852,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose a reset type..."</option>
+                                            <option value="">{L().choose_reset_type_ellipsis}</option>
                                             {ResetTypeView::ALL
                                                 .into_iter()
                                                 .map(|reset| {
@@ -10709,7 +10869,7 @@ mod browser {
                             Some(CommandFamilyView::BootOverride) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-boot-source">"Boot source"</label>
+                                        <label for="center-op-boot-source">{L().label_boot_source}</label>
                                         <select
                                             id="center-op-boot-source"
                                             on:change=move |event| {
@@ -10724,7 +10884,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose a boot source..."</option>
+                                            <option value="">{L().choose_boot_source_ellipsis}</option>
                                             {BootSourceView::ALL
                                                 .into_iter()
                                                 .map(|source| {
@@ -10736,7 +10896,7 @@ mod browser {
                                         </select>
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-boot-enabled">"Enabled"</label>
+                                        <label for="center-op-boot-enabled">{L().label_enabled}</label>
                                         <select
                                             id="center-op-boot-enabled"
                                             on:change=move |event| {
@@ -10751,7 +10911,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose..."</option>
+                                            <option value="">{L().choose_ellipsis}</option>
                                             {BootEnabledView::ALL
                                                 .into_iter()
                                                 .map(|enabled| {
@@ -10763,7 +10923,7 @@ mod browser {
                                         </select>
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-boot-mode">"Mode"</label>
+                                        <label for="center-op-boot-mode">{L().label_mode}</label>
                                         <select
                                             id="center-op-boot-mode"
                                             on:change=move |event| {
@@ -10778,7 +10938,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose a mode..."</option>
+                                            <option value="">{L().choose_mode}</option>
                                             {BootModeView::ALL
                                                 .into_iter()
                                                 .map(|mode| {
@@ -10795,7 +10955,7 @@ mod browser {
                             Some(CommandFamilyView::SecureBoot) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-secure-boot">{L.field_action}</label>
+                                        <label for="center-op-secure-boot">{L().field_action}</label>
                                         <select
                                             id="center-op-secure-boot"
                                             on:change=move |event| {
@@ -10813,7 +10973,7 @@ mod browser {
                                                 set_submit_state.set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">{L.field_choose_action_ellipsis}</option>
+                                            <option value="">{L().field_choose_action_ellipsis}</option>
                                             <option value="enable">
                                                 {SecureBootActionView::Enable.label()}
                                             </option>
@@ -10828,7 +10988,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().secure_boot_action, Some(SecureBootActionView::ResetKeys(_)))
                                     }>
-                                        <label for="center-op-reset-keys">"Key set"</label>
+                                        <label for="center-op-reset-keys">{L().label_key_set}</label>
                                         <select
                                             id="center-op-reset-keys"
                                             on:change=move |event| {
@@ -10843,7 +11003,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose a key set..."</option>
+                                            <option value="">{L().choose_key_set_ellipsis}</option>
                                             {ResetKeysTypeView::ALL
                                                 .into_iter()
                                                 .map(|kind| {
@@ -10860,7 +11020,7 @@ mod browser {
                             Some(CommandFamilyView::EventSubscription) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-event-action">{L.field_action}</label>
+                                        <label for="center-op-event-action">{L().field_action}</label>
                                         <select
                                             id="center-op-event-action"
                                             on:change=move |event| {
@@ -10875,7 +11035,7 @@ mod browser {
                                                 set_submit_state.set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">{L.field_choose_action_ellipsis}</option>
+                                            <option value="">{L().field_choose_action_ellipsis}</option>
                                             <option value="create">
                                                 {EventActionView::CreateSubscription.label()}
                                             </option>
@@ -10887,7 +11047,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-destination">{L.field_destination}</label>
+                                        <label for="center-op-destination">{L().field_destination}</label>
                                         <input
                                             id="center-op-destination"
                                             type="text"
@@ -10903,7 +11063,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-protocol">{L.field_protocol}</label>
+                                        <label for="center-op-protocol">{L().field_protocol}</label>
                                         <select
                                             id="center-op-protocol"
                                             on:change=move |event| {
@@ -10918,7 +11078,7 @@ mod browser {
                                                 }
                                             }
                                         >
-                                            <option value="">"Choose a protocol..."</option>
+                                            <option value="">{L().choose_protocol_ellipsis}</option>
                                             {EventProtocolView::ALL
                                                 .into_iter()
                                                 .map(|protocol| {
@@ -10932,7 +11092,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-event-types">{L.field_event_types}</label>
+                                        <label for="center-op-event-types">{L().field_event_types}</label>
                                         <div class="filter-chip-list">
                                             {EventTypeView::ALL
                                                 .into_iter()
@@ -10974,7 +11134,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::DeleteSubscription))
                                     }>
-                                        <label for="center-op-subscription-id">"Subscription id"</label>
+                                        <label for="center-op-subscription-id">{L().label_subscription_id_lower}</label>
                                         <input
                                             id="center-op-subscription-id"
                                             type="text"
@@ -10992,7 +11152,7 @@ mod browser {
                             Some(CommandFamilyView::FirmwareUpdate) => {
                                 view! {
                                     <p class="form-hint">
-                                        "Firmware updates dispatch from the site console, which holds the artifact."
+                                        {L().hint_firmware_dispatch}
                                     </p>
                                 }
                                     .into_any()
@@ -11000,7 +11160,7 @@ mod browser {
                             Some(CommandFamilyView::Account) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-account-action">"Account action"</label>
+                                        <label for="center-op-account-action">{L().label_account_action}</label>
                                         <select
                                             id="center-op-account-action"
                                             prop:value=move || {
@@ -11033,7 +11193,7 @@ mod browser {
                                                     .set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">{L.field_choose_action_ellipsis}</option>
+                                            <option value="">{L().field_choose_action_ellipsis}</option>
                                             {AccountActionView::ALL
                                                 .into_iter()
                                                 .map(|action| {
@@ -11046,7 +11206,7 @@ mod browser {
                                         </select>
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-id">{L.field_account_id}</label>
+                                        <label for="center-op-account-id">{L().field_account_id}</label>
                                         <input
                                             id="center-op-account-id"
                                             type="text"
@@ -11064,7 +11224,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-user-name">{L.field_user_name}</label>
+                                        <label for="center-op-account-user-name">{L().field_user_name}</label>
                                         <input
                                             id="center-op-account-user-name"
                                             type="text"
@@ -11083,7 +11243,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-password">{L.field_password}</label>
+                                        <label for="center-op-account-password">{L().field_password}</label>
                                         <input
                                             id="center-op-account-password"
                                             type="password"
@@ -11101,7 +11261,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-role">{L.field_role_id}</label>
+                                        <label for="center-op-account-role">{L().field_role_id}</label>
                                         <input
                                             id="center-op-account-role"
                                             type="text"
@@ -11124,7 +11284,7 @@ mod browser {
                             Some(CommandFamilyView::Oem) => {
                                 view! {
                                     <p class="form-hint">
-                                        "OEM profile files dispatch from the site console, which holds the file."
+                                        {L().hint_oem_profile_dispatch}
                                     </p>
                                 }
                                     .into_any()
@@ -11136,7 +11296,7 @@ mod browser {
                             Some(CommandFamilyView::Telemetry) => {
                                 view! {
                                     <p class="form-hint">
-                                        "The telemetry write form is a later milestone."
+                                        {L().hint_telemetry_later}
                                     </p>
                                 }
                                     .into_any()
@@ -11154,10 +11314,10 @@ mod browser {
                             disabled=move || submit_state.get().is_in_flight()
                             on:click=on_submit
                         >
-                            "Dispatch operation"
+                            {L().action_dispatch_operation}
                         </button>
                         <p class="inline-status success" hidden=move || !matches!(submit_state.get(), CenterOperationSubmitState::Succeeded)>
-                            "The operation was dispatched to the site."
+                            {L().success_dispatched}
                         </p>
                         <p class="form-error" hidden=move || !matches!(submit_state.get(), CenterOperationSubmitState::Failed(_))>
                             {move || match submit_state.get() {
@@ -11219,12 +11379,12 @@ mod browser {
         let on_register = move |_| {
             let name = display_name.get();
             if name.trim().is_empty() {
-                set_name_error.set(Some("A site display name is required."));
+                set_name_error.set(Some(L().error_site_display_name_required));
                 return;
             }
             let url = center_url.get();
             if url.trim().is_empty() {
-                set_name_error.set(Some("The center URL is required."));
+                set_name_error.set(Some(L().error_center_url_required));
                 return;
             }
             set_name_error.set(None);
@@ -11264,15 +11424,15 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Center connection"</p>
-                        <h2>"Bindings"</h2>
+                        <p class="section-label">{L().section_center_connection}</p>
+                        <h2>{L().nav_center_bindings}</h2>
                     </div>
-                    <p>"Register a site and hand its one-time code to the site operator (design D2)."</p>
+                    <p>{L().hint_bindings}</p>
                 </div>
                 <div class="form-panel">
-                    <p class="section-label">"Register a site"</p>
+                    <p class="section-label">{L().section_register_site}</p>
                     <div class="form-row">
-                        <label for="center-bind-name">{L.field_display_name}</label>
+                        <label for="center-bind-name">{L().field_display_name}</label>
                         <input
                             id="center-bind-name"
                             type="text"
@@ -11283,7 +11443,7 @@ mod browser {
                         />
                     </div>
                     <div class="form-row">
-                        <label for="center-bind-url">"Center URL the site connects to"</label>
+                        <label for="center-bind-url">{L().label_center_url}</label>
                         <input
                             id="center-bind-url"
                             type="text"
@@ -11303,7 +11463,7 @@ mod browser {
                             disabled=move || matches!(register_state.get(), CenterRegisterState::InFlight)
                             on:click=on_register
                         >
-                            "Register site"
+                            {L().action_register_site}
                         </button>
                     </div>
                 </div>
@@ -11311,17 +11471,17 @@ mod browser {
                     class="form-panel result-panel"
                     hidden=move || !matches!(register_state.get(), CenterRegisterState::Issued(_))
                 >
-                    <p class="section-label">"One-time binding code"</p>
+                    <p class="section-label">{L().section_one_time_binding_code}</p>
                     <p class="form-hint">
-                        "This code is shown exactly once. Hand it to the site operator; it expires at the shown time."
+                        {L().hint_binding_code}
                     </p>
                     {move || {
                         let CenterRegisterState::Issued(code) = register_state.get() else {
                             return Vec::new();
                         };
                         let binding_code = code.code.clone();
-                        let code_meta = format!(
-                            "Site {} · binding {} · expires {}",
+                        let code_meta = catalog_format!(
+                            L().fmt_binding_code,
                             code.site_id,
                             code.binding_id,
                             format_observed_at(&code.expires_at)
@@ -11335,12 +11495,12 @@ mod browser {
                     }}
                 </div>
                 <div class="form-panel">
-                    <p class="section-label">"Active bindings"</p>
+                    <p class="section-label">{L().section_active_bindings}</p>
                     <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterBindingsListState::Loading)>
-                        "Loading bindings..."
+                        {L().loading_bindings}
                     </p>
                     <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                        "The binding list is temporarily unavailable."
+                        {L().unavailable_bindings}
                     </p>
                     <p
                         class="empty-inventory"
@@ -11348,7 +11508,7 @@ mod browser {
                             !list_state.get().is_ready() || !matches!(list_state.get(), CenterBindingsListState::Ready(ref rows) if rows.is_empty())
                         }
                     >
-                        "No sites are registered yet."
+                        {L().empty_bindings}
                     </p>
                     <div hidden=move || !list_state.get().is_ready()>
                         {move || {
@@ -11367,10 +11527,10 @@ mod browser {
                                         <div class="auth-table-row">
                                             <span class="auth-table-name">{site.display_name}</span>
                                             <span class="auth-table-time">
-                                                {move || binding_label.clone().unwrap_or_else(|| "no binding".to_owned())}
+                                                {move || binding_label.clone().unwrap_or_else(|| {L().chip_no_binding}.to_owned())}
                                             </span>
                                             <span class="auth-table-time">
-                                                {move || if online { "online" } else { "offline" }}
+                                                {move || if online { {L().chip_online} } else { {L().chip_offline} }}
                                             </span>
                                             <button
                                                 type="button"
@@ -11378,7 +11538,7 @@ mod browser {
                                                 disabled=!revocable
                                                 on:click=move |_| on_revoke.run(site_id.clone())
                                             >
-                                                "Revoke"
+                                                {L().action_revoke}
                                             </button>
                                         </div>
                                     }
@@ -11387,10 +11547,10 @@ mod browser {
                         }}
                     </div>
                     <p class="inline-status success" hidden=move || !matches!(revoke_state.get(), CenterRevokeState::Succeeded)>
-                        "The binding was revoked; the site converges on its next connection."
+                        {L().success_binding_revoked}
                     </p>
                     <p class="form-error" hidden=move || !matches!(revoke_state.get(), CenterRevokeState::Failed)>
-                        "The revocation was refused; the binding is unchanged."
+                        {L().error_revocation_refused}
                     </p>
                 </div>
             </section>
@@ -11436,8 +11596,71 @@ mod browser {
         }
     }
 
+    /// The URL-fragment prefix of the persisted language choice. The
+    /// fragment is the only browser storage this crate's web-sys surface
+    /// exposes (the leptos CSR feature set enables `Window` and `Location`
+    /// only), and it survives the reload that applies the switch.
+    const LANG_FRAGMENT_PREFIX: &str = "#lang=";
+
+    /// Reads the persisted language code from the URL fragment, if any; the
+    /// caller falls back to the default through [`parse_lang`]. Best-effort:
+    /// an unreadable location simply starts in English.
+    fn stored_lang_code() -> Option<String> {
+        let window = leptos::web_sys::window()?;
+        let hash = window.location().hash().ok()?;
+        hash.strip_prefix(LANG_FRAGMENT_PREFIX).map(str::to_owned)
+    }
+
+    /// Persists the language choice in the URL fragment for the next page
+    /// load. Best-effort: a location failure never blocks the switch.
+    fn persist_language(lang: Lang) {
+        if let Some(window) = leptos::web_sys::window() {
+            let _ = window
+                .location()
+                .set_hash(&format!("lang={}", lang_code(lang)));
+        }
+    }
+
+    /// Applies one language selection: the thread-local switches the
+    /// catalogs [`L()`] resolves, the choice is persisted in the URL
+    /// fragment, and the page reloads so every component re-mounts under the
+    /// new language. A reload is the honest re-render here: the templates
+    /// read `L()` as plain expressions, so Leptos reactivity cannot
+    /// re-evaluate them in place.
+    fn apply_language(lang: Lang) {
+        set_lang(lang);
+        persist_language(lang);
+        if let Some(window) = leptos::web_sys::window() {
+            let _ = window.location().reload();
+        }
+    }
+
+    /// The minimal §5.1 language selector: English (default) and Simplified
+    /// Chinese, persisted across reloads.
+    #[component]
+    fn LanguageSelector() -> impl IntoView {
+        let selected = move || match current_lang() {
+            Lang::En => "en",
+            Lang::Zh => "zh",
+        };
+        view! {
+            <select
+                class="lang-select"
+                aria-label={L().label_language}
+                prop:value=selected
+                on:change=move |event| {
+                    apply_language(parse_lang(&event_target_value(&event)));
+                }
+            >
+                <option value="en">{L().lang_en}</option>
+                <option value="zh">{L().lang_zh}</option>
+            </select>
+        }
+    }
+
     #[wasm_bindgen(start)]
     pub fn start() {
+        set_lang(parse_lang(&stored_lang_code().unwrap_or_default()));
         mount_to_body(|| view! { <ProductShell /> });
     }
 
@@ -11666,7 +11889,7 @@ mod browser {
                         set_selected_endpoint_ids.set(BTreeSet::new());
                         // The refreshed Generations changed what the cards
                         // render, so the console reloads exactly like a
-                        // manual "Refresh inventory" click.
+                        // manual {L().action_refresh_inventory} click.
                         set_state.set(ConsoleLoadState::Loading);
                         spawn_local(async move {
                             set_state.set(fetch_console().await);
@@ -11712,8 +11935,8 @@ mod browser {
             let shown = filtered_endpoint_cards().len();
             let total = state.with(ConsoleLoadState::endpoint_cards).len();
             match shown {
-                1 => format!("1 of {total} endpoints shown"),
-                _ => format!("{shown} of {total} endpoints shown"),
+                1 => catalog_format!(L().fmt_endpoints_shown_one, total),
+                _ => catalog_format!(L().fmt_endpoints_shown_many, shown, total),
             }
         };
 
@@ -11726,10 +11949,10 @@ mod browser {
         let console_active = move || auth_screen.get() == AuthScreen::Console;
         let auth_screen_view = move || match auth_screen.get() {
             AuthScreen::Loading => view! {
-                <section class="auth-screen" aria-label="Loading">
+                <section class="auth-screen" aria-label={L().aria_loading}>
                     <div class="auth-card">
-                        <p class="eyebrow">{L.header_eyebrow}</p>
-                        <p class="auth-note">"Checking…"</p>
+                        <p class="eyebrow">{L().header_eyebrow}</p>
+                        <p class="auth-note">{L().loading_auth}</p>
                     </div>
                 </section>
             }
@@ -11742,620 +11965,621 @@ mod browser {
         };
 
         view! {
-            <main id="app" aria-live="polite">
-                {auth_screen_view}
-                <header class="product-header" hidden=move || !console_active()>
-                    <div>
-                        <p class="eyebrow">{L.header_eyebrow}</p>
-                        <h1>"Rutilus"</h1>
-                        <p id="status">{move || match console_scope.get() {
-                            ConsoleScopeView::Center => L.header_center_console,
-                            _ => state.with(ConsoleLoadState::status_message),
-                        }}</p>
-                    </div>
-                    <dl id="build" hidden=move || !state.with(ConsoleLoadState::is_ready)>
-                        <div>
-                            <dt>"Product"</dt>
-                            <dd id="product-version">
-                                {move || state.with(ConsoleLoadState::product_version_text)}
-                            </dd>
-                        </div>
-                        <div>
-                            <dt>"nv-redfish"</dt>
-                            <dd id="redfish-version">
-                                {move || state.with(ConsoleLoadState::nv_redfish_baseline_text)}
-                            </dd>
-                        </div>
-                    </dl>
-                    <button
-                        type="button"
-                        class="btn"
-                        hidden=move || !console_active()
-                        on:click=on_logout
-                    >
-                        {L.action_sign_out}
-                    </button>
-                </header>
-
-                <nav class="view-nav" aria-label={L.header_nav_aria} hidden=move || !console_active()>
-                    {ConsoleView::ALL
-                        .iter()
-                        .map(|candidate| {
-                            let candidate = *candidate;
-                            let class = move || {
-                                if view.get() == candidate {
-                                    "view-nav-item is-active"
-                                } else {
-                                    "view-nav-item"
-                                }
-                            };
-                            // The capability and diagnostics drill-downs need
-                            // an endpoint (and, for diagnostics, a resource)
-                            // chosen from a card first, so their navigation
-                            // entries stay hidden until a target is selected.
-                            // The user and session administration entries are
-                            // §16.1 Administrator only. The center views
-                            // render only on the Center console and the edge
-                            // views only on the Edge consoles (audit
-                            // follow-up F2/S8), and the navigation stays
-                            // hidden while the scope probe runs.
-                            let hidden = move || {
-                                console_scope.get() == ConsoleScopeView::Checking
-                                    || candidate.is_center_view()
-                                        != (console_scope.get() == ConsoleScopeView::Center)
-                                    || (candidate == ConsoleView::Capabilities
-                                        && capability_target.get().is_none())
-                                    || (candidate == ConsoleView::Diagnostics
-                                        && diagnostics_target.get().is_none())
-                                    || !candidate.allowed_for(
-                                        auth_principal
-                                            .get()
-                                            .as_ref()
-                                            .and_then(|principal| principal.role())
-                                            .map(RoleView::from_wire),
-                                    )
-                            };
-                            view! {
-                                <button
-                                    type="button"
-                                    class=class
-                                    hidden=hidden
-                                    on:click=move |_| set_view.set(candidate)
-                                >
-                                    {candidate.label()}
-                                </button>
-                            }
-                        })
-                        .collect_view()}
-                </nav>
-
-                <section
-                    class="inventory"
-                    hidden=move || {
-                        view.get() != ConsoleView::Overview
-                            || !state.with(ConsoleLoadState::is_ready)
-                    }
-                >
-                    <div class="inventory-heading">
-                        <div>
-                            <p class="section-label">"Inventory"</p>
-                            <h2>{move || state.with(ConsoleLoadState::endpoint_count_text)}</h2>
-                        </div>
-                        <p>"Latest complete Redfish resource generations"</p>
-                    </div>
-                    <div class="inventory-actions">
-                        <button
-                            type="button"
-                            class="btn btn-primary"
-                            disabled=move || {
-                                state.with(ConsoleLoadState::is_loading)
-                                    || refresh_state.get().is_in_flight()
-                                    || selected_endpoint_ids.get().is_empty()
-                            }
-                            on:click=on_refresh_selected
-                        >
-                            "Refresh selected"
-                        </button>
-                        <button
-                            type="button"
-                            class="btn"
-                            disabled=move || state.with(ConsoleLoadState::is_loading)
-                            on:click=on_refresh_inventory
-                        >
-                            "Refresh inventory"
-                        </button>
-                        <p
-                            class="form-hint"
-                            hidden=move || selected_endpoint_ids.get().is_empty()
-                        >
-                            {move || {
-                                let count = selected_endpoint_ids.get().len();
-                                match count {
-                                    1 => "1 endpoint selected".to_owned(),
-                                    _ => format!("{count} endpoints selected"),
-                                }
-                            }}
-                        </p>
-                    </div>
-
-                    // The §14.2 homepage dashboard: one server-derived
-                    // aggregate of the whole fleet. The blocks render only
-                    // once the aggregate is ready; a failed aggregate shows
-                    // the static unavailable message instead of stale facts.
-                    <section
-                        class="overview-dashboard"
-                        hidden=move || !overview_state.get().is_ready()
-                    >
-                        <div class="overview-stats">
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or(0, |projection| projection.total_endpoints)
-                                    }}
-                                </span>
-                                <span class="stat-label">"Endpoints"</span>
+                    <main id="app" aria-live="polite">
+                        {auth_screen_view}
+                        <header class="product-header" hidden=move || !console_active()>
+                            <div>
+                                <p class="eyebrow">{L().header_eyebrow}</p>
+                                <h1>{L().label_rutilus}</h1>
+                                <p id="status">{move || match console_scope.get() {
+                                    ConsoleScopeView::Center => L().header_center_console,
+                                    _ => state.with(ConsoleLoadState::status_message),
+                                }}</p>
                             </div>
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or(0, |projection| {
-                                                projection.with_current_snapshot
-                                            })
-                                    }}
-                                </span>
-                                <span class="stat-label">"With current snapshot"</span>
-                            </div>
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or(0, |projection| {
-                                                projection.awaiting_first_refresh
-                                            })
-                                    }}
-                                </span>
-                                <span class="stat-label">"Awaiting first refresh"</span>
-                            </div>
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or(0, |projection| projection.running_operations)
-                                    }}
-                                </span>
-                                <span class="stat-label">"Running operations"</span>
-                            </div>
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or(0, |projection| projection.firmware_entries)
-                                    }}
-                                </span>
-                                <span class="stat-label">"Firmware members"</span>
-                                <span class="stat-note">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or_else(String::new, |projection| {
-                                                projection.firmware_summary_text()
-                                            })
-                                    }}
-                                </span>
-                            </div>
-                            <div class="stat-tile">
-                                <span class="stat-value">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .and_then(|projection| {
-                                                projection.capability_coverage.clone()
-                                            })
-                                            .map_or_else(|| "—".to_owned(), |coverage| {
-                                                coverage.percent_text
-                                            })
-                                    }}
-                                </span>
-                                <span class="stat-label">"Capability coverage"</span>
-                                <span class="stat-note">
-                                    {move || {
-                                        overview_state
-                                            .get()
-                                            .projection()
-                                            .and_then(|projection| {
-                                                projection.capability_coverage_text()
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "No capability observations yet".to_owned()
-                                            })
-                                    }}
-                                </span>
-                            </div>
-                        </div>
-                        <div class="overview-blocks">
-                            <div class="overview-block">
-                                <h3>"Vendors"</h3>
-                                {move || {
-                                    let chips = overview_state
-                                        .get()
-                                        .projection()
-                                        .map_or_else(Vec::new, |projection| {
-                                            projection.vendors.clone()
-                                        });
-                                    chips
-                                        .into_iter()
-                                        .map(|chip| {
-                                            view! {
-                                                <span class="overview-chip">
-                                                    <span>{chip.label}</span>
-                                                    <b>{chip.count}</b>
-                                                </span>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                            <div class="overview-block">
-                                <h3>"Health"</h3>
-                                {move || {
-                                    let chips = overview_state
-                                        .get()
-                                        .projection()
-                                        .map_or_else(Vec::new, |projection| {
-                                            projection.health.clone()
-                                        });
-                                    chips
-                                        .into_iter()
-                                        .map(|chip| {
-                                            let level = chip.level;
-                                            let label = health_level_label(level);
-                                            let class = format!(
-                                                "overview-chip {}",
-                                                health_badge_class(level)
-                                            );
-                                            view! {
-                                                <span class=class>
-                                                    <span>{label}</span>
-                                                    <b>{chip.count}</b>
-                                                </span>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                            <div class="overview-block">
-                                <h3>"Data freshness"</h3>
-                                {move || {
-                                    let chips = overview_state
-                                        .get()
-                                        .projection()
-                                        .map_or_else(Vec::new, |projection| {
-                                            projection.freshness.clone()
-                                        });
-                                    chips
-                                        .into_iter()
-                                        .map(|chip| {
-                                            view! {
-                                                <span class="overview-chip">
-                                                    <span>{chip.label}</span>
-                                                    <b>{chip.count}</b>
-                                                </span>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                            <div class="overview-block overview-block-events">
-                                <h3>"Recent events"</h3>
-                                <p
-                                    class="overview-events-summary"
-                                    hidden=move || {
-                                        !overview_state
-                                            .get()
-                                            .projection()
-                                            .is_some_and(|projection| {
-                                                projection.recent_events.is_empty()
-                                            })
-                                    }
-                                >
-                                    "No events have been observed yet."
-                                </p>
-                                <ul class="overview-events">
-                                    {move || {
-                                        let events = overview_state
-                                            .get()
-                                            .projection()
-                                            .map_or_else(Vec::new, |projection| {
-                                                projection.recent_events.clone()
-                                            });
-                                        events
-                                            .into_iter()
-                                            .map(|event| {
-                                                view! {
-                                                    <li class="overview-event">
-                                                        <span class=event.severity_class>
-                                                            {event.severity_label}
-                                                        </span>
-                                                        <span class="overview-event-message">
-                                                            {event.message_id}
-                                                        </span>
-                                                        <span class="overview-event-time">
-                                                            {event.observed_at_text}
-                                                        </span>
-                                                    </li>
-                                                }
-                                            })
-                                            .collect_view()
-                                    }}
-                                </ul>
-                            </div>
-                        </div>
-                        <p
-                            class="form-error"
-                            hidden=move || !overview_state.get().is_failed()
-                        >
-                            {move || overview_state.get().failure_message()}
-                        </p>
-                    </section>
-
-                    <div class="overview-filter-bar">
-                        <div class="filter-field filter-field-search">
-                            <label for="overview-search">"Search"</label>
-                            <input
-                                id="overview-search"
-                                class="filter-search"
-                                type="search"
-                                autocomplete="off"
-                                placeholder="Name or address"
-                                prop:value=move || filter_search.get()
-                                on:input=on_search_input
-                            />
-                        </div>
-                        <div class="filter-field">
-                            <span class="filter-field-label">"Tags"</span>
-                            <div class="filter-chip-list">
-                                {move || {
-                                    tags_state
-                                        .get()
-                                        .tag_names()
-                                        .into_iter()
-                                        .map(|tag| {
-                                            let tag_for_check = tag.clone();
-                                            let tag_for_toggle = tag.clone();
-                                            view! {
-                                                <label class="filter-chip">
-                                                    <input
-                                                        type="checkbox"
-                                                        prop:checked=move || {
-                                                            filter_tags.get().contains(&tag_for_check)
-                                                        }
-                                                        on:change=move |_| {
-                                                            on_toggle_tag(tag_for_toggle.clone());
-                                                        }
-                                                    />
-                                                    <span>{tag}</span>
-                                                </label>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                            <p
-                                class="form-hint"
-                                hidden=move || !tags_state.get().is_failed()
+                            <dl id="build" hidden=move || !state.with(ConsoleLoadState::is_ready)>
+                                <div>
+                                    <dt>{L().label_product}</dt>
+                                    <dd id="product-version">
+                                        {move || state.with(ConsoleLoadState::product_version_text)}
+                                    </dd>
+                                </div>
+                                <div>
+                                    <dt>"nv-redfish"</dt>
+                                    <dd id="redfish-version">
+                                        {move || state.with(ConsoleLoadState::nv_redfish_baseline_text)}
+                                    </dd>
+                                </div>
+                            </dl>
+                            <button
+                                type="button"
+                                class="btn"
+                                hidden=move || !console_active()
+                                on:click=on_logout
                             >
-                                "The tag list is temporarily unavailable."
-                            </p>
-                        </div>
-                        <div class="filter-field">
-                            <span class="filter-field-label">"Vendor"</span>
-                            <div class="filter-chip-list">
-                                {move || {
-                                    let cards = state.with(ConsoleLoadState::endpoint_cards);
-                                    vendor_choices(&cards)
-                                        .into_iter()
-                                        .map(|vendor| {
-                                            let vendor_for_check = vendor.clone();
-                                            let vendor_for_toggle = vendor.clone();
-                                            view! {
-                                                <label class="filter-chip">
-                                                    <input
-                                                        type="checkbox"
-                                                        prop:checked=move || {
-                                                            filter_vendors.get().contains(&vendor_for_check)
-                                                        }
-                                                        on:change=move |_| {
-                                                            on_toggle_vendor(vendor_for_toggle.clone());
-                                                        }
-                                                    />
-                                                    <span>{vendor}</span>
-                                                </label>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                        </div>
-                        <div class="filter-field">
-                            <span class="filter-field-label">"Health"</span>
-                            <div class="filter-chip-list">
-                                {move || {
-                                    let cards = state.with(ConsoleLoadState::endpoint_cards);
-                                    health_choices(&cards)
-                                        .into_iter()
-                                        .map(|level| {
-                                            let level_for_check = level;
-                                            let level_for_toggle = level;
-                                            view! {
-                                                <label class="filter-chip">
-                                                    <input
-                                                        type="checkbox"
-                                                        prop:checked=move || {
-                                                            filter_health.get().contains(&level_for_check)
-                                                        }
-                                                        on:change=move |_| {
-                                                            on_toggle_health(level_for_toggle);
-                                                        }
-                                                    />
-                                                    <span>{health_level_label(level)}</span>
-                                                </label>
-                                            }
-                                        })
-                                        .collect_view()
-                                }}
-                            </div>
-                        </div>
-                        <div class="filter-field filter-field-actions">
-                            <button type="button" class="btn" on:click=on_clear_filters>
-                                "Clear filters"
+                                {L().action_sign_out}
                             </button>
-                        </div>
-                    </div>
-                    <p class="filter-summary" hidden=move || !filters_active()>
-                        {move || filter_summary_text()}
-                    </p>
-                    <p
-                        class="empty-inventory"
-                        hidden=move || !state.with(ConsoleLoadState::has_empty_inventory)
-                    >
-                        "No endpoints are managed yet. Add a trusted BMC endpoint to begin."
-                    </p>
-                    <p class="empty-inventory" hidden=move || !has_filtered_empty_result()>
-                        "No endpoints match the current filters."
-                    </p>
-                    <div class="endpoint-grid">
-                        {move || {
-                            filtered_endpoint_cards()
-                                .into_iter()
-                                .map(|card| {
-                                    let selected = selected_endpoint_ids
-                                        .get()
-                                        .contains(&card.endpoint_id);
+                            <LanguageSelector />
+                        </header>
+
+                        <nav class="view-nav" aria-label={L().header_nav_aria} hidden=move || !console_active()>
+                            {ConsoleView::ALL
+                                .iter()
+                                .map(|candidate| {
+                                    let candidate = *candidate;
+                                    let class = move || {
+                                        if view.get() == candidate {
+                                            "view-nav-item is-active"
+                                        } else {
+                                            "view-nav-item"
+                                        }
+                                    };
+                                    // The capability and diagnostics drill-downs need
+                                    // an endpoint (and, for diagnostics, a resource)
+                                    // chosen from a card first, so their navigation
+                                    // entries stay hidden until a target is selected.
+                                    // The user and session administration entries are
+                                    // §16.1 Administrator only. The center views
+                                    // render only on the Center console and the edge
+                                    // views only on the Edge consoles (audit
+                                    // follow-up F2/S8), and the navigation stays
+                                    // hidden while the scope probe runs.
+                                    let hidden = move || {
+                                        console_scope.get() == ConsoleScopeView::Checking
+                                            || candidate.is_center_view()
+                                                != (console_scope.get() == ConsoleScopeView::Center)
+                                            || (candidate == ConsoleView::Capabilities
+                                                && capability_target.get().is_none())
+                                            || (candidate == ConsoleView::Diagnostics
+                                                && diagnostics_target.get().is_none())
+                                            || !candidate.allowed_for(
+                                                auth_principal
+                                                    .get()
+                                                    .as_ref()
+                                                    .and_then(|principal| principal.role())
+                                                    .map(RoleView::from_wire),
+                                            )
+                                    };
                                     view! {
-                                        <EndpointCard
-                                            card=card
-                                            selected=selected
-                                            on_toggle_selection=on_toggle_selection
-                                            on_view_capabilities=on_view_capabilities
-                                            on_open_diagnostics=on_open_diagnostics
-                                        />
+                                        <button
+                                            type="button"
+                                            class=class
+                                            hidden=hidden
+                                            on:click=move |_| set_view.set(candidate)
+                                        >
+                                            {candidate.label()}
+                                        </button>
                                     }
                                 })
-                                .collect_view()
-                        }}
-                    </div>
-                    <div
-                        class="form-panel result-panel"
-                        hidden=move || !refresh_state.get().is_ready()
-                    >
-                        <p class="section-label">"Refresh report"</p>
-                        <p class="inline-status success">
-                            {move || match refresh_state.get() {
-                                RefreshBatchState::Ready(report) => report.summary_text(),
-                                _ => String::new(),
-                            }}
-                        </p>
-                        <table class="results-table">
-                            <thead>
-                                <tr>
-                                    <th>"Endpoint"</th>
-                                    <th>"Result"</th>
-                                    <th>"Detail"</th>
-                                </tr>
-                            </thead>
-                            <tbody>
+                                .collect_view()}
+                        </nav>
+
+                        <section
+                            class="inventory"
+                            hidden=move || {
+                                view.get() != ConsoleView::Overview
+                                    || !state.with(ConsoleLoadState::is_ready)
+                            }
+                        >
+                            <div class="inventory-heading">
+                                <div>
+                                    <p class="section-label">{L().label_inventory}</p>
+                                    <h2>{move || state.with(ConsoleLoadState::endpoint_count_text)}</h2>
+                                </div>
+                                <p>{L().label_latest_generations}</p>
+                            </div>
+                            <div class="inventory-actions">
+                                <button
+                                    type="button"
+                                    class="btn btn-primary"
+                                    disabled=move || {
+                                        state.with(ConsoleLoadState::is_loading)
+                                            || refresh_state.get().is_in_flight()
+                                            || selected_endpoint_ids.get().is_empty()
+                                    }
+                                    on:click=on_refresh_selected
+                                >
+                                    {L().action_refresh_selected}
+                                </button>
+                                <button
+                                    type="button"
+                                    class="btn"
+                                    disabled=move || state.with(ConsoleLoadState::is_loading)
+                                    on:click=on_refresh_inventory
+                                >
+                                    {L().action_refresh_inventory}
+                                </button>
+                                <p
+                                    class="form-hint"
+                                    hidden=move || selected_endpoint_ids.get().is_empty()
+                                >
+                                    {move || {
+                                        let count = selected_endpoint_ids.get().len();
+                                        match count {
+        1 => L().fmt_endpoints_selected_one.to_owned(),
+        _ => catalog_format!(L().fmt_endpoints_selected_many,  count),
+                                        }
+                                    }}
+                                </p>
+                            </div>
+
+                            // The §14.2 homepage dashboard: one server-derived
+                            // aggregate of the whole fleet. The blocks render only
+                            // once the aggregate is ready; a failed aggregate shows
+                            // the static unavailable message instead of stale facts.
+                            <section
+                                class="overview-dashboard"
+                                hidden=move || !overview_state.get().is_ready()
+                            >
+                                <div class="overview-stats">
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or(0, |projection| projection.total_endpoints)
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().label_endpoints}</span>
+                                    </div>
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or(0, |projection| {
+                                                        projection.with_current_snapshot
+                                                    })
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().label_with_current_snapshot}</span>
+                                    </div>
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or(0, |projection| {
+                                                        projection.awaiting_first_refresh
+                                                    })
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().notice_awaiting_first_refresh}</span>
+                                    </div>
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or(0, |projection| projection.running_operations)
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().label_running_operations}</span>
+                                    </div>
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or(0, |projection| projection.firmware_entries)
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().label_firmware_members}</span>
+                                        <span class="stat-note">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or_else(String::new, |projection| {
+                                                        projection.firmware_summary_text()
+                                                    })
+                                            }}
+                                        </span>
+                                    </div>
+                                    <div class="stat-tile">
+                                        <span class="stat-value">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .and_then(|projection| {
+                                                        projection.capability_coverage.clone()
+                                                    })
+                                                    .map_or_else(|| "—".to_owned(), |coverage| {
+                                                        coverage.percent_text
+                                                    })
+                                            }}
+                                        </span>
+                                        <span class="stat-label">{L().label_capability_coverage}</span>
+                                        <span class="stat-note">
+                                            {move || {
+                                                overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .and_then(|projection| {
+                                                        projection.capability_coverage_text()
+                                                    })
+                                                    .unwrap_or_else(|| {
+                                                        {L().label_no_capability_observations}.to_owned()
+                                                    })
+                                            }}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="overview-blocks">
+                                    <div class="overview-block">
+                                        <h3>{L().label_vendors}</h3>
+                                        {move || {
+                                            let chips = overview_state
+                                                .get()
+                                                .projection()
+                                                .map_or_else(Vec::new, |projection| {
+                                                    projection.vendors.clone()
+                                                });
+                                            chips
+                                                .into_iter()
+                                                .map(|chip| {
+                                                    view! {
+                                                        <span class="overview-chip">
+                                                            <span>{chip.label}</span>
+                                                            <b>{chip.count}</b>
+                                                        </span>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                    <div class="overview-block">
+                                        <h3>{L().fact_health}</h3>
+                                        {move || {
+                                            let chips = overview_state
+                                                .get()
+                                                .projection()
+                                                .map_or_else(Vec::new, |projection| {
+                                                    projection.health.clone()
+                                                });
+                                            chips
+                                                .into_iter()
+                                                .map(|chip| {
+                                                    let level = chip.level;
+                                                    let label = health_level_label(level);
+                                                    let class = format!(
+                                                        "overview-chip {}",
+                                                        health_badge_class(level)
+                                                    );
+                                                    view! {
+                                                        <span class=class>
+                                                            <span>{label}</span>
+                                                            <b>{chip.count}</b>
+                                                        </span>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                    <div class="overview-block">
+                                        <h3>{L().label_data_freshness}</h3>
+                                        {move || {
+                                            let chips = overview_state
+                                                .get()
+                                                .projection()
+                                                .map_or_else(Vec::new, |projection| {
+                                                    projection.freshness.clone()
+                                                });
+                                            chips
+                                                .into_iter()
+                                                .map(|chip| {
+                                                    view! {
+                                                        <span class="overview-chip">
+                                                            <span>{chip.label}</span>
+                                                            <b>{chip.count}</b>
+                                                        </span>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                    <div class="overview-block overview-block-events">
+                                        <h3>{L().label_recent_events}</h3>
+                                        <p
+                                            class="overview-events-summary"
+                                            hidden=move || {
+                                                !overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .is_some_and(|projection| {
+                                                        projection.recent_events.is_empty()
+                                                    })
+                                            }
+                                        >
+                                            {L().empty_no_events_observed}
+                                        </p>
+                                        <ul class="overview-events">
+                                            {move || {
+                                                let events = overview_state
+                                                    .get()
+                                                    .projection()
+                                                    .map_or_else(Vec::new, |projection| {
+                                                        projection.recent_events.clone()
+                                                    });
+                                                events
+                                                    .into_iter()
+                                                    .map(|event| {
+                                                        view! {
+                                                            <li class="overview-event">
+                                                                <span class=event.severity_class>
+                                                                    {event.severity_label}
+                                                                </span>
+                                                                <span class="overview-event-message">
+                                                                    {event.message_id}
+                                                                </span>
+                                                                <span class="overview-event-time">
+                                                                    {event.observed_at_text}
+                                                                </span>
+                                                            </li>
+                                                        }
+                                                    })
+                                                    .collect_view()
+                                            }}
+                                        </ul>
+                                    </div>
+                                </div>
+                                <p
+                                    class="form-error"
+                                    hidden=move || !overview_state.get().is_failed()
+                                >
+                                    {move || overview_state.get().failure_message()}
+                                </p>
+                            </section>
+
+                            <div class="overview-filter-bar">
+                                <div class="filter-field filter-field-search">
+                                    <label for="overview-search">{L().label_search}</label>
+                                    <input
+                                        id="overview-search"
+                                        class="filter-search"
+                                        type="search"
+                                        autocomplete="off"
+                                        placeholder={L().label_name_or_address}
+                                        prop:value=move || filter_search.get()
+                                        on:input=on_search_input
+                                    />
+                                </div>
+                                <div class="filter-field">
+                                    <span class="filter-field-label">{L().section_tags}</span>
+                                    <div class="filter-chip-list">
+                                        {move || {
+                                            tags_state
+                                                .get()
+                                                .tag_names()
+                                                .into_iter()
+                                                .map(|tag| {
+                                                    let tag_for_check = tag.clone();
+                                                    let tag_for_toggle = tag.clone();
+                                                    view! {
+                                                        <label class="filter-chip">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || {
+                                                                    filter_tags.get().contains(&tag_for_check)
+                                                                }
+                                                                on:change=move |_| {
+                                                                    on_toggle_tag(tag_for_toggle.clone());
+                                                                }
+                                                            />
+                                                            <span>{tag}</span>
+                                                        </label>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                    <p
+                                        class="form-hint"
+                                        hidden=move || !tags_state.get().is_failed()
+                                    >
+                                        {L().unavailable_tags}
+                                    </p>
+                                </div>
+                                <div class="filter-field">
+                                    <span class="filter-field-label">{L().fact_vendor}</span>
+                                    <div class="filter-chip-list">
+                                        {move || {
+                                            let cards = state.with(ConsoleLoadState::endpoint_cards);
+                                            vendor_choices(&cards)
+                                                .into_iter()
+                                                .map(|vendor| {
+                                                    let vendor_for_check = vendor.clone();
+                                                    let vendor_for_toggle = vendor.clone();
+                                                    view! {
+                                                        <label class="filter-chip">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || {
+                                                                    filter_vendors.get().contains(&vendor_for_check)
+                                                                }
+                                                                on:change=move |_| {
+                                                                    on_toggle_vendor(vendor_for_toggle.clone());
+                                                                }
+                                                            />
+                                                            <span>{vendor}</span>
+                                                        </label>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                </div>
+                                <div class="filter-field">
+                                    <span class="filter-field-label">{L().fact_health}</span>
+                                    <div class="filter-chip-list">
+                                        {move || {
+                                            let cards = state.with(ConsoleLoadState::endpoint_cards);
+                                            health_choices(&cards)
+                                                .into_iter()
+                                                .map(|level| {
+                                                    let level_for_check = level;
+                                                    let level_for_toggle = level;
+                                                    view! {
+                                                        <label class="filter-chip">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || {
+                                                                    filter_health.get().contains(&level_for_check)
+                                                                }
+                                                                on:change=move |_| {
+                                                                    on_toggle_health(level_for_toggle);
+                                                                }
+                                                            />
+                                                            <span>{health_level_label(level)}</span>
+                                                        </label>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </div>
+                                </div>
+                                <div class="filter-field filter-field-actions">
+                                    <button type="button" class="btn" on:click=on_clear_filters>
+                                        {L().action_clear_filters}
+                                    </button>
+                                </div>
+                            </div>
+                            <p class="filter-summary" hidden=move || !filters_active()>
+                                {move || filter_summary_text()}
+                            </p>
+                            <p
+                                class="empty-inventory"
+                                hidden=move || !state.with(ConsoleLoadState::has_empty_inventory)
+                            >
+                                {L().empty_no_endpoints_managed}
+                            </p>
+                            <p class="empty-inventory" hidden=move || !has_filtered_empty_result()>
+                                {L().empty_no_endpoints_match}
+                            </p>
+                            <div class="endpoint-grid">
                                 {move || {
-                                    let RefreshBatchState::Ready(report) = refresh_state.get()
-                                    else {
-                                        return Vec::new();
-                                    };
-                                    report
-                                        .rows
+                                    filtered_endpoint_cards()
                                         .into_iter()
-                                        .map(|row| {
-                                            let result_class = if row.is_success {
-                                                "result-success"
-                                            } else {
-                                                "result-failure"
-                                            };
+                                        .map(|card| {
+                                            let selected = selected_endpoint_ids
+                                                .get()
+                                                .contains(&card.endpoint_id);
                                             view! {
-                                                <tr>
-                                                    <td class="result-address">
-                                                        {row.display_name}
-                                                    </td>
-                                                    <td class=result_class>{row.status_label}</td>
-                                                    <td class="result-detail">
-                                                        {move || row.detail.clone()}
-                                                    </td>
-                                                </tr>
+                                                <EndpointCard
+                                                    card=card
+                                                    selected=selected
+                                                    on_toggle_selection=on_toggle_selection
+                                                    on_view_capabilities=on_view_capabilities
+                                                    on_open_diagnostics=on_open_diagnostics
+                                                />
                                             }
                                         })
                                         .collect_view()
                                 }}
-                            </tbody>
-                        </table>
-                    </div>
-                    <p
-                        class="form-error"
-                        hidden=move || {
-                            !matches!(refresh_state.get(), RefreshBatchState::Failed(_))
-                        }
-                    >
-                        {move || match refresh_state.get() {
-                            RefreshBatchState::Failed(failure) => failure.message(),
-                            _ => String::new(),
-                        }}
-                    </p>
-                </section>
+                            </div>
+                            <div
+                                class="form-panel result-panel"
+                                hidden=move || !refresh_state.get().is_ready()
+                            >
+                                <p class="section-label">{L().section_refresh_report}</p>
+                                <p class="inline-status success">
+                                    {move || match refresh_state.get() {
+                                        RefreshBatchState::Ready(report) => report.summary_text(),
+                                        _ => String::new(),
+                                    }}
+                                </p>
+                                <table class="results-table">
+                                    <thead>
+                                        <tr>
+                                            <th>{L().label_endpoint}</th>
+                                            <th>{L().table_result}</th>
+                                            <th>{L().table_detail}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {move || {
+                                            let RefreshBatchState::Ready(report) = refresh_state.get()
+                                            else {
+                                                return Vec::new();
+                                            };
+                                            report
+                                                .rows
+                                                .into_iter()
+                                                .map(|row| {
+                                                    let result_class = if row.is_success {
+                                                        "result-success"
+                                                    } else {
+                                                        "result-failure"
+                                                    };
+                                                    view! {
+                                                        <tr>
+                                                            <td class="result-address">
+                                                                {row.display_name}
+                                                            </td>
+                                                            <td class=result_class>{row.status_label}</td>
+                                                            <td class="result-detail">
+                                                                {move || row.detail.clone()}
+                                                            </td>
+                                                        </tr>
+                                                    }
+                                                })
+                                                .collect_view()
+                                        }}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <p
+                                class="form-error"
+                                hidden=move || {
+                                    !matches!(refresh_state.get(), RefreshBatchState::Failed(_))
+                                }
+                            >
+                                {move || match refresh_state.get() {
+                                    RefreshBatchState::Failed(failure) => failure.message(),
+                                    _ => String::new(),
+                                }}
+                            </p>
+                        </section>
 
-                <CredentialsView view=view />
-                <AddEndpointView view=view />
-                <ImportView view=view />
-                <AuditView view=view />
-                <CapabilitiesView
-                    view=view
-                    target=capability_target
-                    state=capability_state
-                    set_state=set_capability_state
-                    triggered=capability_triggered
-                    set_triggered=set_capability_triggered
-                    on_back=on_back_to_overview
-                />
-                <OperationsView view=view load_state=state />
-                <EventsView view=view />
-                <TelemetryView view=view />
-                <ArtifactsView view=view />
-                <GroupsView view=view load_state=state />
-                <DiagnosticsView
-                    view=view
-                    target=diagnostics_target
-                    state=diagnostics_state
-                    set_state=set_diagnostics_state
-                    triggered=diagnostics_triggered
-                    set_triggered=set_diagnostics_triggered
-                    on_back=on_back_to_overview
-                />
-                <UsersView view=view />
-                <SessionsView view=view />
-                <CenterSitesView view=view />
-                <CenterOperationsView view=view />
-                <CenterBindingsView view=view />
-            </main>
-        }
+                        <CredentialsView view=view />
+                        <AddEndpointView view=view />
+                        <ImportView view=view />
+                        <AuditView view=view />
+                        <CapabilitiesView
+                            view=view
+                            target=capability_target
+                            state=capability_state
+                            set_state=set_capability_state
+                            triggered=capability_triggered
+                            set_triggered=set_capability_triggered
+                            on_back=on_back_to_overview
+                        />
+                        <OperationsView view=view load_state=state />
+                        <EventsView view=view />
+                        <TelemetryView view=view />
+                        <ArtifactsView view=view />
+                        <GroupsView view=view load_state=state />
+                        <DiagnosticsView
+                            view=view
+                            target=diagnostics_target
+                            state=diagnostics_state
+                            set_state=set_diagnostics_state
+                            triggered=diagnostics_triggered
+                            set_triggered=set_diagnostics_triggered
+                            on_back=on_back_to_overview
+                        />
+                        <UsersView view=view />
+                        <SessionsView view=view />
+                        <CenterSitesView view=view />
+                        <CenterOperationsView view=view />
+                        <CenterBindingsView view=view />
+                    </main>
+                }
     }
 
     #[component]
@@ -12405,7 +12629,7 @@ mod browser {
                     <span
                         class=health_badge_class
                         hidden=health_badge_hidden
-                        title="Unified endpoint health"
+                        title={L().title_unified_endpoint_health}
                     >
                         {health_badge_text.unwrap_or_default()}
                     </span>
@@ -12419,42 +12643,42 @@ mod browser {
                     <label class="endpoint-select">
                         <input
                             type="checkbox"
-                            aria-label="Select this endpoint for refresh"
+                            aria-label={L().aria_select_endpoint}
                             prop:checked=selected
                             on:change=move |_| {
                                 on_toggle_selection.run(endpoint_id_for_selection.clone());
                             }
                         />
-                        <span>{L.action_refresh}</span>
+                        <span>{L().action_refresh}</span>
                     </label>
                     <button
                         type="button"
                         class="btn"
                         on:click=move |_| on_view_capabilities.run(capability_target.clone())
                     >
-                        "View capabilities"
+                        {L().action_view_capabilities}
                     </button>
                 </div>
                 <p class="awaiting-refresh" hidden=!awaiting_refresh>
-                    "No resource counts are published until a complete refresh succeeds."
+                    {L().notice_no_resource_counts}
                 </p>
                 <dl class="resource-counts" hidden=awaiting_refresh>
                     <div>
-                        <dt>"Systems"</dt>
+                        <dt>{L().page_systems}</dt>
                         <dd>{systems}</dd>
                     </div>
                     <div>
-                        <dt>"Chassis"</dt>
+                        <dt>{L().page_chassis}</dt>
                         <dd>{chassis}</dd>
                     </div>
                     <div>
-                        <dt>"Managers"</dt>
+                        <dt>{L().page_managers}</dt>
                         <dd>{managers}</dd>
                     </div>
                 </dl>
                 <section class="core-resources" hidden=awaiting_refresh>
                     <div class="core-resources-heading">
-                        <h4>"Core resources"</h4>
+                        <h4>{L().section_core_resources}</h4>
                         <span>{resources.len()}</span>
                     </div>
                     <div class="core-resource-grid">
@@ -12473,10 +12697,10 @@ mod browser {
                 </section>
                 <section class="oem-section" hidden=awaiting_refresh>
                     <div class="core-resources-heading">
-                        <h4>"OEM"</h4>
+                        <h4>{L().page_oem}</h4>
                     </div>
                     <p class="oem-unsupported" hidden=oem_supported>
-                        {OEM_UNSUPPORTED_NOTICE}
+                        {L().notice_oem_unsupported}
                     </p>
                     <div class="core-resource-grid" hidden=!oem_supported>
                         {oem_cards
@@ -12545,7 +12769,7 @@ mod browser {
                         .collect_view()}
                 </dl>
                 <p class="resource-source" title=source_title>
-                    <span>"Source"</span>
+                    <span>{L().label_source}</span>
                     <code>{source}</code>
                 </p>
                 <div class="core-resource-actions">
@@ -12554,7 +12778,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| on_open_diagnostics.run(diagnostics_target.clone())
                     >
-                        "Diagnostics"
+                        {L().nav_diagnostics}
                     </button>
                 </div>
             </article>
@@ -12640,7 +12864,7 @@ mod browser {
                     set_list_state.set(fetch_groups().await);
                 } else {
                     set_create_state.set(GroupCreateState::Failed(
-                        "The group could not be created.".to_owned(),
+                        { L().error_group_create }.to_owned(),
                     ));
                 }
             });
@@ -12710,9 +12934,7 @@ mod browser {
                 set_member_action.set(if all_added {
                     GroupMemberActionState::Succeeded
                 } else {
-                    GroupMemberActionState::Failed(
-                        "One or more endpoints could not be added to the group.".to_owned(),
-                    )
+                    GroupMemberActionState::Failed({ L().error_group_members_add }.to_owned())
                 });
                 set_selected_members.set(BTreeSet::new());
                 let load = load_state.get();
@@ -12733,9 +12955,7 @@ mod browser {
                 set_member_action.set(if delete_group_member(&group_id, &endpoint_id).await {
                     GroupMemberActionState::Succeeded
                 } else {
-                    GroupMemberActionState::Failed(
-                        "The member could not be removed from the group.".to_owned(),
-                    )
+                    GroupMemberActionState::Failed({ L().error_group_member_remove }.to_owned())
                 });
                 set_detail_state.set(GroupDetailState::Loading);
                 set_detail_state.set(fetch_group_detail(&group_id, load).await);
@@ -12782,9 +13002,7 @@ mod browser {
                     set_tags_state.set(TagsListState::Loading);
                     set_tags_state.set(fetch_tags().await);
                 } else {
-                    set_tag_action.set(TagApplyState::Failed(
-                        "The tag could not be applied.".to_owned(),
-                    ));
+                    set_tag_action.set(TagApplyState::Failed({ L().error_tag_apply }.to_owned()));
                 }
             });
         });
@@ -12795,7 +13013,7 @@ mod browser {
                 set_tag_action.set(if delete_endpoint_tag(&endpoint_id, &name).await {
                     TagApplyState::Applied
                 } else {
-                    TagApplyState::Failed("The tag could not be removed.".to_owned())
+                    TagApplyState::Failed({ L().error_tag_remove }.to_owned())
                 });
                 set_tags_state.set(TagsListState::Loading);
                 set_tags_state.set(fetch_tags().await);
@@ -12806,10 +13024,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Groups"</p>
+                        <p class="section-label">{L().nav_groups}</p>
                         <h2>{move || list_state.get().count_text()}</h2>
                     </div>
-                    <p>"Static groups for organizing managed endpoints"</p>
+                    <p>{L().hint_groups}</p>
                 </div>
                 <div class="inventory-actions">
                     <button
@@ -12818,11 +13036,11 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
-                    "Loading groups..."
+                    {L().loading_groups}
                 </p>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
                     {move || list_state.get().failure_message()}
@@ -12834,7 +13052,7 @@ mod browser {
                             !list_state.get().is_ready() || !list_state.get().has_empty_list()
                         }
                     >
-                        "No groups have been created yet. Create a group to organize endpoints."
+                        {L().empty_groups}
                     </p>
                     <div class="resource-list">
                         {move || {
@@ -12870,16 +13088,15 @@ mod browser {
                 <div class="form-panel">
                     <div class="form-panel-heading">
                         <div>
-                            <p class="section-label">"Create group"</p>
+                            <p class="section-label">{L().section_create_group}</p>
                             <p class="form-hint">
-                                "A static group collects managed endpoints for the Overview
-                                filter and bulk actions."
+                                {L().hint_group_intro}
                             </p>
                         </div>
                     </div>
                     <div class="form-grid">
                         <div class="form-field">
-                            <label for="group-name-input">"Group name"</label>
+                            <label for="group-name-input">{L().label_group_name}</label>
                             <input
                                 id="group-name-input"
                                 class="form-input"
@@ -12906,7 +13123,7 @@ mod browser {
                                 }
                                 on:click=on_create_group
                             >
-                                "Create group"
+                                {L().section_create_group}
                             </button>
                         </div>
                     </div>
@@ -12914,7 +13131,7 @@ mod browser {
                         class="inline-status success"
                         hidden=move || !matches!(create_state.get(), GroupCreateState::Created)
                     >
-                        "Group created."
+                        {L().success_group_created}
                     </p>
                     <p
                         class="form-error"
@@ -12931,15 +13148,15 @@ mod browser {
                 <div class="form-panel">
                     <div class="form-panel-heading">
                         <div>
-                            <p class="section-label">"Tags"</p>
+                            <p class="section-label">{L().section_tags}</p>
                             <p class="form-hint">
-                                "Tags label endpoints for the Overview tag filter."
+                                {L().hint_tags}
                             </p>
                         </div>
                     </div>
                     <div class="form-grid">
                         <div class="form-field">
-                            <label for="tag-endpoint-select">"Endpoint"</label>
+                            <label for="tag-endpoint-select">{L().label_endpoint}</label>
                             <select
                                 id="tag-endpoint-select"
                                 class="form-input"
@@ -12948,7 +13165,7 @@ mod browser {
                                 }
                                 on:change=on_tag_endpoint_change
                             >
-                                <option value="">"Select an endpoint..."</option>
+                                <option value="">{L().select_endpoint}</option>
                                 {move || {
                                     let load = load_state.get();
                                     let inventory = match &load {
@@ -12978,7 +13195,7 @@ mod browser {
                             </select>
                         </div>
                         <div class="form-field">
-                            <label for="tag-name-input">"Tag name"</label>
+                            <label for="tag-name-input">{L().label_tag_name}</label>
                             <input
                                 id="tag-name-input"
                                 class="form-input"
@@ -12998,7 +13215,7 @@ mod browser {
                                 disabled=move || matches!(tag_action.get(), TagApplyState::InFlight)
                                 on:click=move |_| on_apply_tag.run(())
                             >
-                                "Apply tag"
+                                {L().action_apply_tag}
                             </button>
                         </div>
                     </div>
@@ -13006,7 +13223,7 @@ mod browser {
                         class="inline-status success"
                         hidden=move || !matches!(tag_action.get(), TagApplyState::Applied)
                     >
-                        "Tag updated."
+                        {L().success_tag_updated}
                     </p>
                     <p
                         class="form-error"
@@ -13020,7 +13237,7 @@ mod browser {
                         }}
                     </p>
                     <p class="inline-status" hidden=move || !tags_state.get().is_loading()>
-                        "Loading tags..."
+                        {L().loading_tags}
                     </p>
                     <p class="form-error" hidden=move || !tags_state.get().is_failed()>
                         {move || tags_state.get().failure_message()}
@@ -13031,7 +13248,7 @@ mod browser {
                             !tags_state.get().is_ready() || !tags_state.get().has_empty_tags()
                         }
                     >
-                        "No tags have been applied yet."
+                        {L().empty_tags}
                     </p>
                     <div class="resource-list">
                         {move || {
@@ -13065,7 +13282,7 @@ mod browser {
                         <p class="credential-username">{card.member_count_text}</p>
                     </div>
                 </div>
-                <p class="section-label" hidden=members_hidden>"Members"</p>
+                <p class="section-label" hidden=members_hidden>{L().section_members}</p>
                 <ul class="short-id-list" hidden=members_hidden>
                     {card
                         .member_short_ids
@@ -13081,14 +13298,14 @@ mod browser {
                         class="btn"
                         on:click=move |_| on_open.run(manage_group_id.clone())
                     >
-                        "Manage members"
+                        {L().action_manage_members}
                     </button>
                     <button
                         type="button"
                         class="btn"
                         on:click=move |_| on_delete.run(delete_group_id.clone())
                     >
-                        {L.action_delete}
+                        {L().action_delete}
                     </button>
                 </div>
             </article>
@@ -13126,22 +13343,22 @@ mod browser {
             <div class="form-panel">
                 <div class="group-detail-heading">
                     <div>
-                        <p class="section-label">"Group detail"</p>
+                        <p class="section-label">{L().section_group_detail}</p>
                         <h3>
                             {move || {
                                 let state = detail_state.get();
                                 state
                                     .ready_projection()
-                                    .map_or_else(|| "Group".to_owned(), |detail| detail.name.clone())
+                                    .map_or_else(|| {L().section_group}.to_owned(), |detail| detail.name.clone())
                             }}
                         </h3>
                     </div>
                     <button type="button" class="btn" on:click=move |_| on_back.run(())>
-                        "Back to groups"
+                        {L().action_back_to_groups}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !detail_state.get().is_loading()>
-                    "Loading group detail..."
+                    {L().loading_group_detail}
                 </p>
                 <p class="form-error" hidden=move || !detail_state.get().is_failed()>
                     {move || detail_state.get().failure_message()}
@@ -13156,7 +13373,7 @@ mod browser {
                         !detail.has_no_members()
                     }
                 >
-                    "No members yet. Add endpoints below."
+                    {L().empty_group_members}
                 </p>
                 <div class="member-list">
                     {move || {
@@ -13182,7 +13399,7 @@ mod browser {
                                                 on_remove_member.run(endpoint_id.clone());
                                             }
                                         >
-                                            "Remove"
+                                            {L().action_remove}
                                         </button>
                                     </div>
                                 }
@@ -13190,14 +13407,14 @@ mod browser {
                             .collect_view()
                     }}
                 </div>
-                <p class="section-label">"Add members"</p>
+                <p class="section-label">{L().section_add_members}</p>
                 <div class="member-choice-grid">
                     {move || {
                         let choices = member_choices();
                         if choices.is_empty() {
                             return view! {
                                 <p class="form-hint">
-                                    "Every managed endpoint is already in this group."
+                                    {L().empty_group_all_members}
                                 </p>
                             }
                             .into_any();
@@ -13242,7 +13459,7 @@ mod browser {
                         }
                         on:click=move |_| on_add_members.run(())
                     >
-                        "Add selected"
+                        {L().action_add_selected}
                     </button>
                 </div>
                 <p
@@ -13251,7 +13468,7 @@ mod browser {
                         !matches!(member_action.get(), GroupMemberActionState::Succeeded)
                     }
                 >
-                    "Members updated."
+                    {L().success_members_updated}
                 </p>
                 <p
                     class="form-error"
@@ -13295,7 +13512,7 @@ mod browser {
                                         class="btn"
                                         on:click=move |_| on_remove.run(target.clone())
                                     >
-                                        "Untag"
+                                        {L().action_untag}
                                     </button>
                                 </li>
                             }
@@ -13303,7 +13520,7 @@ mod browser {
                         .collect_view()}
                 </ul>
                 <p class="form-hint" hidden=!rows_hidden>
-                    "No endpoints carry this tag yet."
+                    {L().empty_tag_endpoints}
                 </p>
             </article>
         }
@@ -13600,9 +13817,7 @@ mod browser {
                 set_create_state.set(if created {
                     CreateCredentialState::Created
                 } else {
-                    CreateCredentialState::Failed(
-                        "The credential could not be created. Check the fields and try again.",
-                    )
+                    CreateCredentialState::Failed(L().error_credential_create)
                 });
                 if created {
                     set_list_state.set(CredentialsListState::Loading);
@@ -13619,10 +13834,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Protected BMC access"</p>
+                        <p class="section-label">{L().section_protected_bmc_access}</p>
                         <h2>{move || list_state.get().count_text()}</h2>
                     </div>
-                    <p>"Reusable credentials never leave this device unencrypted."</p>
+                    <p>{L().hint_credentials}</p>
                 </div>
                 <p
                     class="empty-inventory"
@@ -13631,7 +13846,7 @@ mod browser {
                             || !list_state.get().has_empty_inventory()
                     }
                 >
-                    "No credentials are stored yet. Create the first one below."
+                    {L().empty_credentials}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -13652,11 +13867,11 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                    "The credential inventory is temporarily unavailable."
+                    {L().unavailable_credentials}
                 </p>
                 <CredentialCreatePanel
                     draft=draft
@@ -13683,14 +13898,14 @@ mod browser {
     ) -> impl IntoView {
         view! {
             <div class="form-panel create-panel">
-                <p class="section-label">"Create credential"</p>
+                <p class="section-label">{L().section_create_credential}</p>
                 <CredentialDraftForm
                     draft=draft
                     set_draft=set_draft
                     error=error
                     set_error=set_error
                     field_id_prefix="new-credential"
-                    submit_label="Create credential"
+                    submit_label={L().section_create_credential}
                     submit_disabled=move || create_state.get() == CreateCredentialState::InFlight
                     on_changed=on_changed
                     on_submit=on_submit
@@ -13699,13 +13914,13 @@ mod browser {
                     class="inline-status"
                     hidden=move || create_state.get() != CreateCredentialState::InFlight
                 >
-                    "Creating the credential..."
+                    {L().loading_credential_create}
                 </p>
                 <p
                     class="inline-status success"
                     hidden=move || create_state.get() != CreateCredentialState::Created
                 >
-                    "Credential created."
+                    {L().success_credential_created}
                 </p>
                 <p
                     class="inline-status error"
@@ -13784,7 +13999,7 @@ mod browser {
         view! {
             <div class="form-grid">
                 <div class="form-field">
-                    <label for=name_id.clone()>"Name"</label>
+                    <label for=name_id.clone()>{L().label_name}</label>
                     <input
                         id=name_id.clone()
                         class="form-input"
@@ -13798,7 +14013,7 @@ mod browser {
                     </p>
                 </div>
                 <div class="form-field">
-                    <label for=username_id.clone()>{L.field_username}</label>
+                    <label for=username_id.clone()>{L().field_username}</label>
                     <input
                         id=username_id.clone()
                         class="form-input"
@@ -13812,7 +14027,7 @@ mod browser {
                     </p>
                 </div>
                 <div class="form-field">
-                    <label for=password_id.clone()>{L.field_password}</label>
+                    <label for=password_id.clone()>{L().field_password}</label>
                     <input
                         id=password_id.clone()
                         class="form-input"
@@ -13861,11 +14076,11 @@ mod browser {
                 </div>
                 <dl class="resource-facts">
                     <div>
-                        <dt>{L.field_created}</dt>
+                        <dt>{L().field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                     <div>
-                        <dt>"Updated"</dt>
+                        <dt>{L().label_updated}</dt>
                         <dd>{updated_at_text}</dd>
                     </div>
                 </dl>
@@ -13883,10 +14098,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Onboarding"</p>
-                        <h2>"Add endpoint"</h2>
+                        <p class="section-label">{L().section_onboarding}</p>
+                        <h2>{L().nav_add_endpoint}</h2>
                     </div>
-                    <p>"Trust is established before any credential is transmitted."</p>
+                    <p>{L().hint_onboarding_trust}</p>
                 </div>
                 <p class="form-error" hidden=move || failure.get().is_none()>
                     {move || failure.get().map_or("", OnboardingFailure::message)}
@@ -13942,7 +14157,7 @@ mod browser {
         view! {
             <div class="form-panel" hidden=move || !step.get().is_address()>
                 <div class="form-field">
-                    <label for="endpoint-address">"Endpoint address"</label>
+                    <label for="endpoint-address">{L().label_endpoint_address}</label>
                     <input
                         id="endpoint-address"
                         class="form-input"
@@ -13957,7 +14172,7 @@ mod browser {
                     </p>
                 </div>
                 <p class="form-hint">
-                    "Rutilus first observes the TLS identity without credentials. No secret is sent before trust is confirmed."
+                    {L().hint_tls_first}
                 </p>
                 <div class="form-actions">
                     <button
@@ -13966,7 +14181,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_begin.run(())
                     >
-                        "Observe TLS identity"
+                        {L().action_observe_tls_identity}
                     </button>
                 </div>
             </div>
@@ -14024,14 +14239,14 @@ mod browser {
         view! {
             <div class="form-panel" hidden=move || !step.get().is_challenge()>
                 <div class="fingerprint-panel">
-                    <p class="section-label">"TLS identity observed"</p>
+                    <p class="section-label">{L().section_tls_identity_observed}</p>
                     <dl class="resource-facts">
                         <div>
-                            <dt>{L.field_address}</dt>
+                            <dt>{L().field_address}</dt>
                             <dd>{move || challenge().map(|challenge| challenge.address)}</dd>
                         </div>
                         <div>
-                            <dt>"Observed at"</dt>
+                            <dt>{L().label_observed_at}</dt>
                             <dd>{move || challenge().map(|challenge| challenge.observed_at_text())}</dd>
                         </div>
                     </dl>
@@ -14039,13 +14254,13 @@ mod browser {
                         <span class="status-dot status-dot-waiting" aria-hidden="true"></span>
                         {move || challenge().map_or("", |challenge| challenge.state_label())}
                     </p>
-                    <p class="section-label">"SHA-256 fingerprint"</p>
+                    <p class="section-label">{L().label_sha256_fingerprint}</p>
                     <code class="fingerprint-block">
                         {move || challenge().map(|challenge| challenge.fingerprint_sha256)}
                     </code>
                 </div>
                 <p class="form-hint">
-                    "No credential has been sent to this device. Confirm the identity to record the trust decision before authentication."
+                    {L().hint_no_credential_sent}
                 </p>
                 <div class="form-actions">
                     <button
@@ -14054,7 +14269,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_back.run(())
                     >
-                        {L.action_back}
+                        {L().action_back}
                     </button>
                     <button
                         type="button"
@@ -14062,7 +14277,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_confirm.run(())
                     >
-                        "Confirm trust and continue"
+                        {L().action_confirm_trust}
                     </button>
                 </div>
             </div>
@@ -14164,7 +14379,7 @@ mod browser {
         view! {
             <div class="form-panel" hidden=move || !step.get().is_credential()>
                 <div class="fingerprint-panel">
-                    <p class="section-label">"Established trust"</p>
+                    <p class="section-label">{L().section_established_trust}</p>
                     <p class="endpoint-address">
                         {move || {
                             step.get()
@@ -14181,7 +14396,7 @@ mod browser {
                     </span>
                 </div>
                 <div class="form-field">
-                    <label for="enroll-display-name">{L.field_display_name}</label>
+                    <label for="enroll-display-name">{L().field_display_name}</label>
                     <input
                         id="enroll-display-name"
                         class="form-input"
@@ -14205,9 +14420,9 @@ mod browser {
                         }}
                     </p>
                 </div>
-                <p class="section-label">"Credential"</p>
+                <p class="section-label">{L().section_credential}</p>
                 <p class="form-hint">
-                    "Choose an existing credential or create a new one. Credentials are encrypted before they are stored."
+                    {L().hint_enrollment_credential}
                 </p>
                 <div class="credential-choice-grid">
                     {move || {
@@ -14251,7 +14466,7 @@ mod browser {
                         }
                         on:click=move |_| set_create_mode.set(true)
                     >
-                        "Create a new credential"
+                        {L().action_create_new_credential}
                     </button>
                 </div>
                 <div
@@ -14277,7 +14492,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_back.run(())
                     >
-                        {L.action_back}
+                        {L().action_back}
                     </button>
                     <button
                         type="button"
@@ -14288,7 +14503,7 @@ mod browser {
                         }
                         on:click=move |_| on_enroll.run(())
                     >
-                        "Enroll endpoint"
+                        {L().action_enroll_endpoint}
                     </button>
                 </div>
                 <p
@@ -14350,14 +14565,14 @@ mod browser {
 
         view! {
             <div>
-                <p class="section-label">"New credential"</p>
+                <p class="section-label">{L().section_new_credential}</p>
                 <CredentialDraftForm
                     draft=draft
                     set_draft=set_draft
                     error=error
                     set_error=set_error
                     field_id_prefix="inline-credential"
-                    submit_label="Create and select"
+                    submit_label={L().action_create_and_select}
                     submit_disabled=move || create_state.get() == CreateCredentialState::InFlight
                     on_changed=on_changed
                     on_submit=on_submit
@@ -14366,7 +14581,7 @@ mod browser {
                     class="inline-status success"
                     hidden=move || create_state.get() != CreateCredentialState::Created
                 >
-                    "Credential created and selected."
+                    {L().success_credential_created_selected}
                 </p>
                 <div class="form-actions" hidden=move || !dismissible()>
                     <button
@@ -14374,7 +14589,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| set_create_mode.set(false)
                     >
-                        {L.action_cancel}
+                        {L().action_cancel}
                     </button>
                 </div>
             </div>
@@ -14394,30 +14609,30 @@ mod browser {
 
         view! {
             <div class="form-panel" hidden=move || !step.get().is_enrolled()>
-                <p class="section-label">"Enrollment complete"</p>
-                <h3>"Endpoint enrolled"</h3>
+                <p class="section-label">{L().section_enrollment_complete}</p>
+                <h3>{L().section_endpoint_enrolled}</h3>
                 <p class="form-hint">
-                    "The first complete core-resource refresh succeeded during enrollment."
+                    {L().hint_enrollment_refresh}
                 </p>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Endpoint ID"</dt>
+                        <dt>{L().label_endpoint_id}</dt>
                         <dd>{move || enrollment().map(|e| e.endpoint_id().to_string())}</dd>
                     </div>
                     <div>
-                        <dt>"Initial generation"</dt>
+                        <dt>{L().label_initial_generation}</dt>
                         <dd>{move || enrollment().map(|e| e.initial_generation().get().to_string())}</dd>
                     </div>
                     <div>
-                        <dt>"Systems"</dt>
+                        <dt>{L().page_systems}</dt>
                         <dd>{move || enrollment().map(|e| e.resource_counts().systems().to_string())}</dd>
                     </div>
                     <div>
-                        <dt>"Chassis"</dt>
+                        <dt>{L().page_chassis}</dt>
                         <dd>{move || enrollment().map(|e| e.resource_counts().chassis().to_string())}</dd>
                     </div>
                     <div>
-                        <dt>"Managers"</dt>
+                        <dt>{L().page_managers}</dt>
                         <dd>{move || enrollment().map(|e| e.resource_counts().managers().to_string())}</dd>
                     </div>
                 </dl>
@@ -14427,7 +14642,7 @@ mod browser {
                         class="btn btn-primary"
                         on:click=move |_| on_add_another.run(())
                     >
-                        "Add another endpoint"
+                        {L().action_add_another_endpoint}
                     </button>
                 </div>
             </div>
@@ -14491,14 +14706,14 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Bulk onboarding"</p>
-                        <h2>"Import endpoints"</h2>
+                        <p class="section-label">{L().section_bulk_onboarding}</p>
+                        <h2>{L().section_import_endpoints}</h2>
                     </div>
-                    <p>"One row per BMC: display_name, address, credential_id, tls_sha256"</p>
+                    <p>{L().hint_import_one_row}</p>
                 </div>
                 <div class="form-panel">
                     <div class="form-field">
-                        <label for="import-file">"CSV file"</label>
+                        <label for="import-file">{L().label_csv_file}</label>
                         <input
                             id="import-file"
                             class="form-input"
@@ -14511,7 +14726,7 @@ mod browser {
                         {move || {
                             file_name
                                 .get()
-                                .map_or_else(String::new, |name| format!("Selected: {name}"))
+                                .map_or_else(String::new, |name| catalog_format!(L().fmt_selected_file, name))
                         }}
                     </p>
                     <p class="form-error" hidden=move || file_error.get().is_none()>
@@ -14531,7 +14746,7 @@ mod browser {
                             }
                             on:click=on_import
                         >
-                            "Import CSV"
+                            {L().action_import_csv}
                         </button>
                     </div>
                 </div>
@@ -14539,7 +14754,7 @@ mod browser {
                     class="form-panel result-panel"
                     hidden=move || !matches!(import_state.get(), ImportState::Ready(_))
                 >
-                    <p class="section-label">"Import report"</p>
+                    <p class="section-label">{L().section_import_report}</p>
                     <p class="inline-status success">
                         {move || match import_state.get() {
                             ImportState::Ready(report) => report.summary_text(),
@@ -14549,10 +14764,10 @@ mod browser {
                     <table class="results-table">
                         <thead>
                             <tr>
-                                <th>"Row"</th>
-                                <th>{L.field_address}</th>
-                                <th>"Result"</th>
-                                <th>"Detail"</th>
+                                <th>{L().table_row}</th>
+                                <th>{L().field_address}</th>
+                                <th>{L().table_result}</th>
+                                <th>{L().table_detail}</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -14633,10 +14848,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Compliance"</p>
+                        <p class="section-label">{L().section_compliance}</p>
                         <h2>{move || state.get().count_text()}</h2>
                     </div>
-                    <p>"Immutable secret-free records, newest first"</p>
+                    <p>{L().hint_audit}</p>
                 </div>
                 <p
                     class="empty-inventory"
@@ -14645,7 +14860,7 @@ mod browser {
                             || !state.get().has_empty_events()
                     }
                 >
-                    "No audit events have been recorded yet."
+                    {L().empty_audit}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -14667,11 +14882,11 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
-                    "The audit log is temporarily unavailable."
+                    {L().unavailable_audit}
                 </p>
             </section>
         }
@@ -14712,23 +14927,23 @@ mod browser {
                 <p class="audit-message">{message}</p>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Target"</dt>
+                        <dt>{L().label_target}</dt>
                         <dd>{target_kind}</dd>
                     </div>
                     <div>
-                        <dt>"Target ID"</dt>
+                        <dt>{L().label_target_id}</dt>
                         <dd>{target_identifier}</dd>
                     </div>
                     <div>
-                        <dt>"Outcome"</dt>
+                        <dt>{L().label_outcome}</dt>
                         <dd class=outcome_class>{outcome_detail}</dd>
                     </div>
                     <div>
-                        <dt>"Sequence"</dt>
+                        <dt>{L().label_sequence}</dt>
                         <dd>{sequence}</dd>
                     </div>
                     <div>
-                        <dt>"Operation"</dt>
+                        <dt>{L().label_operation}</dt>
                         <dd>{operation_id}</dd>
                     </div>
                 </dl>
@@ -14771,10 +14986,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Event history"</p>
+                        <p class="section-label">{L().section_event_history}</p>
                         <h2>{move || state.get().count_text()}</h2>
                     </div>
-                    <p>"BMC event records, newest first"</p>
+                    <p>{L().hint_events}</p>
                 </div>
                 <p
                     class="event-bound"
@@ -14790,7 +15005,7 @@ mod browser {
                         !state.get().is_ready() || !state.get().has_empty_events()
                     }
                 >
-                    "No events have been recorded yet."
+                    {L().empty_events}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -14812,7 +15027,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -14850,7 +15065,7 @@ mod browser {
                         <h3 class="event-message-id" title=event_id_title>{message_id}</h3>
                         <p class="credential-username">
                             {event_timestamp_text}
-                            <span class="event-source">" · endpoint "{endpoint_short_id}</span>
+                            <span class="event-source">{L().label_endpoint_joiner}{endpoint_short_id}</span>
                         </p>
                     </div>
                     <span class=severity_class>{severity_label}</span>
@@ -14858,19 +15073,19 @@ mod browser {
                 <p class="audit-message" hidden=message_empty>{message}</p>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Event time"</dt>
+                        <dt>{L().label_event_time}</dt>
                         <dd>{event_time_text}</dd>
                     </div>
                     <div>
-                        <dt>"Observed at"</dt>
+                        <dt>{L().label_observed_at}</dt>
                         <dd>{observed_at_text}</dd>
                     </div>
                     <div>
-                        <dt>"Source endpoint"</dt>
+                        <dt>{L().label_source_endpoint}</dt>
                         <dd>{source_endpoint_text}</dd>
                     </div>
                     <div>
-                        <dt>"Event id"</dt>
+                        <dt>{L().label_event_id}</dt>
                         <dd>{event_id}</dd>
                     </div>
                 </dl>
@@ -14913,10 +15128,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Telemetry"</p>
+                        <p class="section-label">{L().nav_telemetry}</p>
                         <h2>{move || state.get().count_text()}</h2>
                     </div>
-                    <p>"Current values and bounded history, newest first"</p>
+                    <p>{L().hint_telemetry}</p>
                 </div>
                 <p
                     class="empty-inventory"
@@ -14924,7 +15139,7 @@ mod browser {
                         !state.get().is_ready() || !state.get().has_empty_series()
                     }
                 >
-                    "No telemetry series have been sampled yet. Refresh the endpoint inventory to capture readings."
+                    {L().empty_telemetry}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -14946,7 +15161,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -14979,24 +15194,24 @@ mod browser {
                 <div class="credential-title">
                     <div>
                         <h3 class="event-message-id" title=series_id_title>{series_key}</h3>
-                        <p class="credential-username">"endpoint "{endpoint_short_id}</p>
+                        <p class="credential-username">{L().label_endpoint_joiner_plain}{endpoint_short_id}</p>
                     </div>
                 </div>
                 <dl class="resource-facts">
                     <div hidden=value_empty>
-                        <dt>"Current value"</dt>
+                        <dt>{L().label_current_value}</dt>
                         <dd>{value_text}</dd>
                     </div>
                     <div hidden=value_empty>
-                        <dt>"Latest observed at"</dt>
+                        <dt>{L().label_latest_observed_at}</dt>
                         <dd>{observed_at_text}</dd>
                     </div>
                     <div>
-                        <dt>"Samples retained"</dt>
+                        <dt>{L().label_samples_retained}</dt>
                         <dd>{sample_count_text}</dd>
                     </div>
                 </dl>
-                <p class="section-label" hidden=history_empty>"Latest readings"</p>
+                <p class="section-label" hidden=history_empty>{L().section_latest_readings}</p>
                 <ol class="telemetry-history" hidden=history_empty>
                     {history
                         .into_iter()
@@ -15061,7 +15276,7 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Capabilities"</p>
+                        <p class="section-label">{L().nav_capabilities}</p>
                         <h2>
                             {move || {
                                 target
@@ -15084,7 +15299,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| on_back.run(())
                     >
-                        "Back to overview"
+                        {L().action_back_to_overview}
                     </button>
                     <button
                         type="button"
@@ -15092,11 +15307,11 @@ mod browser {
                         disabled=move || state.get().is_loading()
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !state.get().is_loading()>
-                    "Loading capability list..."
+                    {L().loading_capabilities}
                 </p>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
                     {move || state.get().failure_message()}
@@ -15107,7 +15322,7 @@ mod browser {
                         !state.get().is_ready() || !state.get().has_empty_matrix()
                     }
                 >
-                    "No capability data is available for this endpoint yet."
+                    {L().empty_capabilities}
                 </p>
                 <p class="capability-summary" hidden=move || !state.get().is_ready()>
                     {move || state.get().summary_text()}
@@ -15157,11 +15372,11 @@ mod browser {
                     <span class=entry.state_class>{entry.state_label}</span>
                 </div>
                 <p class="capability-feature">
-                    <span>"Upstream feature"</span>
+                    <span>{L().label_upstream_feature}</span>
                     <code>{entry.upstream_feature}</code>
                 </p>
                 <p class="capability-observed" hidden=!has_observed_at>
-                    <span>"Observed at"</span>
+                    <span>{L().label_observed_at}</span>
                     {entry.observed_at_text}
                 </p>
             </article>
@@ -15217,7 +15432,7 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Diagnostics"</p>
+                        <p class="section-label">{L().nav_diagnostics}</p>
                         <h2>
                             {move || {
                                 target
@@ -15240,7 +15455,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| on_back.run(())
                     >
-                        "Back to overview"
+                        {L().action_back_to_overview}
                     </button>
                     <button
                         type="button"
@@ -15248,11 +15463,11 @@ mod browser {
                         disabled=move || state.get().is_loading()
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !state.get().is_loading()>
-                    "Loading diagnostics..."
+                    {L().loading_diagnostics}
                 </p>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
                     {move || state.get().failure_message()}
@@ -15304,19 +15519,19 @@ mod browser {
                 view! {
                     <dl class="diagnostics-extended-info-entry">
                         <div>
-                            <dt>"MessageId"</dt>
+                            <dt>{L().label_message_id}</dt>
                             <dd><code>{entry.message_id}</code></dd>
                         </div>
                         <div>
-                            <dt>"Severity"</dt>
+                            <dt>{L().label_severity}</dt>
                             <dd>{diagnostics_optional_text(entry.severity.as_deref())}</dd>
                         </div>
                         <div>
-                            <dt>"Message"</dt>
+                            <dt>{L().label_message}</dt>
                             <dd>{diagnostics_optional_text(entry.message.as_deref())}</dd>
                         </div>
                         <div>
-                            <dt>"Resolution"</dt>
+                            <dt>{L().label_resolution}</dt>
                             <dd>{diagnostics_optional_text(entry.resolution.as_deref())}</dd>
                         </div>
                     </dl>
@@ -15338,19 +15553,19 @@ mod browser {
                         view! {
                             <dl class="diagnostics-extended-info-entry">
                                 <div>
-                                    <dt>"MessageId"</dt>
+                                    <dt>{L().label_message_id}</dt>
                                     <dd><code>{entry.message_id}</code></dd>
                                 </div>
                                 <div>
-                                    <dt>"Severity"</dt>
+                                    <dt>{L().label_severity}</dt>
                                     <dd>{diagnostics_optional_text(entry.severity.as_deref())}</dd>
                                 </div>
                                 <div>
-                                    <dt>"Message"</dt>
+                                    <dt>{L().label_message}</dt>
                                     <dd>{diagnostics_optional_text(entry.message.as_deref())}</dd>
                                 </div>
                                 <div>
-                                    <dt>"Resolution"</dt>
+                                    <dt>{L().label_resolution}</dt>
                                     <dd>{diagnostics_optional_text(entry.resolution.as_deref())}</dd>
                                 </div>
                             </dl>
@@ -15360,23 +15575,23 @@ mod browser {
                 view! {
                     <dl class="diagnostics-decode-failure">
                         <div>
-                            <dt>"OData URI"</dt>
+                            <dt>{L().label_odata_uri}</dt>
                             <dd><code>{failure.odata_uri}</code></dd>
                         </div>
                         <div>
-                            <dt>"OData Type"</dt>
+                            <dt>{L().label_odata_type}</dt>
                             <dd><code>{diagnostics_optional_text(failure.odata_type.as_deref())}</code></dd>
                         </div>
                         <div>
-                            <dt>"nv-redfish feature"</dt>
+                            <dt>{L().label_nv_redfish_feature}</dt>
                             <dd><code>{failure.feature}</code></dd>
                         </div>
                         <div>
-                            <dt>"OEM Namespace"</dt>
+                            <dt>{L().label_oem_namespace}</dt>
                             <dd><code>{diagnostics_optional_text(failure.oem_namespace.as_deref())}</code></dd>
                         </div>
                         <div>
-                            <dt>"Decode error"</dt>
+                            <dt>{L().label_decode_error}</dt>
                             <dd><code>{failure.error_summary}</code></dd>
                         </div>
                     </dl>
@@ -15388,34 +15603,34 @@ mod browser {
         view! {
             <dl class="diagnostics-facts">
                 <div>
-                    <dt>"Endpoint"</dt>
+                    <dt>{L().label_endpoint}</dt>
                     <dd><code>{endpoint_id}</code></dd>
                 </div>
                 <div>
-                    <dt>"OData URI"</dt>
+                    <dt>{L().label_odata_uri}</dt>
                     <dd><code>{odata_uri}</code></dd>
                 </div>
                 <div>
-                    <dt>"OData Type"</dt>
+                    <dt>{L().label_odata_type}</dt>
                     <dd><code>{odata_type_text}</code></dd>
                 </div>
                 <div>
-                    <dt>"ETag"</dt>
+                    <dt>{L().label_etag}</dt>
                     <dd><code>{etag_text}</code></dd>
                 </div>
                 <div>
-                    <dt>"nv-redfish feature"</dt>
+                    <dt>{L().label_nv_redfish_feature}</dt>
                     <dd><code>{feature}</code></dd>
                 </div>
                 <div>
-                    <dt>"Generation"</dt>
+                    <dt>{L().label_generation}</dt>
                     <dd>{generation}</dd>
                 </div>
             </dl>
             {(!extended_info_is_empty).then(|| {
                 view! {
                     <section class="diagnostics-extended-info">
-                        <h3>"ExtendedInfo"</h3>
+                        <h3>{L().label_extended_info}</h3>
                         {extended_info_rows}
                     </section>
                 }
@@ -15423,7 +15638,7 @@ mod browser {
             {(!decode_failures_is_empty).then(|| {
                 view! {
                     <section class="diagnostics-decode-failures">
-                        <h3>"Decode failures in this refresh"</h3>
+                        <h3>{L().label_decode_failures}</h3>
                         {decode_failure_rows}
                     </section>
                 }
@@ -15433,10 +15648,10 @@ mod browser {
             // click away without any edit surface, and the pre scrolls
             // within its bound instead of stretching the page.
             <details class="diagnostics-json" open>
-                <summary>"Decoded typed payload"</summary>
+                <summary>{L().label_decoded_payload}</summary>
                 <pre class="diagnostics-json-body"><code>{typed_payload_json}</code></pre>
             </details>
-            <p class="diagnostics-note">{DIAGNOSTICS_FOOTER_NOTE}</p>
+            <p class="diagnostics-note">{L().notice_diagnostics_footer}</p>
         }
     }
 
@@ -15882,10 +16097,10 @@ mod browser {
         submission: &CenterOperationSubmission,
     ) -> Result<(), &'static str> {
         let Ok(site_id) = submission.site_id.parse() else {
-            return Err(L.error_submission_unprepared);
+            return Err(L().error_submission_unprepared);
         };
         let Ok(endpoint_id) = submission.endpoint_id.parse() else {
-            return Err(L.error_submission_unprepared);
+            return Err(L().error_submission_unprepared);
         };
         let request = CenterOperationSubmitRequest::new(
             site_id,
@@ -15895,19 +16110,19 @@ mod browser {
         );
         let Ok(request) = with_csrf(Request::post("/api/v1/center/operations")).json(&request)
         else {
-            return Err(L.error_submission_unprepared);
+            return Err(L().error_submission_unprepared);
         };
         let Ok(response) = request.send().await else {
-            return Err("The center did not answer.");
+            return Err(L().error_center_unreachable);
         };
         if !response_ok(&response) {
-            return Err("The center refused the submission.");
+            return Err(L().error_center_submission_refused);
         }
         response
             .json::<CenterOperationSubmitResponse>()
             .await
             .map(|_| ())
-            .map_err(|_| "The acknowledgement could not be parsed.")
+            .map_err(|_| L().error_center_ack_unparsable)
     }
 
     /// Registers one site and returns its one-time binding code (design
@@ -15919,13 +16134,13 @@ mod browser {
         let request =
             CenterBindingRegisterRequest::new(display_name.to_owned(), center_url.to_owned());
         let Ok(request) = with_csrf(Request::post("/api/v1/center/bindings")).json(&request) else {
-            return Err("The registration could not be prepared.");
+            return Err(L().error_center_registration_unprepared);
         };
         let Ok(response) = request.send().await else {
-            return Err("The center did not answer.");
+            return Err(L().error_center_unreachable);
         };
         if !response_ok(&response) {
-            return Err("The center refused the registration.");
+            return Err(L().error_center_registration_refused);
         }
         response
             .json::<CenterBindingRegisterResponse>()
@@ -15936,7 +16151,7 @@ mod browser {
                 code: registered.code().to_owned(),
                 expires_at: registered.expires_at(),
             })
-            .map_err(|_| "The binding code could not be parsed.")
+            .map_err(|_| L().error_center_binding_code_unparsable)
     }
 
     /// Revokes the active binding of one site (design D2).
@@ -16023,25 +16238,25 @@ mod browser {
             .map(|id| id.parse())
             .collect();
         let Ok(targets) = targets else {
-            return Err(OperationSubmitState::FAILURE_MESSAGE);
+            return Err(OperationSubmitState::failure_message_value());
         };
         let Ok(command) = build_command(command) else {
-            return Err(OperationSubmitState::FAILURE_MESSAGE);
+            return Err(OperationSubmitState::failure_message_value());
         };
         let request = CreateOperationRequest::new(None, targets, command);
         let response = with_csrf(Request::post("/api/v1/operations"))
             .json(&request)
-            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?
+            .map_err(|_| OperationSubmitState::failure_message_value())?
             .send()
             .await
-            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
+            .map_err(|_| OperationSubmitState::failure_message_value())?;
         if !response_ok(&response) {
-            return Err(OperationSubmitState::FAILURE_MESSAGE);
+            return Err(OperationSubmitState::failure_message_value());
         }
         let body = response
             .text()
             .await
-            .map_err(|_| OperationSubmitState::FAILURE_MESSAGE)?;
+            .map_err(|_| OperationSubmitState::failure_message_value())?;
         super::acknowledge_submission(target_count, &body)
     }
 
@@ -16378,10 +16593,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Operation tasks"</p>
+                        <p class="section-label">{L().section_operation_tasks}</p>
                         <h2>{move || list_state.get().count_text()}</h2>
                     </div>
-                    <p>"Every write is a persisted, typed operation before it executes."</p>
+                    <p>{L().hint_operations}</p>
                 </div>
                 <div class="inventory-actions">
                     <button
@@ -16390,14 +16605,14 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
-                    "Loading operations..."
+                    {L().loading_operations}
                 </p>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                    "The operation list is temporarily unavailable."
+                    {L().unavailable_operations}
                 </p>
                 <p
                     class="empty-inventory"
@@ -16405,7 +16620,7 @@ mod browser {
                         !list_state.get().is_ready() || !list_state.get().has_empty_list()
                     }
                 >
-                    "No operations have been submitted yet."
+                    {L().empty_operations}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -16419,16 +16634,16 @@ mod browser {
                 </div>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Batch operations"</p>
+                        <p class="section-label">{L().section_batch_operations}</p>
                         <h2>{move || batches_state.get().count_text()}</h2>
                     </div>
-                    <p>"A multi-endpoint write is one batch with a per-endpoint outcome report."</p>
+                    <p>{L().hint_batches}</p>
                 </div>
                 <p class="inline-status" hidden=move || !batches_state.get().is_loading()>
-                    "Loading batches..."
+                    {L().loading_batches}
                 </p>
                 <p class="form-error" hidden=move || !batches_state.get().is_failed()>
-                    "The batch list is temporarily unavailable."
+                    {L().unavailable_batches}
                 </p>
                 <p
                     class="empty-inventory"
@@ -16436,7 +16651,7 @@ mod browser {
                         !batches_state.get().is_ready() || !batches_state.get().has_empty_list()
                     }
                 >
-                    "No batch operations have been submitted yet."
+                    {L().empty_batches}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -16761,12 +16976,12 @@ mod browser {
 
         view! {
             <div class="form-panel">
-                <p class="section-label">"Submit operation"</p>
+                <p class="section-label">{L().section_submit_operation}</p>
                 <p class="form-hint">
-                    "Choose the target endpoints and the typed command. The submission is persisted before it is executed."
+                    {L().hint_operation_form}
                 </p>
 
-                <p class="section-label">"Targets"</p>
+                <p class="section-label">{L().section_targets}</p>
                 <div class="command-choice-grid">
                     {endpoint_choices()
                         .into_iter()
@@ -16811,7 +17026,7 @@ mod browser {
                     {OperationFormError::EndpointsRequired.message()}
                 </p>
 
-                <p class="section-label">"Command"</p>
+                <p class="section-label">{L().section_command}</p>
                 <div class="command-choice-grid">
                     {CommandFamilyView::ALL
                         .into_iter()
@@ -16845,7 +17060,7 @@ mod browser {
                 </p>
 
                 <div class="form-field" hidden=move || !family_selected(CommandFamilyView::Account)>
-                    <label for="operation-account-action">"Account action"</label>
+                    <label for="operation-account-action">{L().label_account_action}</label>
                     <select
                         id="operation-account-action"
                         class="form-select"
@@ -16857,7 +17072,7 @@ mod browser {
                         }
                         on:change=on_account_action_change
                     >
-                        <option value="">{L.field_choose_action}</option>
+                        <option value="">{L().field_choose_action}</option>
                         {AccountActionView::ALL
                             .into_iter()
                             .map(|action| {
@@ -16880,7 +17095,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::Create)
                     >
                         <div class="form-field">
-                            <label for="operation-account-user-name">{L.field_user_name}</label>
+                            <label for="operation-account-user-name">{L().field_user_name}</label>
                             <input
                                 id="operation-account-user-name"
                                 class="form-input"
@@ -16909,7 +17124,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-password">{L.field_password}</label>
+                            <label for="operation-account-password">{L().field_password}</label>
                             <input
                                 id="operation-account-password"
                                 class="form-input"
@@ -16938,7 +17153,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-role-id">{L.field_role_id}</label>
+                            <label for="operation-account-role-id">{L().field_role_id}</label>
                             <input
                                 id="operation-account-role-id"
                                 class="form-input"
@@ -16973,7 +17188,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdateRole)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">{L.field_account_id}</label>
+                            <label for="operation-account-id">{L().field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17002,7 +17217,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-role-id">{L.field_role_id}</label>
+                            <label for="operation-account-role-id">{L().field_role_id}</label>
                             <input
                                 id="operation-account-role-id"
                                 class="form-input"
@@ -17037,7 +17252,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdatePassword)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">{L.field_account_id}</label>
+                            <label for="operation-account-id">{L().field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17066,7 +17281,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-password">"New password"</label>
+                            <label for="operation-account-password">{L().label_new_password}</label>
                             <input
                                 id="operation-account-password"
                                 class="form-input"
@@ -17101,7 +17316,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdateUserName)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">{L.field_account_id}</label>
+                            <label for="operation-account-id">{L().field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17130,7 +17345,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-user-name">"New user name"</label>
+                            <label for="operation-account-user-name">{L().label_new_user_name}</label>
                             <input
                                 id="operation-account-user-name"
                                 class="form-input"
@@ -17165,7 +17380,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::Delete)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">{L.field_account_id}</label>
+                            <label for="operation-account-id">{L().field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17197,7 +17412,7 @@ mod browser {
                 </div>
 
                 <div class="form-field" hidden=move || !reset_family_selected()>
-                    <label for="operation-reset-type">"Reset type"</label>
+                    <label for="operation-reset-type">{L().label_reset_type}</label>
                     <select
                         id="operation-reset-type"
                         class="form-select"
@@ -17209,7 +17424,7 @@ mod browser {
                         }
                         on:change=on_reset_type_change
                     >
-                        <option value="">"Choose a reset type"</option>
+                        <option value="">{L().choose_reset_type}</option>
                         {ResetTypeView::ALL
                             .into_iter()
                             .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
@@ -17224,7 +17439,7 @@ mod browser {
                 </div>
 
                 <div class="form-field" hidden=move || !family_selected(CommandFamilyView::BootOverride)>
-                    <label for="operation-boot-source">"Boot source"</label>
+                    <label for="operation-boot-source">{L().label_boot_source}</label>
                     <select
                         id="operation-boot-source"
                         class="form-select"
@@ -17236,7 +17451,7 @@ mod browser {
                         }
                         on:change=on_boot_source_change
                     >
-                        <option value="">"Choose a boot source"</option>
+                        <option value="">{L().choose_boot_source}</option>
                         {BootSourceView::ALL
                             .into_iter()
                             .map(|s| view! { <option value=s.as_str()>{s.as_str()}</option> })
@@ -17244,7 +17459,7 @@ mod browser {
                     </select>
                     <div class="form-field-inline">
                         <div class="form-field">
-                            <label for="operation-boot-enabled">"Applies"</label>
+                            <label for="operation-boot-enabled">{L().label_applies}</label>
                             <select
                                 id="operation-boot-enabled"
                                 class="form-select"
@@ -17256,7 +17471,7 @@ mod browser {
                                 }
                                 on:change=on_boot_enabled_change
                             >
-                                <option value="">"Choose"</option>
+                                <option value="">{L().choose}</option>
                                 {BootEnabledView::ALL
                                     .into_iter()
                                     .map(|e| view! { <option value=e.as_str()>{e.as_str()}</option> })
@@ -17264,7 +17479,7 @@ mod browser {
                             </select>
                         </div>
                         <div class="form-field">
-                            <label for="operation-boot-mode">"Mode"</label>
+                            <label for="operation-boot-mode">{L().label_mode}</label>
                             <select
                                 id="operation-boot-mode"
                                 class="form-select"
@@ -17276,7 +17491,7 @@ mod browser {
                                 }
                                 on:change=on_boot_mode_change
                             >
-                                <option value="">"Choose"</option>
+                                <option value="">{L().choose}</option>
                                 {BootModeView::ALL
                                     .into_iter()
                                     .map(|m| view! { <option value=m.as_str()>{m.as_str()}</option> })
@@ -17308,7 +17523,7 @@ mod browser {
                 </div>
 
                 <div class="form-field" hidden=move || !family_selected(CommandFamilyView::SecureBoot)>
-                    <label for="operation-secure-boot-action">{L.field_action}</label>
+                    <label for="operation-secure-boot-action">{L().field_action}</label>
                     <select
                         id="operation-secure-boot-action"
                         class="form-select"
@@ -17320,7 +17535,7 @@ mod browser {
                         }
                         on:change=on_secure_boot_change
                     >
-                        <option value="">{L.field_choose_action}</option>
+                        <option value="">{L().field_choose_action}</option>
                         <option value="enable">{SecureBootActionView::Enable.label()}</option>
                         <option value="disable">{SecureBootActionView::Disable.label()}</option>
                         <option value="reset-keys">
@@ -17329,7 +17544,7 @@ mod browser {
                         </option>
                     </select>
                     <div class="form-field" hidden=move || !is_reset_keys()>
-                        <label for="operation-reset-keys-type">"Key set"</label>
+                        <label for="operation-reset-keys-type">{L().label_key_set}</label>
                         <select
                             id="operation-reset-keys-type"
                             class="form-select"
@@ -17341,7 +17556,7 @@ mod browser {
                             }
                             on:change=on_reset_keys_change
                         >
-                            <option value="">"Choose a key set"</option>
+                            <option value="">{L().choose_key_set}</option>
                             {ResetKeysTypeView::ALL
                                 .into_iter()
                                 .map(|k| view! { <option value=k.as_str()>{k.as_str()}</option> })
@@ -17373,7 +17588,7 @@ mod browser {
                     class="form-field"
                     hidden=move || !family_selected(CommandFamilyView::EventSubscription)
                 >
-                    <label for="operation-event-action">{L.field_action}</label>
+                    <label for="operation-event-action">{L().field_action}</label>
                     <select
                         id="operation-event-action"
                         class="form-select"
@@ -17384,7 +17599,7 @@ mod browser {
                         }
                         on:change=on_event_action_change
                     >
-                        <option value="">{L.field_choose_action}</option>
+                        <option value="">{L().field_choose_action}</option>
                         {EventActionView::ALL
                             .into_iter()
                             .map(|action| {
@@ -17407,7 +17622,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !is_create_subscription()>
                         <div class="form-field">
-                            <label for="operation-destination">"Destination URL"</label>
+                            <label for="operation-destination">{L().label_destination_url}</label>
                             <input
                                 id="operation-destination"
                                 class="form-input"
@@ -17436,7 +17651,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-protocol">{L.field_protocol}</label>
+                            <label for="operation-protocol">{L().field_protocol}</label>
                             <select
                                 id="operation-protocol"
                                 class="form-select"
@@ -17448,7 +17663,7 @@ mod browser {
                                 }
                                 on:change=on_protocol_change
                             >
-                                <option value="">"Choose a protocol"</option>
+                                <option value="">{L().choose_protocol}</option>
                                 {EventProtocolView::ALL
                                     .into_iter()
                                     .map(|p| view! { <option value=p.as_str()>{p.as_str()}</option> })
@@ -17461,7 +17676,7 @@ mod browser {
                                 {OperationFormError::ProtocolRequired.message()}
                             </p>
                         </div>
-                        <p class="section-label">{L.field_event_types}</p>
+                        <p class="section-label">{L().field_event_types}</p>
                         <div class="command-choice-grid">
                             {EventTypeView::ALL
                                 .into_iter()
@@ -17498,7 +17713,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !is_delete_subscription()>
                         <div class="form-field">
-                            <label for="operation-subscription-id">"Subscription ID"</label>
+                            <label for="operation-subscription-id">{L().label_subscription_id}</label>
                             <input
                                 id="operation-subscription-id"
                                 class="form-input"
@@ -17524,14 +17739,14 @@ mod browser {
                     class="form-field"
                     hidden=move || !family_selected(CommandFamilyView::FirmwareUpdate)
                 >
-                    <label for="operation-update-artifact">"Firmware artifact"</label>
+                    <label for="operation-update-artifact">{L().label_firmware_artifact}</label>
                     <select
                         id="operation-update-artifact"
                         class="form-select"
                         prop:value=move || draft.get().artifact_id.clone().unwrap_or_default()
                         on:change=on_update_artifact_change
                     >
-                        <option value="">"Choose an artifact"</option>
+                        <option value="">{L().choose_artifact}</option>
                         {artifact_choices()
                             .into_iter()
                             .map(|choice| {
@@ -17548,7 +17763,7 @@ mod browser {
                             .collect_view()}
                     </select>
                     <p class="form-hint">
-                        "Only artifacts with a verified complete upload (Ready) can be dispatched."
+                        {L().hint_update_only_ready}
                     </p>
                     <p
                         class="form-error"
@@ -17560,13 +17775,13 @@ mod browser {
                         class="inline-status"
                         hidden=move || !artifact_list_state.get().is_loading()
                     >
-                        "Loading firmware artifacts..."
+                        {L().loading_firmware_artifacts}
                     </p>
                     <p
                         class="form-error"
                         hidden=move || !artifact_list_state.get().is_failed()
                     >
-                        "The firmware artifact list is temporarily unavailable."
+                        {L().unavailable_firmware_artifacts}
                     </p>
                     <p
                         class="form-hint"
@@ -17574,10 +17789,10 @@ mod browser {
                             !artifact_list_state.get().is_ready() || !artifact_choices().is_empty()
                         }
                     >
-                        "No ready firmware artifacts. Upload and finalize one in the Artifacts view."
+                        {L().empty_firmware_artifacts}
                     </p>
                     <div class="form-field">
-                        <label for="operation-update-push-uri">"Push URI (optional)"</label>
+                        <label for="operation-update-push-uri">{L().label_push_uri}</label>
                         <input
                             id="operation-update-push-uri"
                             class="form-input"
@@ -17588,7 +17803,7 @@ mod browser {
                             on:input=on_update_push_uri_input
                         />
                         <p class="form-hint">
-                            "Leave empty to dispatch the locally stored artifact as multipart upload."
+                            {L().hint_push_uri}
                         </p>
                         <p
                             class="form-error"
@@ -17601,7 +17816,7 @@ mod browser {
 
                 <div class="form-field" hidden=move || !family_selected(CommandFamilyView::Oem)>
                     <div class="form-field">
-                        <label for="operation-oem-face">"OEM face"</label>
+                        <label for="operation-oem-face">{L().label_oem_face}</label>
                         <select
                             id="operation-oem-face"
                             class="form-select"
@@ -17615,7 +17830,7 @@ mod browser {
                             }
                             on:change=on_oem_face_change
                         >
-                            <option value="">"Choose an OEM face"</option>
+                            <option value="">{L().choose_oem_face}</option>
                             {OemFaceView::ALL
                                 .into_iter()
                                 .map(|face| {
@@ -17632,7 +17847,7 @@ mod browser {
                         </select>
                     </div>
                     <div class="form-field">
-                        <label for="operation-oem-action">{L.field_action}</label>
+                        <label for="operation-oem-action">{L().field_action}</label>
                         <select
                             id="operation-oem-action"
                             class="form-select"
@@ -17646,7 +17861,7 @@ mod browser {
                             }
                             on:change=on_oem_action_change
                         >
-                            <option value="">{L.field_choose_action}</option>
+                            <option value="">{L().field_choose_action}</option>
                             {OemActionView::ALL
                                 .into_iter()
                                 .filter(move |action| {
@@ -17672,7 +17887,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::ProfileUpdate)>
                         <div class="form-field">
-                            <label for="operation-profile-file">"Profile file (JSON)"</label>
+                            <label for="operation-profile-file">{L().label_profile_file}</label>
                             <textarea
                                 id="operation-profile-file"
                                 class="form-input"
@@ -17692,7 +17907,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenGenerate)>
                         <div class="form-field">
-                            <label for="operation-token-type">"Token type"</label>
+                            <label for="operation-token-type">{L().label_token_type}</label>
                             <select
                                 id="operation-token-type"
                                 class="form-select"
@@ -17704,7 +17919,7 @@ mod browser {
                                 }
                                 on:change=on_token_type_change
                             >
-                                <option value="">"Choose a token type"</option>
+                                <option value="">{L().choose_token_type}</option>
                                 {TokenTypeView::ALL
                                     .into_iter()
                                     .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
@@ -17721,7 +17936,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenInstall)>
                         <div class="form-field">
-                            <label for="operation-token-data">"Token data (Base64)"</label>
+                            <label for="operation-token-data">{L().label_token_data}</label>
                             <input
                                 id="operation-token-data"
                                 class="form-input"
@@ -17742,7 +17957,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::TokenErase)>
                         <div class="form-field">
-                            <label for="operation-erase-type">"Erase scope"</label>
+                            <label for="operation-erase-type">{L().label_erase_scope}</label>
                             <select
                                 id="operation-erase-type"
                                 class="form-select"
@@ -17754,7 +17969,7 @@ mod browser {
                                 }
                                 on:change=on_erase_type_change
                             >
-                                <option value="">"Choose an erase scope"</option>
+                                <option value="">{L().choose_erase_scope}</option>
                                 {EraseTypeView::ALL
                                     .into_iter()
                                     .map(|e| view! { <option value=e.as_str()>{e.as_str()}</option> })
@@ -17768,7 +17983,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-erase-token-type">"Token type"</label>
+                            <label for="operation-erase-token-type">{L().label_token_type}</label>
                             <select
                                 id="operation-erase-token-type"
                                 class="form-select"
@@ -17780,7 +17995,7 @@ mod browser {
                                 }
                                 on:change=on_token_type_change
                             >
-                                <option value="">"Choose a token type"</option>
+                                <option value="">{L().choose_token_type}</option>
                                 {TokenTypeView::ALL
                                     .into_iter()
                                     .map(|t| view! { <option value=t.as_str()>{t.as_str()}</option> })
@@ -17797,7 +18012,7 @@ mod browser {
 
                     <div class="form-panel create-panel" hidden=move || !oem_action_selected(OemActionView::PowerActivatePreset)>
                         <div class="form-field">
-                            <label for="operation-profile-id">"Preset profile id"</label>
+                            <label for="operation-profile-id">{L().label_preset_profile_id}</label>
                             <input
                                 id="operation-profile-id"
                                 class="form-input"
@@ -17827,20 +18042,20 @@ mod browser {
                         disabled=move || submit_state.get().is_in_flight()
                         on:click=move |_| on_submit.run(())
                     >
-                        "Submit operation"
+                        {L().section_submit_operation}
                     </button>
                 </div>
                 <p
                     class="inline-status"
                     hidden=move || !submit_state.get().is_in_flight()
                 >
-                    "Submitting the operation..."
+                    {L().loading_submit}
                 </p>
                 <p
                     class="inline-status success"
                     hidden=move || !submit_state.get().is_succeeded()
                 >
-                    "Operation submitted."
+                    {L().success_operation_submitted}
                 </p>
                 <p
                     class="inline-status error"
@@ -17870,8 +18085,8 @@ mod browser {
         let command_payload = command.payload;
         let operation_id_title = operation_id.clone();
         let targets_text = match target_count {
-            1 => "1 target".to_owned(),
-            _ => format!("{target_count} targets"),
+            1 => L().fmt_targets_one.to_owned(),
+            _ => catalog_format!(L().fmt_targets_many, target_count),
         };
 
         view! {
@@ -17889,15 +18104,15 @@ mod browser {
                 </p>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Targets"</dt>
+                        <dt>{L().section_targets}</dt>
                         <dd>{targets_text}</dd>
                     </div>
                     <div>
-                        <dt>{L.field_created}</dt>
+                        <dt>{L().field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                     <div>
-                        <dt>"Updated"</dt>
+                        <dt>{L().label_updated}</dt>
                         <dd>{updated_at_text}</dd>
                     </div>
                 </dl>
@@ -17997,9 +18212,9 @@ mod browser {
             let is_expanded = is_expanded.clone();
             move || {
                 if is_expanded() {
-                    "Hide endpoints"
+                    L().action_hide_endpoints
                 } else {
-                    "Show endpoints"
+                    L().action_show_endpoints
                 }
             }
         };
@@ -18032,7 +18247,7 @@ mod browser {
                 </div>
                 <dl class="resource-facts">
                     <div>
-                        <dt>{L.field_created}</dt>
+                        <dt>{L().field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                 </dl>
@@ -18181,10 +18396,10 @@ mod browser {
             <section class="view-section" hidden=move || !active()>
                 <div class="inventory-heading">
                     <div>
-                        <p class="section-label">"Firmware artifacts"</p>
+                        <p class="section-label">{L().section_firmware_artifacts}</p>
                         <h2>{move || list_state.get().count_text()}</h2>
                     </div>
-                    <p>"Uploaded firmware artifacts for the §14.3 update flow."</p>
+                    <p>{L().hint_artifacts}</p>
                 </div>
                 <div class="inventory-actions">
                     <button
@@ -18193,14 +18408,14 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        {L.action_refresh}
+                        {L().action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
-                    "Loading artifacts..."
+                    {L().loading_artifacts}
                 </p>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
-                    "The artifact store is temporarily unavailable."
+                    {L().unavailable_artifacts}
                 </p>
                 <p
                     class="empty-inventory"
@@ -18208,7 +18423,7 @@ mod browser {
                         !list_state.get().is_ready() || !list_state.get().has_empty_list()
                     }
                 >
-                    "No firmware artifacts have been uploaded yet."
+                    {L().empty_artifacts}
                 </p>
                 <div class="resource-list">
                     {move || {
@@ -18222,7 +18437,7 @@ mod browser {
                 </div>
                 <div class="form-panel">
                     <div class="form-field">
-                        <label for="artifact-file">"Firmware file"</label>
+                        <label for="artifact-file">{L().label_firmware_file}</label>
                         <input
                             id="artifact-file"
                             class="form-input"
@@ -18233,17 +18448,14 @@ mod browser {
                     <p class="form-hint" hidden=move || file_info.get().is_none()>
                         {move || {
                             file_info.get().map_or_else(String::new, |(name, size)| {
-                                format!("Selected: {name} · {}", format_artifact_size(size))
+                                catalog_format!(L().fmt_selected_artifact, name, format_artifact_size(size))
                             })
                         }}
                     </p>
                     <p class="form-hint" hidden=move || resume_target.get().is_none()>
                         {move || {
                             resume_target.get().map_or_else(String::new, |card| {
-                                format!(
-                                    "Resumes the interrupted upload of this file from {}%.",
-                                    card.progress_percent
-                                )
+                                catalog_format!(L().fmt_resume_note, card.progress_percent)
                             })
                         }}
                     </p>
@@ -18257,7 +18469,7 @@ mod browser {
                         class="inline-status success"
                         hidden=move || !upload_state.get().is_succeeded()
                     >
-                        "Artifact uploaded and verified."
+                        {L().success_artifact_uploaded}
                     </p>
                     <div class="form-actions">
                         <button
@@ -18270,9 +18482,9 @@ mod browser {
                         >
                             {move || {
                                 if resume_target.get().is_some() {
-                                    "Resume upload"
+                                    {L().action_resume_upload}
                                 } else {
-                                    "Upload artifact"
+                                    {L().action_upload_artifact}
                                 }
                             }}
                         </button>
@@ -18299,7 +18511,7 @@ mod browser {
             created_at_text,
             ..
         } = card;
-        let progress_width = format!("{progress_percent}%");
+        let progress_width = catalog_format!(L().fmt_percent, progress_percent);
         let uploaded_text = format_artifact_size(uploaded_bytes);
         let sha256_title = sha256_short.clone();
         let sha256_text = format!("{sha256_short}…");
@@ -18315,15 +18527,15 @@ mod browser {
                 </div>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Size"</dt>
+                        <dt>{L().label_size}</dt>
                         <dd>{size_text.clone()}</dd>
                     </div>
                     <div>
-                        <dt>"SHA-256"</dt>
+                        <dt>{L().label_sha256}</dt>
                         <dd title=sha256_title>{sha256_text}</dd>
                     </div>
                     <div>
-                        <dt>{L.field_created}</dt>
+                        <dt>{L().field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                 </dl>
@@ -18332,14 +18544,14 @@ mod browser {
                         <div class="progress-fill" style=("width", progress_width)></div>
                     </div>
                     <p class="form-hint">
-                        {format!("{uploaded_text} of {size_text} uploaded · {progress_percent}%")}
+                        {catalog_format!(L().fmt_upload_progress, uploaded_text, size_text, progress_percent)}
                     </p>
                     <p class="form-hint">
-                        "Select the same file in the upload form to resume from this point."
+                        {L().hint_resume_same_file}
                     </p>
                 </div>
                 <p class="form-error" hidden=!is_failed>
-                    "The uploaded bytes did not pass SHA-256 verification."
+                    {L().error_artifact_digest}
                 </p>
             </article>
         }
@@ -20269,7 +20481,10 @@ mod tests {
         assert_eq!(ready.status_message(), "Authenticated local inventory");
         assert_eq!(ready.product_version_text(), "0.1.0-test");
         assert_eq!(ready.nv_redfish_baseline_text(), "0.13.0-test");
-        assert_eq!(ready.endpoint_count_text(), "2 managed endpoints");
+        assert_eq!(
+            ready.endpoint_count_text(),
+            catalog_format!(L().count_endpoints_many, 2)
+        );
         assert!(!ready.has_empty_inventory());
         assert_eq!(
             metadata_failed.status_message(),
@@ -20323,68 +20538,68 @@ mod tests {
         let system = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "System")
+            .find(|resource| resource.type_label == L().type_system)
             .ok_or("system resource must exist")?;
         assert_eq!(system.name, "Compute One");
         assert_eq!(system.source, "/redfish/v1/Systems/1");
         assert!(system.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Vendor A".to_owned(),
         }));
         assert!(system.facts.contains(&ResourceFactProjection {
-            label: "BIOS version",
+            label: L().fact_bios_version,
             value: "2.3.4".to_owned(),
         }));
         assert!(system.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let processor = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Processor")
+            .find(|resource| resource.type_label == L().type_processor)
             .ok_or("processor resource must exist")?;
         assert_eq!(processor.name, "Processor One");
         assert_eq!(processor.source, "/redfish/v1/Systems/1/Processors/CPU1");
         assert!(processor.facts.contains(&ResourceFactProjection {
-            label: "Processor type",
+            label: L().fact_processor_type,
             value: "CPU".to_owned(),
         }));
         assert!(processor.facts.contains(&ResourceFactProjection {
-            label: "Socket",
+            label: L().fact_socket,
             value: "LGA4189".to_owned(),
         }));
         assert!(processor.facts.contains(&ResourceFactProjection {
-            label: "Total cores",
+            label: L().fact_total_cores,
             value: "64".to_owned(),
         }));
         assert!(
             !processor
                 .facts
                 .iter()
-                .any(|fact| fact.label == "Part number")
+                .any(|fact| fact.label == L().fact_part_number)
         );
         let memory = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Memory")
+            .find(|resource| resource.type_label == L().page_memory)
             .ok_or("memory resource must exist")?;
         assert_eq!(memory.name, "Memory Module One");
         assert_eq!(memory.source, "/redfish/v1/Systems/1/Memory/DIMM1");
         assert!(memory.facts.contains(&ResourceFactProjection {
-            label: "Memory device type",
+            label: L().fact_memory_device_type,
             value: "DDR4".to_owned(),
         }));
         assert!(memory.facts.contains(&ResourceFactProjection {
-            label: "Capacity (MiB)",
+            label: L().fact_capacity_mib,
             value: "32768".to_owned(),
         }));
         assert!(memory.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Vendor B".to_owned(),
         }));
         assert!(memory.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         Ok(())
@@ -20412,7 +20627,7 @@ mod tests {
             current
                 .resources
                 .iter()
-                .filter(|resource| resource.type_label == "Processor")
+                .filter(|resource| resource.type_label == L().type_processor)
                 .count(),
             1
         );
@@ -20420,7 +20635,7 @@ mod tests {
             current
                 .resources
                 .iter()
-                .filter(|resource| resource.type_label == "Memory")
+                .filter(|resource| resource.type_label == L().page_memory)
                 .count(),
             1
         );
@@ -20442,15 +20657,15 @@ mod tests {
             "/redfish/v1/Chassis/1/NetworkAdapters/1/NetworkDeviceFunctions/1"
         );
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Function type",
+            label: L().fact_function_type,
             value: "Ethernet".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Device enabled",
+            label: L().fact_device_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         Ok(())
@@ -20467,35 +20682,35 @@ mod tests {
         assert_eq!(card.name, "Power Shelf One");
         assert_eq!(card.source, "/redfish/v1/PowerEquipment/PowerShelves/1");
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Equipment type",
+            label: L().fact_equipment_type,
             value: "PowerShelf".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Rutilus Test".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Model",
+            label: L().fact_model,
             value: "PDU-30K".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Part number",
+            label: L().fact_part_number,
             value: "PDU-PART-1".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Serial number",
+            label: L().fact_serial_number,
             value: "PDU-1".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Version",
+            label: L().fact_version,
             value: "2.0".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Firmware version",
+            label: L().fact_firmware_version,
             value: "3.1.4".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "State",
+            label: L().fact_state,
             value: "Enabled".to_owned(),
         }));
         Ok(())
@@ -20515,35 +20730,35 @@ mod tests {
             "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1"
         );
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Supply type",
+            label: L().fact_supply_type,
             value: "AC".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Capacity (W)",
+            label: L().fact_capacity_w,
             value: "1600".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Rutilus Test".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Model",
+            label: L().fact_model,
             value: "PSU-1600".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Firmware version",
+            label: L().fact_firmware_version,
             value: "1.0.0".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Serial number",
+            label: L().fact_serial_number,
             value: "PSU-1".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Part number",
+            label: L().fact_part_number,
             value: "PSU-PART-1".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         Ok(())
@@ -20561,19 +20776,24 @@ mod tests {
         assert_eq!(card.name, "Environment Metrics");
         assert_eq!(card.source, "/redfish/v1/Chassis/1/EnvironmentMetrics");
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Temperature (C)",
+            label: L().fact_temperature_c,
             value: "27.5".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Fan readings",
+            label: L().fact_fan_readings,
             value: "2".to_owned(),
         }));
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Power limit (W)",
+            label: L().fact_power_limit_w,
             value: "800".to_owned(),
         }));
-        assert!(!card.facts.iter().any(|fact| fact.label == "Humidity (%)"));
-        assert!(!card.facts.iter().any(|fact| fact.label == "State"));
+        assert!(
+            !card
+                .facts
+                .iter()
+                .any(|fact| fact.label == L().fact_humidity_percent)
+        );
+        assert!(!card.facts.iter().any(|fact| fact.label == L().fact_state));
         Ok(())
     }
 
@@ -20589,26 +20809,26 @@ mod tests {
         let storage = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Storage")
+            .find(|resource| resource.type_label == L().type_storage)
             .ok_or("storage resource must exist")?;
         assert_eq!(storage.name, "Storage Subsystem One");
         assert_eq!(storage.source, "/redfish/v1/Systems/1/Storage/SATA-1");
         assert!(storage.facts.contains(&ResourceFactProjection {
-            label: "Controller count",
+            label: L().fact_controller_count,
             value: "2".to_owned(),
         }));
         assert!(storage.facts.contains(&ResourceFactProjection {
-            label: "Drive count",
+            label: L().fact_drive_count,
             value: "6".to_owned(),
         }));
         assert!(storage.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let network_adapter = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Network adapter")
+            .find(|resource| resource.type_label == L().type_network_adapter)
             .ok_or("network adapter resource must exist")?;
         assert_eq!(network_adapter.name, "Network Adapter One");
         assert_eq!(
@@ -20616,29 +20836,29 @@ mod tests {
             "/redfish/v1/Chassis/1/NetworkAdapters/1"
         );
         assert!(network_adapter.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Vendor A".to_owned(),
         }));
         assert!(network_adapter.facts.contains(&ResourceFactProjection {
-            label: "Model",
+            label: L().fact_model,
             value: "NA-25G-2P".to_owned(),
         }));
         assert!(
             !network_adapter
                 .facts
                 .iter()
-                .any(|fact| fact.label == "Part number")
+                .any(|fact| fact.label == L().fact_part_number)
         );
         assert!(
             !network_adapter
                 .facts
                 .iter()
-                .any(|fact| fact.label == "State")
+                .any(|fact| fact.label == L().fact_state)
         );
         let ethernet = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Ethernet interface")
+            .find(|resource| resource.type_label == L().type_ethernet_interface)
             .ok_or("ethernet interface resource must exist")?;
         assert_eq!(ethernet.name, "Ethernet Interface One");
         assert_eq!(
@@ -20646,15 +20866,15 @@ mod tests {
             "/redfish/v1/Managers/1/EthernetInterfaces/1"
         );
         assert!(ethernet.facts.contains(&ResourceFactProjection {
-            label: "MAC address",
+            label: L().fact_mac_address,
             value: "52:54:00:12:34:56".to_owned(),
         }));
         assert!(ethernet.facts.contains(&ResourceFactProjection {
-            label: "Speed (Mbps)",
+            label: L().fact_speed_mbps,
             value: "10000".to_owned(),
         }));
         assert!(ethernet.facts.contains(&ResourceFactProjection {
-            label: "Interface enabled",
+            label: L().fact_interface_enabled,
             value: "Yes".to_owned(),
         }));
         assert_eq!(
@@ -20681,38 +20901,43 @@ mod tests {
         let account = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Account")
+            .find(|resource| resource.type_label == L().type_account)
             .ok_or("account resource must exist")?;
         assert_eq!(account.name, "Administrator Account");
         assert_eq!(account.source, "/redfish/v1/AccountService/Accounts/admin");
         assert!(account.facts.contains(&ResourceFactProjection {
-            label: "Enabled",
+            label: L().fact_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(account.facts.contains(&ResourceFactProjection {
-            label: "Role",
+            label: L().field_role,
             value: "Administrator".to_owned(),
         }));
         assert!(account.facts.contains(&ResourceFactProjection {
-            label: "Locked",
+            label: L().fact_locked,
             value: "No".to_owned(),
         }));
-        assert!(!account.facts.iter().any(|fact| fact.label == "State"));
+        assert!(
+            !account
+                .facts
+                .iter()
+                .any(|fact| fact.label == L().fact_state)
+        );
         let bios = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "BIOS")
+            .find(|resource| resource.type_label == L().page_bios)
             .ok_or("bios resource must exist")?;
         assert_eq!(bios.name, "BIOS Configuration");
         assert_eq!(bios.source, "/redfish/v1/Systems/1/Bios");
         assert!(bios.facts.contains(&ResourceFactProjection {
-            label: "Attribute registry",
+            label: L().fact_attribute_registry,
             value: "BiosAttributeRegistry.v1_0_0".to_owned(),
         }));
         let boot_option = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Boot option")
+            .find(|resource| resource.type_label == L().type_boot_option)
             .ok_or("boot option resource must exist")?;
         assert_eq!(boot_option.name, "Network Boot Option");
         assert_eq!(
@@ -20720,30 +20945,30 @@ mod tests {
             "/redfish/v1/Systems/1/BootOptions/PXE-1"
         );
         assert!(boot_option.facts.contains(&ResourceFactProjection {
-            label: "Display name",
+            label: L().field_display_name,
             value: "PXE Network Boot".to_owned(),
         }));
         assert!(boot_option.facts.contains(&ResourceFactProjection {
-            label: "Enabled",
+            label: L().fact_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(boot_option.facts.contains(&ResourceFactProjection {
-            label: "UEFI device path",
+            label: L().fact_uefi_device_path,
             value: "PciRoot(0x0)/Pci(0x1C,0x0)/Pci(0x0,0x0)".to_owned(),
         }));
         let secure_boot = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Secure Boot")
+            .find(|resource| resource.type_label == L().page_secure_boot)
             .ok_or("secure boot resource must exist")?;
         assert_eq!(secure_boot.name, "Secure Boot");
         assert_eq!(secure_boot.source, "/redfish/v1/Systems/1/SecureBoot");
         assert!(secure_boot.facts.contains(&ResourceFactProjection {
-            label: "Secure boot enabled",
+            label: L().fact_secure_boot_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(secure_boot.facts.contains(&ResourceFactProjection {
-            label: "Secure boot mode",
+            label: L().fact_secure_boot_mode,
             value: "DeployedMode".to_owned(),
         }));
         assert_eq!(
@@ -20766,7 +20991,10 @@ mod tests {
         );
         assert!(empty.is_ready());
         assert!(empty.has_empty_inventory());
-        assert_eq!(empty.endpoint_count_text(), "0 managed endpoints");
+        assert_eq!(
+            empty.endpoint_count_text(),
+            catalog_format!(L().count_endpoints_many, 0)
+        );
         assert_eq!(
             ConsoleLoadState::accepted(
                 about("different-product"),
@@ -20966,7 +21194,7 @@ mod tests {
                 EndpointTrustChallengeStateResponse::SystemCaTrusted,
             ));
         assert!(trusted.is_system_ca_trusted());
-        assert_eq!(trusted.state_label(), "Verified by system CA roots");
+        assert_eq!(trusted.state_label(), L().notice_verified_by_system_ca);
         assert_eq!(
             trusted.expectation(),
             EndpointTrustExpectationRequest::system_ca()
@@ -21128,7 +21356,7 @@ mod tests {
         assert_eq!(projection.failed_count, 2);
         assert_eq!(
             projection.summary_text(),
-            "1 of 3 endpoints refreshed; 2 failed"
+            catalog_format!(L().fmt_endpoints_refreshed, 1, 3, 2)
         );
         let refreshed = projection.rows.first().ok_or("refreshed row must exist")?;
         assert!(refreshed.is_success);
@@ -21311,7 +21539,10 @@ mod tests {
         assert!(state.is_ready());
         assert!(!state.is_failed());
         assert_eq!(state.count_text(), "3 events");
-        assert_eq!(state.bound_text(), "Showing the latest 3 events");
+        assert_eq!(
+            state.bound_text(),
+            catalog_format!(L().count_events_latest_many, 3)
+        );
 
         let cards = state.event_cards();
         let updated = cards.first().ok_or("ok event card must exist")?;
@@ -21653,14 +21884,14 @@ mod tests {
         assert_eq!(projection.health[1].level, HealthLevel::Ok);
         assert_eq!(projection.health[2].level, HealthLevel::Unknown);
         // The staleness buckets carry the console age-class labels.
-        assert_eq!(projection.freshness[0].label, "Never refreshed");
-        assert_eq!(projection.freshness[1].label, "Within 1 hour");
-        assert_eq!(projection.freshness[2].label, "Older than 7 days");
+        assert_eq!(projection.freshness[0].label, L().freshness_never);
+        assert_eq!(projection.freshness[1].label, L().freshness_hour);
+        assert_eq!(projection.freshness[2].label, L().freshness_older);
         // The firmware summary line and the coverage percentage are derived
         // from the server counts.
         assert_eq!(
             projection.firmware_summary_text(),
-            "3 members across 2 endpoints, 2 distinct versions"
+            catalog_format!(L().fmt_members_versions, 3, 2, 2)
         );
         let coverage = projection
             .capability_coverage
@@ -21718,7 +21949,7 @@ mod tests {
         assert_eq!(projection.capability_coverage_text(), None);
         assert_eq!(
             projection.firmware_summary_text(),
-            "0 members across 0 endpoints, 0 distinct versions"
+            catalog_format!(L().fmt_members_versions, 0, 0, 0)
         );
         assert!(OverviewState::Ready(projection).is_ready());
         Ok(())
@@ -21764,11 +21995,14 @@ mod tests {
         assert_eq!(card.created_at_text, "2026-08-05T10:12:13Z");
         assert_eq!(
             CredentialsListState::Idle.count_text(),
-            "0 stored credentials"
+            catalog_format!(L().count_credentials_many, 0)
         );
         let empty = CredentialsListState::Ready(CredentialInventoryResponse::new(Vec::new()));
         assert!(empty.has_empty_inventory());
-        assert_eq!(empty.count_text(), "0 stored credentials");
+        assert_eq!(
+            empty.count_text(),
+            catalog_format!(L().count_credentials_many, 0)
+        );
         Ok(())
     }
 
@@ -21956,7 +22190,7 @@ mod tests {
 
         assert_eq!(
             CredentialsListState::Loading.count_text(),
-            "0 stored credentials"
+            catalog_format!(L().count_credentials_many, 0)
         );
         assert!(CredentialsListState::Failed.is_failed());
         assert!(
@@ -22011,61 +22245,64 @@ mod tests {
         let power = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Power")
+            .find(|resource| resource.type_label == L().fact_power_flag)
             .ok_or("power resource must exist")?;
         assert_eq!(power.name, "Power");
         assert_eq!(power.source, "/redfish/v1/Chassis/1/Power");
         assert!(
-            power.facts.iter().all(|fact| fact.label == "Redfish ID"),
+            power
+                .facts
+                .iter()
+                .all(|fact| fact.label == L().fact_redfish_id),
             "the Power projection carries no family facts"
         );
         let thermal = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Thermal")
+            .find(|resource| resource.type_label == L().page_thermal)
             .ok_or("thermal resource must exist")?;
         assert_eq!(thermal.name, "Thermal");
         assert_eq!(thermal.source, "/redfish/v1/Chassis/1/Thermal");
         assert!(thermal.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let sensor = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Sensor")
+            .find(|resource| resource.type_label == L().type_sensor)
             .ok_or("sensor resource must exist")?;
         assert_eq!(sensor.name, "Chassis Inlet Temperature");
         assert_eq!(sensor.source, "/redfish/v1/Chassis/1/Sensors/InletTemp");
         assert!(sensor.facts.contains(&ResourceFactProjection {
-            label: "Reading type",
+            label: L().fact_reading_type,
             value: "Temperature".to_owned(),
         }));
         assert!(sensor.facts.contains(&ResourceFactProjection {
-            label: "Reading",
+            label: L().fact_reading,
             value: "27.5".to_owned(),
         }));
         assert!(sensor.facts.contains(&ResourceFactProjection {
-            label: "Reading units",
+            label: L().fact_reading_units,
             value: "Cel".to_owned(),
         }));
         assert!(sensor.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let control = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Control")
+            .find(|resource| resource.type_label == L().type_control)
             .ok_or("control resource must exist")?;
         assert_eq!(control.name, "Chassis Fan Duty");
         assert_eq!(control.source, "/redfish/v1/Chassis/1/Controls/FanDuty");
         assert!(control.facts.contains(&ResourceFactProjection {
-            label: "Control type",
+            label: L().fact_control_type,
             value: "DutyCycle".to_owned(),
         }));
         assert!(control.facts.contains(&ResourceFactProjection {
-            label: "Set point",
+            label: L().fact_set_point,
             value: "30".to_owned(),
         }));
         assert!(
@@ -22075,7 +22312,7 @@ mod tests {
                 .any(|fact| fact.label == "Set point units")
         );
         assert!(control.facts.contains(&ResourceFactProjection {
-            label: "State",
+            label: L().fact_state,
             value: "Enabled".to_owned(),
         }));
         assert_eq!(
@@ -22102,26 +22339,26 @@ mod tests {
         let log_service = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Log Service")
+            .find(|resource| resource.type_label == L().type_log_service)
             .ok_or("log service resource must exist")?;
         assert_eq!(log_service.name, "BMC Event Log");
         assert_eq!(log_service.source, "/redfish/v1/Managers/1/LogServices/1");
         assert!(log_service.facts.contains(&ResourceFactProjection {
-            label: "Service enabled",
+            label: L().fact_service_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(log_service.facts.contains(&ResourceFactProjection {
-            label: "Max records",
+            label: L().fact_max_records,
             value: "1000".to_owned(),
         }));
         assert!(log_service.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let network_protocol = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Manager Network Protocol")
+            .find(|resource| resource.type_label == L().type_manager_network_protocol)
             .ok_or("manager network protocol resource must exist")?;
         assert_eq!(network_protocol.name, "Manager Network Protocol");
         assert_eq!(
@@ -22129,21 +22366,21 @@ mod tests {
             "/redfish/v1/Managers/1/NetworkProtocol"
         );
         assert!(network_protocol.facts.contains(&ResourceFactProjection {
-            label: "Host name",
+            label: L().field_host_name,
             value: "bmc-1".to_owned(),
         }));
         assert!(network_protocol.facts.contains(&ResourceFactProjection {
-            label: "FQDN",
+            label: L().fact_fqdn,
             value: "bmc-1.example.com".to_owned(),
         }));
         assert!(network_protocol.facts.contains(&ResourceFactProjection {
-            label: "State",
+            label: L().fact_state,
             value: "Enabled".to_owned(),
         }));
         let host_interface = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Host Interface")
+            .find(|resource| resource.type_label == L().type_host_interface)
             .ok_or("host interface resource must exist")?;
         assert_eq!(host_interface.name, "Host Interface One");
         assert_eq!(
@@ -22151,7 +22388,7 @@ mod tests {
             "/redfish/v1/Managers/1/HostInterfaces/1"
         );
         assert!(host_interface.facts.contains(&ResourceFactProjection {
-            label: "Interface enabled",
+            label: L().fact_interface_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(
@@ -22161,7 +22398,7 @@ mod tests {
                 .any(|fact| fact.label == "Host interface type")
         );
         assert!(host_interface.facts.contains(&ResourceFactProjection {
-            label: "State",
+            label: L().fact_state,
             value: "Enabled".to_owned(),
         }));
         assert_eq!(
@@ -22188,26 +22425,26 @@ mod tests {
         let pcie_device = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "PCIe device")
+            .find(|resource| resource.type_label == L().type_pcie_device)
             .ok_or("pcie device resource must exist")?;
         assert_eq!(pcie_device.name, "PCIe Device One");
         assert_eq!(pcie_device.source, "/redfish/v1/Systems/1/PCIeDevices/GPU1");
         assert!(pcie_device.facts.contains(&ResourceFactProjection {
-            label: "Device type",
+            label: L().fact_device_type,
             value: "SingleFunction".to_owned(),
         }));
         assert!(pcie_device.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "Vendor C".to_owned(),
         }));
         assert!(pcie_device.facts.contains(&ResourceFactProjection {
-            label: "Model",
+            label: L().fact_model,
             value: "PCIE-GEN4-X16".to_owned(),
         }));
         let assembly = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Assembly")
+            .find(|resource| resource.type_label == L().page_assembly)
             .ok_or("assembly resource must exist")?;
         assert_eq!(assembly.name, "Fan Assembly");
         assert_eq!(
@@ -22215,17 +22452,17 @@ mod tests {
             "/redfish/v1/Chassis/1/Assembly#/Assemblies/0"
         );
         assert!(assembly.facts.contains(&ResourceFactProjection {
-            label: "Producer",
+            label: L().fact_producer,
             value: "Vendor D".to_owned(),
         }));
         assert!(assembly.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let software_inventory = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Software inventory")
+            .find(|resource| resource.type_label == L().type_software_inventory)
             .ok_or("software inventory resource must exist")?;
         assert_eq!(software_inventory.name, "System BIOS");
         assert_eq!(
@@ -22233,15 +22470,15 @@ mod tests {
             "/redfish/v1/UpdateService/SoftwareInventory/BIOS"
         );
         assert!(software_inventory.facts.contains(&ResourceFactProjection {
-            label: "Software ID",
+            label: L().fact_software_id,
             value: "BIOS-2026-1".to_owned(),
         }));
         assert!(software_inventory.facts.contains(&ResourceFactProjection {
-            label: "Version",
+            label: L().fact_version,
             value: "2.7.0".to_owned(),
         }));
         assert!(software_inventory.facts.contains(&ResourceFactProjection {
-            label: "Release date",
+            label: L().fact_release_date,
             value: "2026-05-01T00:00:00Z".to_owned(),
         }));
         assert_eq!(
@@ -22267,22 +22504,22 @@ mod tests {
         let event_service = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Event Service")
+            .find(|resource| resource.type_label == L().type_event_service)
             .ok_or("event service resource must exist")?;
         assert_eq!(event_service.name, "Event Service");
         assert_eq!(event_service.source, "/redfish/v1/EventService");
         assert!(event_service.facts.contains(&ResourceFactProjection {
-            label: "Service enabled",
+            label: L().fact_service_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(event_service.facts.contains(&ResourceFactProjection {
-            label: "Health",
+            label: L().fact_health,
             value: "OK".to_owned(),
         }));
         let subscription = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Event subscription")
+            .find(|resource| resource.type_label == L().type_event_subscription)
             .ok_or("event subscription resource must exist")?;
         assert_eq!(subscription.name, "Subscription One");
         assert_eq!(
@@ -22290,53 +22527,53 @@ mod tests {
             "/redfish/v1/EventService/Subscriptions/1"
         );
         assert!(subscription.facts.contains(&ResourceFactProjection {
-            label: "Destination",
+            label: L().field_destination,
             value: "https://subscriber.example.test/events".to_owned(),
         }));
         assert!(subscription.facts.contains(&ResourceFactProjection {
-            label: "Protocol",
+            label: L().field_protocol,
             value: "Redfish".to_owned(),
         }));
         assert!(subscription.facts.contains(&ResourceFactProjection {
-            label: "Event types",
+            label: L().field_event_types,
             value: "Alert, StatusChange".to_owned(),
         }));
         let task_service = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Task Service")
+            .find(|resource| resource.type_label == L().type_task_service)
             .ok_or("task service resource must exist")?;
         assert_eq!(task_service.name, "Task Service");
         assert_eq!(task_service.source, "/redfish/v1/TaskService");
         assert!(task_service.facts.contains(&ResourceFactProjection {
-            label: "Service enabled",
+            label: L().fact_service_enabled,
             value: "Yes".to_owned(),
         }));
         assert!(task_service.facts.contains(&ResourceFactProjection {
-            label: "Completed task policy",
+            label: L().fact_completed_task_policy,
             value: "Oldest".to_owned(),
         }));
         let task = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Task")
+            .find(|resource| resource.type_label == L().type_task)
             .ok_or("task resource must exist")?;
         assert_eq!(task.name, "Firmware Update Task");
         assert_eq!(task.source, "/redfish/v1/TaskService/Tasks/1");
         assert!(task.facts.contains(&ResourceFactProjection {
-            label: "Task state",
+            label: L().fact_task_state,
             value: "Running".to_owned(),
         }));
         assert!(task.facts.contains(&ResourceFactProjection {
-            label: "Task status",
+            label: L().fact_task_status,
             value: "OK".to_owned(),
         }));
         assert!(task.facts.contains(&ResourceFactProjection {
-            label: "Percent complete",
+            label: L().fact_percent_complete,
             value: "42".to_owned(),
         }));
         assert!(task.facts.contains(&ResourceFactProjection {
-            label: "Start time",
+            label: L().fact_start_time,
             value: "2026-08-05T10:20:00Z".to_owned(),
         }));
         assert_eq!(
@@ -22362,18 +22599,18 @@ mod tests {
         let telemetry_service = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Telemetry Service")
+            .find(|resource| resource.type_label == L().type_telemetry_service)
             .ok_or("telemetry service resource must exist")?;
         assert_eq!(telemetry_service.name, "Telemetry Service");
         assert_eq!(telemetry_service.source, "/redfish/v1/TelemetryService");
         assert!(telemetry_service.facts.contains(&ResourceFactProjection {
-            label: "State",
+            label: L().fact_state,
             value: "Enabled".to_owned(),
         }));
         let definition = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Metric definition")
+            .find(|resource| resource.type_label == L().type_metric_definition)
             .ok_or("metric definition resource must exist")?;
         assert_eq!(definition.name, "Inlet Temperature Definition");
         assert_eq!(
@@ -22381,17 +22618,17 @@ mod tests {
             "/redfish/v1/TelemetryService/MetricDefinitions/1"
         );
         assert!(definition.facts.contains(&ResourceFactProjection {
-            label: "Units",
+            label: L().fact_units,
             value: "Cel".to_owned(),
         }));
         assert!(definition.facts.contains(&ResourceFactProjection {
-            label: "Metric type",
+            label: L().fact_metric_type,
             value: "Numeric".to_owned(),
         }));
         let report = current
             .resources
             .iter()
-            .find(|resource| resource.type_label == "Metric report")
+            .find(|resource| resource.type_label == L().type_metric_report)
             .ok_or("metric report resource must exist")?;
         assert_eq!(report.name, "Inlet Temperature Report");
         assert_eq!(
@@ -22399,14 +22636,14 @@ mod tests {
             "/redfish/v1/TelemetryService/MetricReports/1"
         );
         assert!(report.facts.contains(&ResourceFactProjection {
-            label: "Metric values",
+            label: L().fact_metric_values,
             value: "2".to_owned(),
         }));
         // The card stays concise: only the latest reading of the value array
         // renders as a fact; the timestamped history belongs to the Telemetry
         // view.
         assert!(report.facts.contains(&ResourceFactProjection {
-            label: "Latest value",
+            label: L().fact_latest_value,
             value: "32.0".to_owned(),
         }));
         assert_eq!(
@@ -22431,9 +22668,9 @@ mod tests {
             RoleView::Operator
         );
         assert_eq!(RoleView::from_wire(RoleResponse::Viewer), RoleView::Viewer);
-        assert_eq!(RoleView::Administrator.label(), "Administrator");
-        assert_eq!(RoleView::Operator.label(), "Operator");
-        assert_eq!(RoleView::Viewer.label(), "Viewer");
+        assert_eq!(RoleView::Administrator.label(), L().role_administrator);
+        assert_eq!(RoleView::Operator.label(), L().role_operator);
+        assert_eq!(RoleView::Viewer.label(), L().role_viewer);
         assert!(ConsoleView::Users.allowed_for(Some(RoleView::Administrator)));
         assert!(!ConsoleView::Users.allowed_for(Some(RoleView::Operator)));
         assert!(!ConsoleView::Users.allowed_for(Some(RoleView::Viewer)));
@@ -22467,18 +22704,18 @@ mod tests {
                 ConsoleView::CenterBindings,
             ]
         );
-        assert_eq!(ConsoleView::Overview.label(), "Overview");
-        assert_eq!(ConsoleView::Groups.label(), "Groups");
-        assert_eq!(ConsoleView::Credentials.label(), "Credentials");
-        assert_eq!(ConsoleView::AddEndpoint.label(), "Add endpoint");
-        assert_eq!(ConsoleView::Import.label(), "Import");
-        assert_eq!(ConsoleView::Audit.label(), "Audit");
-        assert_eq!(ConsoleView::Capabilities.label(), "Capabilities");
-        assert_eq!(ConsoleView::Operations.label(), "Operations");
-        assert_eq!(ConsoleView::Events.label(), "Events");
-        assert_eq!(ConsoleView::Artifacts.label(), "Artifacts");
-        assert_eq!(ConsoleView::Telemetry.label(), "Telemetry");
-        assert_eq!(ConsoleView::Diagnostics.label(), "Diagnostics");
+        assert_eq!(ConsoleView::Overview.label(), L().nav_overview);
+        assert_eq!(ConsoleView::Groups.label(), L().nav_groups);
+        assert_eq!(ConsoleView::Credentials.label(), L().nav_credentials);
+        assert_eq!(ConsoleView::AddEndpoint.label(), L().nav_add_endpoint);
+        assert_eq!(ConsoleView::Import.label(), L().nav_import);
+        assert_eq!(ConsoleView::Audit.label(), L().nav_audit);
+        assert_eq!(ConsoleView::Capabilities.label(), L().nav_capabilities);
+        assert_eq!(ConsoleView::Operations.label(), L().nav_operations);
+        assert_eq!(ConsoleView::Events.label(), L().nav_events);
+        assert_eq!(ConsoleView::Artifacts.label(), L().nav_artifacts);
+        assert_eq!(ConsoleView::Telemetry.label(), L().nav_telemetry);
+        assert_eq!(ConsoleView::Diagnostics.label(), L().nav_diagnostics);
 
         assert!(ConsoleLoadState::Loading.is_loading());
         assert!(
@@ -22490,9 +22727,39 @@ mod tests {
             .is_loading()
         );
 
-        assert_eq!(ConsoleView::CenterSites.label(), "Center sites");
-        assert_eq!(ConsoleView::CenterOperations.label(), "Center operations");
-        assert_eq!(ConsoleView::CenterBindings.label(), "Center bindings");
+        assert_eq!(ConsoleView::CenterSites.label(), L().nav_center_sites);
+        assert_eq!(
+            ConsoleView::CenterOperations.label(),
+            L().nav_center_operations
+        );
+        assert_eq!(ConsoleView::CenterBindings.label(), L().nav_center_bindings);
+    }
+
+    #[test]
+    fn zh_switch_swaps_the_label_functions() {
+        // The runtime language selection reaches every label path: after
+        // switching the thread to Simplified Chinese, the navigation, page
+        // titles, health vocabulary, command families, and trust labels all
+        // resolve through the Zh catalog, and the switch back restores
+        // English. The choice is per-thread, so parallel tests are isolated.
+        use i18n::set_lang;
+
+        set_lang(Lang::Zh);
+        assert_eq!(ConsoleView::Overview.label(), "总览");
+        assert_eq!(page_title(UiLocationResponse::Systems), "系统");
+        assert_eq!(page_title(UiLocationResponse::SecureBoot), "安全启动");
+        assert_eq!(health_level_label(HealthLevel::Ok), "正常");
+        assert_eq!(health_level_label(HealthLevel::Critical), "严重");
+        assert_eq!(CommandFamilyView::SecureBoot.label(), "安全启动");
+        assert_eq!(CommandFamilyView::FirmwareUpdate.label(), "固件更新");
+        assert_eq!(
+            trust_mode_label(&EndpointTrustExpectationRequest::system_ca()),
+            "系统 CA"
+        );
+        assert_eq!(*L(), Lang::Zh.strings());
+        set_lang(Lang::En);
+        assert_eq!(ConsoleView::Overview.label(), L().nav_overview);
+        assert_eq!(health_level_label(HealthLevel::Ok), L().health_ok);
     }
 
     #[test]
@@ -22633,9 +22900,9 @@ mod tests {
             Some("6f6f9e40-2c5a-4b4e-9f6f-7f7f7f7f7f7f")
         );
         assert_eq!(cards[0].endpoint_id, "6f6f9e40-2c5a-4b4e-9f6f-9b9b9b9b9b9b");
-        assert!(cards[0].command.contains("System reset"));
+        assert!(cards[0].command.contains(L().family_system_reset));
         assert_eq!(cards[0].target.as_deref(), Some("/redfish/v1/Systems/1"));
-        assert_eq!(cards[0].state, "Queued");
+        assert_eq!(cards[0].state, L().state_queued);
         assert_eq!(cards[0].actor.as_deref(), Some("admin"));
         assert_eq!(
             cards[0].created_at,
@@ -22913,7 +23180,7 @@ mod tests {
 
         let uploading = &cards[0];
         assert_eq!(uploading.status, ArtifactStatusView::Uploading);
-        assert_eq!(uploading.status_label(), "Uploading");
+        assert_eq!(uploading.status_label(), L().status_uploading);
         assert_eq!(uploading.status_class(), "artifact-state artifact-active");
         assert_eq!(uploading.progress_percent, 50);
         assert_eq!(uploading.size_text, "8.0 MiB");
@@ -22925,14 +23192,14 @@ mod tests {
 
         let ready = &cards[1];
         assert_eq!(ready.status, ArtifactStatusView::Ready);
-        assert_eq!(ready.status_label(), "Ready");
+        assert_eq!(ready.status_label(), L().status_ready);
         assert_eq!(ready.status_class(), "artifact-state artifact-ok");
         assert_eq!(ready.progress_percent, 100);
         assert!(ready.is_completely_uploaded());
 
         let failed = &cards[2];
         assert_eq!(failed.status, ArtifactStatusView::Failed);
-        assert_eq!(failed.status_label(), "Failed");
+        assert_eq!(failed.status_label(), L().state_failed);
         assert_eq!(failed.status_class(), "artifact-state artifact-error");
         assert_eq!(failed.sha256_short, "00000000");
         Ok(())
@@ -23005,7 +23272,7 @@ mod tests {
                 uploaded_bytes: 4 * 1024 * 1024,
                 total_bytes: 10 * 1024 * 1024,
             }),
-            "Uploading chunk 2 of 4 · 40%"
+            catalog_format!(L().fmt_uploading_chunk, 2, 4, 40)
         );
         assert_eq!(
             artifact_upload_status_text(&ArtifactUploadState::Finalizing {
@@ -23083,7 +23350,7 @@ mod tests {
             .groups
             .first()
             .ok_or("accounts group must exist")?;
-        assert_eq!(accounts.page_title, "Accounts");
+        assert_eq!(accounts.page_title, L().page_accounts);
         let entry = accounts
             .entries
             .first()
@@ -23100,7 +23367,7 @@ mod tests {
         let network = projection
             .groups
             .iter()
-            .find(|group| group.page_title == "Network")
+            .find(|group| group.page_title == L().page_network)
             .ok_or("network group must exist")?;
         let network_codes = network
             .entries
@@ -23120,7 +23387,7 @@ mod tests {
         let power = projection
             .groups
             .iter()
-            .find(|group| group.page_title == "Power")
+            .find(|group| group.page_title == L().page_power)
             .ok_or("power group must exist")?;
         let power_codes = power
             .entries
@@ -23162,7 +23429,7 @@ mod tests {
                 "Memory",
                 "PCIe",
                 "Processors",
-                "Secure Boot",
+                L().page_secure_boot,
                 "Infrastructure",
                 "Storage",
                 "Tasks",
@@ -23290,7 +23557,7 @@ mod tests {
         let oem_group = matrix
             .groups
             .iter()
-            .find(|group| group.page_title == "OEM")
+            .find(|group| group.page_title == L().page_oem)
             .ok_or("an OEM capability page must exist")?;
         assert_eq!(oem_group.entries.len(), 14);
         assert_eq!(
@@ -23361,29 +23628,38 @@ mod tests {
         let oem_group = matrix
             .groups
             .iter()
-            .find(|group| group.page_title == "OEM")
+            .find(|group| group.page_title == L().page_oem)
             .ok_or("an OEM capability page must exist")?;
         let labels = oem_group
             .entries
             .iter()
             .map(|entry| (entry.state_label, entry.state_class))
             .collect::<Vec<_>>();
-        assert_eq!(labels[0], ("Supported", "capability-state capability-ok"));
-        assert_eq!(labels[1], ("Read only", "capability-state capability-ok"));
+        assert_eq!(
+            labels[0],
+            (L().state_supported, "capability-state capability-ok")
+        );
+        assert_eq!(
+            labels[1],
+            (L().state_read_only, "capability-state capability-ok")
+        );
         assert_eq!(
             labels[2],
-            ("Unauthorized", "capability-state capability-warn")
+            (L().state_unauthorized, "capability-state capability-warn")
         );
         assert_eq!(
             labels[3],
             (
-                "Temporarily unavailable",
+                L().state_temporarily_unavailable,
                 "capability-state capability-warn"
             )
         );
         assert_eq!(
             labels[4],
-            ("Schema incompatible", "capability-state capability-warn")
+            (
+                L().state_schema_incompatible,
+                "capability-state capability-warn"
+            )
         );
         assert_eq!(
             labels[5],
@@ -23473,23 +23749,23 @@ mod tests {
         // The iDRAC identity attributes render with the vendor's original
         // values verbatim (§12.3).
         assert!(dell.facts.contains(&ResourceFactProjection {
-            label: "Model",
+            label: L().fact_model,
             value: "PowerEdge R750".to_owned(),
         }));
         assert!(dell.facts.contains(&ResourceFactProjection {
-            label: "Service tag",
+            label: L().fact_service_tag,
             value: "ABC1234".to_owned(),
         }));
         assert!(dell.facts.contains(&ResourceFactProjection {
-            label: "Generation",
+            label: L().label_generation,
             value: "16G".to_owned(),
         }));
         assert!(dell.facts.contains(&ResourceFactProjection {
-            label: "BMC MAC address",
+            label: L().fact_bmc_mac_address,
             value: "14:18:77:aa:bb:cc".to_owned(),
         }));
         assert!(dell.facts.contains(&ResourceFactProjection {
-            label: "Server name",
+            label: L().fact_server_name,
             value: "rack-1-server-2".to_owned(),
         }));
         Ok(())
@@ -23539,7 +23815,7 @@ mod tests {
         // The vendor's boolean is rendered in its canonical wire spelling
         // verbatim (§12.3).
         assert!(sys_lockdown.facts.contains(&ResourceFactProjection {
-            label: "SysLockdown enabled",
+            label: L().fact_sys_lockdown_enabled,
             value: "true".to_owned(),
         }));
         let kcs_interface = cards
@@ -23550,7 +23826,7 @@ mod tests {
         assert_eq!(kcs_interface.name, "KCSInterface");
         // The vendor's enum spelling is kept verbatim per §12.3.
         assert!(kcs_interface.facts.contains(&ResourceFactProjection {
-            label: "Privilege",
+            label: L().fact_privilege,
             value: "Operator".to_owned(),
         }));
         Ok(())
@@ -23597,7 +23873,7 @@ mod tests {
         // The vendor's `FWRollback` enum spelling is kept verbatim per §12.3,
         // never translated into a product label.
         assert!(security_service.facts.contains(&ResourceFactProjection {
-            label: "Firmware rollback",
+            label: L().fact_firmware_rollback,
             value: "Enabled".to_owned(),
         }));
         Ok(())
@@ -23654,7 +23930,7 @@ mod tests {
         assert_eq!(ami_root.type_label, "AMI Service Root");
         assert_eq!(ami_root.name, "Root Service");
         assert!(ami_root.facts.contains(&ResourceFactProjection {
-            label: "Redfish Technology Pack version",
+            label: L().fact_redfish_tech_pack_version,
             value: "1.2.3".to_owned(),
         }));
         // The `ConfigBmc` card derives its identity from the `@odata.id`
@@ -23667,11 +23943,11 @@ mod tests {
         assert_eq!(config_bmc.type_label, "AMI Config BMC");
         assert_eq!(config_bmc.name, "ConfigBMC");
         assert!(config_bmc.facts.contains(&ResourceFactProjection {
-            label: "Host control lockout",
+            label: L().fact_host_control_lockout,
             value: "Enable".to_owned(),
         }));
         assert!(config_bmc.facts.contains(&ResourceFactProjection {
-            label: "BIOS upgrade/downgrade lockdown",
+            label: L().fact_bios_upgrade_downgrade_lockdown,
             value: "Disable".to_owned(),
         }));
         // The HPE service-root card keeps the first `Manager` entry's texts
@@ -23681,11 +23957,11 @@ mod tests {
             .find(|card| card.source == "/redfish/v1/Oem/Hpe")
             .ok_or("the HPE service-extension card must exist")?;
         assert!(hpe_root.facts.contains(&ResourceFactProjection {
-            label: "Manager type",
+            label: L().fact_manager_type,
             value: "iLO 5".to_owned(),
         }));
         assert!(hpe_root.facts.contains(&ResourceFactProjection {
-            label: "Manager firmware version",
+            label: L().fact_manager_firmware_version,
             value: "2.44".to_owned(),
         }));
         // The HPE manager card keeps the `VirtualNICEnabled` boolean.
@@ -23695,7 +23971,7 @@ mod tests {
             .ok_or("the HPE manager card must exist")?;
         assert_eq!(hpe_manager.type_label, "HPE iLO Manager");
         assert!(hpe_manager.facts.contains(&ResourceFactProjection {
-            label: "Virtual NIC enabled",
+            label: L().fact_virtual_nic_enabled,
             value: "true".to_owned(),
         }));
         // The `LiteOn` supply card keeps the typed power-supply identity
@@ -23705,19 +23981,19 @@ mod tests {
             .iter()
             .find(|card| {
                 card.source == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/LiteOn"
-                    && card.type_label == "LiteOn Power Supply"
+                    && card.type_label == L().type_liteon_power_supply
             })
             .ok_or("the LiteOn supply card must exist")?;
         assert!(liteon.facts.contains(&ResourceFactProjection {
-            label: "Power supply type",
+            label: L().fact_power_supply_type,
             value: "AC".to_owned(),
         }));
         assert!(liteon.facts.contains(&ResourceFactProjection {
-            label: "Power capacity (watts)",
+            label: L().fact_power_capacity_watts,
             value: "2200".to_owned(),
         }));
         assert!(liteon.facts.contains(&ResourceFactProjection {
-            label: "Manufacturer",
+            label: L().fact_manufacturer,
             value: "LITE-ON TECHNOLOGY CORP.".to_owned(),
         }));
         // The Delta supply card keeps the `deltaenergysystems` flags
@@ -23727,15 +24003,15 @@ mod tests {
             .find(|card| {
                 card.source
                     == "/redfish/v1/Chassis/1/PowerSubsystem/PowerSupplies/1/Oem/deltaenergysystems"
-                    && card.type_label == "Delta Power Supply"
+                    && card.type_label == L().type_delta_power_supply
             })
             .ok_or("the Delta supply card must exist")?;
         assert!(delta.facts.contains(&ResourceFactProjection {
-            label: "Power",
+            label: L().fact_power_flag,
             value: "true".to_owned(),
         }));
         assert!(delta.facts.contains(&ResourceFactProjection {
-            label: "Fan speed target",
+            label: L().fact_fan_speed_target,
             value: "50".to_owned(),
         }));
         Ok(())
@@ -23791,11 +24067,11 @@ mod tests {
         // wire spelling verbatim (§12.3); the certificate payloads behind
         // the links never reach the card.
         assert!(chain_root.facts.contains(&ResourceFactProjection {
-            label: "NVIDIA certificates",
+            label: L().fact_nvidia_certificates,
             value: "true".to_owned(),
         }));
         assert!(chain_root.facts.contains(&ResourceFactProjection {
-            label: "OEM certificates",
+            label: L().fact_oem_certificates,
             value: "false".to_owned(),
         }));
         let status = cards
@@ -23806,23 +24082,23 @@ mod tests {
             .ok_or("the status card must exist")?;
         assert_eq!(status.type_label, "NVIDIA Profile Status");
         assert!(status.facts.contains(&ResourceFactProjection {
-            label: "Pending activation",
+            label: L().fact_pending_activation,
             value: "profile-1".to_owned(),
         }));
         assert!(status.facts.contains(&ResourceFactProjection {
-            label: "Active profile index",
+            label: L().fact_active_profile_index,
             value: "1".to_owned(),
         }));
         assert!(status.facts.contains(&ResourceFactProjection {
-            label: "BMC profile version",
+            label: L().fact_bmc_profile_version,
             value: "2".to_owned(),
         }));
         assert!(status.facts.contains(&ResourceFactProjection {
-            label: "Factory reset status",
+            label: L().fact_factory_reset_status,
             value: "Idle".to_owned(),
         }));
         assert!(status.facts.contains(&ResourceFactProjection {
-            label: "Default profile index",
+            label: L().fact_default_profile_index,
             value: "1".to_owned(),
         }));
         let profile = cards
@@ -23834,23 +24110,23 @@ mod tests {
         assert_eq!(profile.type_label, "NVIDIA System Profile");
         // The compiled metadata fields render verbatim per §12.3.
         assert!(profile.facts.contains(&ResourceFactProjection {
-            label: "Default",
+            label: L().fact_default,
             value: "true".to_owned(),
         }));
         assert!(profile.facts.contains(&ResourceFactProjection {
-            label: "Owner",
+            label: L().fact_owner,
             value: "Nvidia".to_owned(),
         }));
         assert!(profile.facts.contains(&ResourceFactProjection {
-            label: "UUID",
+            label: L().fact_uuid,
             value: "11111111-2222-3333-4444-555555555555".to_owned(),
         }));
         assert!(profile.facts.contains(&ResourceFactProjection {
-            label: "Version",
+            label: L().fact_version,
             value: "1".to_owned(),
         }));
         assert!(profile.facts.contains(&ResourceFactProjection {
-            label: "Profile name",
+            label: L().fact_profile_name,
             value: "default-profile".to_owned(),
         }));
         let profile_file = cards
@@ -23863,27 +24139,27 @@ mod tests {
         assert_eq!(profile_file.type_label, "NVIDIA Profile File");
         // The metadata fields and the base64 content render verbatim (§12.3).
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "Activate",
+            label: L().fact_activate,
             value: "true".to_owned(),
         }));
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "Delete",
+            label: L().action_delete,
             value: "false".to_owned(),
         }));
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "Origin profile UUID",
+            label: L().fact_origin_profile_uuid,
             value: "11111111-2222-3333-4444-555555555555".to_owned(),
         }));
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "More profiles",
+            label: L().fact_more_profiles,
             value: "false".to_owned(),
         }));
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "Project name",
+            label: L().fact_project_name,
             value: "BlueField".to_owned(),
         }));
         assert!(profile_file.facts.contains(&ResourceFactProjection {
-            label: "Profile",
+            label: L().fact_profile,
             value: "eyJwcm9maWxlIjogInRlc3QifQ==".to_owned(),
         }));
         Ok(())
@@ -23943,7 +24219,7 @@ mod tests {
             .ok_or("the PowerCompliance card must exist")?;
         assert_eq!(compliance.type_label, "NVIDIA Power Compliance");
         assert!(compliance.facts.contains(&ResourceFactProjection {
-            label: "Manager type",
+            label: L().fact_manager_type,
             value: "PowerManager".to_owned(),
         }));
         let domain = cards
@@ -23955,23 +24231,23 @@ mod tests {
         assert_eq!(domain.type_label, "NVIDIA Power Domain");
         // The compiled scalar fields render verbatim per §12.3.
         assert!(domain.facts.contains(&ResourceFactProjection {
-            label: "Value",
+            label: L().fact_value,
             value: "800".to_owned(),
         }));
         assert!(domain.facts.contains(&ResourceFactProjection {
-            label: "Type",
+            label: L().fact_type,
             value: "Above".to_owned(),
         }));
         assert!(domain.facts.contains(&ResourceFactProjection {
-            label: "Unit",
+            label: L().fact_unit,
             value: "Watts".to_owned(),
         }));
         assert!(domain.facts.contains(&ResourceFactProjection {
-            label: "Sensor reading type",
+            label: L().fact_sensor_reading_type,
             value: "Power".to_owned(),
         }));
         assert!(domain.facts.contains(&ResourceFactProjection {
-            label: "Sensor implementation",
+            label: L().fact_sensor_implementation,
             value: "PhysicalSensor".to_owned(),
         }));
         let policy = cards
@@ -23982,23 +24258,23 @@ mod tests {
             .ok_or("the power policy card must exist")?;
         assert_eq!(policy.type_label, "NVIDIA Power Policy");
         assert!(policy.facts.contains(&ResourceFactProjection {
-            label: "Auto deassert power brake",
+            label: L().fact_auto_deassert_power_brake,
             value: "true".to_owned(),
         }));
         assert!(policy.facts.contains(&ResourceFactProjection {
-            label: "Min",
+            label: L().fact_min,
             value: "200".to_owned(),
         }));
         assert!(policy.facts.contains(&ResourceFactProjection {
-            label: "Max",
+            label: L().fact_max,
             value: "600".to_owned(),
         }));
         assert!(policy.facts.contains(&ResourceFactProjection {
-            label: "Type",
+            label: L().fact_type,
             value: "Inclusive".to_owned(),
         }));
         assert!(policy.facts.contains(&ResourceFactProjection {
-            label: "Policy actions",
+            label: L().fact_policy_actions,
             value: "AssertPowerBrake".to_owned(),
         }));
         let group = cards
@@ -24010,7 +24286,7 @@ mod tests {
             .ok_or("the managed entity group card must exist")?;
         assert_eq!(group.type_label, "NVIDIA Managed Entity Group");
         assert!(group.facts.contains(&ResourceFactProjection {
-            label: "Current managed entity",
+            label: L().fact_current_managed_entity,
             value: "BF1".to_owned(),
         }));
         let state_group = cards
@@ -24021,19 +24297,19 @@ mod tests {
             .ok_or("the power state group card must exist")?;
         assert_eq!(state_group.type_label, "NVIDIA Power State Group");
         assert!(state_group.facts.contains(&ResourceFactProjection {
-            label: "PSC ID",
+            label: L().fact_psc_id,
             value: "PSC1".to_owned(),
         }));
         assert!(state_group.facts.contains(&ResourceFactProjection {
-            label: "Generated watts",
+            label: L().fact_generated_watts,
             value: "2400".to_owned(),
         }));
         assert!(state_group.facts.contains(&ResourceFactProjection {
-            label: "Number of PSCs",
+            label: L().fact_number_of_pscs,
             value: "1".to_owned(),
         }));
         assert!(state_group.facts.contains(&ResourceFactProjection {
-            label: "Number of local PSUs",
+            label: L().fact_number_of_local_psus,
             value: "2".to_owned(),
         }));
         let psc = cards
@@ -24045,19 +24321,19 @@ mod tests {
             .ok_or("the PSC state card must exist")?;
         assert_eq!(psc.type_label, "NVIDIA PSC State");
         assert!(psc.facts.contains(&ResourceFactProjection {
-            label: "Operational PSUs",
+            label: L().fact_operational_psus,
             value: "4".to_owned(),
         }));
         assert!(psc.facts.contains(&ResourceFactProjection {
-            label: "Power brake assert",
+            label: L().fact_power_brake_assert,
             value: "false".to_owned(),
         }));
         assert!(psc.facts.contains(&ResourceFactProjection {
-            label: "Milliseconds since last heartbeat",
+            label: L().fact_ms_since_last_heartbeat,
             value: "12".to_owned(),
         }));
         assert!(psc.facts.contains(&ResourceFactProjection {
-            label: "Status",
+            label: L().fact_status,
             value: "Operational".to_owned(),
         }));
         let psu = cards
@@ -24069,19 +24345,19 @@ mod tests {
             .ok_or("the PSU state card must exist")?;
         assert_eq!(psu.type_label, "NVIDIA PSU State");
         assert!(psu.facts.contains(&ResourceFactProjection {
-            label: "PSU ID",
+            label: L().fact_psu_id,
             value: "PSU1".to_owned(),
         }));
         assert!(psu.facts.contains(&ResourceFactProjection {
-            label: "Presence",
+            label: L().fact_presence,
             value: "true".to_owned(),
         }));
         assert!(psu.facts.contains(&ResourceFactProjection {
-            label: "Input 1 active",
+            label: L().fact_input_1_active,
             value: "true".to_owned(),
         }));
         assert!(psu.facts.contains(&ResourceFactProjection {
-            label: "Input 2 active",
+            label: L().fact_input_2_active,
             value: "false".to_owned(),
         }));
         let redundancy = cards
@@ -24092,15 +24368,15 @@ mod tests {
             .ok_or("the PSU redundancy card must exist")?;
         assert_eq!(redundancy.type_label, "NVIDIA PSU Redundancy");
         assert!(redundancy.facts.contains(&ResourceFactProjection {
-            label: "Max PSUs supported",
+            label: L().fact_max_psus_supported,
             value: "4".to_owned(),
         }));
         assert!(redundancy.facts.contains(&ResourceFactProjection {
-            label: "Min PSUs needed",
+            label: L().fact_min_psus_needed,
             value: "2".to_owned(),
         }));
         assert!(redundancy.facts.contains(&ResourceFactProjection {
-            label: "Redundancy setting",
+            label: L().fact_redundancy_setting,
             value: "NPlusOne".to_owned(),
         }));
         let entity = cards
@@ -24112,19 +24388,19 @@ mod tests {
             .ok_or("the managed entity card must exist")?;
         assert_eq!(entity.type_label, "NVIDIA Managed Entity");
         assert!(entity.facts.contains(&ResourceFactProjection {
-            label: "Transport protocol",
+            label: L().fact_transport_protocol,
             value: "HTTPS".to_owned(),
         }));
         assert!(entity.facts.contains(&ResourceFactProjection {
-            label: "IPv4 address",
+            label: L().fact_ipv4_address,
             value: "192.0.2.10".to_owned(),
         }));
         assert!(entity.facts.contains(&ResourceFactProjection {
-            label: "IPv6 address",
+            label: L().fact_ipv6_address,
             value: "2001:db8::10".to_owned(),
         }));
         assert!(entity.facts.contains(&ResourceFactProjection {
-            label: "Port",
+            label: L().fact_port,
             value: "443".to_owned(),
         }));
         Ok(())
@@ -24142,7 +24418,7 @@ mod tests {
         );
         assert_eq!(card.type_label, "System");
         assert!(card.facts.contains(&ResourceFactProjection {
-            label: "Redfish ID",
+            label: L().fact_redfish_id,
             value: "1".to_owned(),
         }));
 
@@ -24428,7 +24704,7 @@ mod tests {
         let system = rack_b
             .resources
             .iter()
-            .find(|card| card.type_label == "System")
+            .find(|card| card.type_label == L().type_system)
             .ok_or("system card must exist")?;
 
         // The entry must open exactly this card's resource: the target
@@ -24512,9 +24788,12 @@ mod tests {
 
     #[test]
     fn operation_sources_and_command_families_render_static_labels() {
-        assert_eq!(OperationSourceView::Standalone.label(), "Standalone");
-        assert_eq!(OperationSourceView::Site.label(), "Site");
-        assert_eq!(OperationSourceView::Center.label(), "Center");
+        assert_eq!(
+            OperationSourceView::Standalone.label(),
+            L().label_standalone
+        );
+        assert_eq!(OperationSourceView::Site.label(), L().label_site);
+        assert_eq!(OperationSourceView::Center.label(), L().label_center);
 
         assert_eq!(
             CommandFamilyView::ALL,
@@ -24531,16 +24810,20 @@ mod tests {
             ]
         );
         for (family, code, label) in [
-            (CommandFamilyView::Account, "account", "Account"),
+            (CommandFamilyView::Account, "account", L().family_account),
             (CommandFamilyView::SystemReset, "system", "System reset"),
             (CommandFamilyView::ManagerReset, "manager", "Manager reset"),
             (CommandFamilyView::ChassisReset, "chassis", "Chassis reset"),
             (
                 CommandFamilyView::BootOverride,
                 "boot",
-                "Boot source override",
+                L().family_boot_override,
             ),
-            (CommandFamilyView::SecureBoot, "secure-boot", "Secure Boot"),
+            (
+                CommandFamilyView::SecureBoot,
+                "secure-boot",
+                L().family_secure_boot,
+            ),
             (
                 CommandFamilyView::EventSubscription,
                 "event",
@@ -24550,9 +24833,9 @@ mod tests {
             (
                 CommandFamilyView::FirmwareUpdate,
                 "update",
-                "Firmware update",
+                L().family_firmware_update,
             ),
-            (CommandFamilyView::Oem, "oem", "OEM (NVIDIA)"),
+            (CommandFamilyView::Oem, "oem", L().family_oem),
         ] {
             assert_eq!(family.as_str(), code);
             assert_eq!(family.label(), label);
@@ -24800,8 +25083,8 @@ mod tests {
             assert_eq!(member.as_str(), wire);
         }
         assert_eq!(EventActionView::ALL.len(), 2);
-        assert_eq!(SecureBootActionView::Enable.label(), "Enable");
-        assert_eq!(SecureBootActionView::Disable.label(), "Disable");
+        assert_eq!(SecureBootActionView::Enable.label(), L().action_enable);
+        assert_eq!(SecureBootActionView::Disable.label(), L().action_disable);
         assert_eq!(
             SecureBootActionView::ResetKeys(ResetKeysTypeView::DeleteAllKeys).label(),
             "Reset keys"
@@ -24824,24 +25107,24 @@ mod tests {
                     family: ResetResourceView::System,
                     reset_type: ResetTypeView::PowerCycle,
                 },
-                "System reset",
-                "PowerCycle",
+                L().family_system_reset,
+                "PowerCycle".to_owned(),
             ),
             (
                 OperationCommandDraft::Reset {
                     family: ResetResourceView::Manager,
                     reset_type: ResetTypeView::GracefulRestart,
                 },
-                "Manager reset",
-                "GracefulRestart",
+                L().family_manager_reset,
+                "GracefulRestart".to_owned(),
             ),
             (
                 OperationCommandDraft::Reset {
                     family: ResetResourceView::Chassis,
                     reset_type: ResetTypeView::ForceOff,
                 },
-                "Chassis reset",
-                "ForceOff",
+                L().family_chassis_reset,
+                "ForceOff".to_owned(),
             ),
             (
                 OperationCommandDraft::BootOverride {
@@ -24849,25 +25132,25 @@ mod tests {
                     enabled: BootEnabledView::Once,
                     mode: BootModeView::Uefi,
                 },
-                "Boot source override",
-                "Pxe · Once · UEFI",
+                L().family_boot_override,
+                "Pxe · Once · UEFI".to_owned(),
             ),
             (
                 OperationCommandDraft::SecureBoot(SecureBootActionView::Enable),
-                "Secure Boot",
-                "Enable",
+                L().family_secure_boot,
+                L().action_enable.to_owned(),
             ),
             (
                 OperationCommandDraft::SecureBoot(SecureBootActionView::Disable),
-                "Secure Boot",
-                "Disable",
+                L().family_secure_boot,
+                L().action_disable.to_owned(),
             ),
             (
                 OperationCommandDraft::SecureBoot(SecureBootActionView::ResetKeys(
                     ResetKeysTypeView::ResetAllKeysToDefault,
                 )),
-                "Secure Boot",
-                "Reset keys · ResetAllKeysToDefault",
+                L().family_secure_boot,
+                catalog_format!(L().fmt_reset_keys_payload, "ResetAllKeysToDefault"),
             ),
         ] {
             let summary = command_summary(&command);
@@ -24881,18 +25164,26 @@ mod tests {
             event_types: vec![EventTypeView::Alert, EventTypeView::StatusChange],
         });
         let summary = command_summary(&create);
-        assert_eq!(summary.family, "Event subscription");
+        assert_eq!(summary.family, L().family_event_subscription);
         assert_eq!(
             summary.payload,
-            "Create · https://subscriber.example.test/events · Redfish · Alert, StatusChange"
+            catalog_format!(
+                L().fmt_event_create_payload,
+                "https://subscriber.example.test/events",
+                "Redfish",
+                "Alert, StatusChange"
+            )
         );
 
         let delete = OperationCommandDraft::Event(EventActionDraft::DeleteSubscription {
             subscription_id: "Sub-1".to_owned(),
         });
         let summary = command_summary(&delete);
-        assert_eq!(summary.family, "Event subscription");
-        assert_eq!(summary.payload, "Delete · Sub-1");
+        assert_eq!(summary.family, L().family_event_subscription);
+        assert_eq!(
+            summary.payload,
+            catalog_format!(L().fmt_delete_payload, "Sub-1")
+        );
     }
 
     #[test]
@@ -25242,38 +25533,38 @@ mod tests {
                     password: "initial-secret".to_owned(),
                     role_id: "Operator".to_owned(),
                 }),
-                "Create · jane · Operator",
+                catalog_format!(L().fmt_account_create_payload, "jane", "Operator"),
             ),
             (
                 OperationCommandDraft::Account(AccountActionDraft::UpdateRole {
                     account_id: "admin".to_owned(),
                     role_id: "Operator".to_owned(),
                 }),
-                "Change role · admin · Operator",
+                catalog_format!(L().fmt_change_role_payload, "admin", "Operator"),
             ),
             (
                 OperationCommandDraft::Account(AccountActionDraft::UpdatePassword {
                     account_id: "admin".to_owned(),
                     password: "new-secret".to_owned(),
                 }),
-                "Change password · admin",
+                catalog_format!(L().fmt_change_password_payload, "admin"),
             ),
             (
                 OperationCommandDraft::Account(AccountActionDraft::UpdateUserName {
                     account_id: "admin".to_owned(),
                     user_name: "admin.renamed".to_owned(),
                 }),
-                "Rename · admin · admin.renamed",
+                catalog_format!(L().fmt_rename_payload, "admin", "admin.renamed"),
             ),
             (
                 OperationCommandDraft::Account(AccountActionDraft::Delete {
                     account_id: "admin".to_owned(),
                 }),
-                "Delete · admin",
+                catalog_format!(L().fmt_delete_payload, "admin"),
             ),
         ] {
             let summary = command_summary(&draft);
-            assert_eq!(summary.family, "Account");
+            assert_eq!(summary.family, L().family_account);
             assert_eq!(summary.payload, payload);
             // The password value never appears in any summary.
             assert!(!summary.payload.contains("secret"));
@@ -25438,36 +25729,36 @@ mod tests {
                 OperationCommandDraft::Oem(OemCommandDraft::ProfileUpdate {
                     profile_file: "{}".to_owned(),
                 }),
-                "Profile · Update",
+                L().summary_profile_update.to_owned(),
             ),
             (
                 OperationCommandDraft::Oem(OemCommandDraft::ProfileFactoryReset),
-                "Profile · Factory reset",
+                L().summary_profile_factory_reset.to_owned(),
             ),
             (
                 OperationCommandDraft::Oem(OemCommandDraft::TokenGenerate {
                     token_type: TokenTypeView::Frc,
                 }),
-                "Token · Generate · FRC",
+                catalog_format!(L().fmt_token_generate_payload, "FRC"),
             ),
             (
                 OperationCommandDraft::Oem(OemCommandDraft::TokenErase {
                     erase_type: EraseTypeView::EraseAll,
                     token_type: TokenTypeView::Crdt,
                 }),
-                "Token · Erase · EraseAll · CRDT",
+                catalog_format!(L().fmt_token_erase_payload, "EraseAll", "CRDT"),
             ),
             (
                 OperationCommandDraft::Oem(OemCommandDraft::PowerActivatePreset { profile_id: 3 }),
-                "Power smoothing · Activate preset · 3",
+                catalog_format!(L().fmt_power_activate_payload, 3),
             ),
             (
                 OperationCommandDraft::Oem(OemCommandDraft::PowerApplyOverrides),
-                "Power smoothing · Apply overrides",
+                L().summary_power_overrides.to_owned(),
             ),
         ] {
             let summary = command_summary(&draft);
-            assert_eq!(summary.family, "OEM (NVIDIA)");
+            assert_eq!(summary.family, L().family_oem);
             assert_eq!(summary.payload, payload);
         }
     }
@@ -25566,18 +25857,25 @@ mod tests {
             push_uri: None,
         });
         let summary = command_summary(&multipart);
-        assert_eq!(summary.family, "Firmware update");
-        assert_eq!(summary.payload, "Start · 01989abc · multipart");
+        assert_eq!(summary.family, L().family_firmware_update);
+        assert_eq!(
+            summary.payload,
+            catalog_format!(L().fmt_start_multipart_payload, "01989abc")
+        );
 
         let push = OperationCommandDraft::Update(UpdateDraft {
             artifact_id: "01989abc-def0-7abc-8def-0123456789ab".to_owned(),
             push_uri: Some("https://mirror.example.test/fw.bin".to_owned()),
         });
         let summary = command_summary(&push);
-        assert_eq!(summary.family, "Firmware update");
+        assert_eq!(summary.family, L().family_firmware_update);
         assert_eq!(
             summary.payload,
-            "Start · 01989abc · push https://mirror.example.test/fw.bin"
+            catalog_format!(
+                L().fmt_start_push_payload,
+                "01989abc",
+                "https://mirror.example.test/fw.bin"
+            )
         );
     }
 
@@ -25632,7 +25930,7 @@ mod tests {
                         }
                     }
                 }),
-                "Start · 01989abc · multipart",
+                catalog_format!(L().fmt_start_multipart_payload, "01989abc"),
             ),
             (
                 json!({
@@ -25643,12 +25941,16 @@ mod tests {
                         }
                     }
                 }),
-                "Start · 01989abc · push https://mirror.example.test/fw.bin",
+                catalog_format!(
+                    L().fmt_start_push_payload,
+                    "01989abc",
+                    "https://mirror.example.test/fw.bin"
+                ),
             ),
         ] {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;
             let summary = wire_command_summary(&command);
-            assert_eq!(summary.family, "Firmware update");
+            assert_eq!(summary.family, L().family_firmware_update);
             assert_eq!(summary.payload, payload);
         }
         Ok(())
@@ -25659,43 +25961,46 @@ mod tests {
         for (wire, family, payload) in [
             (
                 json!({"Manager": {"ResetToDefaults": "ResetAll"}}),
-                "Manager reset",
-                "Reset to defaults · ResetAll",
+                L().family_manager_reset,
+                catalog_format!(L().fmt_reset_to_defaults_payload, "ResetAll"),
             ),
             (
                 json!({"Chassis": {"PowerSupplyReset": {"power_supply_id": "psu-1"}}}),
-                "Chassis reset",
-                "Power supply reset · psu-1",
+                L().family_chassis_reset,
+                catalog_format!(L().fmt_power_supply_reset_payload, "psu-1"),
             ),
             (
                 json!({"Chassis": {"PowerSupplyReset": {}}}),
-                "Chassis reset",
-                "Power supply reset · first member",
+                L().family_chassis_reset,
+                L().summary_power_supply_reset_first.to_owned(),
             ),
             (
                 json!({"Log": {"ClearLog": {"log_service_id": "Log1"}}}),
-                "Log service",
-                "Clear · Log1",
+                L().family_log_service,
+                catalog_format!(L().fmt_clear_payload, "Log1"),
             ),
             (
                 json!({"Log": {"ClearLog": {}}}),
-                "Log service",
-                "Clear · first log service",
+                L().family_log_service,
+                L().summary_clear_first.to_owned(),
             ),
             (
                 json!({"Control": {"Update": {"set_point": 700.0}}}),
-                "Control",
-                "Set point · 700",
+                L().family_control,
+                catalog_format!(L().fmt_set_point_payload, 700),
             ),
             (
                 json!({"Update": {"Patch": {"service_enabled": true, "targets": ["/redfish/v1/Systems/1"]}}}),
-                "Firmware update",
-                "Patch · enabled=true, targets=/redfish/v1/Systems/1",
+                L().family_firmware_update,
+                catalog_format!(
+                    L().fmt_patch_payload,
+                    "enabled=true, targets=/redfish/v1/Systems/1"
+                ),
             ),
             (
                 json!({"Update": {"Patch": {"service_enabled": false}}}),
-                "Firmware update",
-                "Patch · enabled=false",
+                L().family_firmware_update,
+                catalog_format!(L().fmt_patch_payload, "enabled=false"),
             ),
         ] {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;
@@ -25736,7 +26041,7 @@ mod tests {
         let cards = one.cards();
         let card = cards.first().ok_or("the ready list must carry its card")?;
         assert_eq!(card.short_id, "01989abc");
-        assert_eq!(card.state_label(), "Succeeded");
+        assert_eq!(card.state_label(), L().state_succeeded);
         assert_eq!(card.state_class(), "operation-state operation-ok");
         assert_eq!(card.source_label(), "Standalone");
         assert_eq!(
@@ -25751,11 +26056,12 @@ mod tests {
         assert!(OperationSubmitState::InFlight.is_in_flight());
         assert!(OperationSubmitState::Succeeded.is_succeeded());
         assert_eq!(
-            OperationSubmitState::Failed(OperationSubmitState::FAILURE_MESSAGE).failure_message(),
-            OperationSubmitState::FAILURE_MESSAGE
+            OperationSubmitState::Failed(OperationSubmitState::failure_message_value())
+                .failure_message(),
+            OperationSubmitState::failure_message_value()
         );
         assert_eq!(
-            OperationSubmitState::FAILURE_MESSAGE,
+            OperationSubmitState::failure_message_value(),
             "The operation could not be submitted. Check the fields and try again."
         );
         Ok(())
@@ -25836,15 +26142,15 @@ mod tests {
         // like any other rejected or unparseable submission.
         assert_eq!(
             acknowledge_submission(2, &operation_body),
-            Err(OperationSubmitState::FAILURE_MESSAGE)
+            Err(OperationSubmitState::failure_message_value())
         );
         assert_eq!(
             acknowledge_submission(1, &batch_body),
-            Err(OperationSubmitState::FAILURE_MESSAGE)
+            Err(OperationSubmitState::failure_message_value())
         );
         assert_eq!(
             acknowledge_submission(3, "not json"),
-            Err(OperationSubmitState::FAILURE_MESSAGE)
+            Err(OperationSubmitState::failure_message_value())
         );
         Ok(())
     }
@@ -25928,9 +26234,9 @@ mod tests {
         assert_eq!(card.batch_id, "01989abc-def0-7abc-8def-0123456789b1");
         assert_eq!(card.short_id, "01989abc");
         // The derived verdict is the server's, rendered verbatim.
-        assert_eq!(card.state_label(), "Failed");
+        assert_eq!(card.state_label(), L().state_failed);
         assert_eq!(card.state_class(), "operation-state operation-error");
-        assert_eq!(card.command.family, "System reset");
+        assert_eq!(card.command.family, L().family_system_reset);
         assert_eq!(card.command.payload, "PowerCycle");
         assert_eq!(card.created_at_text, "2026-08-06T09:10:11Z");
         // The five chips render the server counts verbatim in fixed order —
@@ -25951,7 +26257,7 @@ mod tests {
         );
         // The unsupported verdict is a distinct chip: it never masquerades as
         // an ordinary failure count.
-        assert_eq!(chips[3].label, "Unsupported");
+        assert_eq!(chips[3].label, L().state_unsupported);
         assert_eq!(chips[3].count, 1);
         assert_eq!(chips[1].count, 1);
         // The card starts with no children; the per-endpoint rows arrive with
@@ -25964,12 +26270,36 @@ mod tests {
     fn batch_card_projection_parses_fixtures_for_all_six_derived_states()
     -> Result<(), Box<dyn Error>> {
         for (state_code, label, class) in [
-            ("queued", "Queued", "operation-state operation-active"),
-            ("running", "Running", "operation-state operation-active"),
-            ("succeeded", "Succeeded", "operation-state operation-ok"),
-            ("failed", "Failed", "operation-state operation-error"),
-            ("unknown", "Unknown", "operation-state operation-off"),
-            ("cancelled", "Cancelled", "operation-state operation-off"),
+            (
+                "queued",
+                L().state_queued,
+                "operation-state operation-active",
+            ),
+            (
+                "running",
+                L().state_running,
+                "operation-state operation-active",
+            ),
+            (
+                "succeeded",
+                L().state_succeeded,
+                "operation-state operation-ok",
+            ),
+            (
+                "failed",
+                L().state_failed,
+                "operation-state operation-error",
+            ),
+            (
+                "unknown",
+                L().state_unknown,
+                "operation-state operation-off",
+            ),
+            (
+                "cancelled",
+                L().state_cancelled,
+                "operation-state operation-off",
+            ),
         ] {
             let response = batch_summary_fixture(state_code, &batch_outcomes_fixture())?;
             let card = BatchCardProjection::from(&response);
@@ -26103,7 +26433,7 @@ mod tests {
             assert_eq!(card.short_id, "01989abc");
             assert_eq!(card.source_label(), "Standalone");
             assert_eq!(card.target_count, 2);
-            assert_eq!(card.command.family, "System reset");
+            assert_eq!(card.command.family, L().family_system_reset);
             assert_eq!(card.command.payload, "PowerCycle");
             assert_eq!(card.created_at_text, "2026-08-06T09:10:11Z");
             assert_eq!(card.updated_at_text, "2026-08-06T09:12:13Z");
@@ -26131,10 +26461,10 @@ mod tests {
         }))?;
         let card = OperationCardProjection::from(&site);
         assert_eq!(card.source_label(), "Site");
-        assert_eq!(card.command.family, "Manager reset");
+        assert_eq!(card.command.family, L().family_manager_reset);
         assert_eq!(card.command.payload, "GracefulRestart");
         assert_eq!(card.target_count, 1);
-        assert_eq!(card.state_label(), "Succeeded");
+        assert_eq!(card.state_label(), L().state_succeeded);
 
         site = serde_json::from_value(json!({
             "operation_id": "01989abc-def0-7abc-8def-0123456789c0",
@@ -26147,10 +26477,10 @@ mod tests {
         }))?;
         let card = OperationCardProjection::from(&site);
         assert_eq!(card.source_label(), "Center");
-        assert_eq!(card.command.family, "Chassis reset");
+        assert_eq!(card.command.family, L().family_chassis_reset);
         assert_eq!(card.command.payload, "ForceOff");
         assert_eq!(card.target_count, 0);
-        assert_eq!(card.state_label(), "Cancelled");
+        assert_eq!(card.state_label(), L().state_cancelled);
         Ok(())
     }
 
@@ -26160,16 +26490,20 @@ mod tests {
     #[test]
     fn wire_command_summaries_render_every_family() -> Result<(), Box<dyn Error>> {
         for (wire, family, payload) in [
-            (json!({ "System": { "Reset": "On" } }), "System reset", "On"),
+            (
+                json!({ "System": { "Reset": "On" } }),
+                L().family_system_reset,
+                "On".to_owned(),
+            ),
             (
                 json!({ "Manager": { "Reset": "GracefulRestart" } }),
-                "Manager reset",
-                "GracefulRestart",
+                L().family_manager_reset,
+                "GracefulRestart".to_owned(),
             ),
             (
                 json!({ "Chassis": { "Reset": "ForceOff" } }),
-                "Chassis reset",
-                "ForceOff",
+                L().family_chassis_reset,
+                "ForceOff".to_owned(),
             ),
             (
                 json!({
@@ -26181,15 +26515,23 @@ mod tests {
                         }
                     }
                 }),
-                "Boot source override",
-                "Pxe · Once · UEFI",
+                L().family_boot_override,
+                "Pxe · Once · UEFI".to_owned(),
             ),
-            (json!({ "SecureBoot": "Enable" }), "Secure Boot", "Enable"),
-            (json!({ "SecureBoot": "Disable" }), "Secure Boot", "Disable"),
+            (
+                json!({ "SecureBoot": "Enable" }),
+                L().family_secure_boot,
+                L().action_enable.to_owned(),
+            ),
+            (
+                json!({ "SecureBoot": "Disable" }),
+                L().family_secure_boot,
+                L().action_disable.to_owned(),
+            ),
             (
                 json!({ "SecureBoot": { "ResetKeys": "ResetAllKeysToDefault" } }),
-                "Secure Boot",
-                "Reset keys · ResetAllKeysToDefault",
+                L().family_secure_boot,
+                catalog_format!(L().fmt_reset_keys_payload, "ResetAllKeysToDefault"),
             ),
             (
                 json!({
@@ -26201,18 +26543,23 @@ mod tests {
                         }
                     }
                 }),
-                "Event subscription",
-                "Create · https://subscriber.example.test/events · Redfish · Alert, StatusChange",
+                L().family_event_subscription,
+                catalog_format!(
+                    L().fmt_event_create_payload,
+                    "https://subscriber.example.test/events",
+                    "Redfish",
+                    "Alert, StatusChange"
+                ),
             ),
             (
                 json!({ "Event": { "DeleteSubscription": { "subscription_id": "Sub-1" } } }),
-                "Event subscription",
-                "Delete · Sub-1",
+                L().family_event_subscription,
+                catalog_format!(L().fmt_delete_payload, "Sub-1"),
             ),
             (
                 json!({ "Telemetry": { "SetEnabled": { "enabled": true } } }),
-                "Telemetry",
-                "Set enabled · true",
+                L().family_telemetry,
+                catalog_format!(L().fmt_set_enabled_payload, true),
             ),
             (
                 json!({
@@ -26220,8 +26567,8 @@ mod tests {
                         "CreateMetricDefinition": { "metric_type": "Gauge", "units": "W" }
                     }
                 }),
-                "Telemetry",
-                "Metric definition · Create · Gauge · W",
+                L().family_telemetry,
+                catalog_format!(L().fmt_metric_definition_create, "Gauge", "W"),
             ),
             (
                 json!({
@@ -26233,8 +26580,13 @@ mod tests {
                         }
                     }
                 }),
-                "Telemetry",
-                "Metric definition · Update · PowerMetric · Counter · W",
+                L().family_telemetry,
+                catalog_format!(
+                    L().fmt_metric_definition_update,
+                    "PowerMetric",
+                    "Counter",
+                    "W"
+                ),
             ),
             (
                 json!({
@@ -26242,8 +26594,8 @@ mod tests {
                         "DeleteMetricDefinition": { "metric_definition_id": "PowerMetric" }
                     }
                 }),
-                "Telemetry",
-                "Metric definition · Delete · PowerMetric",
+                L().family_telemetry,
+                catalog_format!(L().fmt_metric_definition_delete, "PowerMetric"),
             ),
             (
                 json!({
@@ -26254,8 +26606,8 @@ mod tests {
                         }
                     }
                 }),
-                "Telemetry",
-                "Report definition · Create · OnRequest · PowerMetric",
+                L().family_telemetry,
+                catalog_format!(L().fmt_report_definition_create, "OnRequest", "PowerMetric"),
             ),
             (
                 json!({
@@ -26267,8 +26619,13 @@ mod tests {
                         }
                     }
                 }),
-                "Telemetry",
-                "Report definition · Update · PowerReport · OnChange · PowerMetric",
+                L().family_telemetry,
+                catalog_format!(
+                    L().fmt_report_definition_update,
+                    "PowerReport",
+                    "OnChange",
+                    "PowerMetric"
+                ),
             ),
             (
                 json!({
@@ -26278,8 +26635,8 @@ mod tests {
                         }
                     }
                 }),
-                "Telemetry",
-                "Report definition · Delete · PowerReport",
+                L().family_telemetry,
+                catalog_format!(L().fmt_report_definition_delete, "PowerReport"),
             ),
             (
                 json!({
@@ -26289,33 +26646,33 @@ mod tests {
                         }
                     }
                 }),
-                "OEM (NVIDIA)",
-                "Profile · Update",
+                L().family_oem,
+                L().summary_profile_update.to_owned(),
             ),
             (
                 json!({ "Oem": { "SystemConfigProfile": "FactoryReset" } }),
-                "OEM (NVIDIA)",
-                "Profile · Factory reset",
+                L().family_oem,
+                L().summary_profile_factory_reset.to_owned(),
             ),
             (
                 json!({ "Oem": { "SystemConfigProfile": "ActivateProfile" } }),
-                "OEM (NVIDIA)",
-                "Profile · Activate",
+                L().family_oem,
+                L().summary_profile_activate.to_owned(),
             ),
             (
                 json!({ "Oem": { "DebugToken": { "GenerateToken": "FRC" } } }),
-                "OEM (NVIDIA)",
-                "Token · Generate · FRC",
+                L().family_oem,
+                catalog_format!(L().fmt_token_generate_payload, "FRC"),
             ),
             (
                 json!({ "Oem": { "DebugToken": { "InstallToken": { "token_data": "AA==" } } } }),
-                "OEM (NVIDIA)",
-                "Token · Install",
+                L().family_oem,
+                L().summary_token_install.to_owned(),
             ),
             (
                 json!({ "Oem": { "DebugToken": "DisableToken" } }),
-                "OEM (NVIDIA)",
-                "Token · Disable",
+                L().family_oem,
+                L().summary_token_disable.to_owned(),
             ),
             (
                 json!({
@@ -26328,8 +26685,8 @@ mod tests {
                         }
                     }
                 }),
-                "OEM (NVIDIA)",
-                "Token · Erase · EraseAll · CRDT",
+                L().family_oem,
+                catalog_format!(L().fmt_token_erase_payload, "EraseAll", "CRDT"),
             ),
             (
                 json!({
@@ -26339,13 +26696,13 @@ mod tests {
                         }
                     }
                 }),
-                "OEM (NVIDIA)",
-                "Power smoothing · Activate preset · 3",
+                L().family_oem,
+                catalog_format!(L().fmt_power_activate_payload, 3),
             ),
             (
                 json!({ "Oem": { "PowerSmoothing": "ApplyAdminOverrides" } }),
-                "OEM (NVIDIA)",
-                "Power smoothing · Apply overrides",
+                L().family_oem,
+                L().summary_power_overrides.to_owned(),
             ),
         ] {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;
@@ -26428,8 +26785,9 @@ mod tests {
             endpoint_id: endpoint_id.to_owned(),
             display_name: display_name.to_owned(),
             address: address.to_owned(),
-            trust_label: "System CA",
-            snapshot_label: "Generation 1 · observed 2026-08-05T09:12:13Z".to_owned(),
+            trust_label: L().notice_system_ca,
+            snapshot_label: catalog_format!(L().fmt_generation_observed, 1, "2026-08-05T09:12:13Z")
+                .to_owned(),
             resource_counts: Some(ResourceCountsProjection {
                 systems: 1,
                 chassis: 1,
@@ -26734,7 +27092,7 @@ mod tests {
         // status; the raw health text is retained beside the unified level.
         assert_eq!(current.vendor.as_deref(), Some("Vendor A"));
         assert_eq!(current.health_level, HealthLevel::Ok);
-        assert_eq!(current.health_label.as_deref(), Some("OK"));
+        assert_eq!(current.health_label.as_deref(), Some(L().health_ok));
         Ok(())
     }
 
