@@ -185,7 +185,13 @@ impl CenterClientConfig {
         Stop: Future<Output = ()> + Send,
     {
         tokio::pin!(stop);
-        let mut attempts = 0_u32;
+        // The retry loop is unbounded (it ends only on success or `stop`),
+        // so the attempt counter is u64: a u32 wrap would need 2^32 ×
+        // `SITE_RECONNECT_AFTER` ≈ 16 millennia of continuous failure, but
+        // wrap-around would silently repeat attempt numbers in release
+        // builds. `u64` matches the `CenterLink` sequence counters and the
+        // tracing span field accepts it natively.
+        let mut attempts = 0_u64;
         loop {
             attempts += 1;
             // One span per attempt correlates the failed-connection
