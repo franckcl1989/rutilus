@@ -9596,7 +9596,9 @@ mod browser {
         percent_encode_path_segment, sha256_hex, tag_draft_error, toggle_set_membership,
         trust_mode_label, update_artifact_choices, vendor_choices,
     };
-    use crate::i18n::{current_lang, lang_code, parse_lang, set_lang};
+    use crate::i18n::{
+        current_lang, lang_fragment_value, parse_lang, set_lang, stored_lang_code_from,
+    };
 
     /// The first screen decision of the console (§16.2).
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11597,28 +11599,24 @@ mod browser {
         }
     }
 
-    /// The URL-fragment prefix of the persisted language choice. The
-    /// fragment is the only browser storage this crate's web-sys surface
-    /// exposes (the leptos CSR feature set enables `Window` and `Location`
-    /// only), and it survives the reload that applies the switch.
-    const LANG_FRAGMENT_PREFIX: &str = "#lang=";
-
     /// Reads the persisted language code from the URL fragment, if any; the
     /// caller falls back to the default through [`parse_lang`]. Best-effort:
-    /// an unreadable location simply starts in English.
+    /// an unreadable location simply starts in English. The extraction
+    /// itself is the host-tested [`crate::i18n::stored_lang_code_from`];
+    /// this wrapper only feeds it the `Location` hash.
     fn stored_lang_code() -> Option<String> {
         let window = leptos::web_sys::window()?;
         let hash = window.location().hash().ok()?;
-        hash.strip_prefix(LANG_FRAGMENT_PREFIX).map(str::to_owned)
+        stored_lang_code_from(&hash)
     }
 
     /// Persists the language choice in the URL fragment for the next page
-    /// load. Best-effort: a location failure never blocks the switch.
+    /// load. Best-effort: a location failure never blocks the switch. The
+    /// stored value is the host-tested [`crate::i18n::lang_fragment_value`];
+    /// this wrapper only hands it to the `Location` setter.
     fn persist_language(lang: Lang) {
         if let Some(window) = leptos::web_sys::window() {
-            let _ = window
-                .location()
-                .set_hash(&format!("lang={}", lang_code(lang)));
+            let _ = window.location().set_hash(&lang_fragment_value(lang));
         }
     }
 

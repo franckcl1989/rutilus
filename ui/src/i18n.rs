@@ -1898,6 +1898,35 @@ pub(crate) fn parse_lang(code: &str) -> Lang {
     }
 }
 
+/// The URL-fragment prefix of the persisted language choice. The fragment
+/// is the only browser storage this crate's web-sys surface exposes (the
+/// leptos CSR feature set enables `Window` and `Location` only), and it
+/// survives the reload that applies the switch.
+const LANG_FRAGMENT_PREFIX: &str = "#lang=";
+
+/// The pure core of the fragment persistence: extracts the persisted
+/// language code from one raw fragment string, or `None` when the fragment
+/// does not carry a [`LANG_FRAGMENT_PREFIX`] value. Everything after the
+/// prefix is returned verbatim — the fragment stores nothing else — so a
+/// code that is not one of the [`lang_code`] values still surfaces here and
+/// falls back to English through [`parse_lang`] exactly like a missing
+/// value. Kept free of the browser so the host test runner can pin the
+/// read side; the wasm layer feeds it the `Location` hash.
+pub(crate) fn stored_lang_code_from(fragment: &str) -> Option<String> {
+    fragment
+        .strip_prefix(LANG_FRAGMENT_PREFIX)
+        .map(str::to_owned)
+}
+
+/// The pure core of the fragment persistence: the exact value the browser
+/// stores for one language, written without the leading `#` because the
+/// `Location` hash setter normalizes the value back into a `#...` fragment.
+/// Reading that fragment back through [`stored_lang_code_from`] restores
+/// the original code.
+pub(crate) fn lang_fragment_value(lang: Lang) -> String {
+    format!("lang={}", lang_code(lang))
+}
+
 /// The English catalog, kept in a `'static` slot so [`L()`] can hand out
 /// `'static` references without allocating.
 static EN_CATALOG: Strings = Strings::en();
@@ -2153,6 +2182,80 @@ mod tests {
         assert_eq!(parse_lang("en"), Lang::En);
         assert_eq!(parse_lang("fr"), Lang::En);
         assert_eq!(parse_lang(""), Lang::En);
+    }
+
+    /// The fragment reading extracts the persisted code after the `#lang=`
+    /// prefix, and only there: a missing fragment, a foreign fragment, or a
+    /// prefix without the trailing `=` all yield `None`, matching the
+    /// `Location` hash values the wasm layer feeds `stored_lang_code`.
+    #[test]
+    fn fragment_reading_extracts_only_the_lang_value() {
+        use super::stored_lang_code_from;
+
+        assert_eq!(stored_lang_code_from("#lang=en"), Some("en".to_owned()));
+        assert_eq!(stored_lang_code_from("#lang=zh"), Some("zh".to_owned()));
+        // An empty code survives the strip and degrades through `parse_lang`
+        // exactly like a missing value.
+        assert_eq!(stored_lang_code_from("#lang="), Some(String::new()));
+        // Everything after the prefix stays part of the code: the fragment
+        // stores nothing else, so a trailing value is not a second key.
+        assert_eq!(
+            stored_lang_code_from("#lang=zh&x=1"),
+            Some("zh&x=1".to_owned())
+        );
+        // No `#lang=` value anywhere else in the fragment counts.
+        assert_eq!(stored_lang_code_from(""), None);
+        assert_eq!(stored_lang_code_from("#"), None);
+        assert_eq!(stored_lang_code_from("#lang"), None);
+        assert_eq!(stored_lang_code_from("#Language=en"), None);
+        assert_eq!(stored_lang_code_from("lang=en"), None);
+        assert_eq!(stored_lang_code_from("#x#lang=en"), None);
+    }
+
+    /// The persistence value is the exact `set_hash` argument of each
+    /// language, without the leading `#` the `Location` setter re-adds.
+    #[test]
+    fn fragment_persistence_writes_the_lang_value() {
+        use super::lang_fragment_value;
+
+        assert_eq!(lang_fragment_value(Lang::En), "lang=en");
+        assert_eq!(lang_fragment_value(Lang::Zh), "lang=zh");
+    }
+
+    /// The write/read round trip restores the original language: the
+    /// browser turns the persisted value back into a `#lang=` fragment,
+    /// which the reader strips again.
+    #[test]
+    fn fragment_persistence_round_trips_both_languages() {
+        use super::{lang_fragment_value, stored_lang_code_from};
+
+        for lang in [Lang::En, Lang::Zh] {
+            let fragment = format!("#{}", lang_fragment_value(lang));
+            assert_eq!(
+                stored_lang_code_from(&fragment),
+                Some(lang_code(lang).to_owned())
+            );
+        }
+    }
+
+    /// The startup selection degrades exactly like the pre-split behavior:
+    /// a missing fragment, an empty code, or an unknown code all fall back
+    /// to English, and only the persisted codes select a language. The
+    /// composition mirrors the wasm `start()` expression
+    /// (`parse_lang(&stored_lang_code().unwrap_or_default())`) with the
+    /// pure core substituted for the `Location` read.
+    #[test]
+    fn fragment_lang_selection_falls_back_to_en() {
+        use super::stored_lang_code_from;
+
+        let effective =
+            |fragment: &str| parse_lang(&stored_lang_code_from(fragment).unwrap_or_default());
+        assert_eq!(effective(""), Lang::En);
+        assert_eq!(effective("#"), Lang::En);
+        assert_eq!(effective("#lang="), Lang::En);
+        assert_eq!(effective("#lang=fr"), Lang::En);
+        assert_eq!(effective("#lang=en"), Lang::En);
+        assert_eq!(effective("#lang=zh"), Lang::Zh);
     }
 
     /// The console navigation must read exactly the catalog entries: every
