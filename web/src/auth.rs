@@ -91,6 +91,17 @@ const RATE_WINDOW: StdDuration = StdDuration::from_mins(15);
 const USERNAME_FAILURE_LIMIT: usize = 5;
 /// Sign-in failures allowed per client address in one window.
 const IP_FAILURE_LIMIT: usize = 20;
+/// The longest username key the rate limiter records: every valid principal
+/// name is at most [`rutilus_domain::MAX_PRINCIPAL_NAME_CHARS`] characters,
+/// so a longer presented username is invalid — it must still consume the
+/// per-username budget (the invalid-name attempts of one attacker), but it
+/// must not grow the in-memory bucket map with an unbounded
+/// attacker-controlled string. The key is the first
+/// [`MAX_PRINCIPAL_NAME_CHARS`](rutilus_domain::MAX_PRINCIPAL_NAME_CHARS)
+/// characters, so truncation can only share buckets between invalid names —
+/// never tighten a legitimate principal's budget, because valid names never
+/// exceed the bound.
+const RATE_LIMIT_USERNAME_CHARS: usize = rutilus_domain::MAX_PRINCIPAL_NAME_CHARS;
 
 /// Whether the router enforces session authentication (§16.2).
 #[derive(Clone, Debug)]
@@ -854,13 +865,22 @@ impl LoginRateLimiter {
     /// address. The username bound is the more specific one: a blocked
     /// username is refused even when the address budget remains.
     fn allows(&self, username: &str, ip: &str, now: Instant) -> bool {
-        Self::allows_key(&self.by_username, username, now, USERNAME_FAILURE_LIMIT)
-            && Self::allows_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT)
+        Self::allows_key(
+            &self.by_username,
+            &bounded_username_key(username),
+            now,
+            USERNAME_FAILURE_LIMIT,
+        ) && Self::allows_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT)
     }
 
     /// Records one failed attempt for this username and address.
     fn record_failure(&self, username: &str, ip: &str, now: Instant) {
-        Self::record_key(&self.by_username, username, now, USERNAME_FAILURE_LIMIT);
+        Self::record_key(
+            &self.by_username,
+            &bounded_username_key(username),
+            now,
+            USERNAME_FAILURE_LIMIT,
+        );
         Self::record_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT);
     }
 
@@ -901,6 +921,25 @@ impl LoginRateLimiter {
                 failures.push_back(now);
             }
         }
+    }
+}
+
+/// Bounds a presented username to the [`RATE_LIMIT_USERNAME_CHARS`]-long
+/// bucket key.
+///
+/// The sign-in surface keys the per-username bucket on the *presented*
+/// username — before validation, so invalid-name attempts still consume the
+/// budget. The wire value is attacker-controlled and only bounded by the
+/// request body limit, so the raw string must never reach the bucket map
+/// (whose keys are never evicted): the key is the first
+/// [`MAX_PRINCIPAL_NAME_CHARS`](rutilus_domain::MAX_PRINCIPAL_NAME_CHARS)
+/// characters. The borrow is returned when the value is already within the
+/// bound, so the common (valid-name) path allocates nothing.
+fn bounded_username_key(username: &str) -> std::borrow::Cow<'_, str> {
+    if username.chars().count() <= RATE_LIMIT_USERNAME_CHARS {
+        std::borrow::Cow::Borrowed(username)
+    } else {
+        std::borrow::Cow::Owned(username.chars().take(RATE_LIMIT_USERNAME_CHARS).collect())
     }
 }
 
@@ -2517,6 +2556,46 @@ mod tests {
         // The window slides: an attempt outside the window reopens.
         let later = now + RATE_WINDOW + StdDuration::from_secs(1);
         assert!(limiter.allows("admin", "192.0.2.10", later));
+    }
+
+    #[test]
+    fn rate_limiter_bounds_attacker_controlled_username_keys() {
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        let prefix = "a".repeat(RATE_LIMIT_USERNAME_CHARS);
+
+        // A presented username beyond the principal-name bound is invalid,
+        // but it must still consume the per-username budget under the
+        // bounded key: every form sharing the 64-character prefix — long
+        // invalid variants and the exact valid-length prefix — exhausts one
+        // shared bucket, and the map never stores the full wire string.
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            assert!(limiter.allows(&format!("{prefix}payload"), "192.0.2.30", now));
+            limiter.record_failure(&format!("{prefix}payload"), "192.0.2.30", now);
+        }
+        assert!(
+            !limiter.allows(&prefix, "192.0.2.30", now),
+            "the long invalid forms must share the prefix's bucket"
+        );
+        assert!(
+            !limiter.allows(&format!("{prefix}other"), "192.0.2.30", now),
+            "a different long invalid form must share the same bounded bucket"
+        );
+        assert!(
+            limiter.allows("bbbb", "192.0.2.30", now),
+            "another prefix keeps its own bucket"
+        );
+
+        // A long value shorter than the bound passes through unmodified —
+        // the borrow path must not truncate legitimate names.
+        assert_eq!(bounded_username_key("admin"), "admin");
+        let long = format!("{prefix}tail");
+        assert_eq!(
+            bounded_username_key(&long),
+            prefix,
+            "the bounded key is the first 64 characters"
+        );
+        assert_eq!(bounded_username_key(&long).len(), RATE_LIMIT_USERNAME_CHARS);
     }
 
     #[test]
