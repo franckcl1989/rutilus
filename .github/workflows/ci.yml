@@ -8,7 +8,9 @@
 #   cargo nextest
 #   cargo llvm-cov
 #   cargo deny
-#   cargo audit              <- advisory scan already covered by cargo deny
+#   cargo audit              <- standalone gate since 2026-08-12; its ignore
+#                              list mirrors deny.toml [advisories] via CLI
+#                              flags (cargo-audit reads only audit.toml)
 #   cargo machete
 #   跨平台 Build             <- 3-OS matrix + wasm32 UI artifact
 #   Migration Test
@@ -41,7 +43,8 @@ jobs:
       matrix:
         include:
           # The default job runs the full gates; the other two platforms
-          # verify the 跨平台 Build gate with a full compile instead of tests.
+          # verify the 跨平台 Build gate with a full compile plus the
+          # cross-platform E2E suites (web/tests + app/tests/version.rs).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             is_default: true
@@ -51,6 +54,7 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             is_default: false
+            is_macos: true
     steps:
       - uses: actions/checkout@v4
 
@@ -67,14 +71,15 @@ jobs:
       - uses: swatinem/rust-cache@v2
 
       # §19.4 gate tools: the nextest runner, the llvm-cov coverage driver,
-      # and the machete unused-dependency scan. Prebuilt binaries pinned to
-      # the versions verified locally (2026-08-12); only the default job
-      # runs the gates they serve.
+      # the machete unused-dependency scan, the cargo-audit scanner (0.22.2,
+      # verified locally), and cargo-zigbuild (0.22.3, the version
+      # install-action tracks; cross-links the aarch64 musl release build).
+      # Prebuilt binaries; only the default job runs the gates they serve.
       - name: Install gate tools
         if: matrix.is_default
         uses: taiki-e/install-action@v2
         with:
-          tools: cargo-nextest@0.9.140,cargo-llvm-cov@0.8.7,cargo-machete@0.9.2
+          tools: cargo-nextest@0.9.140,cargo-llvm-cov@0.8.7,cargo-machete@0.9.2,cargo-audit@0.22.2,cargo-zigbuild@0.22.3
 
       # §19.4: cargo fmt --check
       - name: Format
@@ -93,11 +98,29 @@ jobs:
         if: matrix.is_default
         run: cargo test --locked --workspace
 
-      # Non-default platforms: full compile of every target instead of
-      # running tests (same coverage for the 跨平台 Build gate, much cheaper).
+      # Non-default platforms: full compile of every target (the 跨平台 Build
+      # gate) plus the cross-platform E2E suites below.
       - name: Check (cross-platform build)
         if: ${{ !matrix.is_default }}
         run: cargo check --locked --workspace --all-targets
+
+      # §0.9.0 跨平台 E2E: the platform-independent suites, run on the
+      # windows/macos jobs (the ubuntu default job covers the whole workspace
+      # in the Test step above). `-p rutilus-web` runs the nine web/tests
+      # path suites plus the web crate's lib tests; every one of the nine
+      # files is an in-memory fake with no sockets, subprocesses, timers, or
+      # platform-specific code (verified file-by-file and run green on a
+      # local Windows host, 2026-08-12). `--test version` is the app binary
+      # smoke test. app/tests/mock_center_client.rs (loopback mTLS/WebSocket
+      # center interop) is deliberately NOT run here: it opens real sockets
+      # with handshake/negotiation timing, and the conservative rule for the
+      # non-default jobs is to keep only deterministic, network-free suites.
+      # --locked pins the committed Cargo.lock.
+      - name: Test (cross-platform E2E suites)
+        if: ${{ !matrix.is_default }}
+        run: |
+          cargo test --locked -p rutilus-web
+          cargo test --locked -p rutilus --test version
 
       # §19.4: cargo nextest. The same workspace suite on the nextest runner
       # (per-test process isolation and leak detection); --locked pins the
@@ -137,10 +160,25 @@ jobs:
           command: check
           version: 0.20.2
 
-      # §19.4: cargo audit — NOT enabled yet. The advisory scan is already a
-      # part of `cargo deny check` (deny.toml [advisories] holds the ignore
-      # list), so audit is a later standalone gate. Enable with:
-      #   run: cargo audit
+      # §19.4: cargo audit. Standalone gate enabled 2026-08-12. cargo-audit
+      # reads only audit.toml — NOT deny.toml — so the [advisories] ignore
+      # entries are mirrored here as CLI flags (verified with cargo-audit
+      # 0.22.2: without them `--deny warnings` fails on RUSTSEC-2026-0194/0195
+      # plus the two unmaintained warnings; with them it exits 0). Keep this
+      # list in lockstep with deny.toml [advisories] ignore: the TRIGGER notes
+      # there apply — drop RUSTSEC-2026-0194/0195 once upstream
+      # csdl-compiler accepts quick-xml >= 0.41.0. RUSTSEC-2026-0235 (rkyv,
+      # unactivated optional dep of rust_decimal) is the re-registration the
+      # deny.toml comment anticipated when the gate went live.
+      - name: Advisory scan (cargo audit)
+        if: matrix.is_default
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0235 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0173
 
       # §19.4: cargo machete. Zero unused dependencies; the three entries in
       # the per-crate [package.metadata.cargo-machete] sections (api getrandom,
@@ -181,6 +219,45 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update && sudo apt-get install -y musl-tools
           cargo build --locked -p rutilus --target x86_64-unknown-linux-musl --release
+
+      # §5.2 release matrix — aarch64. Same app-only release build as above,
+      # cross-linked with cargo-zigbuild (zig's bundled linker; installed in
+      # the gate-tools step): the standard way to target
+      # aarch64-unknown-linux-musl from an x86_64 GitHub runner without a
+      # musl-cross toolchain.
+      - name: Build linux release binary (aarch64 musl static)
+        if: matrix.is_default
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          cargo zigbuild --locked -p rutilus --target aarch64-unknown-linux-musl --release
+
+      # §5.2 release matrix — aarch64-pc-windows-msvc is deliberately NOT in
+      # CI. Cross-compiling it on the x64 windows-latest runner needs the
+      # ARM64 MSVC linker (link.exe) plus the ARM64 SDK import libraries,
+      # which the hosted Windows images do not reliably provide; a build-only
+      # step with an unverified toolchain is worse than none (真实有效原则).
+      # Revisit with a native ARM64 Windows runner or after the toolchain is
+      # verified on a local Windows ARM64 host. The x64 Windows job above
+      # still compiles x86_64-pc-windows-msvc.
+      #
+      # §5.2 release matrix — macOS Universal 2. macos-latest is an arm64
+      # runner: aarch64-apple-darwin builds natively, and rustc
+      # cross-compiles x86_64-apple-darwin from the same toolchain (no
+      # Rosetta involved — rustup supplies the target std and the Xcode
+      # clang links both architectures, so the build never executes an
+      # x86_64 binary). lipo (Xcode CLT, always present on the hosted
+      # macOS images) merges the two release binaries into the single fat
+      # binary §5.2 ships.
+      - name: Build macOS Universal 2 release binary
+        if: matrix.is_macos
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked -p rutilus --target aarch64-apple-darwin --release
+          cargo build --locked -p rutilus --target x86_64-apple-darwin --release
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/rutilus \
+            target/aarch64-apple-darwin/release/rutilus \
+            target/x86_64-apple-darwin/release/rutilus
 
       # §19.4: Migration Test. Also covered by the full workspace test above;
       # kept as an explicit gate for visibility (migration/tests/initial_storage.rs).
