@@ -16,6 +16,9 @@
 # The only fixture credentials used: the mock BMC's well-known
 # admin/password pair (test-support fixture) and the drill's own local
 # unlock passphrase (a drill fixture, not a secret).
+# Fixture credentials are drill-local test stand-ins. The secret_leak_gate
+# mechanical scan scope only covers `*/src/**/*.rs` and `*/tests/**/*.rs`;
+# .ps1 files are outside that scope (documented boundary).
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -451,8 +454,14 @@ function Start-MockBmc {
         [string]$Profile = 'rutilus',
         [Parameter(Mandatory = $true)][string]$Name = 'mock'
     )
+    # The port is always passed explicitly: the default 0 tells mock-bmc to
+    # bind a free port (TcpListener::bind on port 0) and report it in the
+    # 'listening at' URL below, from which $portActual is parsed - so
+    # $mock.Port is the real bound port whether -Port was given or not. (An
+    # empty ArgumentList would also fail Start-Process' parameter
+    # validation.)
     $argsList = @()
-    if ($Port -gt 0) { $argsList += [string]$Port }
+    $argsList += [string]$Port
     if ($Profile -ne 'rutilus') { $argsList += $Profile }
     $outLog = Join-Path $WorkDir "$Name.stdout.log"
     $errLog = Join-Path $WorkDir "$Name.stderr.log"
@@ -812,8 +821,51 @@ function Invoke-RutilusLogin {
     return $response
 }
 
+# ---------------------------------------------------------------------------
+# Mock-HTTPS pinning helper (C#). Two PowerShell 5.1 realities force this:
+#   * the TLS validation callback runs on a worker thread that has NO
+#     PowerShell runspace, so a scriptblock callback cannot be invoked there
+#     (PSInvalidOperationException -> the handshake always fails);
+#   * $certificate.GetCertHashString() returns SHA-1 on .NET Framework, which
+#     can never match the SHA-256 fingerprint mock-bmc advertises.
+# The C# delegate computes SHA-256 over the served certificate DER (the exact
+# value mock-bmc's fingerprint_text() prints) and compares it, ordinal,
+# against the expected fingerprint normalized to lowercase hex without
+# separators.
+# ---------------------------------------------------------------------------
+if (-not ('MockHttpsPinner' -as [type])) {
+Add-Type -AssemblyName System.Net.Http
+Add-Type -TypeDefinition @'
+using System;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+public static class MockHttpsPinner
+{
+    public static HttpClientHandler Apply(HttpClientHandler handler, string expectedFingerprint)
+    {
+        handler.ServerCertificateCustomValidationCallback =
+            new Func<HttpRequestMessage, X509Certificate2, X509Chain, System.Net.Security.SslPolicyErrors, bool>(
+                (sender, certificate, chain, sslPolicyErrors) =>
+                {
+                    if (certificate == null) { return false; }
+                    using (SHA256 sha = SHA256.Create())
+                    {
+                        string actual = BitConverter.ToString(sha.ComputeHash(certificate.GetRawCertData()))
+                            .Replace("-", string.Empty)
+                            .ToLowerInvariant();
+                        return string.Equals(actual, expectedFingerprint, StringComparison.Ordinal);
+                    }
+                });
+        return handler;
+    }
+}
+'@ -ReferencedAssemblies System.Net.Http
+}
+
 # HTTPS helper for talking to the mock BMC directly (drills verify the mock
-# ledger): pinned by the certificate fingerprint printed by mock-bmc.
+# ledger): pinned by the SHA-256 certificate fingerprint printed by mock-bmc.
 function Invoke-MockHttps {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -824,17 +876,17 @@ function Invoke-MockHttps {
     $handler = New-Object System.Net.Http.HttpClientHandler
     $expected = $ExpectedFingerprint -replace ':', ''
     $expected = $expected.ToLowerInvariant()
-    $handler.ServerCertificateCustomValidationCallback = [System.Net.Security.RemoteCertificateValidationCallback]{
-        param($sender, $certificate, $chain, $sslPolicyErrors)
-        if ($null -eq $certificate) { return $false }
-        $actual = $certificate.GetCertHashString()
-        return ($actual -eq $expected) -or ($actual.ToLowerInvariant() -eq $expected)
-    }
+    $handler = [MockHttpsPinner]::Apply($handler, $expected)
     $client = New-Object System.Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(60)
     try {
         $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::$Method, $Url)
-        if ($null -ne $Body) {
+        # NOTE: a [string] parameter default of $null binds as '' (PS coercion),
+        # so the body must be tested for emptiness, not nullness: attaching an
+        # empty StringContent to a GET makes .NET Framework throw
+        # ProtocolViolationException ("cannot send a content body with this
+        # verb type") before the request is ever sent.
+        if (-not [string]::IsNullOrEmpty($Body)) {
             $request.Content = New-Object System.Net.Http.StringContent($Body, [System.Text.Encoding]::UTF8, 'application/json')
         }
         $response = $client.SendAsync($request).GetAwaiter().GetResult()
