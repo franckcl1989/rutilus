@@ -57,6 +57,13 @@
 //!   secret-named constants are fixture protocol values — the mock's fixed
 //!   `SESSION_TOKEN` and mock resource bodies exist to keep wire-sequence
 //!   assertions deterministic. Nothing in a release ships from it.
+//! - `strings_catalog!` macro bodies (ui/src/i18n.rs): catalog
+//!   construction, not code. Inside the invocation the field names are i18n
+//!   keys and the literals are bilingual copy (`error_bootstrap_code:
+//!   "bootstrap failed — ..."`), so [R1] would misread a catalog entry as
+//!   a secret assignment. The exemption is structural — the macro body is
+//!   tracked like test scope — so a real secret assignment in the same
+//!   file outside the macro is still flagged; no value is allow-listed.
 //! - `ALLOWED_CONSTANT_HITS` below: the rare production constants whose
 //!   *names* read like secrets but whose values hold no secret material
 //!   (backup-package entry names). Each entry binds path+line+name+value, so
@@ -316,12 +323,7 @@ fn is_sensitive_log_identifier(name: &str) -> bool {
 /// constant, confirm it still holds no secret material, then update the
 /// entry — the deny.toml TRIGGER-note discipline. Verified 2026-08-12.
 const ALLOWED_CONSTANT_HITS: [(&str, usize, &str, &str); 2] = [
-    (
-        "app/src/backup.rs",
-        83,
-        "ENTRY_MASTER_KEY",
-        "master-key",
-    ),
+    ("app/src/backup.rs", 83, "ENTRY_MASTER_KEY", "master-key"),
     (
         "app/src/backup.rs",
         84,
@@ -352,7 +354,10 @@ const TRACING_EVENT_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "erro
 /// the tokens inside the brackets, the index just past the closing `]`, and
 /// whether the attribute is an inner (`#![...]`) attribute.
 fn attribute_contents(tokens: &[Token], hash_index: usize) -> Option<(Vec<Token>, usize, bool)> {
-    let is_inner = matches!(tokens.get(hash_index + 1), Some(Token::Punct { ch: '!', .. }));
+    let is_inner = matches!(
+        tokens.get(hash_index + 1),
+        Some(Token::Punct { ch: '!', .. })
+    );
     let open = hash_index + 1 + usize::from(is_inner);
     if !matches!(tokens.get(open), Some(Token::Punct { ch: '[', .. })) {
         return None;
@@ -458,13 +463,16 @@ fn atom_implies_test(tokens: &[Token], i: usize) -> (bool, usize) {
                 && matches!(tokens.get(i + 1), Some(Token::Punct { ch: '(', .. })) =>
         {
             let (some_implies, all_imply) = predicate_arg_values(tokens, i + 1);
-            let implies = if name == "all" { some_implies } else { all_imply };
+            let implies = if name == "all" {
+                some_implies
+            } else {
+                all_imply
+            };
             let next = skip_paren_group(tokens, i + 1);
             (implies, next)
         }
         Some(Token::Ident { name, .. })
-            if name == "not"
-                && matches!(tokens.get(i + 1), Some(Token::Punct { ch: '(', .. })) =>
+            if name == "not" && matches!(tokens.get(i + 1), Some(Token::Punct { ch: '(', .. })) =>
         {
             (false, skip_paren_group(tokens, i + 1))
         }
@@ -514,11 +522,26 @@ fn skip_atom(tokens: &[Token], i: usize) -> usize {
     j
 }
 
+/// The one macro whose invocation body is a string-catalog construction:
+/// `strings_catalog!` (ui/src/i18n.rs) declares every copy key as a struct
+/// field. Inside its body, `field: "copy", zh: "copy"` bindings are catalog
+/// entries — the identifier is an i18n key and the literals are message
+/// copy, never a secret assignment — so [R1] is exempt there by *structure*,
+/// the same way test scope is. The exemption cannot be value-based: catalog
+/// keys like `error_bootstrap_code` legitimately read like secrets, and a
+/// value allow-list would hide a future real secret behind catalog-shaped
+/// copy.
+const CATALOG_MACRO: &str = "strings_catalog";
+
 /// Tracks whether each open brace's block is test scope, plus a pending
-/// "next item is test-gated" flag set by the preceding attribute.
+/// "next item is test-gated" flag set by the preceding attribute, and —
+/// separately — whether each block is a `strings_catalog!` macro body
+/// (catalog-construction scope, [R1]-exempt).
 struct ScopeTracker {
     stack: Vec<bool>,
     pending_test: bool,
+    catalog_stack: Vec<bool>,
+    pending_catalog: bool,
 }
 
 impl ScopeTracker {
@@ -526,6 +549,8 @@ impl ScopeTracker {
         Self {
             stack: vec![initial_test],
             pending_test: false,
+            catalog_stack: vec![false],
+            pending_catalog: false,
         }
     }
 
@@ -533,15 +558,31 @@ impl ScopeTracker {
         *self.stack.last().unwrap_or(&false)
     }
 
+    /// Whether the current block is a `strings_catalog!` macro body.
+    fn in_catalog(&self) -> bool {
+        *self.catalog_stack.last().unwrap_or(&false)
+    }
+
     fn open_brace(&mut self) {
-        let next = if self.pending_test { true } else { self.current() };
+        let next = if self.pending_test {
+            true
+        } else {
+            self.current()
+        };
         self.stack.push(next);
         self.pending_test = false;
+        // A nested brace inside the catalog body stays in catalog scope.
+        let in_catalog = self.pending_catalog || self.in_catalog();
+        self.catalog_stack.push(in_catalog);
+        self.pending_catalog = false;
     }
 
     fn close_brace(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
+        }
+        if self.catalog_stack.len() > 1 {
+            self.catalog_stack.pop();
         }
     }
 
@@ -553,6 +594,11 @@ impl ScopeTracker {
 
     fn semicolon(&mut self) {
         self.pending_test = false;
+    }
+
+    /// Marks the next `{` as opening a `strings_catalog!` macro body.
+    fn on_catalog_macro(&mut self) {
+        self.pending_catalog = true;
     }
 }
 
@@ -582,7 +628,10 @@ fn assigned_literal(tokens: &[Token], i: usize) -> Option<String> {
     while steps < 12 && j < tokens.len() {
         match &tokens[j] {
             Token::Punct { ch: '=', .. } => return literal_after(tokens, j),
-            Token::Punct { ch: ';' | '{' | '}', .. } => return None,
+            Token::Punct {
+                ch: ';' | '{' | '}',
+                ..
+            } => return None,
             Token::Punct { ch: '(', .. } => depth += 1,
             Token::Punct { ch: ')', .. } => {
                 if depth == 0 {
@@ -618,7 +667,9 @@ fn literal_after(tokens: &[Token], index: usize) -> Option<String> {
 /// footer in the same literal). Prefix checks and label-driven writers carry
 /// only one side of the block and are not flagged.
 fn embedded_private_key(content: &str) -> bool {
-    content.contains("-----BEGIN") && content.contains("-----END") && content.contains("PRIVATE KEY")
+    content.contains("-----BEGIN")
+        && content.contains("-----END")
+        && content.contains("PRIVATE KEY")
 }
 
 /// If `tokens[i]` starts an output-macro invocation, the argument slice
@@ -755,11 +806,23 @@ fn scan_file(source: &SourceTokens, initial_test: bool) -> Vec<String> {
             Token::Ident { name, line } => {
                 if let Some((open, close)) = output_macro_span(tokens, i) {
                     if !scope.current() {
-                        violations.extend(output_macro_violations(&tokens[open..close], &source.display_path));
+                        violations.extend(output_macro_violations(
+                            &tokens[open..close],
+                            &source.display_path,
+                        ));
                     }
                     i = close;
+                } else if name == CATALOG_MACRO
+                    && matches!(tokens.get(i + 1), Some(Token::Punct { ch: '!', .. }))
+                    && matches!(tokens.get(i + 2), Some(Token::Punct { ch: '{', .. }))
+                {
+                    // The `{` that follows opens the catalog body, where
+                    // [R1] is exempt by structure (see CATALOG_MACRO).
+                    scope.on_catalog_macro();
+                    i += 1;
                 } else {
                     if !scope.current()
+                        && !scope.in_catalog()
                         && is_sensitive_identifier(name)
                         && let Some(literal) = assigned_literal(tokens, i)
                         && !is_allowed_constant(&source.display_path, *line, name, &literal)
@@ -831,7 +894,11 @@ fn crate_source_files(crate_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> 
     Ok(files)
 }
 
-fn collect_rs_files(directory: &Path, base: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+fn collect_rs_files(
+    directory: &Path,
+    base: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
@@ -858,7 +925,10 @@ struct WorkspaceFile {
 /// attribute makes the whole file test scope, and a `#[cfg(test)] mod name;`
 /// declaration names an out-of-line test module (resolved to its sibling
 /// file by the caller).
-fn file_level_test_flags(tokens: &[Token], declaring_file: &Path) -> (bool, Vec<(PathBuf, String)>) {
+fn file_level_test_flags(
+    tokens: &[Token],
+    declaring_file: &Path,
+) -> (bool, Vec<(PathBuf, String)>) {
     let mut whole_file_test = false;
     let mut declarations = Vec::new();
     let mut pending_test = false;
@@ -890,7 +960,10 @@ fn file_level_test_flags(tokens: &[Token], declaring_file: &Path) -> (bool, Vec<
                         continue;
                     }
                 }
-                Token::Punct { ch: ';' | '{' | '}', .. } => pending_test = false,
+                Token::Punct {
+                    ch: ';' | '{' | '}',
+                    ..
+                } => pending_test = false,
                 _ => {}
             }
         }
@@ -924,16 +997,24 @@ fn scan_workspace() -> Result<Vec<String>, Box<dyn Error>> {
                 absolute,
                 display,
                 tokens: tokens.tokens,
-                initial_test: relative.starts_with("tests") || whole_file_test || crate_name == "test-support",
+                initial_test: relative.starts_with("tests")
+                    || whole_file_test
+                    || crate_name == "test-support",
             });
         }
     }
     // Resolve `#[cfg(test)] mod name;` to `name.rs` / `name/mod.rs` siblings.
     let mut test_module_files = HashSet::new();
     for (parent, name) in &declarations {
-        let candidates = [parent.join(format!("{name}.rs")), parent.join(name).join("mod.rs")];
+        let candidates = [
+            parent.join(format!("{name}.rs")),
+            parent.join(name).join("mod.rs"),
+        ];
         for file in &files {
-            if candidates.iter().any(|candidate| candidate == &file.absolute) {
+            if candidates
+                .iter()
+                .any(|candidate| candidate == &file.absolute)
+            {
                 test_module_files.insert(file.absolute.clone());
             }
         }
@@ -971,7 +1052,8 @@ fn scan_source_sample(source: &str, initial_test: bool) -> Vec<String> {
 }
 
 #[test]
-fn workspace_sources_have_no_hardcoded_secrets_or_plaintext_disclosure() -> Result<(), Box<dyn Error>> {
+fn workspace_sources_have_no_hardcoded_secrets_or_plaintext_disclosure()
+-> Result<(), Box<dyn Error>> {
     let violations = scan_workspace()?;
     assert!(
         violations.is_empty(),
@@ -1019,7 +1101,10 @@ fn hardcoded_secret_rule_flags_production_assignments() {
         ("let bootstrap_code = \"hunter2\";", "`bootstrap_code`"),
         ("let account_password = \"hunter2\";", "`account_password`"),
         ("let totp_secret = \"hunter2\";", "`totp_secret`"),
-        ("let admin_password: SecretString = \"hunter2\";", "`admin_password`"),
+        (
+            "let admin_password: SecretString = \"hunter2\";",
+            "`admin_password`",
+        ),
         ("let password: SecretString = \"hunter2\";", "`password`"),
         ("let password = &\"hunter2\";", "`password`"),
         ("password: \"hunter2\",", "`password`"),
@@ -1081,15 +1166,62 @@ fn test_scope_exempts_fixtures_but_wasm_production_stays_covered() {
         );
     }
     // `any(target_arch = "wasm32", test)` ships the wasm build: production.
-    let wasm = "#[cfg(any(target_arch = \"wasm32\", test))]\nmod ui {\n    let password = \"hunter2\";\n}";
+    let wasm =
+        "#[cfg(any(target_arch = \"wasm32\", test))]\nmod ui {\n    let password = \"hunter2\";\n}";
     let violations = scan_source_sample(wasm, false);
-    assert_eq!(violations.len(), 1, "wasm-shipped code must stay in [R1] scope, got:\n{}", violations.join("\n"));
+    assert_eq!(
+        violations.len(),
+        1,
+        "wasm-shipped code must stay in [R1] scope, got:\n{}",
+        violations.join("\n")
+    );
     // Test scope closes again after the module: the function after it is
     // production and must be flagged on its own line.
     let mixed = "#[cfg(test)]\nmod tests {\n    let password = \"x\";\n}\nfn production() {\n    let password = \"y\";\n}";
     let violations = scan_source_sample(mixed, false);
-    assert_eq!(violations.len(), 1, "only the production function must be flagged, got:\n{}", violations.join("\n"));
-    assert!(violations[0].contains(":6:"), "hit must point at the production line, got: {}", violations[0]);
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the production function must be flagged, got:\n{}",
+        violations.join("\n")
+    );
+    assert!(
+        violations[0].contains(":6:"),
+        "hit must point at the production line, got: {}",
+        violations[0]
+    );
+}
+
+#[test]
+fn strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments() {
+    // The catalog macro declares copy keys: the field name is an i18n key
+    // and the literal is bilingual message copy — even when the key reads
+    // like a secret (`error_bootstrap_code`, `field_password`), the binding
+    // is not a secret assignment. The exemption is structural (the macro
+    // body), so no value can be smuggled in as "catalog copy".
+    let catalog = "\
+strings_catalog! {
+    label_bootstrap_code: \"Bootstrap code\", zh: \"引导码\",
+    error_bootstrap_code: \"bootstrap failed\", zh: \"引导失败\",
+    field_password: \"Password\", zh: \"密码\",
+    label_totp_secret: \"Secret from your authenticator app\", zh: \"认证器应用中的密钥\",
+}";
+    let violations = scan_source_sample(catalog, false);
+    assert!(
+        violations.is_empty(),
+        "catalog entries are copy, not secrets, got:\n{}",
+        violations.join("\n")
+    );
+    // The exemption is the macro body, not the file: a secret assignment
+    // after the closing brace is production and must be flagged.
+    let after = "strings_catalog! {}\nlet password = \"hunter2\";";
+    let violations = scan_source_sample(after, false);
+    assert_eq!(
+        violations.len(),
+        1,
+        "code after the catalog macro stays in [R1] scope, got:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
@@ -1108,7 +1240,11 @@ fn private_key_rule_requires_a_complete_block() {
             "a complete PEM private-key block must be flagged by [R2], got:\n{}",
             violations.join("\n")
         );
-        assert!(violations[0].contains("[R2]"), "unexpected violation: {}", violations[0]);
+        assert!(
+            violations[0].contains("[R2]"),
+            "unexpected violation: {}",
+            violations[0]
+        );
     }
     let passing: &[&str] = &[
         "let pem = \"-----BEGIN PRIVATE KEY-----\";",
