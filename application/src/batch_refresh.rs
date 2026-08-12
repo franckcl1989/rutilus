@@ -14,12 +14,24 @@
 //! the successful result — the batch never turns into an error or a success
 //! because some endpoints failed.
 //!
-//! Concurrency is bounded by a [`Semaphore`] with
+//! Concurrency is bounded by two gates (design §7.8 "读取有全局和端点级
+//! Semaphore"): the global batch gate — a [`Semaphore`] with
 //! [`MAX_CONCURRENT_REFRESHES`] permits, so one batch never drives more than
 //! four Redfish reads at once regardless of how many endpoints it names
-//! (bounded by [`MAX_REFRESH_TARGETS`]).
+//! (bounded by [`MAX_REFRESH_TARGETS`]) — and the process-wide endpoint-level
+//! gate [`endpoint_read_gate`], one permit per managed endpoint, so two
+//! concurrent refreshes of the same endpoint (two overlapping batches, or any
+//! refresh entrance racing the batch) never overlap. Same-endpoint
+//! serialization keeps the §9.5 Generation order honest: the older
+//! observation always commits before the newer one, so a stale observation
+//! can never land as the latest Generation and roll the telemetry and
+//! overview surfaces backward.
 
-use std::{collections::BTreeSet, error::Error, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    error::Error,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use futures::future::join_all;
 use rutilus_domain::{
@@ -53,6 +65,48 @@ pub const MAX_REFRESH_TARGETS: usize = 128;
 /// [`MAX_REFRESH_TARGETS`]-endpoint batch completes in at most 32 sequential
 /// waves.
 pub const MAX_CONCURRENT_REFRESHES: usize = 4;
+
+/// The process-wide registry of per-endpoint refresh gates (design §7.8
+/// "读取有全局和端点级 Semaphore").
+///
+/// Every refresh of one endpoint — inside any batch, across any number of
+/// concurrent `execute` calls — passes through the same one-permit gate, so
+/// two refreshes of one endpoint never overlap. The overlap is the §9.5
+/// regression the gate prevents: the commit boundary assigns Generations
+/// monotonically in commit order, so an older observation whose commit lands
+/// after a newer one would become the "latest" Generation and roll the
+/// telemetry and overview projections backward. Serializing the endpoint
+/// makes commit order equal observation order.
+///
+/// Entries are intentionally retained for the process lifetime: a gate must
+/// never be dropped while a refresh holds its permit, because dropping the
+/// registry's last `Arc` would free the semaphore and admit a concurrent
+/// refresh of the same endpoint. The registry therefore holds at most one
+/// entry per managed endpoint the process has ever refreshed — bounded by
+/// the fleet size.
+static ENDPOINT_READ_GATES: OnceLock<Mutex<HashMap<EndpointId, Arc<Semaphore>>>> = OnceLock::new();
+
+/// Returns the process-wide one-permit read gate of one endpoint, or `None`
+/// when the registry cannot be locked.
+///
+/// The gate is created on first use and shared by every concurrent refresh
+/// of the endpoint; the permit is held for the whole refresh (read,
+/// Generation commit, capability re-probe, and snapshot replace), exactly
+/// like the batch permit. A poisoned registry is the same process-level
+/// break as a closed semaphore, so the caller reports it as the endpoint's
+/// own classified coordination failure instead of panicking.
+fn endpoint_read_gate(endpoint_id: EndpointId) -> Option<Arc<Semaphore>> {
+    let mut gates = ENDPOINT_READ_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    Some(
+        gates
+            .entry(endpoint_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone(),
+    )
+}
 
 /// Coordinates one bounded batch of independent endpoint refreshes.
 ///
@@ -128,6 +182,12 @@ where
     /// snapshot on failure (§9.5). Outcomes are independent: one failed
     /// endpoint never changes another endpoint's outcome, and the batch never
     /// fails or succeeds as a whole because of partial results.
+    ///
+    /// Each endpoint's refresh additionally passes through the process-wide
+    /// endpoint-level gate [`endpoint_read_gate`] (design §7.8), so a batch
+    /// overlapping another refresh of the same endpoint waits instead of
+    /// racing it: the older observation commits first and a stale snapshot
+    /// can never become the latest Generation.
     ///
     /// # Errors
     ///
@@ -211,12 +271,15 @@ where
         Ok(())
     }
 
-    /// Refreshes one endpoint under one semaphore permit and projects its
-    /// independent outcome.
+    /// Refreshes one endpoint under the batch semaphore permit and the
+    /// process-wide endpoint-level gate, then projects its independent
+    /// outcome.
     ///
-    /// The permit is held for the whole refresh — the read, the Generation
-    /// commit, the capability re-probe, and the snapshot replace — so the
-    /// concurrent window is exactly the per-endpoint work, not a slice of it.
+    /// The batch permit and the endpoint gate permit are both held for the
+    /// whole refresh — the read, the Generation commit, the capability
+    /// re-probe, and the snapshot replace — so the concurrent window is
+    /// exactly the per-endpoint work, not a slice of it, and two refreshes
+    /// of the same endpoint can never overlap (design §7.8).
     async fn refresh_one(
         &self,
         semaphore: Arc<Semaphore>,
@@ -231,6 +294,24 @@ where
                 endpoint_id,
                 reason: EndpointRefreshFailureKind::Coordination,
                 message: "the refresh concurrency gate is closed".to_owned(),
+            };
+        };
+        // The endpoint-level gate is process-wide and never closed, so its
+        // acquire can only fail if the registry itself broke — the same
+        // controlled dead-end, reported as the endpoint's own classified
+        // failure.
+        let Some(gate) = endpoint_read_gate(endpoint_id) else {
+            return EndpointRefreshOutcome::Failed {
+                endpoint_id,
+                reason: EndpointRefreshFailureKind::Coordination,
+                message: "the endpoint refresh gate registry is unavailable".to_owned(),
+            };
+        };
+        let Ok(_endpoint_permit) = gate.acquire().await else {
+            return EndpointRefreshOutcome::Failed {
+                endpoint_id,
+                reason: EndpointRefreshFailureKind::Coordination,
+                message: "the endpoint refresh gate is closed".to_owned(),
             };
         };
         let refresh = AuditedEndpointRefresh::new(
@@ -502,7 +583,10 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         error::Error,
         fmt,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -819,6 +903,150 @@ mod tests {
         Ok(())
     }
 
+    // The test drives two overlapping batches through a blocked read and
+    // asserts the full serialized lifecycle plus the Generation/observation
+    // correlation, so the line count is the coverage, not a signal.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn concurrent_same_endpoint_refreshes_serialize_so_an_older_observation_never_becomes_latest()
+    -> Result<(), Box<dyn Error>> {
+        // Two batches refreshing the same endpoint concurrently must never
+        // overlap that endpoint's refresh (design §7.8 endpoint-level gate).
+        // The persistence commit assigns Generations monotonically in commit
+        // order (`next_generation`), so an overlapping older observation
+        // committed after a newer one would become the "latest" Generation
+        // (§9.5 regression): the telemetry and overview projections would
+        // roll backward. The first batch's read is held in flight; the
+        // second batch must wait at the endpoint-level gate instead of
+        // reading, and the commit order must then equal the observation
+        // order.
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let audit_state = Arc::new(Mutex::new(MockAuditState::default()));
+        let endpoints = endpoints(1)?;
+        let endpoint_id = endpoints[0].id();
+        let observation_tracker = Arc::new(Mutex::new(ObservationTracker::default()));
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        // The two batches share one mock set through `'static` references
+        // (the spawned tasks outlive this scope); leaking the test-only
+        // mocks is harmless — the test process owns them for its lifetime.
+        let repository: &'static MockRepository = Box::leak(Box::new(
+            MockRepository::succeed(endpoints.clone(), Arc::clone(&lifecycle))
+                .with_observation_tracker(Arc::clone(&observation_tracker)),
+        ));
+        let reader: &'static MockReader = Box::leak(Box::new(
+            MockReader::succeed(Arc::clone(&lifecycle))
+                .with_observation_tracker(Arc::clone(&observation_tracker))
+                .with_first_read_block(Arc::new(FirstReadBlock::new(reached_tx, release_rx))),
+        ));
+        let credentials: &'static MockCredentials =
+            Box::leak(Box::new(MockCredentials::available(Arc::clone(&lifecycle))));
+        let audit: &'static MockAudit = Box::leak(Box::new(MockAudit::succeed(
+            Arc::clone(&lifecycle),
+            Arc::clone(&audit_state),
+        )));
+        let clock: &'static FixedClock = Box::leak(Box::new(FixedClock(OffsetDateTime::now_utc())));
+        let first = BatchEndpointRefresh::new(
+            repository,
+            credentials,
+            reader,
+            audit,
+            clock,
+            AuditActor::System,
+            None,
+            DeploymentPosture::Site,
+        );
+        let second = BatchEndpointRefresh::new(
+            repository,
+            credentials,
+            reader,
+            audit,
+            clock,
+            AuditActor::System,
+            None,
+            DeploymentPosture::Site,
+        );
+
+        let first_task = tokio::spawn({
+            let ids = vec![endpoint_id];
+            async move { first.execute(ids).await }
+        });
+        // The first refresh is now provably in flight inside its read.
+        reached_rx.await.map_err(|_| MockError::Events)?;
+        let second_task = tokio::spawn({
+            let ids = vec![endpoint_id];
+            async move { second.execute(ids).await }
+        });
+        // Give the second batch time to reach the endpoint-level gate. While
+        // the first observation is still in flight there must be exactly one
+        // read and no commit: the second refresh waits at the gate instead of
+        // overlapping the first.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let events = recorded(&lifecycle)?;
+            assert_eq!(
+                events.iter().filter(|event| **event == "read").count(),
+                1,
+                "the second refresh must wait at the endpoint gate instead of reading"
+            );
+            assert_eq!(
+                events.iter().filter(|event| **event == "commit").count(),
+                0,
+                "no Generation may commit while an observation is still in flight"
+            );
+        }
+        let _ = release_tx.send(());
+        let first_outcomes = first_task.await.map_err(|_| MockError::Events)??;
+        let second_outcomes = second_task.await.map_err(|_| MockError::Events)??;
+        assert!(first_outcomes[0].is_success());
+        assert!(second_outcomes[0].is_success());
+
+        // The two refreshes ran back to back: one complete refresh phase
+        // (audit, credential, read, commit, probe, snapshot, audit) then the
+        // other, with only the two pre-check lookups interleaved arbitrarily
+        // at the start, so the load-filtered stream is exactly two
+        // contiguous phases.
+        let refresh_phase = [
+            "audit",
+            "credential",
+            "read",
+            "commit",
+            "probe",
+            "snapshot",
+            "audit",
+        ];
+        let filtered = recorded(&lifecycle)?
+            .into_iter()
+            .filter(|event| **event != *"load")
+            .collect::<Vec<_>>();
+        assert_eq!(filtered.len(), refresh_phase.len() * 2);
+        assert_eq!(&filtered[..refresh_phase.len()], refresh_phase);
+        assert_eq!(&filtered[refresh_phase.len()..], refresh_phase);
+
+        // Generation assignment follows commit order (the real boundary's
+        // rule), and serialization made commit order equal observation
+        // order: Generation 1 carries the first observation and Generation
+        // 2 — the latest — carries the second, newer observation. An older
+        // observation never lands as the latest Generation.
+        let tracker = observation_tracker.lock().map_err(|_| MockError::Events)?;
+        assert_eq!(
+            tracker.commits,
+            [
+                CommitRecord {
+                    endpoint_id,
+                    generation: 1,
+                    reads: 1,
+                },
+                CommitRecord {
+                    endpoint_id,
+                    generation: 2,
+                    reads: 2,
+                },
+            ]
+        );
+        Ok(())
+    }
+
     /// The single mock failure mode shared by every boundary.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockError {
@@ -919,6 +1147,28 @@ mod tests {
         endpoints.iter().map(Endpoint::id).collect()
     }
 
+    /// One commit of one endpoint's Generation: the Generation the commit
+    /// boundary assigned (monotonically, in commit order — the same
+    /// `next_generation` rule as the real store) and how many observations of
+    /// the endpoint had been completed when the commit landed.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct CommitRecord {
+        endpoint_id: EndpointId,
+        generation: u64,
+        reads: u64,
+    }
+
+    /// Correlates observation order with commit order across the reader and
+    /// the repository, keyed by endpoint address.
+    #[derive(Default)]
+    struct ObservationTracker {
+        /// Completed reads per endpoint address, in completion order.
+        reads: BTreeMap<String, u64>,
+        /// Every commit, in commit order, with the observation count at the
+        /// time the commit landed.
+        commits: Vec<CommitRecord>,
+    }
+
     struct MockRepository {
         endpoints: BTreeMap<EndpointId, Endpoint>,
         /// Endpoints that disappear between the pre-check and the refresh.
@@ -928,6 +1178,10 @@ mod tests {
         /// end instead of only by construction.
         empty_commit: bool,
         lookup_counts: Arc<Mutex<BTreeMap<EndpointId, usize>>>,
+        /// The per-endpoint Generation counter, mirroring the real commit
+        /// boundary's `next_generation` rule.
+        commits: Arc<Mutex<BTreeMap<EndpointId, u64>>>,
+        observation_tracker: Option<Arc<Mutex<ObservationTracker>>>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -941,6 +1195,8 @@ mod tests {
                 vanishing: BTreeSet::new(),
                 empty_commit: false,
                 lookup_counts: Arc::new(Mutex::new(BTreeMap::new())),
+                commits: Arc::new(Mutex::new(BTreeMap::new())),
+                observation_tracker: None,
                 events,
             }
         }
@@ -956,6 +1212,8 @@ mod tests {
                 vanishing: BTreeSet::new(),
                 empty_commit: true,
                 lookup_counts: Arc::new(Mutex::new(BTreeMap::new())),
+                commits: Arc::new(Mutex::new(BTreeMap::new())),
+                observation_tracker: None,
                 events,
             }
         }
@@ -973,8 +1231,17 @@ mod tests {
                 vanishing: vanishing.into_iter().collect(),
                 empty_commit: false,
                 lookup_counts: Arc::new(Mutex::new(BTreeMap::new())),
+                commits: Arc::new(Mutex::new(BTreeMap::new())),
+                observation_tracker: None,
                 events,
             }
+        }
+
+        /// Shares the observation tracker with the reader so commit order can
+        /// be correlated with observation order.
+        fn with_observation_tracker(mut self, tracker: Arc<Mutex<ObservationTracker>>) -> Self {
+            self.observation_tracker = Some(tracker);
+            self
         }
     }
 
@@ -1015,7 +1282,31 @@ mod tests {
                 if self.empty_commit {
                     return Ok(Vec::new());
                 }
-                let generation = RefreshGeneration::new(1).map_err(|_| MockError::Repository)?;
+                // The Generation is assigned monotonically in commit order,
+                // exactly like the real boundary's `next_generation` — this
+                // is the rule that makes an overlapping older observation
+                // committed after a newer one become the "latest" Generation.
+                let mut commits = self.commits.lock().map_err(|_| MockError::Events)?;
+                let next = commits.entry(endpoint_id).or_default();
+                *next += 1;
+                let generation =
+                    RefreshGeneration::new(*next).map_err(|_| MockError::Repository)?;
+                if let Some(tracker) = &self.observation_tracker {
+                    let mut tracker = tracker.lock().map_err(|_| MockError::Events)?;
+                    let address = self
+                        .endpoints
+                        .get(&endpoint_id)
+                        .ok_or(MockError::Repository)?
+                        .address()
+                        .as_url()
+                        .to_string();
+                    let reads = tracker.reads.get(&address).copied().unwrap_or(0);
+                    tracker.commits.push(CommitRecord {
+                        endpoint_id,
+                        generation: *next,
+                        reads,
+                    });
+                }
                 Ok(observations
                     .iter()
                     .map(|observation| {
@@ -1092,12 +1383,37 @@ mod tests {
         max_in_flight: usize,
     }
 
+    /// Deterministically holds one test's first read in flight until the test
+    /// releases it: the armed read signals `reached` and then waits on
+    /// `release`, so the test can pin one refresh inside its read while a
+    /// second refresh is expected to wait at the endpoint-level gate.
+    struct FirstReadBlock {
+        armed: AtomicBool,
+        reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl FirstReadBlock {
+        fn new(
+            reached: tokio::sync::oneshot::Sender<()>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        ) -> Self {
+            Self {
+                armed: AtomicBool::new(true),
+                reached: Mutex::new(Some(reached)),
+                release: Mutex::new(Some(release)),
+            }
+        }
+    }
+
     struct MockReader {
         events: Arc<Mutex<Vec<&'static str>>>,
         succeeds: bool,
         fail_at_address: Option<String>,
         tracker: Option<Arc<Mutex<ConcurrencyTracker>>>,
         slow: bool,
+        observation_tracker: Option<Arc<Mutex<ObservationTracker>>>,
+        first_read_block: Option<Arc<FirstReadBlock>>,
     }
 
     impl MockReader {
@@ -1108,6 +1424,8 @@ mod tests {
                 fail_at_address: None,
                 tracker: None,
                 slow: false,
+                observation_tracker: None,
+                first_read_block: None,
             }
         }
 
@@ -1118,6 +1436,8 @@ mod tests {
                 fail_at_address: Some(address.to_owned()),
                 tracker: None,
                 slow: false,
+                observation_tracker: None,
+                first_read_block: None,
             }
         }
 
@@ -1131,7 +1451,23 @@ mod tests {
                 fail_at_address: None,
                 tracker: Some(tracker),
                 slow: true,
+                observation_tracker: None,
+                first_read_block: None,
             }
+        }
+
+        /// Shares the observation tracker with the repository so commit order
+        /// can be correlated with observation order.
+        fn with_observation_tracker(mut self, tracker: Arc<Mutex<ObservationTracker>>) -> Self {
+            self.observation_tracker = Some(tracker);
+            self
+        }
+
+        /// Holds the first read of this reader in flight until the test
+        /// releases it.
+        fn with_first_read_block(mut self, block: Arc<FirstReadBlock>) -> Self {
+            self.first_read_block = Some(block);
+            self
         }
     }
 
@@ -1151,12 +1487,35 @@ mod tests {
             let succeeds = self.succeeds;
             let fail_at = self.fail_at_address.clone();
             let events = Arc::clone(&self.events);
+            let observation_tracker = self.observation_tracker.clone();
+            let first_read_block = self.first_read_block.clone();
             Box::pin(async move {
                 record(&events, "read")?;
                 if let Some(tracker) = &tracker {
                     let mut tracker = tracker.lock().map_err(|_| MockError::Events)?;
                     tracker.in_flight += 1;
                     tracker.max_in_flight = tracker.max_in_flight.max(tracker.in_flight);
+                }
+                if let Some(tracker) = &observation_tracker {
+                    let mut tracker = tracker.lock().map_err(|_| MockError::Events)?;
+                    let reads = tracker
+                        .reads
+                        .entry(address.as_url().to_string())
+                        .or_default();
+                    *reads += 1;
+                }
+                if let Some(block) = &first_read_block
+                    && block.armed.swap(false, Ordering::SeqCst)
+                {
+                    if let Some(reached) =
+                        block.reached.lock().map_err(|_| MockError::Events)?.take()
+                    {
+                        let _ = reached.send(());
+                    }
+                    let release = block.release.lock().map_err(|_| MockError::Events)?.take();
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
                 }
                 if slow {
                     tokio::time::sleep(Duration::from_millis(10)).await;

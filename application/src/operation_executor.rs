@@ -394,11 +394,24 @@ where
     ///     attempt's start fact and the monitor's terminal fact already
     ///     bracket the lifecycle.
     ///   - without a Task row, the target is re-read through
-    ///     [`CommandVerifier`]:
-    ///     - `Confirmed` — the re-read proves the write happened (§13.5
-    ///       "判断是否已经发生"); `ExecutionAccepted` is back-filled (the
-    ///       re-read takes the place of the lost response) and the
-    ///       verification chain continues to `Succeeded`;
+    ///     [`CommandVerifier`]. The `Confirmed` verdict is split by the
+    ///     command's verification provability
+    ///     ([`recovery_judgement_proves_effect`]):
+    ///     - `Confirmed` for an effect-asserting command — the re-read
+    ///       proves the write happened (§13.5 "判断是否已经发生");
+    ///       `ExecutionAccepted` is back-filled (the re-read takes the place
+    ///       of the lost response) and the verification chain continues to
+    ///       `Succeeded`;
+    ///     - `Confirmed` for an "accepted"-verification command (reset,
+    ///       boot-source override, Secure Boot, password change, firmware
+    ///       upload, log clear, control update, OEM action) — the re-read
+    ///       asserts only that the target re-reads without error, which was
+    ///       already true before the write, so it cannot prove the write
+    ///       happened. The request may have been accepted but the product
+    ///       cannot prove the final result (§13.2): the operation is
+    ///       recorded `Unknown`, never `Succeeded`, with `Inconclusive`
+    ///       verification — the re-read did not fail, but it did not prove
+    ///       the write either;
     ///     - `Mismatched` — the expected result is absent. The operation
     ///       provably did not achieve its result, so it is recorded `Failed`;
     ///       it is never re-dispatched: an absent expected result does not
@@ -499,6 +512,14 @@ where
     /// The §13.5 judgement of a `Running` orphan whose dispatch outcome is
     /// unknown: re-read the target and decide what the re-read proves.
     ///
+    /// The `Confirmed` verdict is split by the command's verification
+    /// provability ([`recovery_judgement_proves_effect`]): a re-read that
+    /// asserts the durable expected result proves the write happened and the
+    /// verification chain continues to `Succeeded`; a re-read that asserts
+    /// only readability (the "accepted" command class) proves nothing beyond
+    /// what was already true before the write, so the product cannot prove
+    /// the final result and the operation is recorded `Unknown` (§13.5).
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::Verifier`] with the re-read error as its
@@ -514,18 +535,50 @@ where
         started: &StartedAudit,
     ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
         match self.gateway.verify(endpoint_id, command).await {
-            Ok(VerificationVerdict::Confirmed) => {
+            Ok(VerificationVerdict::Confirmed) if recovery_judgement_proves_effect(command) => {
                 // The re-read proves the write already happened (§13.5
-                // "判断是否已经发生"), so `ExecutionAccepted` is back-filled —
-                // the re-read takes the place of the lost response — and the
-                // verification chain continues exactly as after a synchronous
-                // acceptance.
+                // "判断是否已经发生") — the expected durable result is present
+                // or provably absent for a deletion — so `ExecutionAccepted`
+                // is back-filled: the re-read takes the place of the lost
+                // response, and the verification chain continues exactly as
+                // after a synchronous acceptance.
                 self.recover_step(engine, operation_id, OperationEvent::ExecutionAccepted)
                     .await?;
                 let final_operation = self
                     .recover_step(engine, operation_id, OperationEvent::VerificationPassed)
                     .await?;
                 self.record_success(started).await?;
+                Ok(final_operation)
+            }
+            Ok(VerificationVerdict::Confirmed) => {
+                // §13.5 decision: this command class's `Confirmed` asserts
+                // only that the target re-reads without error — which was
+                // already true before the write (the physical effect of a
+                // reset, a boot override, a Secure Boot write, a password
+                // change, or a firmware upload takes effect asynchronously
+                // and cannot be asserted from a successful read). With the
+                // dispatch response lost, the re-read cannot prove the write
+                // happened, so the product cannot prove the final result: the
+                // request may have been accepted, but the outcome is
+                // unprovable — the operation is recorded `Unknown`, never
+                // `Succeeded` (§13.2), and the terminal audit fact is
+                // `Inconclusive`, not `Confirmed`.
+                //
+                // The terminal step must not clobber a state another driver
+                // advanced while this judge was in flight: `OutcomeUnknown`
+                // is a legal transition from `WaitingRemote` too, so the
+                // judge re-checks the state and reports the race through the
+                // recovery guard instead of overwriting it.
+                self.refuse_if_no_longer_running(operation_id).await?;
+                let final_operation = self
+                    .recover_step(engine, operation_id, OperationEvent::OutcomeUnknown)
+                    .await?;
+                self.record_failure(
+                    started,
+                    AuditFailure::CoreResourceReadFailed,
+                    AuditFailureVerification::Inconclusive,
+                )
+                .await?;
                 Ok(final_operation)
             }
             Ok(VerificationVerdict::Mismatched) => {
@@ -564,6 +617,47 @@ where
                 Err(ExecutorError::Verifier(source))
             }
         }
+    }
+
+    /// The recovery guard of the unverifiable-judgement arm: refuses when
+    /// the operation is no longer `Running`.
+    ///
+    /// [`OperationEvent::OutcomeUnknown`] is a legal transition from
+    /// `WaitingRemote` too (the domain accepts it from every in-flight
+    /// state), so a driver that moved the operation while this judge was in
+    /// flight would otherwise be silently overwritten with `Unknown` — the
+    /// Task tracking of a concurrently accepted write would be lost. The
+    /// judge re-reads the operation and reports the race through the
+    /// recovery contract's own guard, exactly like the invalid-transition
+    /// defense of the other judgement arms. The re-read and the persisted
+    /// step are two store reads, so a move between them still races; the
+    /// window matches the existing race defense of the other arms and is
+    /// closed atomically by the persistence layer's own step transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::OperationNotFound`] when the operation is
+    /// gone and [`ExecutorError::NotRecoverable`] when the operation is no
+    /// longer `Running`, with the state the domain reported.
+    async fn refuse_if_no_longer_running(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<(), ExecutorErrorOf<Store, Gateway, Audit>> {
+        let Some(operation) = self
+            .store
+            .find_operation(operation_id)
+            .await
+            .map_err(ExecutorError::Store)?
+        else {
+            return Err(ExecutorError::OperationNotFound(operation_id));
+        };
+        if operation.state() != OperationState::Running {
+            return Err(ExecutorError::NotRecoverable {
+                operation_id,
+                state: operation.state(),
+            });
+        }
+        Ok(())
     }
 
     /// Builds and appends the §16.3 start fact before any pre-flight work.
@@ -1143,6 +1237,58 @@ where
     }
 }
 
+/// Whether a `Confirmed` verification re-read proves the write already
+/// happened on the §13.5 recovery judgement path.
+///
+/// The verification boundary splits its checks into two provability classes
+/// (the `CommandVerifier` contract): effect-asserting commands whose
+/// `Confirmed` verdict asserts the durable expected result — the created or
+/// renamed account member, the requested role, the deleted member's absence,
+/// the created or deleted subscription, and every telemetry write — and
+/// "accepted" commands whose `Confirmed` verdict asserts only that the target
+/// surface re-reads without error: the resets, the boot-source override, the
+/// Secure Boot writes, the password change (the CSDL `Password` property is
+/// write-only and never asserted), the firmware upload (the
+/// `SoftwareInventory` surface re-reads; the final version is not compared in
+/// this iteration), the update-service patch, the log clear, the control
+/// update, and the OEM actions. A re-read of the second class proves nothing
+/// beyond what was already true before the write, so its `Confirmed` cannot
+/// stand in for the lost dispatch response during recovery.
+///
+/// The mapping mirrors the boundary contract exhaustively, so a new command
+/// variant fails to compile until its provability is decided here — the same
+/// rule as [`command_audit_operation`] and [`required_capability`].
+fn recovery_judgement_proves_effect(command: &RedfishCommand) -> bool {
+    match command {
+        // The password change is "accepted" verification: the member must
+        // re-read without error, but the stored password is never asserted,
+        // so `Confirmed` never proves the change happened. The resets,
+        // boot-source override, Secure Boot writes, update-service patch,
+        // log clear, control update, and OEM actions are "accepted"
+        // verification for the same reason: `Confirmed` asserts only
+        // re-readability, which was already true before the write.
+        RedfishCommand::Account(AccountCommand::UpdateAccountPassword(_))
+        | RedfishCommand::System(_)
+        | RedfishCommand::Manager(_)
+        | RedfishCommand::Chassis(_)
+        | RedfishCommand::Boot(_)
+        | RedfishCommand::SecureBoot(_)
+        | RedfishCommand::Log(_)
+        | RedfishCommand::Control(_)
+        | RedfishCommand::Update(_)
+        | RedfishCommand::Oem(_) => false,
+        // The other four account writes assert the durable result (the
+        // created member, the requested role, the requested user name, or
+        // the deleted member's absence), a subscription create asserts the
+        // destination member and a delete asserts the member's absence, and
+        // every telemetry write asserts its durable result (service
+        // enablement, definition presence, or deletion absence).
+        RedfishCommand::Account(_) | RedfishCommand::Event(_) | RedfishCommand::Telemetry(_) => {
+            true
+        }
+    }
+}
+
 /// The audit facts opened for one execution attempt (§16.3).
 ///
 /// Bundled so the terminal-recording helpers do not take the three values as
@@ -1709,6 +1855,21 @@ mod tests {
         endpoint_id: EndpointId,
         state: OperationState,
     ) -> Result<Operation, Box<dyn Error>> {
+        parked_operation_with_command(
+            endpoint_id,
+            state,
+            queued_operation(endpoint_id).command().clone(),
+        )
+    }
+
+    /// Builds one operation carrying `command`, parked in the given in-flight
+    /// state — the same parking as [`parked_operation`], for tests that must
+    /// judge a command other than the default system reset.
+    fn parked_operation_with_command(
+        endpoint_id: EndpointId,
+        state: OperationState,
+        command: RedfishCommand,
+    ) -> Result<Operation, Box<dyn Error>> {
         let steps: &[OperationEvent] = match state {
             OperationState::Validating => &[OperationEvent::ValidationStarted],
             OperationState::Running => &[
@@ -1726,7 +1887,13 @@ mod tests {
                 );
             }
         };
-        let mut operation = queued_operation(endpoint_id);
+        let mut operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            command,
+            created_at(),
+        );
         for step in steps {
             operation.apply(*step, clock_time())?;
         }
@@ -3884,7 +4051,21 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
         let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
-        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        // A subscription deletion is an effect-asserting command: the
+        // re-read's `Confirmed` asserts the subscription's absence, which was
+        // not true before the write — so the judgement re-read can prove the
+        // write happened (§13.5 "判断是否已经发生"). The "accepted"-verification
+        // commands (a system reset, a boot override, a Secure Boot write, a
+        // password change, a firmware upload) cannot be judged this way and
+        // are covered by
+        // `running_orphan_with_unverifiable_confirmed_judgement_records_unknown`.
+        let operation = parked_operation_with_command(
+            endpoint_id,
+            OperationState::Running,
+            RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                "subscription-7".to_owned(),
+            ))),
+        )?;
         store.insert(operation.clone())?;
         // No RemoteTask row: the dispatch outcome is judged by re-reading the
         // target (§13.5).
@@ -3928,6 +4109,63 @@ mod tests {
         assert_eq!(
             events[0].context().target(),
             &AuditTarget::Endpoint(endpoint_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_orphan_with_unverifiable_confirmed_judgement_records_unknown()
+    -> Result<(), Box<dyn Error>> {
+        // A system reset is an "accepted"-verification command: the re-read's
+        // `Confirmed` asserts only that the system resource re-reads without
+        // error, which was already true before the write — the reset's
+        // physical effect is transient and cannot be asserted from a
+        // successful read (§13.5). With the dispatch response lost, that
+        // re-read cannot prove the write happened: the request may have been
+        // accepted but the product cannot prove the final result (§13.2), so
+        // the honest terminal state is `Unknown`, never `Succeeded` — the
+        // recovery must not fabricate a confirmation the re-read does not
+        // carry.
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        // No RemoteTask row: the dispatch outcome is judged by re-reading the
+        // target (§13.5).
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Confirmed),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+        let operation_id = operation.id();
+
+        let finished = executor.recover_operation(operation_id).await?;
+
+        assert_eq!(finished.id(), operation_id);
+        assert_eq!(finished.state(), OperationState::Unknown);
+        assert_eq!(
+            applied_states(&store.recorded_calls()?),
+            [OperationState::Unknown],
+            "an unverifiable re-read must never back-fill ExecutionAccepted"
+        );
+        assert_eq!(
+            gateway.recorded_calls()?,
+            [GatewayCall {
+                kind: GatewayCallKind::Verify,
+                endpoint_id,
+                command: operation.command(),
+            }],
+            "recovery must never re-dispatch; only the judgement re-read runs"
+        );
+        let events = audit.recorded_events()?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].outcome().kind(), AuditOutcomeKind::Started);
+        assert_eq!(events[1].outcome().kind(), AuditOutcomeKind::Failed);
+        assert_eq!(
+            events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive),
+            "the product cannot prove the final result, so the terminal audit fact is Inconclusive, never Confirmed"
         );
         Ok(())
     }
@@ -4541,6 +4779,104 @@ mod tests {
                 command_audit_operation(command),
                 expected,
                 "the command family must map to exactly its own audit operation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_judgement_provability_pins_the_write_families() -> Result<(), Box<dyn Error>> {
+        // The §13.5 recovery judgement splits the `Confirmed` verdict by
+        // whether the verification re-read asserts a durable effect: only an
+        // effect-asserting re-read can prove the write happened when the
+        // dispatch response was lost (§13.5 "判断是否已经发生"). The effect
+        // side: the account writes that assert the durable member, role,
+        // user name, or deletion absence — the password change is the one
+        // account exception (the stored password is write-only and never
+        // asserted) — plus the subscription create/delete and every
+        // telemetry write. The accepted side: the resets, the boot-source
+        // override, the Secure Boot writes, the firmware upload, the
+        // update-service patch, the log clear, the control update, and the
+        // OEM actions, whose `Confirmed` asserts only re-readability.
+        for command in [
+            RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+                AccountUserName::parse("jane")?,
+                AccountPassword::parse("initial-secret".to_owned())?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccount(UpdateAccount::new(
+                AccountId::parse("admin")?,
+                RoleId::parse("Operator")?,
+            ))),
+            RedfishCommand::Account(AccountCommand::UpdateAccountUserName(
+                UpdateAccountUserName::new(
+                    AccountId::parse("admin")?,
+                    AccountUserName::parse("admin.renamed")?,
+                ),
+            )),
+            RedfishCommand::Account(AccountCommand::DeleteAccount(DeleteAccount::new(
+                AccountId::parse("admin")?,
+            ))),
+            RedfishCommand::Event(EventCommand::CreateSubscription(
+                CreateSubscription::try_new(
+                    "https://events.example.test".to_owned(),
+                    EventDestinationProtocol::Redfish,
+                    vec![EventType::Alert],
+                )?,
+            )),
+            RedfishCommand::Event(EventCommand::DeleteSubscription(DeleteSubscription::new(
+                "42".to_owned(),
+            ))),
+            RedfishCommand::Telemetry(TelemetryCommand::SetEnabled { enabled: true }),
+        ] {
+            assert!(
+                recovery_judgement_proves_effect(&command),
+                "an effect-asserting re-read must be able to prove the write"
+            );
+        }
+        for command in [
+            // The one account exception: the re-read asserts only that the
+            // member exists, which was already true before the write.
+            RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+                UpdateAccountPassword::new(
+                    AccountId::parse("admin")?,
+                    AccountPassword::parse("new-secret".to_owned())?,
+                ),
+            )),
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            RedfishCommand::Manager(ManagerCommand::Reset(ResetType::ForceRestart)),
+            RedfishCommand::Manager(ManagerCommand::ResetToDefaults(
+                ManagerResetToDefaultsType::ResetAll,
+            )),
+            RedfishCommand::Chassis(ChassisCommand::Reset(ResetType::PowerCycle)),
+            RedfishCommand::Chassis(ChassisCommand::PowerSupplyReset(PowerSupplyReset::new(
+                None,
+            ))),
+            RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                SetBootSourceOverride::new(
+                    BootSource::Pxe,
+                    BootSourceOverrideEnabled::Once,
+                    BootSourceOverrideMode::Uefi,
+                ),
+            )),
+            RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+            RedfishCommand::Log(LogCommand::ClearLog(ClearLog::new(None, None))),
+            RedfishCommand::Control(ControlCommand::Update(UpdateControl::new(
+                None,
+                Some(700.0),
+            ))),
+            RedfishCommand::Update(UpdateCommand::StartUpdate(StartUpdate::new(
+                ArtifactId::generate(),
+                None,
+            ))),
+            RedfishCommand::Update(UpdateCommand::Patch(UpdatePatch::new(Some(true), None))),
+            RedfishCommand::Oem(OemCommand::DebugToken(
+                NvidiaDebugTokenCommand::DisableToken,
+            )),
+        ] {
+            assert!(
+                !recovery_judgement_proves_effect(&command),
+                "an accepted-verification re-read must not be able to prove the write"
             );
         }
         Ok(())
