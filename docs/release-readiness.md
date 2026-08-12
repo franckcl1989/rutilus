@@ -74,7 +74,7 @@
 | 备份恢复演练 | 🟡 | 自动化往返 10 测试（见上表证据，含迭代七 T-E 预快照三态 3 测试）；三平台演练未执行（§四-B） |
 | 签名构建 / SBOM | 🟡 | 代码侧完成（`scripts/` 5 脚本 + `release-artifacts` job，commit 34503ea + d77d54e）；证书未到位、首次实跑未做（条件 17、§四-C） |
 | 用户/运维/支持矩阵/已知限制手册 | ✅ | `docs/user-manual.md`、`docs/operations-manual.md`、`docs/support-matrix.md`、`docs/known-limitations.md` |
-| 性能容量测试 | 🟡 | 合成规模已实测（`docs/operations-manual.md` §九，2026-08-12 本机 debug 构建）；**发布级容量建议未发布**（设计要求「测试后发布真实容量建议」，`design:2810`）——见 §四-B |
+| 性能容量测试 | 🟡 | 合成规模已实测（`docs/operations-manual.md` §九，2026-08-12：debug 构建基线 + **release 构建数据已出**）；**发布级容量建议已发布（release 构建数据）**，正式规模环境复核仍待做（设计要求「测试后发布真实容量建议」，`design:2810`）——见 §四-B |
 
 ### 1.2 最低验证规模对照
 
@@ -82,7 +82,8 @@
 ≥100 Site、中心汇总 ≥5,000 Endpoint。合成规模压力套件已按该规模实测落地
 （`stress_capacity.rs:47-52` 常量 200/100/5,000；实测数据
 `operations-manual.md` §九），**不再是「仅测试目标」**；「测试后发布真实容量建议」
-（`design:2810`）仍未完成。
+（`design:2810`）：release 构建数据已出（2026-08-12，见 `operations-manual.md` §九），
+正式规模环境复核仍待做。
 
 ## 二、1.0.0 发布条件 18 项逐条对照
 
@@ -126,7 +127,7 @@
 |---|---|---|---|---|
 | §12.4 诊断解码失败**生产捕获点**（gateway 捕获 + SQLite 持久化） | ✅ 已合入（E1，commit ce2b8b3） | 全组评审复验（证据链见下） | 无（已合并，全部门禁复跑通过） | 网关捕获：`DecodeFailureObservation`（`infra-redfish/src/redfish_gateway.rs:8720`），捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure`（`:8904, :8931, :8977`），刷新结果经 `outcome.decode_failures()` 流出（`:8831`）；同代事务提交：`persistence/src/resource_snapshot_repository.rs:81-147`（`commit_resource_generation` 在快照同一事务内写 `resource_decode_failures`），生产链路 `application/src/endpoint_refresh.rs:350-355` 直连；新表 + entity（`entity/src/lib.rs:28`、`entity/src/resource_decode_failure.rs:13`）+ 迁移 `m20260812_000001`（E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；web 端到端 7 测试（`web/tests/diagnostics_path.rs:838-1175`，含 `refresh_capture_flows_into_the_diagnostics_response` `:998`）；现状登记见 `known-limitations.md` §八「§12.4」行 |
 | 独立 Secret 泄漏扫描（仓库级自动扫描 + 运行时抓包/日志复核） | ✅ 仓库级已落地（E3b）/ 运行时复核待做 | 安全评审 + CI | 无（仓库级部分）；运行时复核需三平台演示环境（可并入 B） | `security/tests/secret_leak_gate.rs`：3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM / R3 明文输出宏泄露）、8 测试（`:1054, :1066, :1077, :1087, :1146, :1195, :1227, :1265`）、白名单 = `ALLOWED_CONSTANT_HITS` 2 处（path+line+name+literal 四元组绑定，`app/src/backup.rs:88, 89` 备份条目名，T-E 后重核）、`test-support` crate 目录级豁免（fixture scope，`:55-59, 1000-1002`，E3b 原始提交 eefde7e）+ `strings_catalog!` 宏体结构豁免（深度审查批次 commit e8424df：CATALOG_MACRO 帧识别 `:534, 815-822`，新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1195`）；门禁为 CI 独立步骤（`ci.yml:225-227` Secret leak gate，`cargo test --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前；header 注记 `ci.yml:15-17`）；运行时抓包/日志复核仍为 §四-B 项（`security-review.md:110, 128-135`） |
-| UI 本地化 | ✅ 已完整落地（H5 d3f7769 + 0f91c17 + T-H c4dd335：`strings_catalog!` 目录 827 键 En/Zh 双语（`i18n.rs:163-1858`）、`Lang::{En, Zh}` 运行时语言选择（`thread_local!` `i18n.rs:1938-1942` + `L()` `i18n.rs:1968-1973`）、lib.rs `LanguageSelector` 组件（`lib.rs:11640-11658`）与 URL fragment 持久化（**迭代七 T-H 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`、wasm 封装 `lib.rs:11607-11635`、启动恢复 `start()` `lib.rs:11661-11664`）；ui 141 测试全过；深度审查批次补 `format_catalog` 槽位硬化与本地化（fb660d5 + a4950fc，`i18n.rs:1984-2006`，见 `milestone-status.md` §7.4）） | 前端组 | 后续触点：localStorage 持久化（需扩展 web-sys feature）与更多语言；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:106`；`milestone-status.md:286` |
+| UI 本地化 | ✅ 已完整落地（H5 d3f7769 + 0f91c17 + T-H c4dd335：`strings_catalog!` 目录 827 键 En/Zh 双语（`i18n.rs:163-1858`）、`Lang::{En, Zh}` 运行时语言选择（`thread_local!` `i18n.rs:1938-1942` + `L()` `i18n.rs:1968-1973`）、lib.rs `LanguageSelector` 组件（`lib.rs:11640-11658`）与 URL fragment 持久化（**迭代七 T-H 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`、wasm 封装 `lib.rs:11607-11635`、启动恢复 `start()` `lib.rs:11661-11664`）；ui 141 测试全过；深度审查批次补 `format_catalog` 槽位硬化与本地化（fb660d5 + a4950fc，`i18n.rs:1984-2006`，见 `milestone-status.md` §7.4）） | 前端组 | 后续触点：localStorage 持久化（需扩展 web-sys feature）与更多语言；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:107`；`milestone-status.md:290` |
 | N5 `unreachable!` 处置（可选，NOTE 级） | ✅ 已完成（E3c） | — | 无 | `security-review.md` §三 N5 已关闭：`web/src/lib.rs:1223` 编译期 `const _: () = assert!(rutilus_api::OVERVIEW_RECENT_EVENTS > 0);` 钉死常量正性（注释 `:1213-1222`），运行时 guard 保留为已被断言证明不可达的防御分支（`:1224-1226`） |
 | 发布级 CI 扩展（Windows ARM64 原生 runner） | ✅ 移交 §三-B（依赖原生 runner，非 A 类可做） | — | 原生 ARM64 Windows runner 或本地 ARM64 主机验证后另行处理 | `ci.yml:272-279` 注释；§三-B「Windows ARM64 发布验证」行 |
 
@@ -140,7 +141,7 @@
 | 大文件更新端到端演练 | 真实大固件文件的上传→校验→分发→应用 | 真实固件制品 + 设备或等价测试台 | 12 的实测面 |
 | 三平台安装/升级/备份/恢复演练 | 0.9.0 验收第 5 项、1.0.0 条件 15：Windows/macOS/Linux 各跑安装→备份→升级→恢复→任务恢复 | 三平台机器 + 发布包 + 签名产物（签名属 C） | 7、15 |
 | Center/Site 长时间断线重连演练 | 0.9.0 验收第 6 项：跨进程/跨天真实断线（自动化风暴已覆盖单进程形态） | 站点 + 中心运行环境 | 14 的实测面 |
-| 发布级容量建议 | 设计要求「测试后发布真实容量建议」：release 构建 + 正式规模环境复核后发布（当前仅开发机 debug 合成数据，`operations-manual.md` §九） | release 构建 + 正式规模环境 | 7 的配套交付物 |
+| 发布级容量建议 | 设计要求「测试后发布真实容量建议」：release 构建数据已出（2026-08-12，`operations-manual.md` §九），正式规模环境复核后定稿发布 | 正式规模环境 | 7 的配套交付物 |
 | Windows ARM64 发布验证 | `aarch64-pc-windows-msvc` 发布目标：构建 + 安装/运行验证 | 原生 ARM64 Windows runner 或本地 ARM64 主机 | 7 |
 
 ### C. 依赖发布管道（外部证书 / 签名服务 / 发布流程）
@@ -173,7 +174,8 @@ Migration 门禁已复跑通过（`ci.yml:306-330`），本版行号均按合并
 - 已结构达成：Center 不保存 BMC Secret（13 ✅）、Site 脱离 Center 完整运行（14 ✅）、
   数据库 Migration（16 ✅）、文档四件套（18 ✅）、异步操作恢复实现（11 ✅ 结构性）。
 - 缺实测认证：真实设备验证（8/9/10 ⏳）、三平台备份恢复演练（15 🟡）、所有写操作最终
-  验证的评审清零结论（12 🟡）、发布级容量建议（🟡）。
+  验证的评审清零结论（12 🟡）、发布级容量建议的正式规模环境复核（🟡；release 构建数据已出，
+  2026-08-12，见 `operations-manual.md` §九）。
 - 硬缺口：签名与 SBOM（17 🟡）——代码侧已就绪（`scripts/` 5 脚本 + `release-artifacts` job，
   commit 34503ea + d77d54e），剩余全部为外部证书与账号（C 类）+ 证书到位后的首次实跑
   （6 项确认点，见条件 17）；应最早启动证书申请以并行于 B 类演练（Git Commit 嵌入已补齐，
@@ -189,7 +191,7 @@ Migration 门禁已复跑通过（`ci.yml:306-330`），本版行号均按合并
 | 阻塞（硬条件未达成） | 条件 7 的 Windows ARM64 发布目标验证 | B/基础设施 | 原生 ARM64 runner |
 | 评审前须完成 | 0.9.0 验收第 1/4 项评审结论（P0/P1 清零、错误成功报告清零） | 评审流程 | 上述证据链 |
 | 评审建议完成 | Secret 泄漏扫描的运行时复核（仓库级门禁已落地，E3b） | A（运行时复核并入 B） | 三平台演示环境 |
-| 评审建议完成 | 发布级容量建议 | B | release 构建 + 正式规模环境 |
+| 评审建议完成 | 发布级容量建议（release 构建数据已出，2026-08-12）；正式规模环境复核 | B | 正式规模环境 |
 | 不阻塞 | UI 本地化（✅ 已完整落地：827 键 En/Zh 双语 + 运行时语言选择器 + URL fragment 持久化） | A | — |
 
 **4. 结论：** 0.9.0 六项验收中 1 项 ✅、3 项 🟡、2 项 ⏳，**尚不满足 0.9.0 发布条件**——

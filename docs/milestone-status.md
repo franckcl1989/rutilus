@@ -175,7 +175,7 @@
 |---|---|---|
 | 进程级演练（评审跟踪项 #9/#15） | 0.8.0 已落地故障注入覆盖（§19.3）与单进程测试；跨进程演练（操作执行 §13 与中心协议 §15 路径）属 0.9.0 | 设计文档 §19.3、§0.9.0 内容；`docs/known-limitations.md` §五 |
 | 真实设备认证矩阵 | 五厂商至少各一台真实设备进入 1.0.0 认证矩阵（§19.1 Physical Device Test）；当前结论基于上游类型面与 mock/fixture 验证，不是实测认证 | 设计文档 §19.1；`docs/known-limitations.md` §五 |
-| 容量测试 | 🟡 部分：合成规模压力/容量套件已落地（`persistence/tests/stress_capacity.rs` 3 个测试，覆盖设计最低验证规模：200 Endpoint Generation 一致刷新 / 100 Site outbox-inbox-cursor / 5,000 Endpoint 中心投影幂等重投，全部断言正确性不变量）；本机实测数据已记录（2026-08-12，debug 构建、WAL、Windows 开发机）；**发布真实容量建议**（设计要求的"测试后发布"）仍待办 | 设计文档 §0.9.0（2800-2810）；`stress_capacity.rs:47-52`；`docs/operations-manual.md` §九 |
+| 容量测试 | 🟡 部分：合成规模压力/容量套件已落地（`persistence/tests/stress_capacity.rs` 3 个测试，覆盖设计最低验证规模：200 Endpoint Generation 一致刷新 / 100 Site outbox-inbox-cursor / 5,000 Endpoint 中心投影幂等重投，全部断言正确性不变量）；本机实测数据已记录（2026-08-12：debug 构建、WAL、Windows 开发机基线 + release 构建 3 次全过）；**发布级容量建议已发布（release 构建数据，2026-08-12，见 `operations-manual.md` §九）**；正式规模环境复核仍待做 | 设计文档 §0.9.0（2800-2810）；`stress_capacity.rs:47-52`；`docs/operations-manual.md` §九 |
 | 发布构建验证 | 🟡 部分：aarch64 musl（cargo-zigbuild 交叉链接）与 macOS Universal 2（arm64 原生 + x86_64 交叉 + lipo 合并）构建步骤已入 CI（`.github/workflows/ci.yml:266-270, 289-304`）；Windows ARM64 **明确不入 CI**（hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库，真实原因注释于 `ci.yml:272-279`） | `docs/support-matrix.md` §三；`ci.yml` |
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
 | tracing 深化 | ✅ 已落地：`#[instrument]` span 接入 main/backup/center_client/center_runtime/event_listener/scheduler/site_runtime/standalone_runtime/telemetry_sampler（口令等敏感值 `skip_all`）；`--log-format <text|json>` 全局选项与 `init_tracing` 双格式层（默认 text，stderr + `RUST_LOG` 过滤不变） | `app/src/main.rs:27-41, 255-273`；`docs/operations-manual.md` §8.1 |
@@ -252,8 +252,8 @@
 | 用户手册 | ✅ 已完成 | `docs/user-manual.md`（431 行，条目后标注来源文件；`rutilus version` 输出已更新为三行，含 Git Commit） |
 | 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状；§8.1 已补充 `--log-format json` 结构化输出与 span 上下文，§九已补充合成规模实测容量数据） |
 | 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（189 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；§三「CI 现状」已更新（windows/macos E2E 套件、aarch64 musl、macOS Universal 2 入 CI，Windows ARM64 未入 CI 的真实原因，`support-matrix.md:90-95`） |
-| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:125`：合成规模套件已实测、正式容量建议待发布）；§八「§12.4 诊断中的解码错误路径 / ExtendedInfo 展示」行已同步为**已实现**（`known-limitations.md:128`：E1 生产捕获点已合入，如实注记 odata_type 捕获时为 None 等）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致）；§七新增深度审查批次条目（密码策略 API 边界 / 429 不写审计 / ETag 现状 / 迁移 down 纪律，`known-limitations.md:113-116`）；§九新增深度审查遗留项登记 8 项（`known-limitations.md:144-151`），迭代七已全部落地/处置（见 §7.5） |
-| 性能容量测试 | 🟡 部分 | 压力/容量套件已落地（`persistence/tests/stress_capacity.rs`，规模达设计最低验证规模）并有本机实测数据（2026-08-12，debug 构建、WAL、Windows 开发机）：5,000 投影写入 5.78s（≈865 行/s）、幂等重投 9.72s、5,000 行清单查询 0.482s；关键观察：写路径被 `write_gate`（`Semaphore(1)`，`persistence/src/lib.rs:101, 240`）全局串行化，5,000 规模耗时 ≈ 事务数 × 单事务成本——这是发布真实容量建议时最有价值的记录；**最终发布容量建议**未发布（`operations-manual.md` §九） |
+| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:126`：合成规模套件已实测、发布级容量建议已发布（release 构建数据，见 operations-manual §九））；§八「§12.4 诊断中的解码错误路径 / ExtendedInfo 展示」行已同步为**已实现**（`known-limitations.md:129`：E1 生产捕获点已合入，如实注记 odata_type 捕获时为 None 等）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致），同日再更新为「发布级容量建议已发布（release 构建数据，正式规模环境复核仍待做）」（release 实测数据登记，2026-08-12，见 operations-manual §九）；§七新增深度审查批次条目（密码策略 API 边界 / 429 不写审计 / ETag 现状 / 迁移 down 纪律，`known-limitations.md:114-117`）；§九新增深度审查遗留项登记 8 项（`known-limitations.md:148-155`），迭代七已全部落地/处置（见 §7.5） |
+| 性能容量测试 | 🟡 部分 | 压力/容量套件已落地（`persistence/tests/stress_capacity.rs`，规模达设计最低验证规模）并有本机实测数据（2026-08-12：debug 构建、WAL、Windows 开发机基线 + release 构建 3 次全过）：debug 下 5,000 投影写入 5.78s（≈865 行/s）、幂等重投 9.72s、5,000 行清单查询 0.482s，release 下 5,000 投影首次写入 ≈3.5–4.2s、幂等重投 ≈7.9s、清单查询 ≈0.16–0.20s；关键观察：写路径被 `write_gate`（`Semaphore(1)`，`persistence/src/lib.rs:101, 240`）全局串行化，5,000 规模耗时 ≈ 事务数 × 单事务成本——这是发布真实容量建议时最有价值的记录；**发布级容量建议已发布（release 构建数据，2026-08-12，见 `operations-manual.md` §九）**；正式规模环境复核仍待做 |
 
 ### 7.2 剩余工作精确分类
 
@@ -308,7 +308,7 @@ T-H c4dd335 / T-G 8482d85 / T-B 4897b22 / T-D e7aef53 / T-E 02459dc / T-F 83ff07
 | 进程级故障注入演练 | 产品进程在任务中被终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（§19.3 剩余项） | 设计文档 §19.3 |
 | 大文件更新演练 | 真实大固件文件的端到端更新（当前为分块机制级覆盖） | 设计文档 §0.9.0 |
 | 备份恢复演练 | 三平台安装/升级/备份/恢复（0.9.0 验收） | 设计文档 §0.9.0 验收 |
-| 性能容量测试 | 合成规模压力套件已落地并实测（`stress_capacity.rs`，2026-08-12）；**发布真实容量建议**（含 release 构建/正式环境复核）仍待办 | 设计文档 §0.9.0（2800-2810）；`operations-manual.md` §九 |
+| 性能容量测试 | 合成规模压力套件已落地并实测（`stress_capacity.rs`，2026-08-12）；**发布级容量建议已发布（release 构建数据，见 `operations-manual.md` §九）**；正式规模环境复核仍待做 | 设计文档 §0.9.0（2800-2810）；`operations-manual.md` §九 |
 | Center/Site 长时间断线重连演练 | 0.9.0 验收项；并发重连风暴已自动化覆盖（`center_sync.rs:4328, 4448, 4615, 4838, 4968`），长时间（跨进程/跨天）真实断线演练仍未执行 | 设计文档 §0.9.0 验收 |
 
 **C. 依赖发布管道（外部证书 / 签名服务 / 发布流程）**

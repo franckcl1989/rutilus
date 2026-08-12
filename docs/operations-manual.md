@@ -272,11 +272,51 @@ rutilus doctor [--portable]
 
 设计文档 §0.9.0 的"最低验证规模"（单 Site 200 Endpoint / 单 Center 100 Site / 中心汇总
 5,000 Endpoint）已由合成规模压力套件落地并实测（`persistence/tests/stress_capacity.rs`，
-2026-08-12）。**下面的数字是本机（Windows 开发机）debug 构建 + WAL 下的合成数据，不是最终发布
-容量建议**——设计 §0.9.0 要求"测试后发布真实容量建议"（`redfish-management-product-final-design.md:2810`），
-正式容量建议需在 release 构建与正式规模环境复核后发布。
+2026-08-12）。**发布级容量建议以 release 构建数据为第一依据**（见下）；该数据仍为单平台
+（Windows 11 Pro x64 开发机）、单机、合成 fixture 规模（tempfile 临时目录中的真实 SQLite
+文件 + WAL），**正式规模环境复核仍待做**——设计 §0.9.0 要求"测试后发布真实容量建议"
+（`redfish-management-product-final-design.md:2810`）。
 
-**合成规模实测数据（2026-08-12，开发机 debug 构建、WAL）**
+**建议容量表述（0.9.0 最低验证规模，release 构建，2026-08-12）**
+
+- 0.9.0 最低验证规模（200 Endpoint / 100 Site / 5,000 Endpoint）在 release 构建下实测通过
+  （3 次全过）；
+- 5,000 行投影全量查询（含 100 个 per-site 视图）亚秒级（≈0.16–0.20s，≈25,000–31,800 行/s）；
+- 5,000 投影首次写入 ≈3.5–4.2s（≈1,200–1,440 行/s）、幂等重投 ≈7.9s（≈632 行/s，更新路径）；
+- 扩容方向不变：写路径仍被 `write_gate`（`Semaphore(1)`）串行化，扩容方向是减事务数或放宽
+  写门，不是堆并发。
+
+**合成规模实测数据（release 构建，2026-08-12，Windows 11 Pro x64 开发机、单机、合成 fixture）**
+
+运行：`cargo test --release --locked -p rutilus-persistence --test stress_capacity -- --test-threads 1 --nocapture`，
+3 次全过（3 passed; 0 failed；套件总耗时 28.00s / 24.96s / 15.57s）。构建配置：opt-level=3、
+lto="fat"、codegen-units=1、panic="abort"、strip="symbols"。正确性不变量在 release 构建
+（panic=abort、无 debug assertions）下与 debug 完全一致。连续两轮取样（第 2/3 次）核心三项
+与 debug 基线对照：
+
+| 规模场景 | debug 基线 | release 采用值 | 提升 | release 折算吞吐 | 计时点 |
+|---|---|---|---|---|---|
+| 5,000 Endpoint 投影首次写入（100 Site x 50） | 5.78s（≈865 行/s） | 3.5–4.2s（第 2 次 3.48s / 第 3 次 4.15s） | 1.4–1.7× | ≈1,200–1,440 行/s | `stress_capacity.rs:865` |
+| 5,000 Endpoint 投影幂等重投（at-least-once） | 9.72s（≈515 行/s） | 7.91s（第 3 次稳定值；第 2 次 15.73s 为偶发异常值，同机同参数连续运行的瞬时干扰，如实记录） | 1.23× | ≈632 行/s（更新路径） | `stress_capacity.rs:924` |
+| 5,000 行投影清单查询（含 100 个 per-site 视图） | 0.482s（≈10,400 行/s） | 0.16–0.20s（0.157s / 0.200s） | 2.4–3.1× | ≈25,000–31,800 行/s | `stress_capacity.rs:906` |
+
+其余计时点（release 第 2/3 次 vs debug 基线）：
+
+| 规模场景 | debug 基线 | release 第 2/3 次 | 计时点 |
+|---|---|---|---|
+| 200 Endpoint 首轮 Generation 提交（7 snapshot/个） | 0.30s | 0.25–0.40s | `stress_capacity.rs:441` |
+| 200 Endpoint 二轮提交 + 当前视图重载 | 0.32s | 0.22–0.34s | `stress_capacity.rs:491` |
+| 100 Site 建库 | 0.01s | 0.01–0.03s | `stress_capacity.rs:602` |
+| 1,000 outbox 入队 | 0.53s | 0.36–0.53s | `stress_capacity.rs:626` |
+| 500 outbox Ack（含重复 Ack no-op） | 0.141s | 0.133–0.249s | `stress_capacity.rs:652` |
+| 400 inbox 幂等生命周期（100 Site x 4） | 0.31s | 0.28–0.36s | `stress_capacity.rs:760` |
+| 800 sync cursor 推进（100 Site x 4 流 x 2） | 0.28s | 0.30–0.42s | `stress_capacity.rs:795` |
+
+诚实性限定（与 debug 基线同口径）：Windows 11 Pro x64 开发机、单机、合成 fixture（tempfile
+临时目录中的真实 SQLite 文件 + WAL）；连续两轮取样（第 2/3 次）；重投路径第 2 次 15.73s 为
+偶发异常值，采用第 3 次稳定值 7.91s；2026-08-12。
+
+**合成规模实测数据（debug 基线，2026-08-12，开发机 debug 构建、WAL）**
 
 压力套件 3 个测试全部断言正确性不变量（行数、设计 §9.5 Generation 一致、§17 队列与游标有序、
 §15.4 at-least-once 重投 no-op），**不断言任何墙钟时间**（CI 方差不是测试输入，
@@ -296,7 +336,9 @@ rutilus doctor [--portable]
 
 **关键观察（发布容量建议时最有价值的记录）**：persistence 的写路径被 `write_gate`
 （`Semaphore(1)` 全局应用级写信号量，`persistence/src/lib.rs:101, 240`）串行化——同一时刻全库
-只有一个写事务。因此 5,000 规模的写耗时 ≈ **事务数 × 单事务成本**，与并发数无关；扩容方向是
+只有一个写事务。因此 5,000 规模的写耗时 ≈ **事务数 × 单事务成本**，与并发数无关；**该结论在
+release 构建下不变**（写门在 release 下依然主导写耗时）；提升最大的是 CPU 密集段（首次写入
+1.4–1.7×、清单查询 2.4–3.1×），SQLite UPDATE 路径（幂等重投）提升最小（1.23×）；扩容方向是
 减少事务数（批量合并）或放宽串行化（需先评估设计 §9.2 的写门语义与备份一致性依赖），而不是堆并发。
 
 当前代码中可确认的规模相关事实：
