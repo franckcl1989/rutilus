@@ -356,6 +356,16 @@ where
                 // `Rejected` outcome; the verdict class is only consulted
                 // for dispatch failures.
                 Err(CommandExecutionError::Rejected(_)) => Ok(CommandOutcome::Rejected),
+                // A `412 Precondition Failed` (§13.4) is NOT an ordinary
+                // rejection: the target changed since it was read, the write
+                // was provably not executed, and the gateway already
+                // re-read the target — so the conflict surfaces as its own
+                // error (verdict `NotExecuted`: the operation is recorded
+                // `Failed` with the conflict facts, never re-dispatched and
+                // never overwriting the concurrent modification).
+                Err(source @ CommandExecutionError::PreconditionFailed { .. }) => {
+                    Err(CommandDispatchError::PreconditionFailed(source))
+                }
                 // A `202` acceptance surfaces as the application's
                 // `AsyncTaskAccepted` outcome so the scheduler persists the
                 // Task and moves the operation to `WaitingRemote` (§13.6).
@@ -408,15 +418,32 @@ pub enum CommandDispatchError {
     Dispatch(#[source] CommandExecutionError),
     #[error("the accepted Task URI cannot be represented safely: {0}")]
     AsyncTaskUriInvalid(#[source] TaskUriError),
+    /// The BMC rejected the write with `412 Precondition Failed` (§13.4).
+    ///
+    /// The target changed since it was read, so the write was provably not
+    /// executed and the gateway already re-read the target (the re-read
+    /// facts ride on the source error). The operation is recorded `Failed` —
+    /// the verdict is [`DispatchVerdict::NotExecuted`], never a blind retry
+    /// and never an overwrite of the concurrent modification; the operator
+    /// re-reads (or waits for the next refresh) and retries.
+    #[error(
+        "the BMC rejected the write with 412 Precondition Failed — the target changed since it was read, so the write was provably not executed and the target was re-read instead of overwritten (§13.4): {0}"
+    )]
+    PreconditionFailed(#[source] CommandExecutionError),
 }
 
 impl DispatchVerdictClassifier for CommandDispatchError {
     fn verdict(&self) -> DispatchVerdict {
         match self {
+            // §13.4: a `412 Precondition Failed` proves the write was never
+            // executed — the conflict is a provable non-execution, the
+            // operation is recorded `Failed`, never `Unknown`, and the
+            // concurrent modification is never overwritten.
             Self::EndpointResolution(_)
             | Self::EndpointUnknown
             | Self::CredentialResolution(_)
-            | Self::CredentialUnknown => DispatchVerdict::NotExecuted,
+            | Self::CredentialUnknown
+            | Self::PreconditionFailed(_) => DispatchVerdict::NotExecuted,
             // A `202` acceptance whose `Location` cannot be represented is
             // outcome-unknown: the BMC accepted the write, and only the Task
             // could prove its result (§13.5).
@@ -732,7 +759,8 @@ mod tests {
     };
     use rutilus_domain::{
         ArtifactName, CredentialId, CredentialUsername, Endpoint, EndpointAddress,
-        EndpointDisplayName, EndpointId, RedfishCommand, ResourceODataId, TlsCertificate, TlsTrust,
+        EndpointDisplayName, EndpointId, RedfishCommand, ResetType, ResourceEtag, ResourceODataId,
+        SystemCommand, TlsCertificate, TlsTrust,
     };
     use rutilus_operation_engine::{RemoteTaskState, TaskUri, TaskUriError};
     use secrecy::SecretString;
@@ -745,8 +773,8 @@ mod tests {
     use crate::{
         CommandDispatchError, CommandExecutionError, CommandExecutionOutcome, CommandTaskReadError,
         CommandVerificationError, CommandVerificationOutcome, CommandVerifyError,
-        RedfishCommandExecutor, RedfishGateway, RedfishServiceRootError, TaskObservation,
-        TaskReadError, UpdateArtifactUpload,
+        PreconditionReRead, RedfishCommandExecutor, RedfishGateway, RedfishServiceRootError,
+        TaskObservation, TaskReadError, UpdateArtifactUpload,
     };
 
     #[test]
@@ -858,9 +886,12 @@ mod tests {
     /// The scripted gateway double for the executor's boundary tests.
     ///
     /// `read_task` always reports the `TaskGone` disappearance signal, which
-    /// is the branch the adapter tests pin; the execute and verify surfaces
-    /// are inert because no test in this module drives them.
+    /// is the branch the adapter tests pin; the execute surface returns the
+    /// scripted §13.4 conflict when armed, or a dispatch failure otherwise,
+    /// and the verify surface is inert because no test in this module drives
+    /// it.
     struct FakeGateway {
+        precondition_failed: Option<PreconditionReRead>,
         gone_task_uri: ResourceODataId,
         gone_url: url::Url,
     }
@@ -868,6 +899,20 @@ mod tests {
     impl FakeGateway {
         fn task_gone() -> Result<Self, Box<dyn Error>> {
             Ok(Self {
+                precondition_failed: None,
+                gone_task_uri: ResourceODataId::parse("/redfish/v1/TaskService/Tasks/42")?,
+                gone_url: url::Url::parse("https://192.0.2.1/redfish/v1/TaskService/Tasks/42")?,
+            })
+        }
+
+        /// Arms the §13.4 conflict: the gateway rejected the write with
+        /// `412 Precondition Failed` and re-read the target (its current
+        /// `ETag` is `W/"current-2"`).
+        fn precondition_failed() -> Result<Self, Box<dyn Error>> {
+            Ok(Self {
+                precondition_failed: Some(PreconditionReRead::Read {
+                    current_etag: Some(ResourceEtag::parse(r#"W/"current-2""#)?),
+                }),
                 gone_task_uri: ResourceODataId::parse("/redfish/v1/TaskService/Tasks/42")?,
                 gone_url: url::Url::parse("https://192.0.2.1/redfish/v1/TaskService/Tasks/42")?,
             })
@@ -890,10 +935,14 @@ mod tests {
                     + 'a,
             >,
         > {
+            let precondition_failed = self.precondition_failed.clone();
             Box::pin(async move {
-                Err(CommandExecutionError::NotDispatched(Box::new(
-                    RedfishServiceRootError::SessionCleanupFailed,
-                )))
+                match precondition_failed {
+                    Some(re_read) => Err(CommandExecutionError::PreconditionFailed { re_read }),
+                    None => Err(CommandExecutionError::NotDispatched(Box::new(
+                        RedfishServiceRootError::SessionCleanupFailed,
+                    ))),
+                }
             })
         }
 
@@ -1138,6 +1187,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precondition_failed_dispatch_surfaces_the_conflict_error() -> Result<(), Box<dyn Error>>
+    {
+        let executor = RedfishCommandExecutor::new(
+            FakeGateway::precondition_failed()?,
+            TestEndpointRepository {
+                endpoint: Some(managed_endpoint()?),
+            },
+            TestCredentialResolver {
+                credential: Some(resolved_credential()?),
+            },
+        );
+
+        let result = executor
+            .execute(
+                EndpointId::generate(),
+                &RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            )
+            .await;
+
+        // The §13.4 conflict is a distinct dispatch error — never an
+        // ordinary `Rejected` outcome and never an unprovable outcome — and
+        // the re-read facts ride on the error chain.
+        let error = match result {
+            Err(error) => error,
+            Ok(outcome) => {
+                return Err(format!(
+                    "a 412 must surface as the conflict dispatch error, got {outcome:?}"
+                )
+                .into());
+            }
+        };
+        let source = match &error {
+            CommandDispatchError::PreconditionFailed(source) => source,
+            other => {
+                return Err(format!(
+                    "a 412 must map onto CommandDispatchError::PreconditionFailed, got {other:?}"
+                )
+                .into());
+            }
+        };
+        assert!(matches!(
+            source,
+            CommandExecutionError::PreconditionFailed { re_read }
+                if *re_read
+                    == PreconditionReRead::Read {
+                        current_etag: Some(ResourceEtag::parse(r#"W/"current-2""#)?)
+                    }
+        ));
+        assert_eq!(
+            error.verdict(),
+            DispatchVerdict::NotExecuted,
+            "a 412 proves the write was never executed (§13.4, §13.5), so the operation records Failed — never Unknown, never a blind re-dispatch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_task_maps_a_disappeared_task_onto_the_distinct_none_signal()
     -> Result<(), Box<dyn Error>> {
         let executor = RedfishCommandExecutor::new(
@@ -1225,6 +1331,12 @@ mod tests {
             CommandDispatchError::Dispatch(CommandExecutionError::NotDispatched(Box::new(
                 crate::RedfishServiceRootError::SessionCleanupFailed,
             ))),
+            // §13.4: the `412` response proves the write was never executed,
+            // so the conflict is a provable non-execution — the operation
+            // records `Failed`, never `Unknown`, and is never re-dispatched.
+            CommandDispatchError::PreconditionFailed(CommandExecutionError::PreconditionFailed {
+                re_read: PreconditionReRead::Unreadable,
+            }),
         ];
         for error in not_executed {
             assert_eq!(

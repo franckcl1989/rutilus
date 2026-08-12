@@ -593,9 +593,24 @@ impl RedfishGateway {
     /// The transient Session lifecycle is identical to the read surfaces: a
     /// Session is established when usable, every member fetch and the write
     /// authenticate with its token, and the Session is deleted before
-    /// returning. The §13.4 `ETag` precondition is a later iteration — the
-    /// typed `update` sends the transport's existence-only `If-Match: *` —
-    /// and a `202` response is reported as
+    /// returning.
+    ///
+    /// Every typed `update` write carries the `ETag` of the target document
+    /// read during this execution (§13.3 step 1, §13.4): when the decoded
+    /// document carries an `@odata.etag`, the write sends
+    /// `If-Match: <etag>`, so a concurrent modification between that read
+    /// and the write is rejected by the BMC with `412 Precondition Failed`,
+    /// which the gateway reports as
+    /// [`CommandExecutionError::PreconditionFailed`] after re-reading the
+    /// target — the write is stopped and the concurrent change is never
+    /// overwritten (§13.4). A target document without an `ETag` keeps the
+    /// transport's existence-only `If-Match: *`: no concurrency protection
+    /// exists for such a resource (§13.4 second paragraph), and the
+    /// post-write verification re-read is the "执行后重新读取" of that
+    /// paragraph. The action/create/delete families have no `If-Match`
+    /// channel in the typed API, so they never send one.
+    ///
+    /// A `202` response is reported as
     /// [`CommandExecutionError::AsyncTaskAccepted`], never as acceptance:
     /// the gateway itself never polls Tasks, so the application adapter maps
     /// that error onto the `AsyncTaskAccepted` outcome the Task monitor
@@ -4719,7 +4734,7 @@ async fn execute_authenticated_command(
 ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
     match command {
         RedfishCommand::Account(account) => {
-            execute_account_command(root, identity, trust, account).await
+            execute_account_command(bmc, root, identity, trust, account).await
         }
         RedfishCommand::System(SystemCommand::Reset(reset_type)) => {
             execute_system_reset(bmc, root, identity, trust, *reset_type).await
@@ -4761,7 +4776,7 @@ async fn execute_authenticated_command(
             execute_control_update(bmc, root, identity, trust, payload).await
         }
         RedfishCommand::Telemetry(telemetry) => {
-            execute_telemetry_command(root, identity, trust, telemetry).await
+            execute_telemetry_command(bmc, root, identity, trust, telemetry).await
         }
         // The `StartUpdate` variant is deliberately dispatched through the
         // dedicated `UpdateExecutor` boundary, never this one: the typed
@@ -6211,11 +6226,14 @@ async fn execute_control_update(
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(
+            return Err(classify_patch_write_error::<ControlSchema>(
                 nv_redfish::Error::Bmc(source),
+                bmc,
+                control.odata_id(),
                 identity,
                 trust,
-            ));
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6369,11 +6387,14 @@ async fn execute_update_service_patch(
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(
+            return Err(classify_patch_write_error::<UpdateServiceSchema>(
                 nv_redfish::Error::Bmc(source),
+                bmc,
+                update_service.odata_id(),
                 identity,
                 trust,
-            ));
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6417,21 +6438,29 @@ async fn execute_boot_override(
             .with_boot_source_override_enabled(map_boot_override_enabled(override_value.enabled()))
             .with_boot_source_override_mode(map_boot_override_mode(override_value.mode())),
     );
+    // The write carries the ETag of the document just read (§13.4): a
+    // concurrent modification between that read and this PATCH is rejected
+    // with `412 Precondition Failed` and reported as the conflict instead of
+    // being silently overwritten. A system document without an `@odata.etag`
+    // keeps the transport's existence-only `If-Match: *`.
     let response = match bmc
         .update::<ComputerSystemUpdateSchema, NavProperty<ComputerSystemSchema>>(
             system.odata_id(),
-            None,
+            system.etag(),
             &update,
         )
         .await
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(
+            return Err(classify_patch_write_error::<ComputerSystemSchema>(
                 nv_redfish::Error::Bmc(source),
+                bmc,
+                system.odata_id(),
                 identity,
                 trust,
-            ));
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6458,21 +6487,29 @@ async fn execute_secure_boot_enable(
         ));
     };
     let update = SecureBootUpdateSchema::default().with_secure_boot_enable(enabled);
+    // The write carries the ETag of the `SecureBoot` document just read
+    // (§13.4), exactly like the boot override: a `412 Precondition Failed`
+    // takes the conflict path instead of silently overwriting a concurrent
+    // modification. A document without an `@odata.etag` keeps the
+    // transport's existence-only `If-Match: *`.
     let response = match bmc
         .update::<SecureBootUpdateSchema, NavProperty<SecureBootSchema>>(
             secure_boot.odata_id(),
-            None,
+            secure_boot.etag(),
             &update,
         )
         .await
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(
+            return Err(classify_patch_write_error::<SecureBootSchema>(
                 nv_redfish::Error::Bmc(source),
+                bmc,
+                secure_boot.odata_id(),
                 identity,
                 trust,
-            ));
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6653,6 +6690,7 @@ async fn execute_delete_subscription(
 /// [`CommandRejection::CapabilityUnavailable`] before any write is sent,
 /// exactly like the missing `Subscriptions` link of the event family.
 async fn execute_account_command(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6662,14 +6700,18 @@ async fn execute_account_command(
         AccountCommand::CreateAccount(payload) => {
             execute_create_account(root, identity, trust, payload).await
         }
+        // The member-update writes receive the transport handle so a `412
+        // Precondition Failed` can re-read the member through the typed
+        // navigation (§13.4); creates and deletes send no `If-Match` and
+        // keep the classification-only path.
         AccountCommand::UpdateAccount(payload) => {
-            execute_update_account(root, identity, trust, payload).await
+            execute_update_account(bmc, root, identity, trust, payload).await
         }
         AccountCommand::UpdateAccountPassword(payload) => {
-            execute_update_account_password(root, identity, trust, payload).await
+            execute_update_account_password(bmc, root, identity, trust, payload).await
         }
         AccountCommand::UpdateAccountUserName(payload) => {
-            execute_update_account_user_name(root, identity, trust, payload).await
+            execute_update_account_user_name(bmc, root, identity, trust, payload).await
         }
         AccountCommand::DeleteAccount(payload) => {
             execute_delete_account(root, identity, trust, payload).await
@@ -6724,6 +6766,7 @@ async fn execute_create_account(
 /// and the update body is the compiled `ManagerAccountUpdate` type carrying
 /// only `RoleId`, the complete intent of the domain payload (§7.1).
 async fn execute_update_account(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6754,7 +6797,14 @@ async fn execute_update_account(
     let response = match account.update(&update).await {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<ManagerAccountSchema>(
+                source,
+                bmc,
+                account.raw().odata_id(),
+                identity,
+                trust,
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6764,6 +6814,7 @@ async fn execute_update_account(
 /// `Account::update_password`, the typed helper of the `nv-redfish` account
 /// API.
 async fn execute_update_account_password(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6791,7 +6842,14 @@ async fn execute_update_account_password(
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<ManagerAccountSchema>(
+                source,
+                bmc,
+                account.raw().odata_id(),
+                identity,
+                trust,
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6800,6 +6858,7 @@ async fn execute_update_account_password(
 /// Executes an account rename through `Account::update_user_name`, the typed
 /// helper of the `nv-redfish` account API.
 async fn execute_update_account_user_name(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6827,7 +6886,14 @@ async fn execute_update_account_user_name(
     {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<ManagerAccountSchema>(
+                source,
+                bmc,
+                account.raw().odata_id(),
+                identity,
+                trust,
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -6927,6 +6993,7 @@ async fn find_account(
 /// `update`/`delete` helpers — never a hand-written telemetry request
 /// (§7.4).
 async fn execute_telemetry_command(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6934,13 +7001,17 @@ async fn execute_telemetry_command(
 ) -> Result<CommandExecutionOutcome, CommandExecutionError> {
     match telemetry {
         TelemetryCommand::SetEnabled { enabled } => {
-            execute_set_telemetry_enabled(root, identity, trust, *enabled).await
+            execute_set_telemetry_enabled(bmc, root, identity, trust, *enabled).await
         }
         TelemetryCommand::CreateMetricDefinition(payload) => {
             execute_create_metric_definition(root, identity, trust, payload).await
         }
+        // The member-update and service writes receive the transport handle
+        // so a `412 Precondition Failed` can re-read the target through the
+        // typed navigation (§13.4); creates and deletes send no `If-Match`
+        // and keep the classification-only path.
         TelemetryCommand::UpdateMetricDefinition(payload) => {
-            execute_update_metric_definition(root, identity, trust, payload).await
+            execute_update_metric_definition(bmc, root, identity, trust, payload).await
         }
         TelemetryCommand::DeleteMetricDefinition(payload) => {
             execute_delete_metric_definition(root, identity, trust, payload).await
@@ -6949,7 +7020,7 @@ async fn execute_telemetry_command(
             execute_create_metric_report_definition(root, identity, trust, payload).await
         }
         TelemetryCommand::UpdateMetricReportDefinition(payload) => {
-            execute_update_metric_report_definition(root, identity, trust, payload).await
+            execute_update_metric_report_definition(bmc, root, identity, trust, payload).await
         }
         TelemetryCommand::DeleteMetricReportDefinition(payload) => {
             execute_delete_metric_report_definition(root, identity, trust, payload).await
@@ -6961,6 +7032,7 @@ async fn execute_telemetry_command(
 /// `TelemetryService::set_enabled`, the typed helper of the `nv-redfish`
 /// telemetry API (a `PATCH` of the `ServiceEnabled` property).
 async fn execute_set_telemetry_enabled(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -6974,7 +7046,14 @@ async fn execute_set_telemetry_enabled(
     let response = match service.set_enabled(enabled).await {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<TelemetryServiceSchema>(
+                source,
+                bmc,
+                service.raw().odata_id(),
+                identity,
+                trust,
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -7027,6 +7106,7 @@ async fn execute_create_metric_definition(
 /// `MetricDefinitionUpdate` type carrying exactly the complete intent of the
 /// domain payload (§7.1).
 async fn execute_update_metric_definition(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -7054,7 +7134,14 @@ async fn execute_update_metric_definition(
     let response = match definition.update(&update).await {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<MetricDefinitionSchema>(
+                source,
+                bmc,
+                definition.raw().odata_id(),
+                identity,
+                trust,
+            )
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -7136,6 +7223,7 @@ async fn execute_create_metric_report_definition(
 /// body is the compiled `MetricReportDefinitionUpdate` type carrying exactly
 /// the complete intent of the domain payload (§7.1).
 async fn execute_update_metric_report_definition(
+    bmc: &UpstreamBmc,
     root: &ServiceRoot<UpstreamBmc>,
     identity: &IdentityMonitor,
     trust: &TlsTrust,
@@ -7167,7 +7255,10 @@ async fn execute_update_metric_report_definition(
     let response = match definition.update(&update).await {
         Ok(response) => response,
         Err(source) => {
-            return Err(classify_command_write_error(source, identity, trust));
+            return Err(classify_patch_write_error::<
+                nv_redfish::schema::metric_report_definition::MetricReportDefinition,
+            >(source, bmc, definition.raw().odata_id(), identity, trust)
+            .await);
         }
     };
     outcome_from_modification(response)
@@ -12558,6 +12649,30 @@ impl fmt::Display for CommandRejection {
     }
 }
 
+/// The result of the §13.4 re-read of a write target after a
+/// `412 Precondition Failed` response.
+///
+/// The write was provably not executed — the `412` response was received
+/// and fully handled (§13.5: the verdict stays `NotExecuted`, never
+/// `OutcomeUnknown`) — so the re-read never changes the outcome; it exists
+/// to capture the target's current state so the caller can tell the
+/// precondition conflict apart from an ordinary refusal and can re-read (or
+/// wait for the next refresh) instead of overwriting the concurrent
+/// modification. An unparseable current `@odata.etag` is dropped — the
+/// state fact is refused, never fabricated — exactly like the read-side
+/// projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreconditionReRead {
+    /// The target re-read cleanly; `current_etag` is its entity tag right
+    /// after the rejection (`None` when the current document carries no
+    /// `@odata.etag`).
+    Read { current_etag: Option<ResourceEtag> },
+    /// The target could not be re-read (it no longer exists, the BMC
+    /// refused the read, ...): the current state is unknown, but the write
+    /// was still provably not executed.
+    Unreadable,
+}
+
 /// A controlled failure while executing one typed write command.
 ///
 /// The variants are the §13.5 classification surface for the application
@@ -12569,6 +12684,13 @@ impl fmt::Display for CommandRejection {
 pub enum CommandExecutionError {
     #[error("the BMC provably refused the command: {0}")]
     Rejected(CommandRejection),
+    #[error(
+        "the BMC rejected the write with 412 Precondition Failed: the target changed since the pre-write read, so the write was provably not executed and the target was re-read instead of overwritten (§13.4); re-read: {re_read:?}"
+    )]
+    PreconditionFailed {
+        /// The outcome of the mandatory §13.4 re-read of the write target.
+        re_read: PreconditionReRead,
+    },
     #[error("the command was not dispatched because of a client-side failure: {0}")]
     NotDispatched(#[source] Box<RedfishServiceRootError>),
     #[error("the write request was dispatched but its outcome cannot be proven: {0}")]
@@ -12603,7 +12725,9 @@ impl CommandExecutionError {
     pub const fn outcome_is_unknown(&self) -> bool {
         match self {
             Self::OutcomeUnknown(_) | Self::AsyncTaskAccepted { .. } => true,
-            Self::Rejected(_) | Self::NotDispatched(_) => false,
+            // A `412 Precondition Failed` response proves the write was
+            // never executed (§13.4), exactly like the provable refusals.
+            Self::Rejected(_) | Self::PreconditionFailed { .. } | Self::NotDispatched(_) => false,
             Self::OperationAndSessionCleanupFailed { operation, .. } => {
                 operation.outcome_is_unknown()
             }
@@ -13874,6 +13998,55 @@ fn command_preparation_error(
     classify_command_preparation_error(nv_redfish::Error::Bmc(source), identity, trust)
 }
 
+/// Classifies one failed typed `update` write (§13.3 step 7): a
+/// `412 Precondition Failed` response takes the §13.4 conflict path, and
+/// every other failure keeps the ordinary §13.5 classification of
+/// [`classify_command_write_error`].
+///
+/// §13.4: the `412` response proves the write was never executed, so the
+/// gateway stops — it never re-dispatches and never overwrites the
+/// concurrent modification — re-reads the target's current state through
+/// the same typed navigation as every other gateway read (§7.4, §11.5), and
+/// reports the conflict as [`CommandExecutionError::PreconditionFailed`]
+/// with the re-read facts. `target` is the `@odata.id` of the document the
+/// write attempted to modify (the same URI the write itself used) and `T`
+/// its compiled schema type.
+async fn classify_patch_write_error<T>(
+    source: UpstreamServiceRootError,
+    bmc: &UpstreamBmc,
+    target: &ODataId,
+    identity: &IdentityMonitor,
+    trust: &TlsTrust,
+) -> CommandExecutionError
+where
+    T: EntityTypeRef + for<'de> Deserialize<'de> + 'static,
+{
+    let precondition_failed = matches!(
+        source,
+        nv_redfish::Error::Bmc(BmcError::InvalidResponse { status, .. })
+            if status == StatusCode::PRECONDITION_FAILED
+    );
+    if !precondition_failed {
+        return classify_command_write_error(source, identity, trust);
+    }
+    // §13.4: stop, re-read the current state, and report the conflict. A
+    // failed re-read is itself a fact: the write was still provably not
+    // executed (§13.5), but the target's current state could not be
+    // captured; an unparseable current etag is dropped, never fabricated.
+    let re_read = match NavProperty::<T>::new_reference(target.clone())
+        .get(bmc)
+        .await
+    {
+        Ok(current) => PreconditionReRead::Read {
+            current_etag: current
+                .etag()
+                .and_then(|etag| ResourceEtag::parse(&etag.to_string()).ok()),
+        },
+        Err(_) => PreconditionReRead::Unreadable,
+    };
+    CommandExecutionError::PreconditionFailed { re_read }
+}
+
 /// Classifies one failure of the write request itself.
 ///
 /// The classification mirrors §13.5 exactly: a received client error
@@ -13882,6 +14055,13 @@ fn command_preparation_error(
 /// (`5xx`), an undecodable success payload, or a TLS-safety failure all
 /// leave the request's outcome unprovable and become
 /// [`CommandExecutionError::OutcomeUnknown`].
+///
+/// The PATCH write families never reach this classifier with a `412`: the
+/// §13.4 conflict path of [`classify_patch_write_error`] intercepts the
+/// precondition failure before the ordinary classification, because the
+/// re-read needs the target context this classifier does not have. A `412`
+/// from an action/create/delete write (the typed API sends no `If-Match`
+/// for those) is a vendor anomaly and stays an ordinary provable refusal.
 fn classify_command_write_error(
     source: UpstreamServiceRootError,
     identity: &IdentityMonitor,
@@ -25248,6 +25428,46 @@ mod tests {
         }
     }"##;
 
+    /// A System document carrying an `@odata.etag`, for the §13.4 `ETag`
+    /// carrying and `412 Precondition Failed` tests: the write must send
+    /// `If-Match: W/"system-1"` from this read, and the conflict-path
+    /// re-read serves the updated `W/"system-2"` document.
+    const COMMAND_SYSTEM_WITH_ETAG_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-1\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Boot":{
+            "BootSourceOverrideTarget":"None",
+            "BootSourceOverrideEnabled":"Disabled",
+            "BootSourceOverrideMode":"UEFI"
+        },
+        "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
+        "Actions":{
+            "#ComputerSystem.Reset":{"target":"/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}
+        }
+    }"##;
+
+    /// The System document the §13.4 conflict-path re-read serves after a
+    /// concurrent modification bumped the entity tag to `W/"system-2"`.
+    const COMMAND_SYSTEM_WITH_UPDATED_ETAG_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1",
+        "@odata.etag":"W/\"system-2\"",
+        "Id":"1",
+        "Name":"System One",
+        "SystemType":"Physical",
+        "Boot":{
+            "BootSourceOverrideTarget":"None",
+            "BootSourceOverrideEnabled":"Disabled",
+            "BootSourceOverrideMode":"UEFI"
+        },
+        "SecureBoot":{"@odata.id":"/redfish/v1/Systems/1/SecureBoot"},
+        "Actions":{
+            "#ComputerSystem.Reset":{"target":"/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}
+        }
+    }"##;
+
     /// A System document that advertises no write capability at all: no
     /// `Actions`, no `Boot` object, and no `SecureBoot` link. Used to pin
     /// the §13.3 step 2 capability checks.
@@ -25588,6 +25808,23 @@ mod tests {
     /// `#SecureBoot.ResetKeys` action.
     const COMMAND_SECURE_BOOT_BODY: &str = r##"{
         "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+        "Id":"SecureBoot",
+        "Name":"UEFI Secure Boot",
+        "SecureBootEnable":true,
+        "SecureBootCurrentBoot":"Enabled",
+        "Actions":{
+            "#SecureBoot.ResetKeys":{
+                "target":"/redfish/v1/Systems/1/SecureBoot/Actions/SecureBoot.ResetKeys"
+            }
+        }
+    }"##;
+
+    /// A `SecureBoot` document carrying an `@odata.etag`, for the §13.4
+    /// `ETag` carrying test: the enable/disable PATCH must send
+    /// `If-Match: W/"secure-boot-1"` from this read.
+    const COMMAND_SECURE_BOOT_WITH_ETAG_BODY: &str = r##"{
+        "@odata.id":"/redfish/v1/Systems/1/SecureBoot",
+        "@odata.etag":"W/\"secure-boot-1\"",
         "Id":"SecureBoot",
         "Name":"UEFI Secure Boot",
         "SecureBootEnable":true,
@@ -26904,11 +27141,16 @@ mod tests {
 
     #[tokio::test]
     async fn executes_boot_override_through_the_typed_patch_api() -> Result<(), Box<dyn Error>> {
+        // The write must carry the ETag of the System document read during
+        // the execution (§13.4): the PATCH sends `If-Match: W/"system-1"`,
+        // never the existence-only wildcard, so a concurrent modification
+        // between the read and the write is rejected instead of silently
+        // overwritten.
         let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
             FULL_SERVICE_ROOT_BODY,
             &[
                 ("200 OK", FULL_SYSTEMS_BODY),
-                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_ETAG_BODY),
             ],
             http_response("204 No Content", ""),
         ))
@@ -26941,7 +27183,7 @@ mod tests {
             r#"{"Boot":{"BootSourceOverrideTarget":"Pxe","BootSourceOverrideEnabled":"Once","BootSourceOverrideMode":"UEFI"}}"#,
         )?;
         let write = std::str::from_utf8(&requests[6])?;
-        assert_eq!(request_header(write, "if-match"), Some("*"));
+        assert_eq!(request_header(write, "if-match"), Some(r#"W/"system-1""#));
         assert_eq!(
             request_header(write, "content-type"),
             Some("application/json")
@@ -27018,6 +27260,210 @@ mod tests {
             "PATCH",
             r#"{"SecureBootEnable":false}"#,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_boot_writes_carry_the_decoded_documents_etag() -> Result<(), Box<dyn Error>> {
+        // The `SecureBoot` document read during the execution carries an
+        // `@odata.etag`, so the enable PATCH must send
+        // `If-Match: W/"secure-boot-1"` (§13.4), exactly like the boot
+        // override.
+        let server = TestRedfishServer::start_raw_sequence(command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+                ("200 OK", COMMAND_SECURE_BOOT_WITH_ETAG_BODY),
+            ],
+            http_response("204 No Content", ""),
+        ))
+        .await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::SecureBoot(SecureBootCommand::Enable),
+            )
+            .await?;
+
+        assert_eq!(outcome, CommandExecutionOutcome::Accepted);
+        let requests = server.finish_all().await?;
+        assert_command_requests(
+            &requests,
+            &SECURE_BOOT_COMMAND_REQUEST_PATHS,
+            "PATCH",
+            r#"{"SecureBootEnable":true}"#,
+        )?;
+        let write = std::str::from_utf8(&requests[7])?;
+        assert_eq!(
+            request_header(write, "if-match"),
+            Some(r#"W/"secure-boot-1""#)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boot_override_stops_and_re_reads_on_precondition_failed() -> Result<(), Box<dyn Error>>
+    {
+        // §13.4: the BMC answers `412 Precondition Failed` because a
+        // concurrent actor modified the System between the pre-write read
+        // and the PATCH. The gateway must stop — the write was provably not
+        // executed — re-read the target's current state (the document now
+        // carries `W/"system-2"`), and report the conflict; it must never
+        // re-dispatch the write and never overwrite the modification.
+        let responses = command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_ETAG_BODY),
+            ],
+            http_response(
+                "412 Precondition Failed",
+                r#"{"error":{"code":"Base.1.0.PreconditionFailed","message":"the resource changed"}}"#,
+            ),
+        );
+        // The helper's trailing `204` is the Session-delete slot; the §13.4
+        // re-read of the target must be served BEFORE the cleanup, so the
+        // sequence is rebuilt around it: [... , write-412, re-read, delete].
+        let responses = [
+            &responses[..7],
+            &[http_response(
+                "200 OK",
+                COMMAND_SYSTEM_WITH_UPDATED_ETAG_BODY,
+            )],
+            &responses[7..],
+        ]
+        .concat();
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                    SetBootSourceOverride::new(
+                        BootSource::Pxe,
+                        BootSourceOverrideEnabled::Once,
+                        BootSourceOverrideMode::Uefi,
+                    ),
+                )),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(accepted) => {
+                return Err(format!("a 412 must fail the write, got {accepted:?}").into());
+            }
+        };
+        let re_read = match &error {
+            CommandExecutionError::PreconditionFailed { re_read } => re_read.clone(),
+            other => {
+                return Err(
+                    format!("a 412 must surface as PreconditionFailed, got {other:?}").into(),
+                );
+            }
+        };
+        assert_eq!(
+            re_read,
+            PreconditionReRead::Read {
+                current_etag: Some(ResourceEtag::parse(r#"W/"system-2""#)?),
+            }
+        );
+        assert!(
+            !error.outcome_is_unknown(),
+            "a 412 proves the write was never executed: {error}"
+        );
+
+        // Exactly one PATCH was sent (index 6), carrying the read ETag; the
+        // re-read (index 7) re-fetches the same System document, and the
+        // Session cleanup follows — the write was never re-dispatched.
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 9);
+        let write = std::str::from_utf8(&requests[6])?;
+        assert!(write.starts_with("PATCH /redfish/v1/Systems/1 HTTP/1.1\r\n"));
+        assert_eq!(request_header(write, "if-match"), Some(r#"W/"system-1""#));
+        let re_read_request = std::str::from_utf8(&requests[7])?;
+        assert!(re_read_request.starts_with("GET /redfish/v1/Systems/1 HTTP/1.1\r\n"));
+        let cleanup = std::str::from_utf8(&requests[8])?;
+        assert!(cleanup.starts_with("DELETE /redfish/v1/SessionService/Sessions/1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn precondition_failed_reports_unreadable_when_the_re_read_fails()
+    -> Result<(), Box<dyn Error>> {
+        // The target no longer exists when the §13.4 re-read runs (the
+        // concurrent actor deleted it): the conflict is still reported — the
+        // write was provably not executed — with the honest `Unreadable`
+        // fact instead of a fabricated current state. The target document
+        // carries no `@odata.etag`, so the write went out with the
+        // existence-only `If-Match: *` and the `412` still takes the
+        // §13.4 conflict path.
+        let responses = command_write_sequence(
+            FULL_SERVICE_ROOT_BODY,
+            &[
+                ("200 OK", FULL_SYSTEMS_BODY),
+                ("200 OK", COMMAND_SYSTEM_WITH_RESET_ACTION_BODY),
+            ],
+            http_response(
+                "412 Precondition Failed",
+                r#"{"error":{"code":"Base.1.0.PreconditionFailed","message":"the resource changed"}}"#,
+            ),
+        );
+        let responses = [
+            &responses[..7],
+            &[http_response(
+                "404 Not Found",
+                r#"{"error":{"code":"Base.1.0.ResourceMissing","message":"gone"}}"#,
+            )],
+            &responses[7..],
+        ]
+        .concat();
+        let server = TestRedfishServer::start_raw_sequence(responses).await?;
+        let gateway = gateway_with_root(server.certificate.clone())?;
+        let trust = system_ca_trust(&server.certificate)?;
+
+        let outcome = gateway
+            .execute_command(
+                &server.address,
+                &trust,
+                &CredentialUsername::parse("admin")?,
+                &SecretString::from("password"),
+                &RedfishCommand::Boot(BootCommand::SetBootSourceOverride(
+                    SetBootSourceOverride::new(
+                        BootSource::Pxe,
+                        BootSourceOverrideEnabled::Once,
+                        BootSourceOverrideMode::Uefi,
+                    ),
+                )),
+            )
+            .await;
+
+        let re_read = match outcome {
+            Err(CommandExecutionError::PreconditionFailed { re_read }) => re_read,
+            other => {
+                return Err(
+                    format!("a 412 must surface as PreconditionFailed, got {other:?}").into(),
+                );
+            }
+        };
+        assert_eq!(re_read, PreconditionReRead::Unreadable);
+        let requests = server.finish_all().await?;
+        assert_eq!(requests.len(), 9);
+        let write = std::str::from_utf8(&requests[6])?;
+        // The target carries no ETag, so the existence-only wildcard stays.
+        assert_eq!(request_header(write, "if-match"), Some("*"));
         Ok(())
     }
 
@@ -28991,6 +29437,14 @@ mod tests {
 
         let rejected = CommandExecutionError::Rejected(CommandRejection::RefusedByBmc);
         assert!(!rejected.outcome_is_unknown());
+
+        // A `412 Precondition Failed` proves the write was never executed
+        // (§13.4): it is a provable non-execution, never an unprovable
+        // outcome, even though the target was re-read after the rejection.
+        let precondition_failed = CommandExecutionError::PreconditionFailed {
+            re_read: PreconditionReRead::Unreadable,
+        };
+        assert!(!precondition_failed.outcome_is_unknown());
 
         let not_dispatched =
             CommandExecutionError::NotDispatched(Box::new(RedfishServiceRootError::TlsRejected {

@@ -1,5 +1,5 @@
-//! The write-side Redfish boundary contract (design sections 13.3, 13.5, and
-//! 13.6).
+//! The write-side Redfish boundary contract (design sections 13.3, 13.4,
+//! 13.5, and 13.6).
 //!
 //! [`CommandExecutor`] dispatches one typed write to one endpoint and handles
 //! the response; [`CommandVerifier`] re-reads the target after the write and
@@ -8,6 +8,19 @@
 //! operation scheduler in `operation_executor` consumes only these
 //! boundaries, so the gateway's `nv-redfish` and transport details never leak
 //! into the use case (design section 7.2).
+//!
+//! The `ETag` precondition (design section 13.4) is enforced at this
+//! boundary: the implementation sends the target's `ETag` with every
+//! `update` write (`If-Match: <etag>`), so a concurrent modification since
+//! the pre-write read is rejected by the BMC with `412 Precondition Failed`.
+//! That rejection is a provable non-execution (§13.5) — the write was never
+//! applied — so the implementation must surface it as a distinct dispatch
+//! failure whose verdict is [`DispatchVerdict::NotExecuted`], never as an
+//! ordinary `Rejected` outcome and never as `OutcomeUnknown`. The conflict
+//! facts (the target was re-read after the rejection, and its current
+//! `ETag`) ride on the error, and the operation records `Failed` — the
+//! write is stopped, the concurrent modification is never overwritten, and
+//! the operator re-reads (or waits for the next refresh) and retries.
 //!
 //! The asynchronous Task branch (a `202` response, design section 13.6) is
 //! handled as [`CommandOutcome::AsyncTaskAccepted`]: the scheduler persists
@@ -68,9 +81,12 @@ pub enum CommandOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchVerdict {
     /// The failure proves the write was never executed — for example the
-    /// connection failed before the request could be sent, or an intermediate
-    /// refused the request before it reached the BMC. The product can account
-    /// for the outcome, so the operation is recorded `Failed`.
+    /// connection failed before the request could be sent, an intermediate
+    /// refused the request before it reached the BMC, or the BMC answered
+    /// `412 Precondition Failed` (§13.4: the target changed since the
+    /// pre-write read, and the received response proves the write was not
+    /// applied). The product can account for the outcome, so the operation
+    /// is recorded `Failed`.
     NotExecuted,
     /// The write may already have been accepted by the BMC: a timeout after
     /// sending, a connection dropped mid-response, a lost response, or a `202`
@@ -124,6 +140,13 @@ pub trait DispatchVerdictClassifier: Error + Send + Sync + 'static {
 /// `Failed`), and failures that cannot prove that report
 /// [`DispatchVerdict::OutcomeUnknown`] (the scheduler records `Unknown`,
 /// design section 13.5).
+///
+/// A `412 Precondition Failed` (design section 13.4) is always
+/// `NotExecuted`: the response proves the write was not applied. The
+/// implementation must surface it as a distinct failure carrying the
+/// conflict facts (the target re-read after the rejection, and its current
+/// `ETag`) rather than an ordinary refusal, so the caller can tell the
+/// conflict apart and never re-dispatches the write.
 pub trait CommandExecutor: Send + Sync {
     /// The dispatch boundary's controlled failure type; it must declare its
     /// own design section 13.5 verdict.

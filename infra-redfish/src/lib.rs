@@ -16,8 +16,9 @@ pub use redfish_gateway::{
     CommandVerificationOutcome, CoreEndpointDiscovery, CoreResourceProjection,
     CoreResourceReadError, CoreResourceReadOutcome, DecodeFailureExtendedInfo,
     DecodeFailureObservation, EndpointEvent, EventStream, EventStreamError, EventStreamOpenError,
-    RedfishGateway, RedfishServiceRootError, ServiceRootSummary, TaskMessageObservation,
-    TaskObservation, TaskReadError, TlsIdentityStateError, UpdateArtifactUpload,
+    PreconditionReRead, RedfishGateway, RedfishServiceRootError, ServiceRootSummary,
+    TaskMessageObservation, TaskObservation, TaskReadError, TlsIdentityStateError,
+    UpdateArtifactUpload,
 };
 pub use release_baseline::{
     BaselineModule, BaselineModuleClassification, BaselineOperation,
