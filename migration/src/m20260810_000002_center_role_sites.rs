@@ -25,8 +25,11 @@ use sea_orm_migration::prelude::*;
 /// touches exactly this one table, and the copied rows carry no assignee
 /// references into it — the rebuild needs no `PRAGMA foreign_keys` handling.
 ///
-/// The `down` rebuilds back to the exact 000005 shape (no `site_id`, no
-/// scope CHECK).
+/// The rebuild helper is split by direction: `rebuild_up` recreates the
+/// full 000010 shape (with `site_id` and the scope CHECK), and `rebuild_down`
+/// recreates the exact 000005 shape — the four original columns, the role
+/// CHECK, and the two principal foreign keys, with no `site_id` column and
+/// no scope CHECK — while the data copy and the drop/rename tail are shared.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -37,20 +40,20 @@ impl MigrationTrait for Migration {
     }
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rebuild(manager).await
+        rebuild_up(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rebuild(manager).await
+        rebuild_down(manager).await
     }
 }
 
-async fn rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+/// The up direction: recreates the table with the full 000010 shape — the
+/// nullable `site_id` column naming `instances(id)` and the
+/// scope-vocabulary CHECK, on top of the 000005 shape — then copies every
+/// row and swaps the rebuild into place.
+async fn rebuild_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let connection = manager.get_connection();
-    // The rebuild is symmetric: in both directions the source table's rows
-    // are copied into the new shape without `site_id` — the up direction
-    // starts from a table that has no such column yet, and the down
-    // direction discards the scope (the migration rolls the scope back).
     connection
         .execute_unprepared(
             "CREATE TABLE role_assignments_rebuild (\
@@ -71,10 +74,48 @@ async fn rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                ON UPDATE CASCADE ON DELETE SET NULL)",
         )
         .await?;
-    // The copy goes through the SeaQuery builder (`INSERT ... SELECT` via
-    // `select_from`), so the rebuild's raw-SQL surface stays DDL-only — the
-    // §7.3 bare-SQL gate in `tests/bare_sql_gate.rs` enforces that.
+    copy_shared_columns(manager).await?;
+    finish_rebuild(manager).await
+}
+
+/// The down direction: recreates the table with the exact 000005 shape —
+/// the four original columns, the role CHECK, and the two principal
+/// foreign keys, with no `site_id` column and no scope CHECK. The copy
+/// names only the four shared columns, so the scope is discarded as the
+/// migration rolls back.
+async fn rebuild_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let connection = manager.get_connection();
     connection
+        .execute_unprepared(
+            "CREATE TABLE role_assignments_rebuild (\
+             principal_id UUID NOT NULL PRIMARY KEY,\
+             role TEXT NOT NULL,\
+             assigned_by UUID,\
+             assigned_at TEXT NOT NULL,\
+             CONSTRAINT ck_role_assignments_role \
+               CHECK (role IN ('administrator', 'operator', 'viewer')),\
+             CONSTRAINT fk_role_assignments_principal \
+               FOREIGN KEY (principal_id) REFERENCES principals(id) \
+               ON UPDATE CASCADE ON DELETE CASCADE,\
+             CONSTRAINT fk_role_assignments_assigner \
+               FOREIGN KEY (assigned_by) REFERENCES principals(id) \
+               ON UPDATE CASCADE ON DELETE SET NULL)",
+        )
+        .await?;
+    copy_shared_columns(manager).await?;
+    finish_rebuild(manager).await
+}
+
+/// The data copy into the rebuild table, shared by both directions: it
+/// names exactly the four columns both shapes carry, so the up direction
+/// maps the 000005-shaped source one-to-one and the down direction
+/// discards `site_id` (the migration rolls the scope back). The copy goes
+/// through the `SeaQuery` builder (`INSERT ... SELECT` via `select_from`),
+/// so the rebuild's raw-SQL surface stays DDL-only — the §7.3 bare-SQL gate
+/// in `tests/bare_sql_gate.rs` enforces that.
+async fn copy_shared_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .get_connection()
         .execute(
             &Query::insert()
                 .into_table(RoleAssignmentShape::RebuildTable)
@@ -96,7 +137,14 @@ async fn rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .map_err(|error| DbErr::Custom(error.to_string()))?
                 .take(),
         )
-        .await?;
+        .await
+        .map(|_| ())
+}
+
+/// The standard rebuild tail, shared by both directions: drop the old table
+/// and rename the rebuilt one into place.
+async fn finish_rebuild(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let connection = manager.get_connection();
     connection
         .execute_unprepared("DROP TABLE role_assignments")
         .await?;

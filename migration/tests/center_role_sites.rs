@@ -2,6 +2,7 @@ use std::error::Error;
 
 use rutilus_entity::{instance, principal, role_assignment};
 use rutilus_migration::Migrator;
+use sea_orm::sea_query::{Alias, Expr, Query};
 use sea_orm::{
     ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend,
     EntityTrait, Set, Statement,
@@ -122,22 +123,17 @@ async fn center_role_sites_migration_scopes_the_roles_to_sites() -> Result<(), B
     Ok(())
 }
 
+// The downgrade assertions spell out the restored table shape, which
+// exceeds the pedantic line budget (the migration tests allow the same
+// lint on their exhaustive assertion tests).
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<dyn Error>> {
     let (directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
-    // Unwind the feature-list alignment and decode-failure migrations plus
-    // the center-role-sites migration; the down of 000010's successor must
-    // restore the 000010-era shape.
-    Migrator::down(&database, Some(3)).await?;
-    let applied = Migrator::get_applied_migrations(&database).await?;
-    assert_eq!(
-        applied.last().map(sea_orm_migration::Migration::name),
-        Some("m20260810_000001_center_data_sites")
-    );
-
-    // The site_id column is gone: the scoped insert is refused and the
-    // original four-column shape works.
+    // Seed a principal and a site with a scoped assignment, so the
+    // downgrade below runs against real data and the rebuild copy must
+    // carry the row over.
     let now = OffsetDateTime::now_utc();
     let principal_id = Uuid::now_v7();
     principal::ActiveModel {
@@ -149,12 +145,95 @@ async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<
     }
     .insert(&database)
     .await?;
-    let scoped = role_assignment::ActiveModel {
+    let site_id = Uuid::now_v7();
+    instance::ActiveModel {
+        id: Set(site_id),
+        display_name: Set(String::from("Site One")),
+        instance_kind: Set(String::from("site")),
+        created_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    role_assignment::ActiveModel {
         principal_id: Set(principal_id),
         role: Set(String::from("operator")),
         assigned_by: Set(None),
         assigned_at: Set(now),
-        site_id: Set(Some(Uuid::now_v7())),
+        site_id: Set(Some(site_id)),
+    }
+    .insert(&database)
+    .await?;
+
+    // Unwind the feature-list alignment and decode-failure migrations plus
+    // the center-role-sites migration; the down of 000010's successor must
+    // restore the 000010-era shape.
+    Migrator::down(&database, Some(3)).await?;
+    let applied = Migrator::get_applied_migrations(&database).await?;
+    assert_eq!(
+        applied.last().map(sea_orm_migration::Migration::name),
+        Some("m20260810_000001_center_data_sites")
+    );
+
+    // Schema-level proof that the site_id column is really gone: PRAGMA
+    // table_info lists exactly the four original columns. (The insert-based
+    // check would pass under both hypotheses — an unknown site is refused
+    // by the foreign key even while the column exists — so the schema is
+    // asserted directly.)
+    let columns = database
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "PRAGMA table_info(role_assignments)",
+            vec![],
+        ))
+        .await?;
+    let names: Vec<String> = columns
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(1))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        names,
+        ["principal_id", "role", "assigned_by", "assigned_at"],
+        "the down must restore the exact four-column 000005 shape"
+    );
+
+    // The seeded scoped assignment survived the rebuild with its scope
+    // discarded. (The entity model still carries `site_id`, which the down
+    // removed, so the row is counted through raw SQL instead of the
+    // entity.)
+    let statement = Query::select()
+        .expr(Expr::cust("COUNT(*) AS row_count"))
+        .from(Alias::new("role_assignments"))
+        .to_owned();
+    let row = database
+        .query_one(&statement)
+        .await?
+        .ok_or("role_assignments must exist after the rollback")?;
+    assert_eq!(
+        row.try_get_by_index::<i64>(0)?,
+        1,
+        "the scoped assignment must survive the down rebuild"
+    );
+
+    // A scoped insert through the entity is refused — and, unlike the
+    // random-UUID probe, this one discriminates: the site exists, so the
+    // insert would succeed under the old (000010-shaped) table and fails
+    // only because the column is truly gone.
+    let second_id = Uuid::now_v7();
+    principal::ActiveModel {
+        id: Set(second_id),
+        name: Set(String::from("operator-2")),
+        state: Set(String::from("enabled")),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    let scoped = role_assignment::ActiveModel {
+        principal_id: Set(second_id),
+        role: Set(String::from("operator")),
+        assigned_by: Set(None),
+        assigned_at: Set(now),
+        site_id: Set(Some(site_id)),
     }
     .insert(&database)
     .await;
@@ -169,9 +248,20 @@ async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<
             DbBackend::Sqlite,
             "INSERT INTO role_assignments (principal_id, role, assigned_by, assigned_at) \
              VALUES (?, 'operator', NULL, ?)",
-            vec![principal_id.into(), now.into()],
+            vec![second_id.into(), now.into()],
         ))
         .await?;
+    // The original role CHECK survived the rebuild: an unknown role is
+    // still refused.
+    let bad_role = database
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO role_assignments (principal_id, role, assigned_by, assigned_at) \
+             VALUES (?, 'owner', NULL, ?)",
+            vec![Uuid::now_v7().into(), now.into()],
+        ))
+        .await;
+    assert!(bad_role.is_err(), "the role CHECK must survive the down");
 
     drop(database);
     drop(directory);
