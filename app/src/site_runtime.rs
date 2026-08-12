@@ -48,6 +48,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
+use tracing::instrument;
 
 use crate::{
     CenterClientConfig, StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError,
@@ -667,6 +668,7 @@ impl axum::serve::Listener for TlsListener {
 ///
 /// Returns [`SiteRunError`] while preserving both server and close failures
 /// if they occur during the same shutdown.
+#[instrument(skip_all, fields(data_directory = %paths.data_directory().display()))]
 pub async fn run_site<Stop>(
     paths: &RuntimePaths,
     options: &SiteRunOptions,
@@ -1303,6 +1305,7 @@ pub(crate) fn spawn_center_sync(
 
 /// The engine task body: the §15.4 sync loop with the binding-revocation
 /// watch as its stop condition.
+#[instrument(skip_all)]
 async fn run_center_sync_task(
     bundle: CenterSyncBundle,
     state: Arc<StandaloneState>,

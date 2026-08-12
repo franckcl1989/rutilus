@@ -71,6 +71,7 @@ use rutilus_security::{
 use secrecy::SecretString;
 use tempfile::NamedTempFile;
 use thiserror::Error;
+use tracing::instrument;
 use uuid::Uuid;
 
 /// The product version recorded in every backup package.
@@ -153,6 +154,7 @@ impl RestoreOutcome {
 /// Returns [`BackupError`] when the instance is running or not initialized,
 /// any state cannot be read, the master key cannot be recovered, the
 /// package cannot be created or verified, or the output cannot be written.
+#[instrument(skip_all, fields(data_directory = %paths.data_directory().display()))]
 pub async fn create_backup(
     paths: &RuntimePaths,
     unlock: &BackupKeyUnlock,
@@ -218,6 +220,7 @@ pub async fn create_backup(
 /// Returns [`BackupError`] when the instance is running, the master key is
 /// unrecoverable or does not match the package, the package is invalid, the
 /// versions are incompatible, or any file cannot be written or verified.
+#[instrument(skip_all, fields(data_directory = %paths.data_directory().display(), package = %package_path.display()))]
 pub async fn restore_backup(
     paths: &RuntimePaths,
     unlock: &BackupKeyUnlock,
@@ -322,6 +325,7 @@ fn acquire_stopped_instance(paths: &RuntimePaths) -> Result<RuntimeLock, BackupE
 ///
 /// Returns [`BackupError`] when no envelope exists or the envelope cannot be
 /// loaded or authenticated.
+#[instrument(skip_all)]
 async fn recover_instance_master_key(
     paths: &RuntimePaths,
     unlock: &BackupKeyUnlock,
@@ -346,6 +350,7 @@ async fn recover_instance_master_key(
 }
 
 /// Collects every §20.1 entry of the running instance's data directory.
+#[instrument(skip_all)]
 async fn collect_backup_entries(
     paths: &RuntimePaths,
     store: &SqliteStore,
@@ -479,6 +484,7 @@ async fn collect_artifact_entries(
 }
 
 /// Writes the restored non-database files below the data directory.
+#[instrument(skip_all)]
 fn restore_data_directory_files(
     paths: &RuntimePaths,
     backup: &DecryptedBackup,

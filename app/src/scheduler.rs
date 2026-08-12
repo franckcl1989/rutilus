@@ -38,6 +38,7 @@ use rutilus_operation_engine::{EngineError, OperationEngine, OperationStore, Rem
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::watch;
+use tracing::instrument;
 
 /// The cadence of one full scheduling sweep.
 ///
@@ -239,6 +240,7 @@ where
 /// either isolates its failure to one operation or records the failed sweep
 /// and retries on the next tick. `period` is injected so tests run the loop
 /// at a fast cadence; production passes [`TICK_INTERVAL`].
+#[instrument(skip_all, fields(period = ?period))]
 pub(crate) async fn run<Store, Executor, Monitor, Time>(
     mut stop: StopWatch,
     engine: OperationEngine<&Store>,

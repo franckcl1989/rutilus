@@ -56,6 +56,7 @@ use rutilus_application::{
 };
 use rutilus_domain::EndpointId;
 use time::OffsetDateTime;
+use tracing::instrument;
 
 use crate::scheduler::StopWatch;
 
@@ -268,6 +269,7 @@ pub(crate) trait EndpointLister: Send + Sync {
 /// the retention — the runtime's configured policy, defaulting to
 /// [`TelemetryRetention::default`] — so tests can drive the cadence fast and
 /// the runtime owns the policy.
+#[instrument(skip_all, fields(interval = ?interval))]
 pub(crate) async fn run<Driver, Lister, Time>(
     mut stop: StopWatch,
     driver: &Driver,

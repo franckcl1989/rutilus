@@ -69,6 +69,7 @@ use rutilus_application::{
     BoundaryFuture, EventIngestion, EventRepository, EventStream, EventStreamPull, IngestionError,
 };
 use rutilus_domain::{EndpointId, Event};
+use tracing::instrument;
 
 use crate::scheduler::{StopSignal, StopWatch};
 
@@ -368,6 +369,7 @@ impl EventListeners {
     /// of the §14.4 标记端点事件监听失败状态 status map: at shutdown the
     /// runtime's log shows exactly which endpoints stopped being listened
     /// to.
+    #[instrument(skip_all)]
     pub(crate) async fn drain_all(self) {
         for listener in self.listeners.values() {
             listener.stop.signal();
@@ -418,6 +420,7 @@ impl EventListeners {
 /// endpoint enrolled before the process start — is exactly the first
 /// reconciliation. The caller passes the interval so tests can drive the
 /// cadence fast, and the runtime owns the policy.
+#[instrument(skip_all, fields(interval = ?interval))]
 pub(crate) async fn run<Stream, Sink, Lister>(
     mut stop: StopWatch,
     lister: &Lister,
@@ -479,6 +482,7 @@ enum ReconnectOutcome {
 /// reconnect attempt. It exits only on the stop signal (after the in-flight
 /// event finishes) or on a terminal give-up after
 /// [`ReconnectPolicy::max_attempts`] consecutive failures.
+#[instrument(skip_all, fields(endpoint_id = %endpoint_id))]
 async fn run_endpoint_stream<Stream, Sink>(
     mut stop: StopWatch,
     endpoint_id: EndpointId,
@@ -574,6 +578,7 @@ async fn run_endpoint_stream<Stream, Sink>(
 ///
 /// The wait itself is cancellable — a stop landing during the backoff exits
 /// immediately, so shutdown never waits out a backoff.
+#[instrument(skip_all, fields(endpoint_id = %endpoint_id))]
 async fn reconnect_wait(
     stop: &mut StopWatch,
     endpoint_id: EndpointId,

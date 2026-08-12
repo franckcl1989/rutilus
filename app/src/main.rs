@@ -2,7 +2,7 @@
 
 use std::{error::Error, io, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use console::Term;
 use rutilus::{
     BackupKeyUnlock, CenterRunOptions, ListenAddress, SiteRunOptions, StandaloneRunOptions,
@@ -15,6 +15,7 @@ use rutilus_platform::{
     DataLocation, InstanceMarkerFile, InstanceMarkerState, RuntimePaths, ServiceArguments,
 };
 use secrecy::SecretString;
+use tracing::instrument;
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -23,6 +24,22 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// The diagnostic log format: `text` (default) or `json` (one
+    /// newline-delimited structured record per line). Applies to the
+    /// stderr diagnostics only — the CLI's user-facing stdout output is
+    /// unaffected (§7.6 user information vs. diagnostic information).
+    #[arg(long, global = true, value_name = "FORMAT", default_value = "text")]
+    log_format: LogFormat,
+}
+
+/// The stderr diagnostic log format (§6.2).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum LogFormat {
+    /// Human-readable text lines (the default).
+    #[default]
+    Text,
+    /// One newline-delimited structured JSON record per diagnostic.
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -207,22 +224,38 @@ enum ServiceCommand {
 
 /// Initializes the §6.2 diagnostic logging: a `fmt` subscriber writing to
 /// stderr, filtered by the `RUST_LOG` environment variable (defaulting to
-/// `info` when unset or invalid). Diagnostics therefore never mix with the
-/// CLI's user-facing stdout output (§7.6 user information vs. diagnostic
+/// `info` when unset or invalid). `format` selects the human-readable text
+/// layer or the newline-delimited structured JSON layer; the text layer is
+/// the default, so the documented §8.1 behavior is unchanged without the
+/// `--log-format` flag. Diagnostics therefore never mix with the CLI's
+/// user-facing stdout output (§7.6 user information vs. diagnostic
 /// information separation).
-fn init_tracing() {
+fn init_tracing(format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+    match format {
+        LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+        LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    init_tracing();
+    // The CLI is parsed before the subscriber initializes so the
+    // `--log-format` choice can select the diagnostic layer.
     let cli = Cli::parse();
+    init_tracing(cli.log_format);
 
     match cli.command {
         Command::Init { portable } => initialize(portable).await?,
@@ -242,6 +275,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[instrument(skip_all, fields(command = ?command))]
 async fn backup(command: BackupCommand) -> Result<(), Box<dyn Error>> {
     match command {
         BackupCommand::Create { portable, output } => {
@@ -273,6 +307,7 @@ async fn backup(command: BackupCommand) -> Result<(), Box<dyn Error>> {
 /// site's center relationship, mirroring the backup commands' unlock
 /// discipline and refusing to run while the site console owns the
 /// instance.
+#[instrument(fields(portable))]
 async fn unbind(portable: bool) -> Result<(), Box<dyn Error>> {
     let paths = resolve_location(portable)?;
     let unlock = if has_system_master_key(&paths) {
@@ -315,6 +350,7 @@ fn resolve_location(portable: bool) -> Result<RuntimePaths, Box<dyn Error>> {
         .map_err(|error| -> Box<dyn Error> { error.into() })
 }
 
+#[instrument(fields(portable))]
 async fn doctor(portable: bool) -> Result<(), Box<dyn Error>> {
     let location = if portable {
         DataLocation::Portable
@@ -346,6 +382,7 @@ fn print_licenses() {
     print!("{}", rutilus::licenses_text());
 }
 
+#[instrument(skip_all, fields(portable, no_open, telemetry_retention_days = ?telemetry_retention_days, posture = ?posture))]
 async fn run(
     portable: bool,
     no_open: bool,
@@ -420,6 +457,7 @@ fn resolve_posture(args: &PostureArgs) -> Result<Posture, rutilus::SiteConfigErr
     ))
 }
 
+#[instrument(skip_all, fields(command = ?command))]
 async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
     match command {
         ServiceCommand::Install {
@@ -449,6 +487,7 @@ async fn service(command: ServiceCommand) -> Result<(), Box<dyn Error>> {
 /// A configured telemetry retention rides into the registered command line
 /// (`--telemetry-retention-days`), so the service honors the operator's
 /// value from its first start.
+#[instrument(skip_all, fields(portable, telemetry_retention_days = ?telemetry_retention_days))]
 async fn install_service(
     posture: Option<&PostureArgs>,
     portable: bool,
@@ -524,6 +563,7 @@ async fn install_service(
 /// and no interactive prompts. On Windows this registers with the SCM and
 /// stops through the SCM stop control; elsewhere the service manager
 /// supervises the same foreground process.
+#[instrument(skip_all)]
 async fn run_service(
     posture: Option<&PostureArgs>,
     telemetry_retention_days: Option<TelemetryRetention>,
@@ -588,6 +628,7 @@ async fn run_service(
 /// stop (or the console stop signal fires), drains, and releases the SCM
 /// thread.
 #[cfg(windows)]
+#[instrument(skip_all)]
 async fn run_windows_service(
     paths: &rutilus_platform::RuntimePaths,
     run_body: impl FnOnce(
@@ -635,6 +676,7 @@ async fn service_stop_signal(
     }
 }
 
+#[instrument(fields(portable))]
 async fn initialize(portable: bool) -> Result<(), Box<dyn Error>> {
     let location = if portable {
         DataLocation::Portable
@@ -676,7 +718,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BackupCommand, Cli, Command, ListenAddress, PostureArgs, ServiceCommand, TelemetryRetention,
+        BackupCommand, Cli, Command, ListenAddress, LogFormat, PostureArgs, ServiceCommand,
+        TelemetryRetention,
     };
 
     #[test]
@@ -686,7 +729,8 @@ mod tests {
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Command::Version
+                command: Command::Version,
+                ..
             })
         ));
     }
@@ -703,7 +747,8 @@ mod tests {
                     no_open: true,
                     telemetry_retention_days: None,
                     posture: None,
-                }
+                },
+                ..
             })
         ));
     }
@@ -928,7 +973,8 @@ mod tests {
             Ok(Cli {
                 command: Command::Service {
                     command: ServiceCommand::Install { .. }
-                }
+                },
+                ..
             })
         ));
 
@@ -947,7 +993,8 @@ mod tests {
             Ok(Cli {
                 command: Command::Service {
                     command: ServiceCommand::Install { .. }
-                }
+                },
+                ..
             })
         ));
 
@@ -957,7 +1004,8 @@ mod tests {
             Ok(Cli {
                 command: Command::Service {
                     command: ServiceCommand::Uninstall
-                }
+                },
+                ..
             })
         ));
 
@@ -978,7 +1026,8 @@ mod tests {
             Ok(Cli {
                 command: Command::Service {
                     command: ServiceCommand::Run { .. }
-                }
+                },
+                ..
             })
         ));
     }
@@ -1001,7 +1050,8 @@ mod tests {
                         portable: true,
                         output: Some(_)
                     }
-                }
+                },
+                ..
             })
         ));
 
@@ -1014,7 +1064,8 @@ mod tests {
                         portable: false,
                         output: None
                     }
-                }
+                },
+                ..
             })
         ));
 
@@ -1027,7 +1078,8 @@ mod tests {
                         portable: false,
                         path: _
                     }
-                }
+                },
+                ..
             })
         ));
         assert!(Cli::try_parse_from(["rutilus", "backup", "restore"]).is_err());
@@ -1039,19 +1091,22 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["rutilus", "doctor"]),
             Ok(Cli {
-                command: Command::Doctor { portable: false }
+                command: Command::Doctor { portable: false },
+                ..
             })
         ));
         assert!(matches!(
             Cli::try_parse_from(["rutilus", "doctor", "--portable"]),
             Ok(Cli {
-                command: Command::Doctor { portable: true }
+                command: Command::Doctor { portable: true },
+                ..
             })
         ));
         assert!(matches!(
             Cli::try_parse_from(["rutilus", "licenses"]),
             Ok(Cli {
-                command: Command::Licenses
+                command: Command::Licenses,
+                ..
             })
         ));
     }
@@ -1061,13 +1116,15 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["rutilus", "init"]),
             Ok(Cli {
-                command: Command::Init { portable: false }
+                command: Command::Init { portable: false },
+                ..
             })
         ));
         assert!(matches!(
             Cli::try_parse_from(["rutilus", "init", "--portable"]),
             Ok(Cli {
-                command: Command::Init { portable: true }
+                command: Command::Init { portable: true },
+                ..
             })
         ));
     }
@@ -1089,6 +1146,97 @@ mod tests {
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
         })?;
         assert_eq!(options.listen().to_string(), "127.0.0.1:8443");
+        Ok(())
+    }
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        // Without the flag the documented §8.1 text layer is selected, so
+        // the default behavior is unchanged.
+        let parsed = Cli::try_parse_from(["rutilus", "version"]);
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Version,
+                log_format: LogFormat::Text,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_the_global_log_format_flag() {
+        // The flag is global: it is accepted before or after any subcommand.
+        for argv in [
+            vec!["rutilus", "version", "--log-format", "json"],
+            vec!["rutilus", "--log-format", "json", "version"],
+            vec!["rutilus", "run", "--portable", "--log-format", "json"],
+            vec!["rutilus", "backup", "create", "--log-format", "text"],
+        ] {
+            let parsed = Cli::try_parse_from(argv);
+            assert!(
+                matches!(
+                    parsed,
+                    Ok(Cli {
+                        log_format: LogFormat::Json | LogFormat::Text,
+                        ..
+                    })
+                ),
+                "--log-format must parse in every position"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_log_formats() {
+        for value in ["yaml", "JSON", ""] {
+            assert!(
+                Cli::try_parse_from(["rutilus", "version", "--log-format", value]).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    /// A test `io::Write` target appending into an in-memory buffer, so the
+    /// JSON layer's records can be captured without a global subscriber.
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_json_subscriber_emits_structured_records() -> Result<(), Box<dyn std::error::Error>> {
+        // The `--log-format json` layer must emit one newline-delimited JSON
+        // record per diagnostic, with the recorded fields intact.
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_buffer = std::sync::Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || CaptureWriter(std::sync::Arc::clone(&writer_buffer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(endpoint_id = 7, "a structured record");
+        });
+        let captured = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let record: serde_json::Value = serde_json::from_str(captured.trim())?;
+        assert_eq!(record["fields"]["message"], "a structured record");
+        assert_eq!(record["fields"]["endpoint_id"].as_i64(), Some(7));
         Ok(())
     }
 }

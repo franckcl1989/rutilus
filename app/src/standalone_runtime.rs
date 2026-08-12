@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tracing::instrument;
+
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
     CapabilitySnapshotRepository, CenterSessionRegistry, Clock, CoreResourceReader,
@@ -1501,6 +1503,7 @@ pub async fn console_stop_signal() -> io::Result<()> {
 ///
 /// Returns [`StandaloneRunError`] when loopback binding, signal registration,
 /// or HTTP serving fails.
+#[instrument(skip_all)]
 pub async fn run_standalone<Services, Gateway, Time>(
     options: StandaloneRunOptions,
     services: Arc<Services>,
@@ -1558,6 +1561,7 @@ where
 ///
 /// Returns [`StandaloneExecutionError`] while preserving both server and close
 /// failures if they occur during the same shutdown.
+#[instrument(skip_all, fields(data_directory = %paths.data_directory().display()))]
 pub async fn run_initialized_standalone(
     paths: &RuntimePaths,
     unlock: &StandaloneUnlock,
@@ -1629,6 +1633,7 @@ pub async fn run_initialized_standalone(
 /// Returns [`StandaloneRunError`] when signal registration or HTTP serving
 /// fails; the background tasks' own shutdowns are always awaited before the
 /// store close.
+#[instrument(skip_all)]
 pub(crate) async fn run_background_services<Server, Stop>(
     services: Arc<StandaloneState>,
     gateway: Arc<RedfishGateway>,
@@ -1967,6 +1972,7 @@ async fn run_operation_scheduler(
 /// `JoinError` means the task panicked or was cancelled, a programming
 /// defect worth surfacing but not a blocker for the `SQLite` close that
 /// follows.
+#[instrument(skip_all)]
 async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = scheduler.await {
         tracing::error!("The operation scheduling loop failed: {join_error}");
@@ -1979,6 +1985,7 @@ async fn drain_scheduler(scheduler: &mut tokio::task::JoinHandle<()>) {
 /// signal, after every per-endpoint listener has drained — so a `JoinError`
 /// means the wrapper panicked or was cancelled, a programming defect worth
 /// surfacing but not a blocker for the `SQLite` close that follows.
+#[instrument(skip_all)]
 async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = listeners.await {
         tracing::error!("The event listener task failed: {join_error}");
@@ -1991,6 +1998,7 @@ async fn drain_listeners(listeners: &mut tokio::task::JoinHandle<()>) {
 /// after its in-flight sweep finishes — so a `JoinError` means the wrapper
 /// panicked or was cancelled, a programming defect worth surfacing but not a
 /// blocker for the `SQLite` close that follows.
+#[instrument(skip_all)]
 async fn drain_sampler(sampler: &mut tokio::task::JoinHandle<()>) {
     if let Err(join_error) = sampler.await {
         tracing::error!("The telemetry sampling task failed: {join_error}");

@@ -50,8 +50,9 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 # §6.2 diagnostic logging: the runtime modules record operational failures
-# through `tracing::error!`/`warn!`, and main.rs initializes the
-# tracing-subscriber stderr subscriber (RUST_LOG-filtered).
+# through `tracing::error!`/`warn!` inside `#[instrument]` spans, and main.rs
+# initializes the tracing-subscriber stderr subscriber (RUST_LOG-filtered;
+# text by default, or newline-delimited JSON with `--log-format json`).
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { workspace = true, features = ["v7"] }

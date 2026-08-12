@@ -45,6 +45,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tracing::{Instrument as _, instrument};
 
 use crate::{
     ListenAddress,
@@ -158,6 +159,7 @@ impl CenterClientConfig {
     /// center cannot be reached or verified (including a pin mismatch),
     /// the WebSocket upgrade fails, or the center rejects the
     /// negotiation with its stable reason code.
+    #[instrument(skip(self), fields(center = %self.center))]
     pub async fn connect(&self) -> Result<CenterLink, CenterClientError> {
         tokio::time::timeout(self.options.connect_timeout, self.connect_inner())
             .await
@@ -174,6 +176,7 @@ impl CenterClientConfig {
     ///
     /// Returns [`CenterClientError::StopRequested`] when `stop` resolves
     /// between attempts.
+    #[instrument(skip_all, fields(center = %self.center))]
     pub async fn connect_with_retry<Stop>(
         &self,
         stop: Stop,
@@ -182,8 +185,13 @@ impl CenterClientConfig {
         Stop: Future<Output = ()> + Send,
     {
         tokio::pin!(stop);
+        let mut attempts = 0_u32;
         loop {
-            match self.connect().await {
+            attempts += 1;
+            // One span per attempt correlates the failed-connection
+            // diagnostics of a reconnect storm with the attempt number.
+            let attempt = tracing::info_span!("connect_attempt", attempt = attempts);
+            match self.connect().instrument(attempt).await {
                 Ok(link) => return Ok(link),
                 Err(error) => {
                     tracing::warn!(
@@ -400,6 +408,7 @@ impl CenterLink {
     /// Returns [`CenterClientError::Closed`] when the center closes the
     /// connection or the transport ends, and [`CenterClientError`] for
     /// transport and protocol failures.
+    #[instrument(skip_all)]
     pub async fn run<H>(mut self, mut handler: H) -> Result<(), CenterClientError>
     where
         H: CenterFrameHandler<CenterLink>,

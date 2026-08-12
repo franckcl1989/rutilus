@@ -66,6 +66,7 @@ use rutilus_web::{
 };
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::instrument;
 
 use crate::{
     AcceptedCenterConnection, CenterAcceptError, CenterAcceptor, CenterAcceptorError,
@@ -572,6 +573,7 @@ impl StandaloneState {
 ///
 /// Returns [`CenterRunError`] while preserving both server and close
 /// failures if they occur during the same shutdown.
+#[instrument(skip_all, fields(data_directory = %paths.data_directory().display()))]
 pub async fn run_center<Stop>(
     paths: &RuntimePaths,
     options: &CenterRunOptions,
@@ -647,6 +649,7 @@ fn arm_center_issuer(
 /// Serves the center console and the center protocol listener until the
 /// external `stop` future resolves, draining the accept loop (and its
 /// in-flight connection engines) before the console.
+#[instrument(skip_all)]
 async fn run_center_services<Stop>(
     state: Arc<StandaloneState>,
     binding: SiteBinding,
@@ -733,6 +736,7 @@ fn center_banner(console_url: &str, acceptor: &CenterAcceptor) -> String {
 /// The admission is resolved inside the accept (audit follow-up F4): a
 /// refused site receives its `not-bound` `NegotiationResult` at negotiation
 /// time, so it converges its local binding instead of retrying forever.
+#[instrument(skip_all)]
 async fn run_center_accept_loop(
     mut stop: scheduler::StopWatch,
     state: Arc<StandaloneState>,
@@ -783,6 +787,7 @@ async fn run_center_accept_loop(
 /// owns its Arc clones of the instance state, so every repository
 /// reference is built inside the task; the engine observes the shared stop
 /// watch and the registry removes the site on every exit.
+#[instrument(skip_all)]
 async fn run_center_connection(
     state: Arc<StandaloneState>,
     accepted: AcceptedCenterConnection,
