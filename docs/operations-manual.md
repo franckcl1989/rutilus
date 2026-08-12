@@ -380,3 +380,49 @@ Windows `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`、macOS Universal 2
 `deny.toml` 的 `[graph] targets` 已列出全部发布目标。CI 现状（2026-08-12）：musl x86_64/aarch64 与
 macOS Universal 2 的构建步骤均已入 CI（见上表），Linux 门禁本身仍跑 gnu 目标；Windows ARM64 构建
 未入 CI（真实原因见上表注释引用）。
+
+## 十一、故障注入演练（drills）
+
+设计 §19.3 剩余项（产品进程在任务中被终止 / BMC 更新中重启 / SQLite 写入中断）的**进程级
+演练套件**已落地（`scripts/drills/`，2026-08-12），并覆盖 §20.1/§20.2 备份恢复与 §0.4.0
+大文件中断形态；**磁盘空间不足场景未覆盖**（无管理员权限的可靠模拟手段受限，成本/收益评估后
+保持未覆盖）。
+
+**前置条件**：
+
+- **debug 构建产物**：套件直接调用 `target/debug/rutilus.exe` 与 `target/debug/mock-bmc.exe`
+  （`scripts/drills/drill-lib.ps1` 自动定位仓库根与二进制目录），先执行 `cargo build` 与
+  mock-bmc 二进制构建；
+- **Windows 10 1809+（ConPTY 要求）与 Windows PowerShell 5.1**（drill-lib.ps1 明确 PS 5.1
+  兼容，无 BOM 纯 ASCII）；
+- **真实交互控制台会话**（Windows Terminal / PowerShell 窗口）：伪控制台（ConPTY）驱动依赖
+  交互终端；在 Claude Code 等工具进程 spawn 的上下文中 ConPTY 不可用（伪控制台子进程一律
+  0xC0000142 启动失败、零输出），该环境只能验证挂起防护路径、不能做功能验证——2026-08-12
+  首轮实跑 6/6 SKIP 即此根因（证据与复测记录见 `scripts/drills/RESULTS.md`）。
+
+**用法**：从仓库根目录逐个运行（每个 drill 都是独立 PowerShell 脚本；`-KeepWorkDir` 开关
+保留演练工作目录供排障）：
+
+```text
+powershell -File scripts/drills/drill-backup-restore-cycle.ps1
+powershell -File scripts/drills/drill-sqlite-write-interruption.ps1
+powershell -File scripts/drills/drill-bmc-restart-during-task.ps1
+powershell -File scripts/drills/drill-large-file-interruption.ps1
+powershell -File scripts/drills/drill-kill-mid-operation.ps1
+```
+
+`drill-delay-proxy.ps1` 是共享中继组件（自研 TCP 延迟中继，由 drill-lib.ps1 以独立进程启动，
+供 drill-kill-mid-operation 保持 BMC 响应在途），不单独运行。
+
+**输出**：每个 drill 在 `scripts/drills/logs/` 写结构化日志（STEP/PASS/FAIL/WARN 分级 +
+ISO 时间戳，同时输出到控制台）；每次实跑结果追加登记于 `scripts/drills/RESULTS.md`
+（不覆盖、不删除历史登记）。
+
+**已知限制（如实）**：套件基于 mock-bmc + delay relay **合成 fixture**（非真实设备、非真实
+中断形态）；`drill-sqlite-write-interruption` 受 Windows 文件语义限制只能模拟「启动时不可用」；
+`drill-bmc-restart-during-task` 的 mock 不推进 Task 状态（操作恒滞留 `WaitingRemote`）；
+**首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP**（2026-08-12），挂起防护（Start-ConPtyProcess
+启动探测 5s 窗口 / Wait-ConPtyOutput 超时〔默认 60s〕/ Stop-ConPtySession·Dispose 看门狗
+4s 限时）已修复并复测（3 次均 0.6s 快速 FAIL、超时分支 3.2s 有界返回、清理 0s），**功能验证
+待真实交互控制台会话复跑**；磁盘空间不足未覆盖；套件为 **Windows 专属**（ps1），Linux/macOS
+等价脚本未编写。

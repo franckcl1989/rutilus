@@ -149,6 +149,7 @@ NVIDIA 类型化写操作（9 个，全部映射到 `RedfishCommand::Oem`；`inf
 | Mock Center | scripted mTLS 中心（Hello/NegotiationResult、二进制帧 WebSocket），驱动真实 CenterClient 互操作测试 |
 | Fixture | 设计 §19.1 要求保存脱敏真实 BMC 响应（Dell/HPE/Lenovo/xFusion/Inspur 各固件版本）并随上游升级回归；**当前代码库中尚无 fixture 目录**（如实标注，属于 0.9.0 内容） |
 | 真实设备验证 | 设计目标为五个厂商至少各一台真实设备进入 1.0.0 认证矩阵（§19.1）；**尚未达成**，属于 0.9.0 实验室工作 |
+| 进程级故障注入演练 | `scripts/drills/` 7 脚本 + RESULTS.md（2026-08-12 落地），Windows 本机形态（mock-bmc + delay relay，无物理设备/外部证书依赖）：§19.3 剩余 4 项覆盖 3 项（产品进程在任务中被终止 / BMC 更新中重启 / SQLite 写入中断；**磁盘空间不足未覆盖**）+ §20.1/§20.2 备份恢复 + §0.4.0 大文件中断；**首轮实跑 6/6 SKIP**（2026-08-12，执行上下文 ConPTY 不可用，非产品问题；挂起防护修复后快速 FAIL 路径已验证），**功能验证待真实交互控制台会话复跑**；Linux/macOS 等价脚本未编写 |
 
 ## 五、明确不承诺项
 

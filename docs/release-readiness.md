@@ -50,7 +50,7 @@
 | 无已知重复执行 | ✅ 结构性 | 事件去重键（`domain/src/event.rs:383` `dedup_key`）、批量重投 no-op（`operation-engine/src/operation_engine.rs:1332` `create_batch_redelivery_is_a_no_op_that_never_duplicates_children`）、重复 offer 幂等（`application/src/center_sync.rs:3478` 拒绝态不可复活、`:3528` 完成态返回记录结果）、重连重复突发只生效一次（`center_sync.rs:4448` 风暴测试） | 无已知差距；前述证据均为自动化测试钉死的结构性事实 |
 | 无已知错误成功报告 | 🟡 部分 | 写后重读验证系列（`infra-redfish/src/redfish_gateway.rs` `verifies_*` 测试群，如 `:29667`）、响应丢失→Unknown 不盲重试（`redfish_gateway.rs:28807` `classifies_a_dropped_connection_during_the_write_as_result_unknown`）、**412 冲突专用路径**（`CommandExecutionError::PreconditionFailed`：BMC `412` 证明写未执行 + 重读目标不覆盖并发变更，`redfish_gateway.rs:598-611, 12653-12690, 14002-14062`，深度审查批次 commit 6128a17）、`docs/known-limitations.md` §七「HTTP 成功不等于业务成功」 | 结构性证据充分；「整体清零」是评审结论而非可自动化断言的事实。前置条件：0.9.0 发布评审对证据链复核并给出清零结论 |
 | 三平台安装、升级、备份、恢复通过 | ⏳ 演练未执行 | 备份/恢复自动化往返已覆盖（`app/src/backup.rs:1051` 往返保数据、`:1095` 拒绝他实例包、`:1121` 跨机恢复需源信封、`:1208` 源口令对全新信封、`:1240` 需停止实例、`:1266` 拒绝未初始化目录、`:1277` 拒绝不同产品版本；**迭代七 T-E 02459dc 补恢复前预快照三态**：`:1307` 失败保留供回滚、`:1384` 成功清除、`:1404` 拷贝失败不动源目录）；恢复流程实现见 `docs/operations-manual.md` §六-§七 | 三平台（Windows/macOS/Linux）安装、升级、备份、恢复的**发布包级演练**未执行（§四-B）。前置条件：三平台环境 + 发布包 + 签名产物（签名本身为 C 类，见 §四-C） |
-| Center/Site 长时间断线重连通过 | 🟡 部分 | 单连接语义（如 `center_sync.rs:2853` 断线退避重连）与**多连接并发重连风暴**（`center_sync.rs:4328` 全部 outbox 从最后 Ack 续传、`:4448` 重复突发幂等、`:4838` 心跳与重连交错、`:4968` 断线期间本地队列累积并按序排空）+ 重连进度重发（`:4615`）；合计 33 个测试全过（`docs/milestone-status.md:240`）；断线行为语义见 `docs/operations-manual.md` §5.3（心跳 30s、断线判定 90s、重连退避 120s） | 长时间（跨进程/跨天）真实断线演练未执行（§四-B）。前置条件：站点 + 中心运行环境 |
+| Center/Site 长时间断线重连通过 | 🟡 部分 | 单连接语义（如 `center_sync.rs:2853` 断线退避重连）与**多连接并发重连风暴**（`center_sync.rs:4328` 全部 outbox 从最后 Ack 续传、`:4448` 重复突发幂等、`:4838` 心跳与重连交错、`:4968` 断线期间本地队列累积并按序排空）+ 重连进度重发（`:4615`）；合计 33 个测试全过（`docs/milestone-status.md:259`）；断线行为语义见 `docs/operations-manual.md` §5.3（心跳 30s、断线判定 90s、重连退避 120s） | 长时间（跨进程/跨天）真实断线演练未执行（§四-B）。前置条件：站点 + 中心运行环境 |
 
 ### 1.1 0.9.0「内容」逐项盘点（汇总）
 
@@ -60,15 +60,15 @@
 
 | 内容项 | 状态 | 关键证据位置 |
 |---|---|---|
-| 五厂商实验室 | ⏳ | `milestone-status.md:235`；§四-B |
+| 五厂商实验室 | ⏳ | `milestone-status.md:254`；§四-B |
 | 所有 Fixture 回归 | 🟡 | 合成 mock 回归齐备，脱敏真实响应 fixture 目录尚无（`known-limitations.md:76-79`） |
-| 故障注入 | 🟡 | §19.3 多数场景单进程覆盖（`milestone-status.md:237`）；跨进程剩余项见 §四-B |
+| 故障注入 | 🟡 | §19.3 多数场景单进程覆盖（`milestone-status.md:256`）；**Windows 侧进程级演练套件已落地（`scripts/drills/` 7 脚本 + RESULTS.md，2026-08-12，覆盖 §19.3 剩余 4 项中的 3 项 + §20.1/§20.2 备份恢复 + §0.4.0 大文件中断）**，首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP、挂起防护修复后快速 FAIL 路径已验证，功能验证待真实交互控制台会话复跑；磁盘空间不足未覆盖；Linux/macOS 等价脚本未编写（ps1 为 Windows 专属）；详见 §四-B |
 | 跨平台 E2E | ✅ | `ci.yml:130-147`（windows/macos 任务，web/tests 9 个路径套件 + `app/tests/version.rs`） |
 | 数据库压力 | ✅ | `persistence/tests/stress_capacity.rs` 3 测试（`:336, :585, :832`），规模常量对齐设计最低验证规模（`:47-52`） |
 | 中心重连风暴 | ✅ | `center_sync.rs` 33 测试（风暴 4 + 重发 1，见上表） |
-| 大文件更新 | 🟡 | 分块机制全链路覆盖（`milestone-status.md:241`）；真实固件端到端演练未做（§四-B） |
-| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:242`）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、8 测试、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:55-59, 1000-1002`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1195`）；CI 独立步骤 `ci.yml:225-227` Secret leak gate，`cargo test --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
-| 权限测试 | ✅ | 角色掩码/中心站点作用域/限速/BMC 写权限拒绝（`milestone-status.md:243`） |
+| 大文件更新 | 🟡 | 分块机制全链路覆盖（`milestone-status.md:260`）；真实固件端到端演练未做（§四-B） |
+| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:261`）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、8 测试、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:55-59, 1000-1002`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1195`）；CI 独立步骤 `ci.yml:225-227` Secret leak gate，`cargo test --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
+| 权限测试 | ✅ | 角色掩码/中心站点作用域/限速/BMC 写权限拒绝（`milestone-status.md:262`） |
 | 安全审查 | 🟡 | `docs/security-review.md` 已交付（8 范围 + §7.7 扫描，无 BLOCKER）；MINOR-1 已修复（`web/src/auth.rs:1307, 1314, 1335-1346, 1438`）；N5 已关闭（E3c 编译期 const assert，`web/src/lib.rs:1223`）；深度审查批次补认证边界硬化（B1-B4，commit 8147bc9：密码策略 API 边界 / 429 不写审计 / 撤销信号 / M1 残留面证反关闭，见 §三 B1-B4 行）；**迭代七**：N3 限速器桶键淘汰已实现（T-D e7aef53，web 133 全过），§九 8 项遗留全部落地/处置（`milestone-status.md` §7.5） |
 | Migration 回归 | ✅ | `migration/tests/` 20 个测试文件（含 E4 防回归 `resource_feature_lists.rs`）；迁移总数 23；CI 门禁 `ci.yml:306-310` |
 | 备份恢复演练 | 🟡 | 自动化往返 10 测试（见上表证据，含迭代七 T-E 预快照三态 3 测试）；三平台演练未执行（§四-B） |
@@ -137,7 +137,7 @@
 |---|---|---|---|
 | 五厂商实验室 / 真实设备认证矩阵 | Dell/HPE/Lenovo/xFusion/Inspur 各至少一台真实设备进入认证矩阵；验证标准 feature + 上游已有 OEM feature（Dell/HPE/Lenovo）、标准模式限制（xFusion/Inspur） | 五厂商设备与网络环境 | 8、9、10 |
 | 真实响应 fixture 目录 | 五厂商各固件版本脱敏真实响应，随 nv-redfish 升级回归（§19.1 Fixture Test） | 设备抓取 → 脱敏 → 入库 | 8、9 的回归基础 |
-| 进程级故障注入演练 | 产品进程在任务中被终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（§19.3 剩余项，跨进程形态） | 三平台测试环境 | 11、12 的实测面 |
+| 进程级故障注入演练 | **Windows 侧套件已落地（`scripts/drills/` 7 脚本 + RESULTS.md，2026-08-12）**：覆盖产品进程在任务中被终止 / BMC 更新中重启 / SQLite 写入中断（§19.3 剩余 4 项中的 3 项）+ 备份恢复（§20.1/§20.2）+ 大文件中断（§0.4.0）；首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP、挂起防护修复后快速 FAIL 路径已验证，**功能验证待真实交互控制台会话复跑**；**磁盘空间不足未覆盖**；Linux/macOS 等价脚本未编写（ps1 为 Windows 专属） | Windows 本机：debug 构建（rutilus.exe + mock-bmc.exe）+ 真实交互控制台（ConPTY）；跨平台等价脚本待编写 | 11、12 的实测面 |
 | 大文件更新端到端演练 | 真实大固件文件的上传→校验→分发→应用 | 真实固件制品 + 设备或等价测试台 | 12 的实测面 |
 | 三平台安装/升级/备份/恢复演练 | 0.9.0 验收第 5 项、1.0.0 条件 15：Windows/macOS/Linux 各跑安装→备份→升级→恢复→任务恢复 | 三平台机器 + 发布包 + 签名产物（签名属 C） | 7、15 |
 | Center/Site 长时间断线重连演练 | 0.9.0 验收第 6 项：跨进程/跨天真实断线（自动化风暴已覆盖单进程形态） | 站点 + 中心运行环境 | 14 的实测面 |

@@ -77,6 +77,15 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
   各固件版本的真实响应 fixture 并随上游升级回归）——属于 0.9.0 内容；
 - 真实设备验证（五厂商至少各一台进入 1.0.0 认证矩阵，§19.1）尚未达成；
 - 含义：当前对真实 BMC 兼容性的结论都应视为"基于上游类型面与 mock/fixture 验证"，不是实测认证。
+- 进程级故障注入演练套件（`scripts/drills/`，2026-08-12 落地）同样基于 **mock-bmc + 自研
+  delay relay 合成 fixture**（非真实设备、非真实中断形态）：`drill-sqlite-write-interruption`
+  受 Windows 文件语义限制只能模拟「启动时不可用」，无法模拟运行中句柄被外部抢占；`drill-bmc-restart-during-task`
+  的 mock 不推进 Task 状态（操作恒滞留 `WaitingRemote`）；**首轮实跑 6/6 SKIP**（2026-08-12，
+  如实登记：执行上下文（Claude Code 工具进程 spawn）ConPTY 不可用——伪控制台子进程一律
+  0xC0000142 启动失败、零输出（含 cmd.exe 对照），产品 rutilus.exe 在普通管道下正确报错退出 1
+  （"local unlock requires an interactive terminal"），非产品问题；该问题同时暴露套件硬挂起
+  缺陷，挂起防护修复后快速 FAIL 路径已验证），**功能验证待真实交互控制台会话复跑**；
+  **磁盘空间不足场景未覆盖**（无管理员权限的可靠模拟手段受限）。
 
 ## 六、发布级容量建议已发布（release 构建数据，正式规模环境复核仍待做）
 
