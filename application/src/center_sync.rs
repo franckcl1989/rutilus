@@ -1820,6 +1820,7 @@ mod tests {
     };
     use time::OffsetDateTime;
     use tokio::sync::mpsc;
+    use tokio::task::JoinSet;
 
     use super::*;
     use crate::{
@@ -2540,34 +2541,9 @@ mod tests {
             now: OffsetDateTime,
         ) -> Result<(), Box<dyn Error + Send + Sync>> {
             for index in 1..=count {
-                let sequence = {
-                    let mut entries = self
-                        .entries
-                        .lock()
-                        .map_err(|_| std::io::Error::other("the mock outbox lock was poisoned"))?;
-                    let next = entries.iter().map(OutboxEntry::sequence).max().unwrap_or(0) + 1;
-                    let envelope = Envelope {
-                        sequence: u64::try_from(next).map_err(|_| {
-                            std::io::Error::other("the mock outbox sequence overflowed")
-                        })?,
-                        acked_sequence: 0,
-                        message: Some(EnvelopeMessage::Heartbeat(Heartbeat {
-                            sent_at_unix: i64::try_from(index).map_err(|_| {
-                                std::io::Error::other("the mock heartbeat time overflowed")
-                            })?,
-                        })),
-                    };
-                    let entry = OutboxEntry::new(
-                        OutboxEntryId::generate(),
-                        self.instance_id,
-                        next,
-                        serde_json::to_string(&envelope)?,
-                        now,
-                    );
-                    entries.push(entry);
-                    next
-                };
-                let _ = sequence;
+                let sent_at_unix = i64::try_from(index)
+                    .map_err(|_| std::io::Error::other("the mock heartbeat time overflowed"))?;
+                push_heartbeat_entry(&self.entries, self.instance_id, sent_at_unix, now)?;
             }
             Ok(())
         }
@@ -2597,24 +2573,7 @@ mod tests {
         /// The pending messages, in sequence order, decoded from their §9.4
         /// payload records.
         fn pending_messages(&self) -> Result<Vec<EnvelopeMessage>, Box<dyn Error + Send + Sync>> {
-            let entries = self
-                .entries
-                .lock()
-                .map_err(|_| std::io::Error::other("the mock outbox lock was poisoned"))?;
-            let mut pending = entries
-                .iter()
-                .filter(|entry| entry.state() == OutboxEntryState::Pending)
-                .cloned()
-                .collect::<Vec<_>>();
-            pending.sort_by_key(OutboxEntry::sequence);
-            let mut messages = Vec::with_capacity(pending.len());
-            for entry in pending {
-                let envelope: Envelope = serde_json::from_str(entry.payload_json())?;
-                if let Some(message) = envelope.message {
-                    messages.push(message);
-                }
-            }
-            Ok(messages)
+            pending_messages_from(&self.entries)
         }
     }
 
@@ -2683,6 +2642,63 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// Appends one heartbeat entry to the shared entries vector of a
+    /// [`MockOutbox`] — the offline-queue writer of the reconnect storm
+    /// tests: local producers keep enqueuing into the durable outbox while
+    /// the engine is disconnected (§21 0.7.0), and the flush drains the same
+    /// rows on the next connection.
+    fn push_heartbeat_entry(
+        entries: &Arc<Mutex<Vec<OutboxEntry>>>,
+        instance_id: InstanceId,
+        sent_at_unix: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut rows = entries
+            .lock()
+            .map_err(|_| std::io::Error::other("the mock outbox lock was poisoned"))?;
+        let next = rows.iter().map(OutboxEntry::sequence).max().unwrap_or(0) + 1;
+        let envelope = Envelope {
+            sequence: u64::try_from(next)
+                .map_err(|_| std::io::Error::other("the mock outbox sequence overflowed"))?,
+            acked_sequence: 0,
+            message: Some(EnvelopeMessage::Heartbeat(Heartbeat { sent_at_unix })),
+        };
+        rows.push(OutboxEntry::new(
+            OutboxEntryId::generate(),
+            instance_id,
+            next,
+            serde_json::to_string(&envelope)?,
+            now,
+        ));
+        Ok(())
+    }
+
+    /// The pending messages of the shared entries vector, in sequence order,
+    /// decoded from their §9.4 payload records — the reader counterpart of
+    /// [`push_heartbeat_entry`]: a storm test observes the outbox through
+    /// the shared vector while the engine owns the mock.
+    fn pending_messages_from(
+        entries: &Arc<Mutex<Vec<OutboxEntry>>>,
+    ) -> Result<Vec<EnvelopeMessage>, Box<dyn Error + Send + Sync>> {
+        let rows = entries
+            .lock()
+            .map_err(|_| std::io::Error::other("the mock outbox lock was poisoned"))?;
+        let mut pending = rows
+            .iter()
+            .filter(|entry| entry.state() == OutboxEntryState::Pending)
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.sort_by_key(OutboxEntry::sequence);
+        let mut messages = Vec::with_capacity(pending.len());
+        for entry in pending {
+            let envelope: Envelope = serde_json::from_str(entry.payload_json())?;
+            if let Some(message) = envelope.message {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
     }
 
     /// Awaits the wire ends of the next established session.
@@ -4288,6 +4304,521 @@ mod tests {
         assert_eq!(delta.op, ResourceDeltaOp::Delete as i32);
         assert_eq!(delta.resource, None);
         assert!(delta.payload_json.is_empty());
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        assert!(
+            stopped.is_ok(),
+            "the engine must stop cleanly, got {stopped:?}"
+        );
+        Ok(())
+    }
+
+    /// The §0.9.0 reconnect storm: several independent site loops — each
+    /// with its own per-instance durable outbox — lose their connections at
+    /// the same instant and reconnect concurrently. Every flush resumes from
+    /// that instance's last acknowledged sequence: nothing lost, nothing
+    /// already acknowledged re-sent (§15.4 at-least-once delivery).
+    #[tokio::test]
+    async fn a_concurrent_reconnect_storm_resumes_every_outbox_from_its_last_ack()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        // Four concurrent site loops share one center-side storm; each
+        // acknowledges a different prefix of its five-message queue so every
+        // resume point is distinct — the acknowledgement watermark is per
+        // instance.
+        let acked_by = [1u64, 3, 2, 4];
+        let mut runs = JoinSet::new();
+        let mut stops = Vec::new();
+        let mut states = Vec::new();
+        let mut wires = Vec::new();
+        for _ in acked_by {
+            let (transport, state, receiver) = ScriptedTransport::new(0);
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let instance_id = InstanceId::generate();
+            runs.spawn(async move {
+                let store = MockEngineStore::new();
+                let inbox = MockInbox::new();
+                let cursor = MockCursor::new();
+                let events = MockEventTail::new(Vec::new());
+                let outbox = MockOutbox::new(instance_id);
+                // The offline queue: five messages queued before the first
+                // connection, the same shape the flush tests assert on the
+                // wire.
+                outbox.enqueue_heartbeats(5, now)?;
+                let engine = CenterSync::new(
+                    transport,
+                    &store,
+                    outbox,
+                    &inbox,
+                    &cursor,
+                    &events,
+                    FixedClock(now),
+                    instance_id,
+                    engine_options(),
+                );
+                engine
+                    .run(async move {
+                        let _ = stop_rx.await;
+                    })
+                    .await?;
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            });
+            stops.push(stop_tx);
+            states.push(state);
+            wires.push(receiver);
+        }
+
+        // Every loop established its first connection and delivered the
+        // whole queue in sequence order.
+        let mut connected = Vec::new();
+        for receiver in &mut wires {
+            let mut wire = next_wire(receiver).await?;
+            for sequence in 1..=5 {
+                let envelope = next_outbox_frame(&mut wire).await?;
+                assert_eq!(envelope.sequence, sequence);
+            }
+            connected.push(wire);
+        }
+        // Each loop acknowledges its own prefix, then every connection drops
+        // at the same instant — one synchronous step, so no loop can make
+        // progress past its drop point before the storm is complete.
+        for (wire, acked) in connected.iter_mut().zip(acked_by) {
+            wire.inbound
+                .send(Envelope {
+                    sequence: 10,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::Ack(Ack { sequence: acked })),
+                })
+                .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        }
+        for wire in connected {
+            let Wire { outbound, inbound } = wire;
+            drop(outbound);
+            drop(inbound);
+        }
+
+        // All loops reconnect concurrently (each waits out the same backoff);
+        // every flush resumes exactly after its own last acknowledgement —
+        // the acked prefix is never re-sent and the rest is never lost.
+        for (receiver, acked) in wires.iter_mut().zip(acked_by) {
+            let mut wire = next_wire(receiver).await?;
+            for sequence in acked + 1..=5 {
+                let envelope = next_outbox_frame(&mut wire).await?;
+                assert_eq!(envelope.sequence, sequence);
+            }
+        }
+        for (state, acked) in states.iter().zip(acked_by) {
+            assert_eq!(
+                state.attempts(),
+                2,
+                "loop {acked}: the storm must reconnect exactly once"
+            );
+        }
+
+        for stop_tx in stops {
+            let _ = stop_tx.send(());
+        }
+        while let Some(join) = tokio::time::timeout(Duration::from_secs(5), runs.join_next())
+            .await
+            .map_err(|_| std::io::Error::other("the engines did not stop in time"))?
+        {
+            join?.map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The duplicate burst arriving at the reconnect instant: the center
+    /// re-delivers outbox messages (the at-least-once re-send of the pending
+    /// rows), repeats acknowledgements of the same sequence, and re-offers
+    /// an operation whose acceptance is already recorded. Every duplicate
+    /// must be a successful no-op and the business effect must happen
+    /// exactly once (§15.4, §15.6).
+    // The storm test spells out the full concurrent driver script in one
+    // place; splitting it would break the single-scenario assertion
+    // continuity (the persistence stress tests allow the same lint on
+    // their exhaustive storm tests).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_reconnect_duplicate_burst_is_idempotent_and_effects_each_operation_once()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let instance_id = InstanceId::generate();
+        let endpoint_id = endpoint.id();
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        // The task returns the store and the inbox so the test can assert
+        // the recorded state after the storm; the outbox stays observable
+        // through its shared entries vector.
+        let outbox = MockOutbox::new(instance_id);
+        let outbox_entries = Arc::clone(&outbox.entries);
+        let run = tokio::spawn(async move {
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                &store,
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>((store, inbox))
+        });
+
+        let mut wire = next_wire(&mut wires).await?;
+        // The first connection delivers the projection: one snapshot and
+        // two upserts.
+        for sequence in [1, 2, 3] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        // The center acknowledges only the first message, then the storm
+        // drops the connection.
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 1 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let Wire { outbound, inbound } = wire;
+        drop(outbound);
+        drop(inbound);
+
+        // The reconnect flushes the pending rows again — the duplicate
+        // outbox entries of at-least-once delivery, each sent exactly once
+        // on this connection.
+        let mut second = next_wire(&mut wires).await?;
+        for sequence in [2, 3] {
+            let envelope = next_outbox_frame(&mut second).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+
+        // The duplicate burst: an acknowledgement of the already-retired
+        // message, an acknowledgement covering the whole re-sent batch, and
+        // the same acknowledgement repeated.
+        for sequence in [20u64, 21, 22] {
+            second
+                .inbound
+                .send(Envelope {
+                    sequence,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::Ack(Ack {
+                        sequence: if sequence >= 21 { 3 } else { 1 },
+                    })),
+                })
+                .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        }
+
+        // The duplicate offer, re-delivered at the reconnect instant:
+        // accepted against the recorded state, never executed a second time.
+        let (offer, received) = offer_for(instance_id, endpoint_id, now.unix_timestamp() + 3600)
+            .map_err(std::io::Error::other)?;
+        second
+            .inbound
+            .send(received.clone())
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = next_outbox_frame(&mut second).await?;
+        assert_eq!(
+            envelope.sequence, 4,
+            "the reply must be the next frame, not a re-send of the burst"
+        );
+        let Some(EnvelopeMessage::OperationAccepted(accepted)) = envelope.message else {
+            return Err(std::io::Error::other("the reply was not an OperationAccepted").into());
+        };
+        assert_eq!(accepted.operation_id, offer.operation_id);
+        second
+            .inbound
+            .send(received)
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = next_outbox_frame(&mut second).await?;
+        assert_eq!(envelope.sequence, 5);
+        let Some(EnvelopeMessage::OperationProgress(progress)) = envelope.message else {
+            return Err(
+                std::io::Error::other("the duplicate reply was not an OperationProgress").into(),
+            );
+        };
+        assert_eq!(progress.operation_id, offer.operation_id);
+        assert_eq!(progress.state, OperationState::Queued.as_str());
+
+        // The burst did not disturb the connection, and the recorded state
+        // is exactly one operation: the duplicate offer never executed a
+        // second time (§15.4 exactly-once business effect).
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        // The task handle unwraps in two layers — the timeout's Elapsed and
+        // the task's JoinError — before the recorded state.
+        let state = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        let (store, inbox) = state.map_err(|error| std::io::Error::other(error.to_string()))?;
+        let operations = store.operations_owned().map_err(std::io::Error::other)?;
+        assert_eq!(
+            operations.len(),
+            1,
+            "the duplicate offer must not create a second operation"
+        );
+        assert_eq!(operations[0].id().to_string(), offer.operation_id);
+        assert_eq!(operations[0].source(), OperationSource::Center);
+        let operation_id: OperationId = offer.operation_id.parse()?;
+        assert_eq!(
+            inbox
+                .entry_state(operation_id)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Accepted)
+        );
+        // The durable replies: exactly one acceptance and one progress reply.
+        // The re-sent projection rows left the queue under the repeated
+        // acknowledgements.
+        let messages = pending_messages_from(&outbox_entries).map_err(std::io::Error::other)?;
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages.first(),
+            Some(EnvelopeMessage::OperationAccepted(_))
+        ));
+        assert!(matches!(
+            messages.get(1),
+            Some(EnvelopeMessage::OperationProgress(_))
+        ));
+        Ok(())
+    }
+
+    /// The storm interleaves heartbeats and reconnects: while two loops
+    /// lose their connections, a third stays connected and keeps
+    /// heartbeating, and the reconnecting loops resume on their fresh
+    /// connections — no loop's heartbeat loop disturbs another's reconnect,
+    /// and vice versa (§15.2, §15.4).
+    // The storm test spells out the full concurrent driver script in one
+    // place; splitting it would break the single-scenario assertion
+    // continuity (the persistence stress tests allow the same lint on
+    // their exhaustive storm tests). The `_a`/`_b`/`_c` suffixes name the
+    // three concurrent loops, so the a/b/c naming is the test semantics
+    // itself and the similar-names lint is scoped off here as well.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    #[tokio::test]
+    async fn heartbeats_and_reconnects_interleave_without_interference()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (transport_a, state_a, mut wires_a) = ScriptedTransport::new(0);
+        let (transport_b, state_b, mut wires_b) = ScriptedTransport::new(0);
+        let (transport_c, state_c, mut wires_c) = ScriptedTransport::new(0);
+        let (stop_a_tx, stop_a_rx) = tokio::sync::oneshot::channel();
+        let (stop_b_tx, stop_b_rx) = tokio::sync::oneshot::channel();
+        let (stop_c_tx, stop_c_rx) = tokio::sync::oneshot::channel();
+        let mut runs = JoinSet::new();
+        for (transport, stop_rx) in [transport_a, transport_b, transport_c]
+            .into_iter()
+            .zip([stop_a_rx, stop_b_rx, stop_c_rx])
+        {
+            let instance_id = InstanceId::generate();
+            runs.spawn(async move {
+                let store = MockEngineStore::new();
+                let inbox = MockInbox::new();
+                let cursor = MockCursor::new();
+                let events = MockEventTail::new(Vec::new());
+                let outbox = MockOutbox::new(instance_id);
+                outbox.enqueue_heartbeats(2, now)?;
+                let engine = CenterSync::new(
+                    transport,
+                    &store,
+                    outbox,
+                    &inbox,
+                    &cursor,
+                    &events,
+                    FixedClock(now),
+                    instance_id,
+                    engine_options(),
+                );
+                engine
+                    .run(async move {
+                        let _ = stop_rx.await;
+                    })
+                    .await?;
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            });
+        }
+
+        // All three loops connect and deliver their two queued messages;
+        // each acknowledges the pair and keeps heartbeating.
+        let mut wire_a = next_wire(&mut wires_a).await?;
+        let mut wire_b = next_wire(&mut wires_b).await?;
+        let mut wire_c = next_wire(&mut wires_c).await?;
+        for wire in [&mut wire_a, &mut wire_b, &mut wire_c] {
+            for sequence in [1, 2] {
+                let envelope = next_outbox_frame(wire).await?;
+                assert_eq!(envelope.sequence, sequence);
+            }
+            wire.inbound
+                .send(Envelope {
+                    sequence: 10,
+                    acked_sequence: 0,
+                    message: Some(EnvelopeMessage::Ack(Ack { sequence: 2 })),
+                })
+                .map_err(|_| std::io::Error::other("the center feed closed"))?;
+            let envelope = next_frame(wire).await?;
+            assert_eq!(envelope.sequence, 0);
+            assert!(matches!(
+                envelope.message,
+                Some(EnvelopeMessage::Heartbeat(_))
+            ));
+        }
+
+        // The storm drops B's and C's connections while A stays connected.
+        let Wire {
+            outbound: outbound_b,
+            inbound: inbound_b,
+        } = wire_b;
+        drop(outbound_b);
+        drop(inbound_b);
+        let Wire {
+            outbound: outbound_c,
+            inbound: inbound_c,
+        } = wire_c;
+        drop(outbound_c);
+        drop(inbound_c);
+
+        // While B and C wait out the backoff and reconnect, A's connection
+        // never noticed the storm: its heartbeats keep flowing.
+        let envelope = next_frame(&mut wire_a).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
+
+        // B and C reconnect concurrently, and every loop's fresh connection
+        // is liveness-clean: the queue was drained, so only heartbeats
+        // arrive — and A's heartbeat loop stays undisturbed throughout.
+        let (second_b, second_c) = tokio::join!(next_wire(&mut wires_b), next_wire(&mut wires_c),);
+        let mut second_b = second_b?;
+        let mut second_c = second_c?;
+        assert_eq!(state_b.attempts(), 2);
+        assert_eq!(state_c.attempts(), 2);
+        assert_eq!(
+            state_a.attempts(),
+            1,
+            "A never reconnected during the storm"
+        );
+        for wire in [&mut second_b, &mut second_c, &mut wire_a] {
+            let envelope = next_frame(wire).await?;
+            assert_eq!(envelope.sequence, 0);
+            assert!(matches!(
+                envelope.message,
+                Some(EnvelopeMessage::Heartbeat(_))
+            ));
+        }
+
+        let _ = stop_a_tx.send(());
+        let _ = stop_b_tx.send(());
+        let _ = stop_c_tx.send(());
+        while let Some(join) = tokio::time::timeout(Duration::from_secs(5), runs.join_next())
+            .await
+            .map_err(|_| std::io::Error::other("the engines did not stop in time"))?
+        {
+            join?.map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The storm never touches the site's local state: while the loop sits
+    /// in the reconnect backoff, local producers keep enqueuing into the
+    /// durable outbox (the offline queue of §21 0.7.0), and the reconnect
+    /// flushes the whole accumulated queue in one burst, in sequence order —
+    /// nothing lost, nothing duplicated (§15.4 local autonomy).
+    #[tokio::test]
+    async fn the_local_queue_keeps_accumulating_while_disconnected_and_drains_in_order_on_reconnect()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let outbox = MockOutbox::new(instance_id);
+        // The offline queue holds two messages before the first connection.
+        outbox
+            .enqueue_heartbeats(2, now)
+            .map_err(std::io::Error::other)?;
+        // The test keeps the shared entries vector so it can keep writing
+        // the queue while the engine is disconnected.
+        let entries = Arc::clone(&outbox.entries);
+        let run = tokio::spawn(async move {
+            let store = MockEngineStore::new();
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                &store,
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
+        let mut wire = next_wire(&mut wires).await?;
+        for sequence in [1, 2] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 1 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        // The storm drops the connection; the site stays local.
+        let Wire { outbound, inbound } = wire;
+        drop(outbound);
+        drop(inbound);
+
+        // While the loop waits out the backoff, local producers keep
+        // enqueuing: the queue accumulates messages 3, 4, and 5 offline.
+        push_heartbeat_entry(&entries, instance_id, 3, now).map_err(std::io::Error::other)?;
+        push_heartbeat_entry(&entries, instance_id, 4, now).map_err(std::io::Error::other)?;
+        push_heartbeat_entry(&entries, instance_id, 5, now).map_err(std::io::Error::other)?;
+
+        // The reconnect drains the whole accumulated queue in one burst, in
+        // sequence order: the unacknowledged message 2 first, then the
+        // offline accumulation.
+        let mut second = next_wire(&mut wires).await?;
+        for sequence in [2, 3, 4, 5] {
+            let envelope = next_outbox_frame(&mut second).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        // The burst drained the queue: only liveness heartbeats follow, and
+        // the loop answers the stop signal.
+        let envelope = next_frame(&mut second).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
 
         stop_tx
             .send(())
