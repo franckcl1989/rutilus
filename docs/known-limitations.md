@@ -23,7 +23,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 
 | 家族 | 表单现状 | 事实来源 |
 |---|---|---|
-| Telemetry | `CommandFamilyView::ALL` 刻意不含 Telemetry；表单选择器返回 `OperationFormError::FamilyRequired`；界面提示 "The telemetry write form is a later milestone."；已持久化的遥测命令通过 `wire_command_summary` 在卡片中渲染 | `ui/src/lib.rs` 第 4748、6010 行附近 |
+| Telemetry | `CommandFamilyView::ALL` 刻意不含 Telemetry；表单选择器返回 `OperationFormError::FamilyRequired`；界面提示 "The telemetry write form is a later milestone."；已持久化的遥测命令通过 `wire_command_summary` 在卡片中渲染 | `ui/src/lib.rs` 第 4955、6219、11064 行（`CommandFamilyView::ALL` 9 家族 `:4955`、Telemetry 表单拒绝 `:6219`、later-milestone 提示文案 `:11064`） |
 | Log（清空日志 `log.clear`） | 无专用表单（`CommandFamilyView` 中不存在 Log 变体），表单选择器拒绝 | `ui/src/lib.rs` `CommandFamilyView` |
 | Control（控制更新 `control.update`） | 同上，无专用表单 | 同上 |
 
@@ -78,10 +78,15 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 - 真实设备验证（五厂商至少各一台进入 1.0.0 认证矩阵，§19.1）尚未达成；
 - 含义：当前对真实 BMC 兼容性的结论都应视为"基于上游类型面与 mock/fixture 验证"，不是实测认证。
 
-## 六、容量与性能未实测
+## 六、发布级容量建议未发布（合成规模已实测）
 
 - 设计 §0.9.0 的"最低验证规模"（单 Site 200 Endpoint、单 Center 100 Site、中心汇总
-  5,000 Endpoint）是**测试目标，不是已实测能力**；当前没有已发布的容量建议；
+  5,000 Endpoint）已由合成规模压力/容量套件**实测落地**（`persistence/tests/stress_capacity.rs`
+  3 个测试，2026-08-12，开发机 debug 构建 + WAL；详见 §八与 `docs/operations-manual.md` §九），
+  不再是"仅测试目标"；
+- **发布级容量建议尚未发布**：设计 §0.9.0 要求"测试后发布真实容量建议"
+  （`redfish-management-product-final-design.md:2810`），正式容量建议仍待 release 构建/
+  正式规模环境复核后发布；在此之前，本产品没有已发布的容量建议；
 - 中心为单节点 SQLite 生产中心，非主动—主动集群（§9.1、§15.7）——这是有意设计，不是缺陷；
 - 已知的产品侧规模约束（非容量测试结果）：批量操作/批量刷新目标上限 128、刷新并发 4、
   单次查询上限 1000、制品分块 4 MiB、CSV 导入 1 MiB / 10,000 行、中心协议帧 8 MiB。
@@ -111,7 +116,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 |---|---|
 | §19.1 Fixture 测试（真实响应 fixture 目录） | 尚未建立 |
 | §19.1 Physical Device Test（五厂商真实设备认证矩阵） | 尚未达成 |
-| §0.9.0 性能容量测试与真实容量建议 | 尚未执行/发布 |
+| §0.9.0 性能容量测试与真实容量建议 | 部分：合成规模压力容量套件已落地并实测（`persistence/tests/stress_capacity.rs` 3 个测试：200 Endpoint Generation 一致刷新 / 100 Site outbox-inbox-cursor / 5,000 Endpoint 中心投影幂等重投，2026-08-12）；实测数据为**开发机 debug 构建合成数据**（5,000 投影写入 ≈865 行/s、清单查询 0.482s；写路径受 `write_gate`（`Semaphore(1)`）全局串行化，`persistence/src/lib.rs:101, 240`），**不是最终发布容量建议**——设计 §0.9.0 要求"测试后发布真实容量建议"（`redfish-management-product-final-design.md:2810`），正式容量建议仍待 release 构建/正式环境复核后发布（详见 `docs/operations-manual.md` §九） |
 | §6.2 tracing 日志选型 | 已实现（app 诊断日志 + `RUST_LOG` 过滤的 stderr subscriber）；用户可见输出仍为 `println!`，测试/工具输出仍为 `eprintln!`（见 §七"日志设施范围受限"）；运行路径已接入 span/`#[instrument]`，`--log-format json`（`LogFormat`/`init_tracing`）输出结构化 JSON，`RUST_LOG` 过滤不变 |
 | §14.4 遥测保留周期可配置 | 已实现：`--telemetry-retention-days`（默认 7 天，范围 1–365，`TelemetryRetention` 在边界校验）；设置页形态为后续迭代 |
 | §12.4 诊断中的解码错误路径 / ExtendedInfo 展示 | 解码失败的成员在刷新时跳过、不留下记录，诊断视图不显示（`application/src/resource_diagnostics.rs`）——与 §12.4"允许查看解码错误路径"的设计表述存在实现差异，属 0.9.0 待办 |
