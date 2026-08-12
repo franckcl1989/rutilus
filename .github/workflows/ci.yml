@@ -258,6 +258,12 @@ jobs:
           lipo -create -output target/universal-apple-darwin/release/rutilus \
             target/aarch64-apple-darwin/release/rutilus \
             target/x86_64-apple-darwin/release/rutilus
+          # Verify the merged artifact (audit A4): lipo -create cannot fail
+          # on a thin output, so the §5.2 architectures are checked
+          # explicitly — lipo -verify_arch exits non-zero when either is
+          # missing, and lipo -info prints the fat-file banner for the log.
+          lipo -info target/universal-apple-darwin/release/rutilus
+          lipo -verify_arch x86_64 arm64 target/universal-apple-darwin/release/rutilus
 
       # §19.4: Migration Test. Also covered by the full workspace test above;
       # kept as an explicit gate for visibility (migration/tests/initial_storage.rs).
