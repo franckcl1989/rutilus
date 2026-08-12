@@ -12,6 +12,9 @@
 #                              list mirrors deny.toml [advisories] via CLI
 #                              flags (cargo-audit reads only audit.toml)
 #   cargo machete
+#   secret-leak gate          <- 2026-08-12; repo-level half of the security
+#                              review §4.3 follow-up, beyond the frozen §19.4
+#                              list (security/tests/secret_leak_gate.rs)
 #   跨平台 Build             <- 3-OS matrix + wasm32 UI artifact
 #   Migration Test
 #   Capability Ledger Check
@@ -199,6 +202,20 @@ jobs:
       - name: Unused deps check (machete)
         if: matrix.is_default
         run: cargo machete
+
+      # §10 / §16.3 secret-leak gate — the repository-level half of the
+      # security review's §4.3 follow-up (独立 Secret 泄漏扫描): a token-wise
+      # scan of every workspace src/ and tests/ .rs file (crate directories
+      # discovered relative to CARGO_MANIFEST_DIR, so new crates are covered
+      # automatically) that fails on hardcoded secrets ([R1]), embedded PEM
+      # private-key material ([R2]), and plaintext credential disclosure in
+      # output macros ([R3]); test-scope code is exempt by context, not by
+      # value allow-lists (security/tests/secret_leak_gate.rs). The runtime
+      # half (log/response review) stays with the release review. --locked
+      # pins the committed Cargo.lock.
+      - name: Secret leak gate
+        if: matrix.is_default
+        run: cargo test --locked -p rutilus-security --test secret_leak_gate
 
       # §19.4: 跨平台 Build — wasm32 UI artifact. Commands mirror ui/README.md;
       # wasm-bindgen-cli must stay at 0.2.126, the exact workspace
