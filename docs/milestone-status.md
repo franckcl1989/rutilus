@@ -52,6 +52,26 @@
 > HEAD=d1b375c」口径）；**迭代十一已落地（2026-08-12，HEAD = b685818）**：`74570bc`（docs:
 > register iteration ten and sync the gate counts）+ `b685818`（test(migration): precise the
 > down-order gate comments，注释精确化：FK 来源三文件明细 + 诚实规则缝隙注记，8/8 复跑全绿）。
+> **迭代十二已落地（2026-08-12，HEAD = 452a291，3 个提交）**：`318eadd`（fix(scripts)：
+> drill-lib.ps1 证书 Pin 修复——Invoke-MockHttps 原用 `GetCertHashString()`（.NET Framework
+> 上为 SHA-1）比对 mock-bmc 的 SHA-256 指纹恒失败（drill-kill-mid-operation 幂等断言健康
+> 环境必然 FAIL），改为 C# 委托（脚本块回调在无 runspace 的 TLS 工作线程无法执行）
+> SHA-256-of-DER 归一比对，与产品侧 `Sha256::digest(certificate_der)`
+> （domain/src/endpoint.rs:490）逐字节同值，真实 mock-bmc 端到端验证（正确 pin→200、
+> 篡改→拒绝）；同函数另修 2 缺陷（`[string]$Body=$null` 强转 '' 致 GET 带空
+> StringContent〔ProtocolViolationException〕、Start-MockBmc 缺省 -Port 传空参数列表致
+> Start-Process 参数校验异常——改传 '0' 由 mock-bmc 自选端口 + stdout URL 回读，.Port 恒为
+> 真实端口，探针验证启动/连接/清理））、`64125e0`（fix(migration)：m20260810_000002 down
+> 未恢复 000005 形状（MEDIUM）——拆 rebuild_up（000010 形状不变）/rebuild_down（严格 000005
+> 形状：4 列 + role CHECK + 2 FK，无 site_id/scope CHECK，形状核实自
+> m20260807_000005_product_users.rs:355-396），测试改 PRAGMA table_info 断言 + scoped
+> 插入判别 + role CHECK 存活，负向实证旧代码下 FAILED；migration 38 测试全过、clippy/fmt
+> 干净）、`452a291`（docs：深度审查边界登记——down_order_gate raw-CREATE-REFERENCES 盲区
+> 活表案例（000002 role_assignments_rebuild REFERENCES instances/principals）、ci.yml
+> ref_name 斜杠边界（可见失败、不 sanitize 为决策）、known-limitations §八 events 存储增长
+> 登记、§五 drill TOCTOU 与 400ms 时序启发式、milestone-status down_order_gate 行数 1286）；
+> 第二批五维深度审查（安全+并发 / 数据+前端+CI）无 BLOCKER/HIGH/MEDIUM 残留（MEDIUM 1 +
+> LOW 3 已修复、NOTE 全部登记、对抗验证 13 项全部「维持」），详见 §7.4。
 > 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-12 复核）：
@@ -393,6 +413,27 @@ T-H c4dd335 / T-G 8482d85 / T-B 4897b22 / T-D e7aef53 / T-E 02459dc / T-F 83ff07
 （domain/persistence/operation_executor）。**以上 8 项已由迭代七全部落地/处置（2026-08-12，
 master 61b9cc5，9 个提交 + T-C 决策，三批五维审计 APPROVE）——见 §7.5 与本行对应更新；§九
 各行已转 ✅ 最终状态（以 known-limitations 为准）。**
+
+> **第二批五维深度审查（2026-08-12，HEAD = 452a291，安全+并发 / 数据+前端+CI）**：
+> 对第一批处置后状态（迭代七 T-A~T-F / 迭代八 drills / 迭代十 down_order_gate 机械门禁
+> 合入后）做五维再审查。方法：只读代码 + 对抗验证（**13 项对抗验证**——对既有登记结论
+> 构造反例：B4 分支覆盖 / 限流剪枝 / 会话撤销结构性免疫 / 白名单零漂移 / 并发刷新串行化 /
+> 写门无饥饿 / 重启无竞态 / center at-least-once / Generation 中断 / 备份迁移竞争 / 恢复
+> 一致性 / 下迁数据丢失 / 两门禁 23 迁移全量对抗）。结果：**无 BLOCKER/HIGH/MEDIUM 残留**——
+> **MEDIUM 1 + LOW 3 已修复**（2 个修复提交，见下表），NOTE 全部登记（`452a291` docs
+> 提交）；对抗验证 **13 项全部「维持」**（无新反例成立）；drills 无新增真实秘密材料；既有
+> 登记结论无被推翻项。修复提交与代码证据：
+
+| 修复提交 | 内容 | 代码证据 |
+|---|---|---|
+| `318eadd` | fix(scripts)：drill-lib.ps1 证书 Pin 修复（MEDIUM）——Invoke-MockHttps 原用 `GetCertHashString()`（.NET Framework 上为 SHA-1）比对 mock-bmc 的 SHA-256 指纹恒失败（drill-kill-mid-operation 幂等断言健康环境必然 FAIL）；改为 C# 委托（脚本块回调在无 runspace 的 TLS 工作线程无法执行）SHA-256-of-DER 归一比对，与产品侧 `Sha256::digest(certificate_der)`（domain/src/endpoint.rs:490）逐字节同值；真实 mock-bmc 端到端验证（正确 pin→200、篡改→拒绝）；同函数另修 2 缺陷（LOW）：`[string]$Body=$null` 强转 '' 致 GET 带空 StringContent（ProtocolViolationException）、Start-MockBmc 缺省 -Port 传空参数列表致 Start-Process 参数校验异常（改传 '0' 由 mock-bmc 自选端口 + stdout URL 回读，.Port 恒为真实端口，探针验证启动/连接/清理） | `scripts/drills/drill-lib.ps1`（`Invoke-MockHttps` `:869`、`Start-MockBmc` `:450`、Pin 辅助 C# 类型 `:825-838`） |
+| `64125e0` | fix(migration)：m20260810_000002 down 未恢复 000005 形状（MEDIUM）——原 down 复用 up 的 rebuild DDL（site_id 列/外键/scope CHECK 全保留），且测试断言有歧义（随机 UUID 插入被外键拒绝，两种假设下都通过）；拆 `rebuild_up`（000010 形状不变）/`rebuild_down`（严格 000005 形状：4 列 + role CHECK + 2 FK，无 site_id/scope CHECK，形状核实自 m20260807_000005_product_users.rs:355-396）；测试改 PRAGMA table_info 断言 4 列 + scoped 插入（seeded site）判别 + role CHECK 存活；负向实证（旧代码下新断言 FAILED）；migration 38 测试全过、clippy/fmt 干净、两静态门禁兼容 | `migration/src/m20260810_000002_center_role_sites.rs`（`rebuild_up` `:55`、`rebuild_down` `:86`）；`migration/tests/center_role_sites.rs` |
+
+**NOTE 登记（`452a291`，docs）**：down_order_gate raw-CREATE-REFERENCES 盲区活表案例
+（000002 role_assignments_rebuild REFERENCES instances/principals——当下无害、为将来
+down 序依赖挂旗）、ci.yml `ref_name` 斜杠边界（可见失败、不 sanitize 为决策）、
+known-limitations §八 events 存储增长（§14.4 展示有界/存储无界）与 §五 drill
+`Get-FreeTcpPort` TOCTOU / 400ms 时序启发式、milestone-status down_order_gate 行数 1286。
 
 ### 7.5 迭代七：§九遗留项清零（2026-08-12，HEAD = 61b9cc5）
 

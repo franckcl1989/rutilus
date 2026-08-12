@@ -86,6 +86,15 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
   （"local unlock requires an interactive terminal"），非产品问题；该问题同时暴露套件硬挂起
   缺陷，挂起防护修复后快速 FAIL 路径已验证），**功能验证待真实交互控制台会话复跑**；
   **磁盘空间不足场景未覆盖**（无管理员权限的可靠模拟手段受限）。
+  修复记录（迭代十二，2026-08-12，commit 318eadd）：`Invoke-MockHttps` 证书 Pin 原用
+  `GetCertHashString()`（.NET Framework 上为 SHA-1）比对 mock-bmc 的 SHA-256 指纹恒失败
+  （drill-kill-mid-operation 幂等断言健康环境必然 FAIL），已改为 C# 委托（脚本块回调在无
+  runspace 的 TLS 工作线程无法执行）SHA-256-of-DER 归一比对，与产品侧
+  `Sha256::digest(certificate_der)`（`domain/src/endpoint.rs:490`）逐字节同值，真实 mock-bmc
+  端到端验证（正确 pin→200、篡改→拒绝）；另修 `[string]$Body=$null` 强转 '' 致 GET 带空
+  StringContent（ProtocolViolationException）与 `Start-MockBmc` 缺省 -Port 传空参数列表致
+  Start-Process 参数校验异常（改传 '0' 由 mock-bmc 自选端口 + stdout URL 回读，.Port 恒为
+  真实端口，探针验证启动/连接/清理）。
   另登记两项 drill 已知限制（实跑前可不修）：`Get-FreeTcpPort`
   （`drill-lib.ps1:90-96`）为 bind-0/释放/重绑模式——探测与真实绑定之间端口可能被
   抢占（TOCTOU），串行执行下概率极低，仅偶发伪 FAIL；`drill-large-file-interruption`
