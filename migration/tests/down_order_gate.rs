@@ -20,10 +20,13 @@
 //! `ALTER TABLE ... ADD COLUMN ... REFERENCES ...` statements (the only way
 //! `SQLite` adds a live foreign key, `m20260805_000011`'s `batch_id` link)
 //! yield their edges too. Edges from every file form one global graph — a
-//! `down` may drop tables whose foreign keys were created in an earlier
-//! migration (`m20260810_000001` rebuilds `endpoints` and its six children,
-//! whose FKs live in `m20260805_000001`) — and each file's drop sequences
-//! are checked against that graph.
+//! `down` may drop tables whose foreign keys were created in earlier
+//! migrations: `m20260810_000001`'s rebuild drops `endpoints` and its six
+//! children (`endpoint_addresses`, `endpoint_trust`, `endpoint_credentials`
+//! — FKs in `m20260805_000001`; `endpoint_capabilities` — FK in
+//! `m20260805_000002`; `resources` and its child `resource_snapshots` —
+//! FKs in `m20260805_000003`), edges no single-file scan could see — and
+//! each file's drop sequences are checked against that graph.
 //!
 //! Two drop sequences are checked per file:
 //! - the `down` function body's `drop_table(Table::drop().table(X::Table))`
@@ -382,6 +385,12 @@ fn argument_statements(
             Token::Ident { .. } | Token::Punct { .. } => None,
         })
         .collect();
+    // Honest gap: an argument containing any string literal is taken as that
+    // statement regardless of the wrapper around it — a macro-wrapped inline
+    // string (`sql!(...)`, `format!(...)`, ...) would be scanned verbatim and
+    // the unrecognized wrapper would never fail the gate. None of the 23
+    // current migrations has such a shape; if one appears, the scan could
+    // miss what actually executes.
     if !inline.is_empty() {
         return Ok(inline);
     }
@@ -592,6 +601,11 @@ fn foreign_key_edges(
             }
             j += 1;
         }
+        // Honest gap: a chain whose `from`/`to` do not pair (one side
+        // missing) silently yields no edge instead of a gate failure — the
+        // edge, and any ordering constraint it would carry, is simply absent.
+        // Every current migration writes both sides; a future unpaired chain
+        // would be silently skipped, not reported.
         if let (Some(child), Some(parent)) = (child, parent) {
             edges.push((child, parent));
         }
@@ -830,8 +844,9 @@ fn order_violations_for(
 /// The full gate: every migration file's drop sequences must drop every FK
 /// child before its parent. The FK edge set is aggregated across all files,
 /// because a `down` may drop tables whose foreign keys were created in an
-/// earlier migration (`m20260810_000001` rebuilds `endpoints` and its six
-/// children, whose FKs live in `m20260805_000001`).
+/// earlier migration (`m20260810_000001`'s rebuild drops `endpoints` and its
+/// six children — FKs spread across `m20260805_000001`, `m20260805_000002`,
+/// and `m20260805_000003`).
 fn migration_down_order_violations() -> Result<Vec<String>, Box<dyn Error>> {
     let sources = scanned_sources()?;
     let mut edges = Vec::new();
