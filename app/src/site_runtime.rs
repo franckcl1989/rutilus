@@ -746,7 +746,12 @@ where
         .await;
         engine_stop_signal.signal();
         if let Some(engine_task) = engine_task {
-            let _ = engine_task.await;
+            // The engine task's own error paths are logged inside it; a
+            // `JoinError` here means the task panicked, and the shutdown
+            // join is the only observation point left.
+            if let Err(error) = engine_task.await {
+                tracing::error!("the center sync engine task failed: {error}");
+            }
         }
         services_result
     }

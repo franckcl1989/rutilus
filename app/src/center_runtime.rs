@@ -699,7 +699,9 @@ where
             // accept loop too, and wait for the connection engines before
             // closing the store.
             stop_signal.signal();
-            let _ = accept_loop.await;
+            if let Err(error) = accept_loop.await {
+                tracing::error!("the center accept loop task failed: {error}");
+            }
             result.map_err(CenterRunError::Serve)
         }
         signal = stop => {
@@ -708,7 +710,9 @@ where
             // engine observes the same signal and exits, and only then does
             // the console drain.
             stop_signal.signal();
-            let _ = accept_loop.await;
+            if let Err(error) = accept_loop.await {
+                tracing::error!("the center accept loop task failed: {error}");
+            }
             server.await.map_err(CenterRunError::Serve)
         }
     }
@@ -753,11 +757,19 @@ async fn run_center_accept_loop(
             accepted = acceptor.accept_with_admission(&admission) => {
                 match accepted {
                     Ok(accepted) => {
-                        connections.push(tokio::spawn(run_center_connection(
-                            Arc::clone(&state),
-                            accepted,
-                            stop.clone(),
-                        )));
+                        // The site id is captured before the task takes the
+                        // connection, so a task failure is logged with its
+                        // site (the join below is the only observation
+                        // point left).
+                        let site_id = accepted.site().instance_id();
+                        connections.push((
+                            site_id,
+                            tokio::spawn(run_center_connection(
+                                Arc::clone(&state),
+                                accepted,
+                                stop.clone(),
+                            )),
+                        ));
                     }
                     Err(CenterAcceptError::AdmissionRejected { reason }) => {
                         // The site received its `not-bound` answer already;
@@ -774,8 +786,13 @@ async fn run_center_accept_loop(
             }
         }
     }
-    for connection in connections {
-        let _ = connection.await;
+    for (site_id, connection) in connections {
+        // A `JoinError` here means the connection task panicked; its own
+        // error paths are already logged inside the task, so only the
+        // panic signal is recorded here.
+        if let Err(error) = connection.await {
+            tracing::error!("the center connection task for site {site_id} failed: {error}");
+        }
     }
 }
 
