@@ -28,7 +28,16 @@ name: CI
 on:
   push:
     branches: [main, master]
+    # §5.4 / 1.0.0 condition 17: a `v*` tag push builds the release artifacts
+    # (signing + SBOM + SHA-256) in the release-artifacts job below. The ci
+    # job above re-runs the full quality gates on tag pushes too —
+    # intentional: the final check before a release, and `v*` tags are only
+    # ever cut from a gate-green main.
+    tags: ['v*']
   pull_request:
+  # Manual release-artifact build (same gates-first order, via
+  # `needs: ci` on the release-artifacts job).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -318,3 +327,285 @@ jobs:
       - name: Release baseline check
         if: matrix.is_default
         run: cargo test --locked -p rutilus-infra-redfish release_baseline
+
+  # ===========================================================================
+  # §5.4 / 1.0.0 release condition 17: release artifacts — signed binaries,
+  # SHA-256 manifest, and SBOM — built on `workflow_dispatch` or a `v*` tag
+  # push.
+  #
+  # Conservative wiring:
+  #  - The existing `ci` job is untouched; the trigger changes in `on:` above
+  #    only broaden the event surface, and this job waits for `ci` (`needs`),
+  #    so a release always runs the full quality gates first.
+  #  - Every signing step executes ONLY when its secrets are configured;
+  #    otherwise it logs "signing skipped: certificate not configured" and
+  #    the unsigned artifacts still build, checksum, SBOM, and upload — a
+  #    release can be staged before any certificate exists.
+  #  - Certificate injection point: once the certificates/keys exist, only
+  #    the repository secrets below need to be set — no changes to this file
+  #    are required. The scripts (scripts/sign-windows.ps1,
+  #    scripts/sign-macos.sh, scripts/sign-linux.sh) are the local half of
+  #    the pipeline: they fail loudly on a missing env, so a mis-wired secret
+  #    fails the step instead of silently producing an unsigned artifact.
+  #    GitHub secrets are strings, never files, while the scripts consume
+  #    FILE PATHS — so the file-shaped material (PFX, App Store Connect .p8,
+  #    minisign secret key) is stored base64-encoded in the RUTILUS_*_B64
+  #    secrets and decoded to $RUNNER_TEMP by the "Materialize ..." steps
+  #    below (H4 audit MINOR 4). Only the Windows thumbprint mode needs no
+  #    material at all. Secrets consumed here:
+  #      RUTILUS_WINDOWS_CERT_B64 / RUTILUS_WINDOWS_CERT_PASSWORD (PFX,
+  #        base64-encoded) or RUTILUS_WINDOWS_CERT_THUMBPRINT (installed
+  #        store, no materialization)
+  #      RUTILUS_MAC_CERT_ID, RUTILUS_NOTARY_KEY_ID, RUTILUS_NOTARY_KEY_B64
+  #        (base64-encoded .p8), RUTILUS_NOTARY_TEAM_ID
+  #      RUTILUS_LINUX_SIGN_KEY_B64 (base64-encoded minisign secret key),
+  #        and optionally RUTILUS_LINUX_SIGN_PASSWORD
+  release-artifacts:
+    name: Release artifacts (${{ matrix.suffix }})
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ${{ matrix.os }}
+    needs: ci
+    env:
+      # §5.4 build-result embedding — same contract as the ci job: the exact
+      # commit actions/checkout checked out. Without it the release binaries
+      # would silently embed the `dev` fallback instead (app/src/main.rs)
+      # (H4 audit MINOR 1).
+      RUTILUS_GIT_COMMIT: ${{ github.sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # §5.2 release matrix; build shapes mirror the ci job's release
+          # steps (musl static / zigbuild aarch64 musl / MSVC x64 / macOS
+          # Universal 2 via lipo).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: linux-x86_64-musl
+            binary_path: target/x86_64-unknown-linux-musl/release/rutilus
+            sbom: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            suffix: linux-aarch64-musl
+            binary_path: target/aarch64-unknown-linux-musl/release/rutilus
+            zigbuild: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
+            binary_path: target/x86_64-pc-windows-msvc/release/rutilus.exe
+          - os: macos-latest
+            target: universal-apple-darwin
+            suffix: macos-universal
+            binary_path: target/universal-apple-darwin/release/rutilus
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain comes exclusively from rust-toolchain.toml (same policy
+      # as the ci job); targets are added inside the build steps below.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      # cargo-zigbuild for the aarch64 musl cross-link, same install-action
+      # pattern as the ci job's gate-tools step.
+      - name: Install cargo-zigbuild (aarch64)
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-zigbuild@0.22.3
+
+      - name: Build linux release binary (musl static)
+        if: ${{ runner.os == 'Linux' && !matrix.zigbuild }}
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          # musl-gcc, which ring and libsqlite3-sys need for the musl
+          # cross-link, is not on the hosted image — same apt line as the ci
+          # job's musl step (H4 audit BLOCKER 1).
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --locked -p rutilus --target x86_64-unknown-linux-musl --release
+
+      - name: Build linux release binary (aarch64 musl static)
+        if: ${{ runner.os == 'Linux' && matrix.zigbuild }}
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          cargo zigbuild --locked -p rutilus --target aarch64-unknown-linux-musl --release
+
+      - name: Build windows release binary (MSVC x64)
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --locked -p rutilus --target x86_64-pc-windows-msvc --release
+
+      # Mirror of the ci job's Universal 2 step, including the audit-A4
+      # arch verification (lipo -info / lipo -verify_arch).
+      - name: Build macOS Universal 2 release binary
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked -p rutilus --target aarch64-apple-darwin --release
+          cargo build --locked -p rutilus --target x86_64-apple-darwin --release
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/rutilus \
+            target/aarch64-apple-darwin/release/rutilus \
+            target/x86_64-apple-darwin/release/rutilus
+          lipo -info target/universal-apple-darwin/release/rutilus
+          lipo -verify_arch x86_64 arm64 target/universal-apple-darwin/release/rutilus
+
+      # Version-qualified artifact name: on a tag push github.ref_name is the
+      # tag (v1.0.0) -> rutilus-v1.0.0-<suffix>; on workflow_dispatch it is
+      # the branch name. `release/` is the staging dir for checksums,
+      # signing, and upload.
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          cp ${{ matrix.binary_path }} release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+
+      # --- Windows Authenticode (certificate injection point: set the
+      # RUTILUS_WINDOWS_CERT_* secrets) -------------------------------------
+      # Guarded on the certificate material itself (PFX or thumbprint), not
+      # the password: a password without a certificate cannot sign anything,
+      # so it alone must not gate the step.
+      - name: Materialize Windows signing certificate (PFX)
+        if: ${{ runner.os == 'Windows' && secrets.RUTILUS_WINDOWS_CERT_B64 != '' }}
+        shell: pwsh
+        env:
+          RUTILUS_WINDOWS_CERT_B64: ${{ secrets.RUTILUS_WINDOWS_CERT_B64 }}
+        run: |
+          # GitHub secrets are strings, never files, but sign-windows.ps1
+          # consumes a FILE PATH: decode the base64 PFX into $RUNNER_TEMP
+          # (per-job, wiped after the run) and the Sign step points at it.
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'rutilus-windows-cert.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String(($env:RUTILUS_WINDOWS_CERT_B64 -replace '\s', '')))
+      - name: Sign (Windows Authenticode)
+        if: ${{ runner.os == 'Windows' && (secrets.RUTILUS_WINDOWS_CERT_B64 != '' || secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT != '') }}
+        shell: pwsh
+        env:
+          # Empty in thumbprint-only mode — the script then ignores the PFX
+          # and never demands its password (sign-windows.ps1 requires the
+          # password whenever the PATH is set).
+          RUTILUS_WINDOWS_CERT_PATH: ${{ secrets.RUTILUS_WINDOWS_CERT_B64 != '' && format('{0}/rutilus-windows-cert.pfx', runner.temp) || '' }}
+          RUTILUS_WINDOWS_CERT_PASSWORD: ${{ secrets.RUTILUS_WINDOWS_CERT_PASSWORD }}
+          RUTILUS_WINDOWS_CERT_THUMBPRINT: ${{ secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT }}
+        run: ./scripts/sign-windows.ps1 release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+
+      # --- macOS Developer ID + notarization (certificate injection point:
+      # set the RUTILUS_MAC_CERT_ID and RUTILUS_NOTARY_* secrets) ------------
+      - name: Materialize notary API key (.p8)
+        if: ${{ runner.os == 'macOS' && secrets.RUTILUS_NOTARY_KEY_B64 != '' }}
+        env:
+          RUTILUS_NOTARY_KEY_B64: ${{ secrets.RUTILUS_NOTARY_KEY_B64 }}
+        run: |
+          # notarytool --key consumes a FILE PATH; decode the base64 .p8
+          # into $RUNNER_TEMP. `base64 -D` is the macOS decode flag (GNU's
+          # `-d` is the Linux-only spelling); `tr -d '[:space:]'` tolerates
+          # any line-wrapping in the stored base64.
+          printf '%s' "$RUTILUS_NOTARY_KEY_B64" | tr -d '[:space:]' | base64 -D > "$RUNNER_TEMP/rutilus-notary-key.p8"
+      - name: Sign (macOS Developer ID)
+        if: ${{ runner.os == 'macOS' && secrets.RUTILUS_MAC_CERT_ID != '' }}
+        env:
+          RUTILUS_MAC_CERT_ID: ${{ secrets.RUTILUS_MAC_CERT_ID }}
+        run: bash scripts/sign-macos.sh release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+
+      # Notarization additionally requires the signed binary (ditto zips the
+      # staged artifact), hence the MAC_CERT_ID guard on top of the notary
+      # secrets.
+      - name: Notarize and staple (macOS)
+        if: ${{ runner.os == 'macOS' && secrets.RUTILUS_MAC_CERT_ID != '' && secrets.RUTILUS_NOTARY_KEY_ID != '' && secrets.RUTILUS_NOTARY_KEY_B64 != '' && secrets.RUTILUS_NOTARY_TEAM_ID != '' }}
+        env:
+          RUTILUS_NOTARY_KEY_ID: ${{ secrets.RUTILUS_NOTARY_KEY_ID }}
+          RUTILUS_NOTARY_KEY: ${{ secrets.RUTILUS_NOTARY_KEY_B64 != '' && format('{0}/rutilus-notary-key.p8', runner.temp) || '' }}
+          RUTILUS_NOTARY_TEAM_ID: ${{ secrets.RUTILUS_NOTARY_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }} release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}.zip
+          bash scripts/sign-macos.sh --notarize release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}.zip release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+
+      # --- Linux independent signing, minisign (certificate injection point:
+      # set the RUTILUS_LINUX_SIGN_KEY_B64 secret) ----------------------------
+      # minisign is packaged in Ubuntu universe (apt) and Homebrew. The
+      # choice of minisign over gpg is documented in scripts/sign-linux.sh.
+      - name: Materialize Linux signing key (minisign)
+        if: ${{ runner.os == 'Linux' && secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        env:
+          RUTILUS_LINUX_SIGN_KEY_B64: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 }}
+        run: |
+          # minisign -s consumes a FILE PATH; decode the base64 secret key
+          # into $RUNNER_TEMP (GNU base64 -d; tr strips any line-wrapping).
+          printf '%s' "$RUTILUS_LINUX_SIGN_KEY_B64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/rutilus-linux-sign.key"
+      - name: Install minisign
+        if: ${{ runner.os == 'Linux' && secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        run: |
+          if ! command -v minisign >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y minisign
+          fi
+      - name: Sign (Linux, minisign detached)
+        if: ${{ runner.os == 'Linux' && secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        env:
+          RUTILUS_LINUX_SIGN_KEY: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' && format('{0}/rutilus-linux-sign.key', runner.temp) || '' }}
+          RUTILUS_LINUX_SIGN_PASSWORD: ${{ secrets.RUTILUS_LINUX_SIGN_PASSWORD }}
+        run: bash scripts/sign-linux.sh release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+
+      # Visible skip marker so the log shows the absence of a certificate is
+      # intentional, not an error. MUST stay a single-line expression: a
+      # block-scalar `if:` evaluates the literal multi-line string, which is
+      # non-empty and therefore always true (github/docs#6508) — the step
+      # would lie "skipped" even after a successful signing (H4 audit
+      # MINOR 3). Fires only when NO certificate material for this runner's
+      # OS is configured; on macOS the notary key alone cannot sign, so
+      # MAC_CERT_ID stays the sign-mode indicator.
+      - name: Signing skipped (no certificate configured)
+        if: ${{ (runner.os == 'Windows' && secrets.RUTILUS_WINDOWS_CERT_B64 == '' && secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT == '') || (runner.os == 'macOS' && secrets.RUTILUS_MAC_CERT_ID == '') || (runner.os == 'Linux' && secrets.RUTILUS_LINUX_SIGN_KEY_B64 == '') }}
+        run: echo "signing skipped: certificate not configured"
+
+      # --- SBOM (workspace-wide; generated once on the x86_64 linux job) ----
+      # cargo-cyclonedx (pinned to 0.5.9, the latest stable on crates.io as
+      # of 2026-08-12) from taiki-e/install-action, same pattern as the ci
+      # job's gate tools. Real CLI, verified against the upstream README
+      # (CycloneDX/cyclonedx-rust-cargo, 2026-08-12): the only subcommand is
+      # `cargo cyclonedx` — there is NO --locked and NO --output-dir, and
+      # the output is one bom.json written ADJACENT TO EVERY Cargo.toml in
+      # the workspace, not a single file (H4 audit BLOCKER 2). The step
+      # therefore collects the per-crate BOMs under release/ with
+      # crate-qualified names. `--all` lists every dependency (it is the
+      # default; kept explicit).
+      - name: Install cargo-cyclonedx
+        if: matrix.sbom
+        uses: taiki-e/install-action@v2
+        with:
+          tools: cargo-cyclonedx@0.5.9
+      - name: Generate SBOM (CycloneDX JSON)
+        if: matrix.sbom
+        run: |
+          cargo cyclonedx --format json --all
+          # One bom.json per workspace member crate (every Cargo.toml dir is
+          # a unique top-level name, so the parent dir identifies the crate;
+          # the virtual workspace root has no [package], hence no BOM).
+          mkdir -p release
+          find . -name bom.json -not -path './target/*' -not -path './release/*' | sort | while read -r f; do
+            mv "$f" "release/rutilus-${{ github.ref_name }}-sbom-$(basename "$(dirname "$f")").json"
+          done
+          ls -1 release/rutilus-${{ github.ref_name }}-sbom-*.json
+
+      # SHA-256 manifest over everything staged in release/ (binary + any
+      # signatures + SBOM + notarization zip). Generated last so the glob
+      # does not include the manifest itself.
+      - name: Generate SHA-256 manifest
+        shell: bash
+        run: bash scripts/checksums.sh -o release/SHA256SUMS release/*
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
+          path: release/
+          if-no-files-found: error
+
+      # SBOMs are workspace-level artifacts; upload them under their own
+      # artifact so they are not buried in the linux-x86_64 bundle.
+      - name: Upload SBOM
+        if: matrix.sbom
+        uses: actions/upload-artifact@v4
+        with:
+          name: rutilus-${{ github.ref_name }}-sbom
+          path: release/rutilus-${{ github.ref_name }}-sbom-*.json
+          if-no-files-found: error
