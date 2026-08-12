@@ -3,7 +3,7 @@
 > 本文档记录 0.8.0「1.0 能力冻结」里程碑的达成状态与证据链，并逐项盘点 0.9.0「生产候选」
 > 进展，供 0.9.0/1.0.0 评审使用。
 > §一-§五（0.8.0 冻结事实）基于冻结时 master（commit 4ad8c4a）；§六（0.9.0 剩余工作清单）
-> 与 §七（0.9.0 进展盘点）基于 master c4168c5（本轮 HEAD）。所有条目均基于真实代码/测试
+> 与 §七（0.9.0 进展盘点）基于 master edead80（本轮 HEAD）。所有条目均基于真实代码/测试
 > 事实，标注来源文件与测试名；不写设计文档没有且代码不支持的内容。设计基线见仓库根目录
 > `redfish-management-product-final-design.md`（修订冻结版）。全文「file:line」引用已逐一核对
 > 当前 master 实际行号（2026-08-12 复核）：§一-§五 的事实锚定冻结时 commit 4ad8c4a，行号
@@ -166,18 +166,23 @@
 | 签名与 SBOM | Windows Authenticode 签名、macOS 签名和公证、Linux 独立签名、SBOM 生成（§5.4 发布配置） | 设计文档 §0.9.0（2792-2793）、§1.0.0（2847） |
 | tracing 深化 | ✅ 已落地：`#[instrument]` span 接入 main/backup/center_client/center_runtime/event_listener/scheduler/site_runtime/standalone_runtime/telemetry_sampler（口令等敏感值 `skip_all`）；`--log-format <text|json>` 全局选项与 `init_tracing` 双格式层（默认 text，stderr + `RUST_LOG` 过滤不变） | `app/src/main.rs:27-43, 233-251`；`docs/operations-manual.md` §8.1 |
 | 真实响应 fixture 目录 | §19.1 要求 Dell/HPE/Lenovo/xFusion/Inspur 各固件版本的脱敏真实响应 fixture 并随上游升级回归；当前代码库尚无 fixture 目录 | `docs/known-limitations.md` §五 |
-| 其他 | 诊断解码错误路径展示（§12.4）、产品版本号统一策略（`app/tests/log_format.rs:19` 硬编码 `"rutilus 0.1.0"` 版本串与该策略联动）、UI 本地化等 | `docs/known-limitations.md` §七、§八 |
+| 其他 | UI 本地化（界面静态英文，later iteration）；诊断解码错误路径展示（§12.4）与产品版本号统一策略已从本行移出（记录层已完成、捕获点待做与策略落地分别见 §7.1/§7.2-A） | `docs/known-limitations.md` §七、§八 |
 
-## 七、0.9.0 进展盘点（2026-08-12，master c4168c5）
+## 七、0.9.0 进展盘点（2026-08-12，master edead80）
 
 > 对照设计文档 §0.9.0「内容」（`redfish-management-product-final-design.md:2778-2798`）
 > 逐项标注状态。0.8.0 冻结后与 0.9.0 相关的新事实：故障注入与 Supermicro E2E 覆盖落地
 > （commit 4ad8c4a）、x86_64 musl 发布构建进入 CI（commit 3b1ab30）。
-> 本轮（master c4168c5）落地四个工作项：压力容量测试套件（A1）、中心重连风暴测试（A2）、
+> 上一轮（master c4168c5）已落地：压力容量测试套件（A1）、中心重连风暴测试（A2）、
 > tracing 深化（A3）、CI 补齐（A4），全部通过门禁（本机复跑实证：`stress_capacity.rs` 3 测试
-> 全过、`center_sync.rs` 32 测试全过，2026-08-12）。§六「容量测试」「发布构建验证」「tracing
-> 深化」「其他」各行已按新事实同步修订；`docs/known-limitations.md` §七「cargo audit 独立门禁
-> 已启用」「CI 与发布目标差异」「产品版本号」行已先行更新（以 known-limitations 为准）。
+> 全过、`center_sync.rs` 32 测试全过，2026-08-12）。
+> 本轮（master edead80）落地：产品版本号统一策略（commit 2de4351）、§12.4 诊断记录层
+> （commit edead80）、NOTE 收尾（JoinError 记录、center_sync 重连进度重发测试、lipo
+> verify_arch，commit f9a2da2/283e583/c017b7f）、安全审查 M1 修复（commit 72eccb5），
+> 全部通过门禁（本机复跑实证：application 293 / api 80 / web 120 / ui 124 / rutilus 141
+> 全过、`center_sync.rs` 33 测试全过、clippy --all-targets 五 crate 零警告、fmt 干净，
+> 2026-08-12）。§六「其他」与 §7.1/§7.2-A 相关行已按新事实同步修订；
+> `docs/known-limitations.md` §七「产品版本号」行与 §八 §12.4 行已先行更新（以 known-limitations 为准）。
 
 ### 7.1 逐项盘点
 
@@ -188,19 +193,19 @@
 | 故障注入 | 🟡 部分 | §19.3 多数场景已有单进程自动化覆盖：BMC 慢响应（`redfish_gateway.rs:22832, 27486`、`tls_probe.rs:568`）、TLS 证书变化（`domain/src/endpoint.rs:327` `verify_identity`/`TlsIdentityChanged`）、JSON 字段类型错误（`redfish_gateway.rs:18221, 18263` undecodable 成员跳过）、Action 响应丢失/写连接丢弃（`redfish_gateway.rs:27439, 30321`）、Task 消失（`redfish_gateway.rs:21986`）、SSE 流中断/解码失败（`redfish_gateway.rs:31237, 31306`）、重复消息/重复 Operation（`center_sync.rs:3477, 3527`、`operation_engine.rs:1332` 批量重投 no-op、`event_repository.rs:328` 事件去重）、大文件上传中断（`web/tests/artifact_path.rs:733`）、系统时间变化（`application/src/telemetry_sampler.rs:1050, 1076`、`operation_engine.rs:986` 时钟回拨如实记录）、文件写失败（`artifact_store.rs:1476`）；**未覆盖**：产品进程在任务中终止、BMC 更新中重启、SQLite 写入中断、磁盘空间不足（跨进程演练形态，见 7.2-B） |
 | 跨平台 E2E | ✅ 已完成 | windows/macos 任务新增跨平台 E2E 套件步骤（`ci.yml:107-123`）：`cargo test --locked -p rutilus-web`（`web/tests/` 9 个路径套件，均为无 socket/子进程/定时器的内存假件）+ `cargo test --locked -p rutilus --test version`；`app/tests/mock_center_client.rs`（回环 mTLS/WebSocket 中心互操作）因真实 socket 与握手/协商时序**故意不纳入**非默认任务（`ci.yml:113-118` 注释）——三平台 E2E 运行达成 |
 | 数据库压力 | ✅ 已完成 | 压力/容量测试套件落地：`persistence/tests/stress_capacity.rs` 3 个测试（`two_hundred_endpoints_round_trip_with_generation_consistent_refreshes` :336、`one_hundred_sites_advance_outbox_inbox_and_sync_cursors` :582、`five_thousand_endpoint_projections_round_trip_at_the_center` :829），规模常量对齐设计最低验证规模（200/100/5,000，`:47-52`）；本机复跑 3 测试全过（2026-08-12，debug 构建、WAL） |
-| 中心重连风暴 | ✅ 已完成 | 新增 4 个**多连接并发**重连风暴测试（`center_sync.rs:4327` a_concurrent_reconnect_storm_resumes_every_outbox_from_its_last_ack、`:4447` a_reconnect_duplicate_burst_is_idempotent_and_effects_each_operation_once、`:4615` heartbeats_and_reconnects_interleave_without_interference、`:4745` the_local_queue_keeps_accumulating_while_disconnected_and_drains_in_order_on_reconnect）；与既有 28 个单连接语义测试合计 32 个全过（本机复跑 2026-08-12） |
+| 中心重连风暴 | ✅ 已完成 | 4 个**多连接并发**重连风暴测试（`center_sync.rs:4327` a_concurrent_reconnect_storm_resumes_every_outbox_from_its_last_ack、`:4447` a_reconnect_duplicate_burst_is_idempotent_and_effects_each_operation_once、`:4837` heartbeats_and_reconnects_interleave_without_interference、`:4967` the_local_queue_keeps_accumulating_while_disconnected_and_drains_in_order_on_reconnect）+ 1 个重连进度重发测试（`:4614` reconnect_resends_progress_for_active_operations_and_skips_completed_ones，NOTE 收尾 commit 283e583）；与既有 28 个单连接语义测试合计 33 个全过（本机复跑 2026-08-12） |
 | 大文件更新 | 🟡 部分 | 分块上传机制全链路覆盖：4 MiB chunk 上限（`application/src/artifact_store.rs:64` `ARTIFACT_CHUNK_BASE64_MAX_BYTES`）、断点续传（`artifact_store.rs:1364`、`web/tests/artifact_path.rs:733`）、digest 校验（`artifact_path.rs:937`）、multipart 更新（`redfish_gateway.rs:30287, 30321, 30372`）、中心 manifest+chunk 分发（`center_sync.rs:3692`、`application/src/center/projection.rs:1729`）、8 MiB 帧上限（`center-protocol/src/framing.rs:18-31`）；真实大固件文件的端到端更新演练未做 |
 | Secret 泄漏检查 | 🟡 部分 | 结构性防护已有：API 永不回声秘密（`web/tests/write_path.rs:783, 815, 917`、`web/src/lib.rs:6156` secret-free 端点清单、`persistence/src/credential_repository.rs:604`）、审计类型**构造上**不能携带秘密（`domain/src/audit.rs:318, 383`：非秘密身份数据/封闭类型参数摘要）、Center 投影排除凭据与会话（`application/src/center/projection.rs:55`）、命令载荷 at-rest 加密（`security/src/command_cipher.rs`）；独立泄漏扫描/专门审查演练未做（1.0.0「Center 不保存 BMC Secret」路径已由上述结构支撑） |
 | 权限测试 | ✅ 已完成 | `role_masks_are_enforced_on_guarded_routes`（`web/src/lib.rs:10525`）、中心角色站点作用域（`web/src/lib.rs:11398, 11442`）、登录限速预算（`web/src/auth.rs:2523` rate_limiter_enforces_per_username_and_per_ip_budgets）、BMC 写权限拒绝（`redfish_gateway.rs:27328`） |
-| 安全审查 | ⏳ 待做（流程项） | 仓库无安全审查记录/文档证据；可先做代码级自查（7.2-A） |
+| 安全审查 | 🟡 已启动 | 启动交付物 `docs/security-review.md`（8 个审查范围 + §7.7 扫描全完成，无 BLOCKER）；MINOR-1（登录时间侧信道）已于迭代二修复（commit 72eccb5：未知用户名路径哑 Argon2id 验证，`web/src/auth.rs:1242-1253, 1305`）；独立泄漏扫描与外部评估仍待做（见 7.2-A「安全审查（启动）」行） |
 | Migration 回归 | ✅ 已完成 | `migration/tests/` 19 个测试文件（initial_storage/operations/batch_operations/telemetry/events/groups_tags/center_tables/center_data_sites/center_role_sites/product_users/remote_tasks/artifacts/operation_failure_kinds/nvidia_families/nvidia_power_families/lenovo_families/bare_sql_gate/audit_action_shapes/audit_execute_operation）；迁移前自动备份（`persistence/src/lib.rs:510` backs_up_a_closed_database_before_applying_pending_migrations）；CI 独立 Migration Test 门禁（`ci.yml:262-266`） |
 | 备份恢复演练 | 🟡 部分 | 自动化往返覆盖完整：`app/src/backup.rs:765`（往返保数据）、`:799`（拒绝他实例包）、`:825`（跨机恢复需源信封）、`:912`（源口令对全新信封）、`:944`（需停止实例）、`:981`（拒绝不同产品版本）、`:970`（拒绝未初始化目录）；CLI `rutilus backup`/`restore`（`app/src/main.rs:76, 122`）；0.9.0 验收「三平台安装、升级、备份、恢复通过」的演练未执行 |
 | 签名构建 | ⏳ 待做（发布管道） | 仓库无 Authenticode / macOS 公证 / Linux 签名工具链证据（CI 无签名步骤；现有「signing」匹配均为 TLS/CA 证书签名代码，非发布二进制签名）；§5.4 发布配置 |
 | SBOM | ⏳ 待做（发布管道） | 无 SBOM 生成工具（cargo-cyclonedx 等）与产物证据 |
-| 用户手册 | ✅ 已完成 | `docs/user-manual.md`（420 行，条目后标注来源文件） |
+| 用户手册 | ✅ 已完成 | `docs/user-manual.md`（422 行，条目后标注来源文件） |
 | 运维手册 | ✅ 已完成 | `docs/operations-manual.md`（数据目录/主密钥/服务/备份恢复/升级/诊断/容量现状；§8.1 已补充 `--log-format json` 结构化输出与 span 上下文，§九已补充合成规模实测容量数据） |
 | 支持矩阵 | ✅ 已完成 | `docs/support-matrix.md`（189 行：上游基线/平台矩阵/厂商支持现状/不承诺项）；§三「CI 现状」已更新（windows/macos E2E 套件、aarch64 musl、macOS Universal 2 入 CI，Windows ARM64 未入 CI 的真实原因，`support-matrix.md:90-95`） |
-| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（125 行：OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:119`：合成规模套件已实测、正式容量建议待发布）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致） |
+| 已知限制 | ✅ 已完成 | `docs/known-limitations.md`（125 行：OutOfScope 3 项/依赖风险登记/测试基建局限/容量现状等）；§八「§0.9.0 性能容量测试与真实容量建议」行已同步为部分落地（`known-limitations.md:119`：合成规模套件已实测、正式容量建议待发布）；§八「§12.4 诊断中的解码错误路径 / ExtendedInfo 展示」行已同步为部分落地（`known-limitations.md:122`：记录层完成、生产捕获点待做）；§六标题已同步修订为「发布级容量建议未发布（合成规模已实测）」（2026-08-12，与 §八、operations-manual §九 一致） |
 | 性能容量测试 | 🟡 部分 | 压力/容量套件已落地（`persistence/tests/stress_capacity.rs`，规模达设计最低验证规模）并有本机实测数据（2026-08-12，debug 构建、WAL、Windows 开发机）：5,000 投影写入 5.78s（≈865 行/s）、幂等重投 9.72s、5,000 行清单查询 0.482s；关键观察：写路径被 `write_gate`（`Semaphore(1)`，`persistence/src/lib.rs:101, 240`）全局串行化，5,000 规模耗时 ≈ 事务数 × 单事务成本——这是发布真实容量建议时最有价值的记录；**最终发布容量建议**未发布（`operations-manual.md` §九） |
 
 ### 7.2 剩余工作精确分类
@@ -208,15 +213,18 @@
 **A. 代码/CI 可做（不依赖外部资源，可直接进入迭代）**
 
 本轮已落地并从下表移出（详见 §7.1 与 §六）：数据库压力测试套件（`stress_capacity.rs`）、
-中心重连风暴测试（`center_sync.rs` 4 个并发测试）、跨平台 E2E 运行（`ci.yml:107-123`）、
+中心重连风暴测试（`center_sync.rs` 并发测试）、跨平台 E2E 运行（`ci.yml:107-123`）、
 `cargo audit` 独立门禁（`ci.yml:163-181`）、tracing 深化（`app/src/main.rs:233-251`）。
+迭代二（master edead80）落地：产品版本号统一策略（✅，下表该行已标证据）、安全审查
+M1 修复（✅，下表「安全审查（启动）」行）；§12.4 诊断记录层部分落地（记录层完成、
+生产捕获点待做，下表该行标 🟡）。
 
 | 工作项 | 说明 | 证据/来源 |
 |---|---|---|
-| §12.4 诊断解码错误路径 / ExtendedInfo 展示 | 解码失败成员目前跳过且不留记录（`resource_diagnostics.rs:28-30` 明确缺席） | `known-limitations.md` §八 |
-| 产品版本号统一策略 | workspace 版本仍 `0.1.0`，里程碑编号独立；`app/tests/log_format.rs:19` 硬编码 `"rutilus 0.1.0"` 版本串与该策略联动 | `known-limitations.md` §七 |
+| §12.4 诊断解码错误路径 / ExtendedInfo 展示 | 🟡 部分：记录层已完成——`ResourceExtendedInfo`/`ResourceDecodeFailure`（`resource_diagnostics.rs:36, 249`）、api 契约 9 字段（`api/src/lib.rs:1895-1905`）、web 投影（`web/src/lib.rs:3949`）、ui 只读区块（`ui/src/lib.rs:15288` 附近）、端到端测试（`web/tests/diagnostics_path.rs` 6 个测试，commit edead80）；**生产捕获点待做**：gateway 捕获 + SQLite 持久化未实现，生产链路 `decode_failures` 恒为空（`endpoint_inventory.rs:47, 94`） | `known-limitations.md` §八 |
+| 产品版本号统一策略 | ✅ 已落地（commit 2de4351）：workspace 版本 = `0.9.0`（生产候选，与里程碑对齐），单一来源 = 根 `Cargo.toml` `[workspace.package] version`（`Cargo.toml:14`）；`app/tests/version.rs:16-24` 与 `app/tests/log_format.rs:13-17` 改派生断言（`env!("CARGO_PKG_VERSION")` + `NV_REDFISH_DEVELOPMENT_BASELINE`），`rutilus version` 实测输出 `rutilus 0.9.0`；升级只改一处 | 根 `Cargo.toml:6-14`；`app/tests/version.rs`；`app/tests/log_format.rs` |
 | UI 本地化 | 界面静态英文（later iteration） | `known-limitations.md` §七 |
-| 安全审查（启动） | 基于现有代码的审查与记录（流程启动项） | 设计文档 §0.9.0 |
+| 安全审查（启动） | ✅ 已交付：`docs/security-review.md`（8 个审查范围 + §7.7 扫描全完成，无 BLOCKER）；MINOR-1（登录时间侧信道）已修复（commit 72eccb5：`web/src/auth.rs:1242-1253` 哑 Argon2id 验证 + `:1305` 未知用户名分支调用），验证方式 = 调用计数对称断言而非墙钟计时（`web/src/lib.rs:9247` 计数、`:10649` 与 `:10713` 两分支各 1 次/失败、限速拒绝 0 次）；剩余：独立 Secret 泄漏扫描与外部评估（1.0.0 发布评审建议项） | `docs/security-review.md`；设计文档 §0.9.0 |
 | 发布构建矩阵补齐（剩余部分） | aarch64 musl（cargo-zigbuild）与 macOS Universal 2（lipo）已入 CI（`ci.yml:228-232, 243-260`）；Windows ARM64 明确不入 CI——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库（`ci.yml:234-241` 注释），需原生 ARM64 Windows runner 或本地验证后另行处理 | `ci.yml` |
 
 **B. 依赖演练环境（物理设备 / 规模环境 / 三平台流程）**

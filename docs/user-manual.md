@@ -3,8 +3,10 @@
 > 本文档面向运维人员，描述 Rutilus 产品的日常使用。
 > 产品定义以仓库根目录 `redfish-management-product-final-design.md`（修订冻结版）为准；
 > 本文档描述的界面、命令和行为均基于当前 master 的实际代码实现，并在条目后标注事实来源文件。
-> 当前产品版本号为 `0.1.0`（workspace 版本，`rutilus version` 输出；`Cargo.toml`），
-> 设计文档中的 0.1.0→0.8.0 里程碑编号是路线图编号，与 crates.io 版本号相互独立。
+> 当前产品版本号为 `0.9.0`（生产候选，workspace 版本，`rutilus version` 输出；根 `Cargo.toml`），
+> 版本号单一来源 = 根 `Cargo.toml` `[workspace.package] version`（`Cargo.toml:14`）：产品版本与里程碑
+> 对齐、随里程碑升级（设计文档 0.1.0→1.0.0 为产品发布阶段编号），一次升级只改这一处；`rutilus version`
+> 输出与版本/日志格式测试断言均由 `CARGO_PKG_VERSION` 与基线常量派生（`app/tests/version.rs`、`app/tests/log_format.rs`）。
 
 ## 一、产品概述
 
@@ -25,7 +27,7 @@ Rutilus 是一个由 Rust 实现、通过浏览器 GUI 使用、基于 `nv-redfi
 
 | 项目 | 值 | 来源 |
 |---|---|---|
-| 产品 crate 版本 | `0.1.0` | `Cargo.toml` `[workspace.package] version` |
+| 产品 crate 版本 | `0.9.0`（生产候选，与里程碑对齐、随里程碑升级；单一版本来源） | 根 `Cargo.toml` `[workspace.package] version`（`Cargo.toml:14`） |
 | `nv-redfish` 开发/发布基线 | `0.13.0`（2026-08-04 发布） | `infra-redfish/src/lib.rs`、`infra-redfish/src/release_baseline.rs` |
 | 已知更新正式版本 | `0.14.2`（2026-08-10 发布，未 yank），升级决策留待冻结评审 | `infra-redfish/src/release_baseline.rs` |
 | 能力账本规模 | 47 条（33 标准 + 14 OEM） | `domain/src/capability.rs` |
@@ -34,7 +36,7 @@ Rutilus 是一个由 Rust 实现、通过浏览器 GUI 使用、基于 `nv-redfi
 运行 `rutilus version` 可打印产品版本与 `nv-redfish` 开发基线：
 
 ```text
-rutilus 0.1.0
+rutilus 0.9.0
 nv-redfish development baseline 0.13.0
 ```
 
