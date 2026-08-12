@@ -49,6 +49,9 @@
 > 1731 + doc 1 = 1732；迭代十增量恰 +8，全部来自 down_order_gate）；per-crate：migration
 > 38（30 基线 + 8）/ persistence 190+3 / application 301 / infra 291 /
 > test-support 55 / web 133 / ui 141（含 15 个 i18n 测试）/ rutilus 145 / security 门禁 8）。
+> **迭代十一（2026-08-12，HEAD = b685818，74570bc + b685818）已合入**：迭代十登记与
+> 计数同步（74570bc）+ down 门禁注释精确化（b685818，注释-only 变更，down_order_gate
+> 8/8 复跑全绿），计数沿用 7533c03 轮。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
 

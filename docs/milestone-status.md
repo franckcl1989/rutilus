@@ -49,8 +49,10 @@
 > `find -name bom.json` 首跑必然失败；已改 `-name '*.cdx.json'` + 注释如实化；ubuntu 实跑
 > 仍属首跑确认点——消掉首跑确认点 1 项：工具行为与 workspace 兼容性已本地验证）、`7533c03`
 > （docs：release-readiness 头注 bump，后经迭代十一 NOTE 修复统一为「迭代八合入后复核版
-> HEAD=d1b375c」口径）；**迭代十一 NOTE 修复进行中（工作区未提交，2026-08-12）**：
-> release-readiness 口径统一 + down_order_gate 注释精确化。所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
+> HEAD=d1b375c」口径）；**迭代十一已落地（2026-08-12，HEAD = b685818）**：`74570bc`（docs:
+> register iteration ten and sync the gate counts）+ `b685818`（test(migration): precise the
+> down-order gate comments，注释精确化：FK 来源三文件明细 + 诚实规则缝隙注记，8/8 复跑全绿）。
+> 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-12 复核）：
 > §一-§五 的事实锚定冻结时 commit 4ad8c4a，行号一律以当前 master 为准。
