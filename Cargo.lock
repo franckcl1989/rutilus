@@ -3641,6 +3641,7 @@ dependencies = [
  "rutilus-center-protocol",
  "rutilus-domain",
  "rutilus-operation-engine",
+ "rutilus-persistence",
  "rutilus-security",
  "secrecy",
  "serde",

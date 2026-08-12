@@ -25,6 +25,11 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The through-path decode-failure tests (§12.4 / known-limitations §九) drive
+# the production refresh pipeline against the real persistence store: the
+# captured records must land in `resource_decode_failures` through the
+# same-generation commit, which only a real `SqliteStore` exercises.
+rutilus-persistence.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
