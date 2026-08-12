@@ -49,6 +49,9 @@
 //! prints the listening URL and the SHA-256 fingerprint; `test-support/
 //! README.md` walks through the full product demo (init, run, add endpoint,
 //! Pin the printed fingerprint, enroll, browse resources and capabilities).
+//! `mock-bmc --port 8443 --profile dell` pins the port and selects the Dell
+//! profile, and the positional shorthand `mock-bmc 8443 dell` is
+//! equivalent: the long options win when both spellings are given.
 //!
 //! # Test usage
 //!

@@ -31,7 +31,9 @@ cargo run -p rutilus-test-support --bin mock-bmc
 ```
 
 Optional: `--port 8443` to pin a fixed port, and `--profile dell` to serve
-the Dell vendor profile instead of the default. The binary prints:
+the Dell vendor profile instead of the default. The same arguments are
+accepted as a positional shorthand, `mock-bmc 8443 dell`; when both
+spellings are given the long options win. The binary prints:
 
 ```text
 Rutilus Mock Redfish BMC (profile: rutilus) listening at https://127.0.0.1:64153/
@@ -145,7 +147,8 @@ for them instead of classifying a guessed path.
 
 `MockBmc::start()` serves the default Rutilus Test profile;
 `MockBmc::start_with_profile(MockProfile::Dell)` (or `mock-bmc
---profile dell`) serves the Dell iDRAC profile:
+--profile dell`, or the positional `mock-bmc 9443 dell`) serves the Dell
+iDRAC profile:
 
 - Default (`MockProfile::Rutilus`): Vendor "Rutilus Test" / Product "Mock
   BMC", no `Oem` namespace anywhere in the tree, so every §2.1 OEM capability
