@@ -9183,6 +9183,12 @@ mod tests {
         sessions: Vec<Session>,
         bootstrap_code: Option<BootstrapCode>,
         next_token: u64,
+        /// How many times the mock `verify_password` boundary ran. The
+        /// MINOR-1 tests assert the unknown-username sign-in path performs
+        /// its dummy verification 鈥?one call per attempted failure and none
+        /// on the rate-limited refusal 鈥?so a regression that skips the
+        /// dummy fails the count assertions.
+        password_verifications: u64,
     }
 
     impl AuthTestState {
@@ -9230,6 +9236,17 @@ mod tests {
                 fold_hash(code),
                 OffsetDateTime::now_utc(),
             ));
+        }
+
+        /// How many times the verify-password boundary ran 鈥?the MINOR-1
+        /// tests use the count to prove the unknown-username path performs
+        /// its dummy verification (a wall-clock timing assertion would be
+        /// too flaky; the call-count symmetry is the structural guarantee).
+        #[must_use]
+        fn password_verifications(&self) -> u64 {
+            self.inner
+                .lock()
+                .map_or(0, |inner| inner.password_verifications)
         }
     }
 
@@ -9572,6 +9589,12 @@ mod tests {
             })
         }
         fn verify_password(&self, hash: &Argon2IdHash, password: &SecretString) -> bool {
+            // The MINOR-1 tests count this boundary: the unknown-username
+            // path must run exactly one (dummy) verification per attempted
+            // failure, exactly like the wrong-password path.
+            if let Ok(mut inner) = self.auth_state.inner.lock() {
+                inner.password_verifications += 1;
+            }
             hash == deterministic_credential(password.expose_secret(), OffsetDateTime::now_utc())
                 .hash()
         }
@@ -10465,6 +10488,148 @@ mod tests {
             )
             .await?;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        Ok(())
+    }
+
+    /// The unknown-username sign-in keeps the 搂16.2 failure contract
+    /// (unified error, rate-limit budget) and 鈥?security-review MINOR-1 鈥?
+    /// runs exactly one dummy password verification per attempted failure,
+    /// the cost equalizer that makes the branch indistinguishable from the
+    /// wrong-password branch by timing.
+    #[tokio::test]
+    async fn unknown_username_sign_in_runs_one_dummy_verification_per_attempt()
+    -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        let router = test_router_with_policy(state.clone(), AuthPolicy::Guarded);
+        let body = r#"{"username": "no-such-user", "password": "any password"}"#;
+
+        // The unknown username answers the exact same error as a wrong
+        // password.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let error = json_body(refused).await?;
+        assert_eq!(error["message"], "sign-in failed", "{error}");
+
+        // The MINOR-1 cost equalizer ran: the unknown-username branch
+        // performed one dummy password verification, the same count the
+        // wrong-password branch produces (see the next test). A wall-clock
+        // timing comparison would be flaky; the call-count symmetry is the
+        // structural guarantee that the two branches cost the same.
+        assert_eq!(state.password_verifications(), 1);
+
+        // The dummy stays inside the existing budgets: each of the
+        // remaining attempts verifies once, and the sixth 鈥?refused before
+        // any verification 鈥?verifies nothing.
+        for _ in 0..4 {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(state.password_verifications(), 5);
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            state.password_verifications(),
+            5,
+            "the rate-limited refusal must run no verification"
+        );
+        Ok(())
+    }
+
+    /// The wrong-password path runs exactly one verification per attempted
+    /// failure 鈥?the same count the unknown-username path produces 鈥?so the
+    /// two failure branches are structurally indistinguishable in cost (the
+    /// MINOR-1 property the dummy verification restores).
+    #[tokio::test]
+    async fn wrong_password_sign_in_verifies_once_per_attempt() -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        let router = test_router_with_policy(state.clone(), AuthPolicy::Guarded);
+
+        for _ in 0..5 {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"username": "admin", "password": "wrong password"}"#,
+                        ))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(state.password_verifications(), 5);
+        Ok(())
+    }
+
+    /// The unknown-username sign-in still records the 搂16.3 login-failure
+    /// audit pair (started + failed, action `login`) 鈥?the MINOR-1 dummy
+    /// verification must not change the audit semantics.
+    #[tokio::test]
+    async fn unknown_username_sign_in_records_the_login_failure_audit_pair()
+    -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "no-such-user", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "the failure must append start + terminal");
+            assert_eq!(events[0].outcome().kind().as_str(), "started");
+            assert_eq!(events[0].context().action().as_str(), "login");
+            assert_eq!(events[1].outcome().kind().as_str(), "failed");
+            assert_eq!(events[1].context().action().as_str(), "login");
+            assert_eq!(events[1].context().permission().as_str(), "authenticate");
+        }
         Ok(())
     }
 

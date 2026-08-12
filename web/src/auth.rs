@@ -54,12 +54,12 @@ use rutilus_api::{
 };
 use rutilus_application::{AuditEventWriter, BoundaryFuture, Clock};
 use rutilus_domain::{
-    Argon2IdHash, AuditAction, AuditActor, AuditEvent, AuditFailure, AuditFailureVerification,
-    AuditOperationContext, AuditOperationContextError, AuditOperationId, AuditParameterSummary,
-    AuditRedfishOperation, AuditSequence, AuditTarget, BootstrapCode, BootstrapCodeId, InstanceId,
-    PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState, ProductPermission,
-    Role, RoleAssignment, Session, SessionId, TOTP_SECRET_LENGTH, TotpAuthenticator,
-    TotpAuthenticatorError,
+    ARGON2ID_HASH_LENGTH, ARGON2ID_SALT_LENGTH, Argon2IdHash, AuditAction, AuditActor, AuditEvent,
+    AuditFailure, AuditFailureVerification, AuditOperationContext, AuditOperationContextError,
+    AuditOperationId, AuditParameterSummary, AuditRedfishOperation, AuditSequence, AuditTarget,
+    BootstrapCode, BootstrapCodeId, InstanceId, PasswordCredential, Principal, PrincipalId,
+    PrincipalName, PrincipalState, ProductPermission, Role, RoleAssignment, Session, SessionId,
+    TOTP_SECRET_LENGTH, TotpAuthenticator, TotpAuthenticatorError,
 };
 use secrecy::{SecretBox, SecretString};
 use time::{Duration, OffsetDateTime};
@@ -1200,6 +1200,58 @@ fn is_https(uri: &axum::http::Uri, headers: &HeaderMap) -> bool {
         })
 }
 
+/// The fixed salt of the dummy credential behind the `MINOR-1` sign-in
+/// mitigation (docs/security-review.md; §16.2 side-channel protection).
+///
+/// The unknown-username branch of [`login`] runs one dummy Argon2id
+/// verification so its cost matches the wrong-password branch — otherwise
+/// the response timing of the two branches would let an attacker enumerate
+/// valid usernames. The bytes are arbitrary pinned constants: deliberately
+/// not random and never derived from any real user's data, so the dummy
+/// computation cannot touch or leak a genuine credential. The array type
+/// pins the length to the `argon2id-1` salt length, so the dummy
+/// verification runs under exactly the parameters of the real path.
+const DUMMY_SALT: [u8; ARGON2ID_SALT_LENGTH] = [0x1a; ARGON2ID_SALT_LENGTH];
+
+/// The fixed derived hash of the dummy credential (see [`DUMMY_SALT`]).
+///
+/// Pinned to the `argon2id-1` hash length so the dummy derivation fills
+/// the same 64 MiB of memory and produces the same 32-byte digest size as
+/// a real verification.
+const DUMMY_HASH: [u8; ARGON2ID_HASH_LENGTH] = [0x2b; ARGON2ID_HASH_LENGTH];
+
+/// Runs one dummy Argon2id verification for the unknown-username sign-in
+/// branch (security-review `MINOR-1` mitigation).
+///
+/// The branch has no stored hash to verify against, so the presented
+/// password is verified against the fixed [`DUMMY_SALT`]/[`DUMMY_HASH`]
+/// credential instead — the same `argon2id-1` parameters (64 MiB, 3
+/// passes, 1 lane, 32-byte digest; the domain constants the value object
+/// pins) the wrong-password branch's `verify_password` runs, so the two
+/// branches cost the same and response timing cannot distinguish a
+/// non-existent username from a wrong password. The verdict is always
+/// discarded: the branch is a failure either way, and the cost is the
+/// point.
+///
+/// The *presented* password — not a fixed string — is the input, so the
+/// work profile matches the real branch (Argon2id cost depends slightly on
+/// the password bytes); it is attacker-supplied input, never real user
+/// data. The call is bounded by the login rate limiter (5 failures per
+/// username, 20 per address, per 15-minute window), so the dummy cannot
+/// become a denial-of-service lever.
+fn dummy_password_verification<Services>(services: &Services, password: &SecretString)
+where
+    Services: AuthServices,
+{
+    // The constants' array types pin the `argon2id-1` lengths, so the
+    // construction cannot fail; the `Ok` guard is a totality courtesy —
+    // the workspace forbids panics in production code.
+    let Ok(dummy) = Argon2IdHash::from_parts(&DUMMY_SALT, &DUMMY_HASH) else {
+        return;
+    };
+    let _ = services.verify_password(&dummy, password);
+}
+
 /// The §16.2 sign-in handler.
 ///
 /// The handler is the declarative sign-in flow — rate limit, lookup,
@@ -1245,6 +1297,12 @@ where
         .ok()
         .flatten()
     else {
+        // MINOR-1 (docs/security-review.md): this branch must not return
+        // observably faster than the wrong-password branch — the timing
+        // difference would let an attacker enumerate valid usernames. One
+        // dummy Argon2id verification balances the two paths; the failure
+        // handling below stays identical either way.
+        dummy_password_verification(state.services.as_ref(), request.password());
         state
             .auth
             .rate_limiter
@@ -2596,6 +2654,25 @@ mod tests {
             "the bounded key is the first 64 characters"
         );
         assert_eq!(bounded_username_key(&long).len(), RATE_LIMIT_USERNAME_CHARS);
+    }
+
+    #[test]
+    fn dummy_credential_is_a_fixed_constant_in_the_argon2id_format() -> Result<(), Box<dyn Error>> {
+        // The MINOR-1 dummy credential is pinned bytes — the same salt and
+        // hash on every call, typed to the `argon2id-1` lengths — so the
+        // unknown-username branch's dummy verification runs under exactly
+        // the parameters of the real password path and touches no real
+        // user's data. (The behavioral half of the mitigation — that the
+        // unknown-username branch actually performs the verification — is
+        // asserted at the route level in web/src/lib.rs, where the mock
+        // services count `verify_password` calls.)
+        let dummy = Argon2IdHash::from_parts(&DUMMY_SALT, &DUMMY_HASH)
+            .map_err(|_| "the pinned dummy salt and hash lengths are invalid")?;
+        assert_eq!(dummy.salt(), &DUMMY_SALT);
+        assert_eq!(dummy.hash(), &DUMMY_HASH);
+        assert_eq!(dummy.salt().len(), ARGON2ID_SALT_LENGTH);
+        assert_eq!(dummy.hash().len(), ARGON2ID_HASH_LENGTH);
+        Ok(())
     }
 
     #[test]
