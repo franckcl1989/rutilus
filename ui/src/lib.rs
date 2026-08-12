@@ -41,6 +41,12 @@ use rutilus_api::{
 #[cfg(any(target_arch = "wasm32", test))]
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod i18n;
+
+#[cfg(any(target_arch = "wasm32", test))]
+use i18n::L;
+
 // Production wasm builds reach `serde_json` through the leptos re-export:
 // leptos is the wasm-only UI dependency that already carries the crate, so
 // the manifest stays untouched. Host test builds use the dev-dependency.
@@ -99,17 +105,11 @@ impl ConsoleLoadState {
 
     const fn status_message(&self) -> &'static str {
         match self {
-            Self::Loading => "Starting the local management console...",
-            Self::Ready(_) => "Authenticated local inventory",
-            Self::Failed(ConsoleLoadFailure::ProductMetadata) => {
-                "The local console could not verify product metadata."
-            }
-            Self::Failed(ConsoleLoadFailure::EndpointInventory) => {
-                "The endpoint inventory is temporarily unavailable."
-            }
-            Self::Failed(ConsoleLoadFailure::EndpointResources) => {
-                "Core resource details are temporarily unavailable."
-            }
+            Self::Loading => L.header_status_loading,
+            Self::Ready(_) => L.header_status_ready,
+            Self::Failed(ConsoleLoadFailure::ProductMetadata) => L.header_status_failed_metadata,
+            Self::Failed(ConsoleLoadFailure::EndpointInventory) => L.header_status_failed_inventory,
+            Self::Failed(ConsoleLoadFailure::EndpointResources) => L.header_status_failed_resources,
         }
     }
 
@@ -796,7 +796,7 @@ fn system_card_facts(
         serial_number.as_deref(),
     );
     push_fact(&mut facts, "SKU", sku.as_deref());
-    push_fact(&mut facts, "Host name", host_name.as_deref());
+    push_fact(&mut facts, L.field_host_name, host_name.as_deref());
     push_fact(&mut facts, "BIOS version", bios_version.as_deref());
     push_fact(&mut facts, "Power state", power_state.as_deref());
     push_status_facts(&mut facts, status.as_ref());
@@ -1100,7 +1100,7 @@ fn account_card_facts(
         "Enabled",
         enabled.map(|enabled| if enabled { "Yes" } else { "No" }),
     );
-    push_fact(&mut facts, "Role", role_id.as_deref());
+    push_fact(&mut facts, L.field_role, role_id.as_deref());
     push_fact(
         &mut facts,
         "Locked",
@@ -1151,7 +1151,7 @@ fn boot_option_card_facts(
         return ("Boot option", Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Display name", display_name.as_deref());
+    push_fact(&mut facts, L.field_display_name, display_name.as_deref());
     push_fact(
         &mut facts,
         "Enabled",
@@ -1493,7 +1493,7 @@ fn manager_network_protocol_card_facts(
         return ("Manager Network Protocol", Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Host name", host_name.as_deref());
+    push_fact(&mut facts, L.field_host_name, host_name.as_deref());
     push_fact(&mut facts, "FQDN", fqdn.as_deref());
     push_status_facts(&mut facts, status.as_ref());
     ("Manager Network Protocol", facts)
@@ -1667,12 +1667,12 @@ fn event_subscription_card_facts(
         return ("Event subscription", Vec::new());
     };
     let mut facts = Vec::new();
-    push_fact(&mut facts, "Destination", destination.as_deref());
-    push_fact(&mut facts, "Protocol", protocol.as_deref());
+    push_fact(&mut facts, L.field_destination, destination.as_deref());
+    push_fact(&mut facts, L.field_protocol, protocol.as_deref());
     push_fact(&mut facts, "Context", context.as_deref());
     push_fact(
         &mut facts,
-        "Event types",
+        L.field_event_types,
         event_types
             .as_deref()
             .map(|types| types.join(", "))
@@ -2066,7 +2066,7 @@ fn oem_nvidia_system_profile_file_card_facts(
     };
     let mut facts = Vec::new();
     push_boolean_fact(&mut facts, "Activate", *metadata_activate);
-    push_boolean_fact(&mut facts, "Delete", *metadata_delete);
+    push_boolean_fact(&mut facts, L.action_delete, *metadata_delete);
     push_fact(
         &mut facts,
         "Origin profile UUID",
@@ -2730,9 +2730,9 @@ impl RoleView {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Administrator => "Administrator",
-            Self::Operator => "Operator",
-            Self::Viewer => "Viewer",
+            Self::Administrator => L.role_administrator,
+            Self::Operator => L.role_operator,
+            Self::Viewer => L.role_viewer,
         }
     }
 }
@@ -2792,23 +2792,23 @@ impl ConsoleView {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Overview => "Overview",
-            Self::Groups => "Groups",
-            Self::Credentials => "Credentials",
-            Self::AddEndpoint => "Add endpoint",
-            Self::Import => "Import",
-            Self::Audit => "Audit",
-            Self::Capabilities => "Capabilities",
-            Self::Operations => "Operations",
-            Self::Events => "Events",
-            Self::Artifacts => "Artifacts",
-            Self::Telemetry => "Telemetry",
-            Self::Diagnostics => "Diagnostics",
-            Self::Users => "Users",
-            Self::Sessions => "Sessions",
-            Self::CenterSites => "Center sites",
-            Self::CenterOperations => "Center operations",
-            Self::CenterBindings => "Center bindings",
+            Self::Overview => L.nav_overview,
+            Self::Groups => L.nav_groups,
+            Self::Credentials => L.nav_credentials,
+            Self::AddEndpoint => L.nav_add_endpoint,
+            Self::Import => L.nav_import,
+            Self::Audit => L.nav_audit,
+            Self::Capabilities => L.nav_capabilities,
+            Self::Operations => L.nav_operations,
+            Self::Events => L.nav_events,
+            Self::Artifacts => L.nav_artifacts,
+            Self::Telemetry => L.nav_telemetry,
+            Self::Diagnostics => L.nav_diagnostics,
+            Self::Users => L.nav_users,
+            Self::Sessions => L.nav_sessions,
+            Self::CenterSites => L.nav_center_sites,
+            Self::CenterOperations => L.nav_center_operations,
+            Self::CenterBindings => L.nav_center_bindings,
         }
     }
 
@@ -3097,7 +3097,7 @@ impl CapabilityLoadFailure {
         match self {
             Self::EndpointNotFound => "This endpoint no longer exists.",
             Self::Unavailable => "The capability list is temporarily unavailable.",
-            Self::Malformed => "The server response could not be parsed.",
+            Self::Malformed => L.error_server_unparsable,
         }
     }
 }
@@ -3223,9 +3223,9 @@ enum DiagnosticsLoadFailure {
 impl DiagnosticsLoadFailure {
     const fn message(self) -> &'static str {
         match self {
-            Self::ResourceNotFound => "This resource no longer exists in the product.",
+            Self::ResourceNotFound => L.error_resource_missing,
             Self::Unavailable => "The diagnostics snapshot is temporarily unavailable.",
-            Self::Malformed => "The server response could not be parsed.",
+            Self::Malformed => L.error_server_unparsable,
         }
     }
 }
@@ -3427,13 +3427,13 @@ const NOT_OBSERVED_STATE_LABEL: &str = "Not yet observed";
 #[cfg(any(target_arch = "wasm32", test))]
 const fn capability_state_label(state: CapabilityStateResponse) -> &'static str {
     match state {
-        CapabilityStateResponse::Supported => "Supported",
-        CapabilityStateResponse::ReadOnly => "Read only",
-        CapabilityStateResponse::Unauthorized => "Unauthorized",
-        CapabilityStateResponse::TemporarilyUnavailable => "Temporarily unavailable",
-        CapabilityStateResponse::SchemaIncompatible => "Schema incompatible",
-        CapabilityStateResponse::NotAdvertised => "Not advertised",
-        CapabilityStateResponse::NotCompiled => "Not compiled",
+        CapabilityStateResponse::Supported => L.state_supported,
+        CapabilityStateResponse::ReadOnly => L.state_read_only,
+        CapabilityStateResponse::Unauthorized => L.state_unauthorized,
+        CapabilityStateResponse::TemporarilyUnavailable => L.state_temporarily_unavailable,
+        CapabilityStateResponse::SchemaIncompatible => L.state_schema_incompatible,
+        CapabilityStateResponse::NotAdvertised => L.state_not_advertised,
+        CapabilityStateResponse::NotCompiled => L.state_not_compiled,
     }
 }
 
@@ -3670,7 +3670,7 @@ impl CredentialDraftError {
             Self::UsernameRequired => "A BMC username is required.",
             Self::UsernameControlCharacter => "The username cannot contain control characters.",
             Self::UsernameTooLong => "The username cannot exceed 256 characters.",
-            Self::PasswordRequired => "A password is required.",
+            Self::PasswordRequired => L.error_password_required,
             Self::PasswordTooLarge => "The password cannot exceed 4 KiB.",
         }
     }
@@ -3746,7 +3746,7 @@ impl DisplayNameDraftError {
         match self {
             Self::Required => "A display name is required.",
             Self::ControlCharacter => "The display name cannot contain control characters.",
-            Self::TooLong => "The display name cannot exceed 128 characters.",
+            Self::TooLong => L.error_display_name_too_long,
         }
     }
 }
@@ -4257,10 +4257,10 @@ enum ImportFailure {
 impl ImportFailure {
     fn message(&self) -> String {
         match self {
-            Self::FileUnreadable => "The selected file could not be read.".to_owned(),
-            Self::FileEmpty => "The selected file is empty.".to_owned(),
+            Self::FileUnreadable => L.error_file_unreadable.to_owned(),
+            Self::FileEmpty => L.error_file_empty.to_owned(),
             Self::Unavailable => "The import service is temporarily unavailable.".to_owned(),
-            Self::MalformedReport => "The server response could not be read.".to_owned(),
+            Self::MalformedReport => L.error_server_unreadable.to_owned(),
             Self::Rejected { status } => {
                 format!("The server rejected the import request (HTTP {status}).")
             }
@@ -4303,7 +4303,7 @@ impl RefreshFailure {
     fn message(&self) -> String {
         match self {
             Self::Unavailable => "The refresh service is temporarily unavailable.".to_owned(),
-            Self::MalformedReport => "The server response could not be read.".to_owned(),
+            Self::MalformedReport => L.error_server_unreadable.to_owned(),
             Self::Rejected { status } => {
                 format!("The server rejected the refresh request (HTTP {status}).")
             }
@@ -4946,15 +4946,15 @@ impl OperationStateView {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Queued => "Queued",
-            Self::Validating => "Validating",
-            Self::Running => "Running",
-            Self::WaitingRemote => "Waiting for BMC",
-            Self::Verifying => "Verifying",
-            Self::Succeeded => "Succeeded",
-            Self::Failed => "Failed",
-            Self::Unknown => "Unknown",
-            Self::Cancelled => "Cancelled",
+            Self::Queued => L.state_queued,
+            Self::Validating => L.state_validating,
+            Self::Running => L.state_running,
+            Self::WaitingRemote => L.state_waiting_bmc,
+            Self::Verifying => L.state_verifying,
+            Self::Succeeded => L.state_succeeded,
+            Self::Failed => L.state_failed,
+            Self::Unknown => L.state_unknown,
+            Self::Cancelled => L.state_cancelled,
         }
     }
 
@@ -5525,8 +5525,8 @@ impl SecureBootActionView {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Enable => "Enable",
-            Self::Disable => "Disable",
+            Self::Enable => L.action_enable,
+            Self::Disable => L.action_disable,
             Self::ResetKeys(_) => "Reset keys",
         }
     }
@@ -5900,8 +5900,8 @@ fn command_summary(command: &OperationCommandDraft) -> CommandSummaryProjection 
         },
         OperationCommandDraft::SecureBoot(action) => {
             let payload = match action {
-                SecureBootActionView::Enable => "Enable".to_owned(),
-                SecureBootActionView::Disable => "Disable".to_owned(),
+                SecureBootActionView::Enable => L.action_enable.to_owned(),
+                SecureBootActionView::Disable => L.action_disable.to_owned(),
                 SecureBootActionView::ResetKeys(kind) => {
                     format!("Reset keys · {}", kind.as_str())
                 }
@@ -6432,7 +6432,7 @@ impl OperationFormError {
             }
             Self::AccountUserNameRequired => "A user name is required.",
             Self::AccountUserNameInvalid => "The user name contains unsupported characters.",
-            Self::AccountPasswordRequired => "A password is required.",
+            Self::AccountPasswordRequired => L.error_password_required,
             Self::AccountPasswordInvalid => "The password is too long.",
             Self::RoleIdRequired => "A role ID is required.",
             Self::RoleIdInvalid => "The role ID contains unsupported characters.",
@@ -6896,8 +6896,8 @@ enum ArtifactUploadFailure {
 impl ArtifactUploadFailure {
     fn message(self) -> String {
         match self {
-            Self::FileUnreadable => "The selected file could not be read.".to_owned(),
-            Self::FileEmpty => "The selected file is empty.".to_owned(),
+            Self::FileUnreadable => L.error_file_unreadable.to_owned(),
+            Self::FileEmpty => L.error_file_empty.to_owned(),
             Self::CreateRejected { status } => {
                 format!("The server rejected the artifact creation (HTTP {status}).")
             }
@@ -6908,7 +6908,7 @@ impl ArtifactUploadFailure {
                 format!("The server rejected the upload finalize (HTTP {status}).")
             }
             Self::Unavailable => "The artifact store is temporarily unavailable.".to_owned(),
-            Self::MalformedResponse => "The server response could not be read.".to_owned(),
+            Self::MalformedResponse => L.error_server_unreadable.to_owned(),
         }
     }
 }
@@ -7836,11 +7836,11 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
         }
         RedfishCommand::SecureBoot(SecureBootCommand::Enable) => CommandSummaryProjection {
             family: CommandFamilyView::SecureBoot.label(),
-            payload: "Enable".to_owned(),
+            payload: L.action_enable.to_owned(),
         },
         RedfishCommand::SecureBoot(SecureBootCommand::Disable) => CommandSummaryProjection {
             family: CommandFamilyView::SecureBoot.label(),
-            payload: "Disable".to_owned(),
+            payload: L.action_disable.to_owned(),
         },
         RedfishCommand::SecureBoot(SecureBootCommand::ResetKeys(kind)) => {
             CommandSummaryProjection {
@@ -8049,12 +8049,12 @@ impl BatchStateView {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Queued => "Queued",
-            Self::Running => "Running",
-            Self::Succeeded => "Succeeded",
-            Self::Failed => "Failed",
-            Self::Unknown => "Unknown",
-            Self::Cancelled => "Cancelled",
+            Self::Queued => L.state_queued,
+            Self::Running => L.state_running,
+            Self::Succeeded => L.state_succeeded,
+            Self::Failed => L.state_failed,
+            Self::Unknown => L.state_unknown,
+            Self::Cancelled => L.state_cancelled,
         }
     }
 
@@ -8124,27 +8124,27 @@ impl BatchOutcomeChips {
     pub const fn chips(self) -> [BatchOutcomeChip; 5] {
         [
             BatchOutcomeChip {
-                label: "Succeeded",
+                label: L.state_succeeded,
                 count: self.succeeded,
                 class: "operation-state operation-ok",
             },
             BatchOutcomeChip {
-                label: "Failed",
+                label: L.state_failed,
                 count: self.failed,
                 class: "operation-state operation-error",
             },
             BatchOutcomeChip {
-                label: "Unknown",
+                label: L.state_unknown,
                 count: self.unknown,
                 class: "operation-state operation-off",
             },
             BatchOutcomeChip {
-                label: "Unsupported",
+                label: L.state_unsupported,
                 count: self.unsupported,
                 class: "operation-state operation-off",
             },
             BatchOutcomeChip {
-                label: "Cancelled",
+                label: L.state_cancelled,
                 count: self.cancelled,
                 class: "operation-state operation-off",
             },
@@ -9426,7 +9426,7 @@ mod browser {
         EraseTypeView, EventActionView, EventCardProjection, EventProtocolView, EventTypeView,
         EventsListState, GroupCardProjection, GroupCreateState, GroupDetailProjection,
         GroupDetailState, GroupDraft, GroupMemberActionState, GroupNameDraftError, GroupsListState,
-        HealthLevel, ImportFailure, ImportState, OEM_UNSUPPORTED_NOTICE, OemActionView,
+        HealthLevel, ImportFailure, ImportState, L, OEM_UNSUPPORTED_NOTICE, OemActionView,
         OemFaceView, OffsetDateTime, OnboardingCredentialsState, OnboardingFailure, OnboardingStep,
         OperationCardProjection, OperationCommandDraft, OperationEndpointChoice,
         OperationFormDraft, OperationFormError, OperationSubmitState, OperationsListState,
@@ -9704,12 +9704,12 @@ mod browser {
         };
 
         view! {
-            <section class="auth-screen" aria-label="Sign in">
+            <section class="auth-screen" aria-label={L.auth_sign_in}>
                 <div class="auth-card">
-                    <p class="eyebrow">"Local Redfish management"</p>
-                    <h2>"Sign in"</h2>
+                    <p class="eyebrow">{L.header_eyebrow}</p>
+                    <h2>{L.auth_sign_in}</h2>
                     <label>
-                        "Username"
+                        {L.field_username}
                         <input
                             type="text"
                             autocomplete="username"
@@ -9718,7 +9718,7 @@ mod browser {
                         />
                     </label>
                     <label>
-                        "Password"
+                        {L.field_password}
                         <input
                             type="password"
                             autocomplete="current-password"
@@ -9727,12 +9727,12 @@ mod browser {
                         />
                     </label>
                     <label>
-                        "TOTP code (if enrolled)"
+                        {L.auth_totp_code}
                         <input
                             type="text"
                             inputmode="numeric"
                             autocomplete="one-time-code"
-                            placeholder="6 digits"
+                            placeholder={L.auth_totp_placeholder}
                             prop:value=totp_code
                             on:input=move |event| set_totp_code.set(event_target_value(&event))
                         />
@@ -9741,7 +9741,7 @@ mod browser {
                         {move || error.get().unwrap_or_default()}
                     </p>
                     <button type="button" class="btn btn-primary" disabled=move || busy.get() on:click=submit>
-                        "Sign in"
+                        {L.auth_sign_in}
                     </button>
                 </div>
             </section>
@@ -9767,13 +9767,11 @@ mod browser {
             }
             set_error.set(None);
             if password.get() != confirmation.get() {
-                set_error.set(Some("the passwords do not match".to_owned()));
+                set_error.set(Some(L.error_passwords_mismatch.to_owned()));
                 return;
             }
             if password.get().chars().count() < 12 {
-                set_error.set(Some(
-                    "the password must contain at least 12 characters".to_owned(),
-                ));
+                set_error.set(Some(L.error_password_too_short.to_owned()));
                 return;
             }
             set_busy.set(true);
@@ -9805,7 +9803,7 @@ mod browser {
         view! {
             <section class="auth-screen" aria-label="First-run setup">
                 <div class="auth-card">
-                    <p class="eyebrow">"Local Redfish management"</p>
+                    <p class="eyebrow">{L.header_eyebrow}</p>
                     <h2>"First-run setup"</h2>
                     <p class="auth-note">
                         "Enter the one-time bootstrap code printed by the console to set the administrator password."
@@ -9863,7 +9861,7 @@ mod browser {
                                 type="text"
                                 inputmode="numeric"
                                 autocomplete="one-time-code"
-                                placeholder="6 digits"
+                                placeholder={L.auth_totp_placeholder}
                                 prop:value=totp_code
                                 on:input=move |event| set_totp_code.set(event_target_value(&event))
                             />
@@ -9964,13 +9962,13 @@ mod browser {
                         <h2>"Users"</h2>
                     </div>
                     <button type="button" class="btn" on:click=on_reload>
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <div class="auth-admin-form">
                     <input
                         type="text"
-                        placeholder="User name"
+                        placeholder={L.field_user_name}
                         autocomplete="off"
                         spellcheck="false"
                         prop:value=draft_name
@@ -10026,9 +10024,9 @@ mod browser {
                                     "disabled".to_owned()
                                 };
                                 let action_label = if enabled {
-                                    "Disable".to_owned()
+                                    L.action_disable.to_owned()
                                 } else {
-                                    "Enable".to_owned()
+                                    L.action_enable.to_owned()
                                 };
                                 view! {
                                     <div class="auth-table-row">
@@ -10036,7 +10034,7 @@ mod browser {
                                         <span class="auth-table-role">{role_label}</span>
                                         <span class="auth-table-state">{state_label}</span>
                                         <select
-                                            aria-label="Role"
+                                            aria-label={L.field_role}
                                             on:change=move |event| {
                                                 let value = event_target_value(&event);
                                                 let role = match value.as_str() {
@@ -10047,9 +10045,9 @@ mod browser {
                                                 on_assign_role(principal_id_for_select.clone(), role);
                                             }
                                         >
-                                            <option value="Administrator">"Administrator"</option>
-                                            <option value="Operator">"Operator"</option>
-                                            <option value="Viewer">"Viewer"</option>
+                                            <option value="Administrator">{L.role_administrator}</option>
+                                            <option value="Operator">{L.role_operator}</option>
+                                            <option value="Viewer">{L.role_viewer}</option>
                                         </select>
                                         <button
                                             type="button"
@@ -10126,7 +10124,7 @@ mod browser {
                         <h2>"Sessions"</h2>
                     </div>
                     <button type="button" class="btn" on:click=on_reload>
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <div class="auth-table" hidden=move || !matches!(list_state.get(), SessionsListState::Ready(_))>
@@ -10239,7 +10237,7 @@ mod browser {
                         disabled=move || matches!(list_state.get(), CenterSitesListState::Loading)
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !matches!(list_state.get(), CenterSitesListState::Loading)>
@@ -10332,7 +10330,7 @@ mod browser {
                         <thead>
                             <tr>
                                 <th>"Endpoint"</th>
-                                <th>"Address"</th>
+                                <th>{L.field_address}</th>
                                 <th>"Health"</th>
                                 <th>"Generation"</th>
                             </tr>
@@ -10521,7 +10519,7 @@ mod browser {
                 </div>
                 <div class="inventory-actions">
                     <button type="button" class="btn" on:click=reload>
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
@@ -10797,7 +10795,7 @@ mod browser {
                             Some(CommandFamilyView::SecureBoot) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-secure-boot">"Action"</label>
+                                        <label for="center-op-secure-boot">{L.field_action}</label>
                                         <select
                                             id="center-op-secure-boot"
                                             on:change=move |event| {
@@ -10815,7 +10813,7 @@ mod browser {
                                                 set_submit_state.set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">"Choose an action..."</option>
+                                            <option value="">{L.field_choose_action_ellipsis}</option>
                                             <option value="enable">
                                                 {SecureBootActionView::Enable.label()}
                                             </option>
@@ -10862,7 +10860,7 @@ mod browser {
                             Some(CommandFamilyView::EventSubscription) => {
                                 view! {
                                     <div class="form-row">
-                                        <label for="center-op-event-action">"Action"</label>
+                                        <label for="center-op-event-action">{L.field_action}</label>
                                         <select
                                             id="center-op-event-action"
                                             on:change=move |event| {
@@ -10877,7 +10875,7 @@ mod browser {
                                                 set_submit_state.set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">"Choose an action..."</option>
+                                            <option value="">{L.field_choose_action_ellipsis}</option>
                                             <option value="create">
                                                 {EventActionView::CreateSubscription.label()}
                                             </option>
@@ -10889,7 +10887,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-destination">"Destination"</label>
+                                        <label for="center-op-destination">{L.field_destination}</label>
                                         <input
                                             id="center-op-destination"
                                             type="text"
@@ -10905,7 +10903,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-protocol">"Protocol"</label>
+                                        <label for="center-op-protocol">{L.field_protocol}</label>
                                         <select
                                             id="center-op-protocol"
                                             on:change=move |event| {
@@ -10934,7 +10932,7 @@ mod browser {
                                     <div class="form-row" hidden=move || {
                                         !matches!(draft.get().event_action, Some(EventActionView::CreateSubscription))
                                     }>
-                                        <label for="center-op-event-types">"Event types"</label>
+                                        <label for="center-op-event-types">{L.field_event_types}</label>
                                         <div class="filter-chip-list">
                                             {EventTypeView::ALL
                                                 .into_iter()
@@ -11035,7 +11033,7 @@ mod browser {
                                                     .set(CenterOperationSubmitState::Idle);
                                             }
                                         >
-                                            <option value="">"Choose an action..."</option>
+                                            <option value="">{L.field_choose_action_ellipsis}</option>
                                             {AccountActionView::ALL
                                                 .into_iter()
                                                 .map(|action| {
@@ -11048,7 +11046,7 @@ mod browser {
                                         </select>
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-id">"Account ID"</label>
+                                        <label for="center-op-account-id">{L.field_account_id}</label>
                                         <input
                                             id="center-op-account-id"
                                             type="text"
@@ -11066,7 +11064,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-user-name">"User name"</label>
+                                        <label for="center-op-account-user-name">{L.field_user_name}</label>
                                         <input
                                             id="center-op-account-user-name"
                                             type="text"
@@ -11085,7 +11083,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-password">"Password"</label>
+                                        <label for="center-op-account-password">{L.field_password}</label>
                                         <input
                                             id="center-op-account-password"
                                             type="password"
@@ -11103,7 +11101,7 @@ mod browser {
                                         />
                                     </div>
                                     <div class="form-row">
-                                        <label for="center-op-account-role">"Role ID"</label>
+                                        <label for="center-op-account-role">{L.field_role_id}</label>
                                         <input
                                             id="center-op-account-role"
                                             type="text"
@@ -11274,7 +11272,7 @@ mod browser {
                 <div class="form-panel">
                     <p class="section-label">"Register a site"</p>
                     <div class="form-row">
-                        <label for="center-bind-name">"Display name"</label>
+                        <label for="center-bind-name">{L.field_display_name}</label>
                         <input
                             id="center-bind-name"
                             type="text"
@@ -11730,7 +11728,7 @@ mod browser {
             AuthScreen::Loading => view! {
                 <section class="auth-screen" aria-label="Loading">
                     <div class="auth-card">
-                        <p class="eyebrow">"Local Redfish management"</p>
+                        <p class="eyebrow">{L.header_eyebrow}</p>
                         <p class="auth-note">"Checking…"</p>
                     </div>
                 </section>
@@ -11748,10 +11746,10 @@ mod browser {
                 {auth_screen_view}
                 <header class="product-header" hidden=move || !console_active()>
                     <div>
-                        <p class="eyebrow">"Local Redfish management"</p>
+                        <p class="eyebrow">{L.header_eyebrow}</p>
                         <h1>"Rutilus"</h1>
                         <p id="status">{move || match console_scope.get() {
-                            ConsoleScopeView::Center => "Center aggregation console",
+                            ConsoleScopeView::Center => L.header_center_console,
                             _ => state.with(ConsoleLoadState::status_message),
                         }}</p>
                     </div>
@@ -11775,11 +11773,11 @@ mod browser {
                         hidden=move || !console_active()
                         on:click=on_logout
                     >
-                        "Sign out"
+                        {L.action_sign_out}
                     </button>
                 </header>
 
-                <nav class="view-nav" aria-label="Console sections" hidden=move || !console_active()>
+                <nav class="view-nav" aria-label={L.header_nav_aria} hidden=move || !console_active()>
                     {ConsoleView::ALL
                         .iter()
                         .map(|candidate| {
@@ -12427,7 +12425,7 @@ mod browser {
                                 on_toggle_selection.run(endpoint_id_for_selection.clone());
                             }
                         />
-                        <span>"Refresh"</span>
+                        <span>{L.action_refresh}</span>
                     </label>
                     <button
                         type="button"
@@ -12820,7 +12818,7 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
@@ -13090,7 +13088,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| on_delete.run(delete_group_id.clone())
                     >
-                        "Delete"
+                        {L.action_delete}
                     </button>
                 </div>
             </article>
@@ -13654,7 +13652,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !list_state.get().is_failed()>
@@ -13800,7 +13798,7 @@ mod browser {
                     </p>
                 </div>
                 <div class="form-field">
-                    <label for=username_id.clone()>"Username"</label>
+                    <label for=username_id.clone()>{L.field_username}</label>
                     <input
                         id=username_id.clone()
                         class="form-input"
@@ -13814,7 +13812,7 @@ mod browser {
                     </p>
                 </div>
                 <div class="form-field">
-                    <label for=password_id.clone()>"Password"</label>
+                    <label for=password_id.clone()>{L.field_password}</label>
                     <input
                         id=password_id.clone()
                         class="form-input"
@@ -13863,7 +13861,7 @@ mod browser {
                 </div>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Created"</dt>
+                        <dt>{L.field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                     <div>
@@ -14029,7 +14027,7 @@ mod browser {
                     <p class="section-label">"TLS identity observed"</p>
                     <dl class="resource-facts">
                         <div>
-                            <dt>"Address"</dt>
+                            <dt>{L.field_address}</dt>
                             <dd>{move || challenge().map(|challenge| challenge.address)}</dd>
                         </div>
                         <div>
@@ -14056,7 +14054,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_back.run(())
                     >
-                        "Back"
+                        {L.action_back}
                     </button>
                     <button
                         type="button"
@@ -14183,7 +14181,7 @@ mod browser {
                     </span>
                 </div>
                 <div class="form-field">
-                    <label for="enroll-display-name">"Display name"</label>
+                    <label for="enroll-display-name">{L.field_display_name}</label>
                     <input
                         id="enroll-display-name"
                         class="form-input"
@@ -14279,7 +14277,7 @@ mod browser {
                         disabled=move || in_flight.get()
                         on:click=move |_| on_back.run(())
                     >
-                        "Back"
+                        {L.action_back}
                     </button>
                     <button
                         type="button"
@@ -14376,7 +14374,7 @@ mod browser {
                         class="btn"
                         on:click=move |_| set_create_mode.set(false)
                     >
-                        "Cancel"
+                        {L.action_cancel}
                     </button>
                 </div>
             </div>
@@ -14552,7 +14550,7 @@ mod browser {
                         <thead>
                             <tr>
                                 <th>"Row"</th>
-                                <th>"Address"</th>
+                                <th>{L.field_address}</th>
                                 <th>"Result"</th>
                                 <th>"Detail"</th>
                             </tr>
@@ -14669,7 +14667,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -14814,7 +14812,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -14948,7 +14946,7 @@ mod browser {
                         }
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="form-error" hidden=move || !state.get().is_failed()>
@@ -15094,7 +15092,7 @@ mod browser {
                         disabled=move || state.get().is_loading()
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !state.get().is_loading()>
@@ -15250,7 +15248,7 @@ mod browser {
                         disabled=move || state.get().is_loading()
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !state.get().is_loading()>
@@ -15884,10 +15882,10 @@ mod browser {
         submission: &CenterOperationSubmission,
     ) -> Result<(), &'static str> {
         let Ok(site_id) = submission.site_id.parse() else {
-            return Err("The submission could not be prepared.");
+            return Err(L.error_submission_unprepared);
         };
         let Ok(endpoint_id) = submission.endpoint_id.parse() else {
-            return Err("The submission could not be prepared.");
+            return Err(L.error_submission_unprepared);
         };
         let request = CenterOperationSubmitRequest::new(
             site_id,
@@ -15897,7 +15895,7 @@ mod browser {
         );
         let Ok(request) = with_csrf(Request::post("/api/v1/center/operations")).json(&request)
         else {
-            return Err("The submission could not be prepared.");
+            return Err(L.error_submission_unprepared);
         };
         let Ok(response) = request.send().await else {
             return Err("The center did not answer.");
@@ -16392,7 +16390,7 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
@@ -16859,7 +16857,7 @@ mod browser {
                         }
                         on:change=on_account_action_change
                     >
-                        <option value="">"Choose an action"</option>
+                        <option value="">{L.field_choose_action}</option>
                         {AccountActionView::ALL
                             .into_iter()
                             .map(|action| {
@@ -16882,7 +16880,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::Create)
                     >
                         <div class="form-field">
-                            <label for="operation-account-user-name">"User name"</label>
+                            <label for="operation-account-user-name">{L.field_user_name}</label>
                             <input
                                 id="operation-account-user-name"
                                 class="form-input"
@@ -16911,7 +16909,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-password">"Password"</label>
+                            <label for="operation-account-password">{L.field_password}</label>
                             <input
                                 id="operation-account-password"
                                 class="form-input"
@@ -16940,7 +16938,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-role-id">"Role ID"</label>
+                            <label for="operation-account-role-id">{L.field_role_id}</label>
                             <input
                                 id="operation-account-role-id"
                                 class="form-input"
@@ -16975,7 +16973,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdateRole)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">"Account ID"</label>
+                            <label for="operation-account-id">{L.field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17004,7 +17002,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-account-role-id">"Role ID"</label>
+                            <label for="operation-account-role-id">{L.field_role_id}</label>
                             <input
                                 id="operation-account-role-id"
                                 class="form-input"
@@ -17039,7 +17037,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdatePassword)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">"Account ID"</label>
+                            <label for="operation-account-id">{L.field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17103,7 +17101,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::UpdateUserName)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">"Account ID"</label>
+                            <label for="operation-account-id">{L.field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17167,7 +17165,7 @@ mod browser {
                         hidden=move || !account_action_selected(AccountActionView::Delete)
                     >
                         <div class="form-field">
-                            <label for="operation-account-id">"Account ID"</label>
+                            <label for="operation-account-id">{L.field_account_id}</label>
                             <input
                                 id="operation-account-id"
                                 class="form-input"
@@ -17310,7 +17308,7 @@ mod browser {
                 </div>
 
                 <div class="form-field" hidden=move || !family_selected(CommandFamilyView::SecureBoot)>
-                    <label for="operation-secure-boot-action">"Action"</label>
+                    <label for="operation-secure-boot-action">{L.field_action}</label>
                     <select
                         id="operation-secure-boot-action"
                         class="form-select"
@@ -17322,7 +17320,7 @@ mod browser {
                         }
                         on:change=on_secure_boot_change
                     >
-                        <option value="">"Choose an action"</option>
+                        <option value="">{L.field_choose_action}</option>
                         <option value="enable">{SecureBootActionView::Enable.label()}</option>
                         <option value="disable">{SecureBootActionView::Disable.label()}</option>
                         <option value="reset-keys">
@@ -17375,7 +17373,7 @@ mod browser {
                     class="form-field"
                     hidden=move || !family_selected(CommandFamilyView::EventSubscription)
                 >
-                    <label for="operation-event-action">"Action"</label>
+                    <label for="operation-event-action">{L.field_action}</label>
                     <select
                         id="operation-event-action"
                         class="form-select"
@@ -17386,7 +17384,7 @@ mod browser {
                         }
                         on:change=on_event_action_change
                     >
-                        <option value="">"Choose an action"</option>
+                        <option value="">{L.field_choose_action}</option>
                         {EventActionView::ALL
                             .into_iter()
                             .map(|action| {
@@ -17438,7 +17436,7 @@ mod browser {
                             </p>
                         </div>
                         <div class="form-field">
-                            <label for="operation-protocol">"Protocol"</label>
+                            <label for="operation-protocol">{L.field_protocol}</label>
                             <select
                                 id="operation-protocol"
                                 class="form-select"
@@ -17463,7 +17461,7 @@ mod browser {
                                 {OperationFormError::ProtocolRequired.message()}
                             </p>
                         </div>
-                        <p class="section-label">"Event types"</p>
+                        <p class="section-label">{L.field_event_types}</p>
                         <div class="command-choice-grid">
                             {EventTypeView::ALL
                                 .into_iter()
@@ -17634,7 +17632,7 @@ mod browser {
                         </select>
                     </div>
                     <div class="form-field">
-                        <label for="operation-oem-action">"Action"</label>
+                        <label for="operation-oem-action">{L.field_action}</label>
                         <select
                             id="operation-oem-action"
                             class="form-select"
@@ -17648,7 +17646,7 @@ mod browser {
                             }
                             on:change=on_oem_action_change
                         >
-                            <option value="">"Choose an action"</option>
+                            <option value="">{L.field_choose_action}</option>
                             {OemActionView::ALL
                                 .into_iter()
                                 .filter(move |action| {
@@ -17895,7 +17893,7 @@ mod browser {
                         <dd>{targets_text}</dd>
                     </div>
                     <div>
-                        <dt>"Created"</dt>
+                        <dt>{L.field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                     <div>
@@ -18034,7 +18032,7 @@ mod browser {
                 </div>
                 <dl class="resource-facts">
                     <div>
-                        <dt>"Created"</dt>
+                        <dt>{L.field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                 </dl>
@@ -18195,7 +18193,7 @@ mod browser {
                         disabled=move || list_state.get().is_loading()
                         on:click=on_refresh
                     >
-                        "Refresh"
+                        {L.action_refresh}
                     </button>
                 </div>
                 <p class="inline-status" hidden=move || !list_state.get().is_loading()>
@@ -18325,7 +18323,7 @@ mod browser {
                         <dd title=sha256_title>{sha256_text}</dd>
                     </div>
                     <div>
-                        <dt>"Created"</dt>
+                        <dt>{L.field_created}</dt>
                         <dd>{created_at_text}</dd>
                     </div>
                 </dl>
