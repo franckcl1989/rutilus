@@ -87,9 +87,12 @@ oem-supermicro  update-service-deprecated
 保证单一可执行文件、不分发自有 `.dylib`、仅使用系统框架。正式交付术语为
 "Self-contained single executable，无第三方运行时和随包动态库依赖"。
 
-CI 现状（`docs/operations-manual.md` §十）：CI 当前编译验证 `x86_64-unknown-linux-gnu`、
-`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` 与 wasm32 UI 产物；musl、aarch64、ARM64 与
-macOS Universal 2 合并属于 0.9.0 发布流水线工作（尚未在 CI 编译验证，如实标注）。
+CI 现状（`.github/workflows/ci.yml`，2026-08-12）：编译矩阵验证 `x86_64-unknown-linux-gnu`、
+`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` 三平台 + wasm32 UI 产物 diff，windows/macos
+任务另运行跨平台 E2E 套件（`web/tests` 9 个路径文件与 `app/tests/version.rs`）。发布构建矩阵：
+x86_64 musl（commit 3b1ab30 起）与 aarch64 musl（cargo-zigbuild）在 ubuntu 任务构建，macOS
+Universal 2 由 macos 任务 lipo 合并两个 Darwin 构建；`aarch64-pc-windows-msvc` 尚未入 CI
+（GitHub hosted x64 Windows runner 不提供 ARM64 MSVC 链接工具链，见 ci.yml 注释，如实标注）。
 
 ## 四、厂商支持现状
 
