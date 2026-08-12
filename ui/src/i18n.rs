@@ -441,7 +441,7 @@ strings_catalog! {
     /// The resource-card title of the NVIDIA System Profile family.
     type_nvidia_system_profile: "NVIDIA System Profile", zh: "NVIDIA 系统配置文件",
     /// The resource-card title of the NVIDIA Profile File family.
-    type_nvidia_profile_file: "NVIDIA Profile File", zh: "NVIDIA 配置文件文件",
+    type_nvidia_profile_file: "NVIDIA Profile File", zh: "NVIDIA 配置文件",
     /// The resource-card title of the NVIDIA Power Compliance family.
     type_nvidia_power_compliance: "NVIDIA Power Compliance", zh: "NVIDIA 电源合规",
     /// The resource-card title of the NVIDIA Power Domain family.
@@ -594,7 +594,7 @@ strings_catalog! {
     /// The Metric Definition "Metric type" fact label.
     fact_metric_type: "Metric type", zh: "指标类型",
     /// The Metric Report "Metric values" fact label.
-    fact_metric_values: "Metric values", zh: "指标值数量",
+    fact_metric_values: "Metric values", zh: "指标值",
     /// The Task Service "Service enabled" fact label (reuses the service label).
     fact_completed_task_policy: "Completed task policy", zh: "完成任务策略",
     /// The Task "Start time" fact label.
@@ -730,7 +730,7 @@ strings_catalog! {
     /// The "Energy (kWh)" environment fact label.
     fact_energy_kwh: "Energy (kWh)", zh: "能量（kWh）",
     /// The "Power load (%)" environment fact label.
-    fact_power_load_percent: "Power load (%)", zh: "负载（%）",
+    fact_power_load_percent: "Power load (%)", zh: "功率负载（%）",
     /// The "Power limit (W)" environment fact label.
     fact_power_limit_w: "Power limit (W)", zh: "功率上限（W）",
     /// The "Dew point (C)" environment fact label.
