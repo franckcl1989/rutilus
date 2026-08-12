@@ -61,7 +61,7 @@ use rutilus_domain::{
     PrincipalName, PrincipalState, ProductPermission, Role, RoleAssignment, Session, SessionId,
     TOTP_SECRET_LENGTH, TotpAuthenticator, TotpAuthenticatorError,
 };
-use secrecy::{SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use time::{Duration, OffsetDateTime};
 
 use crate::{WebState, json_error, no_store, uncached_status};
@@ -85,10 +85,22 @@ const SESSION_LIFETIME: Duration = Duration::hours(8);
 /// The interval after which a request advances `last_used_at`.
 const TOUCH_INTERVAL: Duration = Duration::MINUTE;
 
+/// The minimum password length of the product, in characters (B1).
+///
+/// The console form enforces the same floor (`ui/src/lib.rs`
+/// `BootstrapView` rejects `chars().count() < 12`, with the copy at
+/// `ui/src/i18n.rs` `error_password_too_short`); the API repeats it because
+/// the form is a convenience, not a control — the API is the actual
+/// boundary every client reaches. The count is Unicode scalar values, not
+/// bytes, exactly like the form's check, so a multi-byte character is one
+/// character (design §16.2 states no default password; this is the product
+/// minimum).
+pub(crate) const MIN_PASSWORD_CHARS: usize = 12;
+
 /// Rate-limit window (§16.2 "登录失败限速").
 const RATE_WINDOW: StdDuration = StdDuration::from_mins(15);
 /// Sign-in failures allowed per username in one window.
-const USERNAME_FAILURE_LIMIT: usize = 5;
+pub(crate) const USERNAME_FAILURE_LIMIT: usize = 5;
 /// Sign-in failures allowed per client address in one window.
 const IP_FAILURE_LIMIT: usize = 20;
 /// The longest username key the rate limiter records: every valid principal
@@ -1252,6 +1264,26 @@ where
     let _ = services.verify_password(&dummy, password);
 }
 
+/// Whether a presented password satisfies the product password policy (B1).
+///
+/// The floor is [`MIN_PASSWORD_CHARS`] characters counted as Unicode scalar
+/// values — the same check the console form applies (`ui/src/lib.rs`
+/// `BootstrapView`), so the API and the form agree on what a valid password
+/// is.
+#[must_use]
+fn password_satisfies_policy(password: &SecretString) -> bool {
+    password.expose_secret().chars().count() >= MIN_PASSWORD_CHARS
+}
+
+/// The password-policy refusal, worded like the console form
+/// (`ui/src/i18n.rs` `error_password_too_short`).
+fn password_policy_error() -> Response {
+    json_error(
+        StatusCode::BAD_REQUEST,
+        "the password must contain at least 12 characters".to_owned(),
+    )
+}
+
 /// The §16.2 sign-in handler.
 ///
 /// The handler is the declarative sign-in flow — rate limit, lookup,
@@ -1270,12 +1302,32 @@ where
     Time: Clock,
 {
     let now = state.clock.now();
+    if !password_satisfies_policy(request.password()) {
+        // B1 (security batch): the API is the enforcement boundary — the
+        // console form's 12-character floor is client-side convenience, not
+        // a control, and under the fixed 'admin' name and the 5-per-15-minute
+        // budget a one-character password is guessable in hours. The refusal
+        // happens here, before the rate limiter, the lookup, and any
+        // verification: it costs nothing, consumes no rate-limit budget (a
+        // policy violation is not a login attempt), and writes no audit (the
+        // response is the record — the same boundedness principle as the
+        // rate-limited branch below).
+        return password_policy_error();
+    }
     let ip = request_ip(&connect_info);
     let username = request.username();
     let rate_now = Instant::now();
     let rate_limited = !state.auth.rate_limiter.allows(username, &ip, rate_now);
     if rate_limited {
-        record_login_failure(&state, None, now, true).await;
+        // B2 (security batch): a limiter refusal writes no audit event.
+        // §16.3 audits login *outcomes* — attempts that ran; a request the
+        // limiter refused before any verification never attempted one, and
+        // the 429 itself is the record. Writing the started + failed pair
+        // here would be unbounded — a flood of refused attempts is exactly
+        // the attack that must not grow the audit table — and every audit
+        // append serializes on the persistence write gate (`Semaphore(1)`),
+        // so a 429 flood would starve legitimate session, telemetry, event,
+        // and operation writes behind it.
         return json_error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many sign-in attempts; try again later".to_owned(),
@@ -1287,7 +1339,7 @@ where
             .auth
             .rate_limiter
             .record_failure(username, &ip, rate_now);
-        record_login_failure(&state, None, now, false).await;
+        record_login_failure(&state, None, now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
     let Some(principal) = state
@@ -1307,15 +1359,23 @@ where
             .auth
             .rate_limiter
             .record_failure(username, &ip, rate_now);
-        record_login_failure(&state, None, now, false).await;
+        record_login_failure(&state, None, now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
     if principal.state() != PrincipalState::Enabled {
+        // B4 (security batch, extends MINOR-1): this branch must not return
+        // observably faster than the wrong-password branch either — the
+        // account is *known to exist and known to be disabled* here, so a
+        // cheap return would be a positive username oracle. One dummy
+        // Argon2id verification (the same cost equalizer as the
+        // unknown-username branch) balances the disabled branch against the
+        // wrong-password branch; the failure handling below stays identical.
+        dummy_password_verification(state.services.as_ref(), request.password());
         state
             .auth
             .rate_limiter
             .record_failure(username, &ip, rate_now);
-        record_login_failure(&state, Some(principal.id()), now, false).await;
+        record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     }
     let Some(credential) = state
@@ -1325,11 +1385,17 @@ where
         .ok()
         .flatten()
     else {
+        // B4 (security batch, extends MINOR-1): the principal is known to
+        // exist but holds no password credential — a cheap return here would
+        // answer "this username exists" observably faster than the
+        // wrong-password branch. One dummy Argon2id verification balances
+        // the branch; the failure handling below stays identical.
+        dummy_password_verification(state.services.as_ref(), request.password());
         state
             .auth
             .rate_limiter
             .record_failure(username, &ip, rate_now);
-        record_login_failure(&state, Some(principal.id()), now, false).await;
+        record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
     if !state
@@ -1340,7 +1406,7 @@ where
             .auth
             .rate_limiter
             .record_failure(username, &ip, rate_now);
-        record_login_failure(&state, Some(principal.id()), now, false).await;
+        record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     }
     if let Some(authenticator) = state
@@ -1357,7 +1423,7 @@ where
                 .auth
                 .rate_limiter
                 .record_failure(username, &ip, rate_now);
-            record_login_failure(&state, Some(principal.id()), now, false).await;
+            record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         };
         let Ok(step) = state.services.verify_totp(
@@ -1370,7 +1436,7 @@ where
                 .auth
                 .rate_limiter
                 .record_failure(username, &ip, rate_now);
-            record_login_failure(&state, Some(principal.id()), now, false).await;
+            record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         };
         // The conditional step write refuses a replay that raced ahead; a
@@ -1386,7 +1452,7 @@ where
                 .auth
                 .rate_limiter
                 .record_failure(username, &ip, rate_now);
-            record_login_failure(&state, Some(principal.id()), now, false).await;
+            record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         }
     }
@@ -1475,6 +1541,13 @@ where
     Time: Clock,
 {
     let now = state.clock.now();
+    if !password_satisfies_policy(request.password()) {
+        // B1 (security batch): the claim sets the product's first
+        // credential, so the API boundary — not the console form — must
+        // enforce the minimum. The refusal happens before anything is
+        // consumed: the one-time code survives a rejected claim.
+        return password_policy_error();
+    }
     if !request.has_complete_totp_pair() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1501,11 +1574,11 @@ where
         .ok()
         .flatten()
     else {
-        record_login_failure(&state, Some(principal.id()), now, false).await;
+        record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "bootstrap failed".to_owned());
     };
     if code.used_at().is_some() {
-        record_login_failure(&state, Some(principal.id()), now, false).await;
+        record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "bootstrap failed".to_owned());
     }
     // The optional TOTP enrollment is verified before the claim consumes
@@ -1623,6 +1696,12 @@ where
     Time: Clock,
 {
     let now = state.clock.now();
+    if !password_satisfies_policy(request.new_password()) {
+        // B1 (security batch): same enforcement as the sign-in and bootstrap
+        // boundaries — the API, not the form, is the policy boundary for the
+        // new password.
+        return password_policy_error();
+    }
     let Some(principal_id) = context.actor_principal_id() else {
         return json_error(
             StatusCode::UNAUTHORIZED,
@@ -1667,10 +1746,34 @@ where
     // §16.2 "密码或角色变化撤销旧 Session": a password change revokes every
     // session of the principal, including the presenting one — the client
     // must sign in again.
-    let _ = state
+    if state
         .services
         .revoke_sessions_for_principal(principal_id, now)
+        .await
+        .is_err()
+    {
+        // B3 (security batch): the revocation is not optional — a silently
+        // failed revocation would leave every old token valid until its
+        // eight-hour deadline with no user or audit signal (§16.2 控制静默
+        // 失效). The password change already succeeded and is not rolled
+        // back; the failure is surfaced as an explicit 500 and recorded as
+        // a failed change-password outcome so the partial state is visible.
+        record_outcome(
+            &state,
+            AuditActor::User,
+            Some(principal_id),
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            false,
+            Some((
+                AuditFailure::AuthenticationFailed,
+                AuditFailureVerification::Inconclusive,
+            )),
+            now,
+        )
         .await;
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     record_management_event(
         &state,
         AuditActor::User,
@@ -2097,11 +2200,15 @@ where
 
 /// Records a failed sign-in: `started` then `failed`, so the audit trail
 /// shows the attempt and the rejection (§16.3).
+///
+/// Rate-limited refusals never reach this function (B2): the limiter
+/// rejected the request before it attempted anything, and the 429 response
+/// is the record — auditing every refused attempt would grow the table
+/// without bound and serialize each append on the persistence write gate.
 async fn record_login_failure<Services, Gateway, Time>(
     state: &WebState<Services, Gateway, Time>,
     principal_id: Option<PrincipalId>,
     now: OffsetDateTime,
-    rate_limited: bool,
 ) where
     Services: AuditEventWriter + AuthServices,
     Time: Clock,
@@ -2111,11 +2218,6 @@ async fn record_login_failure<Services, Gateway, Time>(
     } else {
         AuditActor::System
     };
-    let verification = if rate_limited {
-        AuditFailureVerification::Inconclusive
-    } else {
-        AuditFailureVerification::Rejected
-    };
     record_outcome(
         state,
         actor,
@@ -2123,7 +2225,10 @@ async fn record_login_failure<Services, Gateway, Time>(
         ProductPermission::Authenticate,
         AuditAction::Login,
         false,
-        Some((AuditFailure::AuthenticationFailed, verification)),
+        Some((
+            AuditFailure::AuthenticationFailed,
+            AuditFailureVerification::Rejected,
+        )),
         now,
     )
     .await;
@@ -2226,6 +2331,8 @@ fn json_ok<Body: IntoResponse>(body: Body) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -2663,9 +2770,10 @@ mod tests {
         // unknown-username branch's dummy verification runs under exactly
         // the parameters of the real password path and touches no real
         // user's data. (The behavioral half of the mitigation — that the
-        // unknown-username branch actually performs the verification — is
-        // asserted at the route level in web/src/lib.rs, where the mock
-        // services count `verify_password` calls.)
+        // unknown-username, disabled-account, and missing-credential
+        // branches each actually perform their verification — is asserted
+        // at the route level in web/src/lib.rs, where the mock services
+        // count `verify_password` calls.)
         let dummy = Argon2IdHash::from_parts(&DUMMY_SALT, &DUMMY_HASH)
             .map_err(|_| "the pinned dummy salt and hash lengths are invalid")?;
         assert_eq!(dummy.salt(), &DUMMY_SALT);
@@ -2673,6 +2781,27 @@ mod tests {
         assert_eq!(dummy.salt().len(), ARGON2ID_SALT_LENGTH);
         assert_eq!(dummy.hash().len(), ARGON2ID_HASH_LENGTH);
         Ok(())
+    }
+
+    #[test]
+    fn password_policy_counts_characters_not_bytes() {
+        // The floor matches the console form's check (`chars().count() < 12`):
+        // exactly 12 characters satisfy it, shorter values are refused, and
+        // the count is Unicode scalar values — a 24-byte string of six
+        // four-byte characters is still six characters, and twelve CJK
+        // characters satisfy the floor at 36 bytes.
+        let twelve_ascii: SecretString = "123456789012".to_owned().into();
+        assert!(password_satisfies_policy(&twelve_ascii));
+        let eleven_ascii: SecretString = "12345678901".to_owned().into();
+        assert!(!password_satisfies_policy(&eleven_ascii));
+        let empty: SecretString = String::new().into();
+        assert!(!password_satisfies_policy(&empty));
+        let six_wide: SecretString = "🌮🌮🌮🌮🌮🌮".to_owned().into();
+        assert_eq!(six_wide.expose_secret().len(), 24);
+        assert!(!password_satisfies_policy(&six_wide));
+        let twelve_cjk: SecretString = "一二三四五六七八九十甲乙".to_owned().into();
+        assert_eq!(twelve_cjk.expose_secret().len(), 36);
+        assert!(password_satisfies_policy(&twelve_cjk));
     }
 
     #[test]

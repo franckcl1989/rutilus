@@ -6040,6 +6040,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6060,6 +6061,7 @@ mod tests {
                 batch_store,
                 managed_endpoints: None,
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6081,6 +6083,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -6102,6 +6105,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: Some(managed_endpoints),
                 refresh_working: true,
+                revoke_sessions_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state: CenterTestState::default(),
             }),
@@ -8943,6 +8947,11 @@ mod tests {
         /// answer like a working slice: `false` keeps them unavailable (the
         /// default), `true` arms the refresh route's 200-report test.
         refresh_working: bool,
+        /// Whether the mock `revoke_sessions_for_principal` boundary answers
+        /// a failure (B3): the password-change tests arm it to prove a
+        /// failed session revocation surfaces as an explicit error instead
+        /// of being swallowed.
+        revoke_sessions_fail: bool,
         /// The in-memory authentication state behind the §16.2 auth tests:
         /// the Open test routers never touch it (the auth boundary answers
         /// "nothing found"), while the guarded tests populate it through
@@ -9308,6 +9317,40 @@ mod tests {
             ));
         }
 
+        /// Seeds one disabled principal — the §16.1 soft-off account the
+        /// sign-in flow must refuse (B4 cost-balanced branch).
+        fn seed_disabled_principal(&self, name: &str, password: &str, role: Role) {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            let now = OffsetDateTime::now_utc();
+            let Ok(name) = PrincipalName::parse(name) else {
+                return;
+            };
+            let mut principal = Principal::new(PrincipalId::generate(), name, now);
+            principal.set_state(PrincipalState::Disabled, now);
+            inner.roles.insert(principal.id(), role);
+            inner
+                .passwords
+                .insert(principal.id(), deterministic_credential(password, now));
+            inner.principals.push(principal);
+        }
+
+        /// Seeds one principal without a password credential — the
+        /// credential-missing sign-in branch (B4 cost-balanced).
+        fn seed_passwordless_principal(&self, name: &str, role: Role) {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            let now = OffsetDateTime::now_utc();
+            let Ok(name) = PrincipalName::parse(name) else {
+                return;
+            };
+            let principal = Principal::new(PrincipalId::generate(), name, now);
+            inner.roles.insert(principal.id(), role);
+            inner.principals.push(principal);
+        }
+
         /// How many times the verify-password boundary ran — the MINOR-1
         /// tests use the count to prove the unknown-username path performs
         /// its dummy verification (a wall-clock timing assertion would be
@@ -9417,7 +9460,11 @@ mod tests {
             at: OffsetDateTime,
         ) -> BoundaryFuture<'_, Result<u64, Self::Error>> {
             let inner = Arc::clone(&self.auth_state.inner);
+            let fail = self.revoke_sessions_fail;
             Box::pin(async move {
+                if fail {
+                    return Err(MockWriteError);
+                }
                 let mut inner = inner.lock().map_err(|_| MockWriteError)?;
                 let mut revoked = 0;
                 for session in &mut inner.sessions {
@@ -10301,6 +10348,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state: AuthTestState::default(),
                 center_state,
             }),
@@ -10325,6 +10373,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state,
                 center_state,
             }),
@@ -10503,6 +10552,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: false,
+                revoke_sessions_fail: false,
                 auth_state,
                 center_state: CenterTestState::default(),
             }),
@@ -10769,6 +10819,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: true,
+                revoke_sessions_fail: false,
                 auth_state: auth.clone(),
                 center_state: center.clone(),
             }),
@@ -10796,6 +10847,475 @@ mod tests {
             assert_eq!(events[1].context().action().as_str(), "login");
             assert_eq!(events[1].context().permission().as_str(), "authenticate");
         }
+        Ok(())
+    }
+
+    /// The sign-in API enforces the product password policy (B1): a password
+    /// below the 12-character minimum is refused at the boundary with the
+    /// console form's message — before the rate limiter, the lookup, and any
+    /// verification. The refusal writes no audit event and consumes no
+    /// rate-limit budget (a policy violation is not a login attempt), so an
+    /// attacker cannot use it to lock an account out or grow the audit table.
+    #[tokio::test]
+    async fn sign_in_refuses_passwords_below_the_product_minimum() -> Result<(), Box<dyn Error>> {
+        let auth = seeded_auth_state();
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+
+        // The empty and the one-character password are refused with the
+        // form's copy; the rejection writes no audit event.
+        for body in [
+            r#"{"username": "admin", "password": ""}"#,
+            r#"{"username": "admin", "password": "x"}"#,
+        ] {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            let error = json_body(refused).await?;
+            assert_eq!(
+                error["message"], "the password must contain at least 12 characters",
+                "{error}"
+            );
+        }
+        assert_eq!(
+            audit.lock().map_err(|_| MockWriteError)?.len(),
+            0,
+            "a policy rejection must write no audit event"
+        );
+
+        // The refusals consumed no rate-limit budget: after several
+        // short-password attempts the correct sign-in still succeeds and
+        // still audits its start/terminal pair.
+        for _ in 0..5 {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"username": "admin", "password": "x"}"#))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        }
+        let signed_in = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(events.len(), 2, "the successful sign-in still audits");
+        }
+        Ok(())
+    }
+
+    /// The bootstrap claim enforces the product password policy (B1): the
+    /// claim sets the product's first credential, so the API boundary — not
+    /// the form — must refuse a short password. A refused claim consumes
+    /// nothing, and the one-time code survives for a valid claim.
+    #[tokio::test]
+    async fn bootstrap_claim_refuses_passwords_below_the_product_minimum()
+    -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        state.seed_bootstrap_code("ABCD2345EFGH6789JKLM");
+        let router = test_router_with_policy(state, AuthPolicy::PendingBootstrap(AuthGate::open()));
+
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "ABCD2345EFGH6789JKLM", "password": ""}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let error = json_body(refused).await?;
+        assert_eq!(
+            error["message"], "the password must contain at least 12 characters",
+            "{error}"
+        );
+
+        // The valid claim still succeeds afterwards — the rejected attempt
+        // did not consume the one-time code.
+        let claim = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "ABCD2345EFGH6789JKLM", "password": "first product password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(claim.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    /// The password-change API enforces the product password policy (B1) on
+    /// the new password, and a refused change leaves the old password in
+    /// force.
+    #[tokio::test]
+    async fn password_change_refuses_passwords_below_the_product_minimum()
+    -> Result<(), Box<dyn Error>> {
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "x"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let error = json_body(refused).await?;
+        assert_eq!(
+            error["message"], "the password must contain at least 12 characters",
+            "{error}"
+        );
+
+        // The old password still signs in — the refused change changed
+        // nothing.
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    /// A rate-limited sign-in refusal writes no audit events (B2): the
+    /// limiter rejected the request before it attempted anything, the 429 is
+    /// the record, and auditing every refused attempt would grow the audit
+    /// table without bound and serialize each append on the persistence
+    /// write gate — starving legitimate session, telemetry, event, and
+    /// operation writes. Normal failures keep their start/terminal pair.
+    #[tokio::test]
+    async fn rate_limited_sign_in_refusals_write_no_audit_events() -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("admin", "admin-password", Role::Administrator);
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+
+        // The username budget fills with normal failures, each appending
+        // the started + failed pair.
+        for _ in 0..crate::auth::USERNAME_FAILURE_LIMIT {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/login")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"username": "admin", "password": "wrong password"}"#,
+                        ))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                crate::auth::USERNAME_FAILURE_LIMIT * 2,
+                "each normal failure must append start + terminal"
+            );
+        }
+
+        // The next attempt is refused by the limiter and appends nothing —
+        // the table stops growing exactly where the budget stops.
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                crate::auth::USERNAME_FAILURE_LIMIT * 2,
+                "a rate-limited refusal must write no audit event"
+            );
+        }
+        Ok(())
+    }
+
+    /// A password change whose session revocation fails surfaces the partial
+    /// state (B3): the response is an explicit 500, the audit trail records
+    /// the failed change-password outcome, the password change itself is not
+    /// rolled back, and the old session stays alive — the revocation failure
+    /// is visible, not silent.
+    #[tokio::test]
+    async fn password_change_surfaces_a_failed_session_revocation() -> Result<(), Box<dyn Error>> {
+        let auth = seeded_auth_state();
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: true,
+                auth_state: auth.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        // The sign-in itself appended its login pair; the recorder starts
+        // clean for the change-password assertions.
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        let changed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                2,
+                "the failed change must append start + terminal"
+            );
+            assert_eq!(events[0].outcome().kind().as_str(), "started");
+            assert_eq!(events[0].context().action().as_str(), "change-password");
+            assert_eq!(events[1].outcome().kind().as_str(), "failed");
+            assert_eq!(events[1].context().action().as_str(), "change-password");
+            assert_eq!(events[1].context().permission().as_str(), "authenticate");
+        }
+
+        // The password change is not rolled back...
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+        // ...and the old session is still valid, because the revocation
+        // failed — exactly the state the 500 makes visible.
+        assert_eq!(
+            fetch_endpoints(&router, &cookie).await?,
+            StatusCode::OK,
+            "the unrevoked session must stay alive until the failure is resolved"
+        );
+        Ok(())
+    }
+
+    /// A successful password change revokes every session of the principal,
+    /// clears the presenting cookie, and lets only the new password sign in
+    /// (§16.2 "密码或角色变化撤销旧 Session").
+    #[tokio::test]
+    async fn password_change_revokes_every_session_and_clears_the_cookie()
+    -> Result<(), Box<dyn Error>> {
+        let router = test_router_with_policy(seeded_auth_state(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let changed = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::OK);
+        let cleared = changed
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the change response must clear the cookie")?
+            .to_str()?;
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+
+        // Every session of the principal is revoked — the presenting cookie
+        // is refused afterwards.
+        assert_eq!(
+            fetch_endpoints(&router, &cookie).await?,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The new password signs in; the old one is refused.
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+        let old_login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "correct horse battery staple"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(old_login.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Every sign-in failure branch runs exactly one password verification
+    /// (B4, extending MINOR-1): unknown username, disabled account, missing
+    /// credential, and wrong password are structurally indistinguishable —
+    /// each performs one verification, so no branch answers observably
+    /// faster than the others and none of them is a username oracle.
+    #[tokio::test]
+    async fn every_login_failure_branch_runs_exactly_one_verification() -> Result<(), Box<dyn Error>>
+    {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        state.seed_disabled_principal("ghost", "ghost secret phrase", Role::Viewer);
+        state.seed_passwordless_principal("nopass", Role::Viewer);
+        let router = test_router_with_policy(state.clone(), AuthPolicy::Guarded);
+
+        // Wrong password.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "wrong password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.password_verifications(), 1);
+        // Unknown username.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "no-such-user", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.password_verifications(), 2);
+        // Disabled account.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "ghost", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.password_verifications(), 3);
+        // Missing credential.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "nopass", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.password_verifications(), 4);
         Ok(())
     }
 
@@ -11381,6 +11901,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: true,
+                revoke_sessions_fail: false,
                 auth_state: auth.clone(),
                 center_state: state.clone(),
             }),
@@ -11501,6 +12022,7 @@ mod tests {
                 batch_store: BatchTestStore::failing(),
                 managed_endpoints: None,
                 refresh_working: true,
+                revoke_sessions_fail: false,
                 auth_state: auth.clone(),
                 center_state: failing,
             }),
