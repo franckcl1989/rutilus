@@ -218,7 +218,7 @@ rutilus backup restore [--portable] PATH
 ```
 
 - 不实现自动后台自更新（§20.3）；
-- 当前数据库 Schema 版本：21 个 Migration（`migration/src/`，2026-08-05 至 2026-08-10 的 21 个文件）；
+- 当前数据库 Schema 版本：23 个 Migration（`migration/src/`，2026-08-05 至 2026-08-12 的 23 个文件：`m20260805_*` 11 + `m20260807_*` 8 + `m20260810_*` 2 + `m20260812_000001_resource_decode_failures` + `m20260812_000002_resource_feature_lists`）；备份快照的已应用/支持计数由测试钉死（`persistence/src/backup_snapshot.rs:624-627`：backup_applied 24 / supported 23，备份含未来迁移时恢复拒绝）；
 - Migration 只允许 DDL（`CREATE`/`ALTER`/`DROP`/`PRAGMA` 开头），数据搬迁通过 SeaQuery 表达，
   该边界由 `migration/tests/bare_sql_gate.rs` 机械检查（§7.3）；
 - 升级前可用 `rutilus doctor` 确认当前实例健康。
@@ -245,9 +245,10 @@ rutilus doctor [--portable]
 
 - **统一日志设施已引入**：设计文档 §6.2 选型清单中的 `tracing` + `tracing-subscriber` 已进入
   workspace（根 `Cargo.toml` 的 `[workspace.dependencies]`）；app 二进制在启动时经 `init_tracing`
-  初始化 stderr subscriber（`app/src/main.rs:233-251`）；
-- **输出格式可选**：全局 `--log-format <text|json>`（默认 `text`，`main.rs:27-32` 的 `LogFormat`
-  枚举 `:37-43`）——`text` 为人类可读行，`json` 为每行一条 newline-delimited 结构化 JSON 记录；
+  初始化 stderr subscriber（`app/src/main.rs:255-273`）；
+- **输出格式可选**：全局 `--log-format <text|json>`（默认 `text`；`Cli.log_format` 字段
+  `main.rs:53`、`LogFormat` 枚举 `main.rs:58-64`）——`text` 为人类可读行，`json` 为每行一条
+  newline-delimited 结构化 JSON 记录；
   两种格式都输出到 stderr，过滤级别都来自 `RUST_LOG`（未设置或非法时默认 `info`，例如
   `RUST_LOG=debug rutilus run --log-format json`），**`RUST_LOG` 过滤行为不变**；CLI 解析失败时
   `--log-format` 在命令运行前被拒绝（`app/tests/log_format.rs`）；
@@ -283,15 +284,15 @@ rutilus doctor [--portable]
 
 | 规模场景 | 实测耗时 | 折算吞吐 | 计时点 |
 |---|---|---|---|
-| 5,000 Endpoint 投影首次写入（100 Site x 50） | 5.78s | ≈865 行/s | `stress_capacity.rs:862-865` |
-| 5,000 Endpoint 投影幂等重投（at-least-once） | 9.72s | ≈515 行/s（更新路径） | `stress_capacity.rs:921-924` |
-| 5,000 行投影清单查询（含 100 个 per-site 视图） | 0.482s | ≈10,400 行/s | `stress_capacity.rs:903-906` |
-| 200 Endpoint 首轮 Generation 提交（7 snapshot/Endpoint） | 0.30s | — | `stress_capacity.rs:440-443` |
-| 200 Endpoint 二轮 Generation 提交 + 当前视图重载 | 0.32s | — | `stress_capacity.rs:489-492` |
-| 100 Site 建库 + 1,000 outbox 入队 | 0.01s / 0.53s | — | `stress_capacity.rs:599-602, 623-627` |
-| 500 outbox Ack（含重复 Ack no-op） | 0.141s | — | `stress_capacity.rs:649-653` |
-| 400 inbox 幂等生命周期（100 Site x 4） | 0.31s | — | `stress_capacity.rs:757-760` |
-| 800 sync cursor 推进（100 Site x 4 流 x 2） | 0.28s | — | `stress_capacity.rs:792-797` |
+| 5,000 Endpoint 投影首次写入（100 Site x 50） | 5.78s | ≈865 行/s | `stress_capacity.rs:865` |
+| 5,000 Endpoint 投影幂等重投（at-least-once） | 9.72s | ≈515 行/s（更新路径） | `stress_capacity.rs:924` |
+| 5,000 行投影清单查询（含 100 个 per-site 视图） | 0.482s | ≈10,400 行/s | `stress_capacity.rs:906` |
+| 200 Endpoint 首轮 Generation 提交（7 snapshot/Endpoint） | 0.30s | — | `stress_capacity.rs:441` |
+| 200 Endpoint 二轮 Generation 提交 + 当前视图重载 | 0.32s | — | `stress_capacity.rs:491` |
+| 100 Site 建库 + 1,000 outbox 入队 | 0.01s / 0.53s | — | `stress_capacity.rs:602, 626` |
+| 500 outbox Ack（含重复 Ack no-op） | 0.141s | — | `stress_capacity.rs:652` |
+| 400 inbox 幂等生命周期（100 Site x 4） | 0.31s | — | `stress_capacity.rs:760` |
+| 800 sync cursor 推进（100 Site x 4 流 x 2） | 0.28s | — | `stress_capacity.rs:795` |
 
 **关键观察（发布容量建议时最有价值的记录）**：persistence 的写路径被 `write_gate`
 （`Semaphore(1)` 全局应用级写信号量，`persistence/src/lib.rs:101, 240`）串行化——同一时刻全库
@@ -323,12 +324,13 @@ CI 门禁与 §19.4 的对照（`.github/workflows/ci.yml`）：
 | 门禁 | 现状 |
 |---|---|
 | fmt / clippy（`-D warnings`）/ 全 workspace 测试 | 已启用（ubuntu-latest 默认 job；windows/macos 跑全目标编译 + 跨平台 E2E 套件） |
-| 跨平台 E2E 套件（windows/macos） | 已启用：`cargo test --locked -p rutilus-web`（9 个路径套件，内存假件）+ `cargo test --locked -p rutilus --test version`（`ci.yml:107-123`）；`app/tests/mock_center_client.rs`（回环 mTLS/WebSocket 互操作）因真实 socket 与握手时序不纳入（`ci.yml:113-118` 注释） |
+| 跨平台 E2E 套件（windows/macos） | 已启用：`cargo test --locked -p rutilus-web`（9 个路径套件，内存假件）+ `cargo test --locked -p rutilus --test version`（`ci.yml:122-138`）；`app/tests/mock_center_client.rs`（回环 mTLS/WebSocket 互操作）因真实 socket 与握手时序不纳入（`ci.yml:129-133` 注释） |
 | nextest（`--test-threads 4`）/ llvm-cov（行覆盖 ≥ 80%，本地实测 90.14%，2026-08-12） | 已启用 |
 | cargo deny（advisories/bans/licenses/sources） | 已启用（版本 0.20.2） |
-| cargo audit 独立门禁 | **已启用**（2026-08-12，`ci.yml:163-181`）：`cargo audit --deny warnings`，`--ignore` 镜像 deny.toml `[advisories]` 全部 4 条（quick-xml 0194/0195 两条 TRIGGER、unmaintained 0436/0173）+ 重新登记的 rkyv RUSTSEC-2026-0235（deny.toml 注释预言 cargo-audit 启用时会重新登记，`deny.toml:21-24`）；cargo-audit 只读 audit.toml、不读 deny.toml，故以 CLI 旗标镜像，需与 deny.toml 同步维护（`ci.yml:163-172` 注释） |
+| cargo audit 独立门禁 | **已启用**（2026-08-12，`ci.yml:188-196`）：`cargo audit --deny warnings`，`--ignore` 镜像 deny.toml `[advisories]` 全部 4 条（quick-xml 0194/0195 两条 TRIGGER、unmaintained 0436/0173）+ 重新登记的 rkyv RUSTSEC-2026-0235（deny.toml 注释预言 cargo-audit 启用时会重新登记，`deny.toml:21-24`）；cargo-audit 只读 audit.toml、不读 deny.toml，故以 CLI 旗标镜像，需与 deny.toml 同步维护（`ci.yml:178-187` 注释） |
+| Secret 泄漏扫描门禁 | **已启用**（2026-08-12，E3b）：`security/tests/secret_leak_gate.rs`——3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM 块 / R3 明文输出宏泄露）、7 测试、`ALLOWED_CONSTANT_HITS` 白名单 2 处（path+line+name+literal 绑定，`app/src/backup.rs:83, 84`）；**CI 独立步骤**（`ci.yml:216-218` Secret leak gate：`cargo test --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前，header 注记 `ci.yml:15-17`） |
 | cargo machete | 已启用（3 处误报均在忽略清单中注明） |
-| 跨平台构建与发布矩阵 | CI 编译 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` + `wasm32-unknown-unknown` UI 产物并 diff 校验（ubuntu 默认 job）；发布构建：x86_64 musl（`ci.yml:216-221`）与 aarch64 musl（cargo-zigbuild 交叉链接，`ci.yml:228-232`）在 ubuntu 任务构建，macOS Universal 2 由 macos 任务构建两个 darwin 目标并经 lipo 合并（`ci.yml:243-260`）；**`aarch64-pc-windows-msvc` 明确不入 CI**——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库，注释注明需原生 ARM64 runner 或本地验证后处理（`ci.yml:234-241`） |
+| 跨平台构建与发布矩阵 | CI 编译 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`、`x86_64-apple-darwin` + `wasm32-unknown-unknown` UI 产物并 diff 校验（ubuntu 默认 job）；发布构建：x86_64 musl（`ci.yml:245-250`）与 aarch64 musl（cargo-zigbuild 交叉链接，`ci.yml:257-261`）在 ubuntu 任务构建，macOS Universal 2 由 macos 任务构建两个 darwin 目标并经 lipo 合并（`ci.yml:280-295`）；**`aarch64-pc-windows-msvc` 明确不入 CI**——hosted x64 Windows runner 无法提供 ARM64 MSVC 链接器与 SDK 导入库，注释注明需原生 ARM64 runner 或本地验证后处理（`ci.yml:263-270`） |
 | Migration / 能力账本 / 发布基线检查 | 已启用 |
 
 发布目标矩阵（§5.2）为 Linux `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`、

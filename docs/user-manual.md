@@ -6,7 +6,8 @@
 > 当前产品版本号为 `0.9.0`（生产候选，workspace 版本，`rutilus version` 输出；根 `Cargo.toml`），
 > 版本号单一来源 = 根 `Cargo.toml` `[workspace.package] version`（`Cargo.toml:14`）：产品版本与里程碑
 > 对齐、随里程碑升级（设计文档 0.1.0→1.0.0 为产品发布阶段编号），一次升级只改这一处；`rutilus version`
-> 输出与版本/日志格式测试断言均由 `CARGO_PKG_VERSION` 与基线常量派生（`app/tests/version.rs`、`app/tests/log_format.rs`）。
+> 输出三行（产品版本 / `nv-redfish` 开发基线 / 构建 Git Commit）与版本/日志格式测试断言均由
+> `CARGO_PKG_VERSION`、基线常量与编译期 `RUTILUS_GIT_COMMIT` 派生（`app/tests/version.rs`、`app/tests/log_format.rs`）。
 
 ## 一、产品概述
 
@@ -31,14 +32,22 @@ Rutilus 是一个由 Rust 实现、通过浏览器 GUI 使用、基于 `nv-redfi
 | `nv-redfish` 开发/发布基线 | `0.13.0`（2026-08-04 发布） | `infra-redfish/src/lib.rs`、`infra-redfish/src/release_baseline.rs` |
 | 已知更新正式版本 | `0.14.2`（2026-08-10 发布，未 yank），升级决策留待冻结评审 | `infra-redfish/src/release_baseline.rs` |
 | 能力账本规模 | 47 条（33 标准 + 14 OEM） | `domain/src/capability.rs` |
+| 构建 Git Commit 嵌入 | CI 构建注入 `RUTILUS_GIT_COMMIT`（`github.sha`），本地构建降级 `dev`；`rutilus version` 第三行输出 | `ci.yml:45-55`；`app/src/main.rs:38-40` |
 | CLI 名称 | `rutilus` | `app/src/main.rs` |
 
-运行 `rutilus version` 可打印产品版本与 `nv-redfish` 开发基线：
+运行 `rutilus version` 可打印产品版本、`nv-redfish` 开发基线与构建 Git Commit（三行，
+`app/src/main.rs:733-737`）：
 
 ```text
 rutilus 0.9.0
 nv-redfish development baseline 0.13.0
+git commit dev
 ```
+
+第三行 `git commit`：CI 构建由 job 级 `RUTILUS_GIT_COMMIT` 环境变量注入构建时的
+`github.sha`（`ci.yml:45-55`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）；
+本地构建未设置该变量时降级输出 `dev`（不调用 git 子进程）。版本/日志格式测试断言与二进制
+同源派生（`app/tests/version.rs:27-36`、`app/tests/log_format.rs:23-28`）。
 
 ### 1.2 三级部署的使用场景
 
@@ -77,7 +86,7 @@ rutilus run [--portable] [--no-open]
 ```
 
 - Standalone 前台运行：绑定 IPv4 回环地址的随机端口，默认自动打开系统浏览器（`app/src/standalone_runtime.rs`）；
-- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs` 第 9470 行附近；`web/src/auth.rs`）；
+- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs` 第 9453 行附近；`web/src/auth.rs`）；
 - 认领完成后进入登录页，用管理员账户登录。
 
 ### 2.3 登录与安全基线
@@ -180,13 +189,13 @@ Edge 控制台视图（`ui/src/lib.rs` 的 `ConsoleView`，共 17 个视图，�
 | Users / Sessions | 用户与会话管理（仅 Administrator） |
 | Center sites / Center operations / Center bindings | 中心姿态视图（仅 Center 控制台显示） |
 
-中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs` 第 2760 行附近）。
+中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs` 第 2768-2773 行附近）。
 界面文案当前为英文静态标签（`ui/src/lib.rs` 的 `label()`），与设计文档 §12.1 的一级导航对应关系为：
 总览 = Overview（多服务器清单视图，见 §4.2）；分组 = Groups；操作任务 = Operations；事件 = Events；
 更新制品 = Artifacts；凭据 = Credentials；用户与权限 = Users/Sessions；中心连接 = Center bindings；
 审计 = Audit。设计文档中的"服务器/管理端点/设置"在实现中不以独立导航视图存在——
 服务器与管理端点统一由 Overview 清单呈现（每张端点卡片显示 Systems/Chassis/Managers 资源计数与核心资源列表，
-`ui/src/lib.rs` 第 11910 行附近），"设置"尚无对应视图（如实标注）。
+`ui/src/lib.rs` 第 12364 行附近），"设置"尚无对应视图（如实标注）。
 
 ### 4.2 多服务器首页（Overview）
 
@@ -194,7 +203,7 @@ Overview 视图即多服务器首页（"Inventory"）：上方为 §14.2 聚合�
 服务端聚合，`web/src/lib.rs` 的 overview 路由），下方为端点清单——每张端点卡片显示统一健康徽标
 （Unified endpoint health）、信任徽标、快照状态标签
 （"No resource counts are published until a complete refresh succeeds."）、
-Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs` 第 11536 行起、第 11910 行附近）。
+Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs` 第 12364 行起）。
 
 聚合仪表盘（§14.2"首页显示"列表）展示：
 
@@ -294,7 +303,7 @@ HTTP 返回 200/201/202/204 都不直接等于业务成功——写操作后必�
 
 Telemetry 家族的专用表单**尚未实现**（"The telemetry write form is a later milestone"），
 Log（清空日志）与 Control（控制更新）家族同样没有专用表单——表单选择器会明确拒绝而不是伪造
-（`ui/src/lib.rs` 第 6010 行附近；`OperationFormError::FamilyRequired`）。
+（`ui/src/lib.rs` 第 6148-6296 行；`OperationFormError::FamilyRequired`）。
 已持久化的这些家族命令仍会在操作卡片中正确渲染摘要（`wire_command_summary`）。
 
 ### 5.3 批量操作
@@ -417,6 +426,6 @@ BMC 端异步任务（Task）持久保存 Task URI、TaskMonitor URI、Operation
 | `rutilus unbind [--portable]` | 离线解除站点与中心的绑定 |
 | `rutilus doctor [--portable]` | 自检（数据目录、数据库、迁移、主密钥、服务、TLS） |
 | `rutilus licenses` | 打印第三方许可证清单 |
-| `rutilus version` | 打印产品与 nv-redfish 基线版本 |
+| `rutilus version` | 打印产品版本、nv-redfish 开发基线与构建 Git Commit（三行） |
 
 事实来源：`app/src/main.rs`。日常 Redfish 操作不设计成 CLI（§18.1）。
