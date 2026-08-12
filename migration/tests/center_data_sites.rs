@@ -1,10 +1,14 @@
 use std::error::Error;
 
-use rutilus_entity::{artifact, endpoint, event, instance};
+use rutilus_entity::{
+    artifact, credential, endpoint, endpoint_address, endpoint_capability, endpoint_credential,
+    endpoint_trust, event, instance, resource, resource_snapshot,
+};
 use rutilus_migration::Migrator;
+use sea_orm::sea_query::{Alias, Expr, Query};
 use sea_orm::{
     ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend,
-    EntityTrait, Set, Statement,
+    EntityTrait, PaginatorTrait, Set, Statement,
 };
 use sea_orm_migration::{MigratorTrait, SchemaManager};
 use time::OffsetDateTime;
@@ -133,6 +137,100 @@ async fn center_data_sites_migration_adds_and_drops_the_site_association()
 async fn center_data_sites_down_restores_the_original_table_shapes() -> Result<(), Box<dyn Error>> {
     let (directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
+    // Seed a parent row and one row in every cascade child of `endpoints`
+    // (addresses, TLS trust, credential binding, capability ledger,
+    // resource, and snapshot) so the downgrade below runs against real
+    // data. The foreign keys are on (the `sqlx` default this harness
+    // inherits enables them), so the down of 000010 must rebuild the
+    // children alongside `endpoints` — a bare parent drop would silently
+    // cascade every child row away.
+    let now = OffsetDateTime::now_utc();
+    let seed_site_id = Uuid::now_v7();
+    instance::ActiveModel {
+        id: Set(seed_site_id),
+        display_name: Set(String::from("Site Two")),
+        instance_kind: Set(String::from("site")),
+        created_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    let seed_endpoint_id = Uuid::now_v7();
+    endpoint::ActiveModel {
+        id: Set(seed_endpoint_id),
+        display_name: Set(String::from("Rack B PDU")),
+        created_at: Set(now),
+        updated_at: Set(now),
+        site_id: Set(Some(seed_site_id)),
+        refresh_generation: Set(1),
+        health: Set(String::from("ok")),
+    }
+    .insert(&database)
+    .await?;
+    let seed_credential_id = Uuid::now_v7();
+    credential::ActiveModel {
+        id: Set(seed_credential_id),
+        name: Set(String::from("Rack B credential")),
+        username: Set(String::from("svc")),
+        active_version_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    endpoint_address::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        endpoint_id: Set(seed_endpoint_id),
+        address: Set(String::from("https://rack-b.example.com")),
+        is_active: Set(true),
+        created_at: Set(now),
+        retired_at: Set(None),
+    }
+    .insert(&database)
+    .await?;
+    endpoint_trust::ActiveModel {
+        endpoint_id: Set(seed_endpoint_id),
+        trust_mode: Set(endpoint_trust::TrustMode::PinnedCertificate),
+        certificate_sha256: Set(None),
+        certificate_der: Set(None),
+        trusted_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    endpoint_credential::ActiveModel {
+        endpoint_id: Set(seed_endpoint_id),
+        credential_id: Set(seed_credential_id),
+        assigned_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    endpoint_capability::ActiveModel {
+        endpoint_id: Set(seed_endpoint_id),
+        capability: Set(String::from("power")),
+        state: Set(String::from("supported")),
+        observed_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    let seed_resource_id = Uuid::now_v7();
+    resource::ActiveModel {
+        id: Set(seed_resource_id),
+        endpoint_id: Set(seed_endpoint_id),
+        odata_id: Set(String::from("/redfish/v1/Systems/1")),
+        feature: Set(String::from("systems")),
+        created_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
+    resource_snapshot::ActiveModel {
+        resource_id: Set(seed_resource_id),
+        generation: Set(1),
+        odata_type: Set(None),
+        etag: Set(None),
+        typed_payload_json: Set(String::from("{\"id\": 1}")),
+        observed_at: Set(now),
+    }
+    .insert(&database)
+    .await?;
     // Unwind the feature-list alignment migration, the decode-failure
     // migration, plus the two 0.7.0 S5 migrations; the down of 000010 must
     // restore the 000009-era shapes.
@@ -144,9 +242,59 @@ async fn center_data_sites_down_restores_the_original_table_shapes() -> Result<(
         Some("m20260807_000009_center_tables")
     );
 
+    // The six cascade children survive the downgrade with their rows: the
+    // down rebuilds them alongside `endpoints` instead of letting the old
+    // parent's drop cascade them away (with foreign keys on, the implicit
+    // `DELETE FROM endpoints` would silently empty every child — the defect
+    // this test pins).
+    assert_eq!(
+        endpoint_address::Entity::find().count(&database).await?,
+        1,
+        "the endpoint_addresses row must survive the down"
+    );
+    assert_eq!(
+        endpoint_trust::Entity::find().count(&database).await?,
+        1,
+        "the endpoint_trust row must survive the down"
+    );
+    assert_eq!(
+        endpoint_credential::Entity::find().count(&database).await?,
+        1,
+        "the endpoint_credentials row must survive the down"
+    );
+    assert_eq!(
+        endpoint_capability::Entity::find().count(&database).await?,
+        1,
+        "the endpoint_capabilities row must survive the down"
+    );
+    assert_eq!(
+        resource::Entity::find().count(&database).await?,
+        1,
+        "the resources row must survive the down"
+    );
+    assert_eq!(
+        resource_snapshot::Entity::find().count(&database).await?,
+        1,
+        "the resource_snapshots row must survive the down"
+    );
+    // The `endpoint` model still carries `site_id`, which the down removed,
+    // so the endpoint row is counted through raw SQL instead of the entity.
+    let statement = Query::select()
+        .expr(Expr::cust("COUNT(*) AS row_count"))
+        .from(Alias::new("endpoints"))
+        .to_owned();
+    let row = database
+        .query_one(&statement)
+        .await?
+        .ok_or("endpoints must exist after the rollback")?;
+    assert_eq!(
+        row.try_get_by_index::<i64>(0)?,
+        1,
+        "the endpoints row must survive the down rebuild"
+    );
+
     // The site_id columns are gone: the association inserts are refused
     // and the original shapes work.
-    let now = OffsetDateTime::now_utc();
     let site_id = Uuid::now_v7();
     instance::ActiveModel {
         id: Set(site_id),
