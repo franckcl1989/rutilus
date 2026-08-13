@@ -8,7 +8,7 @@ use rutilus_entity::event;
 use sea_orm::sea_query::ExprTrait;
 use sea_orm::{
     ColumnTrait, Condition, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    TryInsertResult,
+    TransactionTrait, TryInsertResult,
 };
 use thiserror::Error;
 
@@ -90,6 +90,69 @@ impl SqliteStore {
             TryInsertResult::Inserted(_) | TryInsertResult::Conflicted | TryInsertResult::Empty => {
             }
         }
+        Ok(())
+    }
+
+    /// Persists one site-reported event batch (§15.5), deduplicated, as one
+    /// write-gate transaction.
+    ///
+    /// Mirrors [`Self::append_center_event`] per record — the same §14.4
+    /// dedup (the unique `(endpoint_id, dedup_key)` index with
+    /// `ON CONFLICT DO NOTHING`, so a duplicate lands as a no-op conflict
+    /// and the first row is authoritative), the same site association, the
+    /// same at-least-once absorption of a re-delivered record — under one
+    /// write-gate acquisition and one transaction, so the batch commits or
+    /// rolls back as a unit: a boundary failure re-delivers the frame and
+    /// every record of the batch is re-applied whole (the §15.4
+    /// at-least-once discipline of the §21 0.7.0 event reporting).
+    ///
+    /// An empty batch is a no-op that neither touches the write gate nor
+    /// opens a transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventRepositoryError`] when write coordination fails or
+    /// `SQLite` rejects an append for a reason other than the dedup
+    /// conflict; the whole batch is then rolled back.
+    pub async fn append_center_events(
+        &self,
+        events: &[Event],
+        site: InstanceId,
+    ) -> Result<(), EventRepositoryError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(EventRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(EventRepositoryError::Database)?;
+        for event in events {
+            let result = event::Entity::insert(project_event(event, Some(site)))
+                .on_conflict_do_nothing_on([event::Column::EndpointId, event::Column::DedupKey])
+                .exec(&transaction)
+                .await
+                .map_err(EventRepositoryError::Database)?;
+            match result {
+                // `Inserted` persisted a new row; `Conflicted` is a dedup
+                // hit — the first row is authoritative and never rewritten.
+                // `Empty` cannot occur for a single-model insert and exists
+                // only for the iterator API; naming it keeps the match
+                // exhaustive.
+                TryInsertResult::Inserted(_)
+                | TryInsertResult::Conflicted
+                | TryInsertResult::Empty => {}
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(EventRepositoryError::Database)?;
         Ok(())
     }
 
@@ -269,7 +332,9 @@ pub enum StoredEventError {
 mod tests {
     use std::error::Error;
 
-    use rutilus_domain::{EndpointId, EventSeverity, MessageId};
+    use rutilus_domain::{
+        EndpointId, EventSeverity, InstanceId, InstanceKind, MessageId, SiteInstance,
+    };
     use sea_orm::{
         ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, IntoActiveModel, Set,
     };
@@ -402,6 +467,79 @@ mod tests {
         // same message at the same BMC time on two endpoints is two events.
         let listed = store.list_recent_events(100).await?;
         assert_eq!(listed.len(), 2);
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_center_event_batch_is_stored_deduplicated_in_one_transaction()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let site = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Site One"),
+            InstanceKind::Site,
+            OffsetDateTime::now_utc(),
+        );
+        store.create_instance(&site).await?;
+        let observed_at = OffsetDateTime::now_utc();
+        let first = critical_event(
+            EndpointId::generate(),
+            observed_at - Duration::SECOND,
+            observed_at,
+        )?;
+        let second = Event::new(
+            EventId::generate(),
+            first.endpoint_id(),
+            MessageId::parse("ResourceEvent.1.0.LanResetType")?,
+            EventSeverity::Warning,
+            None,
+            observed_at,
+            observed_at,
+        )?;
+        // The third record is a §14.4 duplicate of the first within the
+        // same batch (same endpoint, same message, same BMC time): the
+        // unique index deduplicates it exactly like a cross-batch
+        // redelivery, and the first row stays authoritative.
+        let duplicate = Event::try_from_parts(
+            EventId::generate(),
+            first.endpoint_id(),
+            first.message_id().clone(),
+            first.severity(),
+            first.message().map(str::to_owned),
+            first.event_timestamp(),
+            observed_at,
+        )?;
+        assert_eq!(duplicate.dedup_key(), first.dedup_key());
+
+        store
+            .append_center_events(&[first.clone(), second.clone(), duplicate], site.id())
+            .await?;
+        let listed = store.list_recent_events(100).await?;
+        assert_eq!(listed.len(), 2, "a within-batch duplicate must deduplicate");
+        assert!(listed.contains(&first));
+        assert!(listed.contains(&second));
+        // The batch recorded the reporting site on every row.
+        let stored = event::Entity::find_by_id(first.id().into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the stored event is missing")?;
+        assert_eq!(stored.site_id, Some(site.id().into_uuid()));
+
+        // The at-least-once re-delivery of the whole batch is a no-op.
+        store
+            .append_center_events(&[first, second], site.id())
+            .await?;
+        assert_eq!(
+            store.list_recent_events(100).await?.len(),
+            2,
+            "a re-delivered batch must not duplicate a row"
+        );
+        // An empty batch touches neither the gate nor a transaction.
+        store.append_center_events(&[], site.id()).await?;
+        assert_eq!(store.list_recent_events(100).await?.len(), 2);
+
         store.close().await?;
         drop(directory);
         Ok(())

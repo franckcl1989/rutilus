@@ -519,8 +519,20 @@ impl StandaloneState {
                 .await
                 .map_err(CenterServicesError::Outbox)?;
             for entry in entries {
-                let Ok(envelope) = serde_json::from_str::<Envelope>(entry.payload_json()) else {
-                    continue;
+                let envelope = match serde_json::from_str::<Envelope>(entry.payload_json()) {
+                    Ok(envelope) => envelope,
+                    Err(source) => {
+                        // One unreadable row never fails the whole view:
+                        // like the flush path (E3-9), the row is logged at
+                        // warn and skipped, so the view shows every
+                        // envelope that does decode.
+                        tracing::warn!(
+                            "site {site}: skipping outbox entry {} with an undecodable envelope: \
+                             {source}",
+                            entry.id()
+                        );
+                        continue;
+                    }
                 };
                 if let Some(EnvelopeMessage::OperationOffer(offer)) = envelope.message {
                     let Ok(operation_id) = offer.operation_id.parse::<OperationId>() else {
@@ -898,8 +910,16 @@ mod tests {
     use std::{error::Error, net::Ipv4Addr, path::PathBuf, sync::Arc};
 
     use rutilus_application::{CenterTrustAnchor, SiteCertificateIssuer};
-    use rutilus_domain::{CertificateFingerprint, InstanceId};
-    use rutilus_platform::RuntimePaths;
+    use rutilus_center_protocol::{EnvelopeMessage, OperationOffer};
+    use rutilus_domain::{
+        CertificateFingerprint, InstanceId, InstanceKind, Operation, OperationSource,
+        OperationTarget, OutboxEntry, OutboxEntryId, ResetType, SiteInstance, SystemCommand,
+        TargetId,
+    };
+    use rutilus_persistence::SqliteStore;
+    use rutilus_platform::{RuntimeLock, RuntimePaths};
+    use rutilus_security::MasterKey;
+    use time::{Duration, OffsetDateTime};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -1046,6 +1066,179 @@ mod tests {
         )?;
         assert_eq!(options.console().listen().to_string(), "127.0.0.1:8443");
         assert_eq!(options.center_listen(), &center_listen);
+        Ok(())
+    }
+
+    /// A test instance state over one migrated store.
+    async fn test_state(paths: &RuntimePaths) -> Result<Arc<StandaloneState>, Box<dyn Error>> {
+        let master_key = Arc::new(MasterKey::generate()?);
+        let store =
+            SqliteStore::open_with_command_key(paths.database_path(), Arc::clone(&master_key))
+                .await?;
+        let runtime_lock = RuntimeLock::acquire(paths.runtime_lock_path())?;
+        Ok(Arc::new(StandaloneState {
+            store,
+            master_key,
+            _runtime_lock: runtime_lock,
+            audit_tail: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            registry: Arc::new(rutilus_application::CenterSessionRegistry::new()),
+            center_issuer: std::sync::Mutex::new(None),
+        }))
+    }
+
+    /// A test subscriber that records every event's level and formatted
+    /// message — the same capture shape as the application crate's engine
+    /// tests.
+    #[derive(Clone)]
+    struct CaptureSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl CaptureSubscriber {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured(&self) -> Vec<(tracing::Level, String)> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    struct CaptureVisitor(Option<String>);
+
+    impl tracing::field::Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CaptureVisitor(None);
+            event.record(&mut visitor);
+            let message = visitor.0.unwrap_or_default();
+            self.events
+                .lock()
+                .map(|mut events| events.push((*event.metadata().level(), message)))
+                .ok();
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn list_center_operations_logs_and_skips_an_undecodable_outbox_envelope()
+    -> Result<(), Box<dyn Error>> {
+        // E3-9: one undecodable outbox row never fails the operation view
+        // and never disappears silently — it is reported at warn and
+        // skipped, exactly like the flush path, and every envelope that
+        // does decode still lands in the view.
+        let subscriber = CaptureSubscriber::new();
+        let captured = subscriber.clone();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("center"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let site = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Test Site"),
+            InstanceKind::Site,
+            now,
+        );
+        state.store.create_instance(&site).await?;
+        let endpoint_id = EndpointId::generate();
+        let operation = Operation::new(
+            OperationId::generate(),
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::GracefulShutdown)),
+            now,
+        );
+        rutilus_operation_engine::OperationStore::create_operation(&state.store, &operation)
+            .await?;
+        let projection = rutilus_application::EndpointProjectionWrite::new(
+            endpoint_id,
+            String::from("Rack A PDU"),
+            String::from("https://192.0.2.10"),
+            rutilus_application::CenterTrustMode::SystemCa,
+            1,
+            String::from("ok"),
+        );
+        rutilus_application::CenterProjectionRepository::upsert_endpoint(
+            &state.store,
+            &projection,
+            site.id(),
+            now,
+        )
+        .await?;
+        // One valid offer and one row whose payload is not an envelope.
+        let offer = EnvelopeMessage::OperationOffer(OperationOffer {
+            operation_id: operation.id().to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            site_id: site.id().to_string(),
+            command_json: b"{}".to_vec(),
+            target: String::from("/redfish/v1/Systems/1"),
+            expires_at_unix: (now + Duration::minutes(15)).unix_timestamp(),
+            actor_context: String::from("operator"),
+        });
+        state
+            .store
+            .enqueue_outbox_entry(site.id(), &offer, now)
+            .await?;
+        let bogus = OutboxEntry::new(
+            OutboxEntryId::generate(),
+            site.id(),
+            2,
+            String::from(r#"{"not":"an envelope"}"#),
+            now,
+        );
+        state.store.create_outbox_entry(&bogus).await?;
+
+        let views = state.list_center_operations(None).await?;
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].operation_id(), operation.id());
+        assert_eq!(views[0].target(), Some("/redfish/v1/Systems/1"));
+
+        let events = captured.captured();
+        let warns = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .collect::<Vec<_>>();
+        assert!(
+            warns.iter().any(|(_, message)| {
+                message.contains(bogus.id().to_string().as_str())
+                    && message.contains("undecodable envelope")
+            }),
+            "the undecodable row is reported at warn, not silently dropped"
+        );
         Ok(())
     }
 }

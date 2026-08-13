@@ -133,6 +133,29 @@ pub trait OperationStore: Send + Sync {
         kind: FailureKind,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
 
+    /// Reads the persisted failure classification of one operation (audit
+    /// follow-up E3-4: the site's `OperationCompleted` summary carries the
+    /// classification so the center can distinguish a provably unsupported
+    /// write from an ordinary failure).
+    ///
+    /// `None` for every operation that is not a classified failure and for
+    /// an unknown operation id — the kind is an optional fact of a `Failed`
+    /// row, never a state. The default implementation reports no
+    /// classification, so a store that does not read the column keeps the
+    /// historical summary semantics; the production store overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a boundary error when the classification cannot be read (a
+    /// stored code this build cannot classify is a corrupt row, exactly
+    /// like the batch-children listing).
+    fn find_failure_kind(
+        &self,
+        _operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+        Box::pin(async move { Ok(None) })
+    }
+
     /// Lists operations, optionally filtered by exact state.
     ///
     /// A `None` filter returns every operation; a `Some` filter returns only
@@ -246,6 +269,13 @@ where
         kind: FailureKind,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
         Store::record_failure_kind(*self, operation_id, kind)
+    }
+
+    fn find_failure_kind(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+        Store::find_failure_kind(*self, operation_id)
     }
 
     fn list_operations(

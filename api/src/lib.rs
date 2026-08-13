@@ -3533,6 +3533,21 @@ pub enum OperationStateResponse {
     Cancelled,
 }
 
+/// The §13.7 failure classification of one failed operation.
+///
+/// The wire value is `snake_case` by console contract
+/// (`capability_unsupported`) and mirrors the domain's stable persistence
+/// code (`capability-unsupported`) in meaning; like the `waiting_remote`
+/// state, the Web projection translates between the two vocabularies.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKindResponse {
+    /// The endpoint cannot execute this write because the required capability
+    /// is provably unsupported — the write was never dispatched (§13.3 step 2
+    /// pre-flight refusal), so the refusal is the honest reporting verdict.
+    CapabilityUnsupported,
+}
+
 /// Secret-free input that converts one typed Redfish write into a persisted
 /// operation (§13.1).
 ///
@@ -3692,6 +3707,9 @@ fn redact_password_members(value: serde_json::Value) -> serde_json::Value {
 /// so the console renders exactly what will be dispatched (§13.3 step 7) —
 /// with the §10 account passwords replaced by the fixed redaction marker
 /// (S3-1): the history shows the command structure, never the secret.
+/// `failure_kind` carries the §13.7 classification of a `Failed` operation
+/// (E3-4): the console can render a provably-unsupported refusal instead of
+/// an ordinary failure.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationResponse {
@@ -3705,9 +3723,16 @@ pub struct OperationResponse {
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
+    /// The §13.7 failure classification, `None` for every operation that is
+    /// not a classified failure. `#[serde(default)]` keeps older wire readers
+    /// compatible with the enriched projection, exactly like the additive
+    /// offer fields of [`CenterOperationResponse`].
+    #[serde(default)]
+    failure_kind: Option<FailureKindResponse>,
 }
 
 impl OperationResponse {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
         operation_id: Uuid,
@@ -3717,6 +3742,7 @@ impl OperationResponse {
         state: OperationStateResponse,
         created_at: OffsetDateTime,
         updated_at: OffsetDateTime,
+        failure_kind: Option<FailureKindResponse>,
     ) -> Self {
         Self {
             operation_id,
@@ -3726,6 +3752,7 @@ impl OperationResponse {
             state,
             created_at,
             updated_at,
+            failure_kind,
         }
     }
 
@@ -3763,6 +3790,13 @@ impl OperationResponse {
     #[must_use]
     pub const fn updated_at(&self) -> OffsetDateTime {
         self.updated_at
+    }
+
+    /// Returns the §13.7 failure classification, when the failed operation
+    /// carries a provable reason.
+    #[must_use]
+    pub const fn failure_kind(&self) -> Option<FailureKindResponse> {
+        self.failure_kind
     }
 }
 
@@ -4891,9 +4925,10 @@ impl BootstrapCompleteResponse {
 /// A signed-in principal changing their own password (§16.2).
 ///
 /// The current password authenticates the request; the new password is
-/// hashed for storage as given — the product enforces no password-strength
-/// policy. Both values are `SecretString`-wrapped, serialized only for the
-/// WASM client, and never echoed by any response.
+/// hashed for storage as given. The handler enforces the product password
+/// policy (12 characters) at the API boundary. Both values are
+/// `SecretString`-wrapped, serialized only for the WASM client, and never
+/// echoed by any response.
 pub struct SetPasswordRequest {
     current_password: SecretString,
     new_password: SecretString,
@@ -10612,6 +10647,113 @@ mod tests {
     }
 
     #[test]
+    fn failure_kind_vocabulary_is_exact() -> Result<(), Box<dyn Error>> {
+        // The one §13.7 classification with its exact console wire value.
+        assert_eq!(
+            serde_json::to_value(FailureKindResponse::CapabilityUnsupported)?,
+            json!("capability_unsupported")
+        );
+        assert_eq!(
+            serde_json::from_value::<FailureKindResponse>(json!("capability_unsupported"))?,
+            FailureKindResponse::CapabilityUnsupported
+        );
+        // The domain persistence code is deliberately not a wire value here,
+        // exactly like the `waiting_remote` state translation.
+        assert!(
+            serde_json::from_value::<FailureKindResponse>(json!("capability-unsupported")).is_err()
+        );
+        assert!(serde_json::from_value::<FailureKindResponse>(json!("failed")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_response_carries_the_failure_classification_on_the_wire()
+    -> Result<(), Box<dyn Error>> {
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let operation_id = uuid!("01989abc-def0-7abc-8def-0123456789d5");
+        // A capability refusal is a classified failure: the response carries
+        // the kind, so the console can render the provably-unsupported
+        // verdict instead of an ordinary failure (E3-4).
+        let classified = OperationResponse::new(
+            operation_id,
+            OperationSourceResponse::Standalone,
+            Vec::new(),
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            OperationStateResponse::Failed,
+            observed_at,
+            observed_at,
+            Some(FailureKindResponse::CapabilityUnsupported),
+        );
+        assert_eq!(
+            classified.failure_kind(),
+            Some(FailureKindResponse::CapabilityUnsupported)
+        );
+        assert_eq!(
+            serde_json::to_value(&classified)?,
+            json!({
+                "operation_id": operation_id,
+                "source": "standalone",
+                "targets": [],
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "failed",
+                "created_at": "2026-08-05T10:11:12Z",
+                "updated_at": "2026-08-05T10:11:12Z",
+                "failure_kind": "capability_unsupported"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationResponse>(serde_json::to_value(&classified)?)?,
+            classified
+        );
+
+        // An ordinary failure carries no classification: the field is null,
+        // and a reader from before the field existed (older wire without the
+        // key) reads back as `None` — the projection is additive.
+        let ordinary = OperationResponse::new(
+            operation_id,
+            OperationSourceResponse::Standalone,
+            Vec::new(),
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            OperationStateResponse::Failed,
+            observed_at,
+            observed_at,
+            None,
+        );
+        assert_eq!(ordinary.failure_kind(), None);
+        assert_eq!(
+            serde_json::to_value(&ordinary)?["failure_kind"],
+            json!(null)
+        );
+        let legacy = serde_json::from_value::<OperationResponse>(json!({
+            "operation_id": operation_id,
+            "source": "standalone",
+            "targets": [],
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": "failed",
+            "created_at": "2026-08-05T10:11:12Z",
+            "updated_at": "2026-08-05T10:11:12Z"
+        }))?;
+        assert_eq!(legacy.failure_kind(), None);
+
+        // An unknown classification code is refused, exactly like every other
+        // wire vocabulary.
+        assert!(
+            serde_json::from_value::<OperationResponse>(json!({
+                "operation_id": operation_id,
+                "source": "standalone",
+                "targets": [],
+                "command": { "System": { "Reset": "PowerCycle" } },
+                "state": "failed",
+                "created_at": "2026-08-05T10:11:12Z",
+                "updated_at": "2026-08-05T10:11:12Z",
+                "failure_kind": "capability-missing"
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn create_operation_contract_round_trips_the_typed_command() -> Result<(), Box<dyn Error>> {
         let endpoint_id = uuid!("01989abc-def0-7abc-8def-0123456789ab");
         let request = CreateOperationRequest::new(
@@ -10723,6 +10865,7 @@ mod tests {
             OperationStateResponse::WaitingRemote,
             observed_at,
             observed_at,
+            None,
         );
 
         assert_eq!(response.operation_id(), operation_id);
@@ -10738,6 +10881,7 @@ mod tests {
         assert_eq!(response.state(), OperationStateResponse::WaitingRemote);
         assert_eq!(response.created_at(), observed_at);
         assert_eq!(response.updated_at(), observed_at);
+        assert_eq!(response.failure_kind(), None);
         assert_eq!(
             serde_json::to_value(&response)?,
             json!({
@@ -10749,7 +10893,8 @@ mod tests {
                 "command": { "System": { "Reset": "PowerCycle" } },
                 "state": "waiting_remote",
                 "created_at": "2026-08-05T10:11:12Z",
-                "updated_at": "2026-08-05T10:11:12Z"
+                "updated_at": "2026-08-05T10:11:12Z",
+                "failure_kind": null
             })
         );
         assert_eq!(
@@ -10783,6 +10928,7 @@ mod tests {
             OperationStateResponse::Succeeded,
             observed_at,
             observed_at,
+            None,
         );
         let list = OperationListResponse::new(vec![operation]);
         let encoded = serde_json::to_value(&list)?;
@@ -10863,6 +11009,7 @@ mod tests {
             OperationStateResponse::Queued,
             observed_at,
             observed_at,
+            None,
         );
         let batch = BatchOperationResponse::new(
             uuid!("01989abc-def0-7abc-8def-0123456789f2"),
@@ -11156,6 +11303,7 @@ mod tests {
                     OperationStateResponse::Succeeded,
                     observed_at,
                     observed_at,
+                    None,
                 ),
                 OperationResponse::new(
                     uuid!("01989abc-def0-7abc-8def-0123456789e9"),
@@ -11168,6 +11316,7 @@ mod tests {
                     OperationStateResponse::Queued,
                     observed_at,
                     observed_at,
+                    None,
                 ),
             ],
         );

@@ -1,11 +1,10 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use csv::{ReaderBuilder, StringRecord, Trim};
 use rutilus_domain::{
     CertificateFingerprintParseError, CredentialId, EndpointAddress, EndpointAddressError,
     EndpointDisplayName, EndpointDisplayNameError,
 };
-use thiserror::Error;
 
 use crate::endpoint_trust::EndpointTrustExpectation;
 
@@ -129,7 +128,7 @@ pub fn parse_endpoint_csv(input: &[u8]) -> Result<EndpointCsvImport, EndpointCsv
         .from_reader(input);
     let headers = reader
         .headers()
-        .map_err(|_| EndpointCsvImportError::MalformedHeader)?;
+        .map_err(|source| EndpointCsvImportError::MalformedHeader { source })?;
     if !has_expected_headers(headers) {
         return Err(EndpointCsvImportError::UnexpectedHeaders);
     }
@@ -143,8 +142,9 @@ pub fn parse_endpoint_csv(input: &[u8]) -> Result<EndpointCsvImport, EndpointCsv
                 maximum: ENDPOINT_CSV_MAX_ROWS,
             });
         }
-        let record = result.map_err(|_| EndpointCsvImportError::MalformedRecord {
+        let record = result.map_err(|source| EndpointCsvImportError::MalformedRecord {
             record: record_number,
+            source: Some(source),
         })?;
         let row = parse_record(&record, record_number)?;
         if !addresses.insert(row.address.clone()) {
@@ -201,13 +201,15 @@ fn parse_record(
         EndpointCsvRequiredField::CredentialId,
     )?
     .parse()
-    .map_err(|_| EndpointCsvImportError::InvalidCredentialId {
+    .map_err(|source| EndpointCsvImportError::InvalidCredentialId {
         record: record_number,
+        source: Box::new(source),
     })?;
     let fingerprint = record
         .get(3)
         .ok_or(EndpointCsvImportError::MalformedRecord {
             record: record_number,
+            source: None,
         })?;
     let trust = if fingerprint.is_empty() {
         EndpointImportTrust::SystemCaOnly
@@ -243,49 +245,168 @@ fn required_field(
         }),
         None => Err(EndpointCsvImportError::MalformedRecord {
             record: record_number,
+            source: None,
         }),
     }
 }
 
 /// A controlled, secret-safe endpoint import failure.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+///
+/// The malformed-CSV variants and the invalid-`credential_id` variant carry
+/// the underlying parser error as a diagnostic source: the user-facing
+/// classification stays exactly what it was (a header problem, a record
+/// problem, an invalid credential id), while the source preserves the
+/// parser's own reason — the byte position and the exact malformation — for
+/// the operator. The type deliberately does not derive `Clone`/`PartialEq`:
+/// `csv::Error` offers neither, and the error's equality is its
+/// classification, which the tests assert through `matches!` and `Display`.
+#[derive(Debug)]
 pub enum EndpointCsvImportError {
-    #[error("endpoint CSV has {actual} bytes; maximum is {maximum}")]
+    /// The document exceeds the defensive byte bound.
     InputTooLarge { actual: usize, maximum: usize },
-    #[error("endpoint CSV header is malformed UTF-8 or CSV")]
-    MalformedHeader,
-    #[error("endpoint CSV must contain exactly: display_name,address,credential_id,tls_sha256")]
+    /// The header row is malformed UTF-8 or CSV; the source is the parser's
+    /// own error with the byte position of the malformation.
+    MalformedHeader { source: csv::Error },
+    /// The columns differ from the strict interchange schema.
     UnexpectedHeaders,
-    #[error("endpoint CSV record {record} is malformed")]
-    MalformedRecord { record: usize },
-    #[error("endpoint CSV record {record} is missing required field {field}")]
+    /// A record is malformed — an unequal field count, invalid UTF-8, or
+    /// (defensively, against the `flexible(false)` contract) a row shorter
+    /// than the schema. The source is the parser's own error when the reader
+    /// produced one; the defensive short-row paths carry `None`.
+    MalformedRecord {
+        record: usize,
+
+        source: Option<csv::Error>,
+    },
+    /// A required column is empty on one record.
     MissingRequiredField {
         record: usize,
         field: EndpointCsvRequiredField,
     },
-    #[error("endpoint CSV record {record} has an invalid display_name: {source}")]
+    /// The `display_name` value fails the domain validation; the source is
+    /// the domain's reason.
     InvalidDisplayName {
         record: usize,
+
         source: EndpointDisplayNameError,
     },
-    #[error("endpoint CSV record {record} has an invalid address: {source}")]
+    /// The `address` value fails the domain validation; the source is the
+    /// domain's reason.
     InvalidAddress {
         record: usize,
+
         source: EndpointAddressError,
     },
-    #[error("endpoint CSV record {record} has an invalid credential_id")]
-    InvalidCredentialId { record: usize },
-    #[error("endpoint CSV record {record} has an invalid tls_sha256: {source}")]
+    /// The `credential_id` value is not a valid identifier; the source is
+    /// the domain's parse error (the `uuid` error of the
+    /// `CredentialId::from_str` contract, boxed because the application
+    /// crate cannot name the `uuid` error type directly).
+    InvalidCredentialId {
+        record: usize,
+
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The `tls_sha256` value fails the fingerprint validation; the source
+    /// is the domain's reason.
     InvalidCertificateFingerprint {
         record: usize,
+
         source: CertificateFingerprintParseError,
     },
-    #[error("endpoint CSV record {record} repeats an earlier endpoint address")]
+    /// The record's normalized address repeats an earlier record's.
     DuplicateAddress { record: usize },
-    #[error("endpoint CSV contains no endpoint records")]
+    /// The document carries no endpoint records after the header.
     NoDataRows,
-    #[error("endpoint CSV contains more than {maximum} endpoint records")]
+    /// The document exceeds the defensive record bound.
     TooManyRows { maximum: usize },
+}
+
+impl fmt::Display for EndpointCsvImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InputTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "endpoint CSV has {actual} bytes; maximum is {maximum}"
+                )
+            }
+            Self::MalformedHeader { source } => write!(
+                formatter,
+                "endpoint CSV header is malformed UTF-8 or CSV: {source}"
+            ),
+            Self::UnexpectedHeaders => formatter.write_str(
+                "endpoint CSV must contain exactly: display_name,address,credential_id,tls_sha256",
+            ),
+            Self::MalformedRecord { record, source } => {
+                // The defensive short-row paths have no parser error behind
+                // them, so the message keeps the original "is malformed"
+                // wording and the parser's reason is appended only when the
+                // reader actually produced one.
+                write!(formatter, "endpoint CSV record {record} is malformed")?;
+                if let Some(source) = source {
+                    write!(formatter, ": {source}")?;
+                }
+                Ok(())
+            }
+            Self::MissingRequiredField { record, field } => {
+                write!(
+                    formatter,
+                    "endpoint CSV record {record} is missing required field {field}"
+                )
+            }
+            Self::InvalidDisplayName { record, source } => write!(
+                formatter,
+                "endpoint CSV record {record} has an invalid display_name: {source}"
+            ),
+            Self::InvalidAddress { record, source } => {
+                write!(
+                    formatter,
+                    "endpoint CSV record {record} has an invalid address: {source}"
+                )
+            }
+            Self::InvalidCredentialId { record, source } => write!(
+                formatter,
+                "endpoint CSV record {record} has an invalid credential_id: {source}"
+            ),
+            Self::InvalidCertificateFingerprint { record, source } => write!(
+                formatter,
+                "endpoint CSV record {record} has an invalid tls_sha256: {source}"
+            ),
+            Self::DuplicateAddress { record } => {
+                write!(
+                    formatter,
+                    "endpoint CSV record {record} repeats an earlier endpoint address"
+                )
+            }
+            Self::NoDataRows => formatter.write_str("endpoint CSV contains no endpoint records"),
+            Self::TooManyRows { maximum } => {
+                write!(
+                    formatter,
+                    "endpoint CSV contains more than {maximum} endpoint records"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EndpointCsvImportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MalformedHeader { source }
+            | Self::MalformedRecord {
+                source: Some(source),
+                ..
+            } => Some(source),
+            Self::InvalidDisplayName { source, .. } => Some(source),
+            Self::InvalidAddress { source, .. } => Some(source),
+            // The boxed parse error derefs to the trait object; the
+            // auto-trait-dropping coercion from `&(dyn Error + Send + Sync)`
+            // to `&dyn Error` needs an explicit `as_ref` step.
+            Self::InvalidCredentialId { source, .. } => Some(source.as_ref()),
+            Self::InvalidCertificateFingerprint { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,67 +451,145 @@ mod tests {
     }
 
     #[test]
-    fn requires_the_exact_secret_free_schema_and_at_least_one_record() {
-        assert_eq!(
+    fn requires_the_exact_secret_free_schema_and_at_least_one_record() -> Result<(), Box<dyn Error>>
+    {
+        assert!(matches!(
             parse_endpoint_csv(b"address,display_name,credential_id,tls_sha256\n"),
             Err(EndpointCsvImportError::UnexpectedHeaders)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             parse_endpoint_csv(b"display_name,address,credential_id,password\n"),
             Err(EndpointCsvImportError::UnexpectedHeaders)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             parse_endpoint_csv(b"display_name,address,credential_id,tls_sha256\n"),
             Err(EndpointCsvImportError::NoDataRows)
-        );
+        ));
         let missing_address =
             format!("display_name,address,credential_id,tls_sha256\nRack A,,{CREDENTIAL_ID},\n");
-        assert_eq!(
-            parse_endpoint_csv(missing_address.as_bytes()),
+        let error = parse_endpoint_csv(missing_address.as_bytes());
+        assert!(matches!(
+            error,
             Err(EndpointCsvImportError::MissingRequiredField {
                 record: 2,
                 field: EndpointCsvRequiredField::Address,
             })
+        ));
+        // The Display keeps the exact column name of the missing field, so
+        // an operator can fix the precise cell.
+        let Err(EndpointCsvImportError::MissingRequiredField { record, field }) = error else {
+            return Err(std::io::Error::other("expected a missing-field error").into());
+        };
+        assert_eq!(record, 2);
+        assert_eq!(field, EndpointCsvRequiredField::Address);
+        assert_eq!(
+            EndpointCsvImportError::MissingRequiredField { record, field }.to_string(),
+            "endpoint CSV record 2 is missing required field address"
         );
+        Ok(())
     }
 
     #[test]
-    fn reports_structural_failures_without_retaining_input() {
+    fn reports_structural_failures_without_retaining_input() -> Result<(), Box<dyn Error>> {
         let unequal = format!(
             "display_name,address,credential_id,tls_sha256\nRack A,https://secret-host,{CREDENTIAL_ID}\n"
         );
         let error = parse_endpoint_csv(unequal.as_bytes());
-        assert_eq!(
-            error,
-            Err(EndpointCsvImportError::MalformedRecord { record: 2 })
+        let debug = format!("{error:?}");
+        let Err(
+            ref error @ EndpointCsvImportError::MalformedRecord {
+                record: 2,
+                ref source,
+            },
+        ) = error
+        else {
+            return Err(std::io::Error::other("expected a malformed-record error").into());
+        };
+        let display = error.to_string();
+        // The parser's own error rides along as the diagnostic source — the
+        // unequal-field-count reason with its byte position — so the Display
+        // keeps the logical row number *and* the underlying cause, while
+        // the Debug output still retains no record content.
+        assert!(
+            source.is_some(),
+            "the reader produced the malformation, so its error must be carried"
         );
-        assert!(!format!("{error:?}").contains("secret-host"));
+        assert!(
+            display.starts_with("endpoint CSV record 2 is malformed: "),
+            "the Display must expose the underlying reason: {display}"
+        );
+        assert!(
+            display.contains("found record with 3 fields, but the previous record has 4 fields"),
+            "the unequal-field-count reason must surface: {display}"
+        );
+        assert!(!debug.contains("secret-host"));
 
         let mut invalid_utf8 = format!(
             "display_name,address,credential_id,tls_sha256\nRack A,https://bmc,{CREDENTIAL_ID},"
         )
         .into_bytes();
         invalid_utf8.push(0xff);
-        assert_eq!(
-            parse_endpoint_csv(&invalid_utf8),
-            Err(EndpointCsvImportError::MalformedRecord { record: 2 })
+        let error = parse_endpoint_csv(&invalid_utf8);
+        let Err(
+            ref error @ EndpointCsvImportError::MalformedRecord {
+                record: 2,
+                ref source,
+            },
+        ) = error
+        else {
+            return Err(std::io::Error::other("expected a malformed-record error").into());
+        };
+        let display = error.to_string();
+        assert!(source.is_some());
+        assert!(
+            display.contains("invalid utf-8"),
+            "the underlying UTF-8 reason must surface: {display}"
         );
+        Ok(())
     }
 
     #[test]
-    fn applies_domain_validation_without_echoing_rejected_values() {
+    fn malformed_headers_carry_the_parser_error_and_its_byte_position() -> Result<(), Box<dyn Error>>
+    {
+        // Invalid UTF-8 in the header row: the parser rejects the document
+        // at the header, and the error's source preserves the parser's own
+        // reason — the record, line, and byte position — for the operator.
+        let mut invalid_header = b"display_name,address,credential_id,tls_sha256\n".to_vec();
+        invalid_header[0] = 0xff;
+        let error = parse_endpoint_csv(&invalid_header);
+        let Err(ref error @ EndpointCsvImportError::MalformedHeader { ref source }) = error else {
+            return Err(std::io::Error::other("expected a malformed-header error").into());
+        };
+        let display = error.to_string();
+        assert!(
+            display.starts_with("endpoint CSV header is malformed UTF-8 or CSV: "),
+            "the Display must expose the underlying reason: {display}"
+        );
+        assert!(
+            source.to_string().contains("CSV parse error"),
+            "the parser's own error must be carried: {source}"
+        );
+        assert!(
+            source.to_string().contains("invalid utf-8"),
+            "the header's UTF-8 reason must surface: {source}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applies_domain_validation_without_echoing_rejected_values() -> Result<(), Box<dyn Error>> {
         let credential_url = format!(
             "display_name,address,credential_id,tls_sha256\nRack A,https://admin:password@bmc.example.test,{CREDENTIAL_ID},\n"
         );
         let error = parse_endpoint_csv(credential_url.as_bytes());
-        assert_eq!(
+        let rendered = format!("{error:?}");
+        assert!(matches!(
             error,
             Err(EndpointCsvImportError::InvalidAddress {
                 record: 2,
                 source: EndpointAddressError::EmbeddedCredentials,
             })
-        );
-        let rendered = format!("{error:?}");
+        ));
         assert!(!rendered.contains("admin"));
         assert!(!rendered.contains("password"));
 
@@ -402,10 +601,31 @@ mod tests {
             Err(EndpointCsvImportError::InvalidDisplayName { record: 2, .. })
         ));
         let invalid_id = b"display_name,address,credential_id,tls_sha256\nRack A,https://bmc.example.test,not-a-uuid,\n";
-        assert_eq!(
-            parse_endpoint_csv(invalid_id),
-            Err(EndpointCsvImportError::InvalidCredentialId { record: 2 })
+        let error = parse_endpoint_csv(invalid_id);
+        let debug = format!("{error:?}");
+        let Err(
+            ref error @ EndpointCsvImportError::InvalidCredentialId {
+                record: 2,
+                ref source,
+            },
+        ) = error
+        else {
+            return Err(std::io::Error::other("expected an invalid credential id").into());
+        };
+        let display = error.to_string();
+        // The domain's parse reason rides along as the diagnostic source —
+        // the rejected character and its position — while neither Display
+        // nor Debug echoes the rejected value itself.
+        assert!(
+            display.starts_with("endpoint CSV record 2 has an invalid credential_id: "),
+            "the Display must expose the underlying reason: {display}"
         );
+        assert!(
+            source.to_string().contains("invalid character"),
+            "the uuid parse reason must be carried: {source}"
+        );
+        assert!(!debug.contains("not-a-uuid"));
+
         let invalid_pin = format!(
             "display_name,address,credential_id,tls_sha256\nRack A,https://bmc.example.test,{CREDENTIAL_ID},AA:BB\n"
         );
@@ -413,6 +633,7 @@ mod tests {
             parse_endpoint_csv(invalid_pin.as_bytes()),
             Err(EndpointCsvImportError::InvalidCertificateFingerprint { record: 2, .. })
         ));
+        Ok(())
     }
 
     #[test]
@@ -423,22 +644,31 @@ mod tests {
              Rack B,https://bmc.example.test/,{CREDENTIAL_ID},\n"
         );
 
-        assert_eq!(
+        assert!(matches!(
             parse_endpoint_csv(input.as_bytes()),
             Err(EndpointCsvImportError::DuplicateAddress { record: 3 })
-        );
+        ));
     }
 
     #[test]
     fn bounds_document_bytes_and_record_count() -> Result<(), Box<dyn Error>> {
         let oversized = vec![b'a'; ENDPOINT_CSV_MAX_BYTES + 1];
+        let Err(error) = parse_endpoint_csv(&oversized) else {
+            return Err(std::io::Error::other("the oversized document must be rejected").into());
+        };
         assert_eq!(
-            parse_endpoint_csv(&oversized),
-            Err(EndpointCsvImportError::InputTooLarge {
-                actual: ENDPOINT_CSV_MAX_BYTES + 1,
-                maximum: ENDPOINT_CSV_MAX_BYTES,
-            })
+            error.to_string(),
+            format!(
+                "endpoint CSV has {} bytes; maximum is {}",
+                ENDPOINT_CSV_MAX_BYTES + 1,
+                ENDPOINT_CSV_MAX_BYTES
+            )
         );
+        let EndpointCsvImportError::InputTooLarge { actual, maximum } = error else {
+            return Err(std::io::Error::other("expected an input-too-large error").into());
+        };
+        assert_eq!(actual, ENDPOINT_CSV_MAX_BYTES + 1);
+        assert_eq!(maximum, ENDPOINT_CSV_MAX_BYTES);
 
         let mut too_many = String::from("display_name,address,credential_id,tls_sha256\n");
         for index in 0..=ENDPOINT_CSV_MAX_ROWS {
@@ -447,12 +677,17 @@ mod tests {
                 "Rack {index},https://bmc-{index},{CREDENTIAL_ID},"
             )?;
         }
+        let Err(error) = parse_endpoint_csv(too_many.as_bytes()) else {
+            return Err(std::io::Error::other("the record bound must be rejected").into());
+        };
         assert_eq!(
-            parse_endpoint_csv(too_many.as_bytes()),
-            Err(EndpointCsvImportError::TooManyRows {
-                maximum: ENDPOINT_CSV_MAX_ROWS,
-            })
+            error.to_string(),
+            format!("endpoint CSV contains more than {ENDPOINT_CSV_MAX_ROWS} endpoint records")
         );
+        let EndpointCsvImportError::TooManyRows { maximum } = error else {
+            return Err(std::io::Error::other("expected a too-many-rows error").into());
+        };
+        assert_eq!(maximum, ENDPOINT_CSV_MAX_ROWS);
         Ok(())
     }
 }

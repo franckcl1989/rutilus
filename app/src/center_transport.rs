@@ -27,6 +27,13 @@ impl CenterTransport for CenterClientConfig {
         // transient.
         matches!(error, CenterClientError::NotBound)
     }
+
+    fn is_identity_mismatch(&self, error: &Self::Error) -> bool {
+        // The client classifies the `identity-mismatch` admission refusal
+        // at negotiation time (audit follow-up E3-2); every other failure
+        // stays transient.
+        matches!(error, CenterClientError::IdentityMismatch)
+    }
 }
 
 /// One established site-to-center connection presented as the application's

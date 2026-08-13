@@ -26,7 +26,9 @@ use std::{
 };
 
 use rutilus_center_protocol::{Ack, Envelope, EnvelopeMessage};
-use rutilus_domain::{CenterBindingId, CertificateFingerprint, InstanceId, OutboxEntryId};
+use rutilus_domain::{
+    CenterBindingId, CertificateFingerprint, InstanceId, OutboxEntry, OutboxEntryId,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -101,6 +103,39 @@ pub enum AdmissionRejection {
     },
 }
 
+/// The longest wire-declared identity the logs carry: a `Hello`'s declared
+/// instance id is attacker-controlled wire text, so it is bounded and
+/// control characters are escaped before it reaches the logs (E3-7).
+const DECLARED_IDENTITY_LOG_LIMIT: usize = 64;
+
+/// Sanitizes one wire-declared identity for the logs: the C0 controls,
+/// DEL, and the C1 controls (U+0080–U+009F) are escaped (`\n` becomes
+/// `\x0a`, the CSI `\x9b` becomes `\x9b`) and the escaped value is
+/// truncated to [`DECLARED_IDENTITY_LOG_LIMIT`] characters with an
+/// ellipsis, so an arbitrarily hostile declaration never carries raw
+/// control sequences into the log stream — a raw C1 CSI would otherwise
+/// smuggle a terminal escape command past the C0 escape. The honest bound
+/// identity — read from the binding record, never from the wire — stays
+/// beside the sanitized declaration, so the both-identities diagnostic
+/// value survives.
+fn sanitize_declared_identity(declared: &str) -> String {
+    let mut sanitized = String::with_capacity(declared.len().min(DECLARED_IDENTITY_LOG_LIMIT));
+    for ch in declared.chars() {
+        if sanitized.chars().count() >= DECLARED_IDENTITY_LOG_LIMIT {
+            sanitized.push('…');
+            break;
+        }
+        let escaped = match ch {
+            '\u{0}'..='\u{1f}' | '\u{7f}' | '\u{80}'..='\u{9f}' => {
+                format!("\\x{:02x}", ch as u32)
+            }
+            _ => ch.to_string(),
+        };
+        sanitized.push_str(&escaped);
+    }
+    sanitized
+}
+
 impl std::fmt::Display for AdmissionRejection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -108,7 +143,8 @@ impl std::fmt::Display for AdmissionRejection {
             Self::Identity(reason) => reason.fmt(formatter),
             Self::HelloIdentityMismatch { declared, bound } => write!(
                 formatter,
-                "the Hello declares instance {declared} but the certificate is bound to instance {bound}"
+                "the Hello declares instance {} but the certificate is bound to instance {bound}",
+                sanitize_declared_identity(declared)
             ),
         }
     }
@@ -558,6 +594,14 @@ pub struct CenterInboundEngine<Session, Outbox, Consumer, Registry, Time> {
     clock: Time,
     site: ResolvedSite,
     options: CenterInboundOptions,
+    /// The outbox entries whose undeliverable-state report already fired
+    /// on this connection (E3-8): a corrupt row stays pending forever —
+    /// nothing can acknowledge it — so every flush would otherwise
+    /// re-report the same fact at `error`; the first report of one
+    /// connection is an `error` and every repeat a `warn` naming the
+    /// earlier report. A `Vec` (not a set) keeps the constructor `const`:
+    /// the distinct undeliverable rows of one connection are few.
+    reported_undeliverable: Vec<OutboxEntryId>,
 }
 
 impl<Session, Outbox, Consumer, Registry, Time>
@@ -588,6 +632,7 @@ where
             clock,
             site,
             options,
+            reported_undeliverable: Vec::new(),
         }
     }
 
@@ -733,40 +778,36 @@ where
                     // never sends on top of a tampered queue (fail closed,
                     // deliberate). The per-row skip here survives only for
                     // legacy plaintext rows whose JSON no longer parses:
-                    // log it, skip it, and deliver the rest of the queue.
-                    tracing::error!(
-                        "site {}: skipping outbox entry {} with a corrupt payload: {source}",
-                        self.site.instance_id(),
-                        entry.id()
-                    );
+                    // report it, skip it, and deliver the rest of the
+                    // queue.
+                    self.report_undeliverable(&entry, format!("corrupt payload: {source}"));
                     continue;
                 }
             };
             let Ok(wire_sequence) = u64::try_from(entry.sequence()) else {
-                tracing::error!(
-                    "site {}: skipping outbox entry {} with an unwireable sequence {}",
-                    self.site.instance_id(),
-                    entry.id(),
-                    entry.sequence()
+                self.report_undeliverable(
+                    &entry,
+                    format!("unwireable sequence {}", entry.sequence()),
                 );
                 continue;
             };
             let Some(message) = envelope.message else {
                 // An outbox row without a message cannot be delivered; like
-                // a malformed legacy plaintext payload, it is logged and
+                // a malformed legacy plaintext payload, it is reported and
                 // skipped so one row never wedges the whole flush.
-                tracing::error!(
-                    "site {}: skipping outbox entry {} with an empty envelope",
-                    self.site.instance_id(),
-                    entry.id()
-                );
+                self.report_undeliverable(&entry, "empty envelope");
                 continue;
             };
             // The §15.6 offer TTL: an offer past its expiry can no longer
             // be accepted by the site, so the flush retires the row instead
             // of re-sending it forever — a site that was offline past the
             // TTL would only refuse it. The domain outbox has no expired
-            // state, so the retirement is the queue-level termination.
+            // state, so the retirement is the queue-level termination. The
+            // retired rows stay in the acknowledged state (the queue never
+            // cleans them) and are the §15.4 delivered history the
+            // dispatch retry's fall-through read consults: a retry of a
+            // retired operation is re-delivered under the same id, never
+            // re-minted (F1).
             if let Some(expires_at) = offer_expiry(&message)
                 && now > expires_at
             {
@@ -791,6 +832,25 @@ where
             sent.push_back((entry.id(), entry.sequence()));
         }
         Ok(())
+    }
+
+    /// Logs one undeliverable outbox row (E3-8): `error` on the first
+    /// report of this connection, `warn` on every repeat, so one corrupt
+    /// row cannot flood the logs with the same fact on every flush. The
+    /// row itself stays pending — nothing can acknowledge it — and is
+    /// skipped for delivery; the message names the row in both cases.
+    fn report_undeliverable(&mut self, entry: &OutboxEntry, detail: impl std::fmt::Display) {
+        let site = self.site.instance_id();
+        let entry_id = entry.id();
+        if self.reported_undeliverable.contains(&entry_id) {
+            tracing::warn!(
+                "site {site}: skipping outbox entry {entry_id} again (already reported on this \
+                 connection): {detail}"
+            );
+        } else {
+            self.reported_undeliverable.push(entry_id);
+            tracing::error!("site {site}: skipping outbox entry {entry_id}: {detail}");
+        }
     }
 
     /// Retires every outbox entry whose sequence is at most the
@@ -1026,6 +1086,61 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_identity_mismatch_display_sanitizes_the_declared_identity() {
+        // E3-7: the declared instance id is attacker-controlled wire text;
+        // the display form escapes control characters — the C0 controls,
+        // DEL, and the C1 controls including the CSI sequence — and bounds
+        // the length, while the bound identity stays intact for the
+        // diagnosis.
+        let site = InstanceId::generate();
+        // The control characters sit before the truncation boundary, so
+        // the assertion proves the escaping and not merely the cut.
+        let declared = format!(
+            "host{}\n\u{1b}[2K\u{9b}tail{}",
+            "x".repeat(10),
+            "y".repeat(200)
+        );
+        let reason = AdmissionRejection::HelloIdentityMismatch {
+            declared,
+            bound: site,
+        };
+        let rendered = reason.to_string();
+        assert!(
+            rendered.contains(site.to_string().as_str()),
+            "the bound identity stays intact for the diagnosis"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "the declared newline must never reach the log raw"
+        );
+        assert!(
+            rendered.contains("\\x0a") && rendered.contains("\\x1b"),
+            "the declared C0 control characters are escaped"
+        );
+        assert!(
+            rendered.contains("\\x9b") && !rendered.contains('\u{9b}'),
+            "the declared C1 CSI control character is escaped, never raw"
+        );
+        assert!(
+            rendered.contains('…'),
+            "an over-long declaration is truncated"
+        );
+        assert!(
+            rendered.len() < 450,
+            "the rendered form is bounded by the truncation"
+        );
+        // A well-formed declaration passes through untouched: no escape,
+        // no truncation.
+        let honest = AdmissionRejection::HelloIdentityMismatch {
+            declared: site.to_string(),
+            bound: site,
+        };
+        let rendered = honest.to_string();
+        assert!(rendered.contains(site.to_string().as_str()));
+        assert!(!rendered.contains('\\') && !rendered.contains('…'));
+    }
+
+    #[test]
     fn the_registry_tracks_online_sites_with_one_connection_per_site() -> Result<(), Box<dyn Error>>
     {
         let registry = CenterSessionRegistry::new();
@@ -1206,6 +1321,31 @@ mod tests {
                 now,
             );
             self.entries.lock().map(|mut rows| rows.push(entry)).ok();
+        }
+
+        /// Seeds one pending entry carrying the given raw payload — a
+        /// legacy plaintext row whose payload is not valid envelope JSON,
+        /// the undeliverable-row shape of the flush tests. Returns the
+        /// seeded entry so the test can name it in assertions.
+        fn seed_raw(
+            &self,
+            sequence: u64,
+            site: InstanceId,
+            now: OffsetDateTime,
+            payload_json: String,
+        ) -> rutilus_domain::OutboxEntry {
+            let entry = rutilus_domain::OutboxEntry::new(
+                rutilus_domain::OutboxEntryId::generate(),
+                site,
+                i64::try_from(sequence).unwrap_or(i64::MAX),
+                payload_json,
+                now,
+            );
+            self.entries
+                .lock()
+                .map(|mut rows| rows.push(entry.clone()))
+                .ok();
+            entry
         }
 
         /// The pending entry sequences of one site, in sequence order — the
@@ -1600,6 +1740,172 @@ mod tests {
         ));
         assert!(outbox.pending_sequences(site.instance_id()).is_empty());
         task.abort();
+        Ok(())
+    }
+
+    /// A test subscriber that records every event's level and formatted
+    /// message. The application crate has no tracing-subscriber, so the
+    /// capture is a hand-rolled `Subscriber` over the `tracing` re-exports
+    /// — the same shape the app crate's runtime tests use.
+    #[derive(Clone)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl CaptureSubscriber {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured(&self) -> Vec<(tracing::Level, String)> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    struct CaptureVisitor(Option<String>);
+
+    impl tracing::field::Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CaptureVisitor(None);
+            event.record(&mut visitor);
+            let message = visitor.0.unwrap_or_default();
+            self.events
+                .lock()
+                .map(|mut events| events.push((*event.metadata().level(), message)))
+                .ok();
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_outbox_row_is_reported_once_then_repeated_as_a_warn()
+    -> Result<(), Box<dyn Error>> {
+        // E3-8: an undeliverable row stays pending forever, so the flush
+        // would re-report the same fact on every flush; the first report
+        // of one connection is an error and every repeat a warn naming the
+        // earlier report, while the rest of the queue still delivers.
+        let subscriber = CaptureSubscriber::new();
+        let captured = subscriber.clone();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let site = resolved_site();
+        let (session, mut outbound_rx, inbound_tx) = ChannelInboundSession::channel();
+        let outbox = MockOutbox::new();
+        let base = base_time();
+        let corrupt = outbox.seed_raw(
+            1,
+            site.instance_id(),
+            base,
+            String::from("{not an envelope"),
+        );
+        outbox.seed_offer(
+            2,
+            site.instance_id(),
+            base,
+            (base + Duration::minutes(15)).unix_timestamp(),
+        );
+        let consumer = RecorderConsumer::new();
+        let registry = Arc::new(CenterSessionRegistry::new());
+        registry.mark_connected(site.clone(), base)?;
+        let engine = CenterInboundEngine::new(
+            session,
+            outbox.clone(),
+            consumer.clone(),
+            Arc::clone(&registry),
+            FixedClock(base + Duration::SECOND),
+            site.clone(),
+            CenterInboundOptions::default(),
+        );
+        let task = tokio::spawn(engine.run(std::future::pending::<()>()));
+
+        // The first flush skips the corrupt row and delivers the live
+        // offer.
+        let first = outbound_rx.recv().await.ok_or("no offer frame")?;
+        assert_eq!(first.sequence, 2);
+        assert!(matches!(
+            first.message,
+            Some(EnvelopeMessage::OperationOffer(_))
+        ));
+
+        // A received frame triggers the second flush: the corrupt row is
+        // still pending, so it is skipped again — as a warn now, not a
+        // second error — and the live offer is not re-sent on this
+        // connection.
+        inbound_tx.send(Envelope {
+            sequence: 5,
+            acked_sequence: 0,
+            message: Some(EnvelopeMessage::EventBatch(
+                rutilus_center_protocol::EventBatch { events: Vec::new() },
+            )),
+        })?;
+        let ack = outbound_rx.recv().await.ok_or("no ack frame")?;
+        assert!(matches!(
+            ack.message,
+            Some(EnvelopeMessage::Ack(rutilus_center_protocol::Ack {
+                sequence: 5
+            }))
+        ));
+        task.abort();
+
+        let events = captured.captured();
+        let errors = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::ERROR)
+            .collect::<Vec<_>>();
+        let warns = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .collect::<Vec<_>>();
+        let corrupt_id = corrupt.id().to_string();
+        assert_eq!(
+            errors.len(),
+            1,
+            "the corrupt row is reported exactly once at error per connection"
+        );
+        assert!(
+            errors[0].1.contains(corrupt_id.as_str()),
+            "the error names the corrupt row: {}",
+            errors[0].1
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|(_, message)| message.contains(corrupt_id.as_str())),
+            "the repeated skip is reported at warn, not error"
+        );
         Ok(())
     }
 }

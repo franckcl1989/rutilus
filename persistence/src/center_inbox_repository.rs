@@ -320,7 +320,9 @@ fn map_stored_inbox_entry(
 /// The outcome of an idempotent inbox insertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreateInboxOutcome {
-    /// The envelope was stored as a new `received` entry.
+    /// The envelope was stored as a new entry, carrying the phase of the
+    /// inserted row: `Received` for a fresh offer, or the reply's phase
+    /// when a receipt insert is born at the phase the reply dictates.
     Created,
     /// A stored entry with the same operation id is still being processed.
     DuplicateInProgress,

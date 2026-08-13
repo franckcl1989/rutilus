@@ -1,11 +1,13 @@
+use std::collections::{BTreeMap, HashMap};
+
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, CenterBindingRepository, CenterProjectionRepository,
-    CenterRoleRepository, CredentialInventoryRepository, DiscoveredEndpointRepository,
-    EndpointInventoryItem, EndpointInventoryItemError, EndpointInventoryRepository,
-    EndpointProjectionWrite, EndpointRefreshRepository, InboxInsertOutcome, InstanceRepository,
-    ProjectionWriteOutcome, ResourceDecodeFailure, ResourceObservation, ResourceProjectionWrite,
-    StoredCapability,
+    CapabilitySnapshotRepository, CenterBindingRepository, CenterEndpointProjection,
+    CenterProjectionRepository, CenterRoleRepository, CredentialInventoryRepository,
+    DiscoveredEndpointRepository, EndpointInventoryItem, EndpointInventoryItemError,
+    EndpointInventoryRepository, EndpointProjectionWrite, EndpointRefreshRepository,
+    InboxInsertOutcome, InstanceRepository, ProjectionWriteOutcome, ResourceDecodeFailure,
+    ResourceObservation, ResourceProjectionWrite, StoredCapability,
 };
 use rutilus_center_protocol::EnvelopeMessage;
 use rutilus_domain::{
@@ -35,6 +37,11 @@ use crate::{
 /// Defensive upper bound for one credential inventory projection.
 const CREDENTIAL_INVENTORY_LIMIT: u64 = 1000;
 
+/// One batched capability-read result, mirroring the application boundary's
+/// `CapabilityObservationsByEndpoint` (the alias cannot be re-exported from
+/// the application crate, so the adapter keeps its own).
+type CapabilityObservationsByEndpoint = BTreeMap<EndpointId, Vec<StoredCapability>>;
+
 impl AuditEventWriter for SqliteStore {
     type Error = AuditRepositoryError;
 
@@ -63,6 +70,35 @@ impl CapabilityQueryRepository for SqliteStore {
                     })
                     .collect()
             }))
+        })
+    }
+
+    /// Forwards the batched read unchanged: the store resolves the whole
+    /// fleet with one `endpoint_id IN (...)` query, so the §14.2 homepage
+    /// aggregate never fans out one capability read per endpoint.
+    fn find_endpoint_capabilities_batch<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<CapabilityObservationsByEndpoint, Self::Error>> {
+        Box::pin(async move {
+            let stored = SqliteStore::find_endpoint_capabilities_batch(self, endpoint_ids).await?;
+            Ok(stored
+                .into_iter()
+                .map(|(endpoint_id, capabilities)| {
+                    (
+                        endpoint_id,
+                        capabilities
+                            .iter()
+                            .map(|capability| {
+                                StoredCapability::new(
+                                    capability.observation(),
+                                    capability.observed_at(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect())
         })
     }
 }
@@ -203,6 +239,13 @@ impl OperationStore for SqliteStore {
         kind: FailureKind,
     ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
         Box::pin(async move { SqliteStore::record_failure_kind(self, operation_id, kind).await })
+    }
+
+    fn find_failure_kind(
+        &self,
+        operation_id: OperationId,
+    ) -> OperationBoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+        Box::pin(async move { SqliteStore::find_failure_kind(self, operation_id).await })
     }
 
     fn list_operations(
@@ -599,6 +642,18 @@ impl CenterProjectionRepository for SqliteStore {
         })
     }
 
+    fn upsert_events<'a>(
+        &'a self,
+        events: &'a [Event],
+        site: InstanceId,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::append_center_events(self, events, site)
+                .await
+                .map_err(CenterProjectionRepositoryError::Event)
+        })
+    }
+
     fn declare_artifact<'a>(
         &'a self,
         artifact: &'a Artifact,
@@ -630,6 +685,14 @@ impl CenterProjectionRepository for SqliteStore {
         Result<Option<rutilus_application::CenterEndpointProjection>, Self::Error>,
     > {
         Box::pin(async move { SqliteStore::find_endpoint_projection(self, endpoint_id).await })
+    }
+
+    fn find_endpoint_projections<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<HashMap<EndpointId, CenterEndpointProjection>, Self::Error>>
+    {
+        Box::pin(async move { SqliteStore::find_endpoint_projections(self, endpoint_ids).await })
     }
 
     fn has_resource(
@@ -988,6 +1051,72 @@ mod tests {
                 .await?
                 .is_none()
         );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_forwards_the_batched_capability_boundary() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let (first, created_at) = capability_endpoint(&store).await?;
+        store.create_endpoint(first.clone()).await?;
+        let first_id = first.id();
+        // A second endpoint must publish a distinct address (the fixture
+        // helper pins one), so it is built explicitly against the same
+        // bound credential.
+        let second = Endpoint::try_new(
+            EndpointId::generate(),
+            EndpointDisplayName::parse("Batch second endpoint")?,
+            EndpointAddress::parse("https://192.0.2.83")?,
+            TlsTrust::PinnedCertificate {
+                certificate: TlsCertificate::from_der(b"second endpoint certificate".to_vec())?,
+                trusted_at: created_at,
+            },
+            first.credential_id(),
+            created_at,
+            created_at,
+        )?;
+        store.create_endpoint(second.clone()).await?;
+        let second_id = second.id();
+
+        // One endpoint with the complete ledger, one without any probe, and
+        // one unknown identity: the batched boundary must keep the
+        // single-endpoint semantics while reading every endpoint in one call.
+        let observed_at = created_at + Duration::SECOND;
+        let observations = all_capability_observations();
+        CapabilitySnapshotRepository::replace_endpoint_capabilities(
+            &store,
+            first_id,
+            &observations,
+            observed_at,
+        )
+        .await?;
+        let unknown_id = EndpointId::generate();
+        let batch = CapabilityQueryRepository::find_endpoint_capabilities_batch(
+            &store,
+            &[first_id, second_id, unknown_id],
+        )
+        .await?;
+
+        let stored = batch
+            .get(&first_id)
+            .ok_or("first endpoint capabilities are missing")?;
+        assert_eq!(stored.len(), CAPABILITY_LEDGER_ORDER.len());
+        assert!(
+            stored
+                .iter()
+                .all(|capability| capability.observed_at() == observed_at)
+        );
+        assert!(
+            batch
+                .get(&second_id)
+                .ok_or("second endpoint capabilities are missing")?
+                .is_empty()
+        );
+        assert!(!batch.contains_key(&unknown_id));
 
         store.close().await?;
         drop(directory);

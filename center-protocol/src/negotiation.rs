@@ -4,8 +4,10 @@
 //! `center_protocol_version` must equal [`CENTER_PROTOCOL_VERSION`], the
 //! `nv_redfish_baseline` must equal [`NV_REDFISH_BASELINE`], and the
 //! `capability_ledger_hash` must equal [`capability_ledger_hash`]. The
-//! `product_version` is recorded but never judged. Checks run in that
-//! fixed order, so a peer failing several checks reports the first one.
+//! `product_version` is filled by the sender and not consumed by the peer
+//! today — a protocol reservation that never influences the verdict.
+//! Checks run in that fixed order, so a peer failing several checks
+//! reports the first one.
 //!
 //! The rejection reasons are the stable reason codes of the
 //! [`NegotiationResult`] message: `protocol-mismatch`, `baseline-mismatch`,
@@ -128,8 +130,9 @@ pub fn capability_ledger_hash() -> [u8; 32] {
 ///
 /// Checks run in fixed order and the first failure wins:
 /// `center_protocol_version`, then `nv_redfish_baseline`, then
-/// `capability_ledger_hash`. `product_version` is recorded by the caller
-/// but never participates in the decision.
+/// `capability_ledger_hash`. `product_version` is carried on the wire but
+/// not consumed by the caller today — a protocol reservation that never
+/// participates in the decision.
 #[must_use]
 pub fn negotiate(hello: &Hello) -> NegotiationDecision {
     if hello.center_protocol_version != CENTER_PROTOCOL_VERSION {

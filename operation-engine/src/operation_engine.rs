@@ -345,27 +345,47 @@ where
         Ok((batch, children))
     }
 
-    /// Lists operations in [`RECOVERABLE_STATES`] after a restart.
+    /// Lists the operations the scheduler still owns: every operation in
+    /// [`RECOVERABLE_STATES`].
     ///
-    /// This first version only reports the candidates; the upper layer (the
-    /// future scheduler in `application`) decides per operation whether to
+    /// The scheduler's sweep calls this every tick, not only after a restart:
+    /// in-flight work is re-listed until it reaches a terminal state (design
+    /// sections 13.5 and 13.6). The list is a snapshot; the upper layer (the
+    /// scheduler in `application`) decides per operation whether to
     /// re-validate, re-check the target, resume Task polling, or mark the
-    /// outcome unknown (design sections 13.5 and 13.6). Executing BMC actions
-    /// here is deliberately out of scope for this iteration.
+    /// outcome unknown. Executing BMC actions here is deliberately out of
+    /// scope.
+    ///
+    /// One exact-state query runs per recoverable state instead of a full
+    /// scan: the persistence layer's state filter is index-backed, so
+    /// terminal rows are never read back — and never decrypted — on a tick.
+    /// The recoverable states are disjoint, so each operation is listed
+    /// exactly once; the concatenated results are re-sorted by creation time
+    /// and identity so the recovery replay keeps the listing contract's
+    /// acceptance order.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::Store`] when the persistence boundary fails.
     pub async fn recover_pending(&self) -> Result<Vec<Operation>, EngineError<Store::Error>> {
-        let operations = self
-            .store
-            .list_operations(None)
-            .await
-            .map_err(EngineError::Store)?;
-        Ok(operations
-            .into_iter()
-            .filter(|operation| RECOVERABLE_STATES.contains(&operation.state()))
-            .collect())
+        let mut operations = Vec::new();
+        for state in RECOVERABLE_STATES {
+            operations.extend(
+                self.store
+                    .list_operations(Some(state))
+                    .await
+                    .map_err(EngineError::Store)?,
+            );
+        }
+        // The four queries each arrive ordered by creation time and identity;
+        // re-sorting the concatenation restores that global order, exactly
+        // the order the single full-table listing used to produce.
+        operations.sort_by(|left, right| {
+            left.created_at()
+                .cmp(&right.created_at())
+                .then_with(|| left.id().cmp(&right.id()))
+        });
+        Ok(operations)
     }
 }
 
@@ -1551,6 +1571,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_pending_queries_each_state_and_never_scans_terminal_rows()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+
+        // One operation per recoverable state, plus terminal rows that must
+        // never be read back on a tick.
+        let validating = advance_to(&engine, now, &[OperationEvent::ValidationStarted]).await?;
+        let running = advance_to(
+            &engine,
+            now,
+            &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+            ],
+        )
+        .await?;
+        let waiting = advance_to(
+            &engine,
+            now,
+            &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+                OperationEvent::RemoteTaskStarted,
+            ],
+        )
+        .await?;
+        let verifying = advance_to(
+            &engine,
+            now,
+            &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+                OperationEvent::ExecutionAccepted,
+            ],
+        )
+        .await?;
+        let succeeded = advance_to(
+            &engine,
+            now,
+            &[
+                OperationEvent::ValidationStarted,
+                OperationEvent::ValidationPassed,
+                OperationEvent::ExecutionAccepted,
+                OperationEvent::VerificationPassed,
+            ],
+        )
+        .await?;
+        let failed = advance_to(
+            &engine,
+            now,
+            &[OperationEvent::ValidationStarted, OperationEvent::Failed],
+        )
+        .await?;
+        assert_eq!(succeeded.state(), OperationState::Succeeded);
+        assert_eq!(failed.state(), OperationState::Failed);
+
+        // The recovery scan runs exactly one exact-state query per
+        // recoverable state — never a full-table listing — so the terminal
+        // rows are filtered by the store before any row is rehydrated.
+        let recovered = engine.recover_pending().await?;
+        let mut recovered_ids: Vec<_> = recovered.iter().map(Operation::id).collect();
+        recovered_ids.sort();
+        let mut expected = [validating.id(), running.id(), waiting.id(), verifying.id()];
+        expected.sort();
+        assert_eq!(recovered_ids, expected);
+        let mut calls = store.calls()?;
+        assert_eq!(
+            calls.split_off(calls.len() - RECOVERABLE_STATES.len()),
+            RECOVERABLE_STATES.map(|state| Call::List(Some(state))),
+            "recovery must scan the four recoverable states by exact-state query"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn waiting_remote_flow_persists_observations_and_resumes_verification()
     -> Result<(), Box<dyn Error>> {
         let store = FakeStore::new();
@@ -1651,7 +1748,10 @@ mod tests {
                 Call::ApplyTransition(created.id(), OperationState::WaitingRemote),
                 Call::SaveRemoteTask(created.id()),
                 Call::FindRemoteTask(created.id()),
-                Call::List(None),
+                Call::List(Some(OperationState::Validating)),
+                Call::List(Some(OperationState::Running)),
+                Call::List(Some(OperationState::WaitingRemote)),
+                Call::List(Some(OperationState::Verifying)),
                 Call::SaveRemoteTask(created.id()),
                 Call::FindRemoteTask(created.id()),
                 Call::Find(created.id()),

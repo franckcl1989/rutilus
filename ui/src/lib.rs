@@ -8107,14 +8107,14 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
             }
         }
         RedfishCommand::Update(UpdateCommand::Patch(payload)) => {
-            // The enabled/targets members are the wire field names rendered
-            // as key=value pairs (data vocabulary); only the "no members"
-            // fallback and the "Patch ·" head are copy.
+            // The service_enabled/targets members are the wire field names
+            // rendered as key=value pairs (data vocabulary); only the
+            // "no members" fallback and the "Patch ·" head are copy.
             let members = match (payload.service_enabled(), payload.targets()) {
                 (Some(enabled), Some(targets)) => {
-                    format!("enabled={enabled}, targets={}", targets.join(", "))
+                    format!("service_enabled={enabled}, targets={}", targets.join(", "))
                 }
-                (Some(enabled), None) => format!("enabled={enabled}"),
+                (Some(enabled), None) => format!("service_enabled={enabled}"),
                 (None, Some(targets)) => format!("targets={}", targets.join(", ")),
                 (None, None) => L().summary_patch_no_members.to_owned(),
             };
@@ -26027,13 +26027,13 @@ mod tests {
                 L().family_firmware_update,
                 catalog_format!(
                     L().fmt_patch_payload,
-                    "enabled=true, targets=/redfish/v1/Systems/1"
+                    "service_enabled=true, targets=/redfish/v1/Systems/1"
                 ),
             ),
             (
                 json!({"Update": {"Patch": {"service_enabled": false}}}),
                 L().family_firmware_update,
-                catalog_format!(L().fmt_patch_payload, "enabled=false"),
+                catalog_format!(L().fmt_patch_payload, "service_enabled=false"),
             ),
         ] {
             let command = serde_json::from_value::<RedfishCommand>(wire)?;

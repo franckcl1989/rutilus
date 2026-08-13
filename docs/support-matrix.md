@@ -145,7 +145,7 @@ NVIDIA 类型化写操作（9 个，全部映射到 `RedfishCommand::Oem`；`inf
 
 | 手段 | 现状 |
 |---|---|
-| Mock BMC（`test-support`） | 可运行的 loopback HTTPS Mock Redfish BMC，固定确定性证书与固定资源树；profile：默认 Rutilus、Dell（DellAttributes 表面）、XFusion、Inspur |
+| Mock BMC（`test-support`） | 可运行的 loopback HTTPS Mock Redfish BMC，固定确定性证书与固定资源树；**11 个 `MockProfile` 变体**（`test-support/src/mock_bmc/profile.rs:47-133`）：Rutilus（默认）、Dell（DellAttributes 表面）、NVIDIA、Lenovo、XFusion、Inspur、AMI、HPE、LiteOn、Delta、Supermicro |
 | Mock Center | scripted mTLS 中心（Hello/NegotiationResult、二进制帧 WebSocket），驱动真实 CenterClient 互操作测试 |
 | Fixture | 设计 §19.1 要求保存脱敏真实 BMC 响应（Dell/HPE/Lenovo/xFusion/Inspur 各固件版本）并随上游升级回归；**当前代码库中尚无 fixture 目录**（如实标注，属于 0.9.0 内容） |
 | 真实设备验证 | 设计目标为五个厂商至少各一台真实设备进入 1.0.0 认证矩阵（§19.1）；**尚未达成**，属于 0.9.0 实验室工作 |

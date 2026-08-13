@@ -32,16 +32,16 @@ use rutilus_center_protocol::{
     OperationProgress, OperationRejected,
 };
 use rutilus_domain::{
-    EndpointId, InboxEntry, InboxEntryId, InboxEvent, InstanceId, Operation, OperationEvent,
-    OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry, OutboxEntryId,
-    PrincipalId, RedfishCommand, ResourceODataId, Role, RoleAssignment, TargetId,
+    EndpointId, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation,
+    OperationEvent, OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry,
+    OutboxEntryId, PrincipalId, RedfishCommand, ResourceODataId, Role, RoleAssignment, TargetId,
 };
 use rutilus_operation_engine::OperationStore;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    BoundaryFuture, CenterInbox, CenterOutbox,
+    BoundaryFuture, CenterInbox, CenterOutbox, InboxInsertOutcome,
     center::projection::{CenterContentConsumer, CenterProjectionRepository},
     center::session::ResolvedSite,
 };
@@ -51,6 +51,35 @@ use crate::{
 /// matches the D2 binding-code TTL and keeps a stale dispatch from
 /// executing late).
 pub const CENTER_OFFER_TTL: Duration = Duration::seconds(15 * 60);
+
+/// The candidate states of the §17.5 idempotency scan: every non-terminal
+/// state (the mirror of [`OperationState::is_terminal`]). The scan queries
+/// one state at a time so it rides the state index (`ix_operations_state`,
+/// §13.6) instead of listing the whole operation table — terminal
+/// operations are retired history for the dispatch key.
+const IDEMPOTENCY_CANDIDATE_STATES: [OperationState; 5] = [
+    OperationState::Queued,
+    OperationState::Validating,
+    OperationState::Running,
+    OperationState::WaitingRemote,
+    OperationState::Verifying,
+];
+
+/// How many pending §15.6 offers one idempotency scan reads at most.
+///
+/// The scan needs only the pending offers of the involved site — an
+/// acknowledged row is delivered history (§15.4), so the state filter keeps
+/// the scan from ever decrypting it — and the bound caps the decryption
+/// work of a pathological queue. Each undecided operation holds at most one
+/// pending offer (the TTL retirement acknowledges an expired one before a
+/// fresh offer is delivered under the same id), so the realistic working
+/// set stays far below the bound.
+///
+/// The bound is not a hard cap on the scan's visibility: a candidate whose
+/// pending offer sits beyond the truncation is resolved from the
+/// fall-through history read (`offer_history`) instead of being mistaken
+/// for a never-queued record, so the truncation never re-mints an id.
+const CENTER_DISPATCH_OFFER_SCAN_LIMIT: u64 = 256;
 
 /// One center-initiated operation dispatch (§15.6).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,28 +402,47 @@ where
     /// active center-sourced operation on the same (site, endpoint, target,
     /// command), judged from the tracking records and the §15.6 offer scan.
     ///
-    /// - The offer is still actionable: the dispatch is in flight and the
-    ///   retry returns the existing operation with its original expiry.
-    /// - The offer's TTL passed: the retry retires the stale rows and
-    ///   delivers a fresh offer under the same id — same §17.5 key, so the
-    ///   site can never execute it twice.
-    /// - No offer row exists (an enqueue failure stranded the record
-    ///   `Queued`): the retry delivers the offer under the existing id —
-    ///   the repair that keeps a failed retry from orphaning a second
-    ///   record. The repair runs only for a single candidate, where the
-    ///   offer target is unambiguous.
+    /// - A pending offer is still actionable: the dispatch is in flight and
+    ///   the retry returns the existing operation with its original expiry.
+    /// - The pending offer's TTL passed: the retry retires the stale rows
+    ///   and delivers a fresh offer under the same id — same §17.5 key, so
+    ///   the site can never execute it twice.
+    /// - No pending offer row exists: the retry reads the full offer
+    ///   history — the fall-through repair read — and resolves the
+    ///   candidate against its acknowledged rows (§15.4 delivered history)
+    ///   or its scan-truncated pending rows. An acknowledged offer whose
+    ///   reply receipt was lost is re-delivered under the same id, or
+    ///   returned in flight with its original expiry, so the site's §17.5
+    ///   idempotency still binds; an acknowledged offer for a different
+    ///   target is a different operation on the same endpoint and command,
+    ///   and the retry starts fresh below; a record the history does not
+    ///   know at all was never enqueued, and a fresh id cannot
+    ///   double-execute anything. The repair for the offerless record
+    ///   alone runs only for a single candidate, where no other operation
+    ///   could own the retry.
+    ///
+    /// The tracking scan queries every candidate state on the state index
+    /// (`ix_operations_state`, §13.6) instead of listing the whole table,
+    /// and the offer scan reads only the pending queue (bounded by
+    /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`]), so a retry of a live dispatch
+    /// never decrypts an acknowledged offer row; the full history is
+    /// decrypted only by the rare fall-through branch.
     async fn find_undecided(
         &self,
         request: &CenterOperationRequest,
         now: OffsetDateTime,
     ) -> Result<Option<DispatchedOperation>, DispatchErrorOf<Store, Outbox, Roles>> {
-        let operations = self
-            .store
-            .list_operations(None)
-            .await
-            .map_err(CenterDispatchError::Operation)?;
-        let candidates = operations
-            .iter()
+        let mut operations = Vec::new();
+        for state in IDEMPOTENCY_CANDIDATE_STATES {
+            operations.extend(
+                self.store
+                    .list_operations(Some(state))
+                    .await
+                    .map_err(CenterDispatchError::Operation)?,
+            );
+        }
+        let mut candidates = operations
+            .into_iter()
             .filter(|operation| {
                 operation.source() == OperationSource::Center
                     && !operation.state().is_terminal()
@@ -404,17 +452,27 @@ where
                         .is_some_and(|target| target.endpoint_id() == request.endpoint_id)
                     && operation.command() == request.command
             })
-            .map(Operation::id)
+            .collect::<Vec<_>>();
+        // Each per-state query returns its own acceptance order; the sort
+        // restores the deterministic order of one full listing, so a
+        // multi-candidate retry picks the same operation as before.
+        candidates.sort_by_key(|operation| (operation.created_at(), operation.id()));
+        let candidates = candidates
+            .into_iter()
+            .map(|operation| operation.id())
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(None);
         }
         // The offer facts ride in the site's durable outbox — the center
         // queue holds exactly the §15.6 offers — not in the tracking
-        // record, so the retry scan rebuilds them like the tracking view.
+        // record, so the retry scan rebuilds them from the pending queue:
+        // an acknowledged row is delivered history (§15.4), never part of
+        // an undecided dispatch, and the bound caps the decryption work of
+        // a pathological queue.
         let entries = self
             .outbox
-            .list_offers(request.site_id)
+            .list_pending(request.site_id, CENTER_DISPATCH_OFFER_SCAN_LIMIT)
             .await
             .map_err(CenterDispatchError::Outbox)?;
         let facts = entries.iter().filter_map(offer_facts).collect::<Vec<_>>();
@@ -430,39 +488,118 @@ where
                 .await
                 .map(Some);
         }
+        // The fall-through repair read: the pending scan is bounded by
+        // [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] and skips the acknowledged
+        // rows, so a candidate it cannot see is resolved from the full
+        // offer history instead — loaded once per retry, see
+        // [`Self::resolve_candidate`]. A retry must never mint a fresh id
+        // for a delivered operation: the id is the §17.5 key.
+        let mut history: Option<Vec<OfferFact>> = None;
         for operation_id in candidates {
-            let rows = facts
+            if !facts.iter().any(|fact| fact.operation_id == operation_id) && history.is_none() {
+                history = Some(self.offer_history(request.site_id).await?);
+            }
+            if let Some(dispatched) = self
+                .resolve_candidate(request, operation_id, &facts, history.as_deref(), now)
+                .await?
+            {
+                return Ok(Some(dispatched));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Lists the full §15.6 offer history of one site — the fall-through
+    /// repair read of the retry scan, loaded once per retry the bounded
+    /// pending scan cannot resolve.
+    ///
+    /// The center's durable outbox holds exactly the §15.6 offers,
+    /// acknowledged or not, so the history carries the offer facts — the
+    /// target and the expiry — that the tracking operation record does not
+    /// persist. The read is deliberately the trait's un-bounded offer
+    /// listing: it is the rare branch (an acknowledged receipt-lost offer,
+    /// a queue the scan truncated, an enqueue failure), never the hot path
+    /// of a retry with a live pending offer.
+    async fn offer_history(
+        &self,
+        site_id: InstanceId,
+    ) -> Result<Vec<OfferFact>, DispatchErrorOf<Store, Outbox, Roles>> {
+        let entries = self
+            .outbox
+            .list_offers(site_id)
+            .await
+            .map_err(CenterDispatchError::Outbox)?;
+        Ok(entries.iter().filter_map(offer_facts).collect())
+    }
+
+    /// Resolves one candidate against its offer facts with the §15.6
+    /// judgment: `Some` when the candidate is the same dispatch as the
+    /// request — in flight with the newest offer's expiry, or retired and
+    /// re-delivered under the same id — and `None` when the candidate
+    /// carries no facts or its offers target a different resource (a
+    /// different operation on the same endpoint and command; the retry
+    /// starts fresh below).
+    ///
+    /// The candidate's pending facts are the primary source — the bounded
+    /// scan of [`Self::find_undecided`]. When the pending scan cannot see
+    /// the candidate at all, `history` (the site's full offer history,
+    /// loaded once by the caller) is consulted: an acknowledged offer is
+    /// delivered history (§15.4) whose reply receipt may have been lost —
+    /// re-delivered under the same id, or returned in flight, so the
+    /// site's §17.5 idempotency still binds — and a pending offer beyond
+    /// the scan's limit is the truncation case, resolved exactly like the
+    /// pending scan would. A candidate neither source knows was never
+    /// enqueued: nothing was ever delivered for it, so the fresh start
+    /// below cannot double-execute anything (the single-candidate repair
+    /// in `find_undecided` is the repair path for such a record alone).
+    async fn resolve_candidate(
+        &self,
+        request: &CenterOperationRequest,
+        operation_id: OperationId,
+        pending: &[OfferFact],
+        history: Option<&[OfferFact]>,
+        now: OffsetDateTime,
+    ) -> Result<Option<DispatchedOperation>, DispatchErrorOf<Store, Outbox, Roles>> {
+        let mut rows = pending
+            .iter()
+            .filter(|fact| fact.operation_id == operation_id)
+            .collect::<Vec<_>>();
+        if rows.is_empty()
+            && let Some(history) = history
+        {
+            rows = history
                 .iter()
                 .filter(|fact| fact.operation_id == operation_id)
                 .collect::<Vec<_>>();
-            let Some(newest) = rows.iter().max_by_key(|fact| fact.sequence) else {
-                continue;
-            };
-            if newest.target != request.target_odata_id.as_str() {
-                // A different operation on the same endpoint and command;
-                // the retry of this request starts fresh below.
-                continue;
-            }
-            if now > newest.expires_at {
-                // The pending offer's §15.6 TTL passed: retire the stale
-                // rows and deliver a fresh offer under the same id.
-                for fact in rows {
-                    self.outbox
-                        .acknowledge(fact.entry_id, now)
-                        .await
-                        .map_err(CenterDispatchError::Outbox)?;
-                }
-                return self
-                    .deliver_retry(request, operation_id, now)
-                    .await
-                    .map(Some);
-            }
-            return Ok(Some(DispatchedOperation::new(
-                operation_id,
-                newest.expires_at,
-            )));
         }
-        Ok(None)
+        let Some(newest) = rows.iter().max_by_key(|fact| fact.sequence) else {
+            return Ok(None);
+        };
+        if newest.target != request.target_odata_id.as_str() {
+            // A different operation on the same endpoint and command;
+            // the retry of this request starts fresh below.
+            return Ok(None);
+        }
+        if now > newest.expires_at {
+            // The offer's §15.6 TTL passed: retire the stale rows and
+            // deliver a fresh offer under the same id — the acknowledge
+            // is idempotent, so an already-acknowledged row stays retired
+            // history.
+            for fact in rows {
+                self.outbox
+                    .acknowledge(fact.entry_id, now)
+                    .await
+                    .map_err(CenterDispatchError::Outbox)?;
+            }
+            return self
+                .deliver_retry(request, operation_id, now)
+                .await
+                .map(Some);
+        }
+        Ok(Some(DispatchedOperation::new(
+            operation_id,
+            newest.expires_at,
+        )))
     }
 
     /// Delivers a fresh §15.6 offer under an existing operation id — the
@@ -791,7 +928,23 @@ where
     }
 
     /// Persists the reply envelope as the operation's inbox receipt and
-    /// advances the receipt's phase to mirror the reply.
+    /// sets the receipt's phase to mirror the reply.
+    ///
+    /// The insert and the phase advance are one write-gate transaction
+    /// (P3-9): the receipt row is created at the phase the reply dictates
+    /// — `Accepted` for an acceptance or progress, `Rejected` for a
+    /// refusal, `Completed` for a terminal report — so a fresh receipt
+    /// costs one write instead of two or three. The merge is sound because
+    /// the phase is a fact of the reply being recorded, not a separate
+    /// step: the old two-write path's transient `Received` row was never
+    /// observable, and a crash between the two writes could even have
+    /// stranded the receipt one phase behind the reply.
+    ///
+    /// The advance path survives for a duplicate receipt, where the stored
+    /// row already exists: the phase leads mirror the reply against
+    /// whatever the row carries, best-effort, exactly as before — an
+    /// advance the stored phase refuses (a re-delivered older reply) is
+    /// logged and heals on the next reply.
     async fn log_reply(
         &self,
         site: InstanceId,
@@ -800,9 +953,33 @@ where
         message: Option<&EnvelopeMessage>,
         now: OffsetDateTime,
     ) -> Result<(), TrackingErrorOf<Store, Inbox>> {
-        self.record_reply(site, envelope, operation_id, now).await?;
-        // The receipt's phase mirrors the reply lifecycle; the insert is
-        // the durable record and the phase is best-effort — an advance the
+        let payload_json =
+            serde_json::to_string(envelope).map_err(CenterOperationTrackingError::Payload)?;
+        let phase = reply_events(message)
+            .last()
+            .map_or(InboxEntryState::Received, |event| event.to_state());
+        let entry = InboxEntry::from_parts(
+            InboxEntryId::generate(),
+            operation_id,
+            site,
+            payload_json,
+            phase,
+            now,
+            now,
+        );
+        let outcome = self
+            .inbox
+            .insert(&entry)
+            .await
+            .map_err(CenterOperationTrackingError::Inbox)?;
+        if outcome == InboxInsertOutcome::Created {
+            // The fresh row was born at the reply's phase: the insert
+            // carried the phase the old code applied through a separate
+            // advance write.
+            return Ok(());
+        }
+        // A duplicate receipt: the stored row already exists, so the phase
+        // leads mirror the reply against it, best-effort — an advance the
         // stored phase refuses (a re-delivered older reply) is logged and
         // heals on the next reply.
         for event in reply_events(message) {
@@ -1429,10 +1606,26 @@ mod tests {
 
         fn list_pending(
             &self,
-            _instance_id: InstanceId,
-            _limit: u64,
+            instance_id: InstanceId,
+            limit: u64,
         ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
-            Box::pin(async move { Ok(Vec::new()) })
+            Box::pin(async move {
+                let mut rows = self
+                    .state
+                    .entries
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .iter()
+                    .filter(|entry| {
+                        entry.instance_id() == instance_id
+                            && entry.state() == OutboxEntryState::Pending
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(OutboxEntry::sequence);
+                rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                Ok(rows)
+            })
         }
 
         fn list_offers(
@@ -1526,6 +1719,13 @@ mod tests {
                     .iter_mut()
                     .find(|entry| entry.operation_id() == operation_id)
                     .ok_or(MockStoreError)?;
+                // The trait contract of `CenterInbox::advance`: an entry
+                // that already carries the target state is a successful
+                // no-op, exactly like the persistence implementation's
+                // `AlreadyInState` outcome.
+                if entry.state() == event.to_state() {
+                    return Ok(());
+                }
                 entry.apply(event).map_err(|_| MockStoreError)
             })
         }
@@ -2337,6 +2537,260 @@ mod tests {
             1,
             "exactly one live offer row must remain"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retry_ignores_an_acknowledged_offer_as_delivered_history()
+    -> Result<(), Box<dyn Error>> {
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        // The site processed the offer: the outbox row is acknowledged
+        // (§15.4), but no reply has landed yet — the operation is still
+        // undecided. The idempotency scan reads only pending offers, so
+        // the acked row is delivered history and is never decrypted for a
+        // retry; the retry re-delivers the same operation id, which the
+        // site's §17.5 idempotency absorbs with its recorded state.
+        let entries = state.entries_owned();
+        assert_eq!(entries.len(), 1);
+        store
+            .acknowledge(entries[0].id(), now + Duration::SECOND)
+            .await?;
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(retry.operation_id(), first.operation_id());
+        let entries = state.entries_owned();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "the acknowledged offer row stays retired history"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Pending)
+                .count(),
+            1,
+            "the retry delivers one fresh offer under the same id"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no second tracking record is created"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_multi_candidate_retry_reuses_the_acked_operations_id() -> Result<(), Box<dyn Error>>
+    {
+        // F1: with several undecided operations on the same endpoint and
+        // command, a retry of the one whose offer was acknowledged — the
+        // site processed it, but the reply receipt never landed — must
+        // reuse its id. The pending-only scan cannot see the acknowledged
+        // row, so without the fall-through history read the retry would
+        // mint a fresh id and the site would execute the same dispatch
+        // twice (§17.5: the operation id is the idempotency key).
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Chassis/1")));
+
+        // A: the /Systems/1 dispatch, whose offer the site later
+        // acknowledges without ever answering.
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        // B: a second undecided operation on the same endpoint and
+        // command (another target), still pending — the multi-candidate
+        // working set the retry scan must not confuse.
+        let second = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Chassis/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_ne!(second.operation_id(), first.operation_id());
+        let entries = state.entries_owned();
+        assert_eq!(entries.len(), 2);
+        // The site processes A's offer and acknowledges the frame; the
+        // `OperationAccepted` reply is lost in transit. The rows sit in
+        // enqueue order, so A's is the first.
+        store
+            .acknowledge(entries[0].id(), now + Duration::seconds(2))
+            .await?;
+
+        // The retry of A: the same operation id comes back — in flight
+        // with the original expiry — and no second tracking record or
+        // offer is created.
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(3),
+            )
+            .await?;
+        assert_eq!(retry.operation_id(), first.operation_id());
+        assert_eq!(retry.expires_at(), first.expires_at());
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "no third tracking record is created"
+        );
+        assert_eq!(state.offers_owned().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_multi_candidate_retry_revives_an_expired_acked_offer_under_the_same_id()
+    -> Result<(), Box<dyn Error>> {
+        // The retired flavor of the F1 scenario: A's acknowledged offer
+        // is past its §15.6 TTL — the acknowledged state is exactly what
+        // the flush's TTL retirement leaves behind — and B's offer for a
+        // different target is still pending. The retry of A re-delivers
+        // under A's id with a fresh expiry, the same §17.5 key, never a
+        // second identity.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Chassis/1")));
+
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let second = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Chassis/1", actor)?,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_ne!(second.operation_id(), first.operation_id());
+        // The site processes A's offer and acknowledges the frame; the
+        // reply is lost, and the retry comes only after the offer's TTL
+        // passed.
+        let entries = state.entries_owned();
+        store
+            .acknowledge(entries[0].id(), now + Duration::SECOND)
+            .await?;
+        let retry_at = now + CENTER_OFFER_TTL + Duration::SECOND;
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                retry_at,
+            )
+            .await?;
+        assert_eq!(retry.operation_id(), first.operation_id());
+        assert_eq!(retry.expires_at(), retry_at + CENTER_OFFER_TTL);
+        let entries = state.entries_owned();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "A's stale offer row stays retired history"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Pending)
+                .count(),
+            2,
+            "the retry delivers one fresh offer under A's id beside B's"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "no third tracking record is created"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_receipt_is_born_at_the_phase_the_reply_dictates() -> Result<(), Box<dyn Error>>
+    {
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let dispatched = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let operation_id = dispatched.operation_id();
+        let tracking = CenterOperationTracking::new(store.clone(), store);
+
+        // P3-9: the first receipt is inserted at the phase the reply
+        // dictates — one write, not the insert plus a separate advance.
+        accept_reply(&tracking, site, operation_id, now + Duration::SECOND).await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].state(), InboxEntryState::Accepted);
+
+        // A duplicate reply is absorbed without a second row or a phase
+        // change.
+        accept_reply(&tracking, site, operation_id, now + Duration::seconds(2)).await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].state(), InboxEntryState::Accepted);
+
+        // The terminal report lands the receipt at the terminal phase.
+        complete_reply(
+            &tracking,
+            site,
+            operation_id,
+            "failed",
+            now + Duration::seconds(3),
+        )
+        .await?;
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].state(), InboxEntryState::Completed);
         Ok(())
     }
 

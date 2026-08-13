@@ -512,6 +512,16 @@ impl CenterLink {
             // the generic rejection so the sync engine can converge the
             // site instead of retrying forever.
             Err(CenterClientError::NotBound)
+        } else if reason == NegotiationReason::IdentityMismatch.as_str() {
+            // The admission refusal (audit follow-up E3-2, C5-10): the
+            // center says the `Hello`'s declared instance identity
+            // disagrees with the binding record its certificate resolves
+            // to. The binding is in force on both sides — unlike
+            // `not-bound` this must never converge the local row — but the
+            // mismatch is a configuration error no retry can heal, so it
+            // is classified before the generic rejection and the sync
+            // engine stops retrying instead of alerting every backoff.
+            Err(CenterClientError::IdentityMismatch)
         } else {
             Err(CenterClientError::NegotiationRejected { reason })
         }
@@ -561,6 +571,18 @@ pub enum CenterClientError {
     /// retrying forever.
     #[error("the center refused the connection: the site binding is not in force")]
     NotBound,
+    /// The center answered the `Hello` with the `identity-mismatch`
+    /// admission refusal (audit follow-up E3-2, C5-10): the declared
+    /// instance identity disagrees with the binding record the presented
+    /// certificate resolves to. The binding is in force on both sides, so
+    /// the local row must NOT be converged; the mismatch is a configuration
+    /// error no retry can heal, so the sync engine stops instead of
+    /// alerting every backoff.
+    #[error(
+        "the center refused the connection: the site's instance identity does not match the \
+         center's binding for its certificate"
+    )]
+    IdentityMismatch,
     #[error("a frame could not be decoded: {0}")]
     Frame(#[from] FrameError),
     #[error("the WebSocket transport failed: {source}")]
@@ -877,6 +899,69 @@ mod tests {
             Err(CenterClientError::NegotiationRejected { reason })
                 if reason == "baseline-mismatch"
         ));
+        let scripted_result = scripted.await.map_err(io::Error::other)?;
+        scripted_result.map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_the_identity_mismatch_refusal_before_the_generic_rejection()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up E3-2 (C5-10): the center answers the `Hello` of a
+        // site whose declared instance identity disagrees with its
+        // certificate's binding record with the `identity-mismatch` reason.
+        // The client classifies it as its own error variant — never the
+        // `not-bound` convergence signal and never the generic rejection —
+        // so the sync engine stops retrying instead of alerting every
+        // backoff, without touching the local binding.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let ca = CenterCa::generate_or_load(&paths)?;
+        let listen = crate::ListenAddress::parse("127.0.0.1:8443")?;
+        let server_identity = ca.issue_server_certificate(&listen)?;
+        let client_ca = ca.certificate();
+        let client_pin =
+            CertificateFingerprint::from_certificate_der(server_identity.certificate.as_ref());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+
+        let site = InstanceId::generate();
+        let identity =
+            ca.issue_site_certificate(site, CertificateFingerprint::from_bytes([0x33; 32]))?;
+
+        let scripted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(build_server_config(&ca, server_identity)?);
+            let tls = acceptor.accept(stream).await?;
+            let mut ws = tokio_tungstenite::accept_async(tls).await?;
+            let _hello = ws.next().await;
+            let envelope = Envelope {
+                sequence: 1,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::NegotiationResult(
+                    rutilus_center_protocol::NegotiationResult {
+                        accepted: false,
+                        reason: NegotiationReason::IdentityMismatch.as_str().to_owned(),
+                    },
+                )),
+            };
+            ws.send(Message::Binary(encode_frame(&envelope)?)).await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
+        let config = CenterClientConfig::new(
+            crate::ListenAddress::parse(&format!("127.0.0.1:{}", address.port()))?,
+            client_ca,
+            client_pin,
+            identity.certificate(),
+            identity.private_key(),
+            site,
+            String::from("Test Site"),
+        )?;
+
+        let result = config.connect().await;
+        assert!(matches!(result, Err(CenterClientError::IdentityMismatch)));
         let scripted_result = scripted.await.map_err(io::Error::other)?;
         scripted_result.map_err(|error| io::Error::other(error.to_string()))?;
         Ok(())

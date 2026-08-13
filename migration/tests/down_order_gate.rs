@@ -36,12 +36,18 @@
 //! Two drop sequences are checked per file:
 //! - the `down` function body's `drop_table(Table::drop().table(X::Table))`
 //!   calls and raw `DROP TABLE` statements, in source order;
-//! - the file's raw `DROP TABLE` statements file-wide, in source order —
-//!   the `SQLite` rebuild helpers (`create_resource_tables_with`,
+//! - the file's drop statements file-wide, in source order — the builder
+//!   `drop_table(...)` calls and the raw `DROP TABLE` statements merged by
+//!   line. The `SQLite` rebuild helpers (`create_resource_tables_with`,
 //!   `rebuild_audit_events`, `rebuild`, ...) that `up` and `down` both call
-//!   keep their drops outside the `down` body, and the child-first
-//!   discipline applies to them in both directions (the drop of the old
-//!   parent would cascade into the old children either way).
+//!   keep their drops outside the `down` body — builder-style or raw — and
+//!   the child-first discipline applies to them in both directions (the
+//!   drop of the old parent would cascade into the old children either
+//!   way). A helper's builder drops were once invisible to the file-wide
+//!   scan (only the raw `DROP TABLE` statements were collected outside the
+//!   `down` body); the scan now covers both shapes, so a parent-first order
+//!   inside any helper the `down` calls is rejected like the same order
+//!   written inline.
 //!
 //! False positives are controlled the same way `bare_sql_gate` controls
 //! theirs: comments, doc comments, and attribute strings are stripped by the
@@ -842,14 +848,22 @@ fn down_drop_sequence(
     Ok(distinct_first(drops))
 }
 
-/// The file-wide raw `DROP TABLE` sequence (first occurrence per table) —
-/// the `SQLite` rebuild helpers that `up` and `down` both call keep their
-/// drops outside the `down` body.
-fn file_wide_raw_drop_sequence(
+/// The file-wide drop sequence (first occurrence per table): every builder
+/// `drop_table(...)` call and every raw `DROP TABLE` statement merged in
+/// source order — the `SQLite` rebuild helpers that `up` and `down` both
+/// call keep their drops outside the `down` body, builder-style or raw.
+///
+/// The builder shape is collected file-wide exactly like the raw shape
+/// (T1-3): a helper's drops were previously invisible to this sequence
+/// unless the `down` body itself named them, so a parent-first order inside
+/// a shared helper slipped past the gate.
+fn file_wide_drop_sequence(
     tokens: &[Token],
+    enum_tables: &HashMap<String, String>,
     consts: &HashMap<String, (usize, String)>,
 ) -> Result<Vec<(usize, String)>, String> {
-    let mut drops = raw_drop_statements(tokens, consts)?;
+    let mut drops = builder_drop_targets(tokens, enum_tables)?;
+    drops.extend(raw_drop_statements(tokens, consts)?);
     drops.sort_by_key(|(line, _)| *line);
     Ok(distinct_first(drops))
 }
@@ -921,8 +935,8 @@ fn order_violations_for(
         let drops = down_drop_sequence(&source.tokens, range, &enum_tables, &consts)?;
         violations.extend(check_order(&source.display_path, &drops, edges));
     }
-    let raw_drops = file_wide_raw_drop_sequence(&source.tokens, &consts)?;
-    violations.extend(check_order(&source.display_path, &raw_drops, edges));
+    let file_drops = file_wide_drop_sequence(&source.tokens, &enum_tables, &consts)?;
+    violations.extend(check_order(&source.display_path, &file_drops, edges));
     Ok(violations)
 }
 
@@ -1165,6 +1179,118 @@ fn gate_checks_raw_sql_drop_order_in_down_body() -> Result<(), Box<dyn Error>> {
     assert!(
         violations.is_empty(),
         "raw child-first drops must pass, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// A migration whose `down` delegates its drops to a shared helper outside
+/// the `down` body — the rebuild-helper pattern — with the helper's builder
+/// `drop_table(...)` calls in the requested order.
+fn helper_drop_source(parent_first: bool) -> String {
+    let helper = if parent_first {
+        "manager.drop_table(Table::drop().table(Parent::Table).to_owned()).await?;
+         manager.drop_table(Table::drop().table(Child::Table).to_owned()).await"
+    } else {
+        "manager.drop_table(Table::drop().table(Child::Table).to_owned()).await?;
+         manager.drop_table(Table::drop().table(Parent::Table).to_owned()).await"
+    };
+    format!(
+        r#"use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {{
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        manager
+            .create_table(
+                Table::create()
+                    .table(Parent::Table)
+                    .col(ColumnDef::new(Parent::Id).uuid().not_null().primary_key())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Child::Table)
+                    .col(ColumnDef::new(Child::ParentId).uuid().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Child::Table, Child::ParentId)
+                            .to(Parent::Table, Parent::Id)
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }}
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        // The drops live in the shared helper below, outside this body.
+        drop_the_tables(manager).await
+    }}
+}}
+
+async fn drop_the_tables(manager: &SchemaManager) -> Result<(), DbErr> {{
+    {helper}
+}}
+
+#[derive(DeriveIden)]
+enum Parent {{
+    #[sea_orm(iden = "parents")]
+    Table,
+    Id,
+}}
+
+#[derive(DeriveIden)]
+enum Child {{
+    #[sea_orm(iden = "children")]
+    Table,
+    Id,
+    ParentId,
+}}
+"#
+    )
+}
+
+/// The T1-3 blind spot: a `down` whose drops live in a helper outside its
+/// body was invisible to the gate unless the helper dropped through raw
+/// `execute_unprepared` statements — builder-style `drop_table(...)` calls
+/// in helpers were never collected file-wide. The file-wide sequence now
+/// merges builder drops with the raw statements, so a parent-first order
+/// inside any helper the `down` calls is rejected with the exact line of
+/// the offending drop.
+#[test]
+fn gate_checks_builder_drops_in_helpers_outside_the_down_body() -> Result<(), Box<dyn Error>> {
+    let source = tokenize("synthetic_helper.rs", &helper_drop_source(true));
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    let parent_line = source
+        .tokens
+        .iter()
+        .find_map(|token| match token {
+            Token::Ident { line, name } if name == "drop_table" => Some(*line),
+            _ => None,
+        })
+        .ok_or_else(|| "no drop_table call in the synthetic source".to_owned())?;
+    assert!(
+        violations.iter().any(|violation| {
+            violation.starts_with(&format!("synthetic_helper.rs:{parent_line}:"))
+                && violation.contains("parents")
+                && violation.contains("children")
+        }),
+        "the helper's parent-first builder drops must be rejected, got:\n{}",
+        violations.join("\n"),
+    );
+    let source = tokenize("synthetic_helper.rs", &helper_drop_source(false));
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations.is_empty(),
+        "the helper's child-first builder drops must pass, got:\n{}",
         violations.join("\n"),
     );
     Ok(())
@@ -1487,11 +1613,16 @@ enum Child {
 }
 "#;
     let source = tokenize("synthetic_prose.rs", source);
+    let enum_tables = enum_table_names(&source.tokens);
     let consts = const_literals(&source.tokens);
-    let raw_drops = file_wide_raw_drop_sequence(&source.tokens, &consts)?;
-    assert!(
-        raw_drops.is_empty(),
-        "prose must not produce raw drops, got: {raw_drops:?}",
+    let file_drops = file_wide_drop_sequence(&source.tokens, &enum_tables, &consts)?;
+    // The file-wide sequence may only name the down body's real builder
+    // drops — the comment and the `NARRATIVE` const must contribute nothing.
+    let tables: Vec<&str> = file_drops.iter().map(|(_, table)| table.as_str()).collect();
+    assert_eq!(
+        tables,
+        vec!["children", "parents"],
+        "only the down body's real drops may appear, got: {file_drops:?}",
     );
     let edges = synthetic_edges(&source.tokens)?;
     let violations = order_violations_for(&source, &edges)?;

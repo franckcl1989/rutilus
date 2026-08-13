@@ -62,6 +62,17 @@
 //! edge of the token scan, accepted in exchange for a purely mechanical
 //! check that needs no value heuristics.
 //!
+//! The [R2] fragment rule carries its registered false-positive edge: it is
+//! deliberately conservative, flagging on any `concat!`/`format!` fragment
+//! that carries a PEM feature word even when the assembled text is not a
+//! complete key block (`let password = concat!("-----BEGIN ", label)` is
+//! flagged although `label` may make it a certificate header). The rule
+//! applies only to *sensitive-identifier* bindings, so the same fragments
+//! under a non-sensitive name (`let pem = concat!("-----BEGIN ",
+//! "PRIVATE KEY-----")`, the label-driven writer pattern) stay unflagged —
+//! mechanically indistinguishable from benign construction, the same
+//! boundary as the [R1] wrapper rule.
+//!
 //! The one registered false-positive edge is block-local mutation: binding
 //! records live per block, so an assignment inside a nested block does not
 //! invalidate the outer binding. `let s = "hunter2"; { s = f(); }
@@ -71,7 +82,12 @@
 //!
 //! [R2] Embedded private-key material — a string literal containing a
 //! complete PEM block: a `-----BEGIN ... PRIVATE KEY-----` header and a
-//! `-----END ... PRIVATE KEY-----` footer in the same literal. Prefix checks
+//! `-----END ... PRIVATE KEY-----` footer in the same literal. A PEM block
+//! split across `concat!`/`format!` fragments is additionally caught by the
+//! conservative fragment rule: a sensitive identifier bound to
+//! `concat!`/`format!` whose fragment list contains any fragment carrying a
+//! PEM feature word (`BEGIN` or `PRIVATE KEY`) is flagged, whether or not
+//! the assembled text is a complete block. Prefix checks
 //! (`pem.starts_with("-----BEGIN PRIVATE KEY-----")`) and label-driven PEM
 //! writers (`writeln!(pem, "-----BEGIN {label}-----")`) hold no block and are
 //! not flagged; test-scope fixture `PEM`s are exempt by rule (see below).
@@ -826,6 +842,119 @@ fn wrapper_literal(tokens: &[Token], first_arg: usize, scope: &ScopeTracker) -> 
     direct
 }
 
+/// The direct string fragments of one wrapper invocation's argument span
+/// (`concat!("a", "b")`, `format!("x {} {}", "a", "b")`), in order —
+/// the pieces the [R2] fragment rule inspects. Only direct literals count;
+/// resolved bindings are the [R1] rule's concern.
+fn wrapper_fragments(tokens: &[Token], first_arg: usize) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut depth = 0usize;
+    let mut j = first_arg;
+    while j < tokens.len() {
+        match &tokens[j] {
+            Token::Punct { ch: '(', .. } => depth += 1,
+            Token::Punct { ch: ')', .. } if depth == 0 => break,
+            Token::Punct { ch: ')', .. } => depth -= 1,
+            Token::Str { content, .. } | Token::RawStr { content, .. } => {
+                fragments.push(content.clone());
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    fragments
+}
+
+/// Whether one wrapper fragment carries PEM private-key material — the
+/// conservative [R2] fragment signal: a `BEGIN` or `PRIVATE KEY` feature
+/// word. The signal is deliberately broader than a complete block: a block
+/// split across `concat!`/`format!` fragments leaves each fragment without
+/// the full `BEGIN`+`END`+`PRIVATE KEY` triple, so the check must fire on
+/// the fragments' features, not on the assembled text.
+fn pem_fragment_marker(content: &str) -> bool {
+    content.contains("BEGIN") || content.contains("PRIVATE KEY")
+}
+
+/// The [R2] fragment violation of the sensitive-identifier binding at `i`
+/// (T1-4): a PEM block split across `concat!`/`format!` fragments is
+/// invisible to the single-literal [R2] check — no fragment holds the
+/// complete BEGIN+END+PRIVATE KEY triple. When the binding flows through
+/// `concat!`/`format!`, any direct fragment carrying a PEM feature word
+/// (`BEGIN` / `PRIVATE KEY`) is flagged conservatively, whether or not the
+/// assembled text is a complete block; a binding that does not flow through
+/// the wrappers, or whose fragments carry no marker, yields no violation.
+fn pem_fragment_violation(
+    tokens: &[Token],
+    i: usize,
+    name: &str,
+    line: usize,
+    display_path: &str,
+) -> Option<String> {
+    let bind = binding_equals(tokens, i)?;
+    let mut j = bind + 1;
+    if matches!(tokens.get(j), Some(Token::Punct { ch: '&', .. })) {
+        j += 1;
+    }
+    let is_concat_like = matches!(
+        tokens.get(j),
+        Some(Token::Ident { name, .. })
+            if (name == "concat" || name == "format")
+                && matches!(tokens.get(j + 1), Some(Token::Punct { ch: '!', .. }))
+                && matches!(tokens.get(j + 2), Some(Token::Punct { ch: '(', .. }))
+    );
+    if !is_concat_like {
+        return None;
+    }
+    if !wrapper_fragments(tokens, j + 3)
+        .iter()
+        .any(|fragment| pem_fragment_marker(fragment))
+    {
+        return None;
+    }
+    Some(format!(
+        "{display_path}:{line}: [R2] the sensitive binding `{name}` is assembled from \
+         concat!/format! fragments carrying PEM private-key material"
+    ))
+}
+
+/// The [R1] + [R2] violations of the sensitive-identifier binding at `i`
+/// (the `name = value` assignment or `let`-binding statement): the
+/// hardcoded-secret hit when the value is a literal or a literal-resolving
+/// wrapper or identifier, and the [R2] fragment hit when a `concat!`/
+/// `format!` wrapper carries PEM material. `name`/`line` are the binding
+/// identifier's own token facts, so the violations point at the binding.
+fn sensitive_binding_violations(
+    tokens: &[Token],
+    i: usize,
+    name: &str,
+    line: usize,
+    scope: &ScopeTracker,
+    display_path: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let hit = assigned_literal(tokens, i)
+        .map(|literal| (literal, String::new()))
+        .or_else(|| {
+            binding_equals(tokens, i).and_then(|bind| wrapper_or_indirect(tokens, bind, scope))
+        });
+    if let Some((literal, via)) = hit
+        && !is_allowed_constant(display_path, line, name, &literal)
+    {
+        let suffix = if via.is_empty() {
+            String::new()
+        } else {
+            format!(" (via {via})")
+        };
+        violations.push(format!(
+            "{display_path}:{line}: [R1] hardcoded secret: `{name}` is set to the \
+             non-empty string literal `{literal}`{suffix}",
+        ));
+    }
+    // [R2] fragment rule (T1-4), see pem_fragment_violation.
+    violations.extend(pem_fragment_violation(tokens, i, name, line, display_path));
+    violations
+}
+
 /// The secret value of a binding whose `=`/`:` sits at `bind`, when the
 /// right-hand side is not a direct literal: a known wrapper call
 /// (`String::from(...)`, `format!(...)`, `concat!(...)`,
@@ -1063,26 +1192,14 @@ fn scan_file(source: &SourceTokens, initial_test: bool) -> Vec<String> {
                         scope.record_binding(name, literal_after(tokens, i + 1));
                     }
                     if !scope.current() && !scope.in_catalog() && is_sensitive_identifier(name) {
-                        let hit = assigned_literal(tokens, i)
-                            .map(|literal| (literal, String::new()))
-                            .or_else(|| {
-                                binding_equals(tokens, i)
-                                    .and_then(|bind| wrapper_or_indirect(tokens, bind, &scope))
-                            });
-                        if let Some((literal, via)) = hit
-                            && !is_allowed_constant(&source.display_path, *line, name, &literal)
-                        {
-                            let suffix = if via.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (via {via})")
-                            };
-                            violations.push(format!(
-                                "{}:{}: [R1] hardcoded secret: `{name}` is set to the \
-                                 non-empty string literal `{literal}`{suffix}",
-                                source.display_path, line,
-                            ));
-                        }
+                        violations.extend(sensitive_binding_violations(
+                            tokens,
+                            i,
+                            name,
+                            *line,
+                            &scope,
+                            &source.display_path,
+                        ));
                     }
                     i += 1;
                 }
@@ -1582,6 +1699,59 @@ fn private_key_rule_requires_a_complete_block() {
         assert!(
             violations.is_empty(),
             "incomplete or non-key PEM text must pass [R2], got:\n{}",
+            violations.join("\n")
+        );
+    }
+}
+
+/// T1-4: a PEM block split across `concat!`/`format!` fragments used to
+/// escape [R2] — no single literal held the complete BEGIN+END+PRIVATE KEY
+/// triple, so each fragment passed the single-literal check. The fragment
+/// rule closes that: a sensitive binding assembled from `concat!`/`format!`
+/// is flagged when any fragment carries a PEM feature word (`BEGIN` or
+/// `PRIVATE KEY`). The check is deliberately conservative (a fragment marker
+/// flags even when the assembled text is no complete block) and applies only
+/// to sensitive bindings, so the label-driven writer pattern under a
+/// non-sensitive name stays unflagged — both registered in the gate header.
+#[test]
+fn concat_format_fragments_with_pem_material_are_flagged() {
+    let flagged: &[&str] = &[
+        // The split block: header, body, and footer across fragments.
+        "let password = concat!(\"-----BEGIN PRIVATE KEY-----\\n\", \"AAAA\\n\", \"-----END PRIVATE KEY-----\\n\");",
+        "let token = concat!(\"-----BEGIN RSA PRIVATE KEY-----\", \"AAAA\", \"-----END RSA PRIVATE KEY-----\");",
+        "let secret = format!(\"{}{}{}\", \"-----BEGIN EC PRIVATE KEY-----\", \"AAAA\", \"-----END EC PRIVATE KEY-----\");",
+        // A single feature fragment suffices — conservative by design.
+        "let api_key = concat!(\"-----BEGIN \", \"PRIVATE KEY-----\");",
+        "let session_token = format!(\"x {} y\", \"-----BEGIN\");",
+    ];
+    for sample in flagged {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("[R2]")),
+            "sample `{sample}` must be flagged by the [R2] fragment rule, got:\n{}",
+            violations.join("\n")
+        );
+    }
+    let passing: &[&str] = &[
+        // No fragment carries a PEM feature word.
+        "let password = concat!(prefix, suffix);",
+        "let password = format!(\"{}{}\", 1, 2);",
+        // The label-driven writer under a NON-sensitive name stays
+        // unflagged — the registered boundary of the fragment rule.
+        "let pem = concat!(\"-----BEGIN \", label, \"-----\");",
+        "let header = format!(\"-----BEGIN {label}-----\");",
+        // A PEM marker in a comment or prose literal is not a fragment.
+        "let password = concat!(\"a\", \"b\"); // -----BEGIN PRIVATE KEY-----",
+    ];
+    for sample in passing {
+        let violations = scan_source_sample(sample, false);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.contains("[R2]")),
+            "sample `{sample}` must not be flagged by the [R2] fragment rule, got:\n{}",
             violations.join("\n")
         );
     }

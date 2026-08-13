@@ -333,6 +333,52 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Reads the §13.7 failure classification of one operation (audit
+    /// follow-up E3-4: the site's `OperationCompleted` summary carries the
+    /// classification to the center).
+    ///
+    /// `None` for an unclassified operation and for an unknown operation id
+    /// — the kind is an optional fact, never a state. The stored code is
+    /// rehydrated through the domain [`FailureKind`] deserializer with the
+    /// same corrupt-aggregate rule as the batch-children listing: a code
+    /// this build cannot classify makes the read
+    /// [`OperationRepositoryError::Corrupt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or the
+    /// stored code violates domain invariants.
+    pub async fn find_failure_kind(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<FailureKind>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let model = operation::Entity::find_by_id(operation_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let Some(model) = model else {
+            return Ok(None);
+        };
+        model
+            .failure_kind
+            .as_deref()
+            .map(|code| {
+                code.parse::<FailureKind>()
+                    .map_err(StoredOperationError::InvalidFailureKind)
+                    .map_err(|source| corrupt(operation_id, source))
+            })
+            .transpose()
+    }
+
     /// Reads one complete operation aggregate by stable identity.
     ///
     /// The stored command payload (a ciphertext envelope decrypted under the
@@ -524,8 +570,9 @@ impl SqliteStore {
 
     /// Lists every operation, optionally restricted to one exact state.
     ///
-    /// The optional state filter backs the §13.6 restart recovery scan
-    /// (`WaitingRemote` and other in-flight states) and the §13.7 batch
+    /// The optional state filter backs the §13.6 recovery scan — the
+    /// scheduler's sweep re-lists the in-flight states every tick, which is
+    /// also what resumes them after a restart — and the §13.7 batch
     /// outcome summary, both of which need one exact-state query. Results are
     /// ordered by creation time and identity so recovery replays in
     /// acceptance order. Each listed row is rehydrated as a complete

@@ -43,6 +43,12 @@ impl StoredCapability {
     }
 }
 
+/// One batched capability-read result: every known requested endpoint's
+/// stored observations, keyed by endpoint in stable capability-code order (a
+/// known endpoint with no completed probe maps to an empty vector; an
+/// unknown endpoint is absent).
+pub type CapabilityObservationsByEndpoint = BTreeMap<EndpointId, Vec<StoredCapability>>;
+
 /// Loads the capability observations persisted for one endpoint.
 ///
 /// `Ok(None)` means the endpoint is unknown; `Ok(Some(vec![]))` means the
@@ -54,6 +60,43 @@ pub trait CapabilityQueryRepository: Send + Sync {
         &self,
         endpoint_id: EndpointId,
     ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>>;
+
+    /// Loads the capability observations persisted for several endpoints in
+    /// one query.
+    ///
+    /// The result maps every known endpoint to its observations in stable
+    /// capability-code order, with an endpoint that has no completed probe
+    /// mapped to an empty vector — the batch equivalent of the
+    /// single-endpoint `Ok(Some(vec![]))` — while an unknown endpoint stays
+    /// absent, the batch equivalent of `Ok(None)`. The §14.2 homepage
+    /// aggregate reads the whole fleet through this method instead of
+    /// fanning out one query per endpoint (the fan-out would amplify the
+    /// read surface linearly in the fleet size).
+    ///
+    /// The default implementation falls back to one
+    /// [`Self::find_endpoint_capabilities`] read per endpoint, so every
+    /// repository keeps the boundary working unchanged; a repository that
+    /// can read many endpoints in one statement overrides it with a single
+    /// query.
+    ///
+    /// Warning: a future implementer who overrides only the single-endpoint
+    /// read and forgets to override this batch method silently regresses the
+    /// §14.2 constant query surface — the batch method must be overridden as
+    /// well to preserve it.
+    fn find_endpoint_capabilities_batch<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<CapabilityObservationsByEndpoint, Self::Error>> {
+        Box::pin(async move {
+            let mut observations_by_endpoint = BTreeMap::new();
+            for endpoint_id in endpoint_ids {
+                if let Some(observations) = self.find_endpoint_capabilities(*endpoint_id).await? {
+                    observations_by_endpoint.insert(*endpoint_id, observations);
+                }
+            }
+            Ok(observations_by_endpoint)
+        })
+    }
 }
 
 impl<Repository> CapabilityQueryRepository for &Repository
@@ -67,6 +110,13 @@ where
         endpoint_id: EndpointId,
     ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
         Repository::find_endpoint_capabilities(*self, endpoint_id)
+    }
+
+    fn find_endpoint_capabilities_batch<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<CapabilityObservationsByEndpoint, Self::Error>> {
+        Repository::find_endpoint_capabilities_batch(*self, endpoint_ids)
     }
 }
 
@@ -349,6 +399,35 @@ mod tests {
         let query = EndpointCapabilityQuery::new(MockRepository::Unknown, EndpointId::generate());
 
         assert!(query.execute().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_batch_query_reads_every_endpoint_and_merges_the_observations()
+    -> Result<(), Box<dyn Error>> {
+        let first_id = EndpointId::generate();
+        let second_id = EndpointId::generate();
+        let observed = vec![stored(
+            EndpointCapability::Systems,
+            CapabilityState::Supported,
+        )];
+        let repository = MockRepository::Observed(observed.clone());
+
+        let batch = repository
+            .find_endpoint_capabilities_batch(&[first_id, second_id])
+            .await?;
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.get(&first_id), Some(&observed));
+        assert_eq!(batch.get(&second_id), Some(&observed));
+
+        // An endpoint with no completed probe still maps to an entry — the
+        // empty-vector half of the single-endpoint contract.
+        let unobserved = MockRepository::Observed(Vec::new());
+        let batch = unobserved
+            .find_endpoint_capabilities_batch(&[first_id])
+            .await?;
+        assert_eq!(batch.get(&first_id), Some(&Vec::new()));
         Ok(())
     }
 

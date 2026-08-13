@@ -40,7 +40,9 @@
 //! declared SHA-256 and marked `Ready`, or `Failed` on a digest mismatch
 //! (§14.3 明确失败).
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::path::PathBuf;
 
 use rutilus_center_protocol::{
     ArtifactChunk, ArtifactManifest, EndpointSnapshot, EnvelopeMessage, EventBatch, EventRecord,
@@ -384,6 +386,53 @@ pub trait CenterProjectionRepository: Send + Sync {
         endpoint_id: EndpointId,
         odata_id: &str,
     ) -> BoundaryFuture<'_, Result<bool, Self::Error>>;
+
+    /// Resolves the projection rows of many endpoint ids as one batch —
+    /// the §15.5 ownership preload of one event batch.
+    ///
+    /// The returned map holds exactly one entry per endpoint id that has a
+    /// projection row; ids without a row are absent. The default
+    /// implementation resolves every id through
+    /// [`Self::find_endpoint_projection`]; a store with batch query support
+    /// resolves the whole set with one `IN` lookup.
+    fn find_endpoint_projections<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<HashMap<EndpointId, CenterEndpointProjection>, Self::Error>>
+    {
+        Box::pin(async move {
+            let mut projections = HashMap::with_capacity(endpoint_ids.len());
+            for endpoint_id in endpoint_ids {
+                if let Some(projection) = self.find_endpoint_projection(*endpoint_id).await? {
+                    projections.insert(*endpoint_id, projection);
+                }
+            }
+            Ok(projections)
+        })
+    }
+
+    /// Appends many site-reported events as one batch (§15.5), deduplicated
+    /// by the §14.4 `(endpoint_id, dedup_key)` rule with the site
+    /// association recorded — the batch counterpart of
+    /// [`Self::upsert_event`].
+    ///
+    /// The default implementation appends every event through
+    /// [`Self::upsert_event`]; a store with batch write support appends the
+    /// whole batch under one write-gate acquisition and one transaction, so
+    /// a boundary failure re-delivers and re-applies every record of the
+    /// batch whole (the §15.4 at-least-once discipline).
+    fn upsert_events<'a>(
+        &'a self,
+        events: &'a [Event],
+        site: InstanceId,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            for event in events {
+                self.upsert_event(event, site).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 impl<Repository> CenterProjectionRepository for &Repository
@@ -464,6 +513,22 @@ where
     ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
         Repository::has_resource(*self, endpoint_id, odata_id)
     }
+
+    fn find_endpoint_projections<'a>(
+        &'a self,
+        endpoint_ids: &'a [EndpointId],
+    ) -> BoundaryFuture<'a, Result<HashMap<EndpointId, CenterEndpointProjection>, Self::Error>>
+    {
+        Repository::find_endpoint_projections(*self, endpoint_ids)
+    }
+
+    fn upsert_events<'a>(
+        &'a self,
+        events: &'a [Event],
+        site: InstanceId,
+    ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+        Repository::upsert_events(*self, events, site)
+    }
 }
 
 /// The content-frame boundary of the processor: the projection consumes
@@ -494,6 +559,10 @@ pub trait CenterContentConsumer: Send + Sync {
 pub struct CenterProjection<Store, Cursor> {
     store: Store,
     cursor: Cursor,
+    /// The single open artifact-file handle of the §15.5 chunk writes (see
+    /// [`OpenArtifactFile`]). Only the blocking chunk-write closure touches
+    /// it and never across an await, so the plain `Mutex` is safe.
+    artifact_handle: std::sync::Arc<std::sync::Mutex<Option<OpenArtifactFile>>>,
 }
 
 impl<Store, Cursor> CenterContentConsumer for CenterProjection<Store, Cursor>
@@ -516,8 +585,12 @@ where
 
 impl<Store, Cursor> CenterProjection<Store, Cursor> {
     #[must_use]
-    pub const fn new(store: Store, cursor: Cursor) -> Self {
-        Self { store, cursor }
+    pub fn new(store: Store, cursor: Cursor) -> Self {
+        Self {
+            store,
+            cursor,
+            artifact_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 }
 
@@ -694,6 +767,11 @@ where
     /// §14.4 dedup and the site association; a record that cannot be decoded
     /// — or that names an endpoint the site does not own — is logged and
     /// skipped without failing the batch.
+    ///
+    /// The batch is consumed as a unit: the §15.5 ownership preload of the
+    /// batch's endpoints is one batch lookup, and the surviving records are
+    /// appended as one batch write, instead of a query and a transaction per
+    /// record.
     async fn consume_event_batch(
         &self,
         site: &ResolvedSite,
@@ -707,51 +785,72 @@ where
         {
             return Ok(());
         }
+        // Decode every record first, so the rest of the batch — the
+        // ownership preload and the writes — runs on the decodable records
+        // only.
+        let mut events = Vec::new();
         for record in &batch.events {
-            let event = match decode_event(record, now) {
+            match decode_event(record, now) {
                 Err(reason) => {
-                    tracing::error!(
+                    // The record is a data defect, not a boundary failure,
+                    // exactly like every other absorbed frame: it is logged
+                    // at the same warn level as the delta-stream absorbs and
+                    // the batch cursor advances past it, so one bad record
+                    // can never wedge the event stream behind it (the §15.4
+                    // at-least-once absorption — the frame was consumed once).
+                    tracing::warn!(
                         "site {}: skipping event record {}: {reason}",
                         site.instance_id(),
                         record.event_id
                     );
-                    continue;
                 }
-                Ok(event) => event,
-            };
-            // §14.4 记录事件来源 with the §15.5 site scope: the event's
-            // endpoint must be a projection of the reporting site. A record
-            // that names an unknown endpoint, or an endpoint of another
-            // site, is logged and skipped exactly like an undecodable
-            // record — one site can never plant an event under another
-            // site's endpoint.
-            match self
-                .store
-                .find_endpoint_projection(event.endpoint_id())
-                .await
-                .map_err(CenterProjectionError::Projection)?
-            {
+                Ok(event) => events.push(event),
+            }
+        }
+        // §14.4 记录事件来源 with the §15.5 site scope: each event's
+        // endpoint must be a projection of the reporting site. The batch's
+        // endpoint ownership is resolved in one preload; a record that names
+        // an unknown endpoint, or an endpoint of another site, is logged and
+        // skipped exactly like an undecodable record — one site can never
+        // plant an event under another site's endpoint.
+        let endpoint_ids = events
+            .iter()
+            .map(Event::endpoint_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let projections = self
+            .store
+            .find_endpoint_projections(&endpoint_ids)
+            .await
+            .map_err(CenterProjectionError::Projection)?;
+        let mut owned = Vec::new();
+        for event in events {
+            match projections.get(&event.endpoint_id()) {
                 Some(projection) if projection.site_id() == Some(site.instance_id()) => {
-                    self.store
-                        .upsert_event(&event, site.instance_id())
-                        .await
-                        .map_err(CenterProjectionError::Projection)?;
+                    owned.push(event);
                 }
                 Some(_) => {
-                    tracing::error!(
+                    tracing::warn!(
                         "site {}: skipping event record {}: the endpoint belongs to another site",
                         site.instance_id(),
-                        record.event_id
+                        event.id()
                     );
                 }
                 None => {
-                    tracing::error!(
+                    tracing::warn!(
                         "site {}: skipping event record {}: the endpoint is not projected",
                         site.instance_id(),
-                        record.event_id
+                        event.id()
                     );
                 }
             }
+        }
+        if !owned.is_empty() {
+            self.store
+                .upsert_events(&owned, site.instance_id())
+                .await
+                .map_err(CenterProjectionError::Projection)?;
         }
         self.advance_cursor(site, SyncStream::Event, sequence, now)
             .await
@@ -936,16 +1035,19 @@ where
         // left Uploading forever).
         let path = self.store.artifact_file_path(artifact_id);
         let data = chunk.data.clone();
-        tokio::task::spawn_blocking(move || write_chunk_at(&path, offset, &data))
-            .await
-            .map_err(|source| CenterProjectionError::ArtifactFile {
-                artifact_id,
-                source: std::io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| CenterProjectionError::ArtifactFile {
-                artifact_id,
-                source,
-            })?;
+        let handles = std::sync::Arc::clone(&self.artifact_handle);
+        tokio::task::spawn_blocking(move || {
+            write_chunk_at(artifact_id, &path, offset, &data, &handles)
+        })
+        .await
+        .map_err(|source| CenterProjectionError::ArtifactFile {
+            artifact_id,
+            source: std::io::Error::other(source.to_string()),
+        })?
+        .map_err(|source| CenterProjectionError::ArtifactFile {
+            artifact_id,
+            source,
+        })?;
         if end < artifact.size_bytes() {
             self.store
                 .update_artifact(artifact_id, end, ArtifactState::Uploading, now)
@@ -968,17 +1070,12 @@ where
         now: OffsetDateTime,
     ) -> Result<(), ProjectionErrorOf<Store, Cursor>> {
         let path = self.store.artifact_file_path(artifact_id);
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-            .await
-            .map_err(|source| CenterProjectionError::ArtifactFile {
-                artifact_id,
-                source: std::io::Error::other(source.to_string()),
-            })?
-            .map_err(|source| CenterProjectionError::ArtifactFile {
+        let digest = hash_artifact_file(path).await.map_err(|source| {
+            CenterProjectionError::ArtifactFile {
                 artifact_id,
                 source,
-            })?;
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            }
+        })?;
         let artifact = self
             .store
             .find_artifact(artifact_id)
@@ -1249,6 +1346,45 @@ fn decode_manifest(
     ))
 }
 
+/// Hashes one artifact file under `spawn_blocking` (§7.8) and returns the
+/// digest in the raw 32-byte form for comparison with the declared value.
+///
+/// The file is read in 64 KiB heap-buffered passes, mirroring the site-side
+/// hash path, so a large artifact never loads into memory whole: the buffer
+/// must stay off the Tokio worker stack (§7.8), and a heap buffer keeps the
+/// worker's stack usage independent of the chosen read size.
+async fn hash_artifact_file(path: PathBuf) -> Result<[u8; 32], std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hasher.finalize().into())
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// One open artifact file of the §15.5 chunk write path.
+///
+/// The handle is reused across the in-order chunks of one transfer instead
+/// of opening the file per chunk; the slot holds at most one handle, so a
+/// chunk of another artifact closes the previous transfer's file before
+/// opening its own. The artifact file path is a pure function of the store
+/// location and the artifact identity, so a handle opened for an id is
+/// always the file that id's chunks belong to.
+struct OpenArtifactFile {
+    artifact_id: ArtifactId,
+    file: std::fs::File,
+}
+
 /// Writes one chunk at its exact offset in the artifact file; the blocking
 /// half of the §7.8 file I/O, mirroring the site-side upload flow. The
 /// artifact directory is created on demand: the manifest may outlive any
@@ -1256,18 +1392,51 @@ fn decode_manifest(
 /// to the offset and overwrites exactly that range, so a retried chunk (the
 /// §15.4 at-least-once retransmission) lands on the same bytes instead of
 /// duplicating them.
-fn write_chunk_at(path: &std::path::Path, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+///
+/// The transfer's open file handle is reused across its chunks: `handles`
+/// is the single-slot cache of the projection, holding the current
+/// transfer's handle, so every chunk after the first skips the `open` (and
+/// the directory creation), and a chunk of another artifact closes the
+/// previous file before opening its own. The reuse is safe because every
+/// write still seeks to the chunk's exact offset — a re-delivered chunk
+/// overwrites the same range whatever handle it runs through — and the slot
+/// is one handle, so the open-file count is bounded.
+fn write_chunk_at(
+    artifact_id: ArtifactId,
+    path: &std::path::Path,
+    offset: u64,
+    data: &[u8],
+    handles: &std::sync::Mutex<Option<OpenArtifactFile>>,
+) -> Result<(), std::io::Error> {
     use std::io::{Seek as _, SeekFrom, Write as _};
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let mut guard = handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Reuse the transfer's cached handle when the chunk belongs to the same
+    // artifact; a chunk of another artifact replaces the slot (the taken
+    // `Option` value is dropped right there, closing the previous file), so
+    // the open-file count stays bounded at one. A failed open leaves the
+    // slot empty and the next chunk retries.
+    if guard
+        .as_ref()
+        .is_none_or(|open| open.artifact_id != artifact_id)
+    {
+        *guard = None;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        *guard = Some(OpenArtifactFile { artifact_id, file });
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(data)
+    let open = guard
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("the artifact file handle is not cached"))?;
+    open.file.seek(SeekFrom::Start(offset))?;
+    open.file.write_all(data)
 }
 
 #[cfg(test)]
@@ -1311,6 +1480,13 @@ mod tests {
         endpoint_owners: Arc<Mutex<HashMap<EndpointId, InstanceId>>>,
         artifact_sites: Arc<Mutex<HashMap<ArtifactId, InstanceId>>>,
         artifact_dir: Arc<Mutex<Option<tempfile::TempDir>>>,
+        /// How many batch ownership preloads (`find_endpoint_projections`)
+        /// the batch consumer issued, so a test can pin the one-preload
+        /// restructure of `consume_event_batch`.
+        endpoint_ownership_preloads: Arc<Mutex<usize>>,
+        /// How many batch writes (`upsert_events`) the batch consumer
+        /// issued, so a test can pin the one-write restructure.
+        event_batch_writes: Arc<Mutex<usize>>,
     }
 
     impl MockProjectionState {
@@ -1325,7 +1501,25 @@ mod tests {
                 endpoint_owners: Arc::new(Mutex::new(HashMap::new())),
                 artifact_sites: Arc::new(Mutex::new(HashMap::new())),
                 artifact_dir: Arc::new(Mutex::new(None)),
+                endpoint_ownership_preloads: Arc::new(Mutex::new(0)),
+                event_batch_writes: Arc::new(Mutex::new(0)),
             }
+        }
+
+        /// How many batch ownership preloads the consumer issued.
+        fn endpoint_ownership_preloads(&self) -> usize {
+            self.endpoint_ownership_preloads
+                .lock()
+                .map(|calls| *calls)
+                .unwrap_or_default()
+        }
+
+        /// How many batch event writes the consumer issued.
+        fn event_batch_writes(&self) -> usize {
+            self.event_batch_writes
+                .lock()
+                .map(|calls| *calls)
+                .unwrap_or_default()
         }
 
         /// Registers `endpoint_id` as a projection owned by `site`, so the
@@ -1562,6 +1756,54 @@ mod tests {
             _odata_id: &str,
         ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
             Box::pin(async move { Ok(false) })
+        }
+
+        fn find_endpoint_projections<'a>(
+            &'a self,
+            endpoint_ids: &'a [EndpointId],
+        ) -> BoundaryFuture<'a, Result<HashMap<EndpointId, CenterEndpointProjection>, Self::Error>>
+        {
+            let endpoint_ids = endpoint_ids.to_vec();
+            Box::pin(async move {
+                *self
+                    .state
+                    .endpoint_ownership_preloads
+                    .lock()
+                    .map_err(|_| MockStoreError)? += 1;
+                let owners = self
+                    .state
+                    .endpoint_owners
+                    .lock()
+                    .map_err(|_| MockStoreError)?;
+                Ok(endpoint_ids
+                    .into_iter()
+                    .filter_map(|endpoint_id| {
+                        owners.get(&endpoint_id).copied().map(|site| {
+                            (
+                                endpoint_id,
+                                CenterEndpointProjection::new(endpoint_id, Some(site)),
+                            )
+                        })
+                    })
+                    .collect())
+            })
+        }
+
+        fn upsert_events<'a>(
+            &'a self,
+            events: &'a [Event],
+            _site: InstanceId,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async move {
+                *self
+                    .state
+                    .event_batch_writes
+                    .lock()
+                    .map_err(|_| MockStoreError)? += 1;
+                let mut stored = self.state.events.lock().map_err(|_| MockStoreError)?;
+                stored.extend(events.iter().cloned());
+                Ok(())
+            })
         }
     }
 
@@ -1982,6 +2224,10 @@ mod tests {
         );
         assert_eq!(events[0].event_timestamp().unix_timestamp(), 1_699_999_990);
         assert_eq!(events[0].observed_at(), now);
+        // The batch was consumed as a unit: one ownership preload and one
+        // batch write for the whole batch.
+        assert_eq!(state.endpoint_ownership_preloads(), 1);
+        assert_eq!(state.event_batch_writes(), 1);
         // The event stream cursor advanced past the batch.
         let stored = cursor
             .get(site.instance_id(), SyncStream::Event)
@@ -2337,6 +2583,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interleaved_artifact_transfers_never_mix_their_bytes() -> Result<(), Box<dyn Error>> {
+        let (store, state) = MockProjectionStore::new();
+        let cursor = MockCursor::new();
+        let projection = CenterProjection::new(store, cursor);
+        let site = resolved_site();
+        let now = base_time();
+        let bytes = chunked_payload();
+        let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let mut second_bytes = chunked_payload();
+        second_bytes[0] ^= 0xFF;
+        let second_digest: [u8; 32] = sha2::Sha256::digest(&second_bytes).into();
+
+        // Two manifests on their own sequences — a shared sequence would be
+        // skipped as already processed. The first transfer reuses the
+        // declare helper's sequence 1; the second is declared on sequence 2.
+        let first_id =
+            declare_artifact(&projection, &site, "first.bin", &bytes, digest, now).await?;
+        let second_id = ArtifactId::generate();
+        projection
+            .on_frame(
+                &site,
+                2,
+                &EnvelopeMessage::ArtifactManifest(ArtifactManifest {
+                    artifact_id: second_id.to_string(),
+                    name: String::from("second.bin"),
+                    total_bytes: second_bytes.len() as u64,
+                    sha256: second_digest.to_vec(),
+                }),
+                now,
+            )
+            .await?;
+
+        // The two transfers' chunks alternate, exactly as two artifacts
+        // interleave on the wire. The single-slot file handle is evicted
+        // and re-opened per transfer; each file must still end with exactly
+        // its own bytes and its own digest verification.
+        let chunk_size = usize::try_from(CENTER_ARTIFACT_CHUNK_SIZE)?;
+        let mut sequence = 3;
+        for (index, (first_chunk, second_chunk)) in bytes
+            .chunks(chunk_size)
+            .zip(second_bytes.chunks(chunk_size))
+            .enumerate()
+        {
+            for (artifact_id, payload) in [(first_id, first_chunk), (second_id, second_chunk)] {
+                projection
+                    .on_frame(
+                        &site,
+                        sequence,
+                        &chunk_frame(
+                            artifact_id,
+                            u32::try_from(index).unwrap_or(u32::MAX),
+                            payload.to_vec(),
+                        ),
+                        now + Duration::SECOND,
+                    )
+                    .await?;
+                sequence += 1;
+            }
+        }
+
+        for artifact_id in [first_id, second_id] {
+            let stored = state
+                .find_artifact_owned(artifact_id)
+                .ok_or("the artifact is missing")?;
+            assert_eq!(stored.state(), ArtifactState::Ready);
+            assert_eq!(stored.uploaded_bytes(), bytes.len() as u64);
+        }
+        assert_eq!(
+            state.artifact_bytes(first_id),
+            bytes,
+            "the first transfer must land on its own file"
+        );
+        assert_eq!(
+            state.artifact_bytes(second_id),
+            second_bytes,
+            "the second transfer must land on its own file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn event_timestamps_within_the_clock_tolerance_are_accepted() -> Result<(), Box<dyn Error>>
     {
         let (store, state) = MockProjectionStore::new();
@@ -2436,10 +2763,14 @@ mod tests {
 
         // Only the endpoint the reporting site owns is stored; the foreign
         // and unknown records are logged and skipped without failing the
-        // batch, and the cursor advances past all three.
+        // batch, and the cursor advances past all three. The whole batch
+        // was one ownership preload (the three distinct endpoints) and one
+        // batch write.
         let events = state.events_owned();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].endpoint_id(), owned);
+        assert_eq!(state.endpoint_ownership_preloads(), 1);
+        assert_eq!(state.event_batch_writes(), 1);
         let stored = cursor
             .get(site.instance_id(), SyncStream::Event)
             .await?

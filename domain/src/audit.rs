@@ -287,6 +287,14 @@ stable_audit_codes! {
         // wrong password, a wrong or replayed TOTP code, or a rate-limited
         // refusal (§16.2 "登录失败限速").
         AuthenticationFailed => "authentication-failed",
+        // The §13.3 step 2 capability pre-flight proved the endpoint cannot
+        // serve the write: the required capability is not compiled, not
+        // advertised, schema-incompatible, or read-only. The refusal is a
+        // fact about the endpoint's capability, not about redfish
+        // discovery, so it is audited under its own kind (audit follow-up
+        // E3-4), mirroring the `FailureKind::CapabilityUnsupported`
+        // classification of the same refusal.
+        CapabilityUnsupported => "capability-unsupported",
     }
 }
 
@@ -1165,6 +1173,7 @@ mod tests {
             AuditFailure::CsvInvalid,
             AuditFailure::EndpointImportRowFailed,
             AuditFailure::AuthenticationFailed,
+            AuditFailure::CapabilityUnsupported,
         ]);
         assert_eq!(
             "unknown".parse::<AuditAction>(),

@@ -67,7 +67,11 @@ use rutilus_web::{
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::{net::TcpListener, sync::oneshot, task::spawn_blocking};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, oneshot},
+    task::spawn_blocking,
+};
 use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
 
@@ -79,6 +83,38 @@ use crate::{
 /// Defensive upper bound for the in-memory recent-audit tail served by the
 /// Standalone console until persistence exposes a bounded listing query.
 const AUDIT_TAIL_EVENTS: usize = 1024;
+
+/// The application-side cap on concurrent Argon2id derivations (P4-12).
+///
+/// Every derivation the request surface runs — the sign-in verification, the
+/// dummy verification of the unknown-user branches (`web/src/auth.rs`), the
+/// password-change verification and derivation, the bootstrap-claim
+/// derivation, and the administrator set-password derivation
+/// (`web/src/auth.rs`) — allocates [`rutilus_domain::ARGON2ID_MEMORY_KIB`]
+/// (64 MiB) of memory while it runs. The blocking pool alone would run any
+/// number of
+/// them concurrently, so a sign-in burst across many usernames could
+/// allocate unbounded Argon2id memory at once. This cap bounds the
+/// *derivation* concurrency instead: at most [`MAX_CONCURRENT_PASSWORD_DERIVATIONS`]
+/// derivations are in flight, so the peak concurrent derivation memory is
+/// 4 × 64 MiB = 256 MiB no matter how many attempts queue, and every excess
+/// attempt waits for a slot rather than allocating. The gate sits outside
+/// `spawn_blocking` on purpose (§7.8): it limits the derivations, never the
+/// blocking pool's other work.
+const MAX_CONCURRENT_PASSWORD_DERIVATIONS: usize = 4;
+
+/// The process-wide derivation gate of [`MAX_CONCURRENT_PASSWORD_DERIVATIONS`].
+///
+/// One gate serves every posture (Standalone, Site, Center) and every
+/// authenticated instance in the process — the runtime lock guarantees a
+/// single instance anyway, and a process-wide gate is exactly what the
+/// memory bound means. The permit is acquired before the `spawn_blocking`
+/// dispatch and held until the derivation completes, so at most the
+/// constant's worth of blocking-pool threads are ever busy with Argon2id
+/// work; excess callers wait in the gate, occupying no blocking-pool
+/// thread.
+static PASSWORD_DERIVATION_SLOTS: Semaphore =
+    Semaphore::const_new(MAX_CONCURRENT_PASSWORD_DERIVATIONS);
 
 /// The bounded grace period for in-flight HTTP requests once a shutdown
 /// signal resolves (N2-2): the server stops accepting and gives the
@@ -615,9 +651,15 @@ impl AuthServices for StandaloneState {
         // never on a worker thread. The `JoinError` arm fails closed: a
         // panicked worker is a wrong-password verdict, which is also the
         // fail-closed choice for the login rate limiter.
+        //
+        // P4-12: the derivation gate is acquired *before* the blocking-pool
+        // dispatch, so a sign-in burst queues here instead of running more
+        // than `MAX_CONCURRENT_PASSWORD_DERIVATIONS` derivations at once;
+        // the permit is held until the derivation completes.
         let hash = hash.clone();
         let password = SecretString::from(password.expose_secret().to_owned());
         Box::pin(async move {
+            let _permit = PASSWORD_DERIVATION_SLOTS.acquire().await;
             spawn_blocking(move || verify_password(&hash, &password))
                 .await
                 .unwrap_or(false)
@@ -643,8 +685,14 @@ impl AuthServices for StandaloneState {
         // a worker thread. A panicked worker surfaces as a boundary error —
         // the handlers treat it as the 500 the derivation failure already
         // is.
+        //
+        // P4-12: the derivation gate is acquired *before* the blocking-pool
+        // dispatch, exactly like [`Self::verify_password_async`], so the
+        // bootstrap-claim and password-change derivations queue behind the
+        // same cap; the permit is held until the derivation completes.
         let password = SecretString::from(password.expose_secret().to_owned());
         Box::pin(async move {
+            let _permit = PASSWORD_DERIVATION_SLOTS.acquire().await;
             spawn_blocking(move || hash_password(&password))
                 .await
                 .map_err(StandaloneAuthError::HashWorker)?
@@ -2250,7 +2298,9 @@ mod tests {
         BoundaryFuture, CoreResourceReadOutcome, CoreResourceReader, EndpointDiscovery,
         RedfishDiscovery, TlsIdentityObservation, TlsIdentityProbe,
     };
-    use rutilus_domain::{CredentialUsername, EndpointAddress, TlsTrust};
+    use rutilus_domain::{
+        ARGON2ID_HASH_LENGTH, ARGON2ID_SALT_LENGTH, CredentialUsername, EndpointAddress, TlsTrust,
+    };
     use secrecy::SecretString;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -2641,6 +2691,105 @@ mod tests {
             StandaloneRunOptions::new(false, TelemetryRetention::try_new(3)?).telemetry_retention(),
             TelemetryRetention::try_new(3)?
         );
+        Ok(())
+    }
+
+    /// P4-12: the derivation gate queues excess Argon2id work — at most
+    /// [`MAX_CONCURRENT_PASSWORD_DERIVATIONS`] derivations are ever in
+    /// flight, and a freed slot advances exactly one queued caller, so a
+    /// sign-in burst cannot multiply the 64 MiB per-derivation memory
+    /// without bound.
+    #[tokio::test]
+    async fn password_derivations_queue_beyond_the_concurrency_cap() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+
+        // A fixed hash lets the verification run the full Argon2id
+        // computation (the wrong-password cost of the real branch) without
+        // a derivation of its own.
+        let Ok(hash) =
+            Argon2IdHash::from_parts(&[0x11; ARGON2ID_SALT_LENGTH], &[0x22; ARGON2ID_HASH_LENGTH])
+        else {
+            return Err("the fixed derivation-hash parts are invalid".into());
+        };
+        let password: SecretString = "correct horse battery staple".to_owned().into();
+
+        // Hold every slot: four derivations are already in flight.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_PASSWORD_DERIVATIONS {
+            let Ok(permit) = PASSWORD_DERIVATION_SLOTS.acquire().await else {
+                return Err("the derivation gate is closed".into());
+            };
+            held.push(permit);
+        }
+
+        // Two excess derivations — one verification, one derivation, the two
+        // async boundary forms — queue behind the cap and record their
+        // completion on the shared counter.
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut queued = Vec::new();
+        for derive in [false, true] {
+            let state = Arc::clone(&instance.state);
+            let hash = hash.clone();
+            let password = SecretString::from(password.expose_secret().to_owned());
+            let completed = Arc::clone(&completed);
+            queued.push(tokio::spawn(async move {
+                if derive {
+                    let _ = state.hash_password_async(&password).await;
+                } else {
+                    let _ = state.verify_password_async(&hash, &password).await;
+                }
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+
+        // Neither can start while every slot is held: with the cap fully
+        // occupied, the excess derivations stay queued and no completion can
+        // arrive inside the probe window.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an excess derivation ran despite every slot of the cap being held"
+        );
+
+        // Releasing one slot advances exactly one queued derivation; the
+        // other still waits.
+        held.pop();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while completed.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a freed slot must serve exactly one queued derivation"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a freed slot served more than one queued derivation"
+        );
+
+        // The remaining slots release the rest of the queue.
+        held.clear();
+        for handle in queued {
+            handle.await?;
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every queued derivation must complete once slots free"
+        );
+
+        instance.close().await?;
+        drop(directory);
         Ok(())
     }
 

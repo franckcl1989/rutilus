@@ -418,7 +418,10 @@ pub trait AuthServices: Send + Sync {
     /// the derivation with `tokio::task::spawn_blocking`; the default must
     /// not be used on a live request path. A panicked worker fails closed:
     /// the `JoinError` maps to a wrong-password verdict, which is also the
-    /// fail-closed choice for the login rate limiter.
+    /// fail-closed choice for the login rate limiter. The embedding runtime
+    /// also bounds how many derivations it dispatches at once (each
+    /// allocates the pinned 64 MiB), so a burst of sign-in attempts queues
+    /// behind that bound instead of multiplying the memory (P4-12).
     fn verify_password_async<'a>(
         &'a self,
         hash: &'a Argon2IdHash,
@@ -460,7 +463,9 @@ pub trait AuthServices: Send + Sync {
     /// the derivation with `tokio::task::spawn_blocking`; the default must
     /// not be used on a live request path. The `JoinError` of a panicked
     /// worker maps into [`Self::Error`] like any other derivation failure —
-    /// the handlers treat it as the 500 the boundary failure already is.
+    /// the handlers treat it as the 500 the boundary failure already is. The
+    /// embedding runtime bounds the dispatched derivations through the same
+    /// gate as [`Self::verify_password_async`] (P4-12).
     fn hash_password_async<'a>(
         &'a self,
         password: &'a SecretString,
@@ -3002,6 +3007,348 @@ mod tests {
         }
     }
 
+    /// The §16.1 access one Edge route kind declares — the permission-level
+    /// half of the route gate (T1-1). The kinds are the dispatch keys of the
+    /// route registry, so this match is the exhaustive declaration of what
+    /// every registered Edge route may do; the gate below asserts that
+    /// resolving the route through [`ROUTE_TABLE`] (with the same
+    /// [`route_access`] matcher the middleware uses) yields exactly this
+    /// access. The declaration is one arm per kind, asserted verbatim — the
+    /// line count is inherent to the enumeration.
+    #[allow(clippy::too_many_lines)]
+    fn expected_edge_access(kind: crate::EdgeRouteKind) -> RouteAccess {
+        use crate::EdgeRouteKind as Kind;
+        use RoleMask as Roles;
+        // Same-body arms are the intent itself: the declarative per-kind
+        // permission assertion lists every kind separately, so identical
+        // bodies are the semantics, not duplication.
+        #[allow(clippy::match_same_arms)]
+        match kind {
+            // The public sign-in surface.
+            Kind::Health => RouteAccess::Public,
+            Kind::About => RouteAccess::Public,
+            Kind::Login => RouteAccess::Public,
+            Kind::BootstrapComplete => RouteAccess::Public,
+            Kind::Me => RouteAccess::Public,
+            // The session-bound authentication surface (every mode).
+            Kind::Logout => RouteAccess::Always {
+                roles: Roles::ANY,
+                mutation: true,
+            },
+            Kind::ChangePassword => RouteAccess::Always {
+                roles: Roles::ANY,
+                mutation: true,
+            },
+            // The §16.1 administration surface (Administrator only).
+            Kind::ListSessions => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: false,
+            },
+            Kind::RevokeSession => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::ListUsers => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: false,
+            },
+            Kind::CreateUser => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::SetUserState => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::AssignUserRole => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::SetUserPassword => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            // The audit view (§16.1 Administrator and Operator).
+            Kind::AuditQuery => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: false,
+            },
+            // Operation submission and artifact upload are Administrator and
+            // Operator; the operation, batch, and artifact reads are every
+            // role (§16.1).
+            Kind::CreateOperation => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: true,
+            },
+            Kind::ListOperations => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::OperationDetail => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::ListBatches => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::BatchDetail => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::CreateArtifact => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: true,
+            },
+            Kind::ListArtifacts => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::AppendArtifactChunk => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: true,
+            },
+            Kind::FinalizeArtifact => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: true,
+            },
+            Kind::ArtifactDetail => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            // Credentials are Administrator only (§16.1).
+            Kind::CredentialInventory => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: false,
+            },
+            Kind::CreateCredential => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            // Trust, import, enrollment, and refresh are Administrator only.
+            Kind::BeginEndpointTrust => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::ConfirmEndpointTrust => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::EnrollEndpoint => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::ImportEndpointsCsv => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::RefreshEndpoints => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            // Endpoint reads are every role.
+            Kind::EndpointInventory => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::EndpointResources => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::ResourceDiagnostics => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::EndpointCapabilities => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            // Group and tag views are every role; writes are Administrator.
+            Kind::GroupInventory => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::CreateGroup => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::GroupDetail => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::DeleteGroup => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::AddGroupMember => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::RemoveGroupMember => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::TagInventory => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::AssignTag => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::RemoveTag => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            // Events, telemetry, and the §14.2 homepage overview are every
+            // role.
+            Kind::EventQuery => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::TelemetrySeries => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::TelemetrySamples => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::Overview => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+        }
+    }
+
+    /// The §16.1 access one Center route kind declares (T1-1) — the Center
+    /// counterpart of [`expected_edge_access`]. The Center console shares
+    /// the authentication and administration surface with the Edge console
+    /// and adds the §15.5/§15.6 management routes; the center operation
+    /// submission is Administrator and Operator, the binding management
+    /// Administrator only, and every center view every role (§16.1 管理中心
+    /// 绑定).
+    fn expected_center_access(kind: crate::CenterRouteKind) -> RouteAccess {
+        use crate::CenterRouteKind as Kind;
+        use RoleMask as Roles;
+        // Same-body arms are the intent itself: the declarative per-kind
+        // permission assertion lists every kind separately, so identical
+        // bodies are the semantics, not duplication.
+        #[allow(clippy::match_same_arms)]
+        match kind {
+            Kind::Health => RouteAccess::Public,
+            Kind::About => RouteAccess::Public,
+            Kind::Login => RouteAccess::Public,
+            Kind::BootstrapComplete => RouteAccess::Public,
+            Kind::Me => RouteAccess::Public,
+            Kind::Logout => RouteAccess::Always {
+                roles: Roles::ANY,
+                mutation: true,
+            },
+            Kind::ChangePassword => RouteAccess::Always {
+                roles: Roles::ANY,
+                mutation: true,
+            },
+            Kind::ListSessions => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: false,
+            },
+            Kind::RevokeSession => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::ListUsers => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: false,
+            },
+            Kind::CreateUser => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::SetUserState => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::AssignUserRole => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::SetUserPassword => RouteAccess::Always {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::AuditQuery => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: false,
+            },
+            // The §15.5/§15.6 center surface: views are every role (the
+            // handlers apply the D3 site scope of the actor's assignment),
+            // binding management is Administrator only, and center operation
+            // submission is Administrator and Operator (§16.1).
+            Kind::CenterSites => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::CenterEndpoints => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::CenterOperations => RouteAccess::GuardedOnly {
+                roles: Roles::ANY,
+                mutation: false,
+            },
+            Kind::RegisterCenterSite => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::RevokeCenterBinding => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_ONLY,
+                mutation: true,
+            },
+            Kind::SubmitCenterOperation => RouteAccess::GuardedOnly {
+                roles: Roles::ADMINISTRATOR_OR_OPERATOR,
+                mutation: true,
+            },
+        }
+    }
+
+    /// T1-1: the wildcard coverage gate above proves *that* every route is
+    /// named by the table — not that the naming entry grants the route's
+    /// permission level. A route nested under a prefix whose wildcard entry
+    /// grants more than the route's kind declares (a narrow new write under
+    /// an every-role read prefix, say) would pass the coverage gate while
+    /// the middleware actually resolves it to the broader access. This gate
+    /// closes that gap: for every registered route of both consoles, the
+    /// access resolved through the same [`route_access`] matcher the
+    /// middleware uses must equal exactly the access its kind declares in
+    /// [`expected_edge_access`]/[`expected_center_access`]. The 14 wildcard
+    /// entries keep their coverage semantics — this gate only demands that
+    /// every route they cover resolves to the access its kind declares, so
+    /// a wildcard may only grant what every route under it declares.
+    #[test]
+    fn every_registered_route_resolves_to_the_permission_its_kind_declares() {
+        for (method, path, kind) in crate::EDGE_ROUTES {
+            let resolved = edge_access(method, path);
+            let declared = expected_edge_access(*kind);
+            assert_eq!(
+                resolved, declared,
+                "the registered Edge route {method} {path} ({kind:?}) resolves to \
+                 {resolved:?}, but its kind declares {declared:?}: a wildcard entry must \
+                 not grant more than the route's permission level"
+            );
+        }
+        for (method, path, kind) in crate::CENTER_ROUTES {
+            let resolved = center_access(method, path);
+            let declared = expected_center_access(*kind);
+            assert_eq!(
+                resolved, declared,
+                "the registered Center route {method} {path} ({kind:?}) resolves to \
+                 {resolved:?}, but its kind declares {declared:?}: a wildcard entry must \
+                 not grant more than the route's permission level"
+            );
+        }
+    }
+
     #[test]
     fn constant_time_comparison_detects_any_difference() {
         let left = [0x5a_u8; 32];
@@ -3449,6 +3796,23 @@ mod tests {
         // branches each actually perform their verification — is asserted
         // at the route level in web/src/lib.rs, where the mock services
         // count `verify_password` calls.)
+        //
+        // The byte values are pinned by hardcoded literal comparison, not
+        // by reference: a self-proving assertion against `DUMMY_SALT`
+        // itself would pass no matter what the constant held. The dummy
+        // must never become random, per-call, or derived from any real
+        // credential's material — changing either constant to anything but
+        // the pinned `0x1a`/`0x2b` patterns fails here even though every
+        // other assertion would still hold. The lengths stay bound to the
+        // domain constants so the `argon2id-1` parameters cannot drift.
+        assert_eq!(
+            DUMMY_SALT, [0x1a; ARGON2ID_SALT_LENGTH],
+            "the dummy salt must stay the pinned byte pattern"
+        );
+        assert_eq!(
+            DUMMY_HASH, [0x2b; ARGON2ID_HASH_LENGTH],
+            "the dummy hash must stay the pinned byte pattern"
+        );
         let dummy = Argon2IdHash::from_parts(&DUMMY_SALT, &DUMMY_HASH)
             .map_err(|_| "the pinned dummy salt and hash lengths are invalid")?;
         assert_eq!(dummy.salt(), &DUMMY_SALT);

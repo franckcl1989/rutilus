@@ -66,6 +66,17 @@
 //! the use case surfaces the wall-clock anomaly as a controlled failure and
 //! the sampling loop records it, instead of silently stamping history with a
 //! time that never existed.
+//!
+//! A regressed clock can persist across many sweeps, and every refused sweep
+//! would otherwise storm the operational log with one identical error per
+//! endpoint. The use case therefore tracks consecutive refusals: each
+//! refusal is still refused with the same classification and the same
+//! monotonic semantics, but [`TelemetrySampler::is_refusal_repeated`] tells
+//! the caller whether the refusal repeats the one before it, so the sampling
+//! loop can log the first refusal as an error and every repeat as a warn
+//! that the refusal persists until the clock catches up. The
+//! [`TelemetrySamplerError::CutoffUnderflow`] refusal of the prune gets the
+//! same consecutive-refusal treatment.
 
 use std::{
     error::Error,
@@ -477,6 +488,46 @@ pub struct TelemetrySampler<Reader, Store, Time> {
     /// stamp guard. A `Mutex` because the boundary methods take `&self`; the
     /// lock is held only for the compare-and-store of one tick instant.
     last_sample_instant: Mutex<Option<OffsetDateTime>>,
+    /// The consecutive-refusal dedupe state of the monotonic guard (see the
+    /// module doc): the refusal that persists across sweeps is reported once,
+    /// and every repeat is flagged through
+    /// [`TelemetrySampler::is_refusal_repeated`] so the sampling loop can
+    /// downgrade its logging instead of storming the log. The lock is held
+    /// only for the compare-and-store of one call's verdict.
+    refusals: Mutex<RefusalState>,
+}
+
+/// The kind of one monotonic-guard refusal, for the consecutive-refusal
+/// dedupe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalKind {
+    /// [`TelemetrySamplerError::ClockRollback`]: a regressed sampling
+    /// instant refused by [`TelemetrySampler::accept_instant`].
+    ClockRollback,
+    /// [`TelemetrySamplerError::CutoffUnderflow`]: a prune cutoff predating
+    /// the `OffsetDateTime` range.
+    CutoffUnderflow,
+}
+
+/// The consecutive-refusal dedupe state of the monotonic guard, one bit per
+/// refusal site.
+///
+/// A refusal "continues" when the immediately previous call at the same site
+/// was refused too — the same clock anomaly persisting across sweeps. A call
+/// at the other site neither continues nor breaks the chain: the sample
+/// path's refusals and the prune path's underflows are independent conditions
+/// that each clear only when their own site succeeds again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RefusalState {
+    /// The previous sampling call was also refused by the rollback guard.
+    rollback_continued: bool,
+    /// The previous prune call also underflowed the retention cutoff.
+    underflow_continued: bool,
+    /// The verdict of the most recent sampling or prune call: whether it
+    /// repeated the refusal of the call before it. `false` when the call was
+    /// accepted or failed for a reason other than the clock guard, so the
+    /// sampling loop can consult it after any failed call.
+    repeated_refusal: bool,
 }
 
 impl<Reader, Store, Time> TelemetrySampler<Reader, Store, Time>
@@ -492,6 +543,11 @@ where
             store,
             clock,
             last_sample_instant: Mutex::new(None),
+            refusals: Mutex::new(RefusalState {
+                rollback_continued: false,
+                underflow_continued: false,
+                repeated_refusal: false,
+            }),
         }
     }
 
@@ -598,11 +654,64 @@ where
             // interleave out-of-order rows into the series timeline.
             // Refusing the tick — the `CutoffUnderflow` style: a classified
             // failure the sampling loop records — keeps the history
-            // monotonic without falsifying any stamp.
+            // monotonic without falsifying any stamp. The refusal is
+            // recorded for the consecutive-refusal dedupe before it returns.
+            self.note_refusal(RefusalKind::ClockRollback);
             return Err(TelemetrySamplerError::ClockRollback { previous, now });
         }
         *last_instant = Some(now);
+        // The clock is sane again: the rollback chain clears and the next
+        // refusal is a fresh condition.
+        self.clear_refusal(RefusalKind::ClockRollback);
         Ok(())
+    }
+
+    /// Records one monotonic-guard refusal for the consecutive-refusal
+    /// dedupe: the same kind refusing again is flagged as a repeat, so the
+    /// sampling loop downgrades its logging until the clock catches up.
+    fn note_refusal(&self, kind: RefusalKind) {
+        let mut refusals = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
+        let continued = match kind {
+            RefusalKind::ClockRollback => &mut refusals.rollback_continued,
+            RefusalKind::CutoffUnderflow => &mut refusals.underflow_continued,
+        };
+        let repeated = *continued;
+        *continued = true;
+        refusals.repeated_refusal = repeated;
+    }
+
+    /// Records that the call at one monotonic-guard site succeeded: the
+    /// condition is over, so the next refusal of that kind is fresh again.
+    ///
+    /// A call at the other site leaves the chain untouched — the rollback
+    /// chain survives a successful prune and the underflow chain survives a
+    /// successful sampling, because each site's anomaly clears only when
+    /// that site proves the clock sane again.
+    fn clear_refusal(&self, kind: RefusalKind) {
+        let mut refusals = self.refusals.lock().unwrap_or_else(PoisonError::into_inner);
+        match kind {
+            RefusalKind::ClockRollback => refusals.rollback_continued = false,
+            RefusalKind::CutoffUnderflow => refusals.underflow_continued = false,
+        }
+        refusals.repeated_refusal = false;
+    }
+
+    /// Whether the most recent sampling or prune call repeated the clock
+    /// refusal of the call before it — the consecutive-refusal dedupe signal
+    /// (see the module doc).
+    ///
+    /// The verdict is `false` when the most recent call did not refuse: an
+    /// accepted call, or a failure that is not a clock anomaly — so the
+    /// sampling loop can consult it after any failed call and log a fresh
+    /// error exactly once per anomaly. Each call updates the verdict
+    /// synchronously before returning, so the loop's query right after a
+    /// failed call sees that call's verdict.
+    #[must_use]
+    pub fn is_refusal_repeated(&self) -> bool {
+        self.refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .repeated_refusal
     }
 
     /// Prunes every sample older than the retention window (design §14.4:
@@ -621,11 +730,19 @@ where
         &self,
         retention: time::Duration,
     ) -> Result<(), TelemetrySamplerError<Reader::Error, Store::Error>> {
-        let cutoff = self
-            .clock
-            .now()
-            .checked_sub(retention)
-            .ok_or(TelemetrySamplerError::CutoffUnderflow)?;
+        let Some(cutoff) = self.clock.now().checked_sub(retention) else {
+            // The `CutoffUnderflow` refusal gets the same
+            // consecutive-refusal treatment as the rollback guard: the
+            // clock predates the retention window, the prune cannot cut
+            // any history, and the repeat is flagged for the loop's
+            // downgraded logging until the clock recovers.
+            self.note_refusal(RefusalKind::CutoffUnderflow);
+            return Err(TelemetrySamplerError::CutoffUnderflow);
+        };
+        // The cutoff computed: the clock is sane again, so the underflow
+        // chain clears even if the store call below fails — a store failure
+        // is not a clock anomaly.
+        self.clear_refusal(RefusalKind::CutoffUnderflow);
         self.store
             .prune_before(cutoff)
             .await
@@ -725,7 +842,7 @@ mod tests {
         ResourceId, ResourceODataId, ResourceSnapshot, ResourceSnapshotPayload, TlsCertificate,
         TlsTrust,
     };
-    use time::{Duration, OffsetDateTime};
+    use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
     use super::*;
     use crate::EndpointInventoryItem;
@@ -736,6 +853,13 @@ mod tests {
     /// is spelled out in the payload fixtures.
     fn instant(days: i64) -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::days(days)
+    }
+
+    /// The earliest representable product-clock instant: subtracting any
+    /// positive retention underflows the `OffsetDateTime` range, so the
+    /// prune refuses with `CutoffUnderflow`.
+    fn earliest_instant() -> OffsetDateTime {
+        PrimitiveDateTime::MIN.assume_utc()
     }
 
     fn endpoint() -> Result<Endpoint, Box<dyn Error>> {
@@ -1090,6 +1214,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sustained_rollback_refusals_are_deduplicated_until_the_clock_recovers()
+    -> Result<(), Box<dyn Error>> {
+        // A product clock that stays regressed refuses every sweep, and the
+        // consecutive-refusal verdict lets the loop log the first refusal as
+        // an error and each repeat as a warn — one error, not an unbounded
+        // per-endpoint-per-sweep storm. A refusal that the clock recovers
+        // from is over; a fresh regression after recovery is new again.
+        let endpoint_id = EndpointId::generate();
+        let series = MetricReportValues::try_new(
+            SeriesKey::parse("PowerMetrics")?,
+            vec![MetricReportReading::new(None, 100.0)],
+        )?;
+        let store = RecordingStore::new();
+        let sampler = TelemetrySampler::new(
+            FakeReader::with_reports(vec![series]),
+            &store,
+            FixedClock(instant(30)),
+        );
+
+        sampler.sample_endpoint(endpoint_id, instant(30)).await?;
+        let Err(error) = sampler.sample_endpoint(endpoint_id, instant(10)).await else {
+            return Err(std::io::Error::other("the regressed tick must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::ClockRollback { .. }));
+        assert!(
+            !sampler.is_refusal_repeated(),
+            "the first refusal of a regression is a fresh condition"
+        );
+        // The clock stays regressed: the next sweep's refusal repeats the
+        // previous one — the condition persists across sweeps.
+        let Err(error) = sampler.sample_endpoint(endpoint_id, instant(10)).await else {
+            return Err(std::io::Error::other("the regressed tick must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::ClockRollback { .. }));
+        assert!(sampler.is_refusal_repeated());
+        // A prune between the refusals neither continues nor breaks the
+        // rollback chain: the clock is still regressed below the accepted
+        // instant, so the next refusal is still a repeat.
+        sampler.prune_history(time::Duration::days(7)).await?;
+        let Err(error) = sampler.sample_endpoint(endpoint_id, instant(10)).await else {
+            return Err(std::io::Error::other("the regressed tick must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::ClockRollback { .. }));
+        assert!(sampler.is_refusal_repeated());
+        // The clock catches up (a forward tick past the accepted instant):
+        // the guard accepts again, the chain clears, and the verdict reads
+        // false for the accepted call.
+        sampler.sample_endpoint(endpoint_id, instant(31)).await?;
+        assert!(!sampler.is_refusal_repeated());
+        // A fresh regression after the recovery is a new condition again.
+        let Err(error) = sampler.sample_endpoint(endpoint_id, instant(20)).await else {
+            return Err(std::io::Error::other("the regressed tick must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::ClockRollback { .. }));
+        assert!(!sampler.is_refusal_repeated());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sustained_cutoff_underflows_are_deduplicated_until_the_clock_recovers()
+    -> Result<(), Box<dyn Error>> {
+        // The `CutoffUnderflow` refusal gets the same consecutive-refusal
+        // treatment as the rollback guard: a clock that keeps predating the
+        // retention window refuses every prune, the first refusal is a fresh
+        // condition, and each repeat is flagged until the clock recovers.
+        let clock = MovableClock::at(earliest_instant());
+        let store = RecordingStore::new();
+        let sampler =
+            TelemetrySampler::new(FakeReader::with_reports(Vec::new()), &store, clock.clone());
+
+        let Err(error) = sampler.prune_history(time::Duration::days(7)).await else {
+            return Err(std::io::Error::other("the underflow must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::CutoffUnderflow));
+        assert!(
+            !sampler.is_refusal_repeated(),
+            "the first underflow is a fresh condition"
+        );
+        // A sampling call between the prunes neither continues nor breaks
+        // the underflow chain: the clock still predates the retention
+        // window, so the next prune's underflow is still a repeat.
+        sampler
+            .sample_endpoint(EndpointId::generate(), earliest_instant())
+            .await?;
+        let Err(error) = sampler.prune_history(time::Duration::days(7)).await else {
+            return Err(std::io::Error::other("the underflow must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::CutoffUnderflow));
+        assert!(sampler.is_refusal_repeated());
+        // The clock recovers: the cutoff computes again, the chain clears,
+        // and the verdict reads false for the accepted call.
+        clock.move_to(instant(30));
+        sampler.prune_history(time::Duration::days(7)).await?;
+        assert!(!sampler.is_refusal_repeated());
+        // A fresh underflow after the recovery is a new condition again.
+        clock.move_to(earliest_instant());
+        let Err(error) = sampler.prune_history(time::Duration::days(7)).await else {
+            return Err(std::io::Error::other("the underflow must be refused").into());
+        };
+        assert!(matches!(error, TelemetrySamplerError::CutoffUnderflow));
+        assert!(!sampler.is_refusal_repeated());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sampler_surfaces_source_and_store_failures_with_their_sources()
     -> Result<(), Box<dyn Error>> {
         let endpoint_id = EndpointId::generate();
@@ -1100,6 +1329,10 @@ mod tests {
         };
         assert!(matches!(error, TelemetrySamplerError::Read { .. }));
         assert!(error.to_string().contains("could not be read"));
+        assert!(
+            !sampler.is_refusal_repeated(),
+            "a failure that is not a clock refusal must not be flagged as a repeated refusal"
+        );
 
         let series = MetricReportValues::try_new(
             SeriesKey::parse("PowerMetrics")?,

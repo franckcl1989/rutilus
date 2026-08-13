@@ -32,7 +32,7 @@ Rutilus 是一个由 Rust 实现、通过浏览器 GUI 使用、基于 `nv-redfi
 | `nv-redfish` 开发/发布基线 | `0.13.0`（2026-08-04 发布） | `infra-redfish/src/lib.rs`、`infra-redfish/src/release_baseline.rs` |
 | 已知更新正式版本 | `0.14.2`（2026-08-10 发布，未 yank），升级决策留待冻结评审 | `infra-redfish/src/release_baseline.rs` |
 | 能力账本规模 | 47 条（33 标准 + 14 OEM） | `domain/src/capability.rs` |
-| 构建 Git Commit 嵌入 | CI 构建注入 `RUTILUS_GIT_COMMIT`（`github.sha`），本地构建降级 `dev`；`rutilus version` 第三行输出 | `ci.yml:53-64`；`app/src/main.rs:38-40` |
+| 构建 Git Commit 嵌入 | CI 构建注入 `RUTILUS_GIT_COMMIT`（`github.sha`），本地构建降级 `dev`；`rutilus version` 第三行输出 | `ci.yml:60-71`；`app/src/main.rs:38-40` |
 | CLI 名称 | `rutilus` | `app/src/main.rs` |
 
 运行 `rutilus version` 可打印产品版本、`nv-redfish` 开发基线与构建 Git Commit（三行，
@@ -45,7 +45,7 @@ git commit dev
 ```
 
 第三行 `git commit`：CI 构建由 job 级 `RUTILUS_GIT_COMMIT` 环境变量注入构建时的
-`github.sha`（`ci.yml:53-64`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）；
+`github.sha`（`ci.yml:60-71`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）；
 本地构建未设置该变量时降级输出 `dev`（不调用 git 子进程）。版本/日志格式测试断言与二进制
 同源派生（`app/tests/version.rs:27-36`、`app/tests/log_format.rs:23-28`）。
 
@@ -86,7 +86,7 @@ rutilus run [--portable] [--no-open]
 ```
 
 - Standalone 前台运行：绑定 IPv4 回环地址的随机端口，默认自动打开系统浏览器（`app/src/standalone_runtime.rs`）；
-- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs:9909` `BootstrapView` 组件，渲染于 `:11962`；`web/src/auth.rs`）；
+- 浏览器打开后显示**首次运行认领屏幕**（Bootstrap 视图）：输入终端打印的 Bootstrap Code、设置管理员密码（可选同时启用 TOTP）（`ui/src/lib.rs:9911` `BootstrapView` 组件，渲染于 `:11964`；`web/src/auth.rs`）；
 - 认领完成后进入登录页，用管理员账户登录。
 
 ### 2.3 登录与安全基线
@@ -288,7 +288,7 @@ HTTP 返回 200/201/202/204 都不直接等于业务成功——写操作后必�
 
 执行流程（§13.3）：读取当前资源 → 检查能力 → 检查权限 → 检查参数 → 持久化 Operation → 调用 `nv-redfish` 类型化方法 → 处理同步响应或 Task → 重新读取 → 验证 → 写入最终状态与审计。
 
-**ETag 现状（如实）**：`update` 写家族（PATCH 家族）携带**本次执行读取时**的目标文档 ETag——文档带 `@odata.etag` 时发送 `If-Match: <etag>`，BMC 以 `412 Precondition Failed` 拒绝即证明写未执行，产品先重读目标并报告冲突，并发变更不被覆盖；无 ETag 的文档保持传输层 `If-Match: *`（仅存在性检查）；action/create/delete 家族在类型化 API 中无 If-Match 通道。快照中持久化的 ETag 尚未接入写前校验（后续迭代）。实现证据：`infra-redfish/src/redfish_gateway.rs:598-611, 12653-12690, 14002-14062`；已知差距登记见 `docs/known-limitations.md` §九。
+**ETag 现状（如实）**：`update` 写家族（PATCH 家族）携带**本次执行读取时**的目标文档 ETag——文档带 `@odata.etag` 时发送 `If-Match: <etag>`，BMC 以 `412 Precondition Failed` 拒绝即证明写未执行，产品先重读目标并报告冲突，并发变更不被覆盖；无 ETag 的文档保持传输层 `If-Match: *`（仅存在性检查）；action/create/delete 家族在类型化 API 中无 If-Match 通道。**快照 ETag 接线已处置（决策 c，2026-08-12：快照 ETag 无独立写路径消费价值，接线不实施）**——执行时读取恒为分派时刻最新 ETag，快照 ETag 恒更旧、不可替代，论证见 `docs/known-limitations.md` §九该行。实现证据：`infra-redfish/src/redfish_gateway.rs:598-611, 12653-12690, 14002-14062`。
 
 ### 5.2 操作表单（当前实现的命令家族）
 

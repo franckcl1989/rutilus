@@ -8,7 +8,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::{EndpointInventoryQuery, EndpointInventoryQueryError, EndpointInventoryRepository};
+use crate::{
+    EndpointInventoryItem, EndpointInventoryQuery, EndpointInventoryQueryError,
+    EndpointInventoryRepository,
+};
 
 /// Product-level fields shared by every typed core Redfish resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -953,6 +956,14 @@ where
     /// Returns `None` for an unknown endpoint and otherwise validates every
     /// persisted typed payload before exposing it to delivery layers.
     ///
+    /// The §12.2 Endpoint page and the §2.1 metric-report sampler are the
+    /// callers of this query, so the full-inventory load per call is the
+    /// single-endpoint views' own read cost. The §14.2 homepage aggregate
+    /// deliberately does not use this query: it projects the inventory items
+    /// it already loaded with [`project_loaded_resources`], so the complete
+    /// inventory is never re-read once per endpoint (which would amplify the
+    /// read surface quadratically in the fleet size).
+    ///
     /// # Errors
     ///
     /// Returns [`EndpointResourceInventoryQueryError`] when inventory loading
@@ -987,6 +998,32 @@ where
             resources,
         }))
     }
+}
+
+/// Projects the typed resources of one already-loaded inventory item without
+/// re-running the inventory query.
+///
+/// [`EndpointResourceInventoryQuery::execute`] loads the complete inventory
+/// to serve one endpoint; the §14.2 homepage aggregate holds the inventory
+/// items it already loaded and needs every endpoint's typed resources, so it
+/// projects them here in memory instead of re-loading the inventory once per
+/// endpoint. The per-snapshot decoding is the same typed projection the
+/// detail-page query serves, so an invalid stored payload fails this
+/// projection with the same [`EndpointResourceInventoryQueryError::Projection`]
+/// verdict and the aggregate can never disagree with the §12.2 Endpoint page:
+/// both derive from the same persisted facts through the same decoder.
+///
+/// # Errors
+///
+/// Returns [`EndpointResourceInventoryQueryError::Projection`] when a stored
+/// payload no longer matches its declared core feature.
+pub(crate) fn project_loaded_resources<RepositoryError>(
+    item: &EndpointInventoryItem,
+) -> Result<Vec<CoreResourceSummary>, EndpointResourceInventoryQueryError<RepositoryError>>
+where
+    RepositoryError: Error + 'static,
+{
+    item.resources().iter().map(project_snapshot).collect()
 }
 
 /// A controlled failure while loading one endpoint's core-resource view.

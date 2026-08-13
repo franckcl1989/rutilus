@@ -282,12 +282,17 @@ where
                     .record_failure_kind(operation_id, FailureKind::CapabilityUnsupported)
                     .await
                     .map_err(ExecutorError::Store)?;
+                // The terminal audit fact is classified under its own kind
+                // (audit follow-up E3-4): the refusal is a proven fact
+                // about the endpoint's capability, not a redfish discovery
+                // failure, so it is audited as `capability-unsupported`,
+                // the same vocabulary as the persisted `FailureKind`.
                 return self
                     .refuse(
                         &engine,
                         operation_id,
                         &started,
-                        AuditFailure::RedfishDiscoveryFailed,
+                        AuditFailure::CapabilityUnsupported,
                     )
                     .await;
             }
@@ -3515,9 +3520,12 @@ mod tests {
         assert_eq!(gateway.recorded_calls()?.len(), 0);
         let events = audit.recorded_events()?;
         assert_eq!(events.len(), 2);
+        // The terminal audit fact is classified under its own kind (audit
+        // follow-up E3-4): the refusal is a proven capability limitation,
+        // never a redfish discovery failure.
         assert_eq!(
             events[1].outcome().failure(),
-            Some(AuditFailure::RedfishDiscoveryFailed)
+            Some(AuditFailure::CapabilityUnsupported)
         );
         assert_eq!(
             events[1].outcome().verification(),
@@ -3573,6 +3581,11 @@ mod tests {
             assert_eq!(
                 audit.recorded_events()?[1].outcome().verification(),
                 Some(AuditVerification::Rejected)
+            );
+            assert_eq!(
+                audit.recorded_events()?[1].outcome().failure(),
+                Some(AuditFailure::CapabilityUnsupported),
+                "a {state} capability refusal must be audited under its own kind"
             );
         }
         Ok(())

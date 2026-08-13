@@ -23,9 +23,10 @@ use rutilus_application::{
 };
 use rutilus_domain::{EndpointId, InstanceId};
 use rutilus_entity::{endpoint, endpoint_address, endpoint_trust, resource, resource_snapshot};
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    Set, SqlErr, TransactionTrait,
+    QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -128,59 +129,81 @@ impl SqliteStore {
             .await
             .map_err(CenterProjectionRepositoryError::Database)?;
         }
-        // The active address is replaced in place: the address row is
-        // deleted and re-inserted with the reported address. A unique
-        // address conflict (the address is already projected for another
-        // endpoint) rolls the whole transaction back — the previous address
-        // row survives — and the frame is absorbed.
-        endpoint_address::Entity::delete_many()
+        // The active address is replaced in place, but only when the
+        // reported address changed: a re-reported snapshot with the same
+        // address keeps the stored row untouched (no delete + re-insert
+        // churn), while a changed address is deleted and re-inserted. The
+        // delete removes every address row of the endpoint — the center's
+        // projection never creates address history, so the active row is
+        // the only one. A unique address conflict (the address is already
+        // projected for another endpoint) rolls the whole transaction back
+        // — the previous address row survives — and the frame is absorbed.
+        let active_address = endpoint_address::Entity::find()
             .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
-            .exec(&transaction)
+            .filter(endpoint_address::Column::IsActive.eq(true))
+            .one(&transaction)
             .await
             .map_err(CenterProjectionRepositoryError::Database)?;
-        let address_insert = endpoint_address::ActiveModel {
-            id: Set(Uuid::now_v7()),
-            endpoint_id: Set(endpoint_id.into_uuid()),
-            address: Set(projection.address().to_owned()),
-            is_active: Set(true),
-            created_at: Set(now),
-            retired_at: Set(None),
-        }
-        .insert(&transaction)
-        .await;
-        if let Err(error) = address_insert {
-            if matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(CenterProjectionRepositoryError::Database)?;
-                return Ok(ProjectionWriteOutcome::Ignored {
-                    reason: ProjectionIgnoreReason::AddressAlreadyProjected,
-                });
+        if active_address
+            .as_ref()
+            .is_none_or(|row| row.address != projection.address())
+        {
+            endpoint_address::Entity::delete_many()
+                .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
+                .exec(&transaction)
+                .await
+                .map_err(CenterProjectionRepositoryError::Database)?;
+            let address_insert = endpoint_address::ActiveModel {
+                id: Set(Uuid::now_v7()),
+                endpoint_id: Set(endpoint_id.into_uuid()),
+                address: Set(projection.address().to_owned()),
+                is_active: Set(true),
+                created_at: Set(now),
+                retired_at: Set(None),
             }
-            return Err(CenterProjectionRepositoryError::Database(error));
+            .insert(&transaction)
+            .await;
+            if let Err(error) = address_insert {
+                if matches!(error.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(CenterProjectionRepositoryError::Database)?;
+                    return Ok(ProjectionWriteOutcome::Ignored {
+                        reason: ProjectionIgnoreReason::AddressAlreadyProjected,
+                    });
+                }
+                return Err(CenterProjectionRepositoryError::Database(error));
+            }
         }
-        // The trust mode row is replaced in place; the certificate material
-        // stays on the site (§15.5 — the center never sees endpoint
-        // certificates).
-        endpoint_trust::Entity::delete_many()
-            .filter(endpoint_trust::Column::EndpointId.eq(endpoint_id.into_uuid()))
-            .exec(&transaction)
+        // The trust mode row is replaced in place only when the reported
+        // decision changed, mirroring the address skip; the certificate
+        // material stays on the site (§15.5 — the center never sees
+        // endpoint certificates).
+        let trust = endpoint_trust::Entity::find_by_id(endpoint_id.into_uuid())
+            .one(&transaction)
             .await
             .map_err(CenterProjectionRepositoryError::Database)?;
-        endpoint_trust::ActiveModel {
-            endpoint_id: Set(endpoint_id.into_uuid()),
-            trust_mode: Set(match projection.trust_mode() {
-                CenterTrustMode::SystemCa => endpoint_trust::TrustMode::SystemCa,
-                CenterTrustMode::PinnedCertificate => endpoint_trust::TrustMode::PinnedCertificate,
-            }),
-            certificate_sha256: Set(None),
-            certificate_der: Set(None),
-            trusted_at: Set(now),
+        if trust
+            .as_ref()
+            .is_none_or(|row| row.trust_mode != stored_trust_mode(projection.trust_mode()))
+        {
+            endpoint_trust::Entity::delete_many()
+                .filter(endpoint_trust::Column::EndpointId.eq(endpoint_id.into_uuid()))
+                .exec(&transaction)
+                .await
+                .map_err(CenterProjectionRepositoryError::Database)?;
+            endpoint_trust::ActiveModel {
+                endpoint_id: Set(endpoint_id.into_uuid()),
+                trust_mode: Set(stored_trust_mode(projection.trust_mode())),
+                certificate_sha256: Set(None),
+                certificate_der: Set(None),
+                trusted_at: Set(now),
+            }
+            .insert(&transaction)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?;
         }
-        .insert(&transaction)
-        .await
-        .map_err(CenterProjectionRepositoryError::Database)?;
         transaction
             .commit()
             .await
@@ -252,13 +275,19 @@ impl SqliteStore {
     ///
     /// The write is site-scoped (the endpoint's projection must belong to
     /// the reporting site) and idempotent (a re-delivered delta replaces
-    /// the same generation in place).
+    /// the same generation in place), with the same generation guard as the
+    /// endpoint projection (an older cut is refused whole).
     ///
     /// # Errors
     ///
     /// Returns [`CenterProjectionRepositoryError`] for coordination or
     /// database failures; an unknown or cross-site endpoint is reported as
     /// the ignored outcome.
+    // The resource upsert spells out the site scope, the identity row, the
+    // generation guard, and the snapshot upsert, which exceeds the pedantic
+    // line budget (the endpoint projection upsert allows the same lint for
+    // the same reason).
+    #[allow(clippy::too_many_lines)]
     pub async fn upsert_resource_projection(
         &self,
         projection: &ResourceProjectionWrite,
@@ -320,6 +349,39 @@ impl SqliteStore {
             .map_err(CenterProjectionRepositoryError::Database)?;
             id
         };
+        // The generation guard mirrors the endpoint projection's refresh
+        // watermark: the newest stored snapshot generation is the watermark
+        // of the newest inventory cut the center applied, and a delta of an
+        // older cut must never overwrite it, so the whole frame is absorbed
+        // (an older frame describes a superseded cut — the same semantics
+        // as the per-generation detail snapshots on the site side). A
+        // negative stored generation (a row no current build could have
+        // written) is treated as the newest possible watermark, mirroring
+        // the endpoint row, so it is never clobbered.
+        let stored_generation = resource_snapshot::Entity::find()
+            .filter(resource_snapshot::Column::ResourceId.eq(resource_id))
+            .select_only()
+            .column_as(
+                Expr::col(resource_snapshot::Column::Generation).max(),
+                "max",
+            )
+            .into_tuple::<(Option<i64>,)>()
+            .one(&transaction)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?
+            .and_then(|(maximum,)| maximum);
+        if let Some(maximum) = stored_generation {
+            let watermark = u64::try_from(maximum).unwrap_or(u64::MAX);
+            if projection.generation() < watermark {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(CenterProjectionRepositoryError::Database)?;
+                return Ok(ProjectionWriteOutcome::Ignored {
+                    reason: ProjectionIgnoreReason::StaleGeneration,
+                });
+            }
+        }
         let generation = stored_integer(projection.generation())?;
         resource_snapshot::Entity::insert(resource_snapshot::ActiveModel {
             resource_id: Set(resource_id),
@@ -458,6 +520,48 @@ impl SqliteStore {
             .is_some())
     }
 
+    /// Resolves the projection rows of many endpoint ids in one `IN` query —
+    /// the §15.5 ownership preload of one event batch.
+    ///
+    /// The map holds exactly one entry per endpoint id that has a projection
+    /// row; ids without a row are absent. An empty id set is answered
+    /// without a query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterProjectionRepositoryError::Database`] when the query
+    /// fails.
+    pub async fn find_endpoint_projections(
+        &self,
+        endpoint_ids: &[EndpointId],
+    ) -> Result<HashMap<EndpointId, CenterEndpointProjection>, CenterProjectionRepositoryError>
+    {
+        let ids = endpoint_ids
+            .iter()
+            .map(|endpoint_id| endpoint_id.into_uuid())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let models = endpoint::Entity::find()
+            .filter(endpoint::Column::Id.is_in(ids))
+            .all(&self.database)
+            .await
+            .map_err(CenterProjectionRepositoryError::Database)?;
+        Ok(models
+            .into_iter()
+            .map(|model| {
+                (
+                    EndpointId::from_uuid(model.id),
+                    CenterEndpointProjection::new(
+                        EndpointId::from_uuid(model.id),
+                        model.site_id.map(InstanceId::from_uuid),
+                    ),
+                )
+            })
+            .collect())
+    }
+
     /// Lists the projected endpoints of one site — or of every site when
     /// `site` is `None` — with their active addresses (§15.5 endpoint
     /// view).
@@ -518,6 +622,12 @@ impl SqliteStore {
     /// the newest projection write time (§15.5 site view — the
     /// last-refresh watermark).
     ///
+    /// The summary is one SQL aggregation (`COUNT` + `MAX`) instead of
+    /// materializing every row of the site, so a large site never loads its
+    /// projections to count them; the `MAX` keeps the stored timestamp at
+    /// full precision, where the previous Rust-side re-read truncated it to
+    /// whole seconds.
+    ///
     /// # Errors
     ///
     /// Returns [`CenterProjectionRepositoryError::Database`] when a query
@@ -526,24 +636,20 @@ impl SqliteStore {
         &self,
         site: InstanceId,
     ) -> Result<(u64, Option<OffsetDateTime>), CenterProjectionRepositoryError> {
-        let rows = endpoint::Entity::find()
+        let (count, last_refresh_at) = endpoint::Entity::find()
             .filter(endpoint::Column::SiteId.eq(site.into_uuid()))
-            .all(&self.database)
+            .select_only()
+            .column_as(Expr::col(endpoint::Column::Id).count(), "count")
+            .column_as(
+                Expr::col(endpoint::Column::UpdatedAt).max(),
+                "last_refresh_at",
+            )
+            .into_tuple::<(i64, Option<OffsetDateTime>)>()
+            .one(&self.database)
             .await
-            .map_err(CenterProjectionRepositoryError::Database)?;
-        let count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-        let last_refresh_at = rows
-            .into_iter()
-            .map(|row| row.updated_at)
-            .max()
-            .map(|value| OffsetDateTime::from_unix_timestamp(value.unix_timestamp()))
-            .transpose()
-            .map_err(|_| {
-                CenterProjectionRepositoryError::Database(DbErr::Custom(
-                    "a stored projection timestamp cannot be re-read".to_owned(),
-                ))
-            })?;
-        Ok((count, last_refresh_at))
+            .map_err(CenterProjectionRepositoryError::Database)?
+            .unwrap_or((0, None));
+        Ok((u64::try_from(count).unwrap_or(u64::MAX), last_refresh_at))
     }
 }
 
@@ -616,6 +722,14 @@ fn stored_integer(value: u64) -> Result<i64, CenterProjectionRepositoryError> {
     i64::try_from(value).map_err(|_| CenterProjectionRepositoryError::IntegerOverflow)
 }
 
+/// Maps one center trust decision to the stored trust-mode column.
+fn stored_trust_mode(mode: CenterTrustMode) -> endpoint_trust::TrustMode {
+    match mode {
+        CenterTrustMode::SystemCa => endpoint_trust::TrustMode::SystemCa,
+        CenterTrustMode::PinnedCertificate => endpoint_trust::TrustMode::PinnedCertificate,
+    }
+}
+
 /// A controlled failure while projecting the §15.5 center views.
 #[derive(Debug, Error)]
 pub enum CenterProjectionRepositoryError {
@@ -629,4 +743,329 @@ pub enum CenterProjectionRepositoryError {
     Artifact(#[source] crate::ArtifactRepositoryError),
     #[error("projection database operation failed: {0}")]
     Database(#[source] DbErr),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rutilus_application::{
+        CenterTrustMode, EndpointProjectionWrite, ProjectionIgnoreReason, ProjectionWriteOutcome,
+        ResourceProjectionWrite,
+    };
+    use rutilus_domain::{EndpointId, InstanceId, InstanceKind, ResourceFeature, SiteInstance};
+    use rutilus_entity::{endpoint_address, endpoint_trust, resource, resource_snapshot};
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+    use time::{Duration, OffsetDateTime};
+
+    use super::*;
+    use crate::SqliteStore;
+
+    /// One endpoint projection fixture: a fixed display name and health cut
+    /// with the given address, trust decision, and generation watermark.
+    fn projection_write(
+        endpoint_id: EndpointId,
+        address: &str,
+        trust_mode: CenterTrustMode,
+        refresh_generation: u64,
+    ) -> EndpointProjectionWrite {
+        EndpointProjectionWrite::new(
+            endpoint_id,
+            String::from("Rack A PDU"),
+            String::from(address),
+            trust_mode,
+            refresh_generation,
+            String::from("ok"),
+        )
+    }
+
+    /// One registered site and a store in a fresh temporary directory.
+    async fn site_and_store() -> Result<(tempfile::TempDir, SqliteStore, InstanceId), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let site = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Site One"),
+            InstanceKind::Site,
+            OffsetDateTime::now_utc(),
+        );
+        store.create_instance(&site).await?;
+        Ok((directory, store, site.id()))
+    }
+
+    // The churn test spells out its exhaustive write/read/rewrite
+    // assertions, which exceeds the pedantic line budget (the stress suite
+    // allows the same lint on its exhaustive assertion tests).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn endpoint_projection_upsert_skips_address_and_trust_churn_when_unchanged()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, site_id) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        let endpoint_id = EndpointId::generate();
+
+        assert_eq!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.10",
+                        CenterTrustMode::SystemCa,
+                        3,
+                    ),
+                    site_id,
+                    base,
+                )
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let address_row = endpoint_address::Entity::find()
+            .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .one(&store.database)
+            .await?
+            .ok_or("the address row is missing")?;
+        let address_created_at = address_row.created_at;
+        let trust_row = endpoint_trust::Entity::find_by_id(endpoint_id.into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the trust row is missing")?;
+        let trust_trusted_at = trust_row.trusted_at;
+
+        // The §15.4 redelivery of the identical snapshot is applied without
+        // churning the address and trust rows: their creation times survive.
+        assert_eq!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.10",
+                        CenterTrustMode::SystemCa,
+                        3,
+                    ),
+                    site_id,
+                    base + Duration::SECOND,
+                )
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let address_row = endpoint_address::Entity::find()
+            .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .one(&store.database)
+            .await?
+            .ok_or("the address row is missing")?;
+        assert_eq!(
+            address_row.created_at, address_created_at,
+            "an unchanged redelivery must not re-create the address row"
+        );
+        assert_eq!(address_row.address, "https://192.0.2.10");
+        let trust_row = endpoint_trust::Entity::find_by_id(endpoint_id.into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the trust row is missing")?;
+        assert_eq!(
+            trust_row.trusted_at, trust_trusted_at,
+            "an unchanged redelivery must not re-create the trust row"
+        );
+
+        // A changed address still replaces the row in place — exactly one
+        // row, carrying the new value.
+        assert_eq!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.11",
+                        CenterTrustMode::SystemCa,
+                        3,
+                    ),
+                    site_id,
+                    base + Duration::SECOND * 2,
+                )
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let address_row = endpoint_address::Entity::find()
+            .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .one(&store.database)
+            .await?
+            .ok_or("the address row is missing")?;
+        assert_eq!(address_row.address, "https://192.0.2.11");
+        assert_eq!(
+            endpoint_address::Entity::find()
+                .filter(endpoint_address::Column::EndpointId.eq(endpoint_id.into_uuid()))
+                .count(&store.database)
+                .await?,
+            1,
+            "the replacement must keep exactly one address row"
+        );
+        // A changed trust decision replaces the trust row in place.
+        assert_eq!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.11",
+                        CenterTrustMode::PinnedCertificate,
+                        3,
+                    ),
+                    site_id,
+                    base + Duration::SECOND * 3,
+                )
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let trust_row = endpoint_trust::Entity::find_by_id(endpoint_id.into_uuid())
+            .one(&store.database)
+            .await?
+            .ok_or("the trust row is missing")?;
+        assert_eq!(
+            trust_row.trust_mode,
+            endpoint_trust::TrustMode::PinnedCertificate
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_endpoint_projection_lookup_resolves_exactly_the_projected_ids()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, site_id) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        let first = EndpointId::generate();
+        let second = EndpointId::generate();
+        let unknown = EndpointId::generate();
+        for (index, endpoint_id) in [first, second].into_iter().enumerate() {
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        &format!("https://192.0.2.{}", 10 + index),
+                        CenterTrustMode::SystemCa,
+                        1,
+                    ),
+                    site_id,
+                    base,
+                )
+                .await?;
+        }
+
+        // The batch lookup resolves exactly the projected ids — the unknown
+        // id is absent, whatever the input order — and names the site.
+        let resolved = store
+            .find_endpoint_projections(&[first, unknown, second])
+            .await?;
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved
+                .get(&first)
+                .and_then(CenterEndpointProjection::site_id),
+            Some(site_id)
+        );
+        assert_eq!(
+            resolved
+                .get(&second)
+                .and_then(CenterEndpointProjection::site_id),
+            Some(site_id)
+        );
+        assert!(!resolved.contains_key(&unknown));
+        // An empty id set is answered without a query.
+        assert!(store.find_endpoint_projections(&[]).await?.is_empty());
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resource_projection_refuses_older_generations() -> Result<(), Box<dyn Error>> {
+        let (directory, store, site_id) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        let endpoint_id = EndpointId::generate();
+        store
+            .upsert_endpoint_projection(
+                &projection_write(
+                    endpoint_id,
+                    "https://192.0.2.10",
+                    CenterTrustMode::SystemCa,
+                    1,
+                ),
+                site_id,
+                base,
+            )
+            .await?;
+        let resource = ResourceProjectionWrite::new(
+            endpoint_id,
+            String::from("/redfish/v1/Systems/1"),
+            ResourceFeature::Systems,
+            Some(String::from("#ComputerSystem.v1_20_0.ComputerSystem")),
+            None,
+            5,
+            Some(String::from(r#"{"Name":"System"}"#)),
+            base,
+        );
+        let generation_of = |generation: u64| {
+            ResourceProjectionWrite::new(
+                endpoint_id,
+                String::from("/redfish/v1/Systems/1"),
+                ResourceFeature::Systems,
+                Some(String::from("#ComputerSystem.v1_20_0.ComputerSystem")),
+                None,
+                generation,
+                Some(String::from(r#"{"Name":"System"}"#)),
+                base,
+            )
+        };
+
+        // The first cut lands; a cut of an older generation is absorbed
+        // whole, exactly like the endpoint projection's stale frame.
+        assert_eq!(
+            store
+                .upsert_resource_projection(&resource, site_id, base)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        assert!(matches!(
+            store
+                .upsert_resource_projection(&generation_of(4), site_id, base)
+                .await,
+            Ok(ProjectionWriteOutcome::Ignored {
+                reason: ProjectionIgnoreReason::StaleGeneration
+            })
+        ));
+        // The same-generation redelivery replaces in place (§15.4), and the
+        // next generation appends its own snapshot row.
+        assert_eq!(
+            store
+                .upsert_resource_projection(&resource, site_id, base)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        assert_eq!(
+            store
+                .upsert_resource_projection(&generation_of(6), site_id, base)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let resource_row = resource::Entity::find()
+            .filter(resource::Column::EndpointId.eq(endpoint_id.into_uuid()))
+            .filter(resource::Column::OdataId.eq("/redfish/v1/Systems/1"))
+            .one(&store.database)
+            .await?
+            .ok_or("the resource row is missing")?;
+        assert_eq!(
+            resource_snapshot::Entity::find()
+                .filter(resource_snapshot::Column::ResourceId.eq(resource_row.id))
+                .count(&store.database)
+                .await?,
+            2,
+            "only the accepted generations 5 and 6 may have snapshot rows"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
 }

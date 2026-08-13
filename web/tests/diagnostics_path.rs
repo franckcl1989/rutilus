@@ -1104,6 +1104,10 @@ async fn distinguishes_diagnostics_route_states() -> Result<(), Box<dyn Error>> 
         bad_endpoint_id.status(),
         axum::http::StatusCode::BAD_REQUEST
     );
+    // A5-4: the JSON error body is part of the contract — a bare 400
+    // regression would otherwise leave the console without a reason.
+    let body = json_body(bad_endpoint_id).await?;
+    assert_eq!(body["message"], "endpoint id is invalid");
     let bad_resource_id = get(
         &router,
         &format!("/api/v1/endpoints/{endpoint_id}/resources/not-a-uuid/diagnostics"),
@@ -1113,6 +1117,8 @@ async fn distinguishes_diagnostics_route_states() -> Result<(), Box<dyn Error>> 
         bad_resource_id.status(),
         axum::http::StatusCode::BAD_REQUEST
     );
+    let body = json_body(bad_resource_id).await?;
+    assert_eq!(body["message"], "resource id is invalid");
 
     let missing_endpoint = get(
         &router,

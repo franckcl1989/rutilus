@@ -66,6 +66,20 @@ pub trait CenterTransport: Send + Sync {
     fn is_not_bound(&self, _error: &Self::Error) -> bool {
         false
     }
+
+    /// Reports whether one connect failure is the center's
+    /// `identity-mismatch` admission refusal (audit follow-up E3-2,
+    /// C5-10).
+    ///
+    /// The default treats no failure as an identity mismatch, exactly like
+    /// [`Self::is_not_bound`]. A transport that knows the reason code
+    /// overrides this, and the engine stops retrying a mismatch that no
+    /// retry can heal — without converging the site's binding, because
+    /// `identity-mismatch` means the binding IS in force and the site's
+    /// declared identity disagrees with it.
+    fn is_identity_mismatch(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 impl<Transport> CenterTransport for &Transport
@@ -81,6 +95,10 @@ where
 
     fn is_not_bound(&self, error: &Self::Error) -> bool {
         Transport::is_not_bound(*self, error)
+    }
+
+    fn is_identity_mismatch(&self, error: &Self::Error) -> bool {
+        Transport::is_identity_mismatch(*self, error)
     }
 }
 

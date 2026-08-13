@@ -47,6 +47,15 @@
 //! precedent) and the next endpoint runs. Only a sweep-level failure (the
 //! endpoint listing) aborts the tick, and the loop retries it on the next
 //! tick. The loop itself never panics: every fallible call is handled.
+//!
+//! A clock anomaly that persists across sweeps is the one failure that would
+//! otherwise storm the log: every endpoint of every sweep would record the
+//! same monotonic-guard refusal. The application use case deduplicates
+//! consecutive refusals ([`TelemetrySampler::is_refusal_repeated`]), and the
+//! loop levels its logging accordingly: the first refusal of an anomaly is an
+//! error, and every repeat is a `tracing::warn!` noting that the refusal
+//! persists until the clock catches up. A refusal the clock recovers from is
+//! over — the next anomaly is a fresh error again.
 
 use std::{error::Error, fmt, time::Duration};
 
@@ -204,7 +213,12 @@ impl Error for TelemetryRetentionError {}
 /// and must never interpret the use case's verdicts itself. The seam keeps
 /// the loop testable with scripted fakes and erases the sampling error
 /// vocabulary into one opaque failure that the loop records and moves on
-/// from.
+/// from. The one exception is [`TelemetryDriver::is_refusal_repeated`]: a
+/// clock-anomaly refusal that persists across sweeps would otherwise storm
+/// the log with one identical error per endpoint per sweep, so the seam
+/// exposes only the dedupe verdict — the failure just seen repeats the
+/// refusal of the call before it — and the loop levels its logging without
+/// ever seeing the error vocabulary.
 pub(crate) trait TelemetryDriver: Send + Sync {
     /// The driver's controlled failure type; only its `Display` is used.
     type Error: Error + Send + Sync + 'static;
@@ -221,6 +235,18 @@ pub(crate) trait TelemetryDriver: Send + Sync {
         &self,
         retention: time::Duration,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
+
+    /// Whether the most recent sampling or prune call repeated the clock
+    /// refusal of the call before it — the consecutive-refusal dedupe signal
+    /// (see the module doc).
+    ///
+    /// The loop consults this after a failed call to level its logging: the
+    /// first refusal of a clock anomaly is an operational error, and each
+    /// consecutive repeat is a warn that the refusal persists until the
+    /// clock catches up. The verdict is `false` after an accepted call or a
+    /// failure that is not a clock refusal, so the loop can consult it after
+    /// any failed call.
+    fn is_refusal_repeated(&self) -> bool;
 }
 
 /// The application sampling use case behind the driver seam.
@@ -245,6 +271,10 @@ where
         retention: time::Duration,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
         Box::pin(async move { TelemetrySampler::prune_history(self, retention).await })
+    }
+
+    fn is_refusal_repeated(&self) -> bool {
+        TelemetrySampler::is_refusal_repeated(self)
     }
 }
 
@@ -317,6 +347,13 @@ pub(crate) async fn run<Driver, Lister, Time>(
 /// sweep on the next tick. The prune runs after the sampling pass
 /// regardless of per-endpoint failures, so a tick that sampled nothing still
 /// enforces the retention bound.
+///
+/// A monotonic-guard refusal that persists across sweeps is recorded once
+/// per anomaly: the first refusal is an error, and each consecutive repeat
+/// (the driver's `is_refusal_repeated` verdict) is a warn noting that the
+/// refusal persists until the clock catches up — so a sustained clock
+/// regression cannot storm the log with one identical error per endpoint per
+/// sweep.
 async fn run_tick<Driver, Lister>(
     driver: &Driver,
     lister: &Lister,
@@ -335,11 +372,25 @@ async fn run_tick<Driver, Lister>(
     };
     for endpoint_id in endpoints {
         if let Err(error) = driver.sample_endpoint(endpoint_id, now).await {
-            tracing::error!("telemetry sampling failed for endpoint {endpoint_id}: {error}");
+            if driver.is_refusal_repeated() {
+                tracing::warn!(
+                    "telemetry sampling still refused for endpoint {endpoint_id}: {error}; \
+                     refusing every sweep until the product clock catches up"
+                );
+            } else {
+                tracing::error!("telemetry sampling failed for endpoint {endpoint_id}: {error}");
+            }
         }
     }
     if let Err(error) = driver.prune_history(retention).await {
-        tracing::error!("telemetry history pruning failed: {error}");
+        if driver.is_refusal_repeated() {
+            tracing::warn!(
+                "telemetry history pruning still refused: {error}; \
+                 refusing every sweep until the product clock catches up"
+            );
+        } else {
+            tracing::error!("telemetry history pruning failed: {error}");
+        }
     }
 }
 
@@ -374,14 +425,22 @@ mod tests {
         Prune,
     }
 
-    /// Scripted driver recording every call, with per-endpoint failures and
-    /// an optional one-shot sample gate.
+    /// Scripted driver recording every call, with per-endpoint failures, an
+    /// optional one-shot sample gate, and a scriptable consecutive-refusal
+    /// verdict.
     #[derive(Clone, Debug, Default)]
     struct FakeDriver {
         calls: Arc<Mutex<Vec<DriverCall>>>,
         prune_retentions: Arc<Mutex<Vec<time::Duration>>>,
         failures: Arc<Mutex<HashMap<EndpointId, usize>>>,
         gate: Option<Arc<Notify>>,
+        /// The scriptable verdict behind [`TelemetryDriver::is_refusal_repeated`].
+        ///
+        /// Mock failures are scripted per-endpoint faults, never clock
+        /// refusals, so the default `false` levels every failure as a fresh
+        /// error — exactly the pre-flag behavior. A test scripts the
+        /// persistent-refusal warn path by setting this to `true`.
+        refusal_repeated: bool,
     }
 
     impl FakeDriver {
@@ -420,6 +479,14 @@ mod tests {
 
     impl TelemetryDriver for FakeDriver {
         type Error = MockError;
+
+        fn is_refusal_repeated(&self) -> bool {
+            // Mock failures are scripted per-endpoint faults, never clock
+            // refusals, so the verdict is scripted through the
+            // `refusal_repeated` flag instead of derived from the failures
+            // themselves.
+            self.refusal_repeated
+        }
 
         fn sample_endpoint(
             &self,
@@ -647,6 +714,125 @@ mod tests {
         assert!(
             calls.contains(&DriverCall::Prune),
             "the prune must run despite the per-endpoint failure"
+        );
+        Ok(())
+    }
+
+    /// A test subscriber recording every event's level and formatted
+    /// message — the same capture shape as the center runtime's logging
+    /// tests, so `run_tick`'s logging levels can be asserted on.
+    #[derive(Clone)]
+    struct CaptureSubscriber {
+        events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl CaptureSubscriber {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured(&self) -> Vec<(tracing::Level, String)> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Extracts the `message` field of one captured event.
+    struct CaptureVisitor(Option<String>);
+
+    impl tracing::field::Visit for CaptureVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CaptureVisitor(None);
+            event.record(&mut visitor);
+            let message = visitor.0.unwrap_or_default();
+            self.events
+                .lock()
+                .map(|mut events| events.push((*event.metadata().level(), message)))
+                .ok();
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_repeated_refusal_is_logged_as_a_warn_not_an_error() -> Result<(), Box<dyn Error>> {
+        // A clock anomaly that persists across sweeps must not storm the log
+        // with one identical error per endpoint per sweep: with the driver's
+        // repeated-refusal verdict `true`, the failed sample is recorded at
+        // warn. The existing tests drive the `false` verdict (a fresh
+        // failure is an error); this is the branch that needed a scriptable
+        // flag. The guard installs the capture subscriber for the whole
+        // sweep — the current-thread test runtime keeps every event on this
+        // thread.
+        let endpoint_id = EndpointId::generate();
+        let driver = FakeDriver {
+            refusal_repeated: true,
+            ..FakeDriver::default()
+        };
+        driver.fail_samples_of(endpoint_id, 1);
+        let lister = FakeLister::with_endpoints(vec![endpoint_id]);
+
+        let subscriber = CaptureSubscriber::new();
+        let captured = subscriber.clone();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_tick(
+            &driver,
+            &lister,
+            TelemetryRetention::default().as_duration(),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        // The guard lives to the end of the test; the captured events are
+        // read through the shared buffer, like the center runtime's tests.
+        let events = captured.captured();
+        let warns = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .collect::<Vec<_>>();
+        assert!(
+            warns.iter().any(|(_, message)| {
+                message.contains("still refused for endpoint")
+                    && message.contains(&endpoint_id.to_string())
+            }),
+            "the repeated refusal must be recorded at warn: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level == tracing::Level::WARN),
+            "a repeated refusal must not be recorded at error: {events:?}"
         );
         Ok(())
     }

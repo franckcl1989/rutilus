@@ -29,9 +29,13 @@
 //! sequence needs to complete a half-sent batch.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     error::Error,
     future::Future,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -43,9 +47,9 @@ use rutilus_center_protocol::{
 };
 use rutilus_domain::{
     ArtifactId, ArtifactState, CapabilityState, EndpointId, Event, EventId, EventSeverity,
-    InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation, OperationId,
-    OperationSource, OperationState, OperationTarget, OutboxEntry, OutboxEntryId, RedfishCommand,
-    RefreshGeneration, SyncCursor, SyncCursorId, SyncStream, TargetId, TlsTrust,
+    FailureKind, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation,
+    OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry, OutboxEntryId,
+    RedfishCommand, RefreshGeneration, SyncCursor, SyncCursorId, SyncStream, TargetId, TlsTrust,
 };
 use rutilus_operation_engine::OperationStore;
 use thiserror::Error;
@@ -65,6 +69,33 @@ use crate::{
 /// ([`rutilus_center_protocol::MAX_FRAME_BYTES`]) with room for the envelope
 /// overhead, so a chunk never risks an `EncodeLimit` refusal.
 pub const CENTER_ARTIFACT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// The §13.6 in-flight states of the reconnect report's discovery scan
+/// (audit follow-up P3-10).
+///
+/// An operation with an open inbox entry is either in-flight (progress to
+/// report) or terminal with its completion not yet delivered, so the
+/// in-flight and terminal state sets partition the report's work exactly;
+/// the scan queries each state through the store's state filter instead of
+/// listing the whole table.
+const CENTER_REPORT_IN_FLIGHT_STATES: [OperationState; 5] = [
+    OperationState::Queued,
+    OperationState::Validating,
+    OperationState::Running,
+    OperationState::WaitingRemote,
+    OperationState::Verifying,
+];
+
+/// The terminal states of the reconnect report's discovery scan (audit
+/// follow-up P3-10): an operation that finished since the last report
+/// still carries an open inbox entry until its `OperationCompleted` is
+/// delivered, so the scan must see terminal rows too.
+const CENTER_REPORT_TERMINAL_STATES: [OperationState; 4] = [
+    OperationState::Succeeded,
+    OperationState::Failed,
+    OperationState::Unknown,
+    OperationState::Cancelled,
+];
 
 /// The durable outbox boundary of the site-to-center synchronization
 /// (design §17 D4, §15.4).
@@ -100,8 +131,14 @@ pub trait CenterOutbox: Send + Sync {
     /// center's §15.6 offer scan. The center's durable outbox holds exactly
     /// the operation offers, acknowledged or not, so the scan rebuilds the
     /// offer facts — the target site, the target, and the offer expiry —
-    /// that the tracking operation record does not persist; the dispatch
-    /// retry uses it to recognize an undecided operation (§17.5).
+    /// that the tracking operation record does not persist. The dispatch
+    /// retry uses it as its fall-through repair read: the retry's primary
+    /// scan is the bounded pending listing, and a retry the pending scan
+    /// cannot resolve — an acknowledged offer whose reply receipt was
+    /// lost, an offer beyond the scan's limit, a record whose enqueue
+    /// failed — is disambiguated from this full history, so the retry
+    /// never mints a fresh id for a delivered operation (§17.5: one
+    /// operation id, one execution).
     fn list_offers(
         &self,
         instance_id: InstanceId,
@@ -163,7 +200,10 @@ where
 /// offer with the recorded state instead of a second execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InboxInsertOutcome {
-    /// The envelope was stored as a new `received` entry.
+    /// The envelope was stored as a new entry, carrying the phase of the
+    /// inserted row: `Received` for a fresh §15.6 offer, or the reply's
+    /// phase when the receipt insert is born at the phase the reply
+    /// dictates (P3-9).
     Created,
     /// A stored entry with the same operation id is still being processed.
     DuplicateInProgress,
@@ -389,6 +429,18 @@ pub struct CenterSyncOptions {
     /// runtime converges the site's local binding. `None` disables the
     /// convergence (the engine retries forever, the historical behavior).
     pub not_bound_abort_after: Option<u64>,
+    /// How many consecutive `identity-mismatch` connect refusals end the
+    /// engine (audit follow-up E3-2, C5-10).
+    ///
+    /// The center answers the `Hello` of a site whose declared instance
+    /// identity disagrees with its certificate's binding record with the
+    /// `identity-mismatch` reason; after this many consecutive such
+    /// refusals the engine returns [`CenterSyncError::IdentityMismatch`]
+    /// and the runtime stops it with a diagnostic. Unlike `not-bound`, the
+    /// local binding is NOT converged — the mismatch means the binding is
+    /// in force on both sides, and only a re-bind heals it. `None` keeps
+    /// the historical behavior (the engine retries forever).
+    pub identity_mismatch_abort_after: Option<u64>,
 }
 
 impl Default for CenterSyncOptions {
@@ -403,6 +455,10 @@ impl Default for CenterSyncOptions {
             // the backoff, two still fit a flaky transport, three mean the
             // center consistently says the site is not bound.
             not_bound_abort_after: Some(3),
+            // The same consecutive-refusal verdict: the declared identity
+            // cannot drift transiently, so three refusals mean the
+            // certificate and the binding record genuinely disagree.
+            identity_mismatch_abort_after: Some(3),
         }
     }
 }
@@ -423,6 +479,25 @@ pub struct CenterSync<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time> 
     clock: Time,
     instance_id: InstanceId,
     options: CenterSyncOptions,
+    /// The last-reported `OperationProgress` state of every center-sourced
+    /// operation with an open inbox entry, keyed by operation id (audit
+    /// follow-up P3-10).
+    ///
+    /// `None` marks an accepted operation whose first progress has not been
+    /// reported yet. The map is the reconnect report's working set: it
+    /// bounds every later connection to the operations that still need
+    /// reporting, so a reconnect never scans the operations table. It is
+    /// deliberately in-memory — a restart re-reports the current states,
+    /// which the center's idempotent receipt absorbs (at-least-once).
+    last_progress: Mutex<HashMap<OperationId, Option<OperationState>>>,
+    /// Whether the state-indexed discovery scan of
+    /// [`Self::report_center_operations`] has completed at least once in
+    /// this process run.
+    ///
+    /// The first report scans the in-flight and terminal state sets to
+    /// rediscover operations whose inbox entries a previous process run
+    /// left open; every later report is driven by `last_progress` alone.
+    discovery_done: AtomicBool,
 }
 
 impl<Transport, Store, Outbox, Inbox, Cursor, EventTail, Time>
@@ -443,7 +518,7 @@ where
 {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         transport: Transport,
         store: Store,
         outbox: Outbox,
@@ -464,6 +539,8 @@ where
             clock,
             instance_id,
             options,
+            last_progress: Mutex::new(HashMap::new()),
+            discovery_done: AtomicBool::new(false),
         }
     }
 
@@ -526,17 +603,27 @@ where
         // any other failure resets the count, because the convergence
         // verdict is the center consistently saying the site is not bound.
         let mut consecutive_not_bound: u64 = 0;
+        // The consecutive `identity-mismatch` refusal count (audit
+        // follow-up E3-2, C5-10): the same consecutive-refusal verdict,
+        // kept separate from `not-bound` because the two refusals mean
+        // different things — one says the binding is not in force (the
+        // runtime converges), the other says the declared identity
+        // disagrees with the binding (the runtime stops without touching
+        // the binding).
+        let mut consecutive_identity_mismatch: u64 = 0;
         loop {
             let session = tokio::select! {
                 () = stop.as_mut() => return Ok(()),
                 result = self.transport.connect() => match result {
                     Ok(session) => {
                         consecutive_not_bound = 0;
+                        consecutive_identity_mismatch = 0;
                         session
                     }
                     Err(error) => {
                         if self.transport.is_not_bound(&error) {
                             consecutive_not_bound += 1;
+                            consecutive_identity_mismatch = 0;
                             if let Some(limit) = self.options.not_bound_abort_after
                                 && consecutive_not_bound >= limit
                             {
@@ -551,8 +638,31 @@ where
                                 );
                                 return Err(CenterSyncError::NotBound);
                             }
+                        } else if self.transport.is_identity_mismatch(&error) {
+                            consecutive_identity_mismatch += 1;
+                            consecutive_not_bound = 0;
+                            if let Some(limit) = self.options.identity_mismatch_abort_after
+                                && consecutive_identity_mismatch >= limit
+                            {
+                                // The center consistently refuses the site
+                                // as an identity mismatch: the declared
+                                // instance identity disagrees with the
+                                // binding record its certificate resolves
+                                // to. The binding is in force, so retrying
+                                // is futile and the local row must NOT be
+                                // converged — the runtime logs the repair
+                                // path (re-bind the site) on this return.
+                                tracing::error!(
+                                    "the center refused the connection \
+                                     {consecutive_identity_mismatch} times as an identity \
+                                     mismatch; the site's instance identity does not match the \
+                                     center's binding for its certificate"
+                                );
+                                return Err(CenterSyncError::IdentityMismatch);
+                            }
                         } else {
                             consecutive_not_bound = 0;
+                            consecutive_identity_mismatch = 0;
                         }
                         // §15.3: a center without a common protocol version
                         // rejects the negotiation, and an unreachable center
@@ -885,6 +995,15 @@ where
                     .create_operation(&operation)
                     .await
                     .map_err(CenterSyncError::Operation)?;
+                // The accepted operation joins the reconnect report's
+                // working set before the first progress can be reported
+                // (audit follow-up P3-10): `None` marks it as accepted but
+                // never reported, so the next connection reports its state
+                // instead of a reconnect scan re-finding it.
+                self.last_progress
+                    .lock()
+                    .map_err(|_| CenterSyncError::ProgressTracking)?
+                    .insert(operation_id, None);
                 self.enqueue_outbox_entry(EnvelopeMessage::OperationAccepted(
                     rutilus_center_protocol::OperationAccepted {
                         operation_id: operation_id.to_string(),
@@ -1034,7 +1153,7 @@ where
                 rutilus_center_protocol::OperationCompleted {
                     operation_id: operation_id.to_string(),
                     succeeded: operation.state() == OperationState::Succeeded,
-                    summary: operation.state().as_str().to_owned(),
+                    summary: self.completed_summary(&operation).await?,
                 },
             ))
             .await?;
@@ -1048,6 +1167,7 @@ where
                 .advance(operation_id, InboxEvent::Completed)
                 .await
                 .map_err(CenterSyncError::Inbox)?;
+            self.forget_progress(operation_id)?;
         } else {
             self.enqueue_outbox_entry(EnvelopeMessage::OperationProgress(
                 rutilus_center_protocol::OperationProgress {
@@ -1105,7 +1225,7 @@ where
                 let (succeeded, summary) = match operation {
                     Some(operation) => (
                         operation.state() == OperationState::Succeeded,
-                        operation.state().as_str().to_owned(),
+                        self.completed_summary(&operation).await?,
                     ),
                     None => (false, String::from("the recorded outcome is unavailable")),
                 };
@@ -1133,62 +1253,205 @@ where
     /// one queues `OperationCompleted` and closes the inbox lifecycle. The
     /// inbox state machine makes the report idempotent — terminal entries
     /// are skipped on the next connection.
+    ///
+    /// The report never scans the operations table (audit follow-up
+    /// P3-10): the first report of the process run rediscovers every
+    /// center-sourced operation with an open inbox entry through the
+    /// state-indexed queries over the in-flight and terminal state sets —
+    /// the only states such an operation can be in — and every later
+    /// report is driven by the in-memory progress map, which bounds the
+    /// work to the operations that still need reporting. Progress is
+    /// enqueued only when the reported state changed, so a reconnect does
+    /// not replay states the center already knows.
     async fn report_center_operations(
         &self,
     ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
-        let operations = self
-            .store
-            .list_operations(None)
-            .await
-            .map_err(CenterSyncError::Operation)?;
-        for operation in operations {
-            if operation.source() != OperationSource::Center {
-                continue;
+        if !self.discovery_done.load(Ordering::Acquire) {
+            // The state-indexed discovery scan: an operation with an open
+            // inbox entry is either in-flight (progress to report) or
+            // terminal with its completion not yet delivered — the crash
+            // window a previous process run left behind — so the in-flight
+            // and terminal state sets partition the report's work exactly.
+            // The scan runs once per process run; after it completes, the
+            // progress map knows every open entry.
+            for state in CENTER_REPORT_IN_FLIGHT_STATES
+                .into_iter()
+                .chain(CENTER_REPORT_TERMINAL_STATES)
+            {
+                let operations = self
+                    .store
+                    .list_operations(Some(state))
+                    .await
+                    .map_err(CenterSyncError::Operation)?;
+                for operation in operations {
+                    if operation.source() != OperationSource::Center {
+                        continue;
+                    }
+                    self.report_open_entry(&operation).await?;
+                }
             }
-            let operation_id = operation.id();
+            self.discovery_done.store(true, Ordering::Release);
+            return Ok(());
+        }
+        // The bounded map-driven pass: every center-sourced operation with
+        // an open entry is known to the progress map, so the report
+        // re-reads exactly those rows by id — a reconnect never scans the
+        // table. Entries closed since the last report (a duplicate-offer
+        // reply) are dropped from the map; terminal operations are
+        // reported once and closed.
+        let known = self
+            .last_progress
+            .lock()
+            .map_err(|_| CenterSyncError::ProgressTracking)?
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for operation_id in known {
             let Some(entry) = self
                 .inbox
                 .find_by_operation(operation_id)
                 .await
                 .map_err(CenterSyncError::Inbox)?
             else {
+                self.forget_progress(operation_id)?;
                 continue;
             };
             if entry.state().is_terminal() {
+                self.forget_progress(operation_id)?;
                 continue;
             }
-            if entry.state() == InboxEntryState::Received {
-                // The operation exists, so the offer was accepted before a
-                // crash interrupted the record; repair it and report.
-                self.inbox
-                    .advance(operation_id, InboxEvent::Accepted)
-                    .await
-                    .map_err(CenterSyncError::Inbox)?;
-            }
-            if operation.state().is_terminal() {
-                self.enqueue_outbox_entry(EnvelopeMessage::OperationCompleted(
-                    rutilus_center_protocol::OperationCompleted {
-                        operation_id: operation_id.to_string(),
-                        succeeded: operation.state() == OperationState::Succeeded,
-                        summary: operation.state().as_str().to_owned(),
-                    },
-                ))
-                .await?;
-                self.inbox
-                    .advance(operation_id, InboxEvent::Completed)
-                    .await
-                    .map_err(CenterSyncError::Inbox)?;
-            } else {
-                self.enqueue_outbox_entry(EnvelopeMessage::OperationProgress(
-                    rutilus_center_protocol::OperationProgress {
-                        operation_id: operation_id.to_string(),
-                        state: operation.state().as_str().to_owned(),
-                        detail: String::new(),
-                    },
-                ))
-                .await?;
-            }
+            let Some(operation) = self
+                .store
+                .find_operation(operation_id)
+                .await
+                .map_err(CenterSyncError::Operation)?
+            else {
+                self.forget_progress(operation_id)?;
+                continue;
+            };
+            self.report_open_entry(&operation).await?;
         }
+        Ok(())
+    }
+
+    /// Reports one center-sourced operation with an open inbox entry: an
+    /// active operation queues an `OperationProgress` — only when the
+    /// reported state changed (audit follow-up P3-10) — and a terminal one
+    /// queues `OperationCompleted` and closes the entry.
+    async fn report_open_entry(
+        &self,
+        operation: &Operation,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        let operation_id = operation.id();
+        let Some(entry) = self
+            .inbox
+            .find_by_operation(operation_id)
+            .await
+            .map_err(CenterSyncError::Inbox)?
+        else {
+            return Ok(());
+        };
+        if entry.state().is_terminal() {
+            return Ok(());
+        }
+        if entry.state() == InboxEntryState::Received {
+            // The operation exists, so the offer was accepted before a
+            // crash interrupted the record; repair it and report.
+            self.inbox
+                .advance(operation_id, InboxEvent::Accepted)
+                .await
+                .map_err(CenterSyncError::Inbox)?;
+        }
+        if operation.state().is_terminal() {
+            self.enqueue_outbox_entry(EnvelopeMessage::OperationCompleted(
+                rutilus_center_protocol::OperationCompleted {
+                    operation_id: operation_id.to_string(),
+                    succeeded: operation.state() == OperationState::Succeeded,
+                    summary: self.completed_summary(operation).await?,
+                },
+            ))
+            .await?;
+            self.inbox
+                .advance(operation_id, InboxEvent::Completed)
+                .await
+                .map_err(CenterSyncError::Inbox)?;
+            self.forget_progress(operation_id)?;
+        } else {
+            // The map records the last state the center acknowledged
+            // learning about; an identical state queues nothing, so a
+            // reconnect does not replay it. The enqueue happens before the
+            // map update, so a failed queue write leaves the operation
+            // unreported for the next connection.
+            let already_reported = self
+                .last_progress
+                .lock()
+                .map_err(|_| CenterSyncError::ProgressTracking)?
+                .get(&operation_id)
+                .copied()
+                .flatten()
+                == Some(operation.state());
+            if already_reported {
+                return Ok(());
+            }
+            self.enqueue_outbox_entry(EnvelopeMessage::OperationProgress(
+                rutilus_center_protocol::OperationProgress {
+                    operation_id: operation_id.to_string(),
+                    state: operation.state().as_str().to_owned(),
+                    detail: String::new(),
+                },
+            ))
+            .await?;
+            self.last_progress
+                .lock()
+                .map_err(|_| CenterSyncError::ProgressTracking)?
+                .insert(operation_id, Some(operation.state()));
+        }
+        Ok(())
+    }
+
+    /// The `OperationCompleted` summary of one terminal operation: the
+    /// stable state code, extended with the provable refusal classification
+    /// (audit follow-up E3-4) — a `Failed` operation whose persisted
+    /// failure kind is `capability-unsupported` is summarized as
+    /// `failed-unsupported`, so the center can distinguish the
+    /// endpoint-side limitation from an ordinary failure. The wire contract
+    /// is the field, not the value: the center's receipt parses the summary
+    /// as a stable state code and treats a summary naming no stable state
+    /// as a plain `Failed` outcome, so the extension never distorts the
+    /// tracking.
+    async fn completed_summary(
+        &self,
+        operation: &Operation,
+    ) -> Result<String, CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        if operation.state() != OperationState::Failed {
+            return Ok(operation.state().as_str().to_owned());
+        }
+        let kind = self
+            .store
+            .find_failure_kind(operation.id())
+            .await
+            .map_err(CenterSyncError::Operation)?;
+        Ok(match kind {
+            Some(FailureKind::CapabilityUnsupported) => String::from("failed-unsupported"),
+            _ => operation.state().as_str().to_owned(),
+        })
+    }
+
+    /// Drops one operation from the progress map after its lifecycle
+    /// closed (the entry reached a terminal state or the row vanished).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterSyncError::ProgressTracking`] when the map is
+    /// poisoned.
+    fn forget_progress(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<(), CenterSyncErrorOf<Transport, Store, Outbox, Inbox, Cursor, EventTail>> {
+        self.last_progress
+            .lock()
+            .map_err(|_| CenterSyncError::ProgressTracking)?
+            .remove(&operation_id);
         Ok(())
     }
 
@@ -1752,6 +2015,24 @@ pub enum CenterSyncError<
     /// on this return.
     #[error("the center refused the connection as not bound")]
     NotBound,
+    /// The center refused the connection as `identity-mismatch` the
+    /// configured number of consecutive times (audit follow-up E3-2,
+    /// C5-10): the `Hello`'s declared instance identity disagrees with the
+    /// binding record its certificate resolves to. The binding is in force
+    /// on both sides, so the engine stops instead of retrying forever and
+    /// the runtime must NOT converge the local binding — only a re-bind
+    /// heals the mismatch.
+    #[error(
+        "the center refused the connection as an identity mismatch: the site's instance \
+         identity does not match the center's binding for its certificate"
+    )]
+    IdentityMismatch,
+    /// The engine's in-memory progress tracking could not be locked; the
+    /// tracking is the reconnect report's working set, so the engine treats
+    /// a poisoned lock like any other internal break and the run loop
+    /// reconnects.
+    #[error("the engine's progress tracking is poisoned")]
+    ProgressTracking,
 }
 
 /// Why a stored sync cursor value cannot be interpreted.
@@ -1937,6 +2218,11 @@ mod tests {
         inventory: Mutex<Vec<EndpointInventoryItem>>,
         artifacts: Mutex<Vec<rutilus_domain::Artifact>>,
         artifact_dir: Mutex<Option<tempfile::TempDir>>,
+        // The kind mirrors the persistence column, which stores a code
+        // value (not a boolean): the value is semantically significant and
+        // future `FailureKind` variants will make it non-zero-sized.
+        #[allow(clippy::zero_sized_map_values)]
+        failure_kinds: Mutex<HashMap<OperationId, FailureKind>>,
     }
 
     impl MockEngineStore {
@@ -1949,7 +2235,21 @@ mod tests {
                 inventory: Mutex::new(Vec::new()),
                 artifacts: Mutex::new(Vec::new()),
                 artifact_dir: Mutex::new(None),
+                #[allow(clippy::zero_sized_map_values)]
+                failure_kinds: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn set_failure_kind(
+            &self,
+            operation_id: OperationId,
+            kind: FailureKind,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.failure_kinds
+                .lock()
+                .map_err(|_| std::io::Error::other("the mock store lock was poisoned"))?
+                .insert(operation_id, kind);
+            Ok(())
         }
 
         fn set_endpoint(&self, endpoint: Endpoint) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -2136,10 +2436,30 @@ mod tests {
 
         fn record_failure_kind(
             &self,
-            _operation_id: OperationId,
-            _kind: rutilus_domain::FailureKind,
+            operation_id: OperationId,
+            kind: rutilus_domain::FailureKind,
         ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
-            Box::pin(async move { Ok(()) })
+            Box::pin(async move {
+                self.failure_kinds
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .insert(operation_id, kind);
+                Ok(())
+            })
+        }
+
+        fn find_failure_kind(
+            &self,
+            operation_id: OperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+            Box::pin(async move {
+                Ok(self
+                    .failure_kinds
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .get(&operation_id)
+                    .copied())
+            })
         }
 
         fn list_operations(
@@ -2563,6 +2883,7 @@ mod tests {
             event_batch_limit: 256,
             artifact_chunk_bytes: CENTER_ARTIFACT_CHUNK_BYTES,
             not_bound_abort_after: None,
+            identity_mismatch_abort_after: None,
         }
     }
 
@@ -4719,12 +5040,14 @@ mod tests {
         Ok(())
     }
 
-    /// The reconnect report pin (audit A2): `report_center_operations`
-    /// runs at the start of every established connection, so a reconnect
-    /// re-sends `OperationProgress` for still-active center operations,
-    /// while a completed operation is reported exactly once — its terminal
-    /// inbox entry makes every later connection's report skip it (§15.4
-    /// at-least-once, §15.6 idempotent reporting).
+    /// The reconnect report pin (audit A2, tightened by P3-10):
+    /// `report_center_operations` runs at the start of every established
+    /// connection, so a reconnect reports every state change of a
+    /// still-active center operation as `OperationProgress` — an unchanged
+    /// state is not replayed — while a completed operation is reported
+    /// exactly once: its terminal inbox entry makes every later
+    /// connection's report skip it (§15.4 at-least-once, §15.6 idempotent
+    /// reporting).
     // The reconnect script is one continuous scenario — three connections
     // with the local completion in between — so it stays in one test (the
     // persistence stress tests allow the same lint on their exhaustive
@@ -4886,10 +5209,21 @@ mod tests {
         drop(outbound_second);
         drop(inbound_second);
 
-        // The second reconnect re-reports the still-active operation as
-        // progress and nothing for the completed one: its terminal inbox
-        // entry makes the report skip it, so no duplicate completion can
-        // reach the center.
+        // Between the second and third connections, operation A advances
+        // to `Running` locally: the reconnect reports the state change and
+        // nothing for the completed one — its terminal inbox entry makes
+        // the report skip it, so no duplicate completion can reach the
+        // center. An unchanged state is not replayed (audit follow-up
+        // P3-10): only the state change queues a fresh progress frame.
+        let operation_a: OperationId = offer_a.operation_id.parse()?;
+        store
+            .apply_transition(
+                operation_a,
+                OperationState::Running,
+                now + time::Duration::seconds(2),
+            )
+            .await
+            .map_err(std::io::Error::other)?;
         let mut third = next_wire(&mut wires).await?;
         let envelope = next_outbox_frame(&mut third).await?;
         let Some(EnvelopeMessage::OperationProgress(progress)) = envelope.message else {
@@ -4898,7 +5232,7 @@ mod tests {
             );
         };
         assert_eq!(progress.operation_id, offer_a.operation_id);
-        assert_eq!(progress.state, OperationState::Queued.as_str());
+        assert_eq!(progress.state, OperationState::Running.as_str());
         // The flush delivered exactly that one frame: the next frame is a
         // heartbeat, never a duplicate completion.
         let envelope = next_frame(&mut third).await?;
@@ -4916,7 +5250,6 @@ mod tests {
             .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
         let inbox = stopped.map_err(|error| std::io::Error::other(error.to_string()))?;
         // The recorded lifecycle: A stays accepted and active, B closed.
-        let operation_a: OperationId = offer_a.operation_id.parse()?;
         assert_eq!(
             inbox
                 .entry_state(operation_a)
@@ -4938,6 +5271,510 @@ mod tests {
             Some(EnvelopeMessage::OperationProgress(progress))
                 if progress.operation_id == offer_a.operation_id
         ));
+        Ok(())
+    }
+
+    /// The reconnect report does not replay a state the center already
+    /// knows (audit follow-up P3-10): an operation whose state did not
+    /// change between two connections queues no new `OperationProgress`,
+    /// so a reconnect never replays the whole active set.
+    #[tokio::test]
+    // The no-replay scenario is one continuous three-connection script;
+    // splitting it would break the single-scenario assertion continuity
+    // (the reconnect tests allow the same lint for the same reason).
+    #[allow(clippy::too_many_lines)]
+    async fn reconnect_does_not_replay_an_unchanged_operation_state() -> Result<(), Box<dyn Error>>
+    {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let instance_id = InstanceId::generate();
+        let endpoint_id = endpoint.id();
+        let store = Arc::new(store);
+        let store_for_engine = Arc::clone(&store);
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let outbox = MockOutbox::new(instance_id);
+        let outbox_entries = Arc::clone(&outbox.entries);
+        let run = tokio::spawn(async move {
+            let inbox = MockInbox::new();
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                store_for_engine.as_ref(),
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(inbox)
+        });
+
+        // The first connection flushes the endpoint projection; the report
+        // ran before any operation existed.
+        let mut wire = next_wire(&mut wires).await?;
+        for sequence in [1, 2, 3] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        // One operation is offered and accepted; it stays `Queued`.
+        let (offer_a, received_a) =
+            offer_for(instance_id, endpoint_id, now.unix_timestamp() + 3600)
+                .map_err(std::io::Error::other)?;
+        wire.inbound
+            .send(received_a)
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let envelope = next_outbox_frame(&mut wire).await?;
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::OperationAccepted(_))
+        ));
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 4 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let Wire { outbound, inbound } = wire;
+        drop(outbound);
+        drop(inbound);
+
+        // The reconnect reports the operation's first progress — the
+        // accepted-but-never-reported state is new to the center.
+        let mut second = next_wire(&mut wires).await?;
+        let envelope = next_outbox_frame(&mut second).await?;
+        let Some(EnvelopeMessage::OperationProgress(progress)) = envelope.message else {
+            return Err(
+                std::io::Error::other("the reconnect report was not an OperationProgress").into(),
+            );
+        };
+        assert_eq!(progress.operation_id, offer_a.operation_id);
+        assert_eq!(progress.state, OperationState::Queued.as_str());
+        second
+            .inbound
+            .send(Envelope {
+                sequence: 20,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 5 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let Wire {
+            outbound: outbound_second,
+            inbound: inbound_second,
+        } = second;
+        drop(outbound_second);
+        drop(inbound_second);
+
+        // The second reconnect reports nothing for the unchanged
+        // operation: the flush delivers no report frame, and the next
+        // frame on the wire is the liveness heartbeat.
+        let mut third = next_wire(&mut wires).await?;
+        let envelope = next_frame(&mut third).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        let inbox = stopped.map_err(|error| std::io::Error::other(error.to_string()))?;
+        let operation_a: OperationId = offer_a.operation_id.parse()?;
+        assert_eq!(
+            inbox
+                .entry_state(operation_a)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Accepted)
+        );
+        // The durable outbox: the progress row was acknowledged and
+        // retired; nothing was re-enqueued for the unchanged state.
+        let messages = pending_messages_from(&outbox_entries).map_err(std::io::Error::other)?;
+        assert!(
+            messages.is_empty(),
+            "an unchanged state must not be replayed: {messages:?}"
+        );
+        Ok(())
+    }
+
+    /// The first report of a process run rediscovers every open entry
+    /// through the state-indexed discovery scan (audit follow-up P3-10):
+    /// an operation a previous process run left completed with an open
+    /// inbox entry is reported exactly once, and its entry closes.
+    #[tokio::test]
+    // The restart script is one continuous scenario — the stranded entry,
+    // the discovery report, and the skip on the next connection — so it
+    // stays in one test (the same lint allowance as the storm tests).
+    #[allow(clippy::too_many_lines)]
+    async fn the_first_report_discovers_entries_a_previous_run_left_open()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let instance_id = InstanceId::generate();
+        let endpoint_id = endpoint.id();
+        // The previous run's debris: a center-sourced operation that
+        // completed, whose inbox entry never closed (the crash window).
+        let operation_id = OperationId::generate();
+        let operation = Operation::new(
+            operation_id,
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            now,
+        );
+        store
+            .create_operation(&operation)
+            .await
+            .map_err(std::io::Error::other)?;
+        store
+            .apply_transition(
+                operation_id,
+                OperationState::Succeeded,
+                now + time::Duration::SECOND,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        let store = Arc::new(store);
+        let store_for_engine = Arc::clone(&store);
+        let (transport, _state, mut wires) = ScriptedTransport::new(0);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let outbox = MockOutbox::new(instance_id);
+        let outbox_entries = Arc::clone(&outbox.entries);
+        let run = tokio::spawn(async move {
+            // The open entry the previous run left behind, rehydrated in
+            // its `Accepted` state.
+            let inbox = MockInbox::new();
+            let received = Envelope {
+                sequence: 1,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::OperationOffer(OperationOffer {
+                    operation_id: operation_id.to_string(),
+                    endpoint_id: endpoint_id.to_string(),
+                    site_id: instance_id.to_string(),
+                    command_json: serde_json::to_vec(&RedfishCommand::System(
+                        SystemCommand::Reset(ResetType::PowerCycle),
+                    ))?,
+                    target: String::from("/redfish/v1/Systems/1"),
+                    expires_at_unix: now.unix_timestamp() + 3600,
+                    actor_context: String::from("principal-7"),
+                })),
+            };
+            let entry = InboxEntry::from_parts(
+                InboxEntryId::generate(),
+                operation_id,
+                instance_id,
+                serde_json::to_string(&received)?,
+                InboxEntryState::Accepted,
+                now + time::Duration::seconds(3600),
+                now,
+            );
+            let _ = CenterInbox::insert(&inbox, &entry).await;
+            let cursor = MockCursor::new();
+            let events = MockEventTail::new(Vec::new());
+            let engine = CenterSync::new(
+                transport,
+                store_for_engine.as_ref(),
+                outbox,
+                &inbox,
+                &cursor,
+                &events,
+                FixedClock(now),
+                instance_id,
+                engine_options(),
+            );
+            engine
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(inbox)
+        });
+
+        // The first connection reports the stranded completion before the
+        // projection: the discovery scan found the terminal operation with
+        // its open entry.
+        let mut wire = next_wire(&mut wires).await?;
+        let envelope = next_outbox_frame(&mut wire).await?;
+        let Some(EnvelopeMessage::OperationCompleted(completed)) = envelope.message else {
+            return Err(
+                std::io::Error::other("the first report was not an OperationCompleted").into(),
+            );
+        };
+        assert_eq!(completed.operation_id, operation_id.to_string());
+        assert!(completed.succeeded);
+        assert_eq!(completed.summary, OperationState::Succeeded.as_str());
+        for sequence in [2, 3, 4] {
+            let envelope = next_outbox_frame(&mut wire).await?;
+            assert_eq!(envelope.sequence, sequence);
+        }
+        wire.inbound
+            .send(Envelope {
+                sequence: 10,
+                acked_sequence: 0,
+                message: Some(EnvelopeMessage::Ack(Ack { sequence: 4 })),
+            })
+            .map_err(|_| std::io::Error::other("the center feed closed"))?;
+        let Wire { outbound, inbound } = wire;
+        drop(outbound);
+        drop(inbound);
+
+        // The second connection reports nothing for the closed entry: the
+        // next frame is a heartbeat, never a duplicate completion.
+        let mut second = next_wire(&mut wires).await?;
+        let envelope = next_frame(&mut second).await?;
+        assert_eq!(envelope.sequence, 0);
+        assert!(matches!(
+            envelope.message,
+            Some(EnvelopeMessage::Heartbeat(_))
+        ));
+
+        stop_tx
+            .send(())
+            .map_err(|()| std::io::Error::other("the engine stopped before the signal"))?;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .map_err(|_| std::io::Error::other("the engine did not stop in time"))??;
+        let inbox = stopped.map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(
+            inbox
+                .entry_state(operation_id)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Completed)
+        );
+        let messages = pending_messages_from(&outbox_entries).map_err(std::io::Error::other)?;
+        assert!(
+            messages.is_empty(),
+            "the closed entry must not be reported again: {messages:?}"
+        );
+        Ok(())
+    }
+
+    /// A transport whose connect always fails with the `identity-mismatch`
+    /// classification, exactly like the app transport reports for the
+    /// wire reason code.
+    struct IdentityMismatchTransport;
+
+    impl CenterTransport for IdentityMismatchTransport {
+        type Session = ChannelSession;
+        type Error = MockCenterError;
+
+        fn connect(&self) -> crate::BoundaryFuture<'_, Result<Self::Session, Self::Error>> {
+            Box::pin(async move { Err(MockCenterError) })
+        }
+
+        fn is_identity_mismatch(&self, _error: &Self::Error) -> bool {
+            true
+        }
+    }
+
+    /// Consecutive `identity-mismatch` refusals stop the engine (audit
+    /// follow-up E3-2): the mismatch is a configuration error no retry can
+    /// heal, so the engine returns [`CenterSyncError::IdentityMismatch`]
+    /// instead of alerting every backoff forever — and, unlike `not-bound`,
+    /// nothing about the binding is touched by the engine itself.
+    #[tokio::test]
+    async fn consecutive_identity_mismatch_refusals_stop_the_engine() -> Result<(), Box<dyn Error>>
+    {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let store = MockEngineStore::new();
+        let instance_id = InstanceId::generate();
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = CenterSync::new(
+            IdentityMismatchTransport,
+            &store,
+            &outbox,
+            &inbox,
+            &cursor,
+            &events,
+            FixedClock(now),
+            instance_id,
+            CenterSyncOptions {
+                identity_mismatch_abort_after: Some(2),
+                ..engine_options()
+            },
+        );
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let outcome = engine
+            .run(async move {
+                let _ = stop_rx.await;
+            })
+            .await;
+        assert!(matches!(outcome, Err(CenterSyncError::IdentityMismatch)));
+        Ok(())
+    }
+
+    /// The `OperationCompleted` summary carries the provable refusal
+    /// classification (audit follow-up E3-4): a `Failed` operation whose
+    /// persisted failure kind is `capability-unsupported` is summarized as
+    /// `failed-unsupported`, while an unclassified failure keeps the plain
+    /// state code.
+    #[tokio::test]
+    async fn unsupported_failures_carry_the_classification_in_the_completed_summary()
+    -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let endpoint_id = endpoint.id();
+        let operation_id = OperationId::generate();
+        let operation = Operation::new(
+            operation_id,
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            now,
+        );
+        store
+            .create_operation(&operation)
+            .await
+            .map_err(std::io::Error::other)?;
+        store
+            .apply_transition(
+                operation_id,
+                OperationState::Failed,
+                now + time::Duration::SECOND,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        store
+            .set_failure_kind(operation_id, FailureKind::CapabilityUnsupported)
+            .map_err(std::io::Error::other)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let received = Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: Some(EnvelopeMessage::OperationOffer(OperationOffer {
+                operation_id: operation_id.to_string(),
+                endpoint_id: endpoint_id.to_string(),
+                site_id: instance_id.to_string(),
+                command_json: serde_json::to_vec(&RedfishCommand::System(SystemCommand::Reset(
+                    ResetType::PowerCycle,
+                )))?,
+                target: String::from("/redfish/v1/Systems/1"),
+                expires_at_unix: now.unix_timestamp() + 3600,
+                actor_context: String::from("principal-7"),
+            })),
+        };
+        let entry = InboxEntry::from_parts(
+            InboxEntryId::generate(),
+            operation_id,
+            instance_id,
+            serde_json::to_string(&received)?,
+            InboxEntryState::Accepted,
+            now + time::Duration::seconds(3600),
+            now,
+        );
+        let _ = CenterInbox::insert(&inbox, &entry).await;
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+        engine
+            .report_center_operations()
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let messages = outbox.pending_messages().map_err(std::io::Error::other)?;
+        assert_eq!(messages.len(), 1);
+        let Some(EnvelopeMessage::OperationCompleted(completed)) = messages.first() else {
+            return Err(std::io::Error::other("the report was not an OperationCompleted").into());
+        };
+        assert_eq!(completed.operation_id, operation_id.to_string());
+        assert!(!completed.succeeded);
+        assert_eq!(
+            completed.summary, "failed-unsupported",
+            "the summary must carry the provable refusal classification"
+        );
+        assert_eq!(
+            inbox
+                .entry_state(operation_id)
+                .map_err(std::io::Error::other)?,
+            Some(InboxEntryState::Completed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unclassified_failure_keeps_the_plain_state_summary() -> Result<(), Box<dyn Error>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now).map_err(std::io::Error::other)?;
+        let endpoint_id = endpoint.id();
+        let operation_id = OperationId::generate();
+        let operation = Operation::new(
+            operation_id,
+            OperationSource::Center,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
+            RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+            now,
+        );
+        store
+            .create_operation(&operation)
+            .await
+            .map_err(std::io::Error::other)?;
+        store
+            .apply_transition(
+                operation_id,
+                OperationState::Failed,
+                now + time::Duration::SECOND,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let received = Envelope {
+            sequence: 1,
+            acked_sequence: 0,
+            message: Some(EnvelopeMessage::OperationOffer(OperationOffer {
+                operation_id: operation_id.to_string(),
+                endpoint_id: endpoint_id.to_string(),
+                site_id: instance_id.to_string(),
+                command_json: serde_json::to_vec(&RedfishCommand::System(SystemCommand::Reset(
+                    ResetType::PowerCycle,
+                )))?,
+                target: String::from("/redfish/v1/Systems/1"),
+                expires_at_unix: now.unix_timestamp() + 3600,
+                actor_context: String::from("principal-7"),
+            })),
+        };
+        let entry = InboxEntry::from_parts(
+            InboxEntryId::generate(),
+            operation_id,
+            instance_id,
+            serde_json::to_string(&received)?,
+            InboxEntryState::Accepted,
+            now + time::Duration::seconds(3600),
+            now,
+        );
+        let _ = CenterInbox::insert(&inbox, &entry).await;
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+        engine
+            .report_center_operations()
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let messages = outbox.pending_messages().map_err(std::io::Error::other)?;
+        assert_eq!(messages.len(), 1);
+        let Some(EnvelopeMessage::OperationCompleted(completed)) = messages.first() else {
+            return Err(std::io::Error::other("the report was not an OperationCompleted").into());
+        };
+        assert_eq!(completed.summary, OperationState::Failed.as_str());
         Ok(())
     }
 

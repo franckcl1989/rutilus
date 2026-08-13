@@ -39,7 +39,10 @@ use rutilus_persistence::{
     ProjectedEndpointSummary, ResourceSnapshotRepositoryError, SqliteStore,
 };
 use rutilus_security::{MasterKey, encrypt_credential};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, PaginatorTrait};
+use sea_orm::{
+    ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter,
+};
 use secrecy::SecretString;
 use time::{Duration, OffsetDateTime};
 
@@ -946,6 +949,32 @@ async fn five_thousand_endpoint_projections_round_trip_at_the_center() -> Result
         );
     }
 
+    // §15.5 churn discipline: the redelivery above carried the same
+    // addresses and trust decisions as the first write, so it must not have
+    // churned the address and trust rows — their creation times are the
+    // first write's, not the redelivery's. (The genuine-change replacement
+    // is asserted further down, after the address-conflict case.)
+    let churn_database = counting_connection(directory.path()).await?;
+    for expected in expected_projections.iter().take(3) {
+        let address = endpoint_address::Entity::find()
+            .filter(endpoint_address::Column::EndpointId.eq(expected.endpoint_id.into_uuid()))
+            .one(&churn_database)
+            .await?
+            .ok_or("the address row is missing")?;
+        assert_eq!(
+            address.created_at, base,
+            "an unchanged redelivery must not re-create the address row"
+        );
+        assert_eq!(address.address, expected.address);
+        let trust = endpoint_trust::Entity::find_by_id(expected.endpoint_id.into_uuid())
+            .one(&churn_database)
+            .await?
+            .ok_or("the trust row is missing")?;
+        assert_eq!(
+            trust.trusted_at, base,
+            "an unchanged redelivery must not re-create the trust row"
+        );
+    }
     // §15.5 site scoping: one site's frame can never overwrite another
     // site's projection — the conflicting write is absorbed, and a unique
     // address conflict rolls the whole write back. Endpoint 0 belongs to
@@ -981,6 +1010,63 @@ async fn five_thousand_endpoint_projections_round_trip_at_the_center() -> Result
             reason: ProjectionIgnoreReason::AddressAlreadyProjected
         })
     ));
+
+    // §15.5 churn discipline on a genuine change: a changed address (and
+    // trust decision) replaces the row in place — exactly one row carrying
+    // the new value, stamped with the write time of the change.
+    let changed = EndpointProjectionWrite::new(
+        expected_projections[0].endpoint_id,
+        expected_projections[0].display_name.clone(),
+        String::from("https://203.0.113.50/redfish"),
+        CenterTrustMode::SystemCa,
+        expected_projections[0].refresh_generation + 10,
+        String::from("ok"),
+    );
+    assert_eq!(
+        store
+            .upsert_endpoint_projection(
+                &changed,
+                expected_projections[0].site_id,
+                base + Duration::SECOND,
+            )
+            .await?,
+        ProjectionWriteOutcome::Applied
+    );
+    let address = endpoint_address::Entity::find()
+        .filter(
+            endpoint_address::Column::EndpointId
+                .eq(expected_projections[0].endpoint_id.into_uuid()),
+        )
+        .one(&churn_database)
+        .await?
+        .ok_or("the address row is missing")?;
+    assert_eq!(address.address, "https://203.0.113.50/redfish");
+    assert_eq!(
+        address.created_at,
+        base + Duration::SECOND,
+        "a changed address is replaced at the write time, not skipped and not appended"
+    );
+    let trust = endpoint_trust::Entity::find_by_id(expected_projections[0].endpoint_id.into_uuid())
+        .one(&churn_database)
+        .await?
+        .ok_or("the trust row is missing")?;
+    assert_eq!(trust.trust_mode, endpoint_trust::TrustMode::SystemCa);
+    assert_eq!(
+        trust.trusted_at,
+        base + Duration::SECOND,
+        "a changed trust decision is replaced at the write time"
+    );
+    assert_eq!(
+        endpoint_address::Entity::find()
+            .filter(
+                endpoint_address::Column::EndpointId
+                    .eq(expected_projections[0].endpoint_id.into_uuid(),)
+            )
+            .count(&churn_database)
+            .await?,
+        1,
+        "the replacement must keep exactly one address row"
+    );
 
     // §15.5 resource deltas: 200 endpoints x 3 resources = 600 identity and
     // snapshot rows; the same-generation redelivery replaces in place, and
@@ -1244,6 +1330,92 @@ async fn older_generation_frames_cannot_overwrite_a_newer_projection() -> Result
     );
     let listed = store.list_projected_endpoints(Some(site_id)).await?;
     assert_eq!(listed[0].refresh_generation(), 4);
+
+    store.close().await?;
+    drop(directory);
+    Ok(())
+}
+
+#[tokio::test]
+async fn resource_projections_refuse_older_generations() -> Result<(), Box<dyn Error>> {
+    let (directory, store) = open_store().await?;
+    let base = OffsetDateTime::now_utc();
+    let site = SiteInstance::new(
+        InstanceId::generate(),
+        String::from("Site Generation"),
+        InstanceKind::Site,
+        base,
+    );
+    store.create_instance(&site).await?;
+    let site_id = site.id();
+    let endpoint_id = EndpointId::generate();
+    let expected = ExpectedProjection {
+        endpoint_id,
+        display_name: String::from("Rack A PDU"),
+        address: String::from("https://192.0.2.10"),
+        health: String::from("ok"),
+        refresh_generation: 1,
+        site_id,
+    };
+    assert_eq!(
+        store
+            .upsert_endpoint_projection(&projection_write(&expected, 1, "ok"), site_id, base)
+            .await?,
+        ProjectionWriteOutcome::Applied
+    );
+    let resources = resource_projections(&expected, 5, base + Duration::SECOND);
+
+    // The newest cut lands; a delta of an older cut is absorbed whole — the
+    // same StaleGeneration guard as the endpoint projection, so a
+    // superseded resource cut can never overwrite the newer snapshots.
+    for resource in &resources {
+        assert_eq!(
+            store
+                .upsert_resource_projection(resource, site_id, base + Duration::SECOND)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+    }
+    for resource in resource_projections(&expected, 4, base + Duration::SECOND) {
+        assert!(matches!(
+            store
+                .upsert_resource_projection(&resource, site_id, base + Duration::SECOND)
+                .await,
+            Ok(ProjectionWriteOutcome::Ignored {
+                reason: ProjectionIgnoreReason::StaleGeneration
+            })
+        ));
+    }
+    // The same-generation redelivery replaces in place (§15.4)...
+    for resource in &resources {
+        assert_eq!(
+            store
+                .upsert_resource_projection(resource, site_id, base + Duration::SECOND)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+    }
+    // ...and the next generation appends its own snapshot rows.
+    for resource in resource_projections(&expected, 6, base + Duration::SECOND * 2) {
+        assert_eq!(
+            store
+                .upsert_resource_projection(&resource, site_id, base + Duration::SECOND * 2)
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+    }
+
+    // Exactly the accepted generations have snapshot rows: 3 resources x
+    // generations 5 and 6, with the older cut refused without a trace.
+    let database = counting_connection(directory.path()).await?;
+    assert_eq!(
+        resource::Entity::find().count(&database).await?,
+        u64::try_from(RESOURCES_PER_ENDPOINT)?
+    );
+    assert_eq!(
+        resource_snapshot::Entity::find().count(&database).await?,
+        u64::try_from(RESOURCES_PER_ENDPOINT * 2)?
+    );
 
     store.close().await?;
     drop(directory);

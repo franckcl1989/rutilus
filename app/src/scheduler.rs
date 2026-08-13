@@ -516,9 +516,15 @@ async fn drive_one<ErrorType>(
         None => None,
     };
     if let Err(error) = outcome.await {
-        // One failed operation never stops the sweep; the next tick re-lists
-        // it and tries again.
-        tracing::error!("operation {operation_id} could not be driven: {error}");
+        // One failed operation never stops the sweep. The failure is also
+        // the operation's final word: a failed dispatch or verification
+        // persists the honest terminal state (`Failed`, or `Unknown` when
+        // the BMC outcome cannot be proven) before the error returns, and
+        // terminal states are excluded from the recovery scan — the next
+        // tick never re-lists the operation, so it is never re-driven.
+        tracing::error!(
+            "operation {operation_id} reached its terminal state and will not be re-driven: {error}"
+        );
     }
 }
 
@@ -643,15 +649,6 @@ mod tests {
         List(Option<OperationState>),
     }
 
-    /// Which of the sweep's two listings is armed to fail.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ListingFailure {
-        /// The §13.6 recovery listing (`List(None)`).
-        Recovery,
-        /// The queued-work listing (`List(Some(Queued))`).
-        Queued,
-    }
-
     /// In-memory operation store recording the sweep's listing calls.
     ///
     /// The sweep only lists through `OperationStore`, so the fake needs no
@@ -660,7 +657,7 @@ mod tests {
     struct FakeStore {
         rows: Arc<Mutex<HashMap<OperationId, Operation>>>,
         calls: Arc<Mutex<Vec<StoreCall>>>,
-        fail_listing: Arc<Mutex<Option<ListingFailure>>>,
+        fail_listing: Arc<Mutex<Option<OperationState>>>,
     }
 
     impl FakeStore {
@@ -680,14 +677,12 @@ mod tests {
             Ok(())
         }
 
-        /// Arms exactly one failure for the next listing of `state`: `None`
-        /// arms the recovery listing, `Some` arms the queued listing.
-        fn arm_listing_failure(&self, state: Option<OperationState>) -> Result<(), MockError> {
-            *self.fail_listing.lock().map_err(|_| MockError::Events)? = Some(match state {
-                None => ListingFailure::Recovery,
-                // The sweep's second listing is always the queued one.
-                Some(_) => ListingFailure::Queued,
-            });
+        /// Arms exactly one failure for the next listing of `state`: arming
+        /// a recoverable state fails that recovery-scan query (the sweep
+        /// aborts before dispatch), arming `Queued` fails the queued-work
+        /// listing.
+        fn arm_listing_failure(&self, state: OperationState) -> Result<(), MockError> {
+            *self.fail_listing.lock().map_err(|_| MockError::Events)? = Some(state);
             Ok(())
         }
 
@@ -752,15 +747,11 @@ mod tests {
                     .lock()
                     .map_err(|_| MockError::Events)?
                     .push(StoreCall::List(state));
-                // The sweep only ever lists `None` and `Some(Queued)`, so the
-                // armed listing is identified by the filter it carries.
-                let armed = match state {
-                    None => Some(ListingFailure::Recovery),
-                    Some(OperationState::Queued) => Some(ListingFailure::Queued),
-                    Some(_) => None,
-                };
+                // The armed failure is matched by the exact filter it was
+                // armed for, so a recovery-scan query and the queued-work
+                // query fail independently.
                 let mut fail = self.fail_listing.lock().map_err(|_| MockError::Events)?;
-                if *fail == armed {
+                if state == *fail {
                     *fail = None;
                     return Err(MockError::Store);
                 }
@@ -1080,11 +1071,15 @@ mod tests {
 
         run_tick(&OperationEngine::new(&store), &executor, &monitor, now).await?;
 
-        // One listing for the §13.6 recovery scan, one for the new work.
+        // One exact-state query per recoverable state for the §13.6
+        // recovery scan, then one for the new work.
         assert_eq!(
             store.recorded_calls()?,
             [
-                StoreCall::List(None),
+                StoreCall::List(Some(OperationState::Validating)),
+                StoreCall::List(Some(OperationState::Running)),
+                StoreCall::List(Some(OperationState::WaitingRemote)),
+                StoreCall::List(Some(OperationState::Verifying)),
                 StoreCall::List(Some(OperationState::Queued)),
             ]
         );
@@ -1138,7 +1133,9 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let store = FakeStore::new();
         store.insert(queued_operation())?;
-        store.arm_listing_failure(None)?;
+        // The recovery scan's first exact-state query fails, aborting the
+        // sweep before any dispatch.
+        store.arm_listing_failure(OperationState::Validating)?;
         let executor = FakeExecutor::new(Vec::new());
         let monitor = FakeMonitor::new(Vec::new(), Vec::new());
 
@@ -1169,7 +1166,7 @@ mod tests {
         let store = FakeStore::new();
         store.insert(parked_operation(OperationState::Validating)?)?;
         // The recovery listing succeeds first; the queued listing fails.
-        store.arm_listing_failure(Some(OperationState::Queued))?;
+        store.arm_listing_failure(OperationState::Queued)?;
         let executor = FakeExecutor::new(Vec::new());
         let monitor = FakeMonitor::new(Vec::new(), Vec::new());
 
@@ -1237,14 +1234,28 @@ mod tests {
         let (stop_signal, stop_watch) = StopSignal::new();
         let mut first = stop_watch.clone();
         let mut second = stop_watch;
+        assert!(
+            !first.has_stopped() && !second.has_stopped(),
+            "a fresh watch must not report stopped"
+        );
 
+        // A signalled watch resolves every waiter, under a timeout so a
+        // broken watch fails the test instead of hanging it.
         stop_signal.signal();
-        first.stopped().await;
+        tokio::time::timeout(StdDuration::from_secs(5), first.stopped())
+            .await
+            .map_err(|_| std::io::Error::other("a signalled stop watch did not resolve in time"))?;
 
         // Dropping the signal side also resolves every waiter, so shutdown
-        // is guaranteed even when `signal` is never called.
+        // is guaranteed even when `signal` is never called; the closed
+        // channel also makes the wait side report stopped.
         drop(stop_signal);
-        second.stopped().await;
+        tokio::time::timeout(StdDuration::from_secs(5), second.stopped())
+            .await
+            .map_err(|_| {
+                std::io::Error::other("a stop watch did not resolve on signal drop in time")
+            })?;
+        assert!(second.has_stopped());
         Ok(())
     }
 

@@ -37,10 +37,10 @@ use rutilus_api::{
     EndpointSnapshotSummaryResponse, EndpointSummaryResponse, EndpointTrustChallengeResponse,
     EndpointTrustChallengeStateResponse, EndpointTrustExpectationRequest, EnrollEndpointRequest,
     EnvironmentMetricsControlResponse, EnvironmentMetricsReadingResponse, ErrorResponse,
-    EventListResponse, EventResponse, GroupListResponse, GroupResponse, HealthResponse,
-    MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse, OperationListResponse,
-    OperationResponse, OperationSourceResponse, OperationStateResponse, OperationTargetResponse,
-    OverviewCapabilityCoverageResponse, OverviewEndpointCountsResponse,
+    EventListResponse, EventResponse, FailureKindResponse, GroupListResponse, GroupResponse,
+    HealthResponse, MetricValueResponse, OemNvidiaSystemConfigProfileTruststoreResponse,
+    OperationListResponse, OperationResponse, OperationSourceResponse, OperationStateResponse,
+    OperationTargetResponse, OverviewCapabilityCoverageResponse, OverviewEndpointCountsResponse,
     OverviewFirmwareSummaryResponse, OverviewFreshnessBucketResponse,
     OverviewFreshnessCountResponse, OverviewHealthCountResponse, OverviewHealthLevelResponse,
     OverviewResponse, OverviewVendorCountResponse, RefreshEndpointsRequest,
@@ -80,10 +80,11 @@ use rutilus_domain::{
     BatchOperationState, BatchOutcomeCounts, CapabilityClassification, CapabilityState,
     CenterBindingId, CenterBindingState, CertificateFingerprintParseError, Credential,
     CredentialId, CredentialName, CredentialUsername, DeploymentPosture, Endpoint, EndpointAddress,
-    EndpointDisplayName, EndpointId, Event, Group, GroupId, GroupName, InstanceId, Operation,
-    OperationId, OperationSource, OperationState, OperationTarget, PrincipalId, ProductPermission,
-    RedfishCommand, ResourceFeature, ResourceId, ResourceODataId, ResourceSnapshot, Tag, TagName,
-    TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsTrust, UiLocation,
+    EndpointDisplayName, EndpointId, Event, FailureKind, Group, GroupId, GroupName, InstanceId,
+    Operation, OperationId, OperationSource, OperationState, OperationTarget, PrincipalId,
+    ProductPermission, RedfishCommand, ResourceFeature, ResourceId, ResourceODataId,
+    ResourceSnapshot, Tag, TagName, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId,
+    TlsTrust, UiLocation,
 };
 use time::OffsetDateTime;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -1511,7 +1512,9 @@ where
     Services: EndpointInventoryRepository,
 {
     let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
-        return uncached_status(StatusCode::BAD_REQUEST);
+        // A5-4: the JSON error body convention shared with the sibling
+        // detail routes (batch_detail, operation_detail, ...).
+        return json_error(StatusCode::BAD_REQUEST, "endpoint id is invalid".to_owned());
     };
     let inventory = match EndpointResourceInventoryQuery::new(state.services.as_ref(), endpoint_id)
         .execute()
@@ -1556,11 +1559,13 @@ async fn resource_diagnostics<Services, Gateway, Time>(
 where
     Services: EndpointInventoryRepository,
 {
-    let (Ok(endpoint_id), Ok(resource_id)) = (
-        endpoint_id.parse::<EndpointId>(),
-        resource_id.parse::<ResourceId>(),
-    ) else {
-        return uncached_status(StatusCode::BAD_REQUEST);
+    let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
+        // A5-4: the JSON error body convention, one named id per verdict —
+        // a bare 400 would leave the console without a reason.
+        return json_error(StatusCode::BAD_REQUEST, "endpoint id is invalid".to_owned());
+    };
+    let Ok(resource_id) = resource_id.parse::<ResourceId>() else {
+        return json_error(StatusCode::BAD_REQUEST, "resource id is invalid".to_owned());
     };
     let diagnostics =
         match ResourceDiagnosticsQuery::new(state.services.as_ref(), endpoint_id, resource_id)
@@ -1601,7 +1606,9 @@ where
     Services: CapabilityQueryRepository,
 {
     let Ok(endpoint_id) = endpoint_id.parse::<EndpointId>() else {
-        return uncached_status(StatusCode::BAD_REQUEST);
+        // A5-4: the JSON error body convention shared with the sibling
+        // detail routes.
+        return json_error(StatusCode::BAD_REQUEST, "endpoint id is invalid".to_owned());
     };
     let entries = match EndpointCapabilityQuery::new(state.services.as_ref(), endpoint_id)
         .execute()
@@ -2209,7 +2216,10 @@ where
             .submit(source, targets, request.command().clone(), now)
             .await
         {
-            Ok(operation) => json_created(Json(project_operation(&operation))),
+            // A fresh submission is never born classified: the failure kind
+            // only lands through the executor's refusal path before a
+            // `Failed` transition (§13.7).
+            Ok(operation) => json_created(Json(project_operation(&operation, None))),
             Err(error) => submission_error_response(&error),
         }
     }
@@ -2290,7 +2300,15 @@ where
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
     };
     let mut response = Json(OperationListResponse::new(
-        operations.iter().map(project_operation).collect(),
+        // TODO(E3-4): `OperationSubmission::list` does not surface the
+        // per-operation failure classification, so the history list rows
+        // project no kind. Threading the read through the submission use
+        // case (one `find_failure_kind` per row, or a classified listing
+        // read) fills the wire without any response-shape change.
+        operations
+            .iter()
+            .map(|operation| project_operation(operation, None))
+            .collect(),
     ))
     .into_response();
     no_store(&mut response);
@@ -2306,11 +2324,21 @@ where
     Services: ProductServices,
 {
     let Ok(operation_id) = operation_id.parse::<OperationId>() else {
-        return uncached_status(StatusCode::BAD_REQUEST);
+        // A5-4: the same JSON error body as the sibling `batch_detail` and
+        // every other path-parameter parse — a bare 400 would leave the
+        // console without a reason.
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "operation id is invalid".to_owned(),
+        );
     };
     let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
     match submission.find(operation_id).await {
-        Ok(Some(operation)) => json_ok(Json(project_operation(&operation))),
+        // TODO(E3-4): `OperationSubmission::find` does not surface
+        // `find_failure_kind`, so the single-operation read projects no
+        // kind. Threading the classification read through the submission use
+        // case fills the wire without any response-shape change.
+        Ok(Some(operation)) => json_ok(Json(project_operation(&operation, None))),
         Ok(None) => uncached_status(StatusCode::NOT_FOUND),
         Err(SubmissionError::Store(_)) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
         // The submission verdicts cannot occur from a single-record read; only
@@ -2636,7 +2664,18 @@ fn project_artifact_progress(progress: &ArtifactProgress) -> ArtifactProgressRes
     )
 }
 
-fn project_operation(operation: &Operation) -> OperationResponse {
+/// Projects one persisted operation onto its console wire shape (§13.1),
+/// carrying the §13.7 failure classification when the caller read it (E3-4).
+///
+/// `failure_kind` is the persisted classification of a `Failed` operation —
+/// `None` for every other outcome and for callers whose read path does not
+/// surface the classification. A provably-unsupported refusal keeps its kind
+/// on the wire, so the console renders the honest verdict instead of an
+/// ordinary failure.
+fn project_operation(
+    operation: &Operation,
+    failure_kind: Option<FailureKind>,
+) -> OperationResponse {
     OperationResponse::new(
         operation.id().into_uuid(),
         project_operation_source(operation.source()),
@@ -2649,7 +2688,15 @@ fn project_operation(operation: &Operation) -> OperationResponse {
         project_operation_state(operation.state()),
         operation.created_at(),
         operation.updated_at(),
+        failure_kind.map(project_failure_kind),
     )
+}
+
+/// Projects one §13.7 failure classification onto its console wire value.
+fn project_failure_kind(kind: FailureKind) -> FailureKindResponse {
+    match kind {
+        FailureKind::CapabilityUnsupported => FailureKindResponse::CapabilityUnsupported,
+    }
 }
 
 /// Projects one batch parent with its children onto the wire
@@ -2731,7 +2778,11 @@ fn project_batch_detail(detail: &BatchDetail) -> BatchDetailResponse {
         project_batch_state(detail.summary().state()),
         project_batch_outcomes(detail.summary().outcomes()),
         detail.summary().batch().created_at(),
-        detail.children().iter().map(project_operation).collect(),
+        detail
+            .children()
+            .iter()
+            .map(|(child, kind)| project_operation(child, *kind))
+            .collect(),
     )
 }
 
@@ -7846,6 +7897,19 @@ mod tests {
             child_ids, sorted,
             "the detail must carry the children in target order"
         );
+        // The §13.7 classification rides the wire with each child: the
+        // provably-unsupported refusal keeps its exact console value and
+        // every ordinary outcome carries `null` (E3-4).
+        assert_eq!(
+            detail["children"][0]["failure_kind"],
+            "capability_unsupported"
+        );
+        let children = detail["children"]
+            .as_array()
+            .ok_or("children must be a list")?;
+        for child in &children[1..] {
+            assert_eq!(child["failure_kind"], json!(null));
+        }
 
         // A malformed batch id is a client error; an unknown id is 404.
         let bad_id = router

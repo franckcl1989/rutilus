@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use rutilus_domain::{
     CapabilityState, CapabilityStateParseError, EndpointCapability, EndpointCapabilityObservation,
@@ -115,6 +118,84 @@ impl SqliteStore {
             .await
             .map_err(EndpointCapabilityRepositoryError::Database)?;
         Ok(Some(capabilities))
+    }
+
+    /// Loads the capability observations of several endpoints in one query.
+    ///
+    /// The rows are read with a single `endpoint_id IN (...)` filter (plus
+    /// one read of the endpoints' creation times for the same
+    /// observation-predates-endpoint validation the single-endpoint read
+    /// applies) and grouped by endpoint in stable capability-code order. The
+    /// result maps every requested endpoint that exists to its observations
+    /// — possibly empty when its probe has not completed — and omits unknown
+    /// endpoints, exactly like the single-endpoint read reports
+    /// `Some(vec![])` versus `None`. A capability row whose endpoint vanished
+    /// between the two reads of the batch contributes nothing, matching the
+    /// `Ok(None)` verdict the single-endpoint read gives the same race.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointCapabilityRepositoryError`] when a query fails or a
+    /// persisted capability, state, or timestamp violates domain invariants.
+    pub async fn find_endpoint_capabilities_batch(
+        &self,
+        endpoint_ids: &[EndpointId],
+    ) -> Result<
+        BTreeMap<EndpointId, Vec<StoredEndpointCapability>>,
+        EndpointCapabilityRepositoryError,
+    > {
+        let ids = endpoint_ids
+            .iter()
+            .map(|endpoint_id| endpoint_id.into_uuid())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(EndpointCapabilityRepositoryError::Database)?;
+        let endpoint_models = endpoint::Entity::find()
+            .filter(endpoint::Column::Id.is_in(ids.clone()))
+            .all(&transaction)
+            .await
+            .map_err(EndpointCapabilityRepositoryError::Database)?;
+        let created_at_by_id = endpoint_models
+            .into_iter()
+            .map(|model| (model.id, model.created_at))
+            .collect::<BTreeMap<_, _>>();
+        let models = endpoint_capability::Entity::find()
+            .filter(endpoint_capability::Column::EndpointId.is_in(ids))
+            .order_by_asc(endpoint_capability::Column::Capability)
+            .all(&transaction)
+            .await
+            .map_err(EndpointCapabilityRepositoryError::Database)?;
+        let mut observations_by_endpoint = BTreeMap::new();
+        for endpoint_id in endpoint_ids {
+            if created_at_by_id.contains_key(&endpoint_id.into_uuid()) {
+                observations_by_endpoint.insert(*endpoint_id, Vec::new());
+            }
+        }
+        for model in models {
+            let endpoint_id = EndpointId::from_uuid(model.endpoint_id);
+            let Some(created_at) = created_at_by_id.get(&model.endpoint_id).copied() else {
+                // The endpoint vanished between the two reads of this batch;
+                // the single-endpoint read reports `Ok(None)` in the same
+                // race, so the row contributes nothing.
+                continue;
+            };
+            let capability = map_stored_capability(endpoint_id, created_at, &model)?;
+            observations_by_endpoint
+                .entry(endpoint_id)
+                .or_default()
+                .push(capability);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(EndpointCapabilityRepositoryError::Database)?;
+        Ok(observations_by_endpoint)
     }
 }
 
@@ -514,6 +595,96 @@ mod tests {
             capability.observed_at() == third_observed_at
                 && full.contains(&capability.observation())
         }));
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loads_several_endpoints_in_one_batch_query() -> Result<(), Box<dyn Error>> {
+        let (directory, store, first_id, created_at) = store_with_endpoint().await?;
+        let second_id = EndpointId::generate();
+        let third_id = EndpointId::generate();
+        for (endpoint_id, display_name) in [
+            (second_id, "Batch second endpoint"),
+            (third_id, "Batch unobserved endpoint"),
+        ] {
+            endpoint::ActiveModel {
+                id: Set(endpoint_id.into_uuid()),
+                display_name: Set(String::from(display_name)),
+                created_at: Set(created_at),
+                updated_at: Set(created_at),
+                site_id: Set(None),
+                refresh_generation: Set(0),
+                health: Set(String::from("unknown")),
+            }
+            .insert(&store.database)
+            .await?;
+        }
+        let observed_at = created_at + Duration::SECOND;
+        store
+            .replace_endpoint_capabilities(
+                first_id,
+                &[
+                    observation(EndpointCapability::Systems, CapabilityState::Supported),
+                    observation(EndpointCapability::Managers, CapabilityState::Unauthorized),
+                ],
+                observed_at,
+            )
+            .await?;
+        store
+            .replace_endpoint_capabilities(
+                second_id,
+                &[observation(
+                    EndpointCapability::Chassis,
+                    CapabilityState::ReadOnly,
+                )],
+                observed_at,
+            )
+            .await?;
+        let unknown_id = EndpointId::generate();
+
+        let batch = store
+            .find_endpoint_capabilities_batch(&[second_id, first_id, third_id, unknown_id])
+            .await?;
+
+        // Every known endpoint maps to its observations in stable
+        // capability-code order; the known endpoint without a completed probe
+        // maps to an empty vector, and the unknown endpoint stays absent —
+        // the batch equivalents of `Some(vec![])` versus `None`.
+        assert_eq!(
+            batch.get(&first_id),
+            Some(&vec![
+                stored(
+                    EndpointCapability::Managers,
+                    CapabilityState::Unauthorized,
+                    observed_at,
+                ),
+                stored(
+                    EndpointCapability::Systems,
+                    CapabilityState::Supported,
+                    observed_at,
+                ),
+            ])
+        );
+        assert_eq!(
+            batch.get(&second_id),
+            Some(&vec![stored(
+                EndpointCapability::Chassis,
+                CapabilityState::ReadOnly,
+                observed_at,
+            )])
+        );
+        assert_eq!(batch.get(&third_id), Some(&Vec::new()));
+        assert!(!batch.contains_key(&unknown_id));
+        // An empty id list is one no-op batch read.
+        assert!(
+            store
+                .find_endpoint_capabilities_batch(&[])
+                .await?
+                .is_empty()
+        );
 
         store.close().await?;
         drop(directory);

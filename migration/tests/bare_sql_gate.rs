@@ -35,12 +35,20 @@
 //! SELECT` row query — and DML statements inside a `CREATE TRIGGER` body
 //! (`BEGIN ... INSERT/UPDATE/DELETE/... END`). The trigger's own metadata
 //! words (`AFTER INSERT`, `INSTEAD OF UPDATE`, the `WHEN` clause) appear
-//! before `BEGIN` and are not DML. The embedded-DML check is word-level and
-//! therefore has a registered false-positive boundary: a quoted SQL string
-//! literal that contains a spaced word sequence (`CHECK (a <> ' AS
-//! SELECT ')`, `DEFAULT 'TRIGGER BEGIN SELECT END'`) reads like the
-//! embedded shape. No statement in the current tree holds such a literal,
-//! so the boundary is registered, not expanded.
+//! before `BEGIN` and are not DML.
+//!
+//! The embedded-DML scan first strips SQL comments (`--` line comments and
+//! `/* ... */` block comments; see [`strip_sql_comments`]), so a comment
+//! between the shape's words can no longer hide it — `CREATE TABLE x AS --
+//! comment\nSELECT ...` reads as the `AS SELECT` pair once the comment is
+//! gone, and comment content can never read like DML. The check is
+//! word-level and therefore has a registered false-positive boundary: a
+//! quoted SQL string literal that contains a spaced word sequence (`CHECK
+//! (a <> ' AS SELECT ')`, `DEFAULT 'TRIGGER BEGIN SELECT END'`) reads like
+//! the embedded shape. Quoted literals are preserved verbatim by the
+//! stripper — a `--` or `/*` inside a literal is text, not a comment — so
+//! the boundary stands unchanged. No statement in the current tree holds
+//! such a literal, so the boundary is registered, not expanded.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -244,6 +252,68 @@ fn first_keyword(sql: &str) -> &str {
     sql.split_whitespace().next().unwrap_or_default()
 }
 
+/// Strips SQL comments from one statement: `--` line comments (to the end
+/// of the line, newline consumed) and `/* ... */` block comments, each
+/// replaced by a single space so the words around it stay separate words.
+///
+/// Single-quoted SQL string literals are preserved verbatim — a `--` or
+/// `/*` inside a literal is literal text, not a comment — with a doubled
+/// `''` recognized as an escaped quote rather than the end of the literal.
+/// The embedded-DML scan runs on the stripped statement, so a comment
+/// sitting between the shape's words (`CREATE TABLE x AS -- comment
+/// SELECT ...`) can no longer hide the `AS SELECT` pair or a trigger-body
+/// DML word, and comment content can never read like DML. (The first-word
+/// gate keeps scanning the raw statement: a leading comment is not a DDL
+/// first word, so a comment-first statement still fails the carve-out.)
+fn strip_sql_comments(statement: &str) -> String {
+    let chars: Vec<char> = statement.chars().collect();
+    let mut stripped = String::with_capacity(statement.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+            // A `--` line comment: replaced by one space, consumed through
+            // the terminating newline — a comment glued to its neighbors
+            // (`AS--c\nSELECT`) must still separate them.
+            stripped.push(' ');
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+        } else if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            stripped.push(' ');
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+        } else if chars[i] == '\'' {
+            stripped.push('\'');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        stripped.push_str("''");
+                        i += 2;
+                        continue;
+                    }
+                    stripped.push('\'');
+                    i += 1;
+                    break;
+                }
+                stripped.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            stripped.push(chars[i]);
+            i += 1;
+        }
+    }
+    stripped
+}
+
 /// Whether a statement that passed the first-word gate still embeds DML past
 /// its first word. Two shapes are recognized, both word-delimited and
 /// case-insensitive like `first_keyword`:
@@ -258,12 +328,24 @@ fn first_keyword(sql: &str) -> &str {
 ///   trigger's own metadata (`AFTER INSERT`, `INSTEAD OF UPDATE`, the
 ///   `WHEN` clause) legitimately contains DML words before `BEGIN`.
 ///
+/// The scan runs on the [`strip_sql_comments`]-stripped statement, so SQL
+/// comments cannot hide a shape: a comment between `AS` and `SELECT`, or
+/// between `BEGIN` and a body DML word, is removed before the words are
+/// compared (`CREATE TABLE x AS -- comment\n SELECT ...` is caught), and
+/// comment content itself never reads like DML (`/* AS SELECT */` inside a
+/// statement flags nothing).
+///
 /// The word-level scan has a registered false-positive boundary on quoted
 /// SQL string literals: a literal that contains a spaced word sequence reads
 /// like the embedded shape (`CHECK (a <> ' AS SELECT ')`, `DEFAULT 'TRIGGER
-/// BEGIN SELECT END'`). No statement in the current tree holds such a
-/// literal, so the boundary is documented, not expanded.
+/// BEGIN SELECT END'`). The stripper preserves quoted literals verbatim —
+/// `--`/`/*` inside a literal is text, not a comment — so the boundary
+/// stands: a quoted `'AS -- SELECT'` (comment marker inside the literal) is
+/// not treated as a comment and does not form the adjacent pair. No
+/// statement in the current tree holds such a literal, so the boundary is
+/// documented, not expanded.
 fn ddl_embedded_dml(statement: &str) -> Option<String> {
+    let statement = strip_sql_comments(statement);
     let words: Vec<&str> = statement.split_whitespace().collect();
     for pair in words.windows(2) {
         if pair[0].eq_ignore_ascii_case("AS") && pair[1].eq_ignore_ascii_case("SELECT") {
@@ -577,6 +659,15 @@ fn ddl_embedded_dml_is_flagged() {
         "CREATE TRIGGER t AFTER DELETE ON a BEGIN INSERT INTO log VALUES ('x'); END;",
         "CREATE TRIGGER t INSTEAD OF UPDATE ON v WHEN new.a > 1 \
          BEGIN DELETE FROM t2 WHERE id = new.id; END;",
+        // Comment-split shapes: a SQL comment between the shape's words used
+        // to hide the pair/body from the word window. The `--` and `/* */`
+        // forms are stripped before the scan, so the split form is caught.
+        "CREATE TABLE audit_backup AS -- the data copy\nSELECT * FROM audit;",
+        "CREATE TABLE audit_backup AS /* inline comment */ SELECT * FROM audit;",
+        "CREATE VIEW v AS/*no spaces around the comment*/SELECT id FROM users;",
+        "CREATE TABLE t AS -- one comment\n -- then another\n SELECT 1;",
+        "CREATE TRIGGER t AFTER INSERT ON a BEGIN -- the insert\n \
+         INSERT INTO log VALUES ('x');\nEND;",
     ];
     for statement in flagged {
         assert!(
@@ -593,6 +684,17 @@ fn ddl_embedded_dml_is_flagged() {
         "DROP TRIGGER audit_trigger;",
         "PRAGMA user_version = 12;",
         "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS SELECT'), b TEXT);",
+        // Comment content is stripped, never read as DML: a comment that
+        // contains the shape, or a trigger body that is only a comment,
+        // must pass — the word-level scan used to flag both.
+        "CREATE TABLE x /* AS SELECT in a comment */ (id INTEGER);",
+        "CREATE TABLE x -- AS SELECT in a comment\n (id INTEGER);",
+        "CREATE TRIGGER t AFTER INSERT ON a BEGIN /* INSERT INTO log VALUES ('x'); */ END;",
+        // Quoted literals are preserved verbatim: a `--` or `/*` inside a
+        // literal is text, not a comment — the registered quoted-sequence
+        // boundary, including comment markers inside the quotes.
+        "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS -- SELECT'), b TEXT);",
+        "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS /* x */ SELECT'), b TEXT);",
     ];
     for statement in clean {
         assert!(
@@ -600,6 +702,38 @@ fn ddl_embedded_dml_is_flagged() {
             "statement must pass the embedded-DML check: {statement}"
         );
     }
+}
+
+#[test]
+fn strip_sql_comments_removes_comment_text_and_keeps_literals() {
+    // The stripper's own contract, exercised directly: comment text goes
+    // away (replaced by one separating space), quoted literals keep every
+    // character including comment markers, and a doubled `''` is an escaped
+    // quote, not the end of the literal.
+    assert_eq!(
+        strip_sql_comments("CREATE TABLE x AS -- comment\nSELECT 1;"),
+        "CREATE TABLE x AS  SELECT 1;"
+    );
+    assert_eq!(
+        strip_sql_comments("CREATE TABLE x AS/*c*/SELECT 1;"),
+        "CREATE TABLE x AS SELECT 1;"
+    );
+    assert_eq!(
+        strip_sql_comments("CREATE TRIGGER t AFTER INSERT ON a /* BEFORE */ BEGIN END;"),
+        "CREATE TRIGGER t AFTER INSERT ON a   BEGIN END;"
+    );
+    assert_eq!(
+        strip_sql_comments("SELECT '-- not a comment', '/* not a comment */', 'it''s';"),
+        "SELECT '-- not a comment', '/* not a comment */', 'it''s';"
+    );
+    assert_eq!(
+        strip_sql_comments("SELECT 'a */ b' /* real comment */ FROM t;"),
+        "SELECT 'a */ b'   FROM t;"
+    );
+    assert_eq!(
+        strip_sql_comments("CREATE TABLE x AS -- trailing comment (no newline)"),
+        "CREATE TABLE x AS  "
+    );
 }
 
 #[test]

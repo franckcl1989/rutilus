@@ -6,10 +6,14 @@
 //! summary, capability coverage, running operations, recent events, and data
 //! staleness — is served as one aggregate instead of one request per block.
 //! The use case composes only existing query boundaries (the endpoint
-//! inventory and per-endpoint resource inventories, the capability query,
-//! the operation store, and the event repository), so no new persistence
-//! surface exists and the aggregate can never disagree with the individual
-//! views: it derives from the same persisted facts.
+//! inventory, the typed per-resource projection, the capability query, the
+//! operation store, and the event repository), so the aggregate can never
+//! disagree with the individual views: it derives from the same persisted
+//! facts. The fleet-wide blocks are read with a constant query surface — one
+//! inventory query whose items are projected in memory, and one batched
+//! capability query (`endpoint_id IN (...)`) — instead of re-running the
+//! inventory and the capability reads once per endpoint, which would amplify
+//! the read surface linearly in the fleet size.
 //!
 //! Honest derivations (see the api contract for the wire semantics):
 //! - The product does not model online/offline/auth-failed reachability, so
@@ -42,8 +46,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     CapabilityQueryRepository, CoreResourceDetails, CoreResourceSummary, EndpointInventoryQuery,
-    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointResourceInventoryQuery,
-    EndpointResourceInventoryQueryError, EventRepository, OperationStore, StoredCapability,
+    EndpointInventoryQueryError, EndpointInventoryRepository, EndpointResourceInventoryQueryError,
+    EventRepository, OperationStore, StoredCapability,
+    endpoint_resources::project_loaded_resources,
 };
 
 /// The maximum size of the §14.2 homepage recent-event tail. The wire
@@ -333,10 +338,11 @@ impl OverviewAggregate {
 /// Loads the §14.2 homepage aggregate over the four read-only boundaries the
 /// blocks derive from.
 ///
-/// The inventory boundary also backs the per-endpoint resource-inventory
-/// reads (the §12.3 vendor/health and the §2.1 `SoftwareInventory` facts live
-/// in the typed resource payloads), so the same repository reference feeds
-/// both the inventory query and the per-endpoint fan-out.
+/// The inventory boundary also backs the typed resource projection (the
+/// §12.3 vendor/health and the §2.1 `SoftwareInventory` facts live in the
+/// typed resource payloads), so the same repository reference feeds both the
+/// inventory query and the in-memory projection, and the capability boundary
+/// reads every fleet endpoint's ledger in one batched query.
 pub struct OverviewQuery<Inventory, Capabilities, Operations, Events> {
     inventory: Inventory,
     capabilities: Capabilities,
@@ -388,37 +394,50 @@ where
             .await
             .map_err(OverviewQueryError::Inventory)?;
 
+        // The §12.3 vendor/health and the §2.1 `SoftwareInventory` facts live
+        // in the typed resource payloads, so the block derivation projects
+        // them from the inventory items this query already loaded — the same
+        // typed projection the §12.2 Endpoint page serves, without re-running
+        // the full inventory query once per endpoint. The capability coverage
+        // reads every fleet endpoint's ledger in one batched query instead of
+        // one query per endpoint, so the whole fleet costs a constant number
+        // of reads.
+        let endpoint_ids = items
+            .iter()
+            .map(|item| item.endpoint().id())
+            .collect::<Vec<_>>();
+        let observations_by_endpoint = self
+            .capabilities
+            .find_endpoint_capabilities_batch(&endpoint_ids)
+            .await
+            .map_err(OverviewQueryError::Capabilities)?;
+
         let mut fleet = FleetAccumulator::new();
         for item in &items {
             let endpoint_id = item.endpoint().id();
             fleet.count_endpoint(item, now);
 
-            // The §12.3 vendor/health and the §2.1 `SoftwareInventory` facts
-            // live in the typed resource payloads, so the block derivation
-            // reuses the per-endpoint resource-inventory projection — the
-            // same typed read the §12.2 Endpoint page serves. `Ok(None)`
-            // cannot occur for an inventory-listed endpoint and is treated as
-            // an empty resource set.
-            let resources = EndpointResourceInventoryQuery::new(&self.inventory, endpoint_id)
-                .execute()
-                .await
-                .map_err(|source| OverviewQueryError::Resources {
-                    endpoint_id,
-                    source,
-                })?
-                .map(|inventory| inventory.resources().to_vec())
-                .unwrap_or_default();
+            // An inventory-listed endpoint always projects; an invalid stored
+            // payload fails the aggregate exactly like the detail-page query
+            // would.
+            let resources =
+                project_loaded_resources::<Inventory::Error>(item).map_err(|source| {
+                    OverviewQueryError::Resources {
+                        endpoint_id,
+                        source,
+                    }
+                })?;
             fleet.count_resources(&resources);
 
-            let observations = match self
-                .capabilities
-                .find_endpoint_capabilities(endpoint_id)
-                .await
-            {
-                Ok(Some(observations)) => observations,
-                Ok(None) => Vec::new(),
-                Err(source) => return Err(OverviewQueryError::Capabilities(source)),
-            };
+            // Every fleet endpoint is known by construction, so the map always
+            // carries its entry — modulo the vanishing-endpoint race (an
+            // endpoint that disappears between the inventory load and the batch
+            // read, which the unwrap_or_default fallback absorbs) — possibly
+            // empty for an endpoint whose probe has not completed.
+            let observations = observations_by_endpoint
+                .get(&endpoint_id)
+                .cloned()
+                .unwrap_or_default();
             fleet.count_capabilities(observations);
         }
 
@@ -714,7 +733,12 @@ fn non_zero_freshness_counts(counts: [u64; 5]) -> Vec<OverviewFreshnessCount> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, error::Error, fmt};
+    use std::{
+        collections::HashMap,
+        error::Error,
+        fmt,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use rutilus_domain::{
         CapabilityState, CredentialId, Endpoint, EndpointAddress, EndpointCapability,
@@ -846,13 +870,20 @@ mod tests {
         )?)
     }
 
-    #[derive(Clone)]
+    #[derive(Default)]
     struct MockBoundaries {
         inventory: Vec<EndpointInventoryItem>,
         capabilities: HashMap<EndpointId, Vec<StoredCapability>>,
         operations: Vec<Operation>,
         events: Vec<Event>,
         fail: Option<MockFailure>,
+        /// How often the repository boundary was hit per read surface; the
+        /// call-count assertions pin the constant query surface (one
+        /// inventory read and one batched capability read per fleet, never
+        /// one per endpoint).
+        inventory_queries: AtomicUsize,
+        capability_queries: AtomicUsize,
+        capability_batch_queries: AtomicUsize,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -871,6 +902,7 @@ mod tests {
         fn list_endpoint_inventory(
             &self,
         ) -> BoundaryFuture<'_, Result<Vec<EndpointInventoryItem>, Self::Error>> {
+            self.inventory_queries.fetch_add(1, Ordering::Relaxed);
             let items = self.inventory.clone();
             let fail = self.fail == Some(MockFailure::Inventory);
             Box::pin(async move {
@@ -889,6 +921,7 @@ mod tests {
             &self,
             endpoint_id: EndpointId,
         ) -> BoundaryFuture<'_, Result<Option<Vec<StoredCapability>>, Self::Error>> {
+            self.capability_queries.fetch_add(1, Ordering::Relaxed);
             let capabilities = self.capabilities.get(&endpoint_id).cloned();
             let fail = self.fail == Some(MockFailure::Capabilities);
             Box::pin(async move {
@@ -896,6 +929,32 @@ mod tests {
                     return Err(MockError);
                 }
                 Ok(capabilities)
+            })
+        }
+
+        fn find_endpoint_capabilities_batch<'a>(
+            &'a self,
+            endpoint_ids: &'a [EndpointId],
+        ) -> BoundaryFuture<
+            'a,
+            Result<crate::capability_query::CapabilityObservationsByEndpoint, Self::Error>,
+        > {
+            self.capability_batch_queries
+                .fetch_add(1, Ordering::Relaxed);
+            let capabilities = self.capabilities.clone();
+            let fail = self.fail == Some(MockFailure::Capabilities);
+            Box::pin(async move {
+                if fail {
+                    return Err(MockError);
+                }
+                Ok(endpoint_ids
+                    .iter()
+                    .filter_map(|endpoint_id| {
+                        capabilities
+                            .get(endpoint_id)
+                            .map(|observations| (*endpoint_id, observations.clone()))
+                    })
+                    .collect())
             })
         }
     }
@@ -1120,7 +1179,7 @@ mod tests {
                 event(current_id, NOW)?,
                 event(stale_id, NOW - Duration::MINUTE)?,
             ],
-            fail: None,
+            ..MockBoundaries::default()
         };
 
         let aggregate = query(&boundaries)
@@ -1163,6 +1222,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loads_the_whole_fleet_with_one_inventory_and_one_capability_query()
+    -> Result<(), Box<dyn Error>> {
+        // The P1-1 mitigation: the inventory is read once and its items are
+        // projected in memory, and the capability ledger loads in one batched
+        // query, so the repository call surface stays constant in the fleet
+        // size instead of growing by one inventory re-read and one capability
+        // read per endpoint.
+        let (first, first_item) = refreshed_item(
+            "Rack A BMC",
+            40,
+            Some("ACME"),
+            Some("OK"),
+            &[Some("1.2.3")],
+            NOW - Duration::MINUTE,
+        )?;
+        let (second, second_item) = refreshed_item(
+            "Rack B BMC",
+            41,
+            Some("ACME"),
+            None,
+            &[None],
+            NOW - Duration::MINUTE,
+        )?;
+        let first_id = first.id();
+        let second_id = second.id();
+        let boundaries = MockBoundaries {
+            inventory: vec![first_item, second_item],
+            capabilities: HashMap::from([
+                (
+                    first_id,
+                    vec![stored(
+                        EndpointCapability::Systems,
+                        CapabilityState::Supported,
+                    )],
+                ),
+                (
+                    second_id,
+                    vec![stored(
+                        EndpointCapability::Managers,
+                        CapabilityState::NotAdvertised,
+                    )],
+                ),
+            ]),
+            ..MockBoundaries::default()
+        };
+
+        let aggregate = query(&boundaries).execute(NOW, limit()?).await?;
+
+        // The aggregate still counts every observed capability exactly like
+        // the per-endpoint reads did...
+        assert_eq!(
+            aggregate.capabilities(),
+            &OverviewCapabilityCoverage::new(2, 1)
+        );
+        // ...while the repository boundary was hit exactly once per read
+        // surface, and the per-endpoint capability read never.
+        assert_eq!(boundaries.inventory_queries.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            boundaries.capability_batch_queries.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(boundaries.capability_queries.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn boundary_failures_map_to_the_matching_verdict() -> Result<(), Box<dyn Error>> {
         let current = endpoint("Rack A BMC", 20)?;
         let item = inventory_item(current, Vec::new())?;
@@ -1178,6 +1303,7 @@ mod tests {
                 operations: Vec::new(),
                 events: Vec::new(),
                 fail: Some(failure),
+                ..MockBoundaries::default()
             };
             let result = query(&boundaries).execute(NOW, limit()?).await;
             let Err(error) = result else {
@@ -1203,7 +1329,7 @@ mod tests {
             capabilities: HashMap::new(),
             operations: Vec::new(),
             events: Vec::new(),
-            fail: None,
+            ..MockBoundaries::default()
         };
         let aggregate = query(&boundaries).execute(NOW, limit()?).await?;
         assert_eq!(aggregate.endpoints(), &OverviewEndpointCounts::new(0, 0, 0));
@@ -1235,7 +1361,7 @@ mod tests {
             capabilities: HashMap::new(),
             operations: Vec::new(),
             events: Vec::new(),
-            fail: None,
+            ..MockBoundaries::default()
         };
         let aggregate = query(&boundaries)
             .execute(NOW + Duration::HOUR, limit()?)

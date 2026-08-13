@@ -1,0 +1,26 @@
+# Dependency update automation (supply-chain, F4-1, 2026-08-13): weekly
+# Dependabot PRs for the two ecosystems the repository pins by SHA or
+# version.
+#
+# - github-actions: bumps the commit-SHA pins in .github/workflows/ci.yml
+#   (see the "Third-party action pinning" policy note there). Every such PR
+#   touches .github/ and therefore needs CODEOWNERS review.
+# - cargo: bumps workspace crate versions and Cargo.lock together. The CI
+#   gates (--locked builds, cargo deny, cargo audit) verify each bump; when a
+#   bump changes an advisory status, keep the deny.toml [advisories] ignore
+#   list and the ci.yml Advisory-scan --ignore flags in lockstep (the
+#   TRIGGER notes in deny.toml name the drop conditions).
+#
+# Not verifiable from this file: Dependabot's runtime behavior (schedule,
+# PR labels, commit signing) is configured here but executed by GitHub —
+# the schedule itself is checked on the first weekly run.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

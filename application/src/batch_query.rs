@@ -15,8 +15,8 @@
 use std::error::Error;
 
 use rutilus_domain::{
-    BatchOperation, BatchOperationId, BatchOperationState, BatchOutcomeCounts, Operation,
-    OperationOutcome, derive_batch_state, summarize,
+    BatchOperation, BatchOperationId, BatchOperationState, BatchOutcomeCounts, FailureKind,
+    Operation, OperationOutcome, derive_batch_state, summarize,
 };
 use thiserror::Error;
 
@@ -74,21 +74,27 @@ impl BatchSummary {
     }
 }
 
-/// One batch's full report: the summary plus every child operation (§13.7).
+/// One batch's full report: the summary plus every child operation with its
+/// persisted failure classification (§13.7).
 ///
-/// The children are ordinary persisted operations in target order; their
-/// failure kinds are consumed by the summary's bucket derivation and do not
-/// surface here — the per-child classification is a reporting input, not a
-/// console contract.
+/// The children are ordinary persisted operations in target order, each
+/// paired with its persisted failure kind (`None` for every child that is
+/// not a classified failure). The summary's buckets derive from the same
+/// pairs, and the response projection carries the per-child classification
+/// (E3-4) so the console can render a provably-unsupported refusal instead
+/// of an ordinary failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchDetail {
     summary: BatchSummary,
-    children: Vec<Operation>,
+    children: Vec<(Operation, Option<FailureKind>)>,
 }
 
 impl BatchDetail {
     #[must_use]
-    pub const fn new(summary: BatchSummary, children: Vec<Operation>) -> Self {
+    pub const fn new(
+        summary: BatchSummary,
+        children: Vec<(Operation, Option<FailureKind>)>,
+    ) -> Self {
         Self { summary, children }
     }
 
@@ -97,9 +103,10 @@ impl BatchDetail {
         &self.summary
     }
 
-    /// Returns the batch's children in target order.
+    /// Returns the batch's children in target order, each paired with its
+    /// persisted failure classification.
     #[must_use]
-    pub fn children(&self) -> &[Operation] {
+    pub fn children(&self) -> &[(Operation, Option<FailureKind>)] {
         &self.children
     }
 }
@@ -173,12 +180,13 @@ where
             .iter()
             .map(|(operation, kind)| OperationOutcome::new(operation.state(), *kind))
             .collect::<Vec<_>>();
+        // The classified children are carried whole into the report: the
+        // response projection pairs each child with its persisted failure
+        // kind (E3-4), so the classification is never dropped between the
+        // store read and the console wire.
         Ok(Some(BatchDetail::new(
             BatchSummary::new(batch, derive_batch_state(&states), summarize(&outcomes)),
-            classified
-                .into_iter()
-                .map(|(operation, _)| operation)
-                .collect(),
+            classified,
         )))
     }
 
@@ -659,17 +667,40 @@ mod tests {
         assert_eq!(detail.summary().outcomes().unsupported(), 1);
         assert_eq!(detail.summary().outcomes().succeeded(), 1);
         assert_eq!(detail.summary().outcomes().total(), 3);
-        // The full child list in target order, without the kinds — the
-        // classification is a summary input, not a console contract.
+        // The full child list in target order, each paired with its persisted
+        // failure classification (E3-4): the provably-unsupported refusal
+        // keeps its kind, and the ordinary outcomes carry none.
         assert_eq!(detail.children().len(), 3);
         let ids = detail
             .children()
             .iter()
-            .map(|child| child.targets()[0].target_id())
+            .map(|(child, _)| child.targets()[0].target_id())
             .collect::<Vec<_>>();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "children must read back in target order");
+        let classified = detail
+            .children()
+            .iter()
+            .filter(|(_, kind)| kind.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(classified.len(), 1, "exactly one child is classified");
+        let (child, kind) = classified[0];
+        assert_eq!(*kind, Some(FailureKind::CapabilityUnsupported));
+        assert_eq!(
+            child.state(),
+            OperationState::Failed,
+            "the classification is a fact of a failed child"
+        );
+        assert_eq!(
+            detail
+                .children()
+                .iter()
+                .filter(|(_, kind)| kind.is_none())
+                .count(),
+            2,
+            "every ordinary outcome reads back unclassified"
+        );
         Ok(())
     }
 

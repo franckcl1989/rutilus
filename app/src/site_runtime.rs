@@ -1372,7 +1372,9 @@ async fn run_center_sync_task(
             tokio::select! {
                 () = stop.stopped() => {}
                 () = binding_revoked(store, binding_site, poll) => {
-                    tracing::warn!("the site's center binding was revoked; stopping the center sync");
+                    // The watch logged the true reason (audit follow-up
+                    // E3-1): only a row observed in a non-`Bound` state
+                    // resolves it.
                 }
             }
         })
@@ -1395,19 +1397,70 @@ async fn run_center_sync_task(
                 tracing::error!("failed to revoke the local binding: {error}");
             }
         }
+        Err(CenterSyncError::IdentityMismatch) => {
+            // Audit follow-up E3-2 (C5-10): the center consistently
+            // refused the site as an `identity-mismatch` — the `Hello`'s
+            // declared instance identity disagrees with the center's
+            // binding record for the presented certificate. Unlike
+            // `not-bound`, the binding IS in force on the center, so the
+            // local row must NOT be revoked (that would tear down a valid
+            // binding); the mismatch is a configuration error no retry can
+            // heal — the engine stopped so the site is not alerting every
+            // backoff — and the repair path is to re-bind the site to the
+            // center. The site keeps running locally until then.
+            tracing::error!(
+                "the center refused the site as an identity mismatch: the site's instance \
+                 identity does not match the center's binding for its certificate; re-bind \
+                 the site to the center (the local binding is left in place)"
+            );
+        }
         Err(error) => {
             tracing::error!("the center sync engine stopped with an error: {error}");
         }
     }
 }
 
-/// Resolves when the site's binding is no longer `Bound` (revoked, or the
-/// row vanished).
+/// Resolves when the site's binding is no longer `Bound` (audit follow-up
+/// E3-1).
+///
+/// Only a row that still exists in a different state is a true revocation:
+/// a vanished row and a failed store read are transient — the row may be
+/// mid-write on the bind path or the store may be wedged — and stopping
+/// the sync engine on either would strand a bound site. The watch keeps
+/// polling through them, with a warn naming the true reason, and only a
+/// row observed in a non-`Bound` state stops the engine.
 async fn binding_revoked(store: &SqliteStore, site: InstanceId, poll: Duration) {
     loop {
         match store.find_binding_by_site(site).await {
             Ok(Some(binding)) if binding.state() == CenterBindingState::Bound => {}
-            _ => return,
+            Ok(Some(binding)) => {
+                // The row still exists and is no longer `Bound`: the
+                // binding was revoked on this site. Only this shape stops
+                // the engine.
+                tracing::warn!(
+                    "the site's center binding is {}; stopping the center sync",
+                    binding.state()
+                );
+                return;
+            }
+            Ok(None) => {
+                // The row vanished: transient by the same rule as a failed
+                // read — the bind path writes the row before the engine
+                // starts, so a missing row means an external change, never
+                // a revocation verdict.
+                tracing::warn!(
+                    "the site's center binding row is missing; keeping the center sync running"
+                );
+            }
+            Err(error) => {
+                // A failed store read must not be mistaken for a
+                // revocation: a wedged store would otherwise stop the sync
+                // engine of a still-bound site.
+                tracing::warn!(
+                    "the binding watch could not read the site's center binding: {error}; \
+                     keeping the center sync running"
+                );
+            }
         }
         tokio::time::sleep(poll).await;
     }
@@ -1989,6 +2042,210 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn the_binding_watch_ignores_transient_rows_and_stops_on_a_true_revocation()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up E3-1: a missing binding row and a still-bound
+        // row keep the watch polling — only a row observed in a
+        // non-`Bound` state stops it — so a transient store read (or a
+        // row the bind path has not written yet) can never strand a
+        // bound site with a stopped sync engine.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let state = test_state(&paths).await?;
+        let now = OffsetDateTime::now_utc();
+        let site = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        state.store.create_instance(&site).await?;
+        let poll = Duration::from_millis(10);
+
+        // No binding row yet: the vanished row is transient, so the watch
+        // keeps polling instead of stopping the engine.
+        let watch = binding_revoked(&state.store, site.id(), poll);
+        tokio::pin!(watch);
+        let result = tokio::time::timeout(Duration::from_millis(60), &mut watch).await;
+        assert!(
+            result.is_err(),
+            "a missing binding row must not stop the watch"
+        );
+
+        // The bind path writes the row as `Bound`: the watch keeps
+        // polling.
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            "127.0.0.1:8443".to_owned(),
+            site.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        binding.bind(Some(CertificateFingerprint::from_bytes([0x42; 32])), now)?;
+        let binding_id = binding.id();
+        state.store.create_binding(&binding).await?;
+        let result = tokio::time::timeout(Duration::from_millis(60), &mut watch).await;
+        assert!(result.is_err(), "a bound row must not stop the watch");
+
+        // The true revocation stops the watch.
+        state.store.revoke_binding(binding_id).await?;
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut watch).await;
+        result.map_err(|_| io::Error::other("the watch did not stop after the revocation"))?;
+        Ok(())
+    }
+
+    // The mismatch script is one continuous scenario — the center side,
+    // the mismatched site material, the engine run, and the binding
+    // assertion — so it stays in one test (the same lint allowance as the
+    // not-bound convergence test).
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn identity_mismatch_refusals_stop_the_engine_without_revoking_the_local_binding()
+    -> Result<(), Box<dyn Error>> {
+        // Audit follow-up E3-2 (C5-10): the center's binding for the
+        // presented certificate is in force, but the `Hello` declares a
+        // different instance identity — the certificate was issued for
+        // another instance than the site now runs as. The center refuses
+        // with `identity-mismatch`; the site stops retrying after the
+        // configured consecutive refusals (no more alerting every
+        // backoff) and — unlike `not-bound` — leaves its local binding
+        // untouched: the binding IS in force, only a re-bind heals the
+        // mismatch.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("site"))?;
+        let center_paths = RuntimePaths::from_root(directory.path().join("center"))?;
+
+        // The center side: an acceptor whose admission finds the site's
+        // fingerprint bound to a different instance than the site
+        // declares.
+        let ca = Arc::new(CenterCa::generate_or_load(&paths)?);
+        let acceptor = loop {
+            let port = free_port(Ipv4Addr::LOCALHOST).await?;
+            let listen = ListenAddress::parse(&format!("127.0.0.1:{port}"))?;
+            match CenterAcceptor::bind_with_ca(
+                &paths,
+                &listen,
+                Arc::clone(&ca),
+                CenterAcceptorOptions {
+                    handshake_timeout: Duration::from_secs(5),
+                    idle_timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+            {
+                Ok(acceptor) => break acceptor,
+                Err(error) if is_raced_center_bind(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let acceptor_address = acceptor.address().to_string();
+        let acceptor_fingerprint = acceptor.server_fingerprint();
+        let center_state = test_state(&center_paths).await?;
+        let now = OffsetDateTime::now_utc();
+        // The binding record the certificate resolves to: bound, in force,
+        // but naming a different site than the one the `Hello` declares.
+        let bound_instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        center_state.store.create_instance(&bound_instance).await?;
+        let site_fingerprint = CertificateFingerprint::from_bytes([0x42; 32]);
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            acceptor_address.clone(),
+            bound_instance.id(),
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        binding.bind(Some(site_fingerprint), now)?;
+        center_state.store.create_binding(&binding).await?;
+        let center_state_for_accept = Arc::clone(&center_state);
+        let accept_task = tokio::spawn(async move {
+            let mut acceptor = acceptor;
+            let admission = CenterSessionAdmission::new(&center_state_for_accept.store);
+            loop {
+                // Every connection here is refused with the
+                // `identity-mismatch` answer; the loop keeps accepting the
+                // site's retries until the site stops.
+                let _ = acceptor.accept_with_admission(&admission).await;
+            }
+        });
+
+        // The site side: a bound local row, with the delivered material
+        // issued for the CENTER's bound instance — the certificate and the
+        // site's declared identity disagree exactly like a re-bound or
+        // recreated site.
+        let state = test_state(&paths).await?;
+        let local_instance = SiteInstance::new(
+            InstanceId::generate(),
+            "Test Site".to_owned(),
+            InstanceKind::Site,
+            now,
+        );
+        state.store.create_instance(&local_instance).await?;
+        let local_code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut local_binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            acceptor_address.clone(),
+            local_instance.id(),
+            &local_code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        local_binding.bind(Some(site_fingerprint), now)?;
+        state.store.create_binding(&local_binding).await?;
+        let issued = ca.issue_site_certificate(bound_instance.id(), site_fingerprint)?;
+        let (cert_pem, key_pem) = issued.pem_pair();
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_CERT_FILE), cert_pem)?;
+        std::fs::write(paths.tls_directory().join(SITE_CLIENT_KEY_FILE), key_pem)?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_CA_CERT_FILE),
+            pem_encode("CERTIFICATE", ca.certificate().as_ref()),
+        )?;
+        std::fs::write(
+            paths.tls_directory().join(CENTER_PIN_FILE),
+            acceptor_fingerprint.to_string(),
+        )?;
+        let bundle = assemble_center_sync(&state.store, &paths)
+            .await?
+            .ok_or("a bound site must assemble a bundle")?;
+        let options = CenterSyncRuntimeOptions {
+            binding_poll_interval: Duration::from_millis(20),
+            engine: CenterSyncOptions {
+                heartbeat_interval: Duration::from_millis(20),
+                reconnect_after: Duration::from_millis(50),
+                flush_limit: 64,
+                event_batch_limit: 256,
+                artifact_chunk_bytes: 64,
+                not_bound_abort_after: Some(2),
+                identity_mismatch_abort_after: Some(2),
+            },
+        };
+        let (_stop_signal, stop_watch) = scheduler::StopSignal::new();
+        let task = spawn_center_sync(bundle, Arc::clone(&state), stop_watch, options);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .map_err(|_| io::Error::other("the engine did not stop in time"))??;
+
+        // The engine stopped on its own and the local row was left in
+        // place: the mismatch never converges the binding.
+        let local = state
+            .store
+            .find_binding_by_site(local_instance.id())
+            .await?
+            .ok_or("the local binding row must remain")?;
+        assert_eq!(local.state(), CenterBindingState::Bound);
+        accept_task.abort();
+        Ok(())
+    }
+
     /// Seeds one bound site whose binding names the given center address
     /// and whose material pins the given center server fingerprint (audit
     /// follow-up F4 — the convergence test needs a real, reachable center,
@@ -2175,6 +2432,7 @@ mod tests {
                 event_batch_limit: 256,
                 artifact_chunk_bytes: 64,
                 not_bound_abort_after: Some(2),
+                identity_mismatch_abort_after: Some(2),
             },
         };
         let (_stop_signal, stop_watch) = scheduler::StopSignal::new();
