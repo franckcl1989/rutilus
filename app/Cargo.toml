@@ -36,6 +36,12 @@ tokio-tungstenite.workspace = true
 # is already pinned at the same version by infra-redfish, which defines the
 # gateway stream.
 tokio-util = { version = "0.7.19", default-features = false }
+# The bounded-drain request timeout (N2-2): the console's handlers are
+# capped at the same grace as the shutdown drain (`GRACEFUL_DRAIN_TIMEOUT`),
+# so a slow request is aborted with a 408 instead of stalling the stop.
+# The workspace feature base (set-header, used by the web crate) is merged
+# with the timeout feature this crate needs.
+tower-http = { workspace = true, features = ["timeout"] }
 rutilus-application.workspace = true
 rutilus-domain.workspace = true
 rutilus-infra-redfish.workspace = true

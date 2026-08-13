@@ -26,6 +26,7 @@ SecureBoot、EventSubscription、FirmwareUpdate、OEM-NVIDIA）。以下家族**
 | Telemetry | `CommandFamilyView::ALL` 刻意不含 Telemetry；表单选择器返回 `OperationFormError::FamilyRequired`；界面提示 "The telemetry write form is a later milestone."；已持久化的遥测命令通过 `wire_command_summary` 在卡片中渲染 | `ui/src/lib.rs` 第 5171、6289-6291、6438 行（`CommandFamilyView::ALL` 9 家族 `:5171`、表单选择器 `FamilyRequired` `:6289-6291`、Telemetry 表单拒绝 `:6438`、later-milestone 提示文案串 `i18n.rs:1654` `hint_telemetry_later`） |
 | Log（清空日志 `log.clear`） | 无专用表单（`CommandFamilyView` 中不存在 Log 变体），表单选择器拒绝 | `ui/src/lib.rs` `CommandFamilyView` |
 | Control（控制更新 `control.update`） | 同上，无专用表单 | 同上 |
+| 管理员设置用户口令（S3-4） | **API 已提供**（`POST /api/v1/admin/users/{principal_id}/password`，管理员可给任意用户——含无口令新建用户——设置/重置口令，`web/src/auth.rs::set_user_password`，DTO `api/src/lib.rs::AdminSetPasswordRequest`，ROUTE_TABLE 的 `POST /api/v1/admin/users*` 条目 Admin 守卫 + CSRF，审计按 change-password 记录）；**UI 表单为 later milestone**——管理员用户视图只提供创建（`post_create_user` 仅 name+role）、启停、改角色三个动作，无口令字段（`ui/src/lib.rs:9791-9802`）；新建用户需由 CLI/API 侧设置口令后才能登录 | `web/src/auth.rs` `set_user_password`；`api/src/lib.rs` `AdminSetPasswordRequest`；`ui/src/lib.rs:9791-9802` |
 
 命令本身已完整映射到领域 `RedfishCommand` 与执行引擎（`infra-redfish/src/release_baseline.rs`），
 限制仅在前端表单面；telemetry 表单明确为 later milestone。

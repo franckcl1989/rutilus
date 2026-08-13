@@ -47,8 +47,8 @@ use rutilus_application::{
     BoundaryFuture, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
     CenterDispatchError, CenterFrameProcessor, CenterInboundEngine, CenterInboundOptions,
     CenterInboundSession, CenterOperationDispatch, CenterOperationRequest, CenterOperationTracking,
-    CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock, InstanceRepository,
-    IssuedSiteCertificate, OperationStore, SiteCertificateIssuer,
+    CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock, DisconnectOnDrop,
+    InstanceRepository, IssuedSiteCertificate, OperationStore, SiteCertificateIssuer,
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
@@ -73,7 +73,8 @@ use crate::{
     CenterAcceptorOptions, CenterCa, CenterCaError, CenterConnection, CenterConnectionError,
     ListenAddress, SiteBinding, SiteRunError, SiteRunOptions, StandaloneInstance,
     StandaloneInstanceCloseError, StandaloneInstanceError, StandaloneUnlock, SystemClock,
-    scheduler, standalone_runtime::StandaloneState,
+    scheduler,
+    standalone_runtime::{GRACEFUL_DRAIN_TIMEOUT, StandaloneState},
 };
 use rutilus_infra_redfish::RedfishGateway;
 
@@ -692,6 +693,7 @@ where
             let mut stop = stop_watch;
             stop.stopped().await;
         },
+        GRACEFUL_DRAIN_TIMEOUT,
     );
     tokio::pin!(server);
     tokio::select! {
@@ -739,8 +741,11 @@ fn center_banner(console_url: &str, acceptor: &CenterAcceptor) -> String {
 /// connection is joined.
 ///
 /// The admission is resolved inside the accept (audit follow-up F4): a
-/// refused site receives its `not-bound` `NegotiationResult` at negotiation
-/// time, so it converges its local binding instead of retrying forever.
+/// refused site receives its `NegotiationResult` at negotiation time —
+/// `not-bound` when its binding is not in force, so it converges its
+/// local binding instead of retrying forever, or `identity-mismatch` when
+/// the Hello declared an identity that disagrees with the certificate's
+/// binding (C5-10: the binding is in force, so no convergence).
 #[instrument(skip_all)]
 async fn run_center_accept_loop(
     mut stop: scheduler::StopWatch,
@@ -773,7 +778,7 @@ async fn run_center_accept_loop(
                         ));
                     }
                     Err(CenterAcceptError::AdmissionRejected { reason }) => {
-                        // The site received its `not-bound` answer already;
+                        // The site received its refusal answer already;
                         // one refused site is one client's problem and the
                         // listener keeps accepting (§15.7 local autonomy).
                         tracing::warn!("center refused the connection: {reason}");
@@ -804,7 +809,9 @@ async fn run_center_accept_loop(
 /// F4), so the task starts from the resolved site. The connection task
 /// owns its Arc clones of the instance state, so every repository
 /// reference is built inside the task; the engine observes the shared stop
-/// watch and the registry removes the site on every exit.
+/// watch, the registry removes the site on every exit, and a
+/// [`DisconnectOnDrop`] guard guarantees the same cleanup when the task
+/// ends abnormally (N2-4).
 #[instrument(skip_all)]
 async fn run_center_connection(
     state: Arc<StandaloneState>,
@@ -827,6 +834,14 @@ async fn run_center_connection(
         );
         return;
     }
+    // The crash backstop (N2-4): the engine removes the site on every
+    // orderly exit, and this guard guarantees the same cleanup when the
+    // task ends abnormally — a panic unwind runs the guard's `Drop`. A
+    // crashed task must never leave a zombie online entry, or the site's
+    // reconnects would be refused as `AlreadyConnected` forever, silently.
+    // The cleanup is idempotent, so the guard and the engine's own cleanup
+    // never conflict.
+    let _disconnect_guard = DisconnectOnDrop::new(Arc::clone(&state.registry), site.instance_id());
     let engine = CenterInboundEngine::new(
         connection,
         store,

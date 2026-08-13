@@ -9,9 +9,12 @@
 //!
 //! The rejection reasons are the stable reason codes of the
 //! [`NegotiationResult`] message: `protocol-mismatch`, `baseline-mismatch`,
-//! `ledger-mismatch`, and `not-bound` (the 0.7.0 admission refusal — the
+//! `ledger-mismatch`, `not-bound` (the 0.7.0 admission refusal — the
 //! center answers the `Hello` of a site whose binding is no longer in
-//! force with this reason instead of closing the connection silently).
+//! force with this reason instead of closing the connection silently), and
+//! `identity-mismatch` (the C5-10 admission refusal — the `Hello` declared
+//! an instance id that disagrees with the binding record the presented
+//! certificate resolves to).
 
 use std::{error::Error, fmt, str::FromStr};
 
@@ -44,6 +47,14 @@ pub enum NegotiationReason {
     /// follow-up F4). The protocol message contract allows new reason
     /// codes, so this is a vocabulary addition, never a wire change.
     NotBound,
+    /// The `Hello` declared an instance id that disagrees with the binding
+    /// record the presented certificate resolves to (C5-10 admission
+    /// refusal): the wire identity is not the site the certificate was
+    /// issued for. The site must not converge its binding — its binding is
+    /// in force — so it receives its own honest reason code. The protocol
+    /// message contract allows new reason codes, so this is a vocabulary
+    /// addition, never a wire change.
+    IdentityMismatch,
 }
 
 impl NegotiationReason {
@@ -56,6 +67,7 @@ impl NegotiationReason {
             Self::BaselineMismatch => "baseline-mismatch",
             Self::LedgerMismatch => "ledger-mismatch",
             Self::NotBound => "not-bound",
+            Self::IdentityMismatch => "identity-mismatch",
         }
     }
 }
@@ -75,6 +87,7 @@ impl FromStr for NegotiationReason {
             "baseline-mismatch" => Ok(Self::BaselineMismatch),
             "ledger-mismatch" => Ok(Self::LedgerMismatch),
             "not-bound" => Ok(Self::NotBound),
+            "identity-mismatch" => Ok(Self::IdentityMismatch),
             _ => Err(NegotiationReasonParseError),
         }
     }
@@ -278,6 +291,7 @@ mod tests {
             NegotiationReason::BaselineMismatch,
             NegotiationReason::LedgerMismatch,
             NegotiationReason::NotBound,
+            NegotiationReason::IdentityMismatch,
         ] {
             assert_eq!(reason.to_string().parse(), Ok(reason));
         }

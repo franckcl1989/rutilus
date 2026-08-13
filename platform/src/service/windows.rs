@@ -46,8 +46,15 @@ use windows_sys::core::PWSTR;
 
 use super::{SERVICE_DISPLAY_NAME, SERVICE_NAME, ServiceArguments};
 
-/// The wait hint (milliseconds) reported while the service starts and stops:
-/// the runtime's drain is bounded by its in-flight tasks (§7.8).
+/// The wait hint (milliseconds) reported while the service starts and stops.
+///
+/// The hint is informational only — the SCM never terminates the process
+/// when it expires, it only tunes the SCM's own progress reporting — so the
+/// bound on a stop comes from the runtime itself: the app's drains are
+/// bounded (§7.8), including the 10-second grace for in-flight HTTP
+/// requests once the stop signal resolves (the app runtime's
+/// `GRACEFUL_DRAIN_TIMEOUT`), which keeps the STOPPED status well inside
+/// this 30-second hint window.
 const STATUS_WAIT_HINT_MS: u32 = 30_000;
 
 /// The single dispatch slot: the SCM invokes a static `service_main`, so the
@@ -282,8 +289,15 @@ impl ServiceControlInner {
     /// the status moves to `STOP_PENDING`, but the SCM thread is deliberately
     /// NOT released here — `service_main` parks until [`Self::finish`], which
     /// the runtime calls only after its §7.8 drain completes, so the
-    /// `STOPPED` status is never reported before the drain (the SCM's wait
-    /// hint is the bounded fallback if the drain ever hangs).
+    /// `STOPPED` status is never reported before the drain.
+    ///
+    /// The 30-second wait hint is not the bound on the stop: the SCM treats
+    /// it as a hint for its progress reporting and never terminates the
+    /// process when it expires. The stop is bounded by the runtime's own
+    /// drains — in particular the app runtime's 10-second grace for
+    /// in-flight HTTP requests once the stop signal resolves
+    /// (`GRACEFUL_DRAIN_TIMEOUT`), which force-completes the server drain
+    /// — so a stop lands well inside the hint window.
     fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
         let _ = self.stop_watch.send(true);

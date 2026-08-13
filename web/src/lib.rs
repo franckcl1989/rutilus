@@ -7,11 +7,11 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Extension, Path as AxumPath, State},
     http::{
-        HeaderValue, StatusCode, Uri,
+        HeaderValue, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName},
     },
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{MethodRouter, delete, get, post, put},
 };
 use rust_embed::RustEmbed;
 use rutilus_api::{
@@ -780,19 +780,282 @@ where
     }
 }
 
+/// One route of the Edge console surface, as a dispatch key.
+///
+/// The variants are the keys of the exhaustive [`edge_route`] dispatch: a
+/// route kind without a wired handler fails to compile, and an unused
+/// variant fails the CI clippy `-D warnings` gate — so a route can only be
+/// added by registering it in [`EDGE_ROUTES`] (method, path, kind) and
+/// wiring its kind in the dispatch, both directions enforced at compile
+/// time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeRouteKind {
+    Health,
+    About,
+    EndpointInventory,
+    Overview,
+    EndpointResources,
+    ResourceDiagnostics,
+    EndpointCapabilities,
+    CredentialInventory,
+    CreateCredential,
+    BeginEndpointTrust,
+    ConfirmEndpointTrust,
+    EnrollEndpoint,
+    ImportEndpointsCsv,
+    RefreshEndpoints,
+    AuditQuery,
+    EventQuery,
+    TelemetrySeries,
+    TelemetrySamples,
+    CreateOperation,
+    ListOperations,
+    OperationDetail,
+    ListBatches,
+    BatchDetail,
+    CreateArtifact,
+    ListArtifacts,
+    AppendArtifactChunk,
+    FinalizeArtifact,
+    ArtifactDetail,
+    GroupInventory,
+    CreateGroup,
+    GroupDetail,
+    DeleteGroup,
+    AddGroupMember,
+    RemoveGroupMember,
+    TagInventory,
+    AssignTag,
+    RemoveTag,
+    Login,
+    Logout,
+    BootstrapComplete,
+    ChangePassword,
+    Me,
+    ListSessions,
+    RevokeSession,
+    ListUsers,
+    CreateUser,
+    SetUserState,
+    AssignUserRole,
+    SetUserPassword,
+}
+
+/// The Edge console route registry: (method, path, kind), in registration
+/// order — the single source the Edge router folds over.
+///
+/// The same registry drives the W6-5 coverage gate
+/// (`auth::tests::every_registered_route_is_named_by_the_authorization_table`):
+/// every entry must be named by the §16.1 authorization table of the Edge
+/// scope, so a route added without its table entry fails the gate instead
+/// of silently serving Public.
+pub(crate) const EDGE_ROUTES: &[(Method, &str, EdgeRouteKind)] = &[
+    (Method::GET, "/api/v1/health", EdgeRouteKind::Health),
+    (Method::GET, "/api/v1/about", EdgeRouteKind::About),
+    (
+        Method::GET,
+        "/api/v1/endpoints",
+        EdgeRouteKind::EndpointInventory,
+    ),
+    (Method::GET, "/api/v1/overview", EdgeRouteKind::Overview),
+    (
+        Method::GET,
+        "/api/v1/endpoints/{endpoint_id}/resources",
+        EdgeRouteKind::EndpointResources,
+    ),
+    (
+        Method::GET,
+        "/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics",
+        EdgeRouteKind::ResourceDiagnostics,
+    ),
+    (
+        Method::GET,
+        "/api/v1/endpoints/{endpoint_id}/capabilities",
+        EdgeRouteKind::EndpointCapabilities,
+    ),
+    (
+        Method::GET,
+        "/api/v1/credentials",
+        EdgeRouteKind::CredentialInventory,
+    ),
+    (
+        Method::POST,
+        "/api/v1/credentials",
+        EdgeRouteKind::CreateCredential,
+    ),
+    (
+        Method::POST,
+        "/api/v1/endpoints/trust",
+        EdgeRouteKind::BeginEndpointTrust,
+    ),
+    (
+        Method::POST,
+        "/api/v1/endpoints/trust/expect",
+        EdgeRouteKind::ConfirmEndpointTrust,
+    ),
+    (
+        Method::POST,
+        "/api/v1/endpoints",
+        EdgeRouteKind::EnrollEndpoint,
+    ),
+    (
+        Method::POST,
+        "/api/v1/endpoints/import",
+        EdgeRouteKind::ImportEndpointsCsv,
+    ),
+    (
+        Method::POST,
+        "/api/v1/endpoints/refresh",
+        EdgeRouteKind::RefreshEndpoints,
+    ),
+    (Method::GET, "/api/v1/audit", EdgeRouteKind::AuditQuery),
+    (Method::GET, "/api/v1/events", EdgeRouteKind::EventQuery),
+    (
+        Method::GET,
+        "/api/v1/telemetry",
+        EdgeRouteKind::TelemetrySeries,
+    ),
+    (
+        Method::GET,
+        "/api/v1/telemetry/{series_id}/samples",
+        EdgeRouteKind::TelemetrySamples,
+    ),
+    (
+        Method::POST,
+        "/api/v1/operations",
+        EdgeRouteKind::CreateOperation,
+    ),
+    (
+        Method::GET,
+        "/api/v1/operations",
+        EdgeRouteKind::ListOperations,
+    ),
+    (
+        Method::GET,
+        "/api/v1/operations/{operation_id}",
+        EdgeRouteKind::OperationDetail,
+    ),
+    (Method::GET, "/api/v1/batches", EdgeRouteKind::ListBatches),
+    (
+        Method::GET,
+        "/api/v1/batches/{batch_id}",
+        EdgeRouteKind::BatchDetail,
+    ),
+    (
+        Method::POST,
+        "/api/v1/artifacts",
+        EdgeRouteKind::CreateArtifact,
+    ),
+    (
+        Method::GET,
+        "/api/v1/artifacts",
+        EdgeRouteKind::ListArtifacts,
+    ),
+    (
+        Method::POST,
+        "/api/v1/artifacts/{artifact_id}/chunks",
+        EdgeRouteKind::AppendArtifactChunk,
+    ),
+    (
+        Method::POST,
+        "/api/v1/artifacts/{artifact_id}/finalize",
+        EdgeRouteKind::FinalizeArtifact,
+    ),
+    (
+        Method::GET,
+        "/api/v1/artifacts/{artifact_id}",
+        EdgeRouteKind::ArtifactDetail,
+    ),
+    (Method::GET, "/api/v1/groups", EdgeRouteKind::GroupInventory),
+    (Method::POST, "/api/v1/groups", EdgeRouteKind::CreateGroup),
+    (
+        Method::GET,
+        "/api/v1/groups/{group_id}",
+        EdgeRouteKind::GroupDetail,
+    ),
+    (
+        Method::DELETE,
+        "/api/v1/groups/{group_id}",
+        EdgeRouteKind::DeleteGroup,
+    ),
+    (
+        Method::PUT,
+        "/api/v1/groups/{group_id}/members/{endpoint_id}",
+        EdgeRouteKind::AddGroupMember,
+    ),
+    (
+        Method::DELETE,
+        "/api/v1/groups/{group_id}/members/{endpoint_id}",
+        EdgeRouteKind::RemoveGroupMember,
+    ),
+    (Method::GET, "/api/v1/tags", EdgeRouteKind::TagInventory),
+    (Method::PUT, "/api/v1/tags", EdgeRouteKind::AssignTag),
+    (
+        Method::DELETE,
+        "/api/v1/endpoints/{endpoint_id}/tags/{tag_name}",
+        EdgeRouteKind::RemoveTag,
+    ),
+    (Method::POST, "/api/v1/auth/login", EdgeRouteKind::Login),
+    (Method::POST, "/api/v1/auth/logout", EdgeRouteKind::Logout),
+    (
+        Method::POST,
+        "/api/v1/auth/bootstrap",
+        EdgeRouteKind::BootstrapComplete,
+    ),
+    (
+        Method::POST,
+        "/api/v1/auth/password",
+        EdgeRouteKind::ChangePassword,
+    ),
+    (Method::GET, "/api/v1/auth/me", EdgeRouteKind::Me),
+    (
+        Method::GET,
+        "/api/v1/admin/sessions",
+        EdgeRouteKind::ListSessions,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/sessions",
+        EdgeRouteKind::RevokeSession,
+    ),
+    (Method::GET, "/api/v1/admin/users", EdgeRouteKind::ListUsers),
+    (
+        Method::POST,
+        "/api/v1/admin/users",
+        EdgeRouteKind::CreateUser,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/state",
+        EdgeRouteKind::SetUserState,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/role",
+        EdgeRouteKind::AssignUserRole,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/password",
+        EdgeRouteKind::SetUserPassword,
+    ),
+];
+
 /// The Edge route surface (audit follow-up F2): every local-management
 /// route, and no `/api/v1/center/*` route.
 ///
 /// The bound is [`ProductServices`] — every boundary the local-management
 /// surface composes — plus [`AuthServices`]. [`CenterServices`] is
 /// deliberately absent: an Edge console cannot be assembled over a
-/// center-only services bundle, and its route table never registers the
+/// center-only services bundle, and its route registry never names the
 /// center management surface the S6/S7 dispatcher would otherwise silently
 /// drop.
 ///
-/// The function is a declarative route table; the line count grows with the
-/// product surface, so the lint is not a signal here.
-#[allow(clippy::too_many_lines)]
+/// The router is assembled by folding [`EDGE_ROUTES`] through
+/// [`edge_route`]: the registry is the single source of the (method, path)
+/// pairs, and the dispatch is exhaustive over [`EdgeRouteKind`], so the
+/// registry, the handlers, and the authorization table (W6-5 gate) cannot
+/// drift apart.
 fn edge_router_with_auth<Services, Gateway, Time>(
     product: WebProductInfo,
     actor: AuditActor,
@@ -816,184 +1079,201 @@ where
         gateway,
         clock,
     };
-    let router = Router::new()
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/about", get(about::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/endpoints",
-            get(endpoint_inventory::<Services, Gateway, Time>),
-        )
-        .route("/api/v1/overview", get(overview::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/endpoints/{endpoint_id}/resources",
-            get(endpoint_resources::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/{endpoint_id}/resources/{resource_id}/diagnostics",
-            get(resource_diagnostics::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/{endpoint_id}/capabilities",
-            get(endpoint_capabilities::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/credentials",
-            get(credential_inventory::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/credentials",
-            post(create_credential::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/trust",
-            post(begin_endpoint_trust::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/trust/expect",
-            post(confirm_endpoint_trust::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints",
-            post(enroll_endpoint::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/import",
-            post(import_endpoints_csv::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/endpoints/refresh",
-            post(refresh_endpoints::<Services, Gateway, Time>),
-        )
-        .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/events",
-            get(event_query::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/telemetry",
-            get(telemetry_series::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/telemetry/{series_id}/samples",
-            get(telemetry_samples::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/operations",
-            post(create_operation::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/operations",
-            get(list_operations::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/operations/{operation_id}",
-            get(operation_detail::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/batches",
-            get(list_batches::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/batches/{batch_id}",
-            get(batch_detail::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/artifacts",
-            post(create_artifact::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/artifacts",
-            get(list_artifacts::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/artifacts/{artifact_id}/chunks",
-            post(append_artifact_chunk::<Services, Gateway, Time>)
-                .layer(DefaultBodyLimit::max(ARTIFACT_CHUNK_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/v1/artifacts/{artifact_id}/finalize",
-            post(finalize_artifact::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/artifacts/{artifact_id}",
-            get(artifact_detail::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups",
-            get(group_inventory::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups",
-            post(create_group::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups/{group_id}",
-            get(group_detail::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups/{group_id}",
-            delete(delete_group::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups/{group_id}/members/{endpoint_id}",
-            put(add_group_member::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/groups/{group_id}/members/{endpoint_id}",
-            delete(remove_group_member::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/tags",
-            get(tag_inventory::<Services, Gateway, Time>),
-        )
-        .route("/api/v1/tags", put(assign_tag::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/endpoints/{endpoint_id}/tags/{tag_name}",
-            delete(remove_tag::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/login",
-            post(auth::login::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/logout",
-            post(auth::logout::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/bootstrap",
-            post(auth::bootstrap_complete::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/password",
-            post(auth::change_password::<Services, Gateway, Time>),
-        )
-        .route("/api/v1/auth/me", get(auth::me::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/admin/sessions",
-            get(auth::list_sessions::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/sessions",
-            post(auth::revoke_session::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users",
-            get(auth::list_users::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users",
-            post(auth::create_user::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users/{principal_id}/state",
-            post(auth::set_user_state::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users/{principal_id}/role",
-            post(auth::assign_user_role::<Services, Gateway, Time>),
-        );
+    let router = EDGE_ROUTES
+        .iter()
+        .fold(Router::new(), |router, (_, path, kind)| {
+            router.route(path, edge_route::<Services, Gateway, Time>(*kind))
+        });
     finish_console_surface(router, state)
 }
+
+/// Wires one [`EdgeRouteKind`] to its handler — the exhaustive match that
+/// pins every registered route to a live handler. The line count grows with
+/// the product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
+fn edge_route<Services, Gateway, Time>(
+    kind: EdgeRouteKind,
+) -> MethodRouter<WebState<Services, Gateway, Time>>
+where
+    Services: ProductServices + AuthServices + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
+{
+    match kind {
+        EdgeRouteKind::Health => get(health),
+        EdgeRouteKind::About => get(about::<Services, Gateway, Time>),
+        EdgeRouteKind::EndpointInventory => get(endpoint_inventory::<Services, Gateway, Time>),
+        EdgeRouteKind::Overview => get(overview::<Services, Gateway, Time>),
+        EdgeRouteKind::EndpointResources => get(endpoint_resources::<Services, Gateway, Time>),
+        EdgeRouteKind::ResourceDiagnostics => get(resource_diagnostics::<Services, Gateway, Time>),
+        EdgeRouteKind::EndpointCapabilities => {
+            get(endpoint_capabilities::<Services, Gateway, Time>)
+        }
+        EdgeRouteKind::CredentialInventory => get(credential_inventory::<Services, Gateway, Time>),
+        EdgeRouteKind::CreateCredential => post(create_credential::<Services, Gateway, Time>),
+        EdgeRouteKind::BeginEndpointTrust => post(begin_endpoint_trust::<Services, Gateway, Time>),
+        EdgeRouteKind::ConfirmEndpointTrust => {
+            post(confirm_endpoint_trust::<Services, Gateway, Time>)
+        }
+        EdgeRouteKind::EnrollEndpoint => post(enroll_endpoint::<Services, Gateway, Time>),
+        EdgeRouteKind::ImportEndpointsCsv => post(import_endpoints_csv::<Services, Gateway, Time>),
+        EdgeRouteKind::RefreshEndpoints => post(refresh_endpoints::<Services, Gateway, Time>),
+        EdgeRouteKind::AuditQuery => get(audit_query::<Services, Gateway, Time>),
+        EdgeRouteKind::EventQuery => get(event_query::<Services, Gateway, Time>),
+        EdgeRouteKind::TelemetrySeries => get(telemetry_series::<Services, Gateway, Time>),
+        EdgeRouteKind::TelemetrySamples => get(telemetry_samples::<Services, Gateway, Time>),
+        EdgeRouteKind::CreateOperation => post(create_operation::<Services, Gateway, Time>),
+        EdgeRouteKind::ListOperations => get(list_operations::<Services, Gateway, Time>),
+        EdgeRouteKind::OperationDetail => get(operation_detail::<Services, Gateway, Time>),
+        EdgeRouteKind::ListBatches => get(list_batches::<Services, Gateway, Time>),
+        EdgeRouteKind::BatchDetail => get(batch_detail::<Services, Gateway, Time>),
+        EdgeRouteKind::CreateArtifact => post(create_artifact::<Services, Gateway, Time>),
+        EdgeRouteKind::ListArtifacts => get(list_artifacts::<Services, Gateway, Time>),
+        EdgeRouteKind::AppendArtifactChunk => {
+            post(append_artifact_chunk::<Services, Gateway, Time>)
+                .layer(DefaultBodyLimit::max(ARTIFACT_CHUNK_BODY_LIMIT_BYTES))
+        }
+        EdgeRouteKind::FinalizeArtifact => post(finalize_artifact::<Services, Gateway, Time>),
+        EdgeRouteKind::ArtifactDetail => get(artifact_detail::<Services, Gateway, Time>),
+        EdgeRouteKind::GroupInventory => get(group_inventory::<Services, Gateway, Time>),
+        EdgeRouteKind::CreateGroup => post(create_group::<Services, Gateway, Time>),
+        EdgeRouteKind::GroupDetail => get(group_detail::<Services, Gateway, Time>),
+        EdgeRouteKind::DeleteGroup => delete(delete_group::<Services, Gateway, Time>),
+        EdgeRouteKind::AddGroupMember => put(add_group_member::<Services, Gateway, Time>),
+        EdgeRouteKind::RemoveGroupMember => delete(remove_group_member::<Services, Gateway, Time>),
+        EdgeRouteKind::TagInventory => get(tag_inventory::<Services, Gateway, Time>),
+        EdgeRouteKind::AssignTag => put(assign_tag::<Services, Gateway, Time>),
+        EdgeRouteKind::RemoveTag => delete(remove_tag::<Services, Gateway, Time>),
+        EdgeRouteKind::Login => post(auth::login::<Services, Gateway, Time>),
+        EdgeRouteKind::Logout => post(auth::logout::<Services, Gateway, Time>),
+        EdgeRouteKind::BootstrapComplete => {
+            post(auth::bootstrap_complete::<Services, Gateway, Time>)
+        }
+        EdgeRouteKind::ChangePassword => post(auth::change_password::<Services, Gateway, Time>),
+        EdgeRouteKind::Me => get(auth::me::<Services, Gateway, Time>),
+        EdgeRouteKind::ListSessions => get(auth::list_sessions::<Services, Gateway, Time>),
+        EdgeRouteKind::RevokeSession => post(auth::revoke_session::<Services, Gateway, Time>),
+        EdgeRouteKind::ListUsers => get(auth::list_users::<Services, Gateway, Time>),
+        EdgeRouteKind::CreateUser => post(auth::create_user::<Services, Gateway, Time>),
+        EdgeRouteKind::SetUserState => post(auth::set_user_state::<Services, Gateway, Time>),
+        EdgeRouteKind::AssignUserRole => post(auth::assign_user_role::<Services, Gateway, Time>),
+        EdgeRouteKind::SetUserPassword => post(auth::set_user_password::<Services, Gateway, Time>),
+    }
+}
+
+/// One route of the Center console surface, as a dispatch key — the
+/// counterpart of [`EdgeRouteKind`], exhaustive over [`center_route`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CenterRouteKind {
+    Health,
+    About,
+    AuditQuery,
+    CenterSites,
+    RegisterCenterSite,
+    RevokeCenterBinding,
+    CenterEndpoints,
+    CenterOperations,
+    SubmitCenterOperation,
+    Login,
+    Logout,
+    BootstrapComplete,
+    ChangePassword,
+    Me,
+    ListSessions,
+    RevokeSession,
+    ListUsers,
+    CreateUser,
+    SetUserState,
+    AssignUserRole,
+    SetUserPassword,
+}
+
+/// The Center console route registry: (method, path, kind), in registration
+/// order — the single source the Center router folds over, and the W6-5
+/// coverage gate's Center side.
+pub(crate) const CENTER_ROUTES: &[(Method, &str, CenterRouteKind)] = &[
+    (Method::GET, "/api/v1/health", CenterRouteKind::Health),
+    (Method::GET, "/api/v1/about", CenterRouteKind::About),
+    (Method::GET, "/api/v1/audit", CenterRouteKind::AuditQuery),
+    (
+        Method::GET,
+        "/api/v1/center/sites",
+        CenterRouteKind::CenterSites,
+    ),
+    (
+        Method::POST,
+        "/api/v1/center/bindings",
+        CenterRouteKind::RegisterCenterSite,
+    ),
+    (
+        Method::POST,
+        "/api/v1/center/bindings/revoke",
+        CenterRouteKind::RevokeCenterBinding,
+    ),
+    (
+        Method::GET,
+        "/api/v1/center/endpoints",
+        CenterRouteKind::CenterEndpoints,
+    ),
+    (
+        Method::GET,
+        "/api/v1/center/operations",
+        CenterRouteKind::CenterOperations,
+    ),
+    (
+        Method::POST,
+        "/api/v1/center/operations",
+        CenterRouteKind::SubmitCenterOperation,
+    ),
+    (Method::POST, "/api/v1/auth/login", CenterRouteKind::Login),
+    (Method::POST, "/api/v1/auth/logout", CenterRouteKind::Logout),
+    (
+        Method::POST,
+        "/api/v1/auth/bootstrap",
+        CenterRouteKind::BootstrapComplete,
+    ),
+    (
+        Method::POST,
+        "/api/v1/auth/password",
+        CenterRouteKind::ChangePassword,
+    ),
+    (Method::GET, "/api/v1/auth/me", CenterRouteKind::Me),
+    (
+        Method::GET,
+        "/api/v1/admin/sessions",
+        CenterRouteKind::ListSessions,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/sessions",
+        CenterRouteKind::RevokeSession,
+    ),
+    (
+        Method::GET,
+        "/api/v1/admin/users",
+        CenterRouteKind::ListUsers,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users",
+        CenterRouteKind::CreateUser,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/state",
+        CenterRouteKind::SetUserState,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/role",
+        CenterRouteKind::AssignUserRole,
+    ),
+    (
+        Method::POST,
+        "/api/v1/admin/users/{principal_id}/password",
+        CenterRouteKind::SetUserPassword,
+    ),
+];
 
 /// The Center route surface (audit follow-up F2): the authentication,
 /// administration, audit, and center aggregation routes — and nothing that
@@ -1007,9 +1287,11 @@ where
 /// (§15.1 — the center never enters the customer network; 0.7.0 acceptance
 /// "Center 不连接 BMC").
 ///
-/// The function is a declarative route table; the line count grows with the
-/// product surface, so the lint is not a signal here.
-#[allow(clippy::too_many_lines)]
+/// The router is assembled by folding [`CENTER_ROUTES`] through
+/// [`center_route`], exactly like the Edge surface folds
+/// [`EDGE_ROUTES`] — the registry is the single source and the dispatch is
+/// exhaustive, so the two surfaces cannot drift against their
+/// authorization tables.
 fn center_router_with_auth<Services, Gateway, Time>(
     product: WebProductInfo,
     actor: AuditActor,
@@ -1033,76 +1315,59 @@ where
         gateway,
         clock,
     };
-    let router = Router::new()
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/about", get(about::<Services, Gateway, Time>))
-        .route("/api/v1/audit", get(audit_query::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/center/sites",
-            get(center_sites::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/center/bindings",
-            post(register_center_site::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/center/bindings/revoke",
-            post(revoke_center_binding::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/center/endpoints",
-            get(center_endpoints::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/center/operations",
-            get(center_operations::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/center/operations",
-            post(submit_center_operation::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/login",
-            post(auth::login::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/logout",
-            post(auth::logout::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/bootstrap",
-            post(auth::bootstrap_complete::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/auth/password",
-            post(auth::change_password::<Services, Gateway, Time>),
-        )
-        .route("/api/v1/auth/me", get(auth::me::<Services, Gateway, Time>))
-        .route(
-            "/api/v1/admin/sessions",
-            get(auth::list_sessions::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/sessions",
-            post(auth::revoke_session::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users",
-            get(auth::list_users::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users",
-            post(auth::create_user::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users/{principal_id}/state",
-            post(auth::set_user_state::<Services, Gateway, Time>),
-        )
-        .route(
-            "/api/v1/admin/users/{principal_id}/role",
-            post(auth::assign_user_role::<Services, Gateway, Time>),
-        );
+    let router = CENTER_ROUTES
+        .iter()
+        .fold(Router::new(), |router, (_, path, kind)| {
+            router.route(path, center_route::<Services, Gateway, Time>(*kind))
+        });
     finish_console_surface(router, state)
+}
+
+/// Wires one [`CenterRouteKind`] to its handler — the exhaustive match that
+/// pins every registered route to a live handler. The line count grows with
+/// the product surface, so the lint is not a signal here.
+#[allow(clippy::too_many_lines)]
+fn center_route<Services, Gateway, Time>(
+    kind: CenterRouteKind,
+) -> MethodRouter<WebState<Services, Gateway, Time>>
+where
+    Services: CenterServices + AuthServices + AuditEventWriter + AuditEventQuery + 'static,
+    Gateway: TlsIdentityProbe + RedfishDiscovery + CoreResourceReader + 'static,
+    Time: Clock + Clone + 'static,
+{
+    match kind {
+        CenterRouteKind::Health => get(health),
+        CenterRouteKind::About => get(about::<Services, Gateway, Time>),
+        CenterRouteKind::AuditQuery => get(audit_query::<Services, Gateway, Time>),
+        CenterRouteKind::CenterSites => get(center_sites::<Services, Gateway, Time>),
+        CenterRouteKind::RegisterCenterSite => {
+            post(register_center_site::<Services, Gateway, Time>)
+        }
+        CenterRouteKind::RevokeCenterBinding => {
+            post(revoke_center_binding::<Services, Gateway, Time>)
+        }
+        CenterRouteKind::CenterEndpoints => get(center_endpoints::<Services, Gateway, Time>),
+        CenterRouteKind::CenterOperations => get(center_operations::<Services, Gateway, Time>),
+        CenterRouteKind::SubmitCenterOperation => {
+            post(submit_center_operation::<Services, Gateway, Time>)
+        }
+        CenterRouteKind::Login => post(auth::login::<Services, Gateway, Time>),
+        CenterRouteKind::Logout => post(auth::logout::<Services, Gateway, Time>),
+        CenterRouteKind::BootstrapComplete => {
+            post(auth::bootstrap_complete::<Services, Gateway, Time>)
+        }
+        CenterRouteKind::ChangePassword => post(auth::change_password::<Services, Gateway, Time>),
+        CenterRouteKind::Me => get(auth::me::<Services, Gateway, Time>),
+        CenterRouteKind::ListSessions => get(auth::list_sessions::<Services, Gateway, Time>),
+        CenterRouteKind::RevokeSession => post(auth::revoke_session::<Services, Gateway, Time>),
+        CenterRouteKind::ListUsers => get(auth::list_users::<Services, Gateway, Time>),
+        CenterRouteKind::CreateUser => post(auth::create_user::<Services, Gateway, Time>),
+        CenterRouteKind::SetUserState => post(auth::set_user_state::<Services, Gateway, Time>),
+        CenterRouteKind::AssignUserRole => post(auth::assign_user_role::<Services, Gateway, Time>),
+        CenterRouteKind::SetUserPassword => {
+            post(auth::set_user_password::<Services, Gateway, Time>)
+        }
+    }
 }
 
 /// The shared router tail: the SPA fallback, the state, the session
@@ -9372,6 +9637,18 @@ mod tests {
             inner.principals.push(principal);
         }
 
+        /// The id of the seeded principal with the given name — the
+        /// administration tests target one seeded principal by its wire id.
+        #[must_use]
+        fn principal_id(&self, name: &str) -> Option<PrincipalId> {
+            let inner = self.inner.lock().ok()?;
+            inner
+                .principals
+                .iter()
+                .find(|principal| principal.name().as_str() == name)
+                .map(Principal::id)
+        }
+
         /// How many times the verify-password boundary ran — the MINOR-1
         /// tests use the count to prove the unknown-username path performs
         /// its dummy verification (a wall-clock timing assertion would be
@@ -11426,6 +11703,338 @@ mod tests {
             )
             .await?;
         assert_eq!(wrong_csrf.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// S3-4: an administrator can set a created user's password through the
+    /// administration surface, and the user can then sign in with it — the
+    /// create-user flow no longer produces permanently unloggable accounts
+    /// (the B4 credential-missing branch stops being the permanent fate of
+    /// every created user). The set records the §16.3 change-password
+    /// outcome pair under the acting administrator.
+    #[tokio::test]
+    async fn admin_can_set_a_created_users_password_and_the_user_signs_in()
+    -> Result<(), Box<dyn Error>> {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        state.seed_passwordless_principal("nopass", Role::Viewer);
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: false,
+                auth_state: state.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        // The passwordless user cannot sign in before the set (B4 branch).
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "nopass", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let principal_id = state
+            .principal_id("nopass")
+            .ok_or("the passwordless principal must be seeded")?;
+        let set = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{principal_id}/password"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(set.status(), StatusCode::OK);
+
+        // The user now signs in with the issued password — the endpoint
+        // exists and the B4 branch is no longer the created user's fate.
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "nopass", "password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+
+        // The set audited its change-password outcome pair under the acting
+        // administrator (the sign-in pair of the failed attempt and the
+        // successful attempt surround it in the event stream).
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            let password_sets = events
+                .iter()
+                .filter(|event| event.context().action().as_str() == "change-password")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                password_sets.len(),
+                2,
+                "the set must append start + terminal"
+            );
+            assert_eq!(password_sets[0].outcome().kind().as_str(), "started");
+            assert_eq!(password_sets[1].outcome().kind().as_str(), "succeeded");
+            assert_eq!(
+                password_sets[1].context().permission().as_str(),
+                "authenticate"
+            );
+        }
+        Ok(())
+    }
+
+    /// S3-4: the administration endpoint is Administrator-only. The route is
+    /// in the §16.1 table as an always-session Administrator write, so a
+    /// sessionless request is refused 401 and a non-administrator session is
+    /// refused 403 before the handler runs.
+    #[tokio::test]
+    async fn admin_password_set_refuses_non_administrators() -> Result<(), Box<dyn Error>> {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "admin secret phrase", Role::Administrator);
+        state.seed_principal("viewer", "viewer secret phrase", Role::Viewer);
+        state.seed_passwordless_principal("nopass", Role::Viewer);
+        let router = test_router_with_policy(state.clone(), AuthPolicy::Guarded);
+        let principal_id = state
+            .principal_id("nopass")
+            .ok_or("the passwordless principal must be seeded")?;
+        let path = format!("/api/v1/admin/users/{principal_id}/password");
+        let body = r#"{"new_password": "a fresh replacement secret"}"#;
+
+        // Without a session the always-session administration route refuses.
+        let no_session = router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+
+        // A viewer session passes the CSRF gate but fails the role mask.
+        let (cookie, csrf) = sign_in(&router, "viewer", "viewer secret phrase").await?;
+        let forbidden = router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    /// S3-4: the administration endpoint enforces the product password
+    /// policy (B1) on the new password — a short password is refused with
+    /// the form's copy before any store access, and the principal stays
+    /// passwordless.
+    #[tokio::test]
+    async fn admin_password_set_refuses_passwords_below_the_product_minimum()
+    -> Result<(), Box<dyn Error>> {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        state.seed_passwordless_principal("nopass", Role::Viewer);
+        let router = test_router_with_policy(state.clone(), AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        let principal_id = state
+            .principal_id("nopass")
+            .ok_or("the passwordless principal must be seeded")?;
+
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{principal_id}/password"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(r#"{"new_password": "x"}"#))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let error = json_body(refused).await?;
+        assert_eq!(
+            error["message"], "the password must contain at least 12 characters",
+            "{error}"
+        );
+        // The refusal wrote no credential: the principal is still
+        // passwordless, and its sign-in still fails on the B4 branch.
+        assert!(
+            !state
+                .inner
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .passwords
+                .contains_key(&principal_id),
+            "a refused password set must not write a credential"
+        );
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "nopass", "password": "still no credential"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// S3-4: an unknown principal answers 404 exactly like the sibling
+    /// administration handlers, and an unparsable principal id answers 400.
+    #[tokio::test]
+    async fn admin_password_set_answers_not_found_and_invalid_id() -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        let router = test_router_with_policy(state, AuthPolicy::Guarded);
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+
+        let missing = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let invalid = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/users/not-a-uuid/password")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// S3-4: an administrator's password set whose session revocation fails
+    /// surfaces the partial state (B3) exactly like the self-change path:
+    /// the response is an explicit 500, the audit trail records the failed
+    /// change-password outcome, the password set itself is not rolled back,
+    /// and the target's old session stays alive — the revocation failure is
+    /// visible, not silent.
+    #[tokio::test]
+    async fn admin_password_set_surfaces_a_failed_session_revocation() -> Result<(), Box<dyn Error>>
+    {
+        let state = AuthTestState::default();
+        state.seed_principal("admin", "correct horse battery staple", Role::Administrator);
+        state.seed_principal("target", "target secret phrase", Role::Viewer);
+        let mut center = CenterTestState::default();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        center.audit = Some(Arc::clone(&audit));
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: BatchTestStore::failing(),
+                managed_endpoints: None,
+                refresh_working: true,
+                revoke_sessions_fail: true,
+                auth_state: state.clone(),
+                center_state: center.clone(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        // The target signs in first, so its session is the one the failed
+        // revocation would have revoked; the administrator signs in after.
+        let (target_cookie, _) = sign_in(&router, "target", "target secret phrase").await?;
+        let (cookie, csrf) = sign_in(&router, "admin", "correct horse battery staple").await?;
+        // The sign-ins appended their login pairs; the recorder starts
+        // clean for the password-set assertions.
+        audit.lock().map_err(|_| MockWriteError)?.clear();
+
+        let principal_id = state
+            .principal_id("target")
+            .ok_or("the target principal must be seeded")?;
+        let set = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{principal_id}/password"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(set.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let events = audit.lock().map_err(|_| MockWriteError)?;
+            assert_eq!(
+                events.len(),
+                2,
+                "the failed set must append start + terminal"
+            );
+            assert_eq!(events[0].outcome().kind().as_str(), "started");
+            assert_eq!(events[0].context().action().as_str(), "change-password");
+            assert_eq!(events[1].outcome().kind().as_str(), "failed");
+            assert_eq!(events[1].context().action().as_str(), "change-password");
+            assert_eq!(events[1].context().permission().as_str(), "authenticate");
+        }
+
+        // The password set is not rolled back...
+        let login = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "target", "password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(login.status(), StatusCode::OK);
+        // ...and the target's old session is still valid, because the
+        // revocation failed — exactly the state the 500 makes visible.
+        assert_eq!(
+            fetch_endpoints(&router, &target_cookie).await?,
+            StatusCode::OK,
+            "the unrevoked session must stay alive until the failure is resolved"
+        );
         Ok(())
     }
 

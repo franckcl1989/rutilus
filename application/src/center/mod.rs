@@ -45,5 +45,5 @@ pub use session::{
     AdmissionRejection, AdmissionVerdict, CenterFrameConsumer, CenterInboundEngine,
     CenterInboundEngineError, CenterInboundOptions, CenterInboundSession, CenterPresence,
     CenterSessionAdmission, CenterSessionAdmissionError, CenterSessionRegistry,
-    CenterSessionRegistryError, ResolvedSite,
+    CenterSessionRegistryError, DisconnectOnDrop, ResolvedSite,
 };

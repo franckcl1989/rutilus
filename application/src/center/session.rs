@@ -12,9 +12,11 @@
 //! - [`CenterSessionRegistry`] tracks which bound sites currently hold an
 //!   online connection, with one connection per site. The engine touches
 //!   the registry on every received frame and removes the site on every
-//!   exit, and [`CenterSessionRegistry::prune_stale`] is the defensive
-//!   backstop behind the transport's 90-second idle detection
-//!   ([`rutilus_center_protocol::CENTER_DISCONNECT_AFTER`]).
+//!   exit; the runtime's connection task additionally arms a
+//!   [`DisconnectOnDrop`] guard, so the cleanup is guaranteed even when
+//!   the task ends abnormally — a crashed task can never leave a zombie
+//!   online entry, and the site's next reconnect succeeds instead of a
+//!   stale [`CenterSessionRegistryError::AlreadyConnected`] refusal.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -77,7 +79,7 @@ impl ResolvedSite {
 }
 
 /// Why one inbound connection is refused admission (§15.1).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmissionRejection {
     /// The presented certificate matches no bound binding: it was never
     /// issued, or its binding was revoked or re-bound.
@@ -86,6 +88,17 @@ pub enum AdmissionRejection {
     /// audit item 1): missing extension, mismatched fingerprint, or
     /// mismatched subject, or the binding is not in force.
     Identity(IdentityValidationError),
+    /// The `Hello`'s declared instance id disagrees with the binding
+    /// record the presented certificate resolves to (C5-10): the wire
+    /// identity is not the site the certificate was issued for. The
+    /// site's binding is in force, so it must not converge it — it
+    /// receives its own honest reason code.
+    HelloIdentityMismatch {
+        /// The instance id the `Hello` declared on the wire.
+        declared: String,
+        /// The bound site the certificate was issued for.
+        bound: InstanceId,
+    },
 }
 
 impl std::fmt::Display for AdmissionRejection {
@@ -93,6 +106,10 @@ impl std::fmt::Display for AdmissionRejection {
         match self {
             Self::UnknownSite => formatter.write_str("the certificate matches no bound site"),
             Self::Identity(reason) => reason.fmt(formatter),
+            Self::HelloIdentityMismatch { declared, bound } => write!(
+                formatter,
+                "the Hello declares instance {declared} but the certificate is bound to instance {bound}"
+            ),
         }
     }
 }
@@ -140,7 +157,8 @@ impl<Store> CenterSessionAdmission<Store>
 where
     Store: CenterBindingRepository,
 {
-    /// Resolves one presented certificate identity to its bound site.
+    /// Resolves one presented certificate identity to its bound site,
+    /// under the `Hello`'s declared instance id (C5-10).
     ///
     /// The binding lookup keys on the certificate's private-arc site
     /// fingerprint; a certificate without the extension, or whose extension
@@ -150,6 +168,15 @@ where
     /// re-bound or revoked registration) is refused even though its CA
     /// signature verifies.
     ///
+    /// The certificate identity is not the whole identity: the `Hello`
+    /// carries a self-declared `instance_id`, and admission refuses a
+    /// `Hello` that declares any instance other than the binding record's
+    /// bound site. The certificate and the binding together are the source
+    /// of truth for who this connection is; the wire declaration must agree
+    /// with them, never the other way around. `site_name` is a display
+    /// label without a certificate counterpart, so it never participates in
+    /// the decision.
+    ///
     /// # Errors
     ///
     /// Returns [`CenterSessionAdmissionError::Binding`] when the binding
@@ -157,6 +184,7 @@ where
     pub async fn resolve(
         &self,
         identity: &SiteIdentity,
+        declared_instance_id: &str,
     ) -> Result<AdmissionVerdict, CenterSessionAdmissionError<Store::Error>> {
         let Some(site_fingerprint) = identity.bound_site_fingerprint() else {
             return Ok(AdmissionVerdict::Rejected {
@@ -173,16 +201,31 @@ where
                 reason: AdmissionRejection::UnknownSite,
             });
         };
-        match validate_bound_identity(&binding, identity) {
-            Err(reason) => Ok(AdmissionVerdict::Rejected {
+        if let Err(reason) = validate_bound_identity(&binding, identity) {
+            return Ok(AdmissionVerdict::Rejected {
                 reason: AdmissionRejection::Identity(reason),
-            }),
-            Ok(()) => Ok(AdmissionVerdict::Admitted(ResolvedSite::new(
-                binding.site_instance_id(),
-                binding.id(),
-                site_fingerprint,
-            ))),
+            });
         }
+        let bound_site = binding.site_instance_id();
+        // C5-10: the certificate resolved the connection to the binding
+        // record; the `Hello`'s self-declared instance id must name that
+        // same bound site. A `Hello` that claims a different identity is
+        // refused honestly — the binding is in force, so this is an
+        // identity lie, not a convergence signal for the site's local
+        // binding.
+        if declared_instance_id != bound_site.to_string() {
+            return Ok(AdmissionVerdict::Rejected {
+                reason: AdmissionRejection::HelloIdentityMismatch {
+                    declared: declared_instance_id.to_owned(),
+                    bound: bound_site,
+                },
+            });
+        }
+        Ok(AdmissionVerdict::Admitted(ResolvedSite::new(
+            bound_site,
+            binding.id(),
+            site_fingerprint,
+        )))
     }
 }
 
@@ -220,11 +263,12 @@ struct OnlineSession {
 ///
 /// One connection per site: [`Self::mark_connected`] refuses a second
 /// concurrent connection for a site that is already online. [`Self::touch`]
-/// advances the liveness stamp on every received frame; the engine removes
-/// the site on every connection exit, and [`Self::prune_stale`] is the
-/// defensive backstop behind the transport's idle detection — a site whose
-/// connection ended without cleanup (a crashed handler task) is pruned once
-/// it has been silent for [`rutilus_center_protocol::CENTER_DISCONNECT_AFTER`].
+/// advances the liveness stamp on every received frame, and the engine
+/// removes the site on every connection exit. The runtime's connection task
+/// arms a [`DisconnectOnDrop`] guard around the engine, so the cleanup is
+/// guaranteed even on a crashed task — a panic unwind runs the guard's
+/// `Drop` — and the site's next reconnect succeeds instead of a stale
+/// [`CenterSessionRegistryError::AlreadyConnected`] refusal.
 #[derive(Debug)]
 pub struct CenterSessionRegistry {
     online: Mutex<HashMap<InstanceId, OnlineSession>>,
@@ -311,32 +355,37 @@ impl CenterSessionRegistry {
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_seen));
         sessions.into_iter().map(|session| session.site).collect()
     }
+}
 
-    /// Removes every online site that has been silent for
-    /// [`rutilus_center_protocol::CENTER_DISCONNECT_AFTER`] and returns the
-    /// pruned instance ids, so the caller can log the cleanup.
-    ///
-    /// The transport's idle detection normally removes a dead connection
-    /// first; this is the backstop for a connection whose handler task
-    /// ended without the cleanup path.
-    #[must_use]
-    pub fn prune_stale(
-        &self,
-        now: OffsetDateTime,
-        disconnect_after: time::Duration,
-    ) -> Vec<InstanceId> {
-        let Ok(mut online) = self.online.lock() else {
-            return Vec::new();
-        };
-        let stale = online
-            .iter()
-            .filter(|(_, session)| now > session.last_seen + disconnect_after)
-            .map(|(site, _)| *site)
-            .collect::<Vec<_>>();
-        for site in &stale {
-            online.remove(site);
-        }
-        stale
+/// Guarantees one site leaves the online registry when the connection task
+/// ends, whatever the ending is (§15.1): the normal engine cleanup and the
+/// panic unwind alike.
+///
+/// The engine removes the site on every orderly exit, but a connection task
+/// that crashes — a panic inside the handler or the transport, or a task
+/// aborted by the runtime — would leave a zombie online entry without this
+/// guard, and the site's reconnects would be refused as
+/// [`CenterSessionRegistryError::AlreadyConnected`] forever, silently. The
+/// guard is the crash backstop: its `Drop` runs during the unwind and
+/// removes the site, so the one-connection-per-site rule self-heals on the
+/// next reconnect. The cleanup is idempotent — [`CenterPresence::mark_disconnected`]
+/// is a no-op for a site that is not online — so the guard and the engine's
+/// own cleanup never conflict.
+#[must_use]
+pub struct DisconnectOnDrop<Presence: CenterPresence> {
+    presence: Presence,
+    site: InstanceId,
+}
+
+impl<Presence: CenterPresence> DisconnectOnDrop<Presence> {
+    pub const fn new(presence: Presence, site: InstanceId) -> Self {
+        Self { presence, site }
+    }
+}
+
+impl<Presence: CenterPresence> Drop for DisconnectOnDrop<Presence> {
+    fn drop(&mut self) {
+        self.presence.mark_disconnected(self.site);
     }
 }
 
@@ -859,7 +908,10 @@ mod tests {
         store.seed_bound(bound_binding(site)?);
         let admission = CenterSessionAdmission::new(&store);
 
-        let verdict = admission.resolve(&matching_identity(site)).await?;
+        // The Hello declares the bound instance: the admission admits it.
+        let verdict = admission
+            .resolve(&matching_identity(site), &site.to_string())
+            .await?;
         assert_eq!(
             verdict,
             AdmissionVerdict::Admitted(ResolvedSite::new(
@@ -886,7 +938,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            admission.resolve(&no_extension).await?,
+            admission.resolve(&no_extension, &site.to_string()).await?,
             AdmissionVerdict::Rejected {
                 reason: AdmissionRejection::Identity(IdentityValidationError::ExtensionMissing)
             }
@@ -899,7 +951,7 @@ mod tests {
             Some(CertificateFingerprint::from_bytes([0x43; 32])),
         );
         assert_eq!(
-            admission.resolve(&unknown).await?,
+            admission.resolve(&unknown, &site.to_string()).await?,
             AdmissionVerdict::Rejected {
                 reason: AdmissionRejection::UnknownSite
             }
@@ -912,7 +964,7 @@ mod tests {
             Some(site_fingerprint()),
         );
         assert_eq!(
-            admission.resolve(&wrong_subject).await?,
+            admission.resolve(&wrong_subject, &site.to_string()).await?,
             AdmissionVerdict::Rejected {
                 reason: AdmissionRejection::Identity(IdentityValidationError::SubjectMismatch)
             }
@@ -926,11 +978,49 @@ mod tests {
         let admission_with_revoked = CenterSessionAdmission::new(&store_with_revoked);
         assert_eq!(
             admission_with_revoked
-                .resolve(&matching_identity(other_site))
+                .resolve(&matching_identity(other_site), &other_site.to_string())
                 .await?,
             AdmissionVerdict::Rejected {
                 reason: AdmissionRejection::Identity(IdentityValidationError::NotBound)
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_a_hello_declaring_a_different_instance_id()
+    -> Result<(), Box<dyn Error>> {
+        // C5-10: the certificate and its binding resolve the connection to
+        // one bound site; a `Hello` that declares any other instance id is
+        // refused honestly, with both identities in the reason.
+        let site = InstanceId::generate();
+        let store = MockBindingStore::new();
+        store.seed_bound(bound_binding(site)?);
+        let admission = CenterSessionAdmission::new(&store);
+        let liar = InstanceId::generate();
+
+        assert_eq!(
+            admission
+                .resolve(&matching_identity(site), &liar.to_string())
+                .await?,
+            AdmissionVerdict::Rejected {
+                reason: AdmissionRejection::HelloIdentityMismatch {
+                    declared: liar.to_string(),
+                    bound: site,
+                }
+            }
+        );
+        // The declared identity does not override the certificate: the
+        // same certificate is still admitted when its Hello is honest.
+        assert_eq!(
+            admission
+                .resolve(&matching_identity(site), &site.to_string())
+                .await?,
+            AdmissionVerdict::Admitted(ResolvedSite::new(
+                site,
+                store.seeded_binding_id(),
+                site_fingerprint()
+            ))
         );
         Ok(())
     }
@@ -978,31 +1068,41 @@ mod tests {
     }
 
     #[test]
-    fn prune_stale_removes_sites_silent_beyond_the_disconnect_window() -> Result<(), Box<dyn Error>>
+    fn a_crashed_connection_task_removes_the_site_from_the_registry() -> Result<(), Box<dyn Error>>
     {
-        let registry = CenterSessionRegistry::new();
+        let registry = Arc::new(CenterSessionRegistry::new());
         let base = base_time();
         let site = ResolvedSite::new(
             InstanceId::generate(),
             CenterBindingId::generate(),
             site_fingerprint(),
         );
-        let active = ResolvedSite::new(
-            InstanceId::generate(),
-            CenterBindingId::generate(),
-            site_fingerprint(),
-        );
+        let site_id = site.instance_id();
         registry.mark_connected(site.clone(), base)?;
-        registry.mark_connected(active.clone(), base)?;
-        registry.touch(active.instance_id(), base + Duration::seconds(10));
 
-        let disconnect_after = Duration::seconds(90);
-        let pruned = registry.prune_stale(base + Duration::seconds(100), disconnect_after);
-        // The site is stale (silent for 100 seconds); the active one was
-        // touched 10 seconds in.
-        assert_eq!(pruned, vec![site.instance_id()]);
-        assert!(!registry.is_online(site.instance_id()));
-        assert!(registry.is_online(active.instance_id()));
+        // The connection task crashes after the site was registered (an
+        // index out of bounds, standing in for a handler panic). The
+        // disconnect guard is armed inside the task, so its `Drop` runs
+        // during the unwind and removes the site — the engine's own
+        // cleanup never runs on this path.
+        let crashed = std::thread::spawn({
+            let registry = Arc::clone(&registry);
+            move || {
+                let _guard = DisconnectOnDrop::new(registry, site_id);
+                let values = Vec::from([0_u8]);
+                let _ = values[1];
+            }
+        });
+        assert!(
+            crashed.join().is_err(),
+            "the task must have crashed with a panic"
+        );
+        assert!(!registry.is_online(site_id));
+
+        // The registry healed: the site's next reconnect registers instead
+        // of the stale `AlreadyConnected` refusal of a zombie entry.
+        registry.mark_connected(site, base)?;
+        assert!(registry.is_online(site_id));
         Ok(())
     }
 

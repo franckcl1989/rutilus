@@ -244,12 +244,15 @@ impl CenterAcceptor {
     ///
     /// An admitted site receives `NegotiationResult { accepted: true }`
     /// and the returned connection carries its resolved site. A refused
-    /// site receives `NegotiationResult { accepted: false, reason:
-    /// "not-bound" }` — the doc-sanctioned extensible reason code, never a
-    /// wire change — before the connection closes, so the site learns that
-    /// its binding is not in force and converges instead of retrying
-    /// forever. An admission lookup failure refuses the connection without
-    /// an answer: a broken center must not converge the site.
+    /// site receives `NegotiationResult { accepted: false }` with the
+    /// matching reason code before the connection closes: `not-bound` —
+    /// the doc-sanctioned extensible reason code, never a wire change —
+    /// when the binding is not in force, so the site converges instead of
+    /// retrying forever, or `identity-mismatch` when the Hello declared
+    /// an identity that disagrees with the certificate's binding (C5-10:
+    /// the binding is in force, so the site must not converge). An
+    /// admission lookup failure refuses the connection without an answer:
+    /// a broken center must not converge the site.
     ///
     /// # Errors
     ///
@@ -312,10 +315,13 @@ impl CenterAcceptor {
 /// The production resolver is the S5 [`CenterSessionAdmission`] over the
 /// instance store; the trait keeps the acceptor free of the store type.
 pub trait CenterAdmissionResolver: Send + Sync {
-    /// Resolves the presented identity to its admission verdict.
+    /// Resolves the presented identity to its admission verdict, checking
+    /// the `Hello`'s declared instance id against the binding record the
+    /// certificate resolves to (C5-10).
     fn resolve(
         &self,
         identity: &ClientIdentity,
+        hello: &Hello,
     ) -> BoundaryFuture<
         '_,
         Result<AdmissionVerdict, CenterSessionAdmissionError<CenterBindingRepositoryError>>,
@@ -326,18 +332,21 @@ impl CenterAdmissionResolver for CenterSessionAdmission<&SqliteStore> {
     fn resolve(
         &self,
         identity: &ClientIdentity,
+        hello: &Hello,
     ) -> BoundaryFuture<
         '_,
         Result<AdmissionVerdict, CenterSessionAdmissionError<CenterBindingRepositoryError>>,
     > {
-        // The identity parts are copied into an owned `SiteIdentity` before
-        // the future, so the future never borrows the connection.
+        // The identity parts are copied into an owned `SiteIdentity` and
+        // the Hello's declared instance id into an owned string before the
+        // future, so the future never borrows the connection.
         let site_identity = SiteIdentity::from_parts(
             identity.fingerprint(),
             identity.subject().map(str::to_owned),
             identity.bound_site_fingerprint(),
         );
-        Box::pin(async move { self.resolve(&site_identity).await })
+        let declared_instance_id = hello.instance_id.clone();
+        Box::pin(async move { self.resolve(&site_identity, &declared_instance_id).await })
     }
 }
 
@@ -589,12 +598,16 @@ impl CenterConnection {
     /// The connection-establishment negotiation under the admission
     /// decision (audit follow-up F4): the first frame must be a `Hello`,
     /// and every `Hello` receives a `NegotiationResult` — an acceptance, a
-    /// protocol-level rejection, or the `not-bound` admission refusal.
+    /// protocol-level rejection, or an admission refusal with the matching
+    /// reason code: `not-bound` when the binding is not in force, or
+    /// `identity-mismatch` when the Hello declared an identity that
+    /// disagrees with the certificate's binding (C5-10: the binding is in
+    /// force, so the site must not converge).
     ///
     /// # Errors
     ///
     /// Returns [`CenterAcceptError::AdmissionRejected`] when the admission
-    /// refuses the site (the site received its `not-bound` answer), and
+    /// refuses the site (the site received its refusal answer), and
     /// [`CenterAcceptError::AdmissionLookup`] when the admission cannot be
     /// resolved (the connection is refused without an answer).
     async fn complete_negotiation_with_admission<A: CenterAdmissionResolver + ?Sized>(
@@ -606,9 +619,9 @@ impl CenterConnection {
             NegotiationDecision::Compatible => {
                 // The admission runs before the acceptance answer: only a
                 // site whose binding is in force is accepted; a refused
-                // site learns the `not-bound` reason instead of being
-                // accepted and dropped after the negotiation.
-                match admission.resolve(&self.identity).await {
+                // site learns the reason instead of being accepted and
+                // dropped after the negotiation.
+                match admission.resolve(&self.identity, &hello).await {
                     Ok(AdmissionVerdict::Admitted(site)) => {
                         self.send(EnvelopeMessage::NegotiationResult(NegotiationResult {
                             accepted: true,
@@ -621,12 +634,27 @@ impl CenterConnection {
                     Ok(AdmissionVerdict::Rejected { reason }) => {
                         // The refusal answer is best-effort, exactly like
                         // the protocol-level rejection: the site must learn
-                        // that its binding is not in force, but a failing
-                        // transport must not mask the refusal itself.
+                        // why it cannot join, but a failing transport must
+                        // not mask the refusal itself.
+                        let wire_reason = match reason {
+                            // C5-10: the Hello declared an identity that
+                            // disagrees with the certificate's binding. The
+                            // site must NOT converge its binding — the
+                            // binding is in force — so it receives its own
+                            // honest reason code, never the convergence
+                            // signal `not-bound`.
+                            AdmissionRejection::HelloIdentityMismatch { .. } => {
+                                NegotiationReason::IdentityMismatch.as_str().to_owned()
+                            }
+                            // Every other admission refusal means the
+                            // binding is not in force; the site converges
+                            // its local row (audit follow-up F4).
+                            _ => NegotiationReason::NotBound.as_str().to_owned(),
+                        };
                         let _ = self
                             .send(EnvelopeMessage::NegotiationResult(NegotiationResult {
                                 accepted: false,
-                                reason: NegotiationReason::NotBound.as_str().to_owned(),
+                                reason: wire_reason,
                             }))
                             .await;
                         Err(CenterAcceptError::AdmissionRejected { reason })
@@ -943,8 +971,13 @@ mod tests {
         CENTER_PROTOCOL_VERSION, Envelope, EnvelopeMessage, Heartbeat, Hello, NV_REDFISH_BASELINE,
         capability_ledger_hash, decode_frame, encode_frame,
     };
-    use rutilus_domain::{CertificateFingerprint, InstanceId};
+    use rutilus_domain::{
+        BINDING_CODE_TTL, BindingCode, CenterBinding, CenterBindingId, CertificateFingerprint,
+        InstanceId, InstanceKind, SiteInstance,
+    };
+    use rutilus_persistence::SqliteStore;
     use rutilus_platform::RuntimePaths;
+    use time::OffsetDateTime;
     use tokio::net::TcpStream;
     use tokio_rustls::client::TlsStream;
     use tokio_tungstenite::tungstenite::Message;
@@ -1294,6 +1327,169 @@ mod tests {
         assert!(matches!(
             server.await.map_err(io::Error::other)?,
             Err(CenterAcceptError::ExpectedHello)
+        ));
+        Ok(())
+    }
+
+    /// Seeds one bound site row and its `Bound` binding into a fresh store
+    /// over the given paths, so the admission resolves the site's
+    /// certificate identity against a real binding record.
+    async fn seed_admission_store(
+        paths: &RuntimePaths,
+        site: InstanceId,
+        site_fingerprint: CertificateFingerprint,
+    ) -> Result<SqliteStore, Box<dyn Error>> {
+        let store = SqliteStore::open(paths.database_path()).await?;
+        let now = OffsetDateTime::now_utc();
+        store
+            .create_instance(&SiteInstance::new(
+                site,
+                String::from("Test Site"),
+                InstanceKind::Site,
+                now,
+            ))
+            .await?;
+        let code: BindingCode = "23456789ABCDEFGHJKLM".parse()?;
+        let mut binding = CenterBinding::new_pending(
+            CenterBindingId::generate(),
+            String::from("https://center.example"),
+            site,
+            &code,
+            now + BINDING_CODE_TTL,
+            now,
+        );
+        binding.bind(Some(site_fingerprint), now)?;
+        store.create_binding(&binding).await?;
+        Ok(store)
+    }
+
+    /// One accepted connection under the admission decision, driven by a
+    /// raw client presenting one issued identity and one `Hello` frame.
+    /// Returns the accepted connection and the still-open raw client, and
+    /// asserts the negotiation was accepted. The store travels into the
+    /// accept task, which owns the admission resolver for the accept.
+    async fn accept_with_admission_identity(
+        acceptor: CenterAcceptor,
+        store: SqliteStore,
+        address: SocketAddr,
+        ca_certificate: CertificateDer<'static>,
+        identity: (CertificateDer<'static>, PrivateKeyDer<'static>),
+        hello: Envelope,
+    ) -> Result<
+        (
+            AcceptedCenterConnection,
+            WebSocketStream<TlsStream<TcpStream>>,
+        ),
+        Box<dyn Error>,
+    > {
+        let server = tokio::spawn(async move {
+            let mut acceptor = acceptor;
+            let admission = CenterSessionAdmission::new(&store);
+            acceptor.accept_with_admission(&admission).await
+        });
+        let mut ws = raw_client(address, ca_certificate, Some(identity)).await?;
+        ws.send(Message::Binary(encode_frame(&hello)?)).await?;
+        let accepted = server.await.map_err(io::Error::other)??;
+        // The raw client consumed the NegotiationResult reply.
+        let reply = ws
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("no negotiation reply"))??;
+        let Message::Binary(payload) = reply else {
+            return Err(io::Error::other("non-binary negotiation reply").into());
+        };
+        let envelope = decode_frame(&payload)?;
+        let Some(EnvelopeMessage::NegotiationResult(result)) = envelope.message else {
+            return Err(io::Error::other("the reply was not a NegotiationResult").into());
+        };
+        assert!(result.accepted);
+        Ok((accepted, ws))
+    }
+
+    #[tokio::test]
+    async fn admits_a_hello_declaring_the_bound_instance_id() -> Result<(), Box<dyn Error>> {
+        // C5-10, the honest path: the Hello declares the instance the
+        // certificate was issued for, the admission admits it, and the
+        // accepted connection carries the resolved site.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let (acceptor, _) = bind_acceptor(&paths).await?;
+        let address = acceptor.address();
+        let ca_certificate = acceptor.ca_certificate();
+        let site = InstanceId::generate();
+        let site_fingerprint = CertificateFingerprint::from_bytes([0xAA; 32]);
+        let identity = acceptor.issue_site_certificate(site, site_fingerprint)?;
+        let store = seed_admission_store(&paths, site, site_fingerprint).await?;
+
+        let (accepted, _ws) = accept_with_admission_identity(
+            acceptor,
+            store,
+            address,
+            ca_certificate,
+            (identity.certificate(), identity.private_key()),
+            hello_envelope(CENTER_PROTOCOL_VERSION, &site.to_string()),
+        )
+        .await?;
+        assert_eq!(accepted.site().instance_id(), site);
+        assert_eq!(accepted.site().site_fingerprint(), site_fingerprint);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_hello_declaring_a_different_instance_id() -> Result<(), Box<dyn Error>> {
+        // C5-10, the refusal path: the certificate is bound to `site`, but
+        // the Hello claims another instance. The site receives the honest
+        // `identity-mismatch` answer — never the `not-bound` convergence
+        // signal, because its binding is in force — and the accept is
+        // refused with both identities in the reason.
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let (acceptor, _) = bind_acceptor(&paths).await?;
+        let address = acceptor.address();
+        let ca_certificate = acceptor.ca_certificate();
+        let site = InstanceId::generate();
+        let site_fingerprint = CertificateFingerprint::from_bytes([0xAB; 32]);
+        let identity = acceptor.issue_site_certificate(site, site_fingerprint)?;
+        let store = seed_admission_store(&paths, site, site_fingerprint).await?;
+
+        let server = tokio::spawn(async move {
+            let mut acceptor = acceptor;
+            let admission = CenterSessionAdmission::new(&store);
+            acceptor.accept_with_admission(&admission).await
+        });
+        let mut ws = raw_client(
+            address,
+            ca_certificate,
+            Some((identity.certificate(), identity.private_key())),
+        )
+        .await?;
+        let other = InstanceId::generate();
+        ws.send(Message::Binary(encode_frame(&hello_envelope(
+            CENTER_PROTOCOL_VERSION,
+            &other.to_string(),
+        ))?))
+        .await?;
+
+        // The honest answer arrives before the connection closes.
+        let reply = ws
+            .next()
+            .await
+            .ok_or_else(|| io::Error::other("no refusal reply"))??;
+        let Message::Binary(payload) = reply else {
+            return Err(io::Error::other("non-binary refusal reply").into());
+        };
+        let envelope = decode_frame(&payload)?;
+        let Some(EnvelopeMessage::NegotiationResult(result)) = envelope.message else {
+            return Err(io::Error::other("the reply was not a NegotiationResult").into());
+        };
+        assert!(!result.accepted);
+        assert_eq!(result.reason, "identity-mismatch");
+
+        assert!(matches!(
+            server.await.map_err(io::Error::other)?,
+            Err(CenterAcceptError::AdmissionRejected {
+                reason: AdmissionRejection::HelloIdentityMismatch { .. }
+            })
         ));
         Ok(())
     }

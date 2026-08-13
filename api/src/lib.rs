@@ -5319,6 +5319,79 @@ impl AssignRoleRequest {
     }
 }
 
+/// One administrator setting or resetting a principal's password (§16.1,
+/// S3-4).
+///
+/// The administration surface creates principals without a credential, so a
+/// created user has no way to sign in until an administrator issues one
+/// password. This request carries only the new password — the presenting
+/// administrator authenticates the action, so no current password is asked.
+/// The password is `SecretString`-wrapped, serialized only for the WASM
+/// client, and never echoed by any response; the handler enforces the
+/// product password policy (12 characters) at the API boundary.
+pub struct AdminSetPasswordRequest {
+    new_password: SecretString,
+}
+
+impl AdminSetPasswordRequest {
+    #[must_use]
+    pub fn new(new_password: SecretString) -> Self {
+        Self { new_password }
+    }
+
+    #[must_use]
+    pub fn new_password(&self) -> &SecretString {
+        &self.new_password
+    }
+}
+
+impl Serialize for AdminSetPasswordRequest {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        #[derive(Serialize)]
+        struct WireAdminSetPasswordRequest<'a> {
+            new_password: &'a str,
+        }
+
+        WireAdminSetPasswordRequest {
+            new_password: self.new_password.expose_secret(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AdminSetPasswordRequest {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireAdminSetPasswordRequest {
+            new_password: String,
+        }
+
+        let wire = WireAdminSetPasswordRequest::deserialize(deserializer)?;
+        Ok(Self::new(wire.new_password.into()))
+    }
+}
+
+impl fmt::Debug for AdminSetPasswordRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminSetPasswordRequest")
+            .field("new_password", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// The lifecycle phase of one site-to-center binding (design D2, D6).
 ///
 /// The wire values are the domain's stable snake-case codes; the raw binding
@@ -11949,6 +12022,40 @@ mod tests {
         assert!(
             serde_json::from_value::<LogoutRequest>(json!({ "reason": "bye" })).is_err(),
             "unknown logout fields must be rejected"
+        );
+        Ok(())
+    }
+
+    /// The administrator password-set contract (S3-4): the wire carries only
+    /// the new password, the value round-trips without touching the
+    /// `SecretString` wrapper, `Debug` stays permanently redacted, and
+    /// unknown fields are refused like every other strict request body.
+    #[test]
+    fn admin_password_set_contract_is_secret_safe_and_strict() -> Result<(), Box<dyn Error>> {
+        let request = AdminSetPasswordRequest::new("a fresh replacement secret".to_owned().into());
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({ "new_password": "a fresh replacement secret" })
+        );
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<AdminSetPasswordRequest>(
+                serde_json::to_value(&request)?
+            )?)?,
+            json!({ "new_password": "a fresh replacement secret" })
+        );
+        assert_eq!(
+            request.new_password().expose_secret(),
+            "a fresh replacement secret"
+        );
+        assert!(!format!("{request:?}").contains("a fresh replacement secret"));
+        assert!(format!("{request:?}").contains("[REDACTED]"));
+        assert!(
+            serde_json::from_value::<AdminSetPasswordRequest>(json!({
+                "new_password": "a fresh replacement secret",
+                "current_password": "must not be accepted"
+            }))
+            .is_err(),
+            "unknown admin password-set fields must be rejected"
         );
         Ok(())
     }

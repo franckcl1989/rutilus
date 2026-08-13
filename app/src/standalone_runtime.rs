@@ -8,10 +8,12 @@ use std::{
     num::NonZeroU64,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use tracing::instrument;
 
+use axum::http::StatusCode;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
     CapabilitySnapshotRepository, CenterSessionRegistry, Clock, CoreResourceReader,
@@ -67,6 +69,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot, task::spawn_blocking};
 use tokio_util::sync::CancellationToken;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::{
     ActiveCredentialResolverError, StandaloneUnlock, SystemClock, event_listener, scheduler,
@@ -76,6 +79,29 @@ use crate::{
 /// Defensive upper bound for the in-memory recent-audit tail served by the
 /// Standalone console until persistence exposes a bounded listing query.
 const AUDIT_TAIL_EVENTS: usize = 1024;
+
+/// The bounded grace period for in-flight HTTP requests once a shutdown
+/// signal resolves (N2-2): the server stops accepting and gives the
+/// remaining connections this long to finish, then force-closes them and
+/// completes the stop, so a slow client can never stall the shutdown
+/// forever.
+///
+/// The same value bounds every console request handler (the
+/// [`tower_http::timeout::TimeoutLayer`] in `serve_until`): a handler that
+/// outlives the bound is aborted with a 408. That layer is what actually
+/// terminates a slow in-flight request (axum 0.8 runs each connection in
+/// its own task, so dropping the serve future alone would leave the
+/// handler running against the closing store); the drain race in
+/// [`serve_with_bounded_drain`] then bounds the connections whose request
+/// never reached a handler (a client that stalls mid-head).
+///
+/// The 10-second bound is generous for the console's request surface (no
+/// handler is expected to run for minutes) and keeps the server's drain
+/// comfortably inside the 30-second Windows SCM wait hint
+/// (`platform/src/service/windows.rs`) even after the background tasks'
+/// own §7.8 drain, so a service stop always lands inside the SCM's hint
+/// window.
+pub(crate) const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1469,7 +1495,12 @@ impl StandaloneBinding {
 
     /// Serves the embedded Web application over the injected product services
     /// until a tracked shutdown future resolves, then waits for Axum's
-    /// graceful drain to complete.
+    /// graceful drain to complete — bounded by `drain_timeout` (N2-2). Every
+    /// handler is capped at the same bound (a slower request is aborted with
+    /// a 408); once the shutdown future resolves, the in-flight requests get
+    /// the remaining grace to finish, and the server then force-closes the
+    /// connections it is still waiting on and completes the stop, so a slow
+    /// client can never stall the shutdown forever.
     ///
     /// The §16.2 session policy is the caller's decision — the Standalone
     /// runtime arms it from the bootstrap state of its store, while the
@@ -1490,6 +1521,7 @@ impl StandaloneBinding {
         gateway: Arc<Gateway>,
         clock: Time,
         shutdown: Shutdown,
+        drain_timeout: Duration,
     ) -> io::Result<()>
     where
         Services: ProductServices + AuthServices + CenterServices + 'static,
@@ -1502,21 +1534,89 @@ impl StandaloneBinding {
         if options.open_browser() {
             launch_browser(url).await;
         }
-        axum::serve(
-            self.listener,
-            router_with_auth(
-                WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
-                AuditActor::LocalOperator,
-                posture,
-                policy,
-                services,
-                gateway,
-                clock,
-            )
-            .into_make_service_with_connect_info::<SocketAddr>(),
+        // N2-2: every handler is capped at the same bound as the shutdown
+        // drain, so a slow request is aborted with a 408 instead of
+        // outliving the drain against the closing store.
+        let router = router_with_auth(
+            WebProductInfo::new(PRODUCT_VERSION, NV_REDFISH_DEVELOPMENT_BASELINE),
+            AuditActor::LocalOperator,
+            posture,
+            policy,
+            services,
+            gateway,
+            clock,
         )
-        .with_graceful_shutdown(shutdown)
-        .await
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            drain_timeout,
+        ))
+        .into_make_service_with_connect_info::<SocketAddr>();
+        // The drain signal fires exactly when the graceful shutdown future
+        // resolves — the moment hyper stops accepting and begins draining
+        // the in-flight connections — so the bounded-drain race below
+        // measures the drain itself, never the serving lifetime.
+        let (drain_signal_sender, drain_signal_receiver) = oneshot::channel();
+        let serve = axum::serve(self.listener, router).with_graceful_shutdown(async move {
+            shutdown.await;
+            let _ = drain_signal_sender.send(());
+        });
+        // `with_graceful_shutdown` returns an `IntoFuture`, not a `Future`;
+        // the bounded-drain runner takes the real serve future.
+        serve_with_bounded_drain(serve.into_future(), drain_signal_receiver, drain_timeout).await
+    }
+}
+
+/// Runs one axum serve future under a bounded graceful drain (N2-2).
+///
+/// The value is the `with_graceful_shutdown` serve future of the caller
+/// (axum's serve futures implement `IntoFuture`, not `Future` directly),
+/// and `drain_signal` fires exactly when its graceful shutdown future
+/// resolves — the moment hyper stops accepting and begins draining the
+/// in-flight connections. Until then this races the serve future itself:
+/// the server runs for its natural lifetime. Once the signal fires, the
+/// drain gets `drain_timeout` to finish; when that bound is exceeded, the
+/// timed-out serve future is dropped, so the stop is no longer waiting on
+/// the connections, and the shutdown completes as a success (the stop did
+/// happen — just forcibly).
+///
+/// # Why the race is not the whole fix
+///
+/// axum 0.8 runs each connection in its own spawned task, so dropping the
+/// serve future stops the drain's *wait* but cannot kill a connection
+/// task. The handler timeout layer (see [`GRACEFUL_DRAIN_TIMEOUT`]) is
+/// what actually terminates slow in-flight requests — their handlers are
+/// aborted and the connections complete and exit — while this race bounds
+/// the connections that never dispatched a request (a client that stalls
+/// mid-head), whose tasks then live only until the process exits without
+/// ever touching the store.
+///
+/// Shared by the Standalone and Site `serve_until` paths (the Center
+/// console serves through the Site path), so all three postures bound the
+/// drain identically.
+pub(crate) async fn serve_with_bounded_drain<Server>(
+    serve: Server,
+    drain_signal: oneshot::Receiver<()>,
+    drain_timeout: Duration,
+) -> io::Result<()>
+where
+    Server: IntoFuture<Output = io::Result<()>>,
+    Server::IntoFuture: Future<Output = io::Result<()>> + Send,
+{
+    let serve = serve.into_future();
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result,
+        _ = drain_signal => {
+            match tokio::time::timeout(drain_timeout, &mut serve).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "graceful drain exceeded its {drain_timeout:?} bound; aborting the drain wait; the process will close the remaining connections on exit"
+                    );
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -1583,6 +1683,7 @@ where
         async move {
             let _result = shutdown_receiver.await;
         },
+        GRACEFUL_DRAIN_TIMEOUT,
     );
     tokio::pin!(server);
 
@@ -1649,6 +1750,7 @@ pub async fn run_initialized_standalone(
                         stop.stopped().await;
                         let _ = scheduler_done_receiver.await;
                     },
+                    GRACEFUL_DRAIN_TIMEOUT,
                 )
             },
             console_stop_signal(),
@@ -2211,6 +2313,61 @@ mod tests {
             Box::pin(async { Err(UnavailableGatewayError) })
         }
     }
+
+    /// A Redfish gateway whose TLS identity observation is deliberately
+    /// slow: one trust-establishment request stays in flight in its handler
+    /// for `delay`. `entered` signals the moment an observation begins, so
+    /// tests can wait deterministically for the request to be in flight
+    /// before stopping the server.
+    #[derive(Clone)]
+    struct SlowGateway {
+        entered: Arc<tokio::sync::Notify>,
+        delay: Duration,
+    }
+
+    impl TlsIdentityProbe for SlowGateway {
+        type Error = UnavailableGatewayError;
+
+        fn observe<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+        ) -> BoundaryFuture<'a, Result<TlsIdentityObservation, Self::Error>> {
+            self.entered.notify_one();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(UnavailableGatewayError)
+            })
+        }
+    }
+
+    impl RedfishDiscovery for SlowGateway {
+        type Error = UnavailableGatewayError;
+
+        fn probe_core_capabilities<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<EndpointDiscovery, Self::Error>> {
+            Box::pin(async { Err(UnavailableGatewayError) })
+        }
+    }
+
+    impl CoreResourceReader for SlowGateway {
+        type Error = UnavailableGatewayError;
+
+        fn read_core_resources<'a>(
+            &'a self,
+            _address: &'a EndpointAddress,
+            _trust: &'a TlsTrust,
+            _username: &'a CredentialUsername,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<CoreResourceReadOutcome, Self::Error>> {
+            Box::pin(async { Err(UnavailableGatewayError) })
+        }
+    }
     use crate::{StandaloneUnlock, initialize_standalone};
 
     #[tokio::test]
@@ -2237,6 +2394,7 @@ mod tests {
             async move {
                 let _result = shutdown_receiver.await;
             },
+            GRACEFUL_DRAIN_TIMEOUT,
         ));
         let mut stream = TcpStream::connect(address).await?;
         stream
@@ -2266,6 +2424,203 @@ mod tests {
             .send(())
             .map_err(|()| std::io::Error::other("server shutdown receiver was dropped"))?;
         server.await??;
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// A trust-establishment request whose gateway observation outlives the
+    /// drain grace is still served when it completes inside the bound: the
+    /// graceful drain waits for it and its response is delivered.
+    #[tokio::test]
+    async fn an_in_flight_request_completing_in_time_is_served_during_the_drain()
+    -> Result<(), Box<dyn Error>> {
+        let binding = StandaloneBinding::bind().await?;
+        let address = binding.address();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        // The gateway observation takes 200ms; the drain grace is 2s, so
+        // the in-flight request finishes inside the bound.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(binding.serve_until(
+            StandaloneRunOptions::new(false, TelemetryRetention::default()),
+            DeploymentPosture::Standalone,
+            AuthPolicy::Open,
+            Arc::clone(&instance.state),
+            Arc::new(SlowGateway {
+                entered: Arc::clone(&entered),
+                delay: Duration::from_millis(200),
+            }),
+            SystemClock,
+            async move {
+                let _result = shutdown_receiver.await;
+            },
+            Duration::from_secs(2),
+        ));
+        let mut stream = TcpStream::connect(address).await?;
+        let body = r#"{"address":"https://192.0.2.1"}"#;
+        stream
+            .write_all(
+                format!(
+                    "POST /api/v1/endpoints/trust HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await?;
+        // The handler is now in flight: the gateway observation started.
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .map_err(|_| io::Error::other("the slow handler never started"))?;
+        shutdown_sender
+            .send(())
+            .map_err(|()| io::Error::other("server shutdown receiver was dropped"))?;
+        // The graceful drain waits for the in-flight request; its failure
+        // response is still delivered.
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response = String::from_utf8(response)?;
+        assert!(response.starts_with("HTTP/1.1 502"));
+        server.await??;
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// A slow request still in flight when the drain grace expires must not
+    /// stall the shutdown: the server force-closes it and the whole stop
+    /// completes inside the drain bound (N2-2).
+    #[tokio::test]
+    async fn shutdown_completes_in_bounded_time_with_a_slow_request_in_flight()
+    -> Result<(), Box<dyn Error>> {
+        let binding = StandaloneBinding::bind().await?;
+        let address = binding.address();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        // The gateway observation takes 5s — far beyond the 300ms drain
+        // grace — so the shutdown must force-close the in-flight request.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(binding.serve_until(
+            StandaloneRunOptions::new(false, TelemetryRetention::default()),
+            DeploymentPosture::Standalone,
+            AuthPolicy::Open,
+            Arc::clone(&instance.state),
+            Arc::new(SlowGateway {
+                entered: Arc::clone(&entered),
+                delay: Duration::from_secs(5),
+            }),
+            SystemClock,
+            async move {
+                let _result = shutdown_receiver.await;
+            },
+            Duration::from_millis(300),
+        ));
+        let mut stream = TcpStream::connect(address).await?;
+        let body = r#"{"address":"https://192.0.2.1"}"#;
+        stream
+            .write_all(
+                format!(
+                    "POST /api/v1/endpoints/trust HTTP/1.1\r\nHost: localhost\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await?;
+        // The handler is now in flight: the gateway observation started.
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .map_err(|_| io::Error::other("the slow handler never started"))?;
+        shutdown_sender
+            .send(())
+            .map_err(|()| io::Error::other("server shutdown receiver was dropped"))?;
+        // The whole shutdown stays inside the drain bound: the server stops
+        // about 300ms after the signal, never after the handler's 5s
+        // observation.
+        let joined = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .map_err(|_| io::Error::other("the shutdown exceeded the drain bound"))?;
+        joined??;
+        // The slow handler was aborted at the drain bound: the client
+        // receives the handler-timeout 408, never the handler's 502.
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response = String::from_utf8(response)?;
+        assert!(
+            response.starts_with("HTTP/1.1 408"),
+            "the bounded drain must abort the slow handler with a 408, got: {response}"
+        );
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// A client that stalls before completing a request head never dispatches
+    /// a request, so no handler bound can end its connection wait: only the
+    /// drain race can force-complete the shutdown at the bound (N2-2).
+    #[tokio::test]
+    async fn shutdown_is_bounded_even_for_a_connection_that_never_completes_a_request()
+    -> Result<(), Box<dyn Error>> {
+        let binding = StandaloneBinding::bind().await?;
+        let address = binding.address();
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(binding.serve_until(
+            StandaloneRunOptions::new(false, TelemetryRetention::default()),
+            DeploymentPosture::Standalone,
+            AuthPolicy::Open,
+            Arc::clone(&instance.state),
+            Arc::new(UnavailableGateway),
+            SystemClock,
+            async move {
+                let _result = shutdown_receiver.await;
+            },
+            Duration::from_millis(300),
+        ));
+        // The client stalls mid-head: the request never reaches a handler,
+        // so the connection wait can only end through the drain race.
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n")
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_sender
+            .send(())
+            .map_err(|()| io::Error::other("server shutdown receiver was dropped"))?;
+        // The drain race force-completes the stop at the 300ms bound.
+        let joined = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .map_err(|_| io::Error::other("the shutdown exceeded the drain bound"))?;
+        joined??;
+        // The stalled client's disconnect lets its connection task exit and
+        // release the instance state; the store close then succeeds.
+        drop(stream);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&instance.state) > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&instance.state),
+            1,
+            "the stalled connection task never released the instance state"
+        );
         instance.close().await?;
         drop(directory);
         Ok(())

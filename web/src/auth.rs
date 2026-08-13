@@ -50,11 +50,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rutilus_api::{
-    AssignRoleRequest, BootstrapCompleteRequest, BootstrapCompleteResponse, CreateUserRequest,
-    LoginRequest, LoginResponse, LogoutRequest, MeResponse, PrincipalStateResponse,
-    PrincipalSummaryResponse, RevokeSessionRequest, RoleResponse, SessionAdminResponse,
-    SessionSummaryResponse, SetPasswordRequest, SetPrincipalStateRequest, UserAdminResponse,
-    UserSummaryResponse,
+    AdminSetPasswordRequest, AssignRoleRequest, BootstrapCompleteRequest,
+    BootstrapCompleteResponse, CreateUserRequest, LoginRequest, LoginResponse, LogoutRequest,
+    MeResponse, PrincipalStateResponse, PrincipalSummaryResponse, RevokeSessionRequest,
+    RoleResponse, SessionAdminResponse, SessionSummaryResponse, SetPasswordRequest,
+    SetPrincipalStateRequest, UserAdminResponse, UserSummaryResponse,
 };
 use rutilus_application::{AuditEventWriter, BoundaryFuture, Clock};
 use rutilus_domain::{
@@ -883,32 +883,53 @@ const ROUTE_TABLE: &[(Method, &str, RouteAccess)] = &[
     ),
 ];
 
-/// Resolves the authorization of one request path under one console scope.
+/// Whether a table pattern names one path (§16.1): exact match, or prefix
+/// match for the trailing-`*` wildcard patterns. This single matcher is
+/// shared by the request-time resolution, the coverage gate (W6-5), and the
+/// pin tests, so the three cannot drift apart.
+fn pattern_covers(pattern: &str, path: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .is_some_and(|prefix| path.starts_with(prefix))
+        || path == pattern
+}
+
+/// The authorization entry of one request path under one console scope,
+/// when the table names it.
 ///
 /// The center management entries of [`ROUTE_TABLE`] exist only on the Center
 /// console (audit follow-up F2): an Edge console does not register the
 /// `/api/v1/center/*` routes, so its authorization table must not name them
 /// either — the surface is absent in both the router and the middleware.
+fn table_entry(method: &Method, path: &str, scope: crate::ConsoleScope) -> Option<RouteAccess> {
+    ROUTE_TABLE
+        .iter()
+        .find_map(|(route_method, pattern, access)| {
+            if route_method != method {
+                return None;
+            }
+            if pattern.starts_with(CENTER_SURFACE_PREFIX) && scope != crate::ConsoleScope::Center {
+                return None;
+            }
+            pattern_covers(pattern, path).then_some(*access)
+        })
+}
+
+/// Whether the table names one (method, path) under one console scope —
+/// the mechanical coverage question of the route-registry gate (W6-5).
+///
+/// The gate is the test that walks the route registries, so the helper is
+/// test-only; the request-time resolution uses [`table_entry`].
+#[cfg(test)]
+fn table_covers(method: &Method, path: &str, scope: crate::ConsoleScope) -> bool {
+    table_entry(method, path, scope).is_some()
+}
+
+/// Resolves the authorization of one request path under one console scope.
 fn route_access(method: &Method, path: &str, scope: crate::ConsoleScope) -> RouteAccess {
-    for (route_method, pattern, access) in ROUTE_TABLE {
-        if route_method != method {
-            continue;
-        }
-        if pattern.starts_with(CENTER_SURFACE_PREFIX) && scope != crate::ConsoleScope::Center {
-            continue;
-        }
-        let matches = if let Some(prefix) = pattern.strip_suffix('*') {
-            path.starts_with(prefix)
-        } else {
-            path == *pattern
-        };
-        if matches {
-            return *access;
-        }
-    }
     // Every other path — static assets, the UI shell, and the fallback — is
     // public: the console must load before a session exists.
-    RouteAccess::Public
+    table_entry(method, path, scope).unwrap_or(RouteAccess::Public)
 }
 
 /// The shared prefix of every center management route.
@@ -2326,6 +2347,118 @@ where
     json_ok(Json(LoginResponse::new(String::new())))
 }
 
+/// Sets one principal's password from the administration surface (§16.1,
+/// S3-4).
+///
+/// The create-user flow issues no credential, so a created user has no way
+/// to sign in until an administrator issues one password — this endpoint
+/// closes that gap, and also serves as the administrator-issued password
+/// rotation of any principal (no current password is asked; the presenting
+/// administrator authenticates the action). The policy check, the lookup
+/// order, and the session-revocation rule mirror the sibling administration
+/// handlers: the password floor (B1) is enforced before any store access,
+/// an unknown principal answers 404 like [`set_user_state`] and
+/// [`assign_user_role`], and §16.2 "密码或角色变化撤销旧 Session" revokes the
+/// principal's sessions so the new password applies from the next sign-in.
+pub(crate) async fn set_user_password<Services, Gateway, Time>(
+    State(state): State<WebState<Services, Gateway, Time>>,
+    context: axum::extract::Extension<AuthContext>,
+    AxumPath(principal_id): AxumPath<String>,
+    Json(request): Json<AdminSetPasswordRequest>,
+) -> Response
+where
+    Services: AuditEventWriter + AuthServices,
+    Time: Clock,
+{
+    let now = state.clock.now();
+    if !password_satisfies_policy(request.new_password()) {
+        // B1 (security batch): the API is the enforcement boundary — the
+        // same floor as the sign-in, bootstrap, and self password-change
+        // boundaries, and the same "no audit, no store access" refusal.
+        return password_policy_error();
+    }
+    let Ok(principal_id) = principal_id.parse::<PrincipalId>() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "the principal id is invalid".to_owned(),
+        );
+    };
+    if state
+        .services
+        .find_principal(principal_id)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "the principal does not exist".to_owned(),
+        );
+    }
+    let Ok(hash) = state
+        .services
+        .hash_password_async(request.new_password())
+        .await
+    else {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let Ok(updated) = PasswordCredential::try_from_parts(principal_id, hash, now) else {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    if state
+        .services
+        .save_password_credential(&updated)
+        .await
+        .is_err()
+    {
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    // §16.2 "密码或角色变化撤销旧 Session": a password change revokes every
+    // session of the principal — the new password applies from the next
+    // sign-in, exactly like the self password-change and role-change paths.
+    if state
+        .services
+        .revoke_sessions_for_principal(principal_id, now)
+        .await
+        .is_err()
+    {
+        // B3 (security batch): the revocation is not optional — a silently
+        // failed revocation would leave every old token valid until its
+        // eight-hour deadline with no user or audit signal (§16.2 控制静默
+        // 失效). The password set already succeeded and is not rolled back;
+        // the failure is surfaced as an explicit 500 and recorded as a
+        // failed change-password outcome so the partial state is visible —
+        // the same shape as the self password-change path.
+        record_outcome(
+            &state,
+            context.actor(),
+            context.actor_principal_id(),
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            false,
+            Some((
+                AuditFailure::AuthenticationFailed,
+                AuditFailureVerification::Inconclusive,
+            )),
+            now,
+        )
+        .await;
+        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    record_management_event(
+        &state,
+        context.actor(),
+        context.actor_principal_id(),
+        ProductPermission::Authenticate,
+        AuditAction::ChangePassword,
+        true,
+        now,
+    )
+    .await;
+    json_ok(Json(LoginResponse::new(String::new())))
+}
+
 fn wire_state(state: PrincipalState) -> PrincipalStateResponse {
     match state {
         PrincipalState::Enabled => PrincipalStateResponse::Enabled,
@@ -2824,6 +2957,49 @@ mod tests {
                 mutation: true
             }
         );
+    }
+
+    /// W6-5: the route registry and the authorization table cannot drift
+    /// apart. The Edge and Center routers fold over [`crate::EDGE_ROUTES`]
+    /// and [`crate::CENTER_ROUTES`] — the same source the registration
+    /// iterates — so this gate walks the full registry and requires every
+    /// (method, path) to be named by a [`ROUTE_TABLE`] entry of the matching
+    /// console scope. A route added without its table entry (or with a
+    /// mistyped path) fails here instead of silently falling through to the
+    /// public fallback. The reverse direction pins the table itself: every
+    /// entry must name at least one registered route of the scope where it
+    /// is active, so a dead or mistyped entry is caught too.
+    #[test]
+    fn every_registered_route_is_named_by_the_authorization_table() {
+        for (method, path, kind) in crate::EDGE_ROUTES {
+            assert!(
+                table_covers(method, path, crate::ConsoleScope::Edge),
+                "the registered Edge route {method} {path} ({kind:?}) is not named by ROUTE_TABLE and would silently serve Public"
+            );
+        }
+        for (method, path, kind) in crate::CENTER_ROUTES {
+            assert!(
+                table_covers(method, path, crate::ConsoleScope::Center),
+                "the registered Center route {method} {path} ({kind:?}) is not named by ROUTE_TABLE and would silently serve Public"
+            );
+        }
+        for (method, pattern, access) in ROUTE_TABLE {
+            let registered = if pattern.starts_with(CENTER_SURFACE_PREFIX) {
+                crate::CENTER_ROUTES.iter().any(|(route_method, path, _)| {
+                    route_method == method && pattern_covers(pattern, path)
+                })
+            } else {
+                crate::EDGE_ROUTES.iter().any(|(route_method, path, _)| {
+                    route_method == method && pattern_covers(pattern, path)
+                }) || crate::CENTER_ROUTES.iter().any(|(route_method, path, _)| {
+                    route_method == method && pattern_covers(pattern, path)
+                })
+            };
+            assert!(
+                registered,
+                "the ROUTE_TABLE entry {method} {pattern} ({access:?}) names no registered route"
+            );
+        }
     }
 
     #[test]

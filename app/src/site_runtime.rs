@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use axum::serve::ListenerExt as _;
+use axum::{http::StatusCode, serve::ListenerExt as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rutilus_application::{
     CenterSync, CenterSyncError, CenterSyncOptions, Clock, CoreResourceReader, RedfishDiscovery,
@@ -47,13 +47,16 @@ use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::oneshot};
+use tower_http::timeout::TimeoutLayer;
 use tracing::instrument;
 
 use crate::{
     CenterClientConfig, StandaloneInstance, StandaloneInstanceCloseError, StandaloneInstanceError,
     StandaloneRunError, StandaloneUnlock, SystemClock, scheduler,
-    standalone_runtime::{StandaloneState, run_background_services},
+    standalone_runtime::{
+        GRACEFUL_DRAIN_TIMEOUT, StandaloneState, run_background_services, serve_with_bounded_drain,
+    },
     telemetry_sampler::TelemetryRetention,
     tls_material::{
         TlsMaterialError, key_der_bytes, pem_encode, persist_text, read_certificate,
@@ -539,11 +542,18 @@ impl SiteBinding {
 
     /// Serves the embedded Web application over the Site listener until a
     /// tracked shutdown future resolves, then waits for Axum's graceful
-    /// drain. The certificate fingerprint is printed once, at startup.
+    /// drain — bounded by `drain_timeout` (N2-2). Every handler is capped at
+    /// the same bound (a slower request is aborted with a 408); once the
+    /// shutdown future resolves, the in-flight requests get the remaining
+    /// grace to finish, and the server then force-closes the connections it
+    /// is still waiting on and completes the stop, so a slow client can
+    /// never stall the shutdown forever. The certificate fingerprint is
+    /// printed once, at startup.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the bound listener fails while serving.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve_until<Services, Gateway, Time, Shutdown>(
         self,
         posture: DeploymentPosture,
@@ -552,6 +562,7 @@ impl SiteBinding {
         gateway: Arc<Gateway>,
         clock: Time,
         shutdown: Shutdown,
+        drain_timeout: Duration,
     ) -> io::Result<()>
     where
         Services: ProductServices + AuthServices + CenterServices + 'static,
@@ -573,29 +584,53 @@ impl SiteBinding {
             gateway,
             clock,
         )
+        // N2-2: every handler is capped at the same bound as the shutdown
+        // drain, so a slow request is aborted with a 408 instead of
+        // outliving the drain against the closing store.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            drain_timeout,
+        ))
         .into_make_service_with_connect_info::<SocketAddr>();
-        if let Some(tls) = self.tls {
-            println!("Rutilus Site is listening at {url}");
-            println!("TLS certificate fingerprint: {}", tls.fingerprint());
-            let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
-            // `tap_io` gives axum's generic `Connected` implementation
-            // the accepted remote address, so the sign-in rate limiter
-            // sees client addresses on the TLS path exactly as on the
-            // plaintext path.
-            let listener = TlsListener {
-                listener: self.listener,
-                acceptor,
-            }
-            .tap_io(|_| {});
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown)
-                .await
-        } else {
-            println!("Rutilus Site is listening at {url} (loopback plaintext)");
-            axum::serve(self.listener, router)
-                .with_graceful_shutdown(shutdown)
-                .await
-        }
+        // The drain signal fires exactly when the graceful shutdown future
+        // resolves — the moment hyper stops accepting and begins draining
+        // the in-flight connections — so the bounded-drain race measures
+        // the drain itself, never the serving lifetime. The two listener
+        // paths produce different serve future types, so the future is
+        // boxed once, at startup, for the shared bounded-drain runner.
+        let (drain_signal_sender, drain_signal_receiver) = oneshot::channel();
+        let graceful = async move {
+            shutdown.await;
+            let _ = drain_signal_sender.send(());
+        };
+        let serve: std::pin::Pin<Box<dyn Future<Output = io::Result<()>> + Send>> =
+            if let Some(tls) = self.tls {
+                println!("Rutilus Site is listening at {url}");
+                println!("TLS certificate fingerprint: {}", tls.fingerprint());
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config());
+                // `tap_io` gives axum's generic `Connected` implementation
+                // the accepted remote address, so the sign-in rate limiter
+                // sees client addresses on the TLS path exactly as on the
+                // plaintext path.
+                let listener = TlsListener {
+                    listener: self.listener,
+                    acceptor,
+                }
+                .tap_io(|_| {});
+                Box::pin(
+                    axum::serve(listener, router)
+                        .with_graceful_shutdown(graceful)
+                        .into_future(),
+                )
+            } else {
+                println!("Rutilus Site is listening at {url} (loopback plaintext)");
+                Box::pin(
+                    axum::serve(self.listener, router)
+                        .with_graceful_shutdown(graceful)
+                        .into_future(),
+                )
+            };
+        serve_with_bounded_drain(serve, drain_signal_receiver, drain_timeout).await
     }
 }
 
@@ -739,6 +774,7 @@ where
                         stop.stopped().await;
                         let _ = scheduler_done_receiver.await;
                     },
+                    GRACEFUL_DRAIN_TIMEOUT,
                 )
             },
             stop,

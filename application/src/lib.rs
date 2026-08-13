@@ -52,10 +52,11 @@ pub use center::{
     CenterOperationTrackingError, CenterPresence, CenterProjection, CenterProjectionError,
     CenterProjectionRepository, CenterReplyConsumer, CenterRoleRepository, CenterSessionAdmission,
     CenterSessionAdmissionError, CenterSessionRegistry, CenterSessionRegistryError,
-    CenterTrustAnchor, CenterTrustMode, DispatchedOperation, EndpointProjectionWrite,
-    IdentityValidationError, InstanceRepository, IssuedSiteCertificate, ProjectionIgnoreReason,
-    ProjectionWriteOutcome, RegisteredSite, ResolvedSite, ResourceProjectionWrite,
-    SiteCertificateIssuer, SiteIdentity, allows_dispatch, validate_bound_identity,
+    CenterTrustAnchor, CenterTrustMode, DisconnectOnDrop, DispatchedOperation,
+    EndpointProjectionWrite, IdentityValidationError, InstanceRepository, IssuedSiteCertificate,
+    ProjectionIgnoreReason, ProjectionWriteOutcome, RegisteredSite, ResolvedSite,
+    ResourceProjectionWrite, SiteCertificateIssuer, SiteIdentity, allows_dispatch,
+    validate_bound_identity,
 };
 pub use center_sync::{
     CenterCursor, CenterEventTail, CenterInbox, CenterOutbox, CenterSync, CenterSyncError,

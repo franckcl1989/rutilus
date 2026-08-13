@@ -188,7 +188,10 @@ async fn the_session_admission_resolves_bound_sites_against_the_real_store()
         Some(registered.instance_id().to_string()),
         Some(site_fingerprint()),
     );
-    let verdict = admission.resolve(&matching).await?;
+    // The Hello declares the bound instance: the admission admits it.
+    let verdict = admission
+        .resolve(&matching, registered.instance_id().to_string().as_str())
+        .await?;
     assert_eq!(
         verdict,
         rutilus_application::AdmissionVerdict::Admitted(ResolvedSite::new(
@@ -205,7 +208,9 @@ async fn the_session_admission_resolves_bound_sites_against_the_real_store()
         Some(CertificateFingerprint::from_bytes([0x43; 32])),
     );
     assert!(matches!(
-        admission.resolve(&unknown).await?,
+        admission
+            .resolve(&unknown, registered.instance_id().to_string().as_str())
+            .await?,
         rutilus_application::AdmissionVerdict::Rejected { .. }
     ));
 
