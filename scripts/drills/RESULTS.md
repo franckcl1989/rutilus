@@ -5,7 +5,7 @@
 - 日期/环境：2026-08-12，Windows 11 Pro 10.0.26200（ConPTY 要求满足：≥1809），PowerShell 5.1.26100.8972，debug 构建 commit f6ef715（target/debug/rutilus.exe 与 mock-bmc.exe 均为本轮构建，可用）。
 - 结果：PASS 0 / FAIL 0 / **SKIP 6**（其中 5 个为环境原因——本执行上下文中 ConPTY 不可用，drill 的伪控制台驱动无法 spawn 任何子进程；1 个为共享组件非独立 drill）。
 - 总耗时：约 55 分钟（其中 drill 1 尝试实跑挂起 >20 分钟后终止，其余时间用于根因诊断）。
-- 根因证据：logs/diagnostic-conpty-probes-20260812.log（cmd.exe 对照 + rutilus 实测 + 全契约实现复测 + 普通管道对照），探针脚本保留在 tmp/conpty-probe*.ps1。
+- 根因证据：当时实跑诊断日志（logs/ 下，2026-08-13 收尾清理后不再保留），覆盖 cmd.exe 对照 + rutilus 实测 + 全契约实现复测 + 普通管道对照；探针脚本（conpty-probe*.ps1）已完成使命后清理（2026-08-13 收尾）。
 - 处置建议（供总指挥决策）：在**有真实交互控制台（如用户自己的 Windows Terminal/PowerShell 窗口）的会话**中复跑本套件验证 ConPTY 是否恢复；同时建议 drill 套件维护者评估 ConPTY 失败时的挂起防护（当前故障形态为硬挂起而非 FAIL，见 drill-backup-restore-cycle 行备注）。
 
 ## 复测小节（2026-08-12，挂起防护修复后）
@@ -23,10 +23,10 @@
 
 | Drill 名称 | 日期 | 环境 | 结果 PASS-FAIL | 观察与备注 | 对应设计条款 |
 |---|---|---|---|---|---|
-| drill-backup-restore-cycle | 2026-08-12 | Windows 11 Pro 10.0.26200 + PowerShell 5.1.26100 + debug 构建 commit f6ef715 | SKIP（环境：ConPTY 不可用） | 尝试实跑：`rutilus init --portable` 阶段挂起 >20 分钟（日志 logs/drill-backup-restore-cycle-20260812-210650.log 仅含 2 个 STEP、无 FAIL 行），手动终止。诊断（见 logs/diagnostic-conpty-probes-20260812.log）：drill-lib.ps1 的 ConPTY 驱动在本执行上下文 spawn 的所有子进程（含 cmd.exe 对照）均以 0xC0000142 STATUS_DLL_INIT_FAILED 启动失败、输出为零；即便完整实现 ConPTY 契约（SetHandleInformation + bInheritHandles=true，探针 conpty-probe4.ps1）亦然。普通管道 spawn 正常（cmd echo 输出 OK），产品 rutilus.exe 在非交互管道下正确报错退出 1（"local unlock requires an interactive terminal"）——非产品问题。附带发现：ConPTY 子进程启动失败时 drill 的 Wait-ConPtyOutput 不超时、Stop-ConPtySession 的 ClosePseudoConsole 阻塞清理——故障表现为硬挂起而非 FAIL。 | §20.1 backup / §20.2 restore |
+| drill-backup-restore-cycle | 2026-08-12 | Windows 11 Pro 10.0.26200 + PowerShell 5.1.26100 + debug 构建 commit f6ef715 | SKIP（环境：ConPTY 不可用） | 尝试实跑：`rutilus init --portable` 阶段挂起 >20 分钟（当时实跑日志仅含 2 个 STEP、无 FAIL 行，logs/ 下，2026-08-13 收尾清理后不再保留），手动终止。诊断（见当时实跑诊断日志，同处清理后不再保留）：drill-lib.ps1 的 ConPTY 驱动在本执行上下文 spawn 的所有子进程（含 cmd.exe 对照）均以 0xC0000142 STATUS_DLL_INIT_FAILED 启动失败、输出为零；即便完整实现 ConPTY 契约（SetHandleInformation + bInheritHandles=true，探针 conpty-probe4.ps1）亦然。普通管道 spawn 正常（cmd echo 输出 OK），产品 rutilus.exe 在非交互管道下正确报错退出 1（"local unlock requires an interactive terminal"）——非产品问题。附带发现：ConPTY 子进程启动失败时 drill 的 Wait-ConPtyOutput 不超时、Stop-ConPtySession 的 ClosePseudoConsole 阻塞清理——故障表现为硬挂起而非 FAIL。 | §20.1 backup / §20.2 restore |
 | drill-sqlite-write-interruption | 2026-08-12 | 同上 | SKIP（环境：ConPTY 不可用） | 未实跑：与 drill 1 同一 ConPTY 依赖（init/run/doctor 全走伪控制台交互），ConPTY 不可用使该 drill 必然以相同方式挂起，不硬跑。根因证据同 drill-backup-restore-cycle 行。 | §19.3 SQLite 写入中断 |
 | drill-bmc-restart-during-task | 2026-08-12 | 同上 | SKIP（环境：ConPTY 不可用） | 未实跑：同样依赖 ConPTY 驱动 init/run。mock-bmc 进程本身可正常 spawn（Start-Process 管道重定向路径不依赖 ConPTY），但 drill 的 CLI 交互阶段无法进行。根因证据同上。 | §19.3 / §13.6 |
 | drill-large-file-interruption | 2026-08-12 | 同上 | SKIP（环境：ConPTY 不可用） | 未实跑：同样依赖 ConPTY 驱动 init/run。根因证据同上。 | §19.3 大文件上传中断 / §0.4.0 |
 | drill-kill-mid-operation | 2026-08-12 | 同上 | SKIP（环境：ConPTY 不可用） | 未实跑：同样依赖 ConPTY 驱动 init/run。delay relay（drill-delay-proxy.ps1）为独立 PowerShell 进程 + TCP 代理，不依赖 ConPTY，本可工作；但 drill 整体无法推进。根因证据同上。 | §19.3 / §13.5 / §15.4 |
 | drill-delay-proxy | 2026-08-12 | 同上 | SKIP（共享组件，非独立 drill） | 头注释明确其为共享中继组件（由 drill-lib.ps1 Start-DelayRelay 以独立进程启动，供 drill-kill-mid-operation 使用），非独立可运行 drill，按指令不单独实跑；其功能在 drill-kill-mid-operation 实跑时会覆盖验证（本次因 ConPTY 环境原因未覆盖到）。 | — |
-| drill-backup-restore-cycle | 2026-08-12 | 同环境（挂起防护修复后的复测） | FAIL（预期性：ConPTY 启动失败被启动探测捕获，秒级 FAIL 而非挂起） | 复测：drill-lib.ps1 挂起防护修复后在本环境（ConPTY 不可用）实跑，`rutilus init --portable` 的 Start-ConPtyProcess 启动探测（5s 窗口）捕获子进程启动即死（exitCode=-1073741502 = 0xC0000142，outputLen=0），经有界清理后抛错走 FAIL 路径，总耗时 0.6s（修复前此阶段挂起 >20 分钟）；FAIL 行含退出码/输出长度诊断事实。3 次复跑均稳定 0.6s FAIL（logs/drill-backup-restore-cycle-20260812-213502.log 为最后一次）。 | §20.1 backup / §20.2 restore |
+| drill-backup-restore-cycle | 2026-08-12 | 同环境（挂起防护修复后的复测） | FAIL（预期性：ConPTY 启动失败被启动探测捕获，秒级 FAIL 而非挂起） | 复测：drill-lib.ps1 挂起防护修复后在本环境（ConPTY 不可用）实跑，`rutilus init --portable` 的 Start-ConPtyProcess 启动探测（5s 窗口）捕获子进程启动即死（exitCode=-1073741502 = 0xC0000142，outputLen=0），经有界清理后抛错走 FAIL 路径，总耗时 0.6s（修复前此阶段挂起 >20 分钟）；FAIL 行含退出码/输出长度诊断事实。3 次复跑均稳定 0.6s FAIL（当时实跑日志，logs/ 下，2026-08-13 收尾清理后不再保留）。 | §20.1 backup / §20.2 restore |
