@@ -60,7 +60,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Lexer — copied verbatim from `bare_sql_gate.rs` (same lexing rules, so the
@@ -420,27 +420,39 @@ fn argument_statements(
     Ok(vec![(*line, statement.clone())])
 }
 
-/// Lists `migration/src/*.rs` for scanning, relative to `CARGO_MANIFEST_DIR`
-/// so newly added migration files are covered automatically.
+/// Collects the `.rs` files under `directory`, depth-first in name order,
+/// as paths relative to `base` (the scanned tree's root).
+fn collect_rs(
+    directory: &Path,
+    base: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs(&path, base, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path.strip_prefix(base)?.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Lists every `migration/src` source file for scanning, relative to
+/// `CARGO_MANIFEST_DIR`. The walk is recursive, so a `.rs` file in a newly
+/// added subdirectory is covered automatically.
 fn scanned_sources() -> Result<Vec<SourceTokens>, Box<dyn Error>> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
-    for entry in fs::read_dir(&directory)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path);
-        }
-    }
+    collect_rs(&directory, &directory, &mut files)?;
     files.sort();
     let mut sources = Vec::new();
     for file in files {
-        let display_path = format!(
-            "src/{}",
-            file.file_name()
-                .ok_or("source file without a name")?
-                .to_string_lossy()
-        );
-        let source = fs::read_to_string(&file)?;
+        let display = file.to_string_lossy().replace('\\', "/");
+        let display_path = format!("src/{display}");
+        let source = fs::read_to_string(directory.join(&file))?;
         sources.push(tokenize(&display_path, &source));
     }
     Ok(sources)
@@ -1508,6 +1520,32 @@ fn gate_rejects_unresolvable_drop_targets() -> Result<(), Box<dyn Error>> {
     assert!(
         error.contains("Mystery"),
         "the failure must name the unresolvable table, got: {error}",
+    );
+    Ok(())
+}
+
+/// A `.rs` migration placed in a subdirectory of `migration/src` is a source
+/// like any other: the walk must reach it, sorted with its subdirectory path
+/// in its name, exactly as it reaches a top-level file.
+#[test]
+fn scanned_sources_walk_is_recursive() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let nested = directory.path().join("nested/deeper");
+    fs::create_dir_all(&nested)?;
+    fs::write(directory.path().join("top.rs"), "// top")?;
+    fs::write(nested.join("deep.rs"), "// deep")?;
+    fs::write(directory.path().join("ignored.txt"), "not rust")?;
+    let mut files = Vec::new();
+    collect_rs(directory.path(), directory.path(), &mut files)?;
+    files.sort();
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["nested/deeper/deep.rs", "top.rs"],
+        "the source walk must cover `.rs` files in subdirectories, name-sorted"
     );
     Ok(())
 }
