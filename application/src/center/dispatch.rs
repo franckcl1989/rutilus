@@ -78,8 +78,10 @@ const IDEMPOTENCY_CANDIDATE_STATES: [OperationState; 5] = [
 ///
 /// The bound is not a hard cap on the scan's visibility: a candidate whose
 /// pending offer sits beyond the truncation is resolved from the
-/// fall-through history read (`offer_history`) instead of being mistaken
-/// for a never-queued record, so the truncation never re-mints an id.
+/// fall-through history reads (`offer_history` for the single-candidate
+/// repair, `offer_history_full` for the multi-candidate fall-through)
+/// instead of being mistaken for a never-queued record, so the pending
+/// truncation never re-mints an id.
 const CENTER_DISPATCH_OFFER_SCAN_LIMIT: u64 = 256;
 
 /// One center-initiated operation dispatch (§15.6).
@@ -430,8 +432,10 @@ where
     /// (`ix_operations_state`, §13.6) instead of listing the whole table,
     /// and the offer scan reads only the pending queue (bounded by
     /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`]), so a retry of a live dispatch
-    /// never decrypts an acknowledged offer row; the full history is
-    /// decrypted only by the rare fall-through branch.
+    /// never decrypts an acknowledged offer row; the rare fall-through
+    /// branches are the single-candidate repair's bounded newest window
+    /// ([`Self::offer_history`]) and the multi-candidate fall-through's
+    /// full history ([`Self::offer_history_full`]).
     async fn find_undecided(
         &self,
         request: &CenterOperationRequest,
@@ -484,7 +488,7 @@ where
         if candidates.len() == 1 && !facts.iter().any(|fact| fact.operation_id == candidates[0]) {
             let operation_id = candidates[0];
             // The single-candidate repair read (W3F-1, W3F-5): the
-            // candidate is resolved against the full offer history with
+            // candidate is resolved against the bounded offer history with
             // exactly the judgment the multi-candidate path applies — the
             // retry must never blind-merge a different-target dispatch
             // into the existing id, and an in-flight or scan-truncated
@@ -494,7 +498,8 @@ where
             // dispatch stranded — and its offer is delivered now; a
             // history-known candidate whose offers target a different
             // resource is a different operation on the same endpoint and
-            // command, and the retry starts fresh below.
+            // command, and the retry starts fresh below. See
+            // [`Self::offer_history`] for the bounded-window semantics.
             let history = self.offer_history(request.site_id).await?;
             if let Some(dispatched) = self
                 .resolve_candidate(request, operation_id, &facts, Some(&history), now)
@@ -518,13 +523,17 @@ where
         // The fall-through repair read: the pending scan is bounded by
         // [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] and skips the acknowledged
         // rows, so a candidate it cannot see is resolved from the full
-        // offer history instead — loaded once per retry, see
-        // [`Self::resolve_candidate`]. A retry must never mint a fresh id
-        // for a delivered operation: the id is the §17.5 key.
+        // offer history instead — loaded once per retry through
+        // [`Self::offer_history_full`], see [`Self::resolve_candidate`].
+        // A retry must never mint a fresh id for a delivered operation:
+        // the id is the §17.5 key, so this read is deliberately unbounded
+        // — a bounded fall-through could hide a delivered operation's
+        // offers and start fresh under a new id, which would
+        // double-execute the write at the site.
         let mut history: Option<Vec<OfferFact>> = None;
         for operation_id in candidates {
             if !facts.iter().any(|fact| fact.operation_id == operation_id) && history.is_none() {
-                history = Some(self.offer_history(request.site_id).await?);
+                history = Some(self.offer_history_full(request.site_id).await?);
             }
             if let Some(dispatched) = self
                 .resolve_candidate(request, operation_id, &facts, history.as_deref(), now)
@@ -536,18 +545,67 @@ where
         Ok(None)
     }
 
-    /// Lists the full §15.6 offer history of one site — the fall-through
-    /// repair read of the retry scan, loaded once per retry the bounded
-    /// pending scan cannot resolve.
+    /// Lists the newest §15.6 offer history of one site, bounded by
+    /// [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] — the single-candidate repair
+    /// read (V4P-3) of the retry scan.
     ///
     /// The center's durable outbox holds exactly the §15.6 offers,
     /// acknowledged or not, so the history carries the offer facts — the
     /// target and the expiry — that the tracking operation record does not
-    /// persist. The read is deliberately the trait's un-bounded offer
-    /// listing: it is the rare branch (an acknowledged receipt-lost offer,
-    /// a queue the scan truncated, an enqueue failure), never the hot path
-    /// of a retry with a live pending offer.
+    /// persist. There is no `operation_id` column to direct the read at one
+    /// candidate's offers (the payload is a ciphertext envelope), so the
+    /// bound caps the decryption work at the newest window; the read is
+    /// still the rare branch (an acknowledged receipt-lost offer, a queue
+    /// the scan truncated, an enqueue failure), never the hot path of a
+    /// retry with a live pending offer.
+    ///
+    /// # The bounded-window semantics
+    ///
+    /// A single candidate whose offers all lie beyond the window is
+    /// indistinguishable from a record that was never enqueued, and the
+    /// repair then re-delivers a fresh offer under the *existing*
+    /// operation id — never a fresh id. That is the safety argument of the
+    /// over-limit case: the id is the §17.5 key, so the site's idempotency
+    /// (the inbox entry keyed by that id) answers the re-delivered offer
+    /// with its recorded state, and the duplicate paths never re-execute
+    /// and never revive a rejected entry — no write can run twice. What the
+    /// bound costs is only the *target discrimination* of the unbounded
+    /// read: a candidate whose offers target a different resource is
+    /// normally judged a different operation (the retry starts fresh
+    /// below), while beyond the window it is treated as the same dispatch
+    /// and re-delivered under its id — a possibly different-target envelope
+    /// under a retained id, which the site absorbs as a duplicate of that
+    /// id. Execution safety is unchanged; only the envelope's target may
+    /// disagree with the recorded operation's target (a cosmetic tracking
+    /// inconsistency, bounded by the window).
     async fn offer_history(
+        &self,
+        site_id: InstanceId,
+    ) -> Result<Vec<OfferFact>, DispatchErrorOf<Store, Outbox, Roles>> {
+        let entries = self
+            .outbox
+            .list_offers_bounded(site_id, CENTER_DISPATCH_OFFER_SCAN_LIMIT)
+            .await
+            .map_err(CenterDispatchError::Outbox)?;
+        Ok(entries.iter().filter_map(offer_facts).collect())
+    }
+
+    /// Lists the full §15.6 offer history of one site — the multi-candidate
+    /// fall-through repair read of the retry scan, loaded once per retry
+    /// the bounded pending scan cannot resolve.
+    ///
+    /// Unlike the single-candidate repair ([`Self::offer_history`]), this
+    /// read is deliberately unbounded: the multi-candidate path resolves
+    /// every candidate against the history, and a candidate whose offers
+    /// were truncated away would be mistaken for a never-queued record —
+    /// the loop would then end without a match and the dispatch would mint
+    /// a fresh id for a delivered operation, double-executing the write at
+    /// the site. The unbounded read is the rare branch (an acknowledged
+    /// receipt-lost offer, a queue the scan truncated, an enqueue
+    /// failure), never the hot path of a retry with a live pending offer,
+    /// and the pending scan's [`CENTER_DISPATCH_OFFER_SCAN_LIMIT`] is what
+    /// keeps the common path cheap.
+    async fn offer_history_full(
         &self,
         site_id: InstanceId,
     ) -> Result<Vec<OfferFact>, DispatchErrorOf<Store, Outbox, Roles>> {
@@ -1065,7 +1123,7 @@ fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> 
     operation_id.parse().ok()
 }
 
-/// The `OperationCompleted` summary prefix of the E3-4 refusal
+/// The `OperationCompleted` summary vocabulary of the E3-4 refusal
 /// classification: a `Failed` operation whose persisted §13.7 failure kind
 /// is `capability-unsupported` is summarized as `failed-unsupported` by the
 /// site (`CenterSync::completed_summary` in `application/src/center_sync.rs`;
@@ -1074,6 +1132,13 @@ fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> 
 /// receipt can recognize the endpoint-side limitation instead of letting the
 /// unparseable summary fall through to the plain failure. The recognition is
 /// a value addition to the existing summary field, never a wire change.
+///
+/// The recognition is boundary-checked (see [`is_unsupported_summary`]): the
+/// exact vocabulary value, or the value followed by the `:` detail
+/// delimiter, is the classification; a longer word that merely shares the
+/// prefix — a malformed or unrelated summary — is not, so a truncated or
+/// extended spelling can never misclassify an ordinary failure as
+/// unsupported.
 ///
 /// The console tracking response cannot surface the classification yet:
 /// `CenterOperationResponse` has no unsupported phase in its state
@@ -1084,6 +1149,17 @@ fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> 
 /// classification survives on the tracking record (the §13.7 failure kind
 /// the receipt path records) and in the durable receipt payload.
 const UNSUPPORTED_SUMMARY_PREFIX: &str = "failed-unsupported";
+
+/// Whether one `OperationCompleted` summary carries the E3-4 refusal
+/// classification: the exact [`UNSUPPORTED_SUMMARY_PREFIX`] value, or the
+/// value followed by the `:` delimiter of a detail suffix. Anything else —
+/// a longer word that merely shares the prefix without the delimiter — is
+/// not the classification.
+fn is_unsupported_summary(summary: &str) -> bool {
+    summary
+        .strip_prefix(UNSUPPORTED_SUMMARY_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
 
 /// The tracking target of one reply message.
 fn reply_target(message: Option<&EnvelopeMessage>) -> Option<ReplyTarget> {
@@ -1101,12 +1177,11 @@ fn reply_target(message: Option<&EnvelopeMessage>) -> Option<ReplyTarget> {
                 // operation state code in the summary, so the receipt must
                 // not collapse `Unknown` and `Cancelled` into `Failed`.
                 // The E3-4 refusal vocabulary is recognized before the
-                // stable-state parse — a summary carrying the
-                // `failed-unsupported` prefix is the capability
-                // classification (see [`UNSUPPORTED_SUMMARY_PREFIX`]) —
-                // and a summary that names no stable state is a plain
-                // failure.
-                if completed.summary.starts_with(UNSUPPORTED_SUMMARY_PREFIX) {
+                // stable-state parse — a summary in the `failed-unsupported`
+                // vocabulary is the capability classification (see
+                // [`is_unsupported_summary`]) — and a summary that names no
+                // stable state is a plain failure.
+                if is_unsupported_summary(&completed.summary) {
                     Some(ReplyTarget::Unsupported)
                 } else {
                     match completed.summary.parse::<OperationState>() {
@@ -3327,8 +3402,9 @@ mod tests {
                 summary: summary.to_owned(),
             }))
         };
-        // E3-4: the `failed-unsupported` summary prefix is the capability
-        // classification — recognized exactly, and with a detail suffix.
+        // E3-4: the `failed-unsupported` summary vocabulary is the
+        // capability classification — recognized exactly, and with the `:`
+        // detail-suffix delimiter.
         assert_eq!(
             reply_target(completed("failed-unsupported", false).as_ref()),
             Some(ReplyTarget::Unsupported)
@@ -3336,6 +3412,18 @@ mod tests {
         assert_eq!(
             reply_target(completed("failed-unsupported: reset is not supported", false).as_ref()),
             Some(ReplyTarget::Unsupported)
+        );
+        // The recognition is boundary-checked: a longer word that merely
+        // shares the prefix without the delimiter is a malformed or
+        // unrelated summary, and must not misclassify an ordinary failure
+        // as unsupported.
+        assert_eq!(
+            reply_target(completed("failed-unsupported-extra", false).as_ref()),
+            Some(ReplyTarget::Failed)
+        );
+        assert_eq!(
+            reply_target(completed("failed-unsupportedness", false).as_ref()),
+            Some(ReplyTarget::Failed)
         );
         // The stable-state codes keep their own classifications, and a
         // summary naming no stable state is a plain failure.

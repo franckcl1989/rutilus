@@ -176,10 +176,11 @@ async fn down_restores_the_pre_check_shape_and_preserves_rows() -> Result<(), Bo
     .insert(&database)
     .await?;
 
-    // Roll back through the health-check migration only: the endpoints
-    // columns are unchanged by the downgrade, so the row written under the
-    // checked shape survives.
-    Migrator::down(&database, Some(1)).await?;
+    // Roll back through the health-check migration and the audit vocabulary
+    // migration registered after it: the endpoints columns are unchanged by
+    // the downgrade, so the row written under the checked shape survives.
+    let steps = rollback_steps_to(ENDPOINT_HEALTH_CHECKS_MIGRATION)?;
+    Migrator::down(&database, Some(steps)).await?;
     let stored = endpoint::Entity::find_by_id(inserted.id)
         .one(&database)
         .await?
@@ -359,6 +360,17 @@ fn migrations_before(name: &str) -> Result<u32, Box<dyn Error>> {
         .position(|migration| migration.name() == name)
         .ok_or("endpoint health checks migration is not registered")?;
     Ok(u32::try_from(position)?)
+}
+
+/// The number of registered migrations to roll back so the named migration
+/// is included in the rollback: everything registered after it, plus itself.
+fn rollback_steps_to(name: &str) -> Result<u32, Box<dyn Error>> {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("endpoint health checks migration is not registered")?;
+    Ok(u32::try_from(migrations.len() - position)?)
 }
 
 /// Opens one database in a fresh temporary directory.

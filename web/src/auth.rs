@@ -23,9 +23,13 @@
 //!   attack cannot lock a username out (W3S-4) — and 20 per client address
 //!   in a 15-minute window, with periodic pruning of expired buckets so
 //!   the maps stay memory-bounded under distributed attacks
-//!   (security-review N3). The credential-change path carries the same
-//!   budgets so one session cannot flood the Argon2id derivation gate
-//!   (W3S-1).
+//!   (security-review N3). The credential-change path — the self
+//!   password-change and the administrator set-password surfaces — carries
+//!   the same budgets so one session cannot flood the Argon2id derivation
+//!   gate (W3S-1); a successful change keeps its reserved slots (V4R-2),
+//!   so even a credential holder cycling changes stays within the window,
+//!   while the sign-in surface refunds a successful verification (S3-3)
+//!   and only counts failures.
 //! - The sign-in, sign-out, bootstrap-claim, password-change, `me`, and
 //!   administration handlers.
 //!
@@ -988,8 +992,11 @@ pub(crate) struct AuthState {
     rate_limiter: LoginRateLimiter,
     /// The credential-change rate limiter (W3S-1): the same
     /// per-subject/per-address budgets as the sign-in surface, applied to
-    /// the password-change path, so one authenticated session cannot flood
-    /// the Argon2id derivation gate with password changes.
+    /// the self password-change and the administrator set-password paths,
+    /// so one authenticated session cannot flood the Argon2id derivation
+    /// gate with password changes. Every change keeps its reserved slots —
+    /// success included (V4R-2) — unlike the sign-in surface's S3-3
+    /// refund.
     password_change_limiter: LoginRateLimiter,
 }
 
@@ -1014,9 +1021,15 @@ impl AuthState {
 /// address (W3S-4): each bucket entry records the address it came from, so
 /// 5 distinct addresses × 1 failure each no longer locks a username out
 /// for the window — an attack distributed across addresses is bounded by
-/// the per-address budget (20 per address) instead. The single-address
-/// semantics are unchanged: 5 failures from one address still exhaust that
-/// address's username budget.
+/// the per-address budget (20 per address) instead. The registered
+/// boundary of the tradeoff: a brute force spread across N distinct
+/// addresses may attempt up to N × 5 failures per username in one window
+/// (each address's own username budget), at most 20 per address — the
+/// distribution weakens the per-username bound by exactly the number of
+/// addresses the attacker controls, in exchange for a distributed attack
+/// never locking a username out. The single-address semantics are
+/// unchanged: 5 failures from one address still exhaust that address's
+/// username budget.
 ///
 /// Both bucket maps are memory-bounded (security-review N3): a bucket is
 /// only removed once every entry has left the window, so without a
@@ -1070,9 +1083,11 @@ impl LoginRateLimiter {
     /// record — the old check-then-act window that let a burst exceed the
     /// budget. A successful verification must release the slot with
     /// [`Self::refund`]; a failed or cancelled attempt keeps it, which is
-    /// exactly the failure accounting. The username bound is the more
-    /// specific one: a blocked username is refused even when the address
-    /// budget remains.
+    /// exactly the failure accounting. The credential-change path
+    /// deliberately never refunds (V4R-2): its successes are derivations
+    /// the budget accounts, so [`Self::refund`] stays the sign-in
+    /// surface's contract. The username bound is the more specific one: a
+    /// blocked username is refused even when the address budget remains.
     fn reserve(&self, username: &str, ip: &str, now: Instant) -> bool {
         let username_key = bounded_username_key(username);
         if !Self::reserve_username_key(
@@ -1088,8 +1103,10 @@ impl LoginRateLimiter {
             true
         } else {
             // The address budget refused: release the username slot so the
-            // reservation is all-or-nothing across both budgets.
-            Self::refund_key(&self.by_username, &username_key);
+            // reservation is all-or-nothing across both budgets. The slot
+            // is the one this call just reserved — the newest entry the
+            // presenting address recorded.
+            Self::refund_key(&self.by_username, &username_key, ip);
             false
         };
         // The full sweep runs after the compensation, so a bucket the
@@ -1101,17 +1118,19 @@ impl LoginRateLimiter {
     }
 
     /// Releases one reserved slot of each budget after a successful
-    /// verification (S3-3).
+    /// verification (S3-3) — the sign-in surface's accounting; the
+    /// credential-change path deliberately never refunds (V4R-2).
     ///
-    /// Every entry is either a reserved slot still being verified or a kept
-    /// failure, so removing one entry per successful attempt restores
-    /// exactly the slots the success consumed — the bucket's length always
-    /// ends as the failure count, and the window expiry rule never changes a
+    /// The released slot is the refunding attempt's own entry — the newest
+    /// entry the presenting address recorded (V4R-5) — never another
+    /// address's newest entry, so the per-address budget attributions stay
+    /// exact under multi-IP interleaving. The bucket's length always ends
+    /// as the failure count, and the window expiry rule never changes a
     /// verdict. A missing bucket (a fully expired key the sweep reclaimed)
     /// is a no-op: the slot it held had already left the window.
     fn refund(&self, username: &str, ip: &str) {
-        Self::refund_key(&self.by_username, &bounded_username_key(username));
-        Self::refund_key(&self.by_ip, ip);
+        Self::refund_key(&self.by_username, &bounded_username_key(username), ip);
+        Self::refund_key(&self.by_ip, ip, ip);
     }
 
     /// Consumes one budget slot of the per-username key; `false` when the
@@ -1200,22 +1219,34 @@ impl LoginRateLimiter {
         }
     }
 
-    /// Releases one reserved slot of one key: the newest entry, which is a
-    /// reserved-but-unverified slot unless a previous refund already took it
-    /// — in that case the entry belongs to another in-flight attempt, and
-    /// removing it keeps the invariant that every successful attempt removes
-    /// exactly one entry (see [`Self::refund`]).
+    /// Releases the newest reserved slot of one key that the presenting
+    /// address recorded; a no-op when the key holds no entry of the
+    /// address.
     ///
-    /// In the per-username map, entries also carry the address that recorded
-    /// them, so under multi-IP interleaving the freed slot may shift across
-    /// addresses by at most one entry — an accounting approximation
-    /// inherited from the predecessor, exact when a single address uses the
-    /// username.
-    fn refund_key(bucket: &Arc<Mutex<BucketMap>>, key: &str) {
+    /// In the per-username map every entry carries the address that
+    /// recorded it, so the address-matched pop removes exactly the slot of
+    /// the refunding attempt: under multi-IP interleaving the newest entry
+    /// of the bucket may belong to another address's in-flight attempt,
+    /// and popping it would free the wrong address's slot while the
+    /// refunding address's reservation stayed as a phantom (V4R-5). Entries
+    /// of the same address are interchangeable for the per-address count —
+    /// when the newest same-address entry belongs to another in-flight
+    /// attempt of the same address, removing it keeps the address's budget
+    /// exact. In the per-address map every entry carries the key itself, so
+    /// the match is identical to popping the newest entry.
+    ///
+    /// The `rposition` scan is O(bucket length): the 15-minute window
+    /// and the per-window budget (≤20) bound the bucket, and the
+    /// limiter's own gating bounds the refund frequency — bounded cost,
+    /// no behavioral impact.
+    fn refund_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, ip: &str) {
         if let Ok(mut guard) = bucket.lock() {
             let buckets = &mut *guard;
-            if let Some(failures) = buckets.buckets.get_mut(key) {
-                failures.pop_back();
+            let Some(failures) = buckets.buckets.get_mut(key) else {
+                return;
+            };
+            if let Some(index) = failures.iter().rposition(|(_, entry_ip)| entry_ip == ip) {
+                failures.remove(index);
             }
         }
     }
@@ -1591,6 +1622,40 @@ where
         return;
     };
     let _ = services.verify_password_async(&dummy, password).await;
+}
+
+/// The fixed input of the state/role administration handlers' dummy
+/// derivation (V4S-3).
+///
+/// Those handlers carry no presented password, so their unknown-principal
+/// branches derive this fixed string; the cost profile of an Argon2id
+/// derivation is dominated by its parameters (64 MiB, 3 passes, 1 lane),
+/// not the input bytes, so the fixed input costs the same as a real
+/// derivation. Deliberately a pinned constant, never derived from any
+/// request or credential data.
+const DUMMY_ADMIN_DERIVATION_INPUT: &str = "rutilus-dummy-admin-derivation";
+
+/// Runs one dummy Argon2id derivation for the administration handlers'
+/// unknown-principal branches (V4S-3).
+///
+/// The set-password branch derives the presented new password — exactly
+/// like its real branch, so the work profile matches (Argon2id cost
+/// depends slightly on the input bytes, and the presented input is
+/// attacker-supplied, never real user data); the state and role branches
+/// derive the fixed [`DUMMY_ADMIN_DERIVATION_INPUT`]. The verdict is
+/// always discarded: the branch is a 404 either way, and the cost is the
+/// point.
+///
+/// The derivation runs through the async boundary (§7.8), so it waits
+/// behind the same derivation gate as the real branch (P4-12): when the
+/// gate is saturated, the gate refuses the dummy exactly like a real
+/// derivation — the failure still traveled the wait path, so the
+/// equalization holds — and the 404 stands.
+async fn dummy_admin_derivation<Services>(services: &Services, password: &SecretString)
+where
+    Services: AuthServices,
+{
+    let _ = services.hash_password_async(password).await;
 }
 
 /// Whether a presented password satisfies the product password policy (B1).
@@ -2004,8 +2069,11 @@ where
 /// The path costs two Argon2id derivations (the current-password
 /// verification and the new-password derivation), so it is rate limited
 /// like the sign-in surface (W3S-1): the same per-subject and per-address
-/// budgets in the same 15-minute window, with a successful change
-/// releasing its slots exactly like a successful sign-in.
+/// budgets in the same 15-minute window. Unlike the sign-in surface, a
+/// successful change keeps its reserved slots (V4R-2) — the derivations
+/// the change ran are the account, not the outcome — so a credential
+/// holder cycling password changes cannot exceed the window budget any
+/// more than a failed one can.
 ///
 /// The handler is the declarative change flow — budget, lookup,
 /// verification, derivation, persistence, revocation, audit — so the line
@@ -2035,9 +2103,12 @@ where
         );
     };
     // W3S-1: the budget is consumed atomically *before* any verification,
-    // exactly like the sign-in surface (S3-3) — a success refunds its slots
-    // below, and every failure keeps them, so one session cannot flood the
-    // Argon2id derivation gate with password changes.
+    // exactly like the sign-in surface (S3-3). Unlike the sign-in surface,
+    // a success does not refund its slots (V4R-2): the two derivations it
+    // runs are the account, so a credential holder cycling password
+    // changes is bounded by the same window budget as a failed one — one
+    // session can never flood the Argon2id derivation gate with password
+    // changes.
     let ip = request_ip(&connect_info);
     let rate_now = Instant::now();
     if !state
@@ -2076,12 +2147,9 @@ where
             "password change failed".to_owned(),
         );
     }
-    // The credential verification succeeded: release the reserved budget
-    // slots so a successful change never counts against the window (S3-3).
-    state
-        .auth
-        .password_change_limiter
-        .refund(&principal_id.to_string(), &ip);
+    // The verification succeeded; the reservation is kept — the
+    // derivations this change runs next are what the budget accounts
+    // (V4R-2), never refunded on success.
     let hash = match state
         .services
         .hash_password_async(request.new_password())
@@ -2383,6 +2451,9 @@ where
 }
 
 /// Transitions one principal's enabled/disabled state (§16.1).
+///
+/// The unknown-principal branch runs one dummy Argon2id derivation so its
+/// 404 costs the same as the sibling administration 404s (V4S-3).
 pub(crate) async fn set_user_state<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
@@ -2408,6 +2479,16 @@ where
         .flatten()
         .is_none()
     {
+        // V4S-3: this branch must not return observably faster than the
+        // sibling administration 404s — the three same-shaped 404s (state,
+        // role, password) must cost the same, or a timing probe through any
+        // of them could distinguish the endpoints. One dummy Argon2id
+        // derivation (the same §7.8 boundary and gate as the real branch)
+        // balances the branch; the verdict is discarded — the 404 stands
+        // either way, even when the saturated gate refuses the dummy exactly
+        // like a real derivation.
+        let dummy: SecretString = DUMMY_ADMIN_DERIVATION_INPUT.to_owned().into();
+        dummy_admin_derivation(state.services.as_ref(), &dummy).await;
         return json_error(
             StatusCode::NOT_FOUND,
             "the principal does not exist".to_owned(),
@@ -2444,6 +2525,9 @@ where
 }
 
 /// Reassigns one principal's §16.1 role.
+///
+/// The unknown-principal branch runs one dummy Argon2id derivation so its
+/// 404 costs the same as the sibling administration 404s (V4S-3).
 pub(crate) async fn assign_user_role<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
@@ -2469,6 +2553,16 @@ where
         .flatten()
         .is_none()
     {
+        // V4S-3: this branch must not return observably faster than the
+        // sibling administration 404s — the three same-shaped 404s (state,
+        // role, password) must cost the same, or a timing probe through any
+        // of them could distinguish the endpoints. One dummy Argon2id
+        // derivation (the same §7.8 boundary and gate as the real branch)
+        // balances the branch; the verdict is discarded — the 404 stands
+        // either way, even when the saturated gate refuses the dummy exactly
+        // like a real derivation.
+        let dummy: SecretString = DUMMY_ADMIN_DERIVATION_INPUT.to_owned().into();
+        dummy_admin_derivation(state.services.as_ref(), &dummy).await;
         return json_error(
             StatusCode::NOT_FOUND,
             "the principal does not exist".to_owned(),
@@ -2519,10 +2613,16 @@ where
 /// The success and failure records name the target principal whose
 /// credential was replaced beside the acting administrator (S3-4), and the
 /// unknown-principal branch runs one dummy derivation so its 404 costs the
-/// same as the known-principal path (W3S-5).
+/// same as the known-principal path (W3S-5). The path derives one new
+/// credential hash, so it consumes the credential-change budget like the
+/// self password-change path (V4R-8): keyed on the acting administrator's
+/// principal and presenting address, with every set — success included —
+/// keeping its reserved slots, so one administrator cannot flood the
+/// derivation gate with password sets.
 pub(crate) async fn set_user_password<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
+    connect_info: MaybeClientAddr,
     AxumPath(principal_id): AxumPath<String>,
     Json(request): Json<AdminSetPasswordRequest>,
 ) -> Response
@@ -2537,12 +2637,40 @@ where
         // boundaries, and the same "no audit, no store access" refusal.
         return password_policy_error();
     }
+    let Some(actor_principal_id) = context.actor_principal_id() else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "a valid session is required".to_owned(),
+        );
+    };
     let Ok(principal_id) = principal_id.parse::<PrincipalId>() else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "the principal id is invalid".to_owned(),
         );
     };
+    // V4R-8: the path derives one new credential hash, so it consumes the
+    // credential-change budget (W3S-1) — keyed on the acting administrator
+    // exactly like the self password-change path, so one administrator
+    // cannot flood the Argon2id derivation gate with password sets. The
+    // reservation is the record, consumed before the lookup — the
+    // unknown-principal branch's dummy derivation is budgeted too, like
+    // every sign-in attempt — and a successful set keeps its slots: the
+    // derivation it ran is the account (V4R-2), never refunded.
+    let ip = request_ip(&connect_info);
+    let rate_now = Instant::now();
+    if !state
+        .auth
+        .password_change_limiter
+        .reserve(&actor_principal_id.to_string(), &ip, rate_now)
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 itself is the record, exactly like the sign-in surface.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many password-change attempts; try again later".to_owned(),
+        );
+    }
     if state
         .services
         .find_principal(principal_id)
@@ -2557,11 +2685,9 @@ where
         // from a missing one. One dummy Argon2id derivation (the same §7.8
         // boundary and gate as the real branch, over the presented
         // password) balances the two paths; the verdict is discarded — the
-        // 404 stands either way.
-        let _ = state
-            .services
-            .hash_password_async(request.new_password())
-            .await;
+        // 404 stands either way, even when the saturated gate refuses the
+        // dummy exactly like the real derivation (V4S-3).
+        dummy_admin_derivation(state.services.as_ref(), request.new_password()).await;
         return json_error(
             StatusCode::NOT_FOUND,
             "the principal does not exist".to_owned(),
@@ -3743,6 +3869,48 @@ mod tests {
     }
 
     #[test]
+    fn rate_limiter_refund_removes_exactly_the_presenting_address_slot() {
+        // V4R-5: a refund must remove the refunding attempt's own
+        // reservation, not the newest entry of the bucket. Under multi-IP
+        // interleaving — a second address's in-flight attempt reserving
+        // after the refunding one — the newest entry belongs to the other
+        // address; popping it would free the other address's slot while
+        // the refunding address's own reservation stayed, shifting the
+        // budget attribution between addresses.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+
+        // Two in-flight attempts interleave: the first address reserves,
+        // then the second, then the first succeeds and refunds.
+        assert!(limiter.reserve("admin", "192.0.2.1", now));
+        assert!(limiter.reserve("admin", "192.0.2.2", now));
+        limiter.refund("admin", "192.0.2.1");
+
+        // The refund removed the first address's own reservation, so the
+        // second address's reservation still counts: its budget exhausts
+        // at the limit — under the newest-entry pop the second address
+        // would have one free slot and pass this refusal.
+        for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
+            assert!(limiter.reserve("admin", "192.0.2.2", now));
+        }
+        assert!(
+            !limiter.reserve("admin", "192.0.2.2", now),
+            "the interleaved reservation must still count toward its address's budget"
+        );
+
+        // The refunding address's own slot left with its reservation: its
+        // budget starts clean again and exhausts at the limit like any
+        // fresh address.
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            assert!(limiter.reserve("admin", "192.0.2.1", now));
+        }
+        assert!(
+            !limiter.reserve("admin", "192.0.2.1", now),
+            "the refunding address's budget is untouched by the interleaving"
+        );
+    }
+
+    #[test]
     fn rate_limiter_consumes_the_budget_atomically_under_concurrency() -> Result<(), Box<dyn Error>>
     {
         // S3-3: the reserve is one locked consumption per key, so N
@@ -4531,7 +4699,16 @@ mod tests {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     guard.hash_async_calls += 1;
                     guard.hash_async_thread = Some(std::thread::current().id());
+                    let gate_busy = guard.derivation_gate_busy;
                     drop(guard);
+                    if gate_busy {
+                        // The W3S-1 saturated-gate refusal the runtime
+                        // surfaces as `HashGateBusy`: the dummy-derivation
+                        // tests flip the flag to prove a refused dummy —
+                        // one that still traveled the gate's wait path —
+                        // keeps the handler's verdict.
+                        return Err(WorkerTestError);
+                    }
                     Argon2IdHash::from_parts(
                         &[0x11; ARGON2ID_SALT_LENGTH],
                         &[0x22; ARGON2ID_HASH_LENGTH],
@@ -4787,8 +4964,13 @@ mod tests {
     //
     // The password-change path costs two Argon2id derivations per request,
     // so it carries the same §16.2 budgets as the sign-in surface: a flood
-    // of failed changes from one session cannot starve the derivation gate.
+    // of failed changes from one session cannot starve the derivation
+    // gate, and a credential holder cycling successful changes is bounded
+    // the same way — successes keep their slots (V4R-2).
 
+    // The test walks the failure accounting and the success accounting as
+    // two self-contained halves, so the line count is the coverage.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn change_password_is_rate_limited_like_sign_in() -> Result<(), Box<dyn Error>> {
         // Failed changes keep their reservation (verify_ok = false), so
@@ -4844,9 +5026,11 @@ mod tests {
             .await?;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        // A successful change refunds its slots, so the same principal can
-        // change its password repeatedly without ever hitting the budget —
-        // exactly like the sign-in surface's refund (S3-3).
+        // A successful change keeps its slots (V4R-2): the two derivations
+        // the change ran are the account, not the outcome, so a credential
+        // holder cycling password changes is bounded exactly like a failed
+        // one — the sixth successful change in the window is refused,
+        // where the sign-in surface's S3-3 refund would have admitted it.
         let services = WorkerTestServices::seeded()?;
         {
             let mut inner = services
@@ -4881,7 +5065,7 @@ mod tests {
             .layer(axum::Extension(context))
             .with_state(worker_test_state(services));
         let body = r#"{"current_password": "correct horse battery staple", "new_password": "a brand new password"}"#;
-        for _ in 0..=USERNAME_FAILURE_LIMIT {
+        for _ in 0..USERNAME_FAILURE_LIMIT {
             let changed = router
                 .clone()
                 .oneshot(
@@ -4893,9 +5077,22 @@ mod tests {
             assert_eq!(
                 changed.status(),
                 StatusCode::OK,
-                "a successful change must refund its budget slots"
+                "a successful change within the window budget must succeed"
             );
         }
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(
+            limited.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a credential holder cycling changes must hit the window budget at the limit"
+        );
         Ok(())
     }
 
@@ -5220,6 +5417,220 @@ mod tests {
         assert_eq!(
             inner.hash_async_calls, 2,
             "the known-principal branch must cost the same single derivation"
+        );
+        Ok(())
+    }
+
+    // ---- V4S-3 administration-404 equalizers -----------------------------
+    //
+    // The three same-shaped administration 404s — state, role, password —
+    // must cost the same: each unknown-principal branch runs one dummy
+    // Argon2id derivation, and the dummy travels the same bounded
+    // derivation gate as the real branch, so a saturated gate refuses it
+    // exactly like a real derivation and the 404 stands.
+
+    #[tokio::test]
+    async fn unknown_principal_state_change_runs_one_dummy_derivation() -> Result<(), Box<dyn Error>>
+    {
+        // The unknown-principal branch of the state transition must not
+        // return observably faster than its sibling administration 404s —
+        // a timing probe through any of the three endpoints would otherwise
+        // distinguish them (V4S-3). One dummy derivation per 404 is the
+        // equalizer, exactly like the W3S-5 set-password branch.
+        let services = WorkerTestServices::seeded()?;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/state",
+                axum::routing::post(set_user_state::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(PrincipalId::generate())))
+            .with_state(worker_test_state(services.clone()));
+
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/state")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"state": "disabled"}"#))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.hash_async_calls, 1,
+            "the unknown-principal branch must run one dummy derivation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_principal_role_change_runs_one_dummy_derivation() -> Result<(), Box<dyn Error>>
+    {
+        // The role-reassignment 404 carries the same equalizer as the state
+        // transition and the set-password 404s (V4S-3).
+        let services = WorkerTestServices::seeded()?;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/role",
+                axum::routing::post(assign_user_role::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(PrincipalId::generate())))
+            .with_state(worker_test_state(services.clone()));
+
+        let refused = router
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/role")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"role": "operator"}"#))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.hash_async_calls, 1,
+            "the unknown-principal branch must run one dummy derivation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_principal_admin_changes_keep_the_404_when_the_derivation_gate_is_busy()
+    -> Result<(), Box<dyn Error>> {
+        // V4S-3: the equalizer must survive a saturated derivation gate.
+        // The dummy runs through the same bounded gate as the real
+        // derivation (P4-12); when the gate is at capacity the runtime
+        // refuses it with the gate-busy error, and the handler discards
+        // the failure — the dummy still traveled the wait path, and the
+        // 404 verdict stands. The known-principal branches surface the
+        // same refusal as their 503; the unknown branches keep their 404.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.derivation_gate_busy = true;
+        }
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/state",
+                axum::routing::post(set_user_state::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .route(
+                "/api/v1/admin/users/{principal_id}/role",
+                axum::routing::post(assign_user_role::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .route(
+                "/api/v1/admin/users/{principal_id}/password",
+                axum::routing::post(set_user_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(PrincipalId::generate())))
+            .with_state(worker_test_state(services.clone()));
+
+        let state_refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/state")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"state": "disabled"}"#))?,
+            )
+            .await?;
+        assert_eq!(state_refused.status(), StatusCode::NOT_FOUND);
+        let role_refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/role")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"role": "operator"}"#))?,
+            )
+            .await?;
+        assert_eq!(role_refused.status(), StatusCode::NOT_FOUND);
+        let password_refused = router
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(password_refused.status(), StatusCode::NOT_FOUND);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.hash_async_calls, 3,
+            "each refused dummy derivation must still run through the gate"
+        );
+        Ok(())
+    }
+
+    // ---- V4R-8 administrator set-password budget -------------------------
+
+    #[tokio::test]
+    async fn admin_password_set_is_rate_limited_like_change_password() -> Result<(), Box<dyn Error>>
+    {
+        // V4R-8: the administrator set-password path derives one new
+        // credential hash, so it carries the credential-change budget —
+        // keyed on the acting administrator like the self-change path, and
+        // every set keeps its reserved slots (V4R-2), so even a loop of
+        // successful sets cannot exceed the window budget.
+        let services = WorkerTestServices::seeded()?;
+        let target_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/password",
+                axum::routing::post(set_user_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(PrincipalId::generate())))
+            .with_state(worker_test_state(services));
+        let body = r#"{"new_password": "a fresh replacement secret"}"#;
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            let set = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/admin/users/{target_id}/password"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(
+                set.status(),
+                StatusCode::OK,
+                "a password set within the window budget must succeed"
+            );
+        }
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{target_id}/password"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(
+            limited.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a loop of password sets must hit the window budget at the limit"
         );
         Ok(())
     }

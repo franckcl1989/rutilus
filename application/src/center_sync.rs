@@ -144,6 +144,34 @@ pub trait CenterOutbox: Send + Sync {
         instance_id: InstanceId,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>>;
 
+    /// Lists the newest outbox entries of one instance, newest first,
+    /// bounded by `limit` — the bounded twin of [`Self::list_offers`]
+    /// (V4P-3).
+    ///
+    /// The default implementation reads through [`Self::list_offers`] and
+    /// truncates to the newest `limit` entries in memory: it bounds the
+    /// caller's working set on every store, while the decryption surface is
+    /// reduced only by a store-level override that pushes the limit into
+    /// the query (the production repository exposes that read as
+    /// `SqliteStore::list_outbox_entries_bounded`). The window holds the
+    /// newest `limit` entries of the underlying read in their original
+    /// order, so it holds the offers a repair most likely needs — the
+    /// newest offer per dispatched operation.
+    fn list_offers_bounded(
+        &self,
+        instance_id: InstanceId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Box::pin(async move {
+            let mut rows = self.list_offers(instance_id).await?;
+            let bound = usize::try_from(limit).unwrap_or(usize::MAX);
+            if rows.len() > bound {
+                rows.drain(..rows.len() - bound);
+            }
+            Ok(rows)
+        })
+    }
+
     /// Marks one entry acknowledged. The write is idempotent: a repeated
     /// acknowledgement (the center may deliver its `Ack` more than once) is
     /// a successful no-op.
@@ -182,6 +210,14 @@ where
         instance_id: InstanceId,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
         Outbox::list_offers(*self, instance_id)
+    }
+
+    fn list_offers_bounded(
+        &self,
+        instance_id: InstanceId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Outbox::list_offers_bounded(*self, instance_id, limit)
     }
 
     fn acknowledge(

@@ -9,6 +9,7 @@ pub struct Model {
     pub event_sequence: i64,
     pub actor: String,
     pub actor_principal_id: Option<Uuid>,
+    pub target_principal_id: Option<Uuid>,
     pub origin: String,
     pub target_kind: String,
     pub target_endpoint_id: Option<Uuid>,

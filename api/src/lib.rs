@@ -3539,6 +3539,11 @@ pub enum OperationStateResponse {
 /// (`capability_unsupported`) and mirrors the domain's stable persistence
 /// code (`capability-unsupported`) in meaning; like the `waiting_remote`
 /// state, the Web projection translates between the two vocabularies.
+///
+/// The vocabulary is forward-tolerant (W3C-1): [`Unknown`] absorbs a wire
+/// value this build does not know, so a future classification never breaks
+/// a console built before it existed — the response renders the fallback
+/// instead of failing the whole parse.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKindResponse {
@@ -3546,6 +3551,12 @@ pub enum FailureKindResponse {
     /// is provably unsupported — the write was never dispatched (§13.3 step 2
     /// pre-flight refusal), so the refusal is the honest reporting verdict.
     CapabilityUnsupported,
+    /// A classification this build does not know — the fallback of a future
+    /// wire value (W3C-1). This build never constructs it: the projections
+    /// write only the known kinds, so the value surfaces only when a newer
+    /// server speaks a newer vocabulary.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Secret-free input that converts one typed Redfish write into a persisted
@@ -5796,8 +5807,12 @@ impl CenterEndpointViewResponse {
 }
 
 /// The center's §15.5 aggregated endpoint view.
+///
+/// The response direction never rejects unknown fields (W3C-1): an additive
+/// field in a newer payload must not break a console built before the field
+/// existed, so the envelope tolerates keys this build does not know — the
+/// §15.5 credential boundary stays with the endpoint view items below.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CenterEndpointViewListResponse {
     endpoints: Vec<CenterEndpointViewResponse>,
 }
@@ -5923,8 +5938,11 @@ impl CenterOperationResponse {
 }
 
 /// The center's §15.6 operation tracking view.
+///
+/// The response direction never rejects unknown fields (W3C-1): an additive
+/// field in a newer payload must not break a console built before the field
+/// existed, so the envelope tolerates keys this build does not know.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CenterOperationListResponse {
     operations: Vec<CenterOperationResponse>,
 }
@@ -5998,8 +6016,11 @@ impl CenterOperationSubmitRequest {
 
 /// The acknowledgement of one dispatched center operation (§15.6): the
 /// stable operation id and the moment the offer stops being actionable.
+///
+/// The response direction never rejects unknown fields (W3C-1): an additive
+/// field in a newer payload must not break a console built before the field
+/// existed, so the acknowledgement tolerates keys this build does not know.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CenterOperationSubmitResponse {
     operation_id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
@@ -10676,12 +10697,19 @@ mod tests {
             serde_json::from_value::<FailureKindResponse>(json!("capability_unsupported"))?,
             FailureKindResponse::CapabilityUnsupported
         );
-        // The domain persistence code is deliberately not a wire value here,
-        // exactly like the `waiting_remote` state translation.
-        assert!(
-            serde_json::from_value::<FailureKindResponse>(json!("capability-unsupported")).is_err()
+        // A value this build does not know — a future classification, or the
+        // domain persistence code that is deliberately not a wire value here
+        // (exactly like the `waiting_remote` state translation) — is absorbed
+        // by the `Unknown` fallback instead of failing the parse (W3C-1): a
+        // console built before the value existed keeps parsing the payload.
+        assert_eq!(
+            serde_json::from_value::<FailureKindResponse>(json!("capability-unsupported"))?,
+            FailureKindResponse::Unknown
         );
-        assert!(serde_json::from_value::<FailureKindResponse>(json!("failed")).is_err());
+        assert_eq!(
+            serde_json::from_value::<FailureKindResponse>(json!("failed"))?,
+            FailureKindResponse::Unknown
+        );
         Ok(())
     }
 
@@ -10754,20 +10782,23 @@ mod tests {
         }))?;
         assert_eq!(legacy.failure_kind(), None);
 
-        // An unknown classification code is refused, exactly like every other
-        // wire vocabulary.
-        assert!(
-            serde_json::from_value::<OperationResponse>(json!({
-                "operation_id": operation_id,
-                "source": "standalone",
-                "targets": [],
-                "command": { "System": { "Reset": "PowerCycle" } },
-                "state": "failed",
-                "created_at": "2026-08-05T10:11:12Z",
-                "updated_at": "2026-08-05T10:11:12Z",
-                "failure_kind": "capability-missing"
-            }))
-            .is_err()
+        // An unknown classification code — a newer vocabulary value — is
+        // absorbed by the `Unknown` fallback instead of failing the whole
+        // payload (W3C-1): a console built before the code existed keeps
+        // parsing the operation, and the classification reads as unknown.
+        let future_kind = serde_json::from_value::<OperationResponse>(json!({
+            "operation_id": operation_id,
+            "source": "standalone",
+            "targets": [],
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": "failed",
+            "created_at": "2026-08-05T10:11:12Z",
+            "updated_at": "2026-08-05T10:11:12Z",
+            "failure_kind": "capability-missing"
+        }))?;
+        assert_eq!(
+            future_kind.failure_kind(),
+            Some(FailureKindResponse::Unknown)
         );
         Ok(())
     }

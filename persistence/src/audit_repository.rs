@@ -224,6 +224,9 @@ fn project_event(event: &AuditEvent) -> audit_event::ActiveModel {
         actor_principal_id: Set(context
             .actor_principal_id()
             .map(rutilus_domain::PrincipalId::into_uuid)),
+        target_principal_id: Set(context
+            .target_principal_id()
+            .map(rutilus_domain::PrincipalId::into_uuid)),
         origin: Set(context.origin().as_str().to_owned()),
         target_kind: Set(target_kind.to_owned()),
         target_endpoint_id: Set(target_endpoint_id),
@@ -276,7 +279,7 @@ fn map_context(model: &audit_event::Model) -> Result<AuditOperationContext, Stor
         AuditAction::from_str(&model.action).map_err(StoredAuditEventError::UnknownAction)?;
     let redfish_operation = AuditRedfishOperation::from_str(&model.redfish_operation)
         .map_err(StoredAuditEventError::UnknownRedfishOperation)?;
-    AuditOperationContext::try_new_with_actor_principal(
+    let context = AuditOperationContext::try_new_with_actor_principal(
         AuditOperationId::from_uuid(model.operation_id),
         actor,
         origin,
@@ -289,7 +292,21 @@ fn map_context(model: &audit_event::Model) -> Result<AuditOperationContext, Stor
             .actor_principal_id
             .map(rutilus_domain::PrincipalId::from_uuid),
     )
-    .map_err(StoredAuditEventError::InvalidContext)
+    .map_err(StoredAuditEventError::InvalidContext)?;
+    match model.target_principal_id {
+        Some(target_principal_id) => {
+            // A target principal may only be recorded under an action that
+            // names a subject distinct from its actor (S3-4); the schema
+            // CHECK pins the same rule, so a stored row that violates it was
+            // written by a build with a different contract and is corrupt.
+            if !action.names_distinct_target_principal() {
+                return Err(StoredAuditEventError::InvalidTargetPrincipalShape);
+            }
+            Ok(context
+                .with_target_principal(rutilus_domain::PrincipalId::from_uuid(target_principal_id)))
+        }
+        None => Ok(context),
+    }
 }
 
 fn map_target(model: &audit_event::Model) -> Result<AuditTarget, StoredAuditEventError> {
@@ -466,6 +483,10 @@ pub enum StoredAuditEventError {
     UnknownRedfishOperation(#[source] AuditCodeParseError),
     #[error("stored audit context is inconsistent: {0}")]
     InvalidContext(#[source] AuditOperationContextError),
+    #[error(
+        "stored audit target principal is recorded under an action that names no distinct subject"
+    )]
+    InvalidTargetPrincipalShape,
     #[error("stored audit sequence is outside the supported range")]
     InvalidSequenceValue,
     #[error("stored audit sequence is invalid: {0}")]
@@ -504,7 +525,10 @@ mod tests {
     use std::error::Error;
 
     use rutilus_domain::{AuditTlsTrust, DeploymentPosture, PrincipalId};
-    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+    use sea_orm::{
+        ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, EntityTrait, IntoActiveModel,
+        Set,
+    };
     use time::{Duration, OffsetDateTime};
 
     use super::*;
@@ -828,6 +852,82 @@ mod tests {
                 .await?,
             [started, failed]
         );
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_principal_round_trips_and_foreign_action_shapes_are_corrupt()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        let actor_principal_id = PrincipalId::generate();
+        let target_principal_id = PrincipalId::generate();
+        // S3-4: the administrator-issued password set records the acting
+        // administrator as actor and the user whose credential was replaced
+        // as the target, and the target rides every event of the operation.
+        let context = AuditOperationContext::try_new_with_actor_principal(
+            AuditOperationId::generate(),
+            AuditActor::User,
+            DeploymentPosture::Site,
+            AuditTarget::Product,
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            AuditRedfishOperation::None,
+            Some(actor_principal_id),
+        )?
+        .with_target_principal(target_principal_id);
+        let started = AuditEvent::started(context.clone(), now);
+        let succeeded = AuditEvent::succeeded(context, AuditSequence::FIRST.next()?, now)?;
+        let operation_id = started.context().operation_id();
+        let succeeded_id = succeeded.id();
+        store.append_audit_event(&started).await?;
+        store.append_audit_event(&succeeded).await?;
+        assert_eq!(
+            store.find_audit_operation(operation_id).await?,
+            [started, succeeded]
+        );
+
+        // A stored target under an action that names no distinct subject is
+        // corrupt. The schema CHECK refuses such a row, so it is written on
+        // a dedicated single-connection writer with check constraints
+        // ignored — exactly what a build with a different contract's row
+        // looks like, the upgrade-order discipline of the event-repository
+        // test. One connection executes both the pragma and the update, so
+        // the bypass is deterministic.
+        //
+        // Test-scope exception to the §7.3 bare-SQL ban: the PRAGMA only
+        // simulates the foreign-build write above; no production path runs
+        // raw SQL (the `tests/bare_sql_gate.rs` gate in the migration crate
+        // pins persistence/src to PRAGMA-only).
+        let database_path = store.database_path();
+        let normalized_path = database_path.to_string_lossy().replace('\\', "/");
+        let mut options = ConnectOptions::new(format!("sqlite://{normalized_path}?mode=rwc"));
+        options.max_connections(1);
+        options.sqlx_logging(false);
+        let writer = Database::connect(options).await?;
+        writer
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await?;
+        let mut stored = audit_event::Entity::find_by_id(succeeded_id.into_uuid())
+            .one(&writer)
+            .await?
+            .ok_or("inserted audit event is missing")?
+            .into_active_model();
+        stored.action = Set(String::from("login"));
+        stored.update(&writer).await?;
+        writer.close().await?;
+
+        assert!(matches!(
+            store.find_audit_operation(operation_id).await,
+            Err(AuditRepositoryError::Corrupt {
+                source: StoredAuditEventError::InvalidTargetPrincipalShape,
+                ..
+            })
+        ));
         store.close().await?;
         drop(directory);
         Ok(())

@@ -21,12 +21,14 @@ use rutilus_application::{
     CenterEndpointProjection, CenterTrustMode, EndpointProjectionWrite, ProjectionIgnoreReason,
     ProjectionWriteOutcome, ResourceProjectionWrite,
 };
-use rutilus_domain::{EndpointId, InstanceId};
-use rutilus_entity::{endpoint, endpoint_address, endpoint_trust, resource, resource_snapshot};
+use rutilus_domain::{CenterBindingState, EndpointId, InstanceId};
+use rutilus_entity::{
+    center_binding, endpoint, endpoint_address, endpoint_trust, resource, resource_snapshot,
+};
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set, SqlErr, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
+    QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -40,12 +42,15 @@ impl SqliteStore {
     /// `endpoints` row, its active address, and its trust mode.
     ///
     /// The write is site-scoped and idempotent: an existing projection of
-    /// another site is refused (the frame is absorbed), a frame whose
-    /// refresh generation is older than the stored projection is refused
-    /// (an older inventory cut must never roll back the `refresh_generation`
-    /// and `health` of a newer one — the same semantics as the per-generation
-    /// detail snapshots), and a re-reported snapshot of the same or a newer
-    /// generation replaces the summary in place.
+    /// another site is refused (the frame is absorbed) — except for the
+    /// V4R-7 re-bind self-healing, where the stored site's binding is no
+    /// longer in force and the frame re-homes the row (see the re-home
+    /// branch below) — a frame whose refresh generation is older than the
+    /// stored projection is refused (an older inventory cut must never roll
+    /// back the `refresh_generation` and `health` of a newer one — the same
+    /// semantics as the per-generation detail snapshots), and a
+    /// re-reported snapshot of the same or a newer generation replaces the
+    /// summary in place.
     ///
     /// # Errors
     ///
@@ -79,7 +84,24 @@ impl SqliteStore {
             .await
             .map_err(CenterProjectionRepositoryError::Database)?;
         if let Some(stored) = stored.as_ref() {
-            if stored.site_id != Some(site.into_uuid()) {
+            // V4R-7 re-bind self-healing: a frame whose reporting site
+            // differs from the stored site is a second site claiming the
+            // endpoint. The claim is refused while the stored site's
+            // binding is still in force; a stored site whose binding was
+            // explicitly revoked (the operator's unbind that precedes every
+            // re-bind — the site re-registers under a fresh instance
+            // identity) can never report again — its connection is refused
+            // at admission — so its projection is dead and the frame
+            // re-homes the row to the reporting site instead of freezing
+            // the endpoint forever. A missing binding is deliberately NOT
+            // treated as a revoke: two sites may both report without a
+            // center binding in test fixtures, and the absence of a row is
+            // not an operator's unbind. The refresh-generation guard below
+            // still applies, so a re-home can never roll back a newer
+            // inventory cut.
+            let rehome = stored.site_id != Some(site.into_uuid())
+                && binding_revoked(&transaction, stored.site_id).await?;
+            if stored.site_id != Some(site.into_uuid()) && !rehome {
                 transaction
                     .rollback()
                     .await
@@ -107,6 +129,9 @@ impl SqliteStore {
                 });
             }
             let mut active = stored.clone().into_active_model();
+            if rehome {
+                active.site_id = Set(Some(site.into_uuid()));
+            }
             active.display_name = Set(projection.display_name().to_owned());
             active.refresh_generation = Set(stored_integer(projection.refresh_generation())?);
             active.health = Set(projection.health().to_owned());
@@ -215,7 +240,11 @@ impl SqliteStore {
     /// its trust row, and — by the existing cascade — its resources.
     ///
     /// The delete is idempotent — an endpoint that is already gone leaves
-    /// the goal state holding — and site-scoped.
+    /// the goal state holding — and site-scoped, with the same V4R-7
+    /// re-bind carve-out as the upsert: a stored site whose binding is no
+    /// longer in force can never report again, so the reporting site's
+    /// delete delta applies (§21 deletion convergence) instead of leaving
+    /// the dead site's stale row behind forever.
     ///
     /// # Errors
     ///
@@ -250,13 +279,23 @@ impl SqliteStore {
             return Ok(ProjectionWriteOutcome::Applied);
         };
         if stored.site_id != Some(site.into_uuid()) {
-            transaction
-                .rollback()
-                .await
-                .map_err(CenterProjectionRepositoryError::Database)?;
-            return Ok(ProjectionWriteOutcome::Ignored {
-                reason: ProjectionIgnoreReason::EndpointBelongsToOtherSite,
-            });
+            // V4R-7 re-bind self-healing: the stored site's binding was
+            // explicitly revoked (the operator's unbind that precedes every
+            // re-bind — the site re-registers under a fresh instance
+            // identity), so the stored site can never report again and its
+            // projection is dead — the reporting site's delete applies. A
+            // stored site whose binding is still in force (or missing, which
+            // is not an operator's unbind) owns the row and the delete is
+            // refused as a cross-site conflict.
+            if !binding_revoked(&transaction, stored.site_id).await? {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(CenterProjectionRepositoryError::Database)?;
+                return Ok(ProjectionWriteOutcome::Ignored {
+                    reason: ProjectionIgnoreReason::EndpointBelongsToOtherSite,
+                });
+            }
         }
         endpoint::Entity::delete_by_id(endpoint_id.into_uuid())
             .exec(&transaction)
@@ -717,6 +756,40 @@ impl ProjectedEndpointSummary {
     }
 }
 
+/// Whether the site that owns a stored projection row was explicitly
+/// unbound (V4R-7 re-bind self-healing).
+///
+/// A revoked binding is the operator's unbind that precedes every re-bind —
+/// the site then re-registers under a fresh instance identity — and a site
+/// whose binding is revoked is refused at connection admission, so it can
+/// never report again; the projections it left behind are dead, and a
+/// different site reporting the same endpoint ids may take them over. A
+/// missing or pending binding deliberately reports `false`: the absence of
+/// a row is not an operator's unbind, and a pending binding's site has
+/// never reported anything.
+///
+/// # Errors
+///
+/// Returns [`CenterProjectionRepositoryError::Database`] when the binding
+/// query fails.
+async fn binding_revoked<C>(
+    database: &C,
+    site_id: Option<Uuid>,
+) -> Result<bool, CenterProjectionRepositoryError>
+where
+    C: ConnectionTrait,
+{
+    let Some(site_id) = site_id else {
+        return Ok(false);
+    };
+    let binding = center_binding::Entity::find()
+        .filter(center_binding::Column::SiteInstanceId.eq(site_id))
+        .one(database)
+        .await
+        .map_err(CenterProjectionRepositoryError::Database)?;
+    Ok(binding.is_some_and(|row| row.state == CenterBindingState::Revoked.as_str()))
+}
+
 /// Maps one projection `u64` to the `SQLite` `INTEGER` range.
 fn stored_integer(value: u64) -> Result<i64, CenterProjectionRepositoryError> {
     i64::try_from(value).map_err(|_| CenterProjectionRepositoryError::IntegerOverflow)
@@ -973,6 +1046,242 @@ mod tests {
         assert!(!resolved.contains_key(&unknown));
         // An empty id set is answered without a query.
         assert!(store.find_endpoint_projections(&[]).await?.is_empty());
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// Persists one binding row for a site in the given state — the V4R-7
+    /// fixture: a `bound` binding keeps the site able to report, a
+    /// `revoked` one is the operator's unbind that precedes a re-bind.
+    async fn bind_site(
+        store: &SqliteStore,
+        site: InstanceId,
+        state: CenterBindingState,
+        now: OffsetDateTime,
+    ) -> Result<(), Box<dyn Error>> {
+        center_binding::ActiveModel {
+            id: Set(Uuid::now_v7()),
+            center_url: Set(String::from("https://center.example")),
+            binding_code_hash: Set(None),
+            site_instance_id: Set(site.into_uuid()),
+            site_cert_fingerprint: Set(None),
+            state: Set(state.as_str().to_owned()),
+            bound_at: Set(Some(now)),
+            expires_at: Set(None),
+            created_at: Set(now),
+        }
+        .insert(&store.database)
+        .await?;
+        Ok(())
+    }
+
+    /// The second site of the re-bind tests: a fresh instance identity, as
+    /// a re-registration mints.
+    fn second_site(now: OffsetDateTime) -> SiteInstance {
+        SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Site Two"),
+            InstanceKind::Site,
+            now,
+        )
+    }
+
+    #[tokio::test]
+    async fn endpoint_projection_rehomes_to_the_reporting_site_when_the_old_site_is_unbound()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, first_site) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        let second_site = second_site(base);
+        store.create_instance(&second_site).await?;
+        let endpoint_id = EndpointId::generate();
+        store
+            .upsert_endpoint_projection(
+                &projection_write(
+                    endpoint_id,
+                    "https://192.0.2.10",
+                    CenterTrustMode::SystemCa,
+                    1,
+                ),
+                first_site,
+                base,
+            )
+            .await?;
+
+        // V4R-7: the first site's binding was explicitly revoked — the
+        // operator's unbind that precedes every re-bind (the site then
+        // re-registers under a fresh instance identity) — so it can never
+        // report again and its projection is dead: the second site's
+        // snapshot re-homes the row instead of freezing the endpoint under
+        // the dead site.
+        bind_site(&store, first_site, CenterBindingState::Revoked, base).await?;
+        assert_eq!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.10",
+                        CenterTrustMode::SystemCa,
+                        2,
+                    ),
+                    second_site.id(),
+                    base + Duration::SECOND,
+                )
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        let projection = store
+            .find_endpoint_projection(endpoint_id)
+            .await?
+            .ok_or("the re-homed projection is missing")?;
+        assert_eq!(
+            projection.site_id(),
+            Some(second_site.id()),
+            "the dead site's projection must be re-homed to the reporting site"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_projection_refuses_a_second_live_site_claiming_the_endpoint()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, first_site) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        // The first site's binding is in force, so it can still report: the
+        // second site's claim is a cross-site conflict, refused exactly
+        // like before the re-bind self-healing existed.
+        bind_site(&store, first_site, CenterBindingState::Bound, base).await?;
+        let second_site = second_site(base);
+        store.create_instance(&second_site).await?;
+        let endpoint_id = EndpointId::generate();
+        store
+            .upsert_endpoint_projection(
+                &projection_write(
+                    endpoint_id,
+                    "https://192.0.2.10",
+                    CenterTrustMode::SystemCa,
+                    1,
+                ),
+                first_site,
+                base,
+            )
+            .await?;
+
+        assert!(matches!(
+            store
+                .upsert_endpoint_projection(
+                    &projection_write(
+                        endpoint_id,
+                        "https://192.0.2.11",
+                        CenterTrustMode::SystemCa,
+                        1,
+                    ),
+                    second_site.id(),
+                    base + Duration::SECOND,
+                )
+                .await,
+            Ok(ProjectionWriteOutcome::Ignored {
+                reason: ProjectionIgnoreReason::EndpointBelongsToOtherSite
+            })
+        ));
+        let projection = store
+            .find_endpoint_projection(endpoint_id)
+            .await?
+            .ok_or("the projection is missing")?;
+        assert_eq!(
+            projection.site_id(),
+            Some(first_site),
+            "a live site's projection must never be re-homed"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_projection_applies_a_dead_sites_delete_delta()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, first_site) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        let second_site = second_site(base);
+        store.create_instance(&second_site).await?;
+        let endpoint_id = EndpointId::generate();
+        store
+            .upsert_endpoint_projection(
+                &projection_write(
+                    endpoint_id,
+                    "https://192.0.2.10",
+                    CenterTrustMode::SystemCa,
+                    1,
+                ),
+                first_site,
+                base,
+            )
+            .await?;
+
+        // V4R-7: the stored site's binding was revoked (the operator's
+        // unbind that precedes a re-bind), so the stored site is dead and
+        // the reporting site's delete delta converges the stale projection
+        // instead of leaving it under the dead site forever.
+        bind_site(&store, first_site, CenterBindingState::Revoked, base).await?;
+        assert_eq!(
+            store
+                .delete_endpoint_projection(endpoint_id, second_site.id())
+                .await?,
+            ProjectionWriteOutcome::Applied
+        );
+        assert!(
+            store.find_endpoint_projection(endpoint_id).await?.is_none(),
+            "a dead site's projection must yield to the reporting site's delete"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_projection_refuses_a_live_sites_cross_site_delete()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store, first_site) = site_and_store().await?;
+        let base = OffsetDateTime::now_utc();
+        // The first site's binding is in force, so it can still report: the
+        // second site's delete is a cross-site conflict, refused exactly
+        // like before the re-bind self-healing existed.
+        bind_site(&store, first_site, CenterBindingState::Bound, base).await?;
+        let second_site = second_site(base);
+        store.create_instance(&second_site).await?;
+        let endpoint_id = EndpointId::generate();
+        store
+            .upsert_endpoint_projection(
+                &projection_write(
+                    endpoint_id,
+                    "https://192.0.2.10",
+                    CenterTrustMode::SystemCa,
+                    1,
+                ),
+                first_site,
+                base,
+            )
+            .await?;
+
+        assert!(matches!(
+            store
+                .delete_endpoint_projection(endpoint_id, second_site.id())
+                .await,
+            Ok(ProjectionWriteOutcome::Ignored {
+                reason: ProjectionIgnoreReason::EndpointBelongsToOtherSite
+            })
+        ));
+        assert!(
+            store.find_endpoint_projection(endpoint_id).await?.is_some(),
+            "a live site's projection must survive another site's delete"
+        );
 
         store.close().await?;
         drop(directory);

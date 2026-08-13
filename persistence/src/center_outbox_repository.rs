@@ -259,6 +259,52 @@ impl SqliteStore {
             .collect()
     }
 
+    /// Lists the newest outbox entries of one instance, newest first,
+    /// bounded by `limit` — the bounded twin of
+    /// [`Self::list_outbox_entries`] (V4P-2).
+    ///
+    /// The read is the offer scan of the center's operation tracking view
+    /// with the decrypt surface capped: the view needs at most one offer
+    /// per displayed operation, and the newest entries are the newest
+    /// offers — the facts (target, actor context, offer expiry) of the
+    /// recent dispatches the view is built to track. The bound is not a
+    /// visibility guarantee: an operation whose newest offer lies beyond
+    /// the window simply renders without its offer facts, exactly like the
+    /// dispatch scan's bounded pending queue. There is no `operation_id`
+    /// column to direct the read at the offers of the displayed operations
+    /// (the payload is a ciphertext envelope), so the newest-`limit` window
+    /// is the smallest honest decryption surface. Like the unbounded twin,
+    /// every stored envelope is decrypted back to its §9.4 plaintext
+    /// payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CenterOutboxRepositoryError::Corrupt`] when any stored row
+    /// violates domain invariants or its payload ciphertext cannot be
+    /// authenticated, and [`CenterOutboxRepositoryError::CommandKeyMissing`]
+    /// when a ciphertext row is read through a keyless store.
+    pub async fn list_outbox_entries_bounded(
+        &self,
+        instance_id: InstanceId,
+        limit: u64,
+    ) -> Result<Vec<OutboxEntry>, CenterOutboxRepositoryError> {
+        let models = center_outbox::Entity::find()
+            .filter(center_outbox::Column::InstanceId.eq(instance_id.into_uuid()))
+            .order_by_desc(center_outbox::Column::Sequence)
+            .order_by_desc(center_outbox::Column::Id)
+            .limit(Some(limit))
+            .all(&self.database)
+            .await
+            .map_err(CenterOutboxRepositoryError::Database)?;
+        models
+            .iter()
+            .map(|model| {
+                let entry_id = OutboxEntryId::from_uuid(model.id);
+                map_stored_outbox_entry(self, entry_id, model)
+            })
+            .collect()
+    }
+
     /// Acknowledges one outbound envelope (design §17, D4).
     ///
     /// The conditional update makes the write idempotent: only a `pending`
@@ -578,6 +624,69 @@ mod tests {
             .await?;
         let all = store.list_pending_outbox(site.id(), 10).await?;
         assert_eq!(all.len(), 3);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_listing_returns_only_the_newest_entries_newest_first()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let site = site_instance(base);
+        store.create_instance(&site).await?;
+
+        store
+            .create_outbox_entry(&outbox_entry(&site, 1, base))
+            .await?;
+        store
+            .create_outbox_entry(&outbox_entry(&site, 3, base))
+            .await?;
+        store
+            .create_outbox_entry(&outbox_entry(&site, 2, base))
+            .await?;
+
+        // The bounded scan (V4P-2) keeps the newest entries only, newest
+        // first: the tracking view's decrypt surface is capped at the
+        // window instead of the whole queue.
+        let page = store.list_outbox_entries_bounded(site.id(), 2).await?;
+        assert_eq!(
+            page.iter().map(OutboxEntry::sequence).collect::<Vec<_>>(),
+            vec![3, 2],
+            "the bound must keep the newest entries, newest first"
+        );
+        let all = store.list_outbox_entries_bounded(site.id(), 10).await?;
+        assert_eq!(
+            all.iter().map(OutboxEntry::sequence).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "a bound above the queue size is the full newest-first listing"
+        );
+        assert!(
+            store
+                .list_outbox_entries_bounded(site.id(), 0)
+                .await?
+                .is_empty(),
+            "a zero bound reads nothing"
+        );
+
+        // Another instance's entries never leak into this scan.
+        let other = SiteInstance::new(
+            InstanceId::generate(),
+            String::from("Site Two"),
+            InstanceKind::Site,
+            base,
+        );
+        store.create_instance(&other).await?;
+        store
+            .create_outbox_entry(&outbox_entry(&other, 1, base))
+            .await?;
+        let page = store.list_outbox_entries_bounded(site.id(), 2).await?;
+        assert_eq!(
+            page.iter().map(OutboxEntry::sequence).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
 
         store.close().await?;
         drop(directory);

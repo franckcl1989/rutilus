@@ -32,11 +32,61 @@ use rutilus_domain::{
     BatchOperation, EndpointId, FailureKind, Operation, OperationId, OperationSource,
     OperationState, OperationTarget, RedfishCommand,
 };
-use rutilus_operation_engine::{EngineError, MAX_BATCH_TARGETS, OperationEngine, OperationStore};
+use rutilus_operation_engine::{
+    BoundaryFuture, ClassifiedBatchChild, EngineError, MAX_BATCH_TARGETS, OperationEngine,
+    OperationStore,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::EndpointRefreshRepository;
+
+/// The batch-classified operation listing boundary (V4P-1): one call pairs
+/// every listed operation with its persisted §13.7 failure classification,
+/// instead of one [`OperationStore::find_failure_kind`] read per row.
+///
+/// The blanket implementation over store references is the honest fallback:
+/// it lists through [`OperationStore::list_operations`] and reads each
+/// row's classification through [`OperationStore::find_failure_kind`] — the
+/// exact per-row shape every store without a batch read must keep. A store
+/// with a batch-classified read overrides the boundary on its concrete
+/// type; the production repository exposes that read as
+/// `SqliteStore::list_operations_classified` (one query carrying the
+/// classification column), and the override wiring is the embedding
+/// runtime's composition point.
+pub trait ClassifiedOperationListing: OperationStore {
+    /// Lists operations, optionally filtered by exact state, each paired
+    /// with its persisted §13.7 failure classification — the batch twin of
+    /// listing plus per-row classification lookups.
+    fn list_classified(
+        &self,
+        state: Option<OperationState>,
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>>;
+}
+
+impl<Store> ClassifiedOperationListing for &Store
+where
+    Store: OperationStore + ?Sized,
+{
+    /// The fallback for stores without a batch-classified read: the
+    /// classification is read once per listed row through the base
+    /// boundary, so the pairings stay truthful on every store — the batch
+    /// read is the override, never a different contract.
+    fn list_classified(
+        &self,
+        state: Option<OperationState>,
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+        Box::pin(async move {
+            let operations = self.list_operations(state).await?;
+            let mut classified = Vec::with_capacity(operations.len());
+            for operation in operations {
+                let kind = self.find_failure_kind(operation.id()).await?;
+                classified.push((operation, kind));
+            }
+            Ok(classified)
+        })
+    }
+}
 
 /// Persists validated operation submissions and answers operation queries.
 ///
@@ -50,7 +100,7 @@ pub struct OperationSubmission<Store, Lookup> {
 
 impl<Store, Lookup> OperationSubmission<Store, Lookup>
 where
-    Store: OperationStore,
+    Store: OperationStore + ClassifiedOperationListing,
     Lookup: EndpointRefreshRepository,
 {
     #[must_use]
@@ -196,37 +246,28 @@ where
     /// Lists persisted operations, optionally filtered by exact state, each
     /// paired with its persisted §13.7 failure classification (E3-4).
     ///
-    /// The optional filter is forwarded unchanged to the engine; `None` lists
-    /// every operation. Batch reporting (design section 13.7) filters per
-    /// state to summarize outcomes. Each row is paired with the kind its
-    /// operation is classified with — `None` for every operation that is not
-    /// a classified failure — read through the store boundary's
-    /// [`OperationStore::find_failure_kind`], so the console history renders
-    /// a provably-unsupported refusal instead of an ordinary failure. One
-    /// classification read per row keeps the bounded console listing honest
-    /// without a new classified-listing boundary.
+    /// The optional filter is forwarded unchanged; `None` lists every
+    /// operation. Batch reporting (design section 13.7) filters per state to
+    /// summarize outcomes. Each row is paired with the kind its operation is
+    /// classified with — `None` for every operation that is not a classified
+    /// failure — read through the batch-classified boundary
+    /// ([`ClassifiedOperationListing`]), so the console history renders a
+    /// provably-unsupported refusal instead of an ordinary failure and the
+    /// classification costs one batch read (V4P-1), never one lookup per
+    /// row.
     ///
     /// # Errors
     ///
-    /// Returns [`SubmissionError::Store`] when the engine cannot read the
-    /// operation store or a classification lookup fails.
+    /// Returns [`SubmissionError::Store`] when the classified listing fails.
     pub async fn list(
         &self,
         state: Option<OperationState>,
     ) -> Result<Vec<(Operation, Option<FailureKind>)>, SubmissionError<Store::Error, Lookup::Error>>
     {
-        let engine = OperationEngine::new(&self.store);
-        let operations = engine.list(state).await.map_err(SubmissionError::Store)?;
-        let mut classified = Vec::with_capacity(operations.len());
-        for operation in operations {
-            let kind = self
-                .store
-                .find_failure_kind(operation.id())
-                .await
-                .map_err(|source| SubmissionError::Store(EngineError::Store(source)))?;
-            classified.push((operation, kind));
-        }
-        Ok(classified)
+        self.store
+            .list_classified(state)
+            .await
+            .map_err(|source| SubmissionError::Store(EngineError::Store(source)))
     }
 
     /// Reads one operation by id, paired with its persisted §13.7 failure
@@ -345,6 +386,12 @@ mod tests {
         // must keep the mock faithful.
         #[allow(clippy::zero_sized_map_values)]
         failure_kinds: Mutex<HashMap<OperationId, FailureKind>>,
+        /// How many batch-classified listings the store has answered
+        /// (V4P-1): the query test asserts one batch read per listing.
+        classified_listing_calls: Mutex<usize>,
+        /// How many per-row classification lookups the store has answered:
+        /// the query test asserts the batch path never falls back to them.
+        find_failure_kind_calls: Mutex<usize>,
     }
 
     impl MockStore {
@@ -357,7 +404,25 @@ mod tests {
                 // field's allow); the lint would prefer a set.
                 #[allow(clippy::zero_sized_map_values)]
                 failure_kinds: Mutex::new(HashMap::new()),
+                classified_listing_calls: Mutex::new(0),
+                find_failure_kind_calls: Mutex::new(0),
             }
+        }
+
+        /// The number of batch-classified listings answered so far.
+        fn classified_listing_calls(&self) -> Result<usize, MockError> {
+            self.classified_listing_calls
+                .lock()
+                .map(|calls| *calls)
+                .map_err(|_| MockError::Store)
+        }
+
+        /// The number of per-row classification lookups answered so far.
+        fn find_failure_kind_calls(&self) -> Result<usize, MockError> {
+            self.find_failure_kind_calls
+                .lock()
+                .map(|calls| *calls)
+                .map_err(|_| MockError::Store)
         }
 
         fn find_owned(&self, operation_id: OperationId) -> Result<Option<Operation>, MockError> {
@@ -506,6 +571,10 @@ mod tests {
             operation_id: OperationId,
         ) -> BoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
             Box::pin(async move {
+                *self
+                    .find_failure_kind_calls
+                    .lock()
+                    .map_err(|_| MockError::Store)? += 1;
                 Ok(self
                     .failure_kinds
                     .lock()
@@ -591,6 +660,42 @@ mod tests {
                     .list_batch_children_owned(batch_id)?
                     .into_iter()
                     .map(|child| (child, None))
+                    .collect())
+            })
+        }
+    }
+
+    /// The store's batch-classified listing (V4P-1): one call answers the
+    /// whole listing with its recorded classifications — the in-memory twin
+    /// of the production `SqliteStore::list_operations_classified` one-query
+    /// read, recording the call so the query test can assert the listing
+    /// costs one batch read.
+    impl ClassifiedOperationListing for MockStore {
+        fn list_classified(
+            &self,
+            state: Option<OperationState>,
+        ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+            Box::pin(async move {
+                *self
+                    .classified_listing_calls
+                    .lock()
+                    .map_err(|_| MockError::Store)? += 1;
+                let mut rows = self
+                    .rows
+                    .lock()
+                    .map_err(|_| MockError::Store)?
+                    .values()
+                    .filter(|operation| state.is_none_or(|state| operation.state() == state))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(|operation| (operation.created_at(), operation.id()));
+                let kinds = self.failure_kinds.lock().map_err(|_| MockError::Store)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|operation| {
+                        let kind = kinds.get(&operation.id()).copied();
+                        (operation, kind)
+                    })
                     .collect())
             })
         }
@@ -895,6 +1000,73 @@ mod tests {
         assert_eq!(
             submission.list(Some(OperationState::Succeeded)).await?,
             vec![(succeeded, None)]
+        );
+        Ok(())
+    }
+
+    /// V4P-1: the classified listing must cost exactly one batch read, never
+    /// one classification lookup per listed row.
+    #[tokio::test]
+    async fn list_classifies_every_row_with_one_batch_read_never_a_per_row_lookup()
+    -> Result<(), Box<dyn Error>> {
+        let store = MockStore::new();
+        let endpoint = managed_endpoint()?;
+        let lookup = MockLookup {
+            endpoints: vec![endpoint.clone()],
+            fail_lookup: false,
+        };
+        let submission = OperationSubmission::new(store, &lookup);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let failed = Operation::try_from_parts(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+            one_command(),
+            OperationState::Failed,
+            now,
+            now + Duration::SECOND,
+        )?;
+        submission
+            .store
+            .create_operation(&failed)
+            .await
+            .map_err(|_| std::io::Error::other("the mock store rejected the failed row"))?;
+        submission
+            .store
+            .record_failure_kind(failed.id(), FailureKind::CapabilityUnsupported)
+            .await
+            .map_err(|_| std::io::Error::other("the mock store rejected the classification"))?;
+        let queued = submission
+            .submit(
+                OperationSource::Site,
+                vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+                one_command(),
+                now,
+            )
+            .await?;
+
+        let listed = submission.list(None).await?;
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.contains(&(failed.clone(), Some(FailureKind::CapabilityUnsupported))),
+            "the classified row must pair with its recorded kind"
+        );
+        assert!(
+            listed.contains(&(queued.clone(), None)),
+            "the unclassified row must pair with no kind"
+        );
+
+        // One batch-classified read for the whole listing — and not one
+        // per-row classification lookup: the N+1 the batch read removes.
+        assert_eq!(
+            submission.store.classified_listing_calls()?,
+            1,
+            "the listing must classify every row through one batch read"
+        );
+        assert_eq!(
+            submission.store.find_failure_kind_calls()?,
+            0,
+            "the batch path must never fall back to per-row lookups"
         );
         Ok(())
     }

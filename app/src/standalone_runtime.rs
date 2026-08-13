@@ -16,14 +16,14 @@ use tracing::instrument;
 use axum::http::StatusCode;
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository,
-    CapabilitySnapshotRepository, CenterSessionRegistry, Clock, CoreResourceReader,
-    CredentialCreationRepository, CredentialInventoryRepository, CredentialResolver,
-    CredentialSecretProtector, DiscoveredEndpointRepository, EndpointInventoryItem,
-    EndpointInventoryRepository, EndpointRefreshRepository, EventIngestion, EventRepository,
-    EventStream, EventStreamPull, GroupRepository, MetricReportSnapshotReader, OperationExecutor,
-    ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential, ResourceDecodeFailure,
-    ResourceObservation, StoredCapability, TagRepository, TaskMonitor, TelemetryRepository,
-    TelemetrySampler, TlsIdentityProbe,
+    CapabilitySnapshotRepository, CenterSessionRegistry, ClassifiedOperationListing, Clock,
+    CoreResourceReader, CredentialCreationRepository, CredentialInventoryRepository,
+    CredentialResolver, CredentialSecretProtector, DiscoveredEndpointRepository,
+    EndpointInventoryItem, EndpointInventoryRepository, EndpointRefreshRepository, EventIngestion,
+    EventRepository, EventStream, EventStreamPull, GroupRepository, MetricReportSnapshotReader,
+    OperationExecutor, ProtectedCredentialCreation, RedfishDiscovery, ResolvedCredential,
+    ResourceDecodeFailure, ResourceObservation, StoredCapability, TagRepository, TaskMonitor,
+    TelemetryRepository, TelemetrySampler, TlsIdentityProbe,
 };
 use rutilus_domain::{
     Argon2IdHash, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BootstrapCode,
@@ -929,6 +929,21 @@ impl OperationStore for StandaloneState {
         batch_id: rutilus_domain::BatchOperationId,
     ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
         <SqliteStore as OperationStore>::list_batch_children(&self.store, batch_id)
+    }
+}
+
+impl ClassifiedOperationListing for StandaloneState {
+    /// Delegates the batch-classified §13.7 operation listing to the same
+    /// `SqliteStore` that owns every other aggregate, so the Web layer's
+    /// operation-history path (which composes the `ClassifiedOperationListing`
+    /// boundary of the product-services bundle) reads the store's one-query
+    /// classified listing (V4P-1) instead of resolving through the reference
+    /// blanket and paying one classification lookup per listed row.
+    fn list_classified(
+        &self,
+        state: Option<OperationState>,
+    ) -> OperationBoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+        <SqliteStore as ClassifiedOperationListing>::list_classified(&self.store, state)
     }
 }
 

@@ -1,7 +1,10 @@
 use std::error::Error;
 
 use rutilus_migration::Migrator;
-use sea_orm::{ActiveModelTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    Set,
+};
 use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -103,14 +106,19 @@ async fn widened_action_shapes_persist_and_foreign_shapes_are_refused() -> Resul
     let steps = rollback_steps_to(AUDIT_ACTION_SHAPES_MIGRATION)?;
     Migrator::down(&database, Some(steps)).await?;
 
-    // The restored schema refuses the widened shapes again.
-    let refused = insert_action_row(
+    // The restored schema refuses the widened shapes again. The row goes
+    // through raw SQL because the entity model names the
+    // `target_principal_id` column the restored table no longer has (the
+    // product-users rollback's precedent).
+    let refused = insert_raw_audit_row(
         &database,
+        Uuid::now_v7(),
         "login",
         "authenticate",
+        "product",
         None,
+        "none",
         "succeeded",
-        occurred_at,
     )
     .await;
     assert!(
@@ -132,8 +140,7 @@ async fn widened_rebuild_preserves_existing_audit_rows() -> Result<(), Box<dyn E
     let steps = migrations_before(AUDIT_ACTION_SHAPES_MIGRATION)?;
     Migrator::up(&database, Some(steps)).await?;
     let legacy_id = Uuid::now_v7();
-    let row = insert_legacy_audit_row(&database, legacy_id).await?;
-    assert_eq!(row.action, "enroll-endpoint");
+    insert_legacy_audit_row(&database, legacy_id).await?;
 
     // The rebuild preserves every legacy row.
     Migrator::up(&database, None).await?;
@@ -169,36 +176,73 @@ fn rollback_steps_to(name: &str) -> Result<u32, Box<dyn Error>> {
 }
 
 /// Writes one pre-slice audit row in the endpoint-management product shape,
-/// the only shape the table accepts before the widening.
+/// the only shape the table accepts before the widening, through raw SQL —
+/// the only way to write to an `audit_events` schema without the
+/// `target_principal_id` column, which the entity model names (the
+/// product-users rollback's precedent).
 async fn insert_legacy_audit_row(
     database: &DatabaseConnection,
     id: Uuid,
-) -> Result<rutilus_entity::audit_event::Model, sea_orm::DbErr> {
-    rutilus_entity::audit_event::ActiveModel {
-        id: Set(id),
-        operation_id: Set(Uuid::now_v7()),
-        event_sequence: Set(1),
-        actor: Set(String::from("system")),
-        actor_principal_id: Set(None),
-        origin: Set(String::from("standalone")),
-        target_kind: Set(String::from("endpoint-address")),
-        target_endpoint_id: Set(None),
-        target_endpoint_address: Set(Some(String::from("https://192.0.2.90"))),
-        parameter_kind: Set(String::from("endpoint-enrollment")),
-        credential_id: Set(Some(Uuid::now_v7())),
-        trust_mode: Set(Some(String::from("pinned-certificate"))),
-        row_count: Set(None),
-        permission: Set(String::from("manage-endpoints")),
-        action: Set(String::from("enroll-endpoint")),
-        redfish_operation: Set(String::from("probe-core-capabilities")),
-        outcome: Set(String::from("started")),
-        progress: Set(None),
-        failure: Set(None),
-        verification: Set(None),
-        occurred_at: Set(OffsetDateTime::now_utc()),
-    }
-    .insert(database)
-    .await
+) -> Result<(), sea_orm::DbErr> {
+    database
+        .execute_unprepared(&format!(
+            "INSERT INTO audit_events \
+             (id, operation_id, event_sequence, actor, actor_principal_id, origin, \
+              target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
+              credential_id, trust_mode, row_count, permission, action, redfish_operation, \
+              outcome, progress, failure, verification, occurred_at) \
+             VALUES (X'{id}', X'{operation_id}', 1, 'system', NULL, 'standalone', \
+              'endpoint-address', NULL, 'https://192.0.2.90', 'endpoint-enrollment', \
+              X'{credential_id}', 'pinned-certificate', NULL, 'manage-endpoints', \
+              'enroll-endpoint', 'probe-core-capabilities', 'started', NULL, NULL, NULL, \
+              '2026-08-07 12:00:00')",
+            id = id.simple(),
+            operation_id = Uuid::now_v7().simple(),
+            credential_id = Uuid::now_v7().simple(),
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Writes one terminal audit row through raw SQL — the only way to write to
+/// an `audit_events` schema without the `target_principal_id` column, which
+/// the entity model names (the product-users rollback's precedent).
+#[allow(clippy::too_many_arguments)]
+async fn insert_raw_audit_row(
+    database: &DatabaseConnection,
+    id: Uuid,
+    action: &str,
+    permission: &str,
+    target_kind: &str,
+    target_endpoint_id: Option<Uuid>,
+    redfish_operation: &str,
+    outcome: &str,
+) -> Result<(), sea_orm::DbErr> {
+    let target_endpoint = match target_endpoint_id {
+        Some(target_endpoint_id) => format!("X'{}'", target_endpoint_id.simple()),
+        None => String::from("NULL"),
+    };
+    let verification = if outcome == "succeeded" {
+        "'confirmed'"
+    } else {
+        "'rejected'"
+    };
+    database
+        .execute_unprepared(&format!(
+            "INSERT INTO audit_events \
+             (id, operation_id, event_sequence, actor, actor_principal_id, origin, \
+              target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
+              credential_id, trust_mode, row_count, permission, action, redfish_operation, \
+              outcome, progress, failure, verification, occurred_at) \
+             VALUES (X'{id}', X'{operation_id}', 2, 'system', NULL, 'standalone', \
+              '{target_kind}', {target_endpoint}, NULL, 'endpoint-refresh', NULL, NULL, \
+              NULL, '{permission}', '{action}', '{redfish_operation}', '{outcome}', NULL, \
+              NULL, {verification}, '2026-08-07 12:00:00')",
+            id = id.simple(),
+            operation_id = Uuid::now_v7().simple(),
+        ))
+        .await
+        .map(|_| ())
 }
 
 /// Writes one terminal audit row in the §16 authentication-slice product
@@ -217,6 +261,7 @@ async fn insert_action_row(
         event_sequence: Set(if outcome == "started" { 1 } else { 2 }),
         actor: Set(String::from("user")),
         actor_principal_id: Set(Some(Uuid::now_v7())),
+        target_principal_id: Set(None),
         origin: Set(String::from("standalone")),
         target_kind: Set(String::from("product")),
         target_endpoint_id: Set(None),

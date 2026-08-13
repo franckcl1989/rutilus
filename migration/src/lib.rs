@@ -36,6 +36,7 @@ mod m20260812_000001_resource_decode_failures;
 mod m20260812_000002_resource_feature_lists;
 mod m20260813_000001_audit_center_actions;
 mod m20260813_000002_endpoint_health_checks;
+mod m20260813_000003_audit_failure_vocabulary;
 
 pub struct Migrator;
 
@@ -68,6 +69,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260812_000002_resource_feature_lists::Migration),
             Box::new(m20260813_000001_audit_center_actions::Migration),
             Box::new(m20260813_000002_endpoint_health_checks::Migration),
+            Box::new(m20260813_000003_audit_failure_vocabulary::Migration),
         ]
     }
 }

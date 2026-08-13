@@ -1,7 +1,10 @@
 use std::error::Error;
 
 use rutilus_migration::Migrator;
-use sea_orm::{ActiveModelTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, EntityTrait,
+    Set,
+};
 use sea_orm_migration::MigratorTrait;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -92,22 +95,36 @@ async fn execute_operation_shapes_persist_and_foreign_shapes_are_refused()
     Migrator::down(&database, Some(steps)).await?;
 
     // The restored 000007 schema refuses the execution shape again, while
-    // the authentication shapes it gained stay accepted.
-    let refused = insert_execute_row(&database, "reset-system", occurred_at).await;
+    // the authentication shapes it gained stay accepted. The rows go through
+    // raw SQL because the entity model names the `target_principal_id`
+    // column the restored table no longer has (the product-users rollback's
+    // precedent).
+    let refused = insert_raw_audit_row(
+        &database,
+        Uuid::now_v7(),
+        "execute-operation",
+        "execute-operations",
+        "endpoint",
+        Some(Uuid::now_v7()),
+        "reset-system",
+        "succeeded",
+    )
+    .await;
     assert!(
         refused.is_err(),
         "the rolled-back schema must not know the execution shape"
     );
-    let authentication = insert_action_row(
+    insert_raw_audit_row(
         &database,
+        Uuid::now_v7(),
         "login",
         "authenticate",
+        "product",
         None,
+        "none",
         "succeeded",
-        occurred_at,
     )
     .await?;
-    assert_eq!(authentication.action, "login");
 
     Ok(())
 }
@@ -123,21 +140,22 @@ async fn execute_rebuild_preserves_existing_audit_rows() -> Result<(), Box<dyn E
     // list.
     let steps = migrations_before(AUDIT_EXECUTE_OPERATION_MIGRATION)?;
     Migrator::up(&database, Some(steps)).await?;
-    let row = insert_action_row(
+    let legacy_id = Uuid::now_v7();
+    insert_raw_audit_row(
         &database,
+        legacy_id,
         "manage-settings",
         "manage-site-settings",
+        "product",
         None,
+        "none",
         "succeeded",
-        OffsetDateTime::now_utc(),
     )
     .await?;
-    assert_eq!(row.action, "manage-settings");
-    assert_eq!(row.verification.as_deref(), Some("confirmed"));
 
     // The rebuild preserves every legacy row.
     Migrator::up(&database, None).await?;
-    let stored = rutilus_entity::audit_event::Entity::find_by_id(row.id)
+    let stored = rutilus_entity::audit_event::Entity::find_by_id(legacy_id)
         .one(&database)
         .await?
         .ok_or("the legacy audit row must survive the rebuild")?;
@@ -193,6 +211,7 @@ fn execute_row(
         event_sequence: Set(2),
         actor: Set(String::from("system")),
         actor_principal_id: Set(None),
+        target_principal_id: Set(None),
         origin: Set(String::from("standalone")),
         target_kind: Set(String::from("endpoint")),
         target_endpoint_id: Set(Some(Uuid::now_v7())),
@@ -212,47 +231,45 @@ fn execute_row(
     }
 }
 
-/// Writes one terminal audit row in the §16 authentication-slice product
-/// shape, the pre-execution schema's vocabulary.
-async fn insert_action_row(
+/// Writes one terminal audit row through raw SQL — the only way to write to
+/// an `audit_events` schema without the `target_principal_id` column, which
+/// the entity model names (the product-users rollback's precedent).
+#[allow(clippy::too_many_arguments)]
+async fn insert_raw_audit_row(
     database: &DatabaseConnection,
+    id: Uuid,
     action: &str,
     permission: &str,
-    failure: Option<&str>,
+    target_kind: &str,
+    target_endpoint_id: Option<Uuid>,
+    redfish_operation: &str,
     outcome: &str,
-    occurred_at: OffsetDateTime,
-) -> Result<rutilus_entity::audit_event::Model, sea_orm::DbErr> {
-    rutilus_entity::audit_event::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        operation_id: Set(Uuid::now_v7()),
-        event_sequence: Set(if outcome == "started" { 1 } else { 2 }),
-        actor: Set(String::from("user")),
-        actor_principal_id: Set(Some(Uuid::now_v7())),
-        origin: Set(String::from("standalone")),
-        target_kind: Set(String::from("product")),
-        target_endpoint_id: Set(None),
-        target_endpoint_address: Set(None),
-        parameter_kind: Set(String::from("endpoint-refresh")),
-        credential_id: Set(None),
-        trust_mode: Set(None),
-        row_count: Set(None),
-        permission: Set(permission.to_owned()),
-        action: Set(action.to_owned()),
-        redfish_operation: Set(String::from("none")),
-        outcome: Set(outcome.to_owned()),
-        progress: Set(None),
-        failure: Set(failure.map(str::to_owned)),
-        verification: Set(if outcome == "succeeded" {
-            Some(String::from("confirmed"))
-        } else if outcome == "failed" {
-            Some(String::from("rejected"))
-        } else {
-            None
-        }),
-        occurred_at: Set(occurred_at),
-    }
-    .insert(database)
-    .await
+) -> Result<(), sea_orm::DbErr> {
+    let target_endpoint = match target_endpoint_id {
+        Some(target_endpoint_id) => format!("X'{}'", target_endpoint_id.simple()),
+        None => String::from("NULL"),
+    };
+    let verification = if outcome == "succeeded" {
+        "'confirmed'"
+    } else {
+        "'rejected'"
+    };
+    database
+        .execute_unprepared(&format!(
+            "INSERT INTO audit_events \
+             (id, operation_id, event_sequence, actor, actor_principal_id, origin, \
+              target_kind, target_endpoint_id, target_endpoint_address, parameter_kind, \
+              credential_id, trust_mode, row_count, permission, action, redfish_operation, \
+              outcome, progress, failure, verification, occurred_at) \
+             VALUES (X'{id}', X'{operation_id}', 2, 'system', NULL, 'standalone', \
+              '{target_kind}', {target_endpoint}, NULL, 'endpoint-refresh', NULL, NULL, \
+              NULL, '{permission}', '{action}', '{redfish_operation}', '{outcome}', NULL, \
+              NULL, {verification}, '2026-08-07 12:00:00')",
+            id = id.simple(),
+            operation_id = Uuid::now_v7().simple(),
+        ))
+        .await
+        .map(|_| ())
 }
 
 /// Opens one database in a fresh temporary directory.

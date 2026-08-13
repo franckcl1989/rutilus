@@ -131,6 +131,23 @@ stable_audit_codes! {
     }
 }
 
+impl AuditAction {
+    /// Whether the action names a subject distinct from its actor (S3-4).
+    ///
+    /// `ChangePassword` names the principal whose credential the action
+    /// changes — the administrator-issued password set records the user
+    /// whose credential was replaced — and is the only action of the
+    /// current vocabulary that may carry a target principal
+    /// (`AuditOperationContext::with_target_principal`). The `audit_events`
+    /// schema CHECK (`ck_audit_events_target_principal`) pins the same rule
+    /// on persisted rows, and the persistence read-back treats a stored
+    /// target under any other action as corrupt.
+    #[must_use]
+    pub const fn names_distinct_target_principal(self) -> bool {
+        matches!(self, Self::ChangePassword)
+    }
+}
+
 stable_audit_codes! {
     /// The public typed Redfish operation used by a product action.
     ///
@@ -779,6 +796,17 @@ impl AuditOperationContext {
     /// current vocabulary: it is attached by the web handler at the one
     /// site that names a distinct subject, after the constructor's
     /// consistency matrix has checked the action shape.
+    ///
+    /// # The shape contract
+    ///
+    /// Only an action where [`AuditAction::names_distinct_target_principal`]
+    /// is true — [`AuditAction::ChangePassword`], the one S3-4 action of the
+    /// current vocabulary — may carry a target principal. The method stays
+    /// infallible because its only production caller attaches the target
+    /// exactly at that one action; the `audit_events` schema CHECK
+    /// (`ck_audit_events_target_principal`) refuses any persisted row that
+    /// attaches one elsewhere, and the persistence read-back treats such a
+    /// stored row as corrupt.
     #[must_use]
     pub fn with_target_principal(mut self, target_principal_id: PrincipalId) -> Self {
         self.target_principal_id = Some(target_principal_id);
@@ -1402,6 +1430,11 @@ mod tests {
         let context = context.with_target_principal(target);
         assert_eq!(context.actor_principal_id(), Some(actor));
         assert_eq!(context.target_principal_id(), Some(target));
+        // The shape contract: only the action that names a subject distinct
+        // from its actor may carry a target principal, and the schema CHECK
+        // (`ck_audit_events_target_principal`) pins the same rule on
+        // persisted rows, so the domain side names the one allowed action.
+        assert!(context.action().names_distinct_target_principal());
         // The target is operation-level metadata: it rides every event of
         // the operation, started and terminal alike.
         let now = OffsetDateTime::now_utc();
@@ -1424,6 +1457,18 @@ mod tests {
             Some(actor),
         )?;
         assert_eq!(login.target_principal_id(), None);
+        assert!(!login.action().names_distinct_target_principal());
+        for action in [
+            AuditAction::EnrollEndpoint,
+            AuditAction::ExecuteOperation,
+            AuditAction::ManageUsers,
+            AuditAction::RegisterSiteBinding,
+        ] {
+            assert!(
+                !action.names_distinct_target_principal(),
+                "{action} names no subject distinct from its actor"
+            );
+        }
         Ok(())
     }
 

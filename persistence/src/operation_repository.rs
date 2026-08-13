@@ -614,6 +614,68 @@ impl SqliteStore {
             .map_err(OperationRepositoryError::Database)?;
         Ok(operations)
     }
+
+    /// Lists every operation with its persisted §13.7 failure
+    /// classification, in one query (V4P-1: the classified console listing
+    /// must cost one read, not one listing plus one classification lookup
+    /// per row).
+    ///
+    /// The method is the batch-classified twin of [`Self::list_operations`]
+    /// in the shape of [`Self::list_batch_children`]: the state filter, the
+    /// acceptance order, and the corrupt-aggregate rule are identical to the
+    /// plain listing, and every row is additionally paired with its
+    /// persisted failure kind — `None` for every operation that is not a
+    /// classified failure — read from the same row the query already
+    /// materialized, so the classification never costs a second query. The
+    /// kind code is rehydrated through the domain [`FailureKind`]
+    /// deserializer with the same corrupt-aggregate rule as the
+    /// batch-children listing: a stored code this build cannot classify
+    /// makes the whole listing [`OperationRepositoryError::Corrupt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError`] when the query fails or any
+    /// persisted operation or classification violates domain invariants.
+    pub async fn list_operations_classified(
+        &self,
+        state: Option<OperationState>,
+    ) -> Result<Vec<(Operation, Option<FailureKind>)>, OperationRepositoryError> {
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut query = operation::Entity::find();
+        if let Some(state) = state {
+            query = query.filter(operation::Column::State.eq(state.as_str()));
+        }
+        let models = query
+            .order_by_asc(operation::Column::CreatedAt)
+            .order_by_asc(operation::Column::Id)
+            .all(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let mut classified = Vec::with_capacity(models.len());
+        for model in models {
+            let operation_id = OperationId::from_uuid(model.id);
+            let failure_kind = model
+                .failure_kind
+                .as_deref()
+                .map(|code| {
+                    code.parse::<FailureKind>()
+                        .map_err(StoredOperationError::InvalidFailureKind)
+                        .map_err(|source| corrupt(operation_id, source))
+                })
+                .transpose()?;
+            let operation = map_stored_operation(self, &transaction, operation_id, model).await?;
+            classified.push((operation, failure_kind));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(classified)
+    }
 }
 
 impl SqliteStore {
@@ -1495,6 +1557,74 @@ mod tests {
         Ok(())
     }
 
+    /// The batch-classified listing (V4P-1) must pair every row with its
+    /// persisted failure kind from the same query that materialized it: one
+    /// read for the whole classified history, never one classification
+    /// lookup per row.
+    #[tokio::test]
+    async fn list_operations_classified_pairs_every_row_with_its_kind_in_acceptance_order()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let base = OffsetDateTime::now_utc();
+        let unclassified = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            base,
+        );
+        let classified = queued_operation(
+            OperationSource::Standalone,
+            &three_sorted_targets(),
+            one_command(),
+            base + Duration::SECOND,
+        );
+        for operation in [&unclassified, &classified] {
+            store.create_operation(operation).await?;
+        }
+        let classified_id = classified.id();
+        store
+            .record_failure_kind(classified_id, FailureKind::CapabilityUnsupported)
+            .await?;
+
+        let listed = store.list_operations_classified(None).await?;
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].0, unclassified);
+        assert_eq!(
+            listed[0].1, None,
+            "an unclassified row must pair with no failure kind"
+        );
+        assert_eq!(listed[1].0, classified);
+        assert_eq!(
+            listed[1].1,
+            Some(FailureKind::CapabilityUnsupported),
+            "the classification must ride the same query as the row"
+        );
+
+        // The state filter narrows the classified listing exactly like the
+        // plain listing, and a classified row under the filter keeps its
+        // kind.
+        let classified_only = store
+            .list_operations_classified(Some(OperationState::Queued))
+            .await?;
+        assert_eq!(
+            classified_only
+                .iter()
+                .map(|(operation, _)| operation.id())
+                .collect::<Vec<_>>(),
+            vec![unclassified.id(), classified_id]
+        );
+        assert_eq!(
+            store
+                .list_operations_classified(Some(OperationState::Succeeded))
+                .await?,
+            Vec::new()
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn deleting_an_operation_cascades_to_its_targets() -> Result<(), Box<dyn Error>> {
         let (directory, store) = store_with_directory().await?;
@@ -2009,6 +2139,10 @@ mod tests {
         ));
         assert!(matches!(
             store.list_operations(None).await,
+            Err(OperationRepositoryError::CommandKeyMissing)
+        ));
+        assert!(matches!(
+            store.list_operations_classified(None).await,
             Err(OperationRepositoryError::CommandKeyMissing)
         ));
 

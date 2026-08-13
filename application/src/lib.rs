@@ -117,7 +117,7 @@ pub use event_ingestion::{
 };
 pub use group_management::{GroupManagement, GroupManagementError, GroupRepository};
 pub use operation_executor::{ExecutorError, OperationAuditStage, OperationExecutor};
-pub use operation_submission::{OperationSubmission, SubmissionError};
+pub use operation_submission::{ClassifiedOperationListing, OperationSubmission, SubmissionError};
 pub use overview::{
     OVERVIEW_RECENT_EVENTS, OverviewAggregate, OverviewCapabilityCoverage, OverviewEndpointCounts,
     OverviewFirmwareSummary, OverviewFreshnessBucket, OverviewFreshnessCount, OverviewHealthCount,

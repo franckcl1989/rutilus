@@ -128,6 +128,15 @@ where
     /// same call, so the summary of a batch that finishes mid-listing is
     /// still a single consistent snapshot per batch.
     ///
+    /// The listing reads one child batch per parent (the `B+1` shape, V4P-4,
+    /// registered): each child read is indexed by the batch id, the batch
+    /// count of one console page is small, and a merged read — one parents
+    /// query plus one children query over the whole id set — needs a store
+    /// boundary that does not exist yet (`OperationStore` has no
+    /// batch-listing-with-children method), so the merge is a follow-up on
+    /// the store boundary rather than a query-shape change this use case
+    /// can make.
+    ///
     /// # Errors
     ///
     /// Returns [`BatchQueryError::Store`] when the store rejects a read; one

@@ -4081,11 +4081,13 @@ fn project_center_endpoint(endpoint: &CenterEndpointView) -> CenterEndpointViewR
 
 /// Projects one center operation onto its console wire shape (§15.6).
 ///
-/// The tracking state is the record's derived phase. TODO(W3C-3): a
-/// `failed-unsupported` receipt (E3-4) tracks as a plain `failed` — the
-/// console state vocabulary has no unsupported phase and no classification
-/// field, so the tracking view cannot surface the classification without a
-/// vocabulary addition; tracked with the W3C-3 batch.
+/// The tracking state is the record's derived phase. TODO(W3C-3): the
+/// center-side classification has landed — a `failed-unsupported` receipt
+/// (E3-4) is recorded as the operation's §13.7 failure kind on the tracking
+/// record and in the durable receipt — so only the display-side vocabulary
+/// remains: the tracking view has no unsupported phase and no
+/// classification field, and the console still renders the plain `failed`
+/// phase; tracked with the W3C-3 batch.
 fn project_center_operation(operation: &CenterOperationView) -> CenterOperationResponse {
     CenterOperationResponse::new(
         operation.operation_id().into_uuid(),

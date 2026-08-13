@@ -284,6 +284,15 @@ impl OperationStore for SqliteStore {
     }
 }
 
+impl rutilus_application::ClassifiedOperationListing for SqliteStore {
+    fn list_classified(
+        &self,
+        state: Option<OperationState>,
+    ) -> BoundaryFuture<'_, Result<Vec<ClassifiedBatchChild>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_operations_classified(self, state).await })
+    }
+}
+
 impl RemoteTaskStore for SqliteStore {
     type Error = RemoteTaskRepositoryError;
 
@@ -508,6 +517,16 @@ impl rutilus_application::CenterOutbox for SqliteStore {
         instance_id: InstanceId,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
         Box::pin(async move { SqliteStore::list_outbox_entries(self, instance_id).await })
+    }
+
+    fn list_offers_bounded(
+        &self,
+        instance_id: InstanceId,
+        limit: u64,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Box::pin(
+            async move { SqliteStore::list_outbox_entries_bounded(self, instance_id, limit).await },
+        )
     }
 
     fn acknowledge(

@@ -45,11 +45,11 @@ use std::{
 
 use rutilus_application::{
     AdmissionRejection, BoundaryFuture, CenterBindingFlow, CenterBindingFlowError,
-    CenterBindingRepository, CenterDispatchError, CenterFrameProcessor, CenterInboundEngine,
-    CenterInboundOptions, CenterInboundSession, CenterOperationDispatch, CenterOperationRequest,
-    CenterOperationTracking, CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock,
-    DisconnectOnDrop, InstanceRepository, IssuedSiteCertificate, OperationStore,
-    SiteCertificateIssuer,
+    CenterBindingRepository, CenterDispatchError, CenterEndpointProjection, CenterFrameProcessor,
+    CenterInboundEngine, CenterInboundOptions, CenterInboundSession, CenterOperationDispatch,
+    CenterOperationRequest, CenterOperationTracking, CenterProjection, CenterSessionAdmission,
+    CenterTrustAnchor, Clock, DisconnectOnDrop, InstanceRepository, IssuedSiteCertificate,
+    OperationStore, SiteCertificateIssuer,
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
@@ -474,6 +474,25 @@ impl CenterServices for StandaloneState {
     }
 }
 
+/// The offer-scan bound of the center's operation tracking view (V4P-2):
+/// at most the newest 256 outbox entries of each involved site are
+/// decrypted per view, so a pathological queue can never make one console
+/// page decrypt its whole history.
+///
+/// The value matches the dispatch retry's offer-scan bound
+/// (`CENTER_DISPATCH_OFFER_SCAN_LIMIT`, 256): the same working-set argument
+/// — each undecided operation holds at most one pending offer, so the
+/// realistic per-site offer window stays far below the bound. The bound is
+/// deliberately not a visibility guarantee:
+/// an operation whose newest offer lies beyond the window renders without
+/// its offer facts (the target, the actor context, and the offer expiry),
+/// while its tracking record — the ids, the command, and the state — never
+/// depends on the scan. There is no `operation_id` column to direct the
+/// read at the offers of the displayed operations (the payload is a
+/// ciphertext envelope), so the newest-`limit` window is the smallest
+/// honest decryption surface.
+const CENTER_VIEW_OFFER_SCAN_LIMIT: u64 = 256;
+
 impl StandaloneState {
     /// The center's §15.6 operation tracking view.
     ///
@@ -481,7 +500,8 @@ impl StandaloneState {
     /// the §13.2 state; the offer facts the records do not persist — the
     /// target, the actor context, and the offer expiry — are rebuilt from
     /// the durable §15.6 offer envelopes in each involved site's outbox,
-    /// scanned once per site.
+    /// scanned once per site within the bounded window
+    /// ([`CENTER_VIEW_OFFER_SCAN_LIMIT`]).
     async fn list_center_operations(
         &self,
         site_filter: Option<InstanceId>,
@@ -490,10 +510,11 @@ impl StandaloneState {
             .await
             .map_err(CenterServicesError::Operation)?;
         // The endpoint projection names each operation's site, and the
-        // involved sites bound the offer scan.
-        let mut operation_sites: HashMap<OperationId, Option<InstanceId>> = HashMap::new();
-        let mut involved_sites: HashSet<InstanceId> = HashSet::new();
-        let mut offers: HashMap<OperationId, OperationOffer> = HashMap::new();
+        // involved sites bound the offer scan. The projection rows of all
+        // involved endpoints resolve in one `IN` query (V4P-2), never one
+        // lookup per listed operation.
+        let mut endpoint_ids: Vec<EndpointId> = Vec::with_capacity(operations.len());
+        let mut operation_endpoints: HashMap<OperationId, EndpointId> = HashMap::new();
         for operation in &operations {
             let Some(endpoint_id) = operation
                 .targets()
@@ -502,13 +523,22 @@ impl StandaloneState {
             else {
                 continue;
             };
-            let projection = self
-                .store
-                .find_endpoint_projection(endpoint_id)
-                .await
-                .map_err(CenterServicesError::Projection)?;
-            let site = projection.and_then(|projection| projection.site_id());
-            operation_sites.insert(operation.id(), site);
+            endpoint_ids.push(endpoint_id);
+            operation_endpoints.insert(operation.id(), endpoint_id);
+        }
+        let projections = self
+            .store
+            .find_endpoint_projections(&endpoint_ids)
+            .await
+            .map_err(CenterServicesError::Projection)?;
+        let mut operation_sites: HashMap<OperationId, Option<InstanceId>> = HashMap::new();
+        let mut involved_sites: HashSet<InstanceId> = HashSet::new();
+        let mut offers: HashMap<OperationId, OperationOffer> = HashMap::new();
+        for (operation_id, endpoint_id) in operation_endpoints {
+            let site = projections
+                .get(&endpoint_id)
+                .and_then(CenterEndpointProjection::site_id);
+            operation_sites.insert(operation_id, site);
             if let Some(site) = site {
                 involved_sites.insert(site);
             }
@@ -516,7 +546,7 @@ impl StandaloneState {
         for site in involved_sites {
             let entries = self
                 .store
-                .list_outbox_entries(site)
+                .list_outbox_entries_bounded(site, CENTER_VIEW_OFFER_SCAN_LIMIT)
                 .await
                 .map_err(CenterServicesError::Outbox)?;
             for entry in entries {
@@ -539,7 +569,7 @@ impl StandaloneState {
                     let Ok(operation_id) = offer.operation_id.parse::<OperationId>() else {
                         continue;
                     };
-                    offers.insert(operation_id, offer);
+                    offers.entry(operation_id).or_insert(offer);
                 }
             }
         }

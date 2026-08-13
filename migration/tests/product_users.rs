@@ -498,6 +498,7 @@ async fn insert_audit_row(
         event_sequence: Set(1),
         actor: Set(actor.to_owned()),
         actor_principal_id: Set(actor_principal_id),
+        target_principal_id: Set(None),
         origin: Set(String::from("standalone")),
         target_kind: Set(String::from("endpoint-address")),
         target_endpoint_id: Set(None),
