@@ -22,6 +22,13 @@
 #
 # The toolchain comes exclusively from rust-toolchain.toml (channel 1.97.1,
 # components clippy + rustfmt); no version is hard-coded here.
+#
+# Repository self-protection (W6-2, 2026-08-13): .github/CODEOWNERS requires
+# explicit review for every change under .github/, including this workflow.
+# Branch protection is the stronger line of defense and lives OUTSIDE the
+# repository (repository settings are not version-controlled) — CODEOWNERS
+# is the in-repo mitigation so workflow changes still land in a reviewable
+# pull request even if those settings are ever loosened or the repo moves.
 
 name: CI
 
@@ -176,8 +183,12 @@ jobs:
       # advisories/bans/licenses/sources ok). Advisories stay green via the
       # two quick-xml ignores (RUSTSEC-2026-0194/0195) whose trigger notes
       # gate the nv-redfish quick-xml 0.41+ upgrade, and bans stay green via
-      # the sha1 0.10 skip (tokio-tungstenite 0.24); the action caches the
-      # advisory database on top of swatinem/rust-cache above.
+      # the sha1 0.10 skip (tokio-tungstenite 0.24). The action is a Docker
+      # container action with no cache step (verified against its action.yml,
+      # 2026-08-13): the advisory database is fetched fresh on every run, and
+      # the swatinem/rust-cache step above caches only cargo registry/build
+      # artifacts under a ref-scoped key — no advisory-database reuse and no
+      # cache pollution surface between runs either way.
       - name: Deny checks
         uses: embarkstudios/cargo-deny-action@v2
         with:
@@ -222,9 +233,21 @@ jobs:
       # value allow-lists (security/tests/secret_leak_gate.rs). The runtime
       # half (log/response review) stays with the release review. --locked
       # pins the committed Cargo.lock.
+      #
+      # W6-1 ran-assertion (2026-08-13): scripts/assert-tests-ran.sh fails
+      # the step unless the number of tests that actually ran and passed
+      # is >= 8. The pin is the master-measured count (2026-08-12 gate
+      # re-run, release-readiness.md §五: "security 门禁 8"): the 3
+      # workspace-scan tests plus the 5 rule-matrix tests of
+      # security/tests/secret_leak_gate.rs. Floor semantics, not exact
+      # count: the step fails only when the count dips below the pin —
+      # deleting the file, #[ignore]-ing its tests, or cfg-emptying them
+      # drops it to 0 and fails, while a partial reduction that still
+      # leaves >= 8 passing tests passes. The pin is the lower bound of
+      # the measured baseline; the test total grows with the product.
       - name: Secret leak gate
         if: matrix.is_default
-        run: cargo test --locked -p rutilus-security --test secret_leak_gate
+        run: bash scripts/assert-tests-ran.sh 8 --locked -p rutilus-security --test secret_leak_gate
 
       # §19.4: 跨平台 Build — wasm32 UI artifact. Commands mirror ui/README.md;
       # wasm-bindgen-cli must stay at 0.2.126, the exact workspace
@@ -305,9 +328,31 @@ jobs:
 
       # §19.4: Migration Test. Also covered by the full workspace test above;
       # kept as an explicit gate for visibility (migration/tests/initial_storage.rs).
+      #
+      # W6-1 ran-assertion (2026-08-13): scripts/assert-tests-ran.sh fails
+      # the step unless the number of tests that actually ran and passed
+      # is >= 38. The pin is the master-measured count (2026-08-12 gate
+      # re-run, release-readiness.md §五: "migration 38 = 30 基线 +
+      # 8 down_order_gate"; re-verified 2026-08-13 against the working
+      # tree at 40 with down_order_gate at 10). Floor semantics, not
+      # exact count: the step fails only when the count dips below the
+      # pin — deleting a non-gate test file that still leaves 38-39
+      # passing tests passes, and only a dip below 38 (whole-suite
+      # deletion, #[ignore], or cfg-emptying) fails. The pin is the lower
+      # bound of the measured baseline; the test total grows with the
+      # product.
       - name: Migration test
         if: matrix.is_default
-        run: cargo test --locked -p rutilus-migration
+        run: bash scripts/assert-tests-ran.sh 38 --locked -p rutilus-migration
+
+      # Ran-assertion coverage (2026-08-13, W6-1 follow-up): the
+      # scripts/assert-tests-ran.sh gate currently covers exactly two
+      # steps — the Secret leak gate (pin 8) and the Migration test
+      # (pin 38) above. Release baseline check, Capability ledger check,
+      # and the workspace Test step are registered as future candidates
+      # but are NOT asserted yet: they still run plain `cargo test`, so a
+      # deleted or emptied suite there would pass the step uncaught
+      # until their assert-tests-ran.sh pins are added.
 
       # §19.4: Capability Ledger Check. Asserts the compiled nv-redfish
       # baseline (version 0.13.0, std-redfish, 14 OEM feature groups) in

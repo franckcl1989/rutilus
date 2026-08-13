@@ -1,0 +1,10 @@
+# W6-2 (2026-08-13): the .github/ directory — workflow definitions and this
+# file — is the repository's self-protection layer. Every change under
+# .github/, including .github/workflows/ci.yml, requires explicit review by
+# an owner.
+#
+# Branch protection (repository settings, outside version control) is the
+# stronger line of defense; CODEOWNERS is the in-repo mitigation so workflow
+# changes land in a reviewable pull request even where those settings are
+# looser or the repo moves. Registered in the ci.yml header comment.
+.github/ @franckcl1989
