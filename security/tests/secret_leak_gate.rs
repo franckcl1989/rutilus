@@ -7,26 +7,67 @@
 //! material, and plaintext credential disclosure in output macros. The
 //! runtime half (log/response review) stays with the release review.
 //!
-//! Scope: every `*/src/**/*.rs` and `*/tests/**/*.rs` file of the workspace.
-//! Crate directories are discovered relative to `CARGO_MANIFEST_DIR`, so a
-//! newly added crate is covered automatically; `.claude` worktrees, `target`,
-//! and hidden directories are never crates. Files are lexed with the same
-//! tokenizer as the migration bare-SQL gate (`migration/tests/bare_sql_gate.rs`):
-//! comments and doc comments are stripped, and plain, byte, and raw string
-//! literals are recognized as tokens, so none of the checks can be fooled by
-//! quoting.
+//! Scope: every `*/src/**/*.rs` and `*/tests/**/*.rs` file of the workspace,
+//! plus each crate's `build.rs` build script (build scripts are production
+//! code — they compile protos and generate code, and they ship in the
+//! release build). Crate directories are discovered relative to
+//! `CARGO_MANIFEST_DIR`, so a newly added crate is covered automatically;
+//! `.claude` worktrees, `target`, and hidden directories are never crates.
+//! Files are lexed with the same tokenizer as the migration bare-SQL gate
+//! (`migration/tests/bare_sql_gate.rs`): comments and doc comments are
+//! stripped, and plain, byte, and raw string literals are recognized as
+//! tokens, so none of the checks can be fooled by quoting.
 //!
 //! Rules:
 //!
-//! [R1] Hardcoded secrets — an identifier that names a secret is directly
-//! bound to a non-empty string literal: `let password = "..."`, a struct
-//! field `password: "..."`, the typed-let shape `let password: SecretString =
-//! "..."`, each optionally through a leading `&`. The identifier set is
-//! `password`/`passwd`/`pwd`/`passphrase`/`secret`/`token`/`api_key`/
-//! `apikey`/`master_key`/`bootstrap_code` and their `*_<name>` compound forms
-//! (`session_token`, `account_password`, ...), matched case-insensitively.
-//! Identifiers that merely *name* non-secrets are excluded on purpose:
-//! `credential_id`/`endpoint_id` are addresses, `password_hash` is a digest.
+//! [R1] Hardcoded secrets — an identifier that names a secret is bound to a
+//! non-empty string literal:
+//!
+//! - directly: `let password = "..."`, a struct field `password: "..."`,
+//!   the typed-let shape `let password: SecretString = "..."`, each
+//!   optionally through a leading `&`;
+//! - through a wrapper: `let password = String::from("...")`,
+//!   `let password = "..." .to_string()`/`.to_owned()`, `let password =
+//!   format!("...")`, `let password = concat!("a", "b")` — the wrapper must
+//!   hold a non-empty literal or an identifier that itself resolves to a
+//!   `let`-bound literal (`format!("{}", s)` with `let s = "..."`);
+//! - through an identifier indirection: `let s = "..."; let password = s;`
+//!   — the bound identifier resolves (transitively, forward-only, and
+//!   scope-aware) to a `let`-bound literal.
+//!
+//! The identifier set is `password`/`passwd`/`pwd`/`passphrase`/`secret`/
+//! `token`/`api_key`/`apikey`/`master_key`/`bootstrap_code` and their
+//! `*_<name>` compound forms (`session_token`, `account_password`, ...),
+//! matched case-insensitively. Identifiers that merely *name* non-secrets
+//! are excluded on purpose: `credential_id`/`endpoint_id` are addresses,
+//! `password_hash` is a digest.
+//!
+//! Indistinguishable forms, registered on purpose: the gate flags only
+//! *bindings of sensitive identifiers*, because that is the shape that
+//! separates a hardcoded secret from benign code without value heuristics
+//! (which the gate deliberately does not use — see the fixture-literal
+//! exclusion). A literal wrapped into a *non-sensitive* name
+//! (`let x = String::from("secret")`) is therefore not flagged: it is
+//! mechanically indistinguishable from `String::from("hello")`. Likewise a
+//! sensitive identifier bound to a *function call* (`let password = f()`) is
+//! not flagged, even when `f` returns a literal, and a binding reassigned in
+//! its own block (`let mut s = "..."; s = input(); let password = s;`) does
+//! not resolve — the reassignment shadows the earlier literal. Two wrapper
+//! shapes are additionally missed: the struct-field `:` branch of
+//! `binding_equals` accepts only a direct literal, so
+//! `password: String::from("x")` is not flagged, and `record_let_binding`
+//! resolves only literals and bare identifiers, so a wrapper-bound name
+//! never resolves through the indirection rule (`let x = String::from("x");
+//! let password = x;` is not flagged). Each of these is a false-negative
+//! edge of the token scan, accepted in exchange for a purely mechanical
+//! check that needs no value heuristics.
+//!
+//! The one registered false-positive edge is block-local mutation: binding
+//! records live per block, so an assignment inside a nested block does not
+//! invalidate the outer binding. `let s = "hunter2"; { s = f(); }
+//! let password = s;` re-resolves `s` to the stale literal once the block
+//! closes and is flagged, although `s` then holds `f()`'s value, not the
+//! literal.
 //!
 //! [R2] Embedded private-key material — a string literal containing a
 //! complete PEM block: a `-----BEGIN ... PRIVATE KEY-----` header and a
@@ -87,7 +128,7 @@
 //! it fails on any production-scope hit, which on the current tree means the
 //! workspace is expected to scan green.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -537,11 +578,19 @@ const CATALOG_MACRO: &str = "strings_catalog";
 /// "next item is test-gated" flag set by the preceding attribute, and —
 /// separately — whether each block is a `strings_catalog!` macro body
 /// (catalog-construction scope, [R1]-exempt).
+///
+/// Alongside the scopes it tracks `let` bindings per block: each level holds
+/// `name -> Some(literal)` for a name bound to a direct literal (or to an
+/// identifier that resolved to one at binding time) and `name -> None` for a
+/// name bound to anything else, which shadows the name for the [R1]
+/// identifier-indirection rule. The stack pops with the block, so a binding
+/// cannot leak past its scope.
 struct ScopeTracker {
     stack: Vec<bool>,
     pending_test: bool,
     catalog_stack: Vec<bool>,
     pending_catalog: bool,
+    bindings: Vec<HashMap<String, Option<String>>>,
 }
 
 impl ScopeTracker {
@@ -551,6 +600,7 @@ impl ScopeTracker {
             pending_test: false,
             catalog_stack: vec![false],
             pending_catalog: false,
+            bindings: vec![HashMap::new()],
         }
     }
 
@@ -575,6 +625,7 @@ impl ScopeTracker {
         let in_catalog = self.pending_catalog || self.in_catalog();
         self.catalog_stack.push(in_catalog);
         self.pending_catalog = false;
+        self.bindings.push(HashMap::new());
     }
 
     fn close_brace(&mut self) {
@@ -584,6 +635,32 @@ impl ScopeTracker {
         if self.catalog_stack.len() > 1 {
             self.catalog_stack.pop();
         }
+        if self.bindings.len() > 1 {
+            self.bindings.pop();
+        }
+    }
+
+    /// Records a `let`/assignment binding of `name` at the current block
+    /// level: `Some(literal)` for a direct literal, `None` for anything else
+    /// (shadowing any earlier binding of the name for the indirection rule).
+    fn record_binding(&mut self, name: &str, literal: Option<String>) {
+        if let Some(level) = self.bindings.last_mut() {
+            level.insert(name.to_owned(), literal);
+        }
+    }
+
+    /// The literal a `let`-bound name resolves to at this point of the scan,
+    /// or `None` when the name is not bound to a literal: not bound at all,
+    /// shadowed by a non-literal binding in an inner scope, or invalidated
+    /// by an assignment. The innermost binding wins, and the stored value is
+    /// the *final* literal (transitive chains collapse at binding time).
+    fn resolve_binding(&self, name: &str) -> Option<String> {
+        for level in self.bindings.iter().rev() {
+            if let Some(value) = level.get(name) {
+                return value.clone();
+            }
+        }
+        None
     }
 
     fn on_attribute(&mut self, is_test: bool) {
@@ -602,32 +679,28 @@ impl ScopeTracker {
     }
 }
 
-/// The `(line, literal)` of a string literal directly bound to the
-/// identifier at `i` by `=` or `:` (struct field), optionally through a
-/// leading `&`, or the typed-let shape `name: Type = "..."` via a bounded
-/// lookahead over the type tokens.
-fn assigned_literal(tokens: &[Token], i: usize) -> Option<String> {
+/// The index of the `=` or `:` that binds the identifier at `i`: a plain
+/// `=`, a struct-field `:` whose value is a literal (`password: "..."`), or
+/// the typed-let shape `name: Type = "..."` via a bounded lookahead over the
+/// type tokens (the `;`/`{`/`}` terminals stop the scan, and a balanced
+/// `(...)` group is skipped whole).
+fn binding_equals(tokens: &[Token], i: usize) -> Option<usize> {
     let next = tokens.get(i + 1)?;
-    let binding = if next.is_punct('=') || next.is_punct(':') {
-        literal_after(tokens, i + 1)
-    } else {
-        None
-    };
-    if binding.is_some() {
-        return binding;
+    if next.is_punct('=') {
+        return Some(i + 1);
     }
     if !next.is_punct(':') {
         return None;
     }
-    // Typed-let lookahead: `let password: SecretString = "..."`. The type is
-    // a bounded run of identifiers, paths, and brackets; the `;`/`{`/`}`
-    // terminals stop the scan, and a balanced `(...)` group is skipped whole.
+    if literal_after(tokens, i + 1).is_some() {
+        return Some(i + 1);
+    }
     let mut depth = 0usize;
     let mut steps = 0usize;
     let mut j = i + 2;
     while steps < 12 && j < tokens.len() {
         match &tokens[j] {
-            Token::Punct { ch: '=', .. } => return literal_after(tokens, j),
+            Token::Punct { ch: '=', .. } => return Some(j),
             Token::Punct {
                 ch: ';' | '{' | '}',
                 ..
@@ -647,6 +720,13 @@ fn assigned_literal(tokens: &[Token], i: usize) -> Option<String> {
     None
 }
 
+/// The string literal directly bound to the identifier at `i` by `=` or `:`
+/// (struct field), optionally through a leading `&`, or the typed-let shape
+/// `name: Type = "..."`.
+fn assigned_literal(tokens: &[Token], i: usize) -> Option<String> {
+    binding_equals(tokens, i).and_then(|bind| literal_after(tokens, bind))
+}
+
 /// The content of the non-empty string literal after the binding token at
 /// `index` (`=` or `:`), skipping one optional `&`.
 fn literal_after(tokens: &[Token], index: usize) -> Option<String> {
@@ -658,6 +738,143 @@ fn literal_after(tokens: &[Token], index: usize) -> Option<String> {
         Some(Token::Str { content, .. } | Token::RawStr { content, .. }) if !content.is_empty() => {
             Some(content.clone())
         }
+        _ => None,
+    }
+}
+
+/// The index of the `=` that binds a `let` declaration's value, scanning
+/// from just past the declared name: skips the optional `: Type` run
+/// (bounded, like the typed-let lookahead) and stops at `;`/`{`/`}`.
+fn scan_to_binding_equals(tokens: &[Token], name_index: usize) -> Option<usize> {
+    let mut steps = 0usize;
+    let mut j = name_index + 1;
+    while steps < 12 && j < tokens.len() {
+        match &tokens[j] {
+            Token::Punct { ch: '=', .. } => return Some(j),
+            Token::Punct {
+                ch: ';' | '{' | '}',
+                ..
+            } => return None,
+            _ => {}
+        }
+        j += 1;
+        steps += 1;
+    }
+    None
+}
+
+/// Records the `let <name> = <value>` binding starting at the `let` token at
+/// `i`: the value is a direct literal (optionally `&`-prefixed), or a bare
+/// identifier that resolves to a recorded literal (transitive chains
+/// collapse here), else `None` — a non-literal value shadows any earlier
+/// binding of the same name for the [R1] indirection rule.
+fn record_let_binding(tokens: &[Token], i: usize, scope: &mut ScopeTracker) {
+    let mut name_index = i + 1;
+    if matches!(
+        tokens.get(name_index),
+        Some(Token::Ident { name, .. }) if name == "mut" || name == "ref"
+    ) {
+        name_index += 1;
+    }
+    let Some(Token::Ident { name, .. }) = tokens.get(name_index) else {
+        return;
+    };
+    let Some(eq) = scan_to_binding_equals(tokens, name_index) else {
+        return;
+    };
+    let literal = literal_after(tokens, eq).or_else(|| {
+        let mut j = eq + 1;
+        if matches!(tokens.get(j), Some(Token::Punct { ch: '&', .. })) {
+            j += 1;
+        }
+        match tokens.get(j) {
+            Some(Token::Ident { name: rhs, .. }) => scope.resolve_binding(rhs),
+            _ => None,
+        }
+    });
+    scope.record_binding(name, literal);
+}
+
+/// The first secret-bearing argument of a wrapper invocation (`String::from`,
+/// `format!`, `concat!`): a non-empty string literal directly, or an
+/// identifier that resolves to a `let`-bound literal. A resolved literal
+/// wins over a direct one — a `format!("{}", s)` format string is a
+/// placeholder, not the secret.
+fn wrapper_literal(tokens: &[Token], first_arg: usize, scope: &ScopeTracker) -> Option<String> {
+    let mut direct = None;
+    let mut depth = 0usize;
+    let mut j = first_arg;
+    while j < tokens.len() {
+        match &tokens[j] {
+            Token::Punct { ch: '(', .. } => depth += 1,
+            Token::Punct { ch: ')', .. } if depth == 0 => break,
+            Token::Punct { ch: ')', .. } => depth -= 1,
+            Token::Str { content, .. } | Token::RawStr { content, .. }
+                if !content.is_empty() && direct.is_none() =>
+            {
+                direct = Some(content.clone());
+            }
+            Token::Ident { name, .. } => {
+                if let Some(literal) = scope.resolve_binding(name) {
+                    return Some(literal);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    direct
+}
+
+/// The secret value of a binding whose `=`/`:` sits at `bind`, when the
+/// right-hand side is not a direct literal: a known wrapper call
+/// (`String::from(...)`, `format!(...)`, `concat!(...)`,
+/// `<ident>.to_string()`/`.to_owned()`) holding a non-empty literal or a
+/// literal-resolving identifier, or a bare identifier that resolves to a
+/// `let`-bound literal. Returns the literal and the shape it flowed
+/// through, for the violation message.
+fn wrapper_or_indirect(
+    tokens: &[Token],
+    bind: usize,
+    scope: &ScopeTracker,
+) -> Option<(String, String)> {
+    let mut j = bind + 1;
+    if matches!(tokens.get(j), Some(Token::Punct { ch: '&', .. })) {
+        j += 1;
+    }
+    match tokens.get(j) {
+        Some(Token::Ident { name, .. })
+            if name == "String"
+                && matches!(tokens.get(j + 1), Some(Token::Punct { ch: ':', .. }))
+                && matches!(tokens.get(j + 2), Some(Token::Punct { ch: ':', .. }))
+                && matches!(tokens.get(j + 3), Some(Token::Ident { name, .. }) if name == "from")
+                && matches!(tokens.get(j + 4), Some(Token::Punct { ch: '(', .. })) =>
+        {
+            wrapper_literal(tokens, j + 5, scope)
+                .map(|literal| (literal, "`String::from(...)`".to_owned()))
+        }
+        Some(Token::Ident { name, .. })
+            if (name == "format" || name == "concat")
+                && matches!(tokens.get(j + 1), Some(Token::Punct { ch: '!', .. }))
+                && matches!(tokens.get(j + 2), Some(Token::Punct { ch: '(', .. })) =>
+        {
+            wrapper_literal(tokens, j + 3, scope)
+                .map(|literal| (literal, format!("`{name}!(...)`")))
+        }
+        Some(Token::Ident { name: receiver, .. })
+            if matches!(tokens.get(j + 1), Some(Token::Punct { ch: '.', .. }))
+                && matches!(tokens.get(j + 2), Some(Token::Ident { name, .. })
+                    if name == "to_string" || name == "to_owned")
+                && matches!(tokens.get(j + 3), Some(Token::Punct { ch: '(', .. }))
+                && matches!(tokens.get(j + 4), Some(Token::Punct { ch: ')', .. })) =>
+        {
+            scope
+                .resolve_binding(receiver)
+                .map(|literal| (literal, format!("`{receiver}.to_string()`")))
+        }
+        Some(Token::Ident { name, .. }) => scope
+            .resolve_binding(name)
+            .map(|literal| (literal, format!("identifier `{name}`"))),
         _ => None,
     }
 }
@@ -804,7 +1021,13 @@ fn scan_file(source: &SourceTokens, initial_test: bool) -> Vec<String> {
                 }
             }
             Token::Ident { name, line } => {
-                if let Some((open, close)) = output_macro_span(tokens, i) {
+                if name == "let" {
+                    // Record the `let` binding for the [R1] identifier-
+                    // indirection rule before the statement's own tokens are
+                    // scanned, so `let password = s;` resolves `s`'s literal.
+                    record_let_binding(tokens, i, &mut scope);
+                    i += 1;
+                } else if let Some((open, close)) = output_macro_span(tokens, i) {
                     if !scope.current() {
                         violations.extend(output_macro_violations(
                             &tokens[open..close],
@@ -821,17 +1044,45 @@ fn scan_file(source: &SourceTokens, initial_test: bool) -> Vec<String> {
                     scope.on_catalog_macro();
                     i += 1;
                 } else {
-                    if !scope.current()
-                        && !scope.in_catalog()
-                        && is_sensitive_identifier(name)
-                        && let Some(literal) = assigned_literal(tokens, i)
-                        && !is_allowed_constant(&source.display_path, *line, name, &literal)
+                    // `name = value` reassignment: the tracked binding of
+                    // `name`, if any, no longer holds what it was bound to
+                    // (the record is replaced — a literal by the new
+                    // literal, anything else by None). `==` comparisons and
+                    // the `let` statement's own declared name (after
+                    // `let`/`mut`/`ref`) are not assignments.
+                    let prev_is_let_declared_name = i > 0
+                        && matches!(
+                            tokens.get(i - 1),
+                            Some(Token::Ident { name: prev, .. })
+                                if prev == "let" || prev == "mut" || prev == "ref"
+                        );
+                    if matches!(tokens.get(i + 1), Some(Token::Punct { ch: '=', .. }))
+                        && !matches!(tokens.get(i + 2), Some(Token::Punct { ch: '=', .. }))
+                        && !prev_is_let_declared_name
                     {
-                        violations.push(format!(
-                            "{}:{}: [R1] hardcoded secret: `{name}` is set to the \
-                             non-empty string literal `{literal}`",
-                            source.display_path, line,
-                        ));
+                        scope.record_binding(name, literal_after(tokens, i + 1));
+                    }
+                    if !scope.current() && !scope.in_catalog() && is_sensitive_identifier(name) {
+                        let hit = assigned_literal(tokens, i)
+                            .map(|literal| (literal, String::new()))
+                            .or_else(|| {
+                                binding_equals(tokens, i)
+                                    .and_then(|bind| wrapper_or_indirect(tokens, bind, &scope))
+                            });
+                        if let Some((literal, via)) = hit
+                            && !is_allowed_constant(&source.display_path, *line, name, &literal)
+                        {
+                            let suffix = if via.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (via {via})")
+                            };
+                            violations.push(format!(
+                                "{}:{}: [R1] hardcoded secret: `{name}` is set to the \
+                                 non-empty string literal `{literal}`{suffix}",
+                                source.display_path, line,
+                            ));
+                        }
                     }
                     i += 1;
                 }
@@ -882,7 +1133,9 @@ fn crate_directories(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
 }
 
 /// The `src/` and `tests/` `.rs` files of one crate, sorted deterministically
-/// (depth-first, name order at each level), relative to the crate directory.
+/// (depth-first, name order at each level), relative to the crate directory,
+/// plus the crate's `build.rs` build script — build scripts are production
+/// code (they compile protos and generate code) and ship in the release.
 fn crate_source_files(crate_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut files = Vec::new();
     for tree in ["src", "tests"] {
@@ -890,6 +1143,9 @@ fn crate_source_files(crate_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> 
         if directory.is_dir() {
             collect_rs_files(&directory, crate_dir, &mut files)?;
         }
+    }
+    if crate_dir.join("build.rs").is_file() {
+        files.push(PathBuf::from("build.rs"));
     }
     Ok(files)
 }
@@ -1085,6 +1341,31 @@ fn workspace_scan_covers_the_expected_source_population() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn crate_scan_includes_build_scripts() -> Result<(), Box<dyn Error>> {
+    // Build scripts are production code: every crate whose directory holds a
+    // `build.rs` must have it in the scan's file list.
+    let root = workspace_root();
+    for crate_name in crate_directories(&root)? {
+        let crate_dir = root.join(&crate_name);
+        let files = crate_source_files(&crate_dir)?;
+        if crate_dir.join("build.rs").is_file() {
+            assert!(
+                files.iter().any(|file| file == &PathBuf::from("build.rs")),
+                "{crate_name}/build.rs must be part of the scan scope"
+            );
+        }
+    }
+    // The workspace's one build script today compiles the protos; keep the
+    // assertion load-bearing so a future crate's build script is noticed.
+    let center = root.join("center-protocol");
+    assert!(
+        center.join("build.rs").is_file(),
+        "center-protocol must keep its build script for the self-test to bite"
+    );
+    Ok(())
+}
+
+#[test]
 fn hardcoded_secret_rule_flags_production_assignments() {
     let flagged: &[(&str, &str)] = &[
         ("let password = \"hunter2\";", "`password`"),
@@ -1110,6 +1391,35 @@ fn hardcoded_secret_rule_flags_production_assignments() {
         ("password: \"hunter2\",", "`password`"),
         ("let PASSWORD = \"hunter2\";", "`PASSWORD`"),
         ("let Secret = \"hunter2\";", "`Secret`"),
+        // Wrappers: the literal flows into the sensitive binding through a
+        // constructor or macro instead of sitting in binding position.
+        ("let password = String::from(\"hunter2\");", "`password`"),
+        ("let password = \"hunter2\".to_string();", "`password`"),
+        ("let password = \"hunter2\".to_owned();", "`password`"),
+        // Reclassified from the passing list: a wrapped literal is still a
+        // hardcoded secret — the old `let password = format!("x")` sample
+        // passed only because the matcher looked at binding position alone.
+        ("let password = format!(\"x\");", "`password`"),
+        ("let password = concat!(\"hunter2\", \"!\");", "`password`"),
+        // Identifier indirection: the literal arrives through a `let` chain
+        // (one hop, transitive hops, and wrapped hops).
+        ("let s = \"hunter2\"; let password = s;", "`password`"),
+        (
+            "let s = \"hunter2\"; let t = s; let password = t;",
+            "`password`",
+        ),
+        (
+            "let s = \"hunter2\"; let password = String::from(s);",
+            "`password`",
+        ),
+        (
+            "let s = \"hunter2\"; let password = format!(\"{}\", s);",
+            "`password`",
+        ),
+        (
+            "let s = \"hunter2\"; let password = s.to_string();",
+            "`password`",
+        ),
     ];
     for (sample, needle) in flagged {
         let violations = scan_source_sample(sample, false);
@@ -1125,7 +1435,22 @@ fn hardcoded_secret_rule_flags_production_assignments() {
     }
     let passing: &[&str] = &[
         "let secret = \"\";",
-        "let password = format!(\"x\");",
+        // Boundary: a literal wrapped into a *non-sensitive* name is
+        // mechanically indistinguishable from benign wrapping
+        // (`String::from("hello")`); [R1] flags sensitive-identifier
+        // bindings only. Registered in the gate header doc.
+        "let x = String::from(\"hunter2\");",
+        "let greeting = format!(\"hello {}\", name);",
+        // Boundary: resolution is forward-only — the binding is seen before
+        // the literal that would resolve it.
+        "let password = s; let s = \"hunter2\";",
+        // Boundary: a function-call value is not a literal, and a binding
+        // invalidated by an assignment no longer resolves.
+        "let password = String::from(f());",
+        "let s = input(); let password = s;",
+        "let mut s = \"hunter2\"; s = f(); let password = s;",
+        "let password = String::new();",
+        // Unchanged exclusions of the direct-literal rule.
         "if password == \"hunter2\" { }",
         "let x = \"password = \\\"hunter2\\\"\";",
         "uri.starts_with(\"otpauth://totp/Rutilus:admin?secret=\")",

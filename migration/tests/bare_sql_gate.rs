@@ -21,15 +21,31 @@
 //! The scans read the crate sources from disk relative to
 //! `CARGO_MANIFEST_DIR` (the release-baseline gate in `rutilus-infra-redfish`
 //! uses the same pattern), so newly added migration files are covered
-//! automatically. Files are scanned token-wise: comments, doc comments, and
-//! attribute strings are ignored, and both plain (`"..."`) and raw
-//! (`r"..."` / `r#"..."#`) string literals are recognized, so the checks
-//! cannot be fooled by quoting.
+//! automatically; the walk is recursive, so `.rs` files in subdirectories of
+//! `migration/src` or `persistence/src` are covered too. Files are scanned
+//! token-wise: comments, doc comments, and attribute strings are ignored,
+//! and both plain (`"..."`) and raw (`r"..."` / `r#"..."#`) string literals
+//! are recognized, so the checks cannot be fooled by quoting.
+//!
+//! The first-word check alone is not sufficient: a statement may start with
+//! a DDL keyword and still smuggle DML past the carve-out's edge. Two
+//! embedded-DML shapes are therefore checked inside every statement that
+//! passes the first-word gate: the `CREATE ... AS SELECT` shapes — the CTAS
+//! data copy (`CREATE TABLE x AS SELECT`) and the `CREATE VIEW ... AS
+//! SELECT` row query — and DML statements inside a `CREATE TRIGGER` body
+//! (`BEGIN ... INSERT/UPDATE/DELETE/... END`). The trigger's own metadata
+//! words (`AFTER INSERT`, `INSTEAD OF UPDATE`, the `WHEN` clause) appear
+//! before `BEGIN` and are not DML. The embedded-DML check is word-level and
+//! therefore has a registered false-positive boundary: a quoted SQL string
+//! literal that contains a spaced word sequence (`CHECK (a <> ' AS
+//! SELECT ')`, `DEFAULT 'TRIGGER BEGIN SELECT END'`) reads like the
+//! embedded shape. No statement in the current tree holds such a literal,
+//! so the boundary is registered, not expanded.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The only statement kinds the migration crate may run raw (`SQLite` DDL).
 const DDL_FIRST_WORDS: [&str; 4] = ["CREATE", "ALTER", "DROP", "PRAGMA"];
@@ -228,6 +244,60 @@ fn first_keyword(sql: &str) -> &str {
     sql.split_whitespace().next().unwrap_or_default()
 }
 
+/// Whether a statement that passed the first-word gate still embeds DML past
+/// its first word. Two shapes are recognized, both word-delimited and
+/// case-insensitive like `first_keyword`:
+///
+/// - `CREATE ... AS SELECT`: the CTAS data copy (`CREATE TABLE x AS SELECT`)
+///   or the `CREATE VIEW v AS SELECT` row query — a raw-SQL data copy
+///   bypasses the `SeaQuery` builder the §7.3 carve-out requires for
+///   rebuilds, and a raw view definition bypasses it for reads.
+/// - `CREATE TRIGGER ... BEGIN ... END`: DML words (`INSERT`, `UPDATE`,
+///   `DELETE`, `SELECT`, ...) inside the trigger body. Only the words
+///   between the first `BEGIN` and the first `END` after it count: the
+///   trigger's own metadata (`AFTER INSERT`, `INSTEAD OF UPDATE`, the
+///   `WHEN` clause) legitimately contains DML words before `BEGIN`.
+///
+/// The word-level scan has a registered false-positive boundary on quoted
+/// SQL string literals: a literal that contains a spaced word sequence reads
+/// like the embedded shape (`CHECK (a <> ' AS SELECT ')`, `DEFAULT 'TRIGGER
+/// BEGIN SELECT END'`). No statement in the current tree holds such a
+/// literal, so the boundary is documented, not expanded.
+fn ddl_embedded_dml(statement: &str) -> Option<String> {
+    let words: Vec<&str> = statement.split_whitespace().collect();
+    for pair in words.windows(2) {
+        if pair[0].eq_ignore_ascii_case("AS") && pair[1].eq_ignore_ascii_case("SELECT") {
+            return Some(format!(
+                "the `AS SELECT` clause copies data through raw SQL: {statement}"
+            ));
+        }
+    }
+    if !words
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case("TRIGGER"))
+    {
+        return None;
+    }
+    let begin = words
+        .iter()
+        .position(|word| word.eq_ignore_ascii_case("BEGIN"))?;
+    let end = words[begin + 1..]
+        .iter()
+        .position(|word| word.eq_ignore_ascii_case("END"))
+        .map_or(words.len(), |offset| begin + 1 + offset);
+    for word in &words[begin + 1..end] {
+        if DML_FIRST_WORDS
+            .iter()
+            .any(|dml| word.eq_ignore_ascii_case(dml))
+        {
+            return Some(format!(
+                "`{word}` runs DML inside the `CREATE TRIGGER` body: {statement}"
+            ));
+        }
+    }
+    None
+}
+
 /// Collects `const NAME: &str = <string literal>` declarations as
 /// `name -> (line, statement)`.
 fn const_literals(tokens: &[Token]) -> HashMap<String, (usize, String)> {
@@ -343,27 +413,42 @@ fn argument_statements(
     Ok(vec![(*line, statement.clone())])
 }
 
-/// Lists `migration/src/*.rs` and `persistence/src/*.rs` for scanning.
+/// Collects the `.rs` files under `directory`, depth-first in name order,
+/// as paths relative to `base` (the scanned tree's root).
+fn collect_rs(
+    directory: &Path,
+    base: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs(&path, base, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path.strip_prefix(base)?.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Lists the `.rs` files under `migration/src` and `persistence/src` for
+/// scanning. The walk is recursive, so a `.rs` file in a newly added
+/// subdirectory is covered automatically.
 fn scanned_sources(relative_dir: &str) -> Result<Vec<SourceTokens>, Box<dyn Error>> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_dir);
     let mut files = Vec::new();
-    for entry in fs::read_dir(&directory)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path);
-        }
-    }
+    collect_rs(&directory, &directory, &mut files)?;
     files.sort();
     let mut sources = Vec::new();
     for file in files {
         let display_path = format!(
             "{}/{}",
             relative_dir,
-            file.file_name()
-                .ok_or("source file without a name")?
-                .to_string_lossy()
+            file.to_string_lossy().replace('\\', "/")
         );
-        let source = fs::read_to_string(&file)?;
+        let source = fs::read_to_string(directory.join(&file))?;
         sources.push(tokenize(&display_path, &source));
     }
     Ok(sources)
@@ -408,6 +493,12 @@ fn migration_violations() -> Result<Vec<String>, Box<dyn Error>> {
                          only CREATE/ALTER/DROP/PRAGMA are allowed: {statement}",
                         source.display_path, line,
                     ));
+                } else if let Some(reason) = ddl_embedded_dml(&statement) {
+                    violations.push(format!(
+                        "{}:{}: execute_unprepared statement embeds DML past its \
+                         first word: {reason}",
+                        source.display_path, line,
+                    ));
                 }
             }
         }
@@ -432,6 +523,12 @@ fn persistence_violations() -> Result<Vec<String>, Box<dyn Error>> {
                     violations.push(format!(
                         "{}:{}: execute_unprepared statement starts with `{keyword}`, \
                          only PRAGMA (test-scope exception) is allowed: {statement}",
+                        source.display_path, line,
+                    ));
+                } else if let Some(reason) = ddl_embedded_dml(&statement) {
+                    violations.push(format!(
+                        "{}:{}: execute_unprepared statement embeds DML past its \
+                         first word: {reason}",
                         source.display_path, line,
                     ));
                 }
@@ -459,6 +556,71 @@ fn persistence_raw_sql_is_test_only_pragma() -> Result<(), Box<dyn Error>> {
         violations.is_empty(),
         "persistence/src violates the §7.3 test-scope PRAGMA exception:\n{}",
         violations.join("\n"),
+    );
+    Ok(())
+}
+
+#[test]
+fn ddl_embedded_dml_is_flagged() {
+    // Negative samples: DDL that passes the first-word check but embeds DML
+    // past it — the two shapes the first-keyword-only scan used to miss.
+    let flagged: &[&str] = &[
+        // CTAS: a raw-SQL data copy bypasses the SeaQuery builder.
+        "CREATE TABLE audit_backup AS SELECT * FROM audit;",
+        "CREATE VIEW active_users AS SELECT id, name FROM users;",
+        "create table x as select * from y;",
+        "CREATE TABLE daily_snapshot AS\n  SELECT * FROM telemetry;",
+        // CREATE TRIGGER bodies: DML words between BEGIN and END. The
+        // metadata words before BEGIN (`AFTER INSERT`) are not DML.
+        "CREATE TRIGGER audit_trigger AFTER INSERT ON users \
+         BEGIN UPDATE users SET updated_at = 1; END;",
+        "CREATE TRIGGER t AFTER DELETE ON a BEGIN INSERT INTO log VALUES ('x'); END;",
+        "CREATE TRIGGER t INSTEAD OF UPDATE ON v WHEN new.a > 1 \
+         BEGIN DELETE FROM t2 WHERE id = new.id; END;",
+    ];
+    for statement in flagged {
+        assert!(
+            ddl_embedded_dml(statement).is_some(),
+            "statement must be flagged for embedded DML: {statement}"
+        );
+    }
+    // Positive samples: the carve-out's real shapes hold no DML past the
+    // first word, including DROP TRIGGER and trigger metadata without a body.
+    let clean: &[&str] = &[
+        "CREATE TABLE settings (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        "ALTER TABLE users ADD COLUMN role TEXT REFERENCES roles(id);",
+        "CREATE INDEX idx_users_name ON users (name) WHERE role != 'admin';",
+        "DROP TRIGGER audit_trigger;",
+        "PRAGMA user_version = 12;",
+        "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS SELECT'), b TEXT);",
+    ];
+    for statement in clean {
+        assert!(
+            ddl_embedded_dml(statement).is_none(),
+            "statement must pass the embedded-DML check: {statement}"
+        );
+    }
+}
+
+#[test]
+fn scanned_sources_walk_is_recursive() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let nested = directory.path().join("nested/deeper");
+    fs::create_dir_all(&nested)?;
+    fs::write(directory.path().join("top.rs"), "// top")?;
+    fs::write(nested.join("deep.rs"), "// deep")?;
+    fs::write(directory.path().join("ignored.txt"), "not rust")?;
+    let mut files = Vec::new();
+    collect_rs(directory.path(), directory.path(), &mut files)?;
+    files.sort();
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["nested/deeper/deep.rs", "top.rs"],
+        "the source walk must cover `.rs` files in subdirectories, name-sorted"
     );
     Ok(())
 }
