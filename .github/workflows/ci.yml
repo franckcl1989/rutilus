@@ -29,6 +29,19 @@
 # repository (repository settings are not version-controlled) — CODEOWNERS
 # is the in-repo mitigation so workflow changes still land in a reviewable
 # pull request even if those settings are ever loosened or the repo moves.
+#
+# Third-party action pinning (supply-chain, F4-1, 2026-08-13): every external
+# action below is pinned to the full commit SHA of the tag it tracks, with
+# the tag noted inline on the `uses:` line. A moving or rewritten tag can
+# then no longer inject a new action revision into a run without an explicit
+# PR. .github/dependabot.yml opens weekly PRs to bump the pins (github-actions
+# ecosystem), and every such PR touches .github/ so CODEOWNERS review applies.
+# Trade-off, stated honestly: pinning freezes the action at that commit until
+# the bump lands, so security fixes to an action arrive via the Dependabot
+# bump, not silently. Toolchain choice is NOT pinned here — it comes
+# exclusively from rust-toolchain.toml (channel 1.97.1), so the
+# dtolnay/rust-toolchain pin freezes only the action's own revision, not the
+# compiler.
 
 name: CI
 
@@ -87,19 +100,17 @@ jobs:
             is_default: false
             is_macos: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # tag v4
 
       # dtolnay/rust-toolchain reads rust-toolchain.toml (channel 1.97.1,
       # components clippy + rustfmt) and adds the per-OS host target plus
       # wasm32-unknown-unknown for the UI crate.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }},wasm32-unknown-unknown
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # tag stable (moving; pinned 2026-08-05)
 
       # Build cache for cargo. Covers target/ (including the wasm target and
       # target/rutilus-tools, where the pinned wasm-bindgen-cli is installed)
       # and ~/.cargo; keyed by toolchain + Cargo.lock.
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # tag v2 (2.9.2)
 
       # §19.4 gate tools: the nextest runner, the llvm-cov coverage driver,
       # the machete unused-dependency scan, the cargo-audit scanner (0.22.2,
@@ -116,7 +127,7 @@ jobs:
       # list and per-tool pins unchanged.
       - name: Install gate tools
         if: matrix.is_default
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
         with:
           tool: cargo-nextest@0.9.140,cargo-llvm-cov@0.8.7,cargo-machete@0.9.2,cargo-audit@0.22.2,cargo-zigbuild@0.22.3
 
@@ -207,7 +218,7 @@ jobs:
       # cache pollution surface between runs either way.
       - name: Deny checks
         if: matrix.is_default
-        uses: embarkstudios/cargo-deny-action@v2
+        uses: embarkstudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # tag v2
         with:
           command: check
 
@@ -216,11 +227,16 @@ jobs:
       # entries are mirrored here as CLI flags (verified with cargo-audit
       # 0.22.2: without them `--deny warnings` fails on RUSTSEC-2026-0194/0195
       # plus the two unmaintained warnings; with them it exits 0). Keep this
-      # list in lockstep with deny.toml [advisories] ignore: the TRIGGER notes
-      # there apply — drop RUSTSEC-2026-0194/0195 once upstream
-      # csdl-compiler accepts quick-xml >= 0.41.0. RUSTSEC-2026-0235 (rkyv,
-      # unactivated optional dep of rust_decimal) is the re-registration the
-      # deny.toml comment anticipated when the gate went live.
+      # list in lockstep with deny.toml [advisories] ignore — the convention
+      # runs both directions (deny.toml's [advisories] comment points back
+      # here): the TRIGGER notes in deny.toml apply — drop
+      # RUSTSEC-2026-0194/0195 once upstream csdl-compiler accepts
+      # quick-xml >= 0.41.0. RUSTSEC-2026-0235 (rkyv, unactivated optional
+      # dep of rust_decimal) lives ONLY in this list, not in deny.toml: the
+      # cargo-deny graph never sees rkyv, while cargo-audit reports the
+      # lockfile-resident version — this entry is the registered re-registration
+      # the deny.toml comment anticipated when the gate went live, and it
+      # stays here as long as the rust_decimal dependency exists.
       - name: Advisory scan (cargo audit)
         if: matrix.is_default
         run: |
@@ -275,6 +291,11 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown
           cargo build --locked -p rutilus-ui --target wasm32-unknown-unknown --release
+          # The installed CLI lands in target/rutilus-tools, which the
+          # swatinem/rust-cache step above already caches (the cache key
+          # covers target/ wholesale) — so the pinned 0.2.126 binary is
+          # restored on later runs instead of recompiled from scratch. That
+          # is the existing mitigation for the per-run install cost.
           cargo install wasm-bindgen-cli --version 0.2.126 --locked --root target/rutilus-tools
           target/rutilus-tools/bin/wasm-bindgen --target web --no-typescript \
             --out-dir target/wasm-assets --out-name rutilus_ui \
@@ -471,13 +492,13 @@ jobs:
             suffix: macos-universal
             binary_path: target/universal-apple-darwin/release/rutilus
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # tag v4
 
       # The toolchain comes exclusively from rust-toolchain.toml (same policy
       # as the ci job); targets are added inside the build steps below.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # tag stable (moving; pinned 2026-08-05)
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # tag v2 (2.9.2)
 
       # cargo-zigbuild for the aarch64 musl cross-link, same install-action
       # pattern as the ci job's gate-tools step — same input contract: `tool`
@@ -485,7 +506,7 @@ jobs:
       # silently ignored — see the ci job's Install gate tools step).
       - name: Install cargo-zigbuild (aarch64)
         if: matrix.zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
         with:
           tool: cargo-zigbuild@0.22.3
 
@@ -657,9 +678,21 @@ jobs:
       # find keeps its existing exclusions of ./target/ and ./release/ so
       # only the freshly generated per-crate files are picked up. `--all`
       # lists every dependency (it is the default; kept explicit).
+      #
+      # Lock consistency (F4-5, 2026-08-13): because cargo-cyclonedx has no
+      # --locked, the step first asserts the committed Cargo.lock is up to
+      # date with a `cargo metadata --locked` run; the SBOM then documents
+      # exactly the locked graph the release binaries were built from (the
+      # build steps above all use --locked). --no-dev-deps was evaluated and
+      # does NOT exist in cargo-cyclonedx 0.5.9 — the only related flag is
+      # --no-build-deps, which would drop build-time components (prost-build
+      # etc.) the release binaries genuinely require at build time, so it is
+      # deliberately NOT used. Dev-dependencies therefore stay in the
+      # workspace-wide SBOM by design (a repo inventory, not a link-time
+      # manifest); revisit the flag set when cargo-cyclonedx is upgraded.
       - name: Install cargo-cyclonedx
         if: matrix.sbom
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d  # tag v2 (2.85.12)
         with:
           # `tool` (singular) — `tools` is not a declared install-action
           # input and is silently ignored (see the ci job's Install gate
@@ -668,6 +701,10 @@ jobs:
       - name: Generate SBOM (CycloneDX JSON)
         if: matrix.sbom
         run: |
+          # cargo-cyclonedx has no --locked (see the step comment above), so
+          # assert the committed Cargo.lock is up to date first; fails the
+          # step if manifests and lockfile have drifted.
+          cargo metadata --locked --format-version 1 > /dev/null
           cargo cyclonedx --format json --all
           # One <package>.cdx.json per workspace member crate (every
           # Cargo.toml dir is a unique top-level name, so the parent dir
@@ -687,7 +724,7 @@ jobs:
         run: bash scripts/checksums.sh -o release/SHA256SUMS release/*
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
         with:
           name: rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
           path: release/
@@ -697,7 +734,7 @@ jobs:
       # artifact so they are not buried in the linux-x86_64 bundle.
       - name: Upload SBOM
         if: matrix.sbom
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # tag v4
         with:
           name: rutilus-${{ github.ref_name }}-sbom
           path: release/rutilus-${{ github.ref_name }}-sbom-*.json

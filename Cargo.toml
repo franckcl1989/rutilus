@@ -66,6 +66,11 @@ tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = "0.3.55"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Shared by app (EventService stream adapter) and infra-redfish (gateway
+# stream) for the `CancellationToken` contract (§7.8); single workspace pin
+# so the two crates can never drift. default-features off: the
+# CancellationToken API needs no tokio-util features in 0.7.
+tokio-util = { version = "0.7.19", default-features = false }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 # The site-to-center WebSocket transport (§15): the same 0.24 line that
 # axum's `ws` feature would pull in, used directly because the center

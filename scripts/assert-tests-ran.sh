@@ -18,6 +18,11 @@
 # were measured on master (2026-08-12 gate re-run, documented in
 # docs/release-readiness.md §五 门禁复跑: security 门禁 8, migration 38).
 #
+# NOTE: the min-passed case below keeps `[1-9]` as its own alternative —
+# the double-bracket glob `[1-9][0-9]*` alone rejects single-digit values
+# in bash case (CI hit this: pin "8" was refused), and single digits are
+# legitimate pins. Do not merge the three patterns back into two.
+#
 # Usage:
 #   scripts/assert-tests-ran.sh <min-passed> [cargo test args...]
 #
@@ -44,7 +49,7 @@ die() { echo "assert-tests-ran.sh: ERROR: $*" >&2; exit 1; }
 min="$1"
 shift
 case "$min" in
-    0 | [1-9][0-9]*) ;;
+    0 | [1-9] | [1-9][0-9]*) ;;
     *) die "min-passed must be a non-negative integer without a leading zero (bash arithmetic parses leading zeros as octal), got: $min" ;;
 esac
 

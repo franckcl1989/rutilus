@@ -33,9 +33,9 @@ tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 # The §14.4 EventService stream adapter owns the gateway stream's
 # `CancellationToken` (the gateway's open contract requires one); tokio-util
-# is already pinned at the same version by infra-redfish, which defines the
-# gateway stream.
-tokio-util = { version = "0.7.19", default-features = false }
+# is pinned once in [workspace.dependencies] (infra-redfish, which defines
+# the gateway stream, resolves the same single version).
+tokio-util.workspace = true
 # The bounded-drain request timeout (N2-2): the console's handlers are
 # capped at the same grace as the shutdown drain (`GRACEFUL_DRAIN_TIMEOUT`),
 # so a slow request is aborted with a 408 instead of stalling the stop.
