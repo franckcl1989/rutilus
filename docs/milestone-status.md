@@ -72,6 +72,27 @@
 > 登记、§五 drill TOCTOU 与 400ms 时序启发式、milestone-status down_order_gate 行数 1286）；
 > 第二批五维深度审查（安全+并发 / 数据+前端+CI）无 BLOCKER/HIGH/MEDIUM 残留（MEDIUM 1 +
 > LOW 3 已修复、NOTE 全部登记、对抗验证 13 项全部「维持」），详见 §7.4。
+> **迭代十三已落地（2026-08-13，HEAD = 6bbdf1c）**：`6bbdf1c`（docs：re-anchor the
+> cross-document line references after iteration twelve——迭代十二登记（0a5e64b 头注 +20 行）
+> 与 §五 drill 修复（+15 行）再次推偏 17 处跨文档引用（含迭代九修复的 6 处 §7.1 锚，累积
+> +38）；全部按当前 master 逐行核实后重新锚定（release-readiness 12 / security-review 1 /
+> milestone-status 4）；注记：头注自检纪律只覆盖代码 file:line 引用、不覆盖跨文档引用，
+> 建议 0.9.0 评审前做最终全量核对）。
+> **收尾批次（2026-08-13，HEAD = c8bc30b，2 个提交——为人工复跑扫清前置）**：`d9a9a8e`
+> （feat(scripts)：add the one-command drill runner——`scripts/drills/run-all-drills.ps1`
+> （432 行）：顺序运行 5 个独立 drill（各自独立 powershell.exe 5.1 子进程、stdout/stderr
+> 重定向 logs/、watchdog 超时 taskkill /T /F）、解析 DRILL PASSED/FAILED、0xC0000142/ConPTY
+> launch failed 模式诚实注解、summary 文件（start/end/PS/OS/git head/二进制时间戳/product
+> version/逐 drill 结果/totals）、-KeepWorkDir 透传、-Drill 单跑（别名容忍）、
+> -DrillTimeoutMinutes（默认 30）、退出码 0 全 PASS / 1 有 FAIL；纯 ASCII、PARSE OK、无效
+> -Drill 冒烟通过；五维审计 APPROVE）、`c8bc30b`（docs：sync the RESULTS.md references
+> after the runtime cleanup——tmp/（4 探针 + 2 挂起 workdir）与 logs/（诊断 + 实跑日志）
+> 运行时产物清理（约 178 MB，gitignore 覆盖不入库），RESULTS.md 3 处引用同步为「清理后
+> 不再保留」措辞、证据结论零损失；3 个遗留 worktree（wb23-stress/wb24-e2e/wb25-version，
+> 无未提交改动）移除、分支保留；首轮实跑历史记录（f6ef715 构建等）保持原样；审计
+> APPROVE）；**复跑前置已齐备**：run-all 脚本 + 最新 debug 二进制（已确认即 HEAD 产物——
+> cargo build 0 编译步骤，最后 Rust 源码提交 64125e0 早于二进制构建 23:36-23:37）+ 空
+> logs//tmp/。
 > 所有条目均基于真实代码/测试事实，标注来源文件与测试名；不写设计
 > 文档没有且代码不支持的内容。设计基线见仓库根目录 `redfish-management-product-final-design.md`
 > （修订冻结版）。全文「file:line」引用已逐一核对当前 master 实际行号（2026-08-12 复核）：
