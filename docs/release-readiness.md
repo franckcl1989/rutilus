@@ -83,25 +83,37 @@
 > 修正 infra-redfish 291→295（旧 291 为迭代三+四 bfb001e 实测，深度审查批次 6128a17 已 +4）与
 > test-support 55→54（历史 55 混入头文档 doc-test 1，与新 `--list` 口径分离；54 = 26 lib
 > 〔mock_bmc/tests.rs 21 + mock_center/mod.rs 4 + mock_center/tls.rs 1〕+ 28 集成〔gateway_mock_bmc.rs〕）**。
-> **迭代十五已落地（2026-08-13，HEAD = 5cd75ae，9 个提交）——wave-one 对抗修复批次**：第一波
+> **迭代十五已落地（2026-08-13，HEAD = 5cd75ae，10 个提交）——wave-one 对抗修复批次**：第一波
 > 对抗审查（6 透镜，38 条 → 31 confirmed + 2 refuted + 1 降级 + 4 半/部分）的 27 项确认发现
-> 全部修复（8a4d271 / 2a4340b / bcef349 / 73d480d / 6ca207c / 3f312b2 / 31a4232 / d3b966a
-> 〔22 项，含 **2 HIGH：S3-1 操作历史 API 回声明文 BMC 口令、S3-2 首启未认领窗口 GuardedOnly
-> 整面开放**，均已修复〕/ 5cd75ae〔余 5 项：S3-4 管理员设口令端点、W6-5 路由表防漂移门禁、
-> N2-2 关停时限、N2-4 DisconnectOnDrop、C5-10 Hello 身份校验〕），逐项登记见
-> `milestone-status.md` 头注/§7.6 与 `known-limitations.md` §九（第一波块）；第二波对抗审查
-> （2026-08-13）61 条发现按现状登记于 `known-limitations.md` §九（第二波块，fixes pending，
-> 其中 D6-1..D6-12 与 A5-8 由本批文档收口处置）。**测试计数复核（2026-08-13，
-> `cargo test --workspace -- --list` 口径）：总数 1800（lib/集成 1799 + doc 1，doc =
-> test-support 头文档）**，增量 1731→1800（+69，全部来自 wave-one 测试面）；per-crate 以
+> 全部修复（8a4d271 / 2a4340b / bcef349 / e652831 / 73d480d / 6ca207c / 3f312b2 / 31a4232 /
+> d3b966a〔22 项，含 **2 HIGH：S3-1 操作历史 API 回声明文 BMC 口令、S3-2 首启未认领窗口
+> GuardedOnly 整面开放**，均已修复〕/ 5cd75ae〔余 5 项：S3-4 管理员设口令端点、W6-5 路由表
+> 防漂移门禁、N2-2 关停时限、N2-4 DisconnectOnDrop、C5-10 Hello 身份校验〕），逐项登记见
+> `milestone-status.md` 头注/§7.6 与 `known-limitations.md` §九（第一波块）。**测试计数复核
+> （2026-08-13，`cargo test --workspace -- --list` 口径）：总数 1800（lib/集成 1799 + doc 1，
+> doc = test-support 头文档）**，增量 1731→1800（+69，全部来自 wave-one 测试面）；per-crate 以
 > 实测为准：rutilus 152 / api 82 / application 322 / center-protocol 30 / domain 209 /
 > infra-redfish 295 / migration 48 / operation-engine 33 / persistence 202 / platform 32 /
 > security 52（含门禁 9）/ test-support 54+1 / ui 141 / web 147；相对迭代十登记的变化：
 > migration 38→48、persistence 190+3→202、application 301→322、web 133→147、rutilus
 > 145→152（infra 295 / ui 141 / test-support 54 不变）；门禁计数：security 8→9、
 > down_order_gate 8→11、migration 38→48；迁移文件 25、迁移测试文件 23、备份 pin 26/25
-> （`persistence/src/backup_snapshot.rs:646-647`）。**本版跨文档引用已全量核对重锚
-> （2026-08-13，wave-one 触面 auth.rs/lib.rs/ci.yml 等）**，§五/§六 历史登记注明其当时基准。
+> （`persistence/src/backup_snapshot.rs:646-647`）。
+> **迭代十六已落地（2026-08-13，HEAD = e59b14a，2 个提交）——wave-two 对抗修复批次**：
+> `a4ab972`（fix(ci)：assert-tests-ran.sh 单数字 pin 修复——`[1-9][0-9]*` 拒绝个位数 pin（CI
+> 首跑 Secret leak gate pin 8 被拒），补 `[1-9]` 独立分支；**该提交还意外携带依赖供应链批次
+> （F4-1..7：六 action SHA 钉版 + dependabot.yml + deny 理由修正 + tokio-util 单一来源 +
+> audit 忽略列表锁步），e59b14a 提交说明如实披露此混合提交事实**）、`e59b14a`（fix：第二波
+> 61 条发现中 60 项确认修复 + F1 追加发现，含 **2 HIGH（T1-1 路由门权限级检查、E3-1 绑定轮询
+> 瞬态错误不再当撤销）**；全部门禁复跑绿：fmt 干净、clippy `-D warnings` 零警告、**1837 测试
+> 0 失败（+37，wave-two 测试面）**；lipo `-verify_arch` 参数顺序修正（run 31674299719 首次
+> 真实执行暴露）；per-crate 实测：rutilus 158 / api 84 / application 339 / center-protocol 30 /
+> domain 209 / infra-redfish 295 / migration 50 / operation-engine 34 / persistence 209 /
+> platform 32 / security 53（含 secret_leak_gate 10）/ test-support 54+1 / ui 141 / web 148；
+> 相对迭代十五：center_sync.rs 34→39、down_order_gate 11→12、bare_sql_gate 4→5、secret
+> leak gate 9→10；逐项登记见 `known-limitations.md` §九（第二波块）与 `milestone-status.md`
+> 头注/§7.6）。**本版跨文档引用已全量核对重锚（2026-08-13，wave-two 触面
+> auth.rs/web lib.rs/ci.yml/redfish_gateway.rs 等）**，§五/§六 历史登记注明其当时基准。
 
 ## 一、0.9.0 验收逐项对照（设计文档 §0.9.0「验收」）
 
@@ -115,7 +127,7 @@
 | 无已知重复执行 | ✅ 结构性 | 事件去重键（`domain/src/event.rs:383` `dedup_key`）、批量重投 no-op（`operation-engine/src/operation_engine.rs:1763` `create_batch_redelivery_is_a_no_op_that_never_duplicates_children`）、重复 offer 幂等（`application/src/center_sync.rs:3638` 拒绝态不可复活、`:3688` 完成态返回记录结果）、重连重复突发只生效一次（`center_sync.rs:4567` 风暴测试） | 无已知差距；前述证据均为自动化测试钉死的结构性事实 |
 | 无已知错误成功报告 | 🟡 部分 | 写后重读验证系列（`infra-redfish/src/redfish_gateway.rs` `verifies_*` 测试群，如 `:29667`）、响应丢失→Unknown 不盲重试（`redfish_gateway.rs:28807` `classifies_a_dropped_connection_during_the_write_as_result_unknown`）、**412 冲突专用路径**（`CommandExecutionError::PreconditionFailed`：BMC `412` 证明写未执行 + 重读目标不覆盖并发变更，`redfish_gateway.rs:598-611, 12653-12690, 14002-14062`，深度审查批次 commit 6128a17）、`docs/known-limitations.md` §七「HTTP 成功不等于业务成功」 | 结构性证据充分；「整体清零」是评审结论而非可自动化断言的事实。前置条件：0.9.0 发布评审对证据链复核并给出清零结论 |
 | 三平台安装、升级、备份、恢复通过 | ⏳ 演练未执行 | 备份/恢复自动化往返已覆盖（`app/src/backup.rs:1068` 往返保数据、`:1112` 拒绝他实例包、`:1138` 跨机恢复需源信封、`:1225` 源口令对全新信封、`:1257` 需停止实例、`:1283` 拒绝未初始化目录、`:1294` 拒绝不同产品版本；**迭代七 T-E 02459dc 补恢复前预快照三态**：`:1324` 失败保留供回滚、`:1401` 成功清除、`:1421` 拷贝失败不动源目录）；恢复流程实现见 `docs/operations-manual.md` §六-§七 | 三平台（Windows/macOS/Linux）安装、升级、备份、恢复的**发布包级演练**未执行（§四-B）。前置条件：三平台环境 + 发布包 + 签名产物（签名本身为 C 类，见 §四-C） |
-| Center/Site 长时间断线重连通过 | 🟡 部分 | 单连接语义（如 `center_sync.rs:2965` 断线退避重连）与**多连接并发重连风暴**（`center_sync.rs:4447` 全部 outbox 从最后 Ack 续传、`:4567` 重复突发幂等、`:4957` 心跳与重连交错、`:5087` 断线期间本地队列累积并按序排空）+ 重连进度重发（`:4734`）；合计 33 个测试全过（`docs/milestone-status.md:390`）；断线行为语义见 `docs/operations-manual.md` §5.3（心跳 30s、断线判定 90s、重连退避 120s） | 长时间（跨进程/跨天）真实断线演练未执行（§四-B）。前置条件：站点 + 中心运行环境 |
+| Center/Site 长时间断线重连通过 | 🟡 部分 | 单连接语义（如 `center_sync.rs:2965` 断线退避重连）与**多连接并发重连风暴**（`center_sync.rs:4447` 全部 outbox 从最后 Ack 续传、`:4567` 重复突发幂等、`:4957` 心跳与重连交错、`:5087` 断线期间本地队列累积并按序排空）+ 重连进度重发（`:4734`）；`center_sync.rs` 现 **39 测试全过**（2026-08-13 实测，含 wave-two 新增 5 个）；断线行为语义见 `docs/operations-manual.md` §5.3（心跳 30s、断线判定 90s、重连退避 120s） | 长时间（跨进程/跨天）真实断线演练未执行（§四-B）。前置条件：站点 + 中心运行环境 |
 
 ### 1.1 0.9.0「内容」逐项盘点（汇总）
 
@@ -128,14 +140,14 @@
 | 五厂商实验室 | ⏳ | `milestone-status.md:385`；§四-B |
 | 所有 Fixture 回归 | 🟡 | 合成 mock 回归齐备，脱敏真实响应 fixture 目录尚无（`known-limitations.md:77-79`） |
 | 故障注入 | 🟡 | §19.3 多数场景单进程覆盖（`milestone-status.md:387`）；**Windows 侧进程级演练套件已落地（`scripts/drills/` 7 脚本 + RESULTS.md，2026-08-12，覆盖 §19.3 剩余 4 项中的 3 项 + §20.1/§20.2 备份恢复 + §0.4.0 大文件中断）**，首轮实跑因执行上下文 ConPTY 不可用 6/6 SKIP、挂起防护修复后快速 FAIL 路径已验证，功能验证待真实交互控制台会话复跑；磁盘空间不足未覆盖；Linux/macOS 等价脚本未编写（ps1 为 Windows 专属）；详见 §四-B |
-| 跨平台 E2E | ✅ | `ci.yml:130-147`（windows/macos 任务，web/tests 9 个路径套件 + `app/tests/version.rs`） |
+| 跨平台 E2E | ✅ | `ci.yml:159-175`（windows/macos 任务，web/tests 9 个路径套件 + `app/tests/version.rs`） |
 | 数据库压力 | ✅ | `persistence/tests/stress_capacity.rs` 3 测试（`:336, :585, :832`），规模常量对齐设计最低验证规模（`:47-52`） |
-| 中心重连风暴 | ✅ | `center_sync.rs` 33 测试（风暴 4 + 重发 1，见上表） |
+| 中心重连风暴 | ✅ | `center_sync.rs` 39 测试（风暴 4 + 重发 1 + 单连接语义 28 + wave-two 5，见上表） |
 | 大文件更新 | 🟡 | 分块机制全链路覆盖（`milestone-status.md:391`）；真实固件端到端演练未做（§四-B） |
-| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:392`）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、9 测试、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）、wave-one 73d480d 补间接赋值盲区 `:836`；CI 独立步骤 `ci.yml:264-266` Secret leak gate，`bash scripts/assert-tests-ran.sh 8 --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
+| Secret 泄漏检查 | ✅ | 结构性防护（`milestone-status.md:392`）+ 独立扫描门禁已落地（E3b：`security/tests/secret_leak_gate.rs`，3 规则 R1/R2/R3、9 测试、`test-support` crate 目录级豁免（E3b 原始提交 eefde7e）`:96-101, 1258`、深度审查批次 e8424df 补 `strings_catalog!` 宏体结构豁免（CATALOG_MACRO 帧识别 + 新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）、wave-one 73d480d 补间接赋值盲区 `:836`；CI 独立步骤 `ci.yml:282-284` Secret leak gate，`bash scripts/assert-tests-ran.sh 8 --locked -p rutilus-security --test secret_leak_gate`，machete 之后、wasm32 之前，`if: matrix.is_default`，header 注记 `ci.yml:15-17`；运行时抓包/日志复核仍为 §四-B 演练项） |
 | 权限测试 | ✅ | 角色掩码/中心站点作用域/限速/BMC 写权限拒绝（`milestone-status.md:393`） |
 | 安全审查 | 🟡 | `docs/security-review.md` 已交付（8 范围 + §7.7 扫描，无 BLOCKER）；MINOR-1 已修复（`web/src/auth.rs:1436, 1443, 1468-1483, 1574`）；N5 已关闭（E3c 编译期 const assert，`web/src/lib.rs:1488`）；深度审查批次补认证边界硬化（B1-B4，commit 8147bc9：密码策略 API 边界 / 429 不写审计 / 撤销信号 / M1 残留面证反关闭，见 §三 B1-B4 行）；**迭代七**：N3 限速器桶键淘汰已实现（T-D e7aef53，web 147 全过），§九 8 项遗留全部落地/处置（`milestone-status.md` §7.5）；**迭代十五（wave-one）**：对抗第一波发现 2 HIGH（S3-1/S3-2）均已修复（d3b966a，见 `security-review.md` §三 S3-1/S3-2 行），当前无 HIGH 残留 |
-| Migration 回归 | ✅ | `migration/tests/` 23 个测试文件（含 E4 防回归 `resource_feature_lists.rs`、wave-one 新增 `audit_center_actions.rs`/`endpoint_health_checks.rs`）；迁移总数 25；CI 门禁 `ci.yml:360-362`（W6-1 ran-断言 floor 38） |
+| Migration 回归 | ✅ | `migration/tests/` 23 个测试文件（含 E4 防回归 `resource_feature_lists.rs`、wave-one 新增 `audit_center_actions.rs`/`endpoint_health_checks.rs`）；迁移总数 25；CI 门禁 `ci.yml:393-395`（W6-1 ran-断言 floor 38） |
 | 备份恢复演练 | 🟡 | 自动化往返 10 测试（见上表证据，含迭代七 T-E 预快照三态 3 测试）；三平台演练未执行（§四-B） |
 | 签名构建 / SBOM | 🟡 | 代码侧完成（`scripts/` 5 脚本 + `release-artifacts` job，commit 34503ea + d77d54e）；证书未到位、首次实跑未做（条件 17、§四-C） |
 | 用户/运维/支持矩阵/已知限制手册 | ✅ | `docs/user-manual.md`、`docs/operations-manual.md`、`docs/support-matrix.md`、`docs/known-limitations.md` |
@@ -167,7 +179,7 @@
 | 4 | 所有写操作均类型化 | ✅ | 结构性 | 43 个公开写操作全部经 `nv-redfish` 类型化面（`release_baseline.rs:677`；`milestone-status.md` §1.4）；NVIDIA 9 个 OEM action 均类型化（`support-matrix.md:124-130`） | 无 |
 | 5 | 不存在原始 BMC 写请求 | ✅ | 结构性 | 唯一 `nv-redfish` 依赖 crate = infra-redfish（`infra-redfish/Cargo.toml:14`）；`UpstreamBmc = HttpBmc<NvHttpClient>` 传输注入（`redfish_gateway.rs:338, 1115`）；0.8.0 验收 4 达成（`milestone-status.md` §二 验收 4） | 无 |
 | 6 | 不存在裸 SQL | ✅ | 结构性 | 机械门禁：迁移 crate 只允许 DDL 裸语句、DML 词全禁（`migration/tests/bare_sql_gate.rs:35, 40, 445, 456`；wave-one 73d480d 补 CTAS/TRIGGER 内嵌 DML 扫描）；表重建数据复制全部 SeaQuery（`milestone-status.md:278`） | 无 |
-| 7 | 三平台单二进制发布 | 🟡 | 结构性（构建矩阵）+ 实测缺位 | 构建矩阵入 CI：x86_64 musl（`ci.yml:254-259`）、aarch64 musl cargo-zigbuild（`ci.yml:266-270`）、macOS Universal 2 lipo 合并 + `lipo -verify_arch x86_64 arm64` 校验（`ci.yml:289-304`）；三平台编译 + wasm32 UI 产物 diff（`ci.yml:65-81, 234-244`）；Windows ARM64 明确不入 CI（`ci.yml:272-279` 注释：hosted x64 runner 无 ARM64 MSVC 链接器与 SDK 导入库）；发布配置与 §5.4 一致（`Cargo.toml:110-116`；`rust-toolchain.toml` 已固定；Cargo.lock 已提交）；单二进制自包含边界（`support-matrix.md:85-88`） | ① Windows ARM64 发布目标无 CI 构建、无安装验证（§四-B，前置：原生 ARM64 runner 或本地 ARM64 主机）；② 三平台**发布包级**安装/运行验证并入条件 15 演练（§四-B）；③ 签名（条件 17）前置 |
+| 7 | 三平台单二进制发布 | 🟡 | 结构性（构建矩阵）+ 实测缺位 | 构建矩阵入 CI：x86_64 musl（`ci.yml:316-321`）、aarch64 musl cargo-zigbuild（`ci.yml:328-332`）、macOS Universal 2 lipo 合并 + `lipo -verify_arch x86_64 arm64` 校验（`ci.yml:351-376`）；三平台编译 + wasm32 UI 产物 diff（`ci.yml:85-101, 291-306`）；Windows ARM64 明确不入 CI（`ci.yml:334-341` 注释：hosted x64 runner 无 ARM64 MSVC 链接器与 SDK 导入库）；发布配置与 §5.4 一致（`Cargo.toml:110-116`；`rust-toolchain.toml` 已固定；Cargo.lock 已提交）；单二进制自包含边界（`support-matrix.md:85-88`） | ① Windows ARM64 发布目标无 CI 构建、无安装验证（§四-B，前置：原生 ARM64 runner 或本地 ARM64 主机）；② 三平台**发布包级**安装/运行验证并入条件 15 演练（§四-B）；③ 签名（条件 17）前置 |
 | 8 | 五厂商标准能力验证 | ⏳ | 实测 | Mock 层已覆盖五厂商 profile（`test-support/src/mock_bmc/profile.rs:47-133`）；§19.1 Physical Device Test「五厂商至少各一台真实设备进入 1.0.0 认证矩阵」未达成（`design:2320-2322`；`known-limitations.md:79`） | 前置条件：五厂商真实设备实验室（§四-B）。当前结论只能是「基于上游类型面与 mock/fixture 验证」，不是实测认证（`known-limitations.md:80`） |
 | 9 | Dell、HPE、Lenovo 上游 OEM 能力验证 | ⏳ | 实测 | Dell/HPE/Lenovo OEM 读取面已编译并映射（`support-matrix.md:113-118`）；真实设备验证未达成（同上） | 前置条件：Dell/HPE/Lenovo 设备各一台（§四-B）；验证范围限标准 feature + 上游已有 OEM feature，不声称覆盖全部 OEM API（`design:2326-2334`） |
 | 10 | xFusion、Inspur 标准模式限制明确 | ✅ | 结构性（文档）+ 实测缺位 | 限制已明确成文：上游无 xFusion/Inspur OEM feature，只能用标准 Redfish 能力，OEM-only 标 `NotAvailableInNvRedfishBaseline`（`support-matrix.md:135-142`；`design:2336-2352`）；mock 变体验证标准模式行为 | 「限制明确」这一文档条件达成；设备侧标准模式验证并入条件 8（§四-B） |
@@ -176,8 +188,8 @@
 | 13 | Center 不保存 BMC Secret | ✅ | 结构性 | Center 投影只含 display_name/address/generation/health/resources，注释「the center never sees credentials or sessions」（`application/src/center_sync.rs:1306`）；投影表无凭据列（`persistence/src/center_projection_repository.rs` 全文件 grep 无 credential/password/secret 命中）；安全审查范围 4 结论（`security-review.md` §二#4）；Site 本地解密边界（凭据表只存在于 Site 库） | 无。0.7.0 验收「Center 不保存 BMC 密码」达成（`design:2728-2735`） |
 | 14 | Site 脱离 Center 完整运行 | ✅ | 结构性 | 0.7.0 验收达成（`design:2728-2735`）；断线后端点刷新/操作/本地 GUI 继续运行（`operations-manual.md:161`）；断线期间本地队列累积、重连按序排空（`center_sync.rs:5087`）；中心不可用不影响站点已接受任务（`operations-manual.md:110`） | 无 |
 | 15 | 备份恢复通过 | 🟡 | 结构性（自动化往返 10 测试，含 T-E 预快照三态）+ 实测缺位 | `app/src/backup.rs:1068, 1112, 1138, 1225, 1257, 1283, 1294, 1324, 1401, 1421`（见 §一第 5 行证据；迭代七 T-E 02459dc 新增 3 个预快照测试）；流程与身份校验（`operations-manual.md` §六）；§20.1/20.2 对照（`design:2403-2446`） | 三平台安装/升级/备份/恢复演练未执行（§四-B）——0.9.0 验收同项 |
-| 16 | 数据库 Migration 通过 | ✅ | 结构性 | 25 个 migration（`operations-manual.md:221`；`migration/tests/initial_storage.rs`；E1/E4 新增 `m20260812_000001_resource_decode_failures` 与 `m20260812_000002_resource_feature_lists`，wave-one 新增 `m20260813_000001_audit_center_actions` 与 `m20260813_000002_endpoint_health_checks`）；23 个测试文件回归 + CI 独立门禁（`ci.yml:360-362`）；裸 SQL 机械门禁（条件 6）；迁移前自动备份（`persistence/src/lib.rs:510`） | 无 |
-| 17 | 正式签名和 SBOM | 🟡 代码侧完成（流水线就绪，证书未到位） | 结构性（管道已入 CI；首次实跑未做） | 管道证据：`scripts/` 5 脚本（sign-windows.ps1 / sign-macos.sh / sign-linux.sh / checksums.sh / checksums.ps1，commit 34503ea）；ci.yml `release-artifacts` job（commit d77d54e，`ci.yml:424-704`）——`v*` tag push / `workflow_dispatch` 触发（`ci.yml:35-47`）、`needs: ci` 门禁先行（`ci.yml:428`）、签名步骤仅在对应 secret 配置时执行（`ci.yml:563-564, 587-588, 625-626`，未配置则 "signing skipped: certificate not configured"（`ci.yml:640-642`））、Windows Authenticode（PFX base64 物化 `ci.yml:552-562` 或 thumbprint-only `ci.yml:567-572`）、macOS Developer ID + notarization（`.p8` 物化 `ci.yml:577-586`）、Linux minisign（密钥物化 `ci.yml:610-617`）、SBOM cargo-cyclonedx@0.5.9 钉版（`ci.yml:660-680`）、SHA-256 清单（`ci.yml:685-687`）、artifact 上传（`ci.yml:689-694`）；§5.4「构建结果嵌入 Git Commit」**已实现**（E3a：CI 在 job 级注入 `RUTILUS_GIT_COMMIT`（`ci.yml:60-71`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`），`rutilus version` 输出三行（`:733-737`），本地无该变量时降级 `dev`；`app/src/standalone_runtime.rs:1541` WebProductInfo 嵌入）。**6 项首跑确认点**（证书到位后首次实跑核验）：① musl-tools 安装（`ci.yml:499`）；② cargo-cyclonedx@0.5.9 钉版（`ci.yml:667`）；③ base64 物化（`ci.yml:552-562, 577-586, 610-617`）；④ env 的 `&&`/`||` 表达式（`ci.yml:570, 600, 628`）；⑤ thumbprint-only 模式（`ci.yml:567-572`）；⑥ 上传权限（`ci.yml:689-694`；workflow `permissions: contents: read` `ci.yml:49-50`） | 前置条件：证书/账号——RUTILUS_WINDOWS_CERT_B64/THUMBPRINT(+PASSWORD)、RUTILUS_MAC_CERT_ID + RUTILUS_NOTARY_KEY_ID/B64/TEAM_ID、RUTILUS_LINUX_SIGN_KEY_B64（`ci.yml:416-423, 441-447`；§四-C）。**1.0.0 发布硬条件** |
+| 16 | 数据库 Migration 通过 | ✅ | 结构性 | 25 个 migration（`operations-manual.md:221`；`migration/tests/initial_storage.rs`；E1/E4 新增 `m20260812_000001_resource_decode_failures` 与 `m20260812_000002_resource_feature_lists`，wave-one 新增 `m20260813_000001_audit_center_actions` 与 `m20260813_000002_endpoint_health_checks`）；23 个测试文件回归 + CI 独立门禁（`ci.yml:393-395`）；裸 SQL 机械门禁（条件 6）；迁移前自动备份（`persistence/src/lib.rs:510`） | 无 |
+| 17 | 正式签名和 SBOM | 🟡 代码侧完成（流水线就绪，证书未到位） | 结构性（管道已入 CI；首次实跑未做） | 管道证据：`scripts/` 5 脚本（sign-windows.ps1 / sign-macos.sh / sign-linux.sh / checksums.sh / checksums.ps1，commit 34503ea）；ci.yml `release-artifacts` job（commit d77d54e，`ci.yml:457-755`）——`v*` tag push / `workflow_dispatch` 触发（`ci.yml:48-60`）、`needs: ci` 门禁先行（`ci.yml:461`）、签名步骤仅在对应 secret 配置时执行（`ci.yml:599, 623, 661`，未配置则 "signing skipped: certificate not configured"（`ci.yml:675-677`））、Windows Authenticode（PFX base64 物化 `ci.yml:587-597` 或 thumbprint-only `ci.yml:601-607`）、macOS Developer ID + notarization（`.p8` 物化 `ci.yml:612-621`）、Linux minisign（密钥物化 `ci.yml:645-652`）、SBOM cargo-cyclonedx@0.5.9 钉版（`ci.yml:707-731`）、SHA-256 清单（`ci.yml:736-738`）、artifact 上传（`ci.yml:740-745`）；§5.4「构建结果嵌入 Git Commit」**已实现**（E3a：CI 在 job 级注入 `RUTILUS_GIT_COMMIT`（`ci.yml:84`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`），`rutilus version` 输出三行（`:733-737`），本地无该变量时降级 `dev`；`app/src/standalone_runtime.rs:1541` WebProductInfo 嵌入）。**6 项首跑确认点**（证书到位后首次实跑核验）：① musl-tools 安装（`ci.yml:532`）；② cargo-cyclonedx@0.5.9 钉版（`ci.yml:714`）；③ base64 物化（`ci.yml:587-597, 612-621, 645-652`）；④ env 的 `&&`/`||` 表达式（`ci.yml:605, 635, 663`）；⑤ thumbprint-only 模式（`ci.yml:601-607`）；⑥ 上传权限（`ci.yml:740-745`；workflow `permissions: contents: read` `ci.yml:62-63`） | 前置条件：证书/账号——RUTILUS_WINDOWS_CERT_B64/THUMBPRINT(+PASSWORD)、RUTILUS_MAC_CERT_ID + RUTILUS_NOTARY_KEY_ID/B64/TEAM_ID、RUTILUS_LINUX_SIGN_KEY_B64（`ci.yml:449-456, 474-480`；§四-C）。**1.0.0 发布硬条件** |
 | 18 | 用户、运维、兼容和故障文档完成 | ✅ | 结构性 | `docs/user-manual.md`（436 行）；`docs/operations-manual.md`（数据/服务/备份/升级/诊断/容量，§8.1 含 `--log-format json`）；`docs/support-matrix.md`（基线/平台/厂商/不承诺）；`docs/known-limitations.md`（OutOfScope/依赖风险/测试基建局限/容量/偏差）；故障语义与诊断（`operations-manual.md` §八、`known-limitations.md` §七） | 「故障文档」由 known-limitations（已知限制与偏差）+ operations §八（doctor/诊断）承担，与设计 §0.9.0 内容一致；故障注入演练结果文档待 §四-B 完成后补充 |
 
 ## 三、剩余工作分类
@@ -190,11 +202,11 @@
 
 | 工作项 | 状态 | 负责方 | 前置条件 | 证据/来源 |
 |---|---|---|---|---|
-| §12.4 诊断解码失败**生产捕获点**（gateway 捕获 + SQLite 持久化） | ✅ 已合入（E1，commit ce2b8b3） | 全组评审复验（证据链见下） | 无（已合并，全部门禁复跑通过） | 网关捕获：`DecodeFailureObservation`（`infra-redfish/src/redfish_gateway.rs:8720`），捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure`（`:8904, :8931, :8977`），刷新结果经 `outcome.decode_failures()` 流出（`:8831`）；同代事务提交：`persistence/src/resource_snapshot_repository.rs:81-147`（`commit_resource_generation` 在快照同一事务内写 `resource_decode_failures`），生产链路 `application/src/endpoint_refresh.rs:350-355` 直连；新表 + entity（`entity/src/lib.rs:28`、`entity/src/resource_decode_failure.rs:13`）+ 迁移 `m20260812_000001`（E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；web 端到端 7 测试（`web/tests/diagnostics_path.rs:848-1185`，含 `refresh_capture_flows_into_the_diagnostics_response` `:1008`）；现状登记见 `known-limitations.md` §八「§12.4」行 |
-| 独立 Secret 泄漏扫描（仓库级自动扫描 + 运行时抓包/日志复核） | ✅ 仓库级已落地（E3b）/ 运行时复核待做 | 安全评审 + CI | 无（仓库级部分）；运行时复核需三平台演示环境（可并入 B） | `security/tests/secret_leak_gate.rs`：3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM / R3 明文输出宏泄露）、9 测试（`:1311, :1323, :1334, :1344, :1369, :1472, :1521, :1553, :1591`，wave-one 73d480d 后实测）、白名单 = `ALLOWED_CONSTANT_HITS` 2 处（path+line+name+literal 四元组绑定，`app/src/backup.rs:88, 89` 备份条目名）、`test-support` crate 目录级豁免（fixture scope，`:96-101, 1258`，E3b 原始提交 eefde7e）+ `strings_catalog!` 宏体结构豁免（深度审查批次 commit e8424df：CATALOG_MACRO 帧识别 `:575, 1038-1043`，新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）+ wave-one 间接赋值盲区（73d480d：`wrapper_or_indirect` `:836`）；门禁为 CI 独立步骤（`ci.yml:264-266` Secret leak gate，`bash scripts/assert-tests-ran.sh 8 --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前；header 注记 `ci.yml:15-17`）；运行时抓包/日志复核仍为 §四-B 项（`security-review.md:141`） |
+| §12.4 诊断解码失败**生产捕获点**（gateway 捕获 + SQLite 持久化） | ✅ 已合入（E1，commit ce2b8b3） | 全组评审复验（证据链见下） | 无（已合并，全部门禁复跑通过） | 网关捕获：`DecodeFailureObservation`（`infra-redfish/src/redfish_gateway.rs:8811`），捕获函数 `capture_fetch_failure`/`capture_projection_failure`/`capture_segment_decode_failure`（`:8995, :9022, :9068`），刷新结果经 `outcome.decode_failures()` 流出（`:8922`）；同代事务提交：`persistence/src/resource_snapshot_repository.rs:81-147`（`commit_resource_generation` 在快照同一事务内写 `resource_decode_failures`），生产链路 `application/src/endpoint_refresh.rs:350-355` 直连；新表 + entity（`entity/src/lib.rs:28`、`entity/src/resource_decode_failure.rs:13`）+ 迁移 `m20260812_000001`（E4 由 `m20260812_000002` 重建约束为领域枚举 47 码）；web 端到端 7 测试（`web/tests/diagnostics_path.rs:848-1185`，含 `refresh_capture_flows_into_the_diagnostics_response` `:1008`）；现状登记见 `known-limitations.md` §八「§12.4」行 |
+| 独立 Secret 泄漏扫描（仓库级自动扫描 + 运行时抓包/日志复核） | ✅ 仓库级已落地（E3b）/ 运行时复核待做 | 安全评审 + CI | 无（仓库级部分）；运行时复核需三平台演示环境（可并入 B） | `security/tests/secret_leak_gate.rs`：3 规则（R1 硬编码秘密 / R2 内嵌私钥 PEM / R3 明文输出宏泄露）、10 测试（`:1427, :1439, :1450, :1460, :1485, :1588, :1637, :1669, :1716, :1760`，e59b14a 后实测——wave-two T1-4 补跨字面量拆分 PEM 私钥盲区）、白名单 = `ALLOWED_CONSTANT_HITS` 2 处（path+line+name+literal 四元组绑定，`app/src/backup.rs:88, 89` 备份条目名）、`test-support` crate 目录级豁免（fixture scope，`:96-101, 1258`，E3b 原始提交 eefde7e）+ `strings_catalog!` 宏体结构豁免（深度审查批次 commit e8424df：CATALOG_MACRO 帧识别 `:575, 1038-1043`，新测试 `strings_catalog_macro_bodies_are_copy_construction_not_secret_assignments` `:1521`）+ wave-one 间接赋值盲区（73d480d：`wrapper_or_indirect` `:836`）+ wave-two 跨字面量拆分 PEM 私钥盲区（e59b14a，T1-4，`pem_fragment_violation` `:886`）；门禁为 CI 独立步骤（`ci.yml:282-284` Secret leak gate，`bash scripts/assert-tests-ran.sh 8 --locked -p rutilus-security --test secret_leak_gate`，`if: matrix.is_default`，machete 之后、wasm32 之前；header 注记 `ci.yml:15-17`）；运行时抓包/日志复核仍为 §四-B 项（`security-review.md:141`） |
 | UI 本地化 | ✅ 已完整落地（H5 d3f7769 + 0f91c17 + T-H c4dd335：`strings_catalog!` 目录 827 键 En/Zh 双语（`i18n.rs:163-1858`）、`Lang::{En, Zh}` 运行时语言选择（`thread_local!` `i18n.rs:1938-1942` + `L()` `i18n.rs:1968-1973`）、lib.rs `LanguageSelector` 组件（`lib.rs:11640-11658`）与 URL fragment 持久化（**迭代七 T-H 已拆为纯函数 + 薄封装**：`stored_lang_code_from`/`lang_fragment_value` `i18n.rs:1915-1936`、wasm 封装 `lib.rs:11607-11635`、启动恢复 `start()` `lib.rs:11661-11664`）；ui 141 测试全过；深度审查批次补 `format_catalog` 槽位硬化与本地化（fb660d5 + a4950fc，`i18n.rs:1984-2006`，见 `milestone-status.md` §7.4）） | 前端组 | 后续触点：localStorage 持久化（需扩展 web-sys feature）与更多语言；1.0.0 定义与 18 项条件均不涉及，**不阻塞 1.0.0** | `known-limitations.md:132`；`milestone-status.md:437` |
 | N5 `unreachable!` 处置（可选，NOTE 级） | ✅ 已完成（E3c） | — | 无 | `security-review.md` §三 N5 已关闭：`web/src/lib.rs:1488` 编译期 `const _: () = assert!(rutilus_api::OVERVIEW_RECENT_EVENTS > 0);` 钉死常量正性（注释 `:1476-1487`），运行时 guard 保留为已被断言证明不可达的防御分支（`:1490-1491`） |
-| 发布级 CI 扩展（Windows ARM64 原生 runner） | ✅ 移交 §三-B（依赖原生 runner，非 A 类可做） | — | 原生 ARM64 Windows runner 或本地 ARM64 主机验证后另行处理 | `ci.yml:311-318` 注释；§三-B「Windows ARM64 发布验证」行 |
+| 发布级 CI 扩展（Windows ARM64 原生 runner） | ✅ 移交 §三-B（依赖原生 runner，非 A 类可做） | — | 原生 ARM64 Windows runner 或本地 ARM64 主机验证后另行处理 | `ci.yml:334-341` 注释；§三-B「Windows ARM64 发布验证」行 |
 
 ### B. 依赖演练环境（物理设备 / 规模环境 / 三平台流程）
 
@@ -221,9 +233,9 @@
 | macOS 签名与公证 | Developer ID 签名 + notarization + staple | Apple Developer 账号与证书 | `design:655`；条件 17 |
 | Linux 独立签名 | 独立签名 + 公钥发布路径 | 签名密钥/签名服务 | `design:656`；条件 17 |
 | SBOM 生成与发布 | cargo-cyclonedx 等工具生成 SPDX/CycloneDX，随发布产物发布 | 工具选型与发布流程挂接 | `design:652`；条件 17 |
-| §5.4 构建信息嵌入补齐 | ✅ 已完成（E3a）：Git Commit 经 job 级 `RUTILUS_GIT_COMMIT` 注入（`ci.yml:53-64`）、`GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）、`rutilus version` 三行输出（`:733-737`）、本地无变量时降级 `dev`（`app/tests/version.rs:8-11, 27-36` 派生断言）；§5.4 四项构建结果（产品版本 + Git Commit + 基线 + 账本 Hash）已全部嵌入 | 无 | `design:657` |
-| SHA-256 校验清单 | 发布产物清单随包发布（`release-artifacts` job 已用 `scripts/checksums.sh` 生成 `release/SHA256SUMS`，`ci.yml:592-594`） | 发布流程 | `design:653` |
-| 证书到位后首次 release 实跑演练 | 签名/SBOM/校验链全流程首跑：Windows Authenticode、macOS 签名与公证、Linux minisign、SBOM 生成、SHA-256 清单、artifact 上传——核验 **6 项确认点**（musl-tools 安装 / cargo-cyclonedx@0.5.9 钉版 / base64 物化 / env `&&`·`||` 表达式 / thumbprint-only 模式 / 上传权限，见条件 17） | 证书/账号（RUTILUS_WINDOWS_CERT_* / RUTILUS_MAC_* / RUTILUS_NOTARY_* / RUTILUS_LINUX_SIGN_* secrets，`ci.yml:355-362`） | 条件 17 |
+| §5.4 构建信息嵌入补齐 | ✅ 已完成（E3a）：Git Commit 经 job 级 `RUTILUS_GIT_COMMIT` 注入（`ci.yml:84`）、`GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）、`rutilus version` 三行输出（`:733-737`）、本地无变量时降级 `dev`（`app/tests/version.rs:8-11, 27-36` 派生断言）；§5.4 四项构建结果（产品版本 + Git Commit + 基线 + 账本 Hash）已全部嵌入 | 无 | `design:657` |
+| SHA-256 校验清单 | 发布产物清单随包发布（`release-artifacts` job 已用 `scripts/checksums.sh` 生成 `release/SHA256SUMS`，`ci.yml:736-738`） | 发布流程 | `design:653` |
+| 证书到位后首次 release 实跑演练 | 签名/SBOM/校验链全流程首跑：Windows Authenticode、macOS 签名与公证、Linux minisign、SBOM 生成、SHA-256 清单、artifact 上传——核验 **6 项确认点**（musl-tools 安装 / cargo-cyclonedx@0.5.9 钉版 / base64 物化 / env `&&`·`||` 表达式 / thumbprint-only 模式 / 上传权限，见条件 17） | 证书/账号（RUTILUS_WINDOWS_CERT_* / RUTILUS_MAC_* / RUTILUS_NOTARY_* / RUTILUS_LINUX_SIGN_* secrets，`ci.yml:449-456, 474-480`） | 条件 17 |
 
 ## 四、1.0.0 就绪度结论
 
@@ -233,7 +245,7 @@
 条件 1-6 全部 ✅：47 账本 / 29 模块 / 43 操作 / 未映射 0 由 0.8.0 冻结 + 门禁钉死
 （`milestone-status.md` §一-§二），写操作全类型化、无原始 BMC 写请求、无裸 SQL 均为机械
 门禁可复验事实。此面**不依赖外部资源**；E1 已合入且 Release Baseline / Capability Ledger /
-Migration 门禁已复跑通过（`ci.yml:306-330`），本版行号均按合并后 master 复核。
+Migration 门禁已复跑通过（`ci.yml:393-423`），本版行号均按合并后 master 复核。
 
 **2. 支撑能力面（安全、任务、审计、备份、恢复、跨平台交付）：结构性支撑充分，实测认证缺位。**
 - 已结构达成：Center 不保存 BMC Secret（13 ✅）、Site 脱离 Center 完整运行（14 ✅）、
@@ -291,11 +303,18 @@ BLOCKER；N5 已关闭、Secret 扫描门禁已落地、E1 捕获点与 E4 约�
   在前轮全部重核换算完毕。
 - 门禁复跑（2026-08-13，迭代十五后，HEAD = 5cd75ae）：**fmt 干净、clippy `-D warnings` 全 workspace 零警告、
   1800 测试 0 失败**（`cargo test --workspace -- --list` 口径：lib/集成 1799 + doc 1 = 1800；
-  增量 1731→1800，+69 全部来自 wave-one 测试面）；`ci.yml:360-390`（Migration `:360-362`、Capability Ledger `:376-378`、
-  Release Baseline `:388-390`）独立门禁复跑通过；per-crate 口径（2026-08-13 实测）：migration 48 /
+  增量 1731→1800，+69 全部来自 wave-one 测试面）；`ci.yml:393-423`（Migration `:393-395`、Capability Ledger `:409-411`、
+  Release Baseline `:421-423`）独立门禁复跑通过；per-crate 口径（2026-08-13 实测）：migration 48 /
   persistence 202 / application 322 / infra 295 / test-support 54（+1 doc-test）/
   web 147 / ui 141（含 15 个 i18n 测试）/ rutilus 152 / security 52（门禁 9）。
   上一轮（迭代十，2026-08-12，HEAD = 7533c03）的 1731/38/301/133/145/门禁 8 为当时实测，保留为历史基准。
+- 门禁复跑（2026-08-13，迭代十六后，HEAD = e59b14a）：**fmt 干净、clippy `-D warnings` 全 workspace 零警告、
+  **1837 测试 0 失败**（`cargo test --workspace -- --list` 口径：lib/集成 1836 + doc 1 = 1837；
+  增量 1800→1837，+37 全部来自 wave-two 测试面）；per-crate 口径（2026-08-13 实测）：
+  rutilus 158 / api 84 / application 339 / center-protocol 30 / domain 209 / infra-redfish 295 /
+  migration 50 / operation-engine 34 / persistence 209 / platform 32 / security 53（含门禁 10）/
+  test-support 54（+1 doc-test）/ ui 141 / web 148；门禁计数：down_order_gate 11→12、
+  bare_sql_gate 4→5、secret leak gate 9→10（`assert-tests-ran.sh` floor 8/38 为下界 pin 保持不动）。
 - 引用自检记录见下节（每个 file:line 均在本轮打开核实）。
 
 ## 六、引用自检记录（2026-08-12，HEAD d1b375c 复核，迭代八后；历史记录）

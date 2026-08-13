@@ -32,7 +32,7 @@ Rutilus 是一个由 Rust 实现、通过浏览器 GUI 使用、基于 `nv-redfi
 | `nv-redfish` 开发/发布基线 | `0.13.0`（2026-08-04 发布） | `infra-redfish/src/lib.rs`、`infra-redfish/src/release_baseline.rs` |
 | 已知更新正式版本 | `0.14.2`（2026-08-10 发布，未 yank），升级决策留待冻结评审 | `infra-redfish/src/release_baseline.rs` |
 | 能力账本规模 | 47 条（33 标准 + 14 OEM） | `domain/src/capability.rs` |
-| 构建 Git Commit 嵌入 | CI 构建注入 `RUTILUS_GIT_COMMIT`（`github.sha`），本地构建降级 `dev`；`rutilus version` 第三行输出 | `ci.yml:60-71`；`app/src/main.rs:38-40` |
+| 构建 Git Commit 嵌入 | CI 构建注入 `RUTILUS_GIT_COMMIT`（`github.sha`），本地构建降级 `dev`；`rutilus version` 第三行输出 | `ci.yml:84`；`app/src/main.rs:38-40` |
 | CLI 名称 | `rutilus` | `app/src/main.rs` |
 
 运行 `rutilus version` 可打印产品版本、`nv-redfish` 开发基线与构建 Git Commit（三行，
@@ -45,7 +45,7 @@ git commit dev
 ```
 
 第三行 `git commit`：CI 构建由 job 级 `RUTILUS_GIT_COMMIT` 环境变量注入构建时的
-`github.sha`（`ci.yml:60-71`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）；
+`github.sha`（`ci.yml:84`），二进制经 `GIT_COMMIT` 常量嵌入（`app/src/main.rs:38-40`）；
 本地构建未设置该变量时降级输出 `dev`（不调用 git 子进程）。版本/日志格式测试断言与二进制
 同源派生（`app/tests/version.rs:27-36`、`app/tests/log_format.rs:23-28`）。
 
@@ -189,24 +189,24 @@ Edge 控制台视图（`ui/src/lib.rs` 的 `ConsoleView`，共 17 个视图，�
 | Users / Sessions | 用户与会话管理（仅 Administrator） |
 | Center sites / Center operations / Center bindings | 中心姿态视图（仅 Center 控制台显示） |
 
-中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs:10333` `CenterSitesView`、
-`:10524` `CenterOperationsView`、`:11336` `CenterBindingsView`，渲染于 `:12579-12581`）。
+中心控制台提供已注册站点列表、聚合端点详情、中心操作派发、绑定管理（`ui/src/lib.rs:10335` `CenterSitesView`、
+`:10526` `CenterOperationsView`、`:11338` `CenterBindingsView`，渲染于 `:12581-12583`）。
 界面文案经 i18n 目录解析（`ui/src/lib.rs` 的 `ConsoleView::label()` 返回 `L().nav_*` 目录键，
 `lib.rs:2922-2940`；运行时语言选择 En/Zh，`ui/src/i18n.rs`），与设计文档 §12.1 的一级导航对应关系为：
 总览 = Overview（多服务器清单视图，见 §4.2）；分组 = Groups；操作任务 = Operations；事件 = Events；
 更新制品 = Artifacts；凭据 = Credentials；用户与权限 = Users/Sessions；中心连接 = Center bindings；
 审计 = Audit。设计文档中的"服务器/管理端点/设置"在实现中不以独立导航视图存在——
 服务器与管理端点统一由 Overview 清单呈现（每张端点卡片显示 Systems/Chassis/Managers 资源计数与核心资源列表，
-`ui/src/lib.rs:12587` `EndpointCard`，"No resource counts are published until a complete refresh succeeds."
-提示 `:12664`），"设置"尚无对应视图（如实标注）。
+`ui/src/lib.rs:12589` `EndpointCard`，"No resource counts are published until a complete refresh succeeds."
+提示 `:12666`），"设置"尚无对应视图（如实标注）。
 
 ### 4.2 多服务器首页（Overview）
 
 Overview 视图即多服务器首页（"Inventory"）：上方为 §14.2 聚合仪表盘（一次 `GET /api/v1/overview`
 服务端聚合，`web/src/lib.rs` 的 overview 路由），下方为端点清单——每张端点卡片显示统一健康徽标
 （Unified endpoint health）、信任徽标、快照状态标签
-（"No resource counts are published until a complete refresh succeeds."，`ui/src/lib.rs:12664`）、
-Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs:12587` `EndpointCard` 起，资源计数 `:12595-12598`）。
+（"No resource counts are published until a complete refresh succeeds."，`ui/src/lib.rs:12666`）、
+Systems/Chassis/Managers 资源计数与核心资源列表（`ui/src/lib.rs:12589` `EndpointCard` 起，资源计数 `:12597-12599`）。
 
 聚合仪表盘（§14.2"首页显示"列表）展示：
 
@@ -308,7 +308,7 @@ HTTP 返回 200/201/202/204 都不直接等于业务成功——写操作后必�
 
 Telemetry 家族的专用表单**尚未实现**（"The telemetry write form is a later milestone"），
 Log（清空日志）与 Control（控制更新）家族同样没有专用表单——表单选择器会明确拒绝而不是伪造
-（`ui/src/lib.rs:6290, 6362, 6438` 返回 `OperationFormError::FamilyRequired`，变体定义 `:6530`）。
+（`ui/src/lib.rs:6290, 6362, 6438` 返回 `OperationFormError::FamilyRequired`，变体定义 `:6530`，wave-two 后重核）。
 已持久化的这些家族命令仍会在操作卡片中正确渲染摘要（`wire_command_summary`）。
 
 ### 5.3 批量操作
