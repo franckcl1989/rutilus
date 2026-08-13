@@ -563,7 +563,7 @@ jobs:
       # MAC_CERT_ID stays the sign-mode indicator.
       - name: Signing skipped (no certificate configured)
         if: ${{ (runner.os == 'Windows' && secrets.RUTILUS_WINDOWS_CERT_B64 == '' && secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT == '') || (runner.os == 'macOS' && secrets.RUTILUS_MAC_CERT_ID == '') || (runner.os == 'Linux' && secrets.RUTILUS_LINUX_SIGN_KEY_B64 == '') }}
-        run: echo "signing skipped: certificate not configured"
+        run: 'echo "signing skipped: certificate not configured"'
 
       # --- SBOM (workspace-wide; generated once on the x86_64 linux job) ----
       # cargo-cyclonedx (pinned to 0.5.9, the latest stable on crates.io as
