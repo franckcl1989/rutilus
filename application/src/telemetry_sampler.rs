@@ -51,8 +51,29 @@
 //! as optional display metadata ([`MetricReportReading::bmc_timestamp`]),
 //! exactly like the events model keeps the BMC's `EventTimestamp` beside the
 //! product receive time.
+//!
+//! # The monotonic sampling guard
+//!
+//! The product clock is a wall clock, so it can regress (NTP correction,
+//! wall-clock drift). A sample stamped with a regressed instant would sit
+//! out of order inside the series timeline — the newest-first projection and
+//! the retention prune are product-time cuts, so a regressed row would
+//! interleave into the middle of the history instead of extending it. The
+//! sampler therefore guards the stamp: every `now` must be at least the
+//! previous accepted one (equal instants are the same sweep and stay
+//! allowed), and a regressed instant is refused with the classified
+//! [`TelemetrySamplerError::ClockRollback`] — the `CutoffUnderflow` style:
+//! the use case surfaces the wall-clock anomaly as a controlled failure and
+//! the sampling loop records it, instead of silently stamping history with a
+//! time that never existed.
 
-use std::{error::Error, fmt, num::NonZeroU64, str::FromStr as _};
+use std::{
+    error::Error,
+    fmt,
+    num::NonZeroU64,
+    str::FromStr as _,
+    sync::{Mutex, PoisonError},
+};
 
 use rutilus_domain::{
     EndpointId, NonFiniteSampleValue, ResourceFeature, SeriesKey, SeriesKeyError, TelemetrySample,
@@ -443,10 +464,19 @@ where
 /// Generic over the sample-source boundary, the telemetry repository, and
 /// the product clock; the use case decides the *what* (which values become
 /// samples), never the *when* — the background loop owns the cadence.
+///
+/// The use case is the product-time guard of the sampling path: it tracks
+/// the last accepted sampling instant and refuses a regressed one (see the
+/// module doc's monotonic-guard section), so the persisted timeline can
+/// never contain an out-of-order row written by this path.
 pub struct TelemetrySampler<Reader, Store, Time> {
     reader: Reader,
     store: Store,
     clock: Time,
+    /// The last sampling instant this use case accepted, for the monotonic
+    /// stamp guard. A `Mutex` because the boundary methods take `&self`; the
+    /// lock is held only for the compare-and-store of one tick instant.
+    last_sample_instant: Mutex<Option<OffsetDateTime>>,
 }
 
 impl<Reader, Store, Time> TelemetrySampler<Reader, Store, Time>
@@ -461,6 +491,7 @@ where
             reader,
             store,
             clock,
+            last_sample_instant: Mutex::new(None),
         }
     }
 
@@ -476,19 +507,28 @@ where
     /// predating the 0.4.0 value projection — samples zero series without
     /// error.
     ///
+    /// The stamp is guarded monotonically (see the module doc): an instant
+    /// below the previous accepted one is refused before any series is
+    /// touched, so a wall-clock rollback can never append a regressed row
+    /// into the bounded history — the newest-first projection and the
+    /// retention prune stay honest product-time cuts. Equal instants are
+    /// the same sweep and stay allowed.
+    ///
     /// # Errors
     ///
     /// Returns [`TelemetrySamplerError::Read`] when the sample source fails,
     /// [`TelemetrySamplerError::Upsert`] when a series cannot be recorded,
-    /// and [`TelemetrySamplerError::Append`] when a sample cannot be
-    /// recorded. Per-endpoint failure isolation is the caller's job, exactly
-    /// like the event-listener sink failures: one endpoint's failed tick
-    /// never stops the others.
+    /// [`TelemetrySamplerError::Append`] when a sample cannot be recorded,
+    /// and [`TelemetrySamplerError::ClockRollback`] when `now` regresses
+    /// below the previous accepted instant. Per-endpoint failure isolation
+    /// is the caller's job, exactly like the event-listener sink failures:
+    /// one endpoint's failed tick never stops the others.
     pub async fn sample_endpoint(
         &self,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
     ) -> Result<EndpointSampling, TelemetrySamplerError<Reader::Error, Store::Error>> {
+        self.accept_instant(now)?;
         let reports = self
             .reader
             .read_metric_reports(endpoint_id)
@@ -534,6 +574,35 @@ where
             }
         }
         Ok(EndpointSampling::new(series_sampled, samples_appended))
+    }
+
+    /// Accepts one sampling instant under the monotonic stamp guard, or
+    /// refuses the tick with [`TelemetrySamplerError::ClockRollback`] when
+    /// `now` regresses below the previous accepted instant.
+    ///
+    /// The lock is held only for this compare-and-store: the helper is
+    /// synchronous, so the guard never spans an await point.
+    fn accept_instant(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(), TelemetrySamplerError<Reader::Error, Store::Error>> {
+        let mut last_instant = self
+            .last_sample_instant
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = *last_instant
+            && now < previous
+        {
+            // A regressed product clock (NTP correction, wall-clock drift):
+            // appending samples stamped with the regressed instant would
+            // interleave out-of-order rows into the series timeline.
+            // Refusing the tick — the `CutoffUnderflow` style: a classified
+            // failure the sampling loop records — keeps the history
+            // monotonic without falsifying any stamp.
+            return Err(TelemetrySamplerError::ClockRollback { previous, now });
+        }
+        *last_instant = Some(now);
+        Ok(())
     }
 
     /// Prunes every sample older than the retention window (design §14.4:
@@ -633,6 +702,13 @@ where
     Prune(#[source] StoreError),
     #[error("the product clock predates the telemetry retention window")]
     CutoffUnderflow,
+    #[error(
+        "the product clock regressed from {previous} to {now}; refusing a non-monotonic sample instant"
+    )]
+    ClockRollback {
+        previous: OffsetDateTime,
+        now: OffsetDateTime,
+    },
 }
 
 #[cfg(test)]
@@ -951,6 +1027,65 @@ mod tests {
 
         assert_eq!(sampling, EndpointSampling::new(0, 0));
         assert!(store.upserts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clock_rollback_is_refused_and_history_stays_monotonic() -> Result<(), Box<dyn Error>>
+    {
+        // The monotonic stamp guard: a product-clock rollback (NTP
+        // correction, wall-clock drift) between ticks must refuse the
+        // regressed sweep — the `CutoffUnderflow` style, a classified
+        // failure the sampling loop records — so a regressed row can never
+        // interleave into the newest-first projection. Equal instants (the
+        // other endpoints of one sweep) and forward ticks sample normally.
+        let endpoint_id = EndpointId::generate();
+        let series = MetricReportValues::try_new(
+            SeriesKey::parse("PowerMetrics")?,
+            vec![MetricReportReading::new(None, 100.0)],
+        )?;
+        let store = RecordingStore::new();
+        let sampler = TelemetrySampler::new(
+            FakeReader::with_reports(vec![series]),
+            &store,
+            FixedClock(instant(30)),
+        );
+
+        sampler.sample_endpoint(endpoint_id, instant(30)).await?;
+        let Err(error) = sampler.sample_endpoint(endpoint_id, instant(10)).await else {
+            return Err(std::io::Error::other("a regressed tick must be refused").into());
+        };
+        assert!(matches!(
+            error,
+            TelemetrySamplerError::ClockRollback { previous, now }
+                if previous == instant(30) && now == instant(10)
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the product clock regressed from {} to {}; refusing a non-monotonic sample instant",
+                instant(30),
+                instant(10)
+            )
+        );
+        // The regressed tick appended nothing: the recorded history holds
+        // only the monotonic instant, so the newest-first projection cannot
+        // contain an out-of-order row.
+        let recorded = store.samples();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1, instant(30));
+
+        // Equal instants are one sweep, not a rollback; a forward tick
+        // samples again — the guard refuses only regressions.
+        sampler.sample_endpoint(endpoint_id, instant(30)).await?;
+        sampler.sample_endpoint(endpoint_id, instant(31)).await?;
+        let recorded = store.samples();
+        assert_eq!(recorded.len(), 3);
+        let instants = recorded.iter().map(|sample| sample.1).collect::<Vec<_>>();
+        assert!(
+            instants.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the appended history must stay non-decreasing in product time"
+        );
         Ok(())
     }
 

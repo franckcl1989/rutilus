@@ -84,8 +84,13 @@ message Hello {
   // Operator-chosen display name of the site.
   string site_name = 6;
 
-  // The last outbox sequence this site has accepted; the center resumes the
-  // reliable outbox from here after a reconnect (§15.4).
+  // Contract drift, retained for wire stability only: the resume contract
+  // moved off this field. The reliable outbox (§15.4) resumes through the
+  // durable outbox re-send — the site re-sends every unacknowledged entry on
+  // reconnect and the center acknowledges per frame (the envelope
+  // `acked_sequence` piggyback plus the explicit `Ack` message) — and the
+  // center never reads this field. Senders keep writing the proto3 default
+  // (zero); the field is dead, never repurposed.
   uint64 last_acked_sequence = 7;
 }
 

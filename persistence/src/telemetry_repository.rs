@@ -212,6 +212,14 @@ impl SqliteStore {
     /// the product sampling time (`observed_at`), with the row identity as a
     /// deterministic tie-break for readings sampled at the same instant.
     ///
+    /// The sampler's monotonic stamp guard (the application
+    /// `TelemetrySampler` refuses regressed instants) means rows written
+    /// through the sampling path extend the timeline in `observed_at` order,
+    /// so the projection is exactly the write sequence's product-time form.
+    /// The ordering is nevertheless a pure product-time cut: even a row
+    /// written outside the guard (manual database edit) projects by its own
+    /// `observed_at`, never by insertion order.
+    ///
     /// Each row is rehydrated as a complete domain sample, so one corrupt
     /// row poisons the whole listing: the caller must surface the
     /// corruption rather than silently drop an unreadable reading.
@@ -543,6 +551,49 @@ mod tests {
             store.list_samples(series.id(), 100).await?.len(),
             readings.len(),
             "a limit above the table size must return every reading"
+        );
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn out_of_order_observed_at_rows_project_in_product_time_order()
+    -> Result<(), Box<dyn Error>> {
+        // The sampler's monotonic guard refuses regressed instants, so the
+        // sampling path can never insert an out-of-order row; a row written
+        // by another path (a manual database edit) still projects honestly:
+        // the listing orders by the product sampling time, so a regressed
+        // row sorts by its own `observed_at`, never by insertion order —
+        // a clock-rollback sample cannot produce an out-of-order projection.
+        let (directory, store) = store_with_directory().await?;
+        let series = store
+            .upsert_series(
+                EndpointId::generate(),
+                SeriesKey::parse("PowerMetrics/PowerConsumedWatts")?,
+            )
+            .await?;
+        let base = OffsetDateTime::now_utc();
+        let readings = [
+            (base + Duration::hours(2), 12.0),
+            (base, 10.0),
+            (base + Duration::hours(1), 11.0),
+        ];
+        for (observed_at, value) in readings {
+            store
+                .append_sample(&TelemetrySample::new(series.id(), observed_at, value)?)
+                .await?;
+        }
+
+        let listed = store.list_samples(series.id(), 10).await?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(TelemetrySample::observed_at)
+                .collect::<Vec<_>>(),
+            vec![base + Duration::hours(2), base + Duration::hours(1), base,],
+            "the listing must order by product time regardless of insertion order"
         );
 
         store.close().await?;

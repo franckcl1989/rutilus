@@ -81,9 +81,20 @@ pub const MAX_CONCURRENT_REFRESHES: usize = 4;
 /// Entries are intentionally retained for the process lifetime: a gate must
 /// never be dropped while a refresh holds its permit, because dropping the
 /// registry's last `Arc` would free the semaphore and admit a concurrent
-/// refresh of the same endpoint. The registry therefore holds at most one
-/// entry per managed endpoint the process has ever refreshed — bounded by
-/// the fleet size.
+/// refresh of the same endpoint.
+///
+/// The registry therefore has no reclamation path — and none is reachable
+/// today: the site has no endpoint-deletion use case (endpoint rows are
+/// only created; the site's managed-endpoint path exposes no removal, and
+/// the §21 delete convergence in `center_sync` reacts to endpoints that
+/// vanished by manual database change or restore, with deletion itself
+/// named a future use case there). The registry is process-internal: one
+/// entry per managed endpoint per process lifecycle, never released,
+/// bounded by the all-time
+/// fleet size. A future endpoint-removal path must wire reclamation here —
+/// reclaiming a gate only after every refresh of that endpoint has finished
+/// (never while a permit is held), so the registry never shrinks underneath
+/// an in-flight refresh.
 static ENDPOINT_READ_GATES: OnceLock<Mutex<HashMap<EndpointId, Arc<Semaphore>>>> = OnceLock::new();
 
 /// Returns the process-wide one-permit read gate of one endpoint, or `None`
