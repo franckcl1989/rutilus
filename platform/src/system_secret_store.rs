@@ -171,8 +171,14 @@ pub enum SystemSecretStoreError {
 
 #[cfg(test)]
 mod tests {
+    // The three tests below are cfg'd off on macOS (the macOS-specific
+    // Keychain CLI tests live in the macos_keychain submodule), leaving the
+    // module with no body on that platform — gate the imports the same way
+    // or clippy fails the macOS job on unused-imports.
+    #[cfg(not(target_os = "macos"))]
     use std::error::Error;
 
+    #[cfg(not(target_os = "macos"))]
     use super::*;
 
     #[cfg(not(target_os = "macos"))]
