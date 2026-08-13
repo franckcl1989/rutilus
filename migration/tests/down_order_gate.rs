@@ -19,7 +19,12 @@
 //! through the `#[sea_orm(iden = "...")]` table names, and raw
 //! `ALTER TABLE ... ADD COLUMN ... REFERENCES ...` statements (the only way
 //! `SQLite` adds a live foreign key, `m20260805_000011`'s `batch_id` link)
-//! yield their edges too. Edges from every file form one global graph — a
+//! yield their edges too. The `REFERENCES` clauses of raw `CREATE TABLE`
+//! rebuild DDL yield theirs as well — `m20260810_000001`'s six cascade
+//! children and `m20260810_000002`'s `role_assignments` — with the
+//! `*_rebuild` staging name normalized to the live table it is renamed into
+//! (`SQLite` rewrites references on rename, so the live foreign key is the
+//! renamed one). Edges from every file form one global graph — a
 //! `down` may drop tables whose foreign keys were created in earlier
 //! migrations: `m20260810_000001`'s rebuild drops `endpoints` and its six
 //! children (`endpoint_addresses`, `endpoint_trust`, `endpoint_credentials`
@@ -617,17 +622,11 @@ fn foreign_key_edges(
 /// The foreign-key edges `child → parent` defined by raw SQL: every
 /// `ALTER TABLE <table> ... REFERENCES <other>(...)` statement adds the edge
 /// `<table> → <other>`. This is the only way `SQLite` adds a live foreign
-/// key (`m20260805_000011`'s `operations.batch_id` link,
-/// `m20260810_000001`'s `endpoints.site_id`); the `REFERENCES` clauses of
-/// raw `CREATE TABLE` rebuild DDL are deliberately not read — they usually
-/// name the `*_rebuild` staging tables, but the blind spot includes live
-/// cases: `m20260810_000002`'s `role_assignments_rebuild` references
-/// `instances(id)`/`principals(id)`, so the `role_assignments →
-/// instances`/`principals` edges are not scanned. Currently harmless (that
-/// file's `down` only drops `role_assignments` and renames the rebuild
-/// table, never `instances`/`principals`); a future migration whose down
-/// order depends on such an edge would require extending the scan to raw
-/// `CREATE TABLE` rebuild DDL.
+/// key to an existing table (`m20260805_000011`'s `operations.batch_id`
+/// link, `m20260810_000001`'s `endpoints.site_id`). The rebuild `RENAME TO`
+/// tails never carry a `REFERENCES` clause, so they contribute nothing here;
+/// the edges of the raw `CREATE TABLE` rebuild DDL itself are read by
+/// [`raw_create_table_references`].
 fn raw_alter_references(
     tokens: &[Token],
     consts: &HashMap<String, (usize, String)>,
@@ -653,6 +652,73 @@ fn raw_alter_references(
             };
             if let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word)) {
                 edges.push((altered.to_owned(), referenced.to_owned()));
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// The live table a `*_rebuild` staging name stands for: the `_rebuild`
+/// suffix is stripped, because the rebuild tail renames the staging table
+/// into the live table and `SQLite` rewrites its foreign keys on rename.
+fn live_table_name(name: &str) -> &str {
+    name.strip_suffix("_rebuild").unwrap_or(name)
+}
+
+/// The foreign-key edges `child → parent` defined by raw `CREATE TABLE`
+/// rebuild DDL: every `REFERENCES <other>(...)` clause in the created
+/// table's body adds the edge `<table> → <other>`, whether the clause is
+/// inline in a column definition (`site_id UUID NULL REFERENCES
+/// instances(id)`) or inside a table-level `CONSTRAINT ... FOREIGN KEY`
+/// (`m20260810_000002`'s two `principals(id)` links).
+///
+/// The rebuild staging tables are created under the `<table>_rebuild` name
+/// and renamed into place afterwards
+/// (`ALTER TABLE <table>_rebuild RENAME TO <table>`), so
+/// [`live_table_name`] is applied to both sides of every
+/// edge: `role_assignments_rebuild REFERENCES instances(id)` is the live
+/// `role_assignments → instances` edge, the six `endpoints_rebuild`
+/// children of `m20260810_000001` normalize to their live `→ endpoints`
+/// edges, and a staging table referencing its own `*_rebuild` parent
+/// (`endpoints_rebuild → endpoints_rebuild`) normalizes to a self-edge that
+/// the order check skips. A `CREATE TABLE IF NOT EXISTS` statement (none in
+/// the current migrations) is skipped by the `IF` guard rather than
+/// misread.
+fn raw_create_table_references(
+    tokens: &[Token],
+    consts: &HashMap<String, (usize, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut edges = Vec::new();
+    for argument in execute_unprepared_arguments(tokens) {
+        for (_line, statement) in argument_statements(&argument, consts)? {
+            let words: Vec<&str> = statement.split_whitespace().collect();
+            if !(words
+                .first()
+                .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+                && words
+                    .get(1)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("TABLE")))
+            {
+                continue;
+            }
+            if words
+                .get(2)
+                .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
+            {
+                continue;
+            }
+            let Some(created) = words.get(2).map(|word| sql_identifier(word)) else {
+                continue;
+            };
+            let created = live_table_name(created).to_owned();
+            for position in words.iter().enumerate().filter_map(|(position, word)| {
+                word.eq_ignore_ascii_case("REFERENCES").then_some(position)
+            }) {
+                let Some(referenced) = words.get(position + 1).map(|word| sql_identifier(word))
+                else {
+                    continue;
+                };
+                edges.push((created.clone(), live_table_name(referenced).to_owned()));
             }
         }
     }
@@ -862,6 +928,7 @@ fn migration_down_order_violations() -> Result<Vec<String>, Box<dyn Error>> {
         let consts = const_literals(&source.tokens);
         edges.extend(foreign_key_edges(&source.tokens, &enum_tables)?);
         edges.extend(raw_alter_references(&source.tokens, &consts)?);
+        edges.extend(raw_create_table_references(&source.tokens, &consts)?);
     }
     edges.sort();
     edges.dedup();
@@ -895,6 +962,7 @@ fn synthetic_edges(tokens: &[Token]) -> Result<Vec<(String, String)>, String> {
     let consts = const_literals(tokens);
     let mut edges = foreign_key_edges(tokens, &enum_tables)?;
     edges.extend(raw_alter_references(tokens, &consts)?);
+    edges.extend(raw_create_table_references(tokens, &consts)?);
     edges.sort();
     edges.dedup();
     Ok(edges)
@@ -1160,6 +1228,165 @@ enum Operations {
             violation.contains("operations") && violation.contains("batch_operations")
         }),
         "dropping `operations` before `batch_operations` must be rejected, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// A raw `CREATE TABLE` with an inline `REFERENCES` clause — the rebuild-DDL
+/// shape, here against a live parent — must yield the edge, and a `down`
+/// that drops the parent first must be rejected with the exact `file:line`
+/// of the offending drop in the message.
+#[test]
+fn gate_reads_fk_edges_from_raw_create_table_references() -> Result<(), Box<dyn Error>> {
+    let source = r#"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TABLE children (\
+                 id UUID NOT NULL PRIMARY KEY,\
+                 parent_id UUID NOT NULL REFERENCES parents(id) ON DELETE CASCADE)",
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection.execute_unprepared("DROP TABLE parents").await?;
+        connection.execute_unprepared("DROP TABLE children").await
+    }
+}
+"#;
+    let source = tokenize("synthetic_raw_create.rs", source);
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "parents".to_owned())),
+        "the raw CREATE TABLE REFERENCES clause must yield the edge, got: {edges:?}",
+    );
+    let violations = order_violations_for(&source, &edges)?;
+    let parent_line = source
+        .tokens
+        .iter()
+        .find_map(|token| match token {
+            Token::Str { line, content } if content.contains("DROP TABLE parents") => Some(*line),
+            _ => None,
+        })
+        .ok_or_else(|| "no `DROP TABLE parents` literal in the synthetic source".to_owned())?;
+    assert!(
+        violations.iter().any(|violation| {
+            violation.starts_with(&format!("synthetic_raw_create.rs:{parent_line}:"))
+                && violation.contains("parents")
+                && violation.contains("children")
+        }),
+        "the parent-first `down` must be rejected with the exact line, got:\n{}",
+        violations.join("\n"),
+    );
+    Ok(())
+}
+
+/// A raw-rebuild migration in the `m20260810_000002` shape: `up` creates the
+/// `children_rebuild` staging table with a `REFERENCES parents(id)` clause,
+/// drops the old table, and renames the staging table into place; `down`
+/// drops both tables in the requested order through raw
+/// `execute_unprepared` statements.
+fn raw_create_rebuild_source(drop_parent_first: bool) -> String {
+    let drops = if drop_parent_first {
+        r#"connection.execute_unprepared("DROP TABLE parents").await?;
+        connection.execute_unprepared("DROP TABLE children").await"#
+    } else {
+        r#"connection.execute_unprepared("DROP TABLE children").await?;
+        connection.execute_unprepared("DROP TABLE parents").await"#
+    };
+    format!(
+        r#"use sea_orm::ConnectionTrait;
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {{
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(
+                "CREATE TABLE children_rebuild (\
+                 id UUID NOT NULL PRIMARY KEY,\
+                 parent_id UUID NOT NULL REFERENCES parents(id) ON DELETE CASCADE)",
+            )
+            .await?;
+        connection.execute_unprepared("DROP TABLE children").await?;
+        connection
+            .execute_unprepared("ALTER TABLE children_rebuild RENAME TO children")
+            .await
+    }}
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {{
+        let connection = manager.get_connection();
+        {drops}
+    }}
+}}
+"#
+    )
+}
+
+/// The `m20260810_000002` blind spot: the raw rebuild `CREATE TABLE` names
+/// the `*_rebuild` staging table while its `REFERENCES` clauses name the
+/// live parents. The gate must normalize the staging name to the live table
+/// it is renamed into — `role_assignments_rebuild REFERENCES
+/// instances(id)` is the live `role_assignments → instances` edge — so the
+/// live edge is scanned and a `down` that drops the parent before the child
+/// is rejected against it, naming the live tables, never the staging name.
+#[test]
+fn gate_normalizes_raw_create_rebuild_references_to_live_edges() -> Result<(), Box<dyn Error>> {
+    let source = raw_create_rebuild_source(true);
+    let source = tokenize("synthetic_raw_create_rebuild.rs", &source);
+    let edges = synthetic_edges(&source.tokens)?;
+    assert!(
+        edges.contains(&("children".to_owned(), "parents".to_owned())),
+        "the staging REFERENCES clause must normalize to the live edge, got: {edges:?}",
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|(child, parent)| child.contains("_rebuild") || parent.contains("_rebuild")),
+        "no edge may keep a `*_rebuild` staging name, got: {edges:?}",
+    );
+    let violations = order_violations_for(&source, &edges)?;
+    let parent_line = source
+        .tokens
+        .iter()
+        .find_map(|token| match token {
+            Token::Str { line, content } if content.contains("DROP TABLE parents") => Some(*line),
+            _ => None,
+        })
+        .ok_or_else(|| "no `DROP TABLE parents` literal in the synthetic source".to_owned())?;
+    assert!(
+        violations.iter().any(|violation| {
+            violation.starts_with(&format!("synthetic_raw_create_rebuild.rs:{parent_line}:"))
+                && violation.contains("parents")
+                && violation.contains("children")
+                && !violation.contains("children_rebuild")
+        }),
+        "the parent-first `down` must be rejected against the live edge, got:\n{}",
+        violations.join("\n"),
+    );
+
+    let source = raw_create_rebuild_source(false);
+    let source = tokenize("synthetic_raw_create_rebuild.rs", &source);
+    let edges = synthetic_edges(&source.tokens)?;
+    let violations = order_violations_for(&source, &edges)?;
+    assert!(
+        violations.is_empty(),
+        "the child-first `down` must pass with the normalized edge, got:\n{}",
         violations.join("\n"),
     );
     Ok(())
