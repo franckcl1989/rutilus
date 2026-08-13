@@ -344,6 +344,18 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let key_file = SystemMasterKeyFile::new(directory.path().join("system-key.rut"));
         fs::write(key_file.path(), b"secret-looking truncated input")?;
+        // `fs::write` creates the file with the process umask (0644 on CI),
+        // which the Unix loader refuses as NotPrivateFile before it ever
+        // parses the envelope. Pin mode 0600 so the envelope-rejection path
+        // this test asserts is exercised on every platform (Windows has no
+        // POSIX modes, so the block compiles away there); the later
+        // `fs::write` calls truncate the existing file in place and keep
+        // mode 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(key_file.path(), fs::Permissions::from_mode(0o600))?;
+        }
 
         let error = key_file
             .load()

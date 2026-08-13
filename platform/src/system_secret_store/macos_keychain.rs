@@ -74,7 +74,7 @@ pub(crate) fn load() -> Result<Vec<u8>, KeychainCliError> {
     if !output.status.success() {
         return Err(KeychainCliError::Failed {
             operation,
-            status: exit_status(&output.status),
+            status: exit_status(output.status),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
@@ -89,14 +89,16 @@ fn finish(
     if !output.status.success() {
         return Err(KeychainCliError::Failed {
             operation,
-            status: exit_status(&output.status),
+            status: exit_status(output.status),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     Ok(())
 }
 
-fn exit_status(status: &std::process::ExitStatus) -> String {
+// `ExitStatus` is a 4-byte `Copy` type; the macOS clippy gate
+// (trivially_copy_pass_by_ref, `-D warnings`) demands by-value.
+fn exit_status(status: std::process::ExitStatus) -> String {
     status.code().map_or_else(
         || "terminated by signal".to_owned(),
         |code| code.to_string(),

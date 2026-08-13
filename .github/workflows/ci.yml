@@ -178,22 +178,30 @@ jobs:
           rustup component add llvm-tools-preview
           cargo llvm-cov --locked --workspace --fail-under-lines 80 -- --test-threads 4
 
-      # §19.4: cargo deny. Official cargo-deny action (pinned to the version
-      # verified locally against deny.toml: `cargo deny check` -> all of
+      # §19.4: cargo deny. Official cargo-deny action (the v2 tag pins its
+      # own cargo-deny binary; deny.toml compatibility was verified locally
+      # with cargo-deny 0.20.2: `cargo deny check` -> all of
       # advisories/bans/licenses/sources ok). Advisories stay green via the
       # two quick-xml ignores (RUSTSEC-2026-0194/0195) whose trigger notes
       # gate the nv-redfish quick-xml 0.41+ upgrade, and bans stay green via
       # the sha1 0.10 skip (tokio-tungstenite 0.24). The action is a Docker
       # container action with no cache step (verified against its action.yml,
-      # 2026-08-13): the advisory database is fetched fresh on every run, and
-      # the swatinem/rust-cache step above caches only cargo registry/build
+      # 2026-08-13): GitHub runs Docker container actions only on Linux
+      # runners ("Container action is only supported on Linux"), so the step
+      # is gated `if: matrix.is_default` and runs on the ubuntu job alone.
+      # The earlier `version: 0.20.2` input was dropped — the v2 action has
+      # no version input (it builds the cargo-deny pinned by its own tag);
+      # the action's valid inputs are checked on every run, and the CI first
+      # run's "Unexpected input(s) 'version'" warning is what caught it. The
+      # advisory database is fetched fresh on every run, and the
+      # swatinem/rust-cache step above caches only cargo registry/build
       # artifacts under a ref-scoped key — no advisory-database reuse and no
       # cache pollution surface between runs either way.
       - name: Deny checks
+        if: matrix.is_default
         uses: embarkstudios/cargo-deny-action@v2
         with:
           command: check
-          version: 0.20.2
 
       # §19.4: cargo audit. Standalone gate enabled 2026-08-12. cargo-audit
       # reads only audit.toml — NOT deny.toml — so the [advisories] ignore
