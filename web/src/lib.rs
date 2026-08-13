@@ -743,11 +743,11 @@ where
 /// F2).
 ///
 /// The session middleware runs on every route: in `Open` mode it only
-/// resolves the unauthenticated actor, while `Guarded` (and an armed
-/// `PendingBootstrap` gate) require a session and the route's role mask on
-/// everything except the public sign-in surface. The authentication
-/// boundaries are composed from the same injected services bundle as the
-/// product boundaries.
+/// resolves the unauthenticated actor, while `Guarded` and
+/// `PendingBootstrap` — armed or not (S3-2) — require a session and the
+/// route's role mask on everything except the public sign-in surface. The
+/// authentication boundaries are composed from the same injected services
+/// bundle as the product boundaries.
 ///
 /// The posture decides the assembled surface, and the service bound stays
 /// the union of both surfaces because the runtimes inject one services
@@ -6007,7 +6007,7 @@ mod tests {
 
     use axum::{
         body::Body,
-        http::{Request, header::SET_COOKIE},
+        http::{Method, Request, header::SET_COOKIE},
     };
     use http_body_util::BodyExt as _;
     use rutilus_application::{
@@ -6018,15 +6018,17 @@ mod tests {
         StoredCapability, TlsIdentityObservation,
     };
     use rutilus_domain::{
-        Argon2IdHash, BatchOperation, BatchOperationId, BootstrapCode, BootstrapCodeId,
-        CredentialId, CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress,
-        EndpointCapability, EndpointCapabilityObservation, EndpointDisplayName, EndpointId,
-        FailureKind, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-        PasswordCredential, Principal, PrincipalId, PrincipalName, PrincipalState, RedfishCommand,
-        RefreshGeneration, ResetType, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId,
-        ResourceODataType, ResourceSnapshot, ResourceSnapshotPayload, Role, RoleAssignment,
-        SeriesKey, Session, SessionId, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
+        AccountCommand, AccountId, AccountPassword, AccountUserName, Argon2IdHash, BatchOperation,
+        BatchOperationId, BootstrapCode, BootstrapCodeId, CreateAccount, CredentialId,
+        CredentialUsername, CredentialVersionId, Endpoint, EndpointAddress, EndpointCapability,
+        EndpointCapabilityObservation, EndpointDisplayName, EndpointId, FailureKind, Operation,
+        OperationId, OperationSource, OperationState, OperationTarget, PasswordCredential,
+        Principal, PrincipalId, PrincipalName, PrincipalState, RedfishCommand, RefreshGeneration,
+        ResetType, ResourceEtag, ResourceFeature, ResourceId, ResourceODataId, ResourceODataType,
+        ResourceSnapshot, ResourceSnapshotPayload, Role, RoleAssignment, RoleId, SeriesKey,
+        Session, SessionId, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
         TelemetrySeriesId, TlsCertificate, TlsTrust, TotpAuthenticator, TotpAuthenticatorError,
+        UpdateAccountPassword,
     };
     use secrecy::{ExposeSecret, SecretBox, SecretString};
     use serde_json::{Value, json};
@@ -9051,6 +9053,16 @@ mod tests {
                 );
             Ok(())
         }
+
+        /// Inserts one standalone operation exactly as the repository would
+        /// persist it — the operation-history route tests seed rows this way.
+        fn insert_operation(&self, operation: &Operation) -> Result<(), MockWriteError> {
+            self.rows
+                .lock()
+                .map_err(|_| MockWriteError)?
+                .insert(operation.id(), operation.clone());
+            Ok(())
+        }
     }
 
     /// Every gateway boundary reports a controlled failure so the read-path
@@ -9853,9 +9865,20 @@ mod tests {
 
         fn find_operation(
             &self,
-            _operation_id: OperationId,
+            operation_id: OperationId,
         ) -> BoundaryFuture<'_, Result<Option<Operation>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let store = self.batch_store.clone();
+            Box::pin(async move {
+                if store.fail {
+                    return Err(MockWriteError);
+                }
+                Ok(store
+                    .rows
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .get(&operation_id)
+                    .cloned())
+            })
         }
 
         fn apply_transition(
@@ -9867,11 +9890,36 @@ mod tests {
             Box::pin(async { Err(MockWriteError) })
         }
 
+        fn apply_transition_if_current(
+            &self,
+            _operation_id: OperationId,
+            _expected_state: OperationState,
+            _new_state: OperationState,
+            _occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Err(MockWriteError) })
+        }
+
         fn list_operations(
             &self,
-            _state: Option<OperationState>,
+            state_filter: Option<OperationState>,
         ) -> BoundaryFuture<'_, Result<Vec<Operation>, Self::Error>> {
-            Box::pin(async { Err(MockWriteError) })
+            let store = self.batch_store.clone();
+            Box::pin(async move {
+                if store.fail {
+                    return Err(MockWriteError);
+                }
+                let mut operations = store
+                    .rows
+                    .lock()
+                    .map_err(|_| MockWriteError)?
+                    .values()
+                    .filter(|operation| state_filter.is_none_or(|state| operation.state() == state))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                operations.sort_by_key(|operation| (operation.created_at(), operation.id()));
+                Ok(operations)
+            })
         }
 
         fn create_batch<'a>(
@@ -11439,6 +11487,134 @@ mod tests {
         Ok(())
     }
 
+    /// S3-1 regression: a signed-in Viewer reads the every-role operation
+    /// history — the listing, the detail, and the batch report — which must
+    /// render the command structure without ever exposing the §10 account
+    /// password.
+    // The walk covers the listing, the detail, and the batch report (parent
+    // and children), so the line count is the coverage.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn viewer_reads_operation_history_without_account_password_plaintext()
+    -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("viewer", "viewer secret phrase", Role::Viewer);
+        let store = BatchTestStore::working();
+        let base = OffsetDateTime::UNIX_EPOCH;
+        let secret = "viewer-must-never-read-this-password";
+        let command = RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+            AccountUserName::parse("jane")?,
+            AccountPassword::parse(secret.to_owned())?,
+            RoleId::parse("Operator")?,
+        )));
+        let operation = Operation::try_from_parts(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(
+                TargetId::generate(),
+                EndpointId::generate(),
+            )],
+            command.clone(),
+            OperationState::Queued,
+            base,
+            base,
+        )?;
+        store.insert_operation(&operation)?;
+        let batch = BatchOperation::new(
+            BatchOperationId::generate(),
+            OperationSource::Site,
+            command,
+            base,
+        );
+        store.insert(&batch, &[(OperationState::Queued, None)])?;
+        let router = router_with_auth(
+            WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            AuditActor::LocalOperator,
+            DeploymentPosture::Standalone,
+            AuthPolicy::Guarded,
+            Arc::new(UnavailableWriteServices {
+                inventory: Ok(Vec::new()),
+                batch_store: store,
+                managed_endpoints: None,
+                refresh_working: false,
+                revoke_sessions_fail: false,
+                auth_state: auth.clone(),
+                center_state: CenterTestState::default(),
+            }),
+            Arc::new(UnavailableGateway { working: false }),
+            FixedClock,
+        );
+        let (cookie, _csrf) = sign_in(&router, "viewer", "viewer secret phrase").await?;
+
+        let listed = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/operations")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = json_body(listed).await?;
+        let text = serde_json::to_string(&body)?;
+        assert!(
+            !text.contains(secret),
+            "a Viewer must never read the password through the operation listing"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "the redaction marker must stand in for the password"
+        );
+        assert_eq!(
+            body["operations"][0]["command"]["Account"]["CreateAccount"]["user_name"],
+            json!("jane"),
+            "the non-secret command structure stays visible"
+        );
+
+        let detailed = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/operations/{}", operation.id()))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detailed.status(), StatusCode::OK);
+        let body = json_body(detailed).await?;
+        assert!(
+            !serde_json::to_string(&body)?.contains(secret),
+            "a Viewer must never read the password through the operation detail"
+        );
+        assert_eq!(
+            body["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]")
+        );
+
+        let report = router
+            .oneshot(
+                Request::get(format!("/api/v1/batches/{}", batch.id()))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(report.status(), StatusCode::OK);
+        let body = json_body(report).await?;
+        assert!(
+            !serde_json::to_string(&body)?.contains(secret),
+            "a Viewer must never read the password through the batch report"
+        );
+        assert_eq!(
+            body["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]")
+        );
+        assert_eq!(
+            body["children"][0]["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]"),
+            "the batch children are ordinary operation projections and redact too"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bootstrap_claim_arms_the_pending_gate() -> Result<(), Box<dyn Error>> {
         let state = seeded_auth_state();
@@ -11446,12 +11622,13 @@ mod tests {
         let gate = AuthGate::open();
         let router = test_router_with_policy(state, AuthPolicy::PendingBootstrap(gate.clone()));
 
-        // Before the claim the console is open...
+        // Before the claim the product surface is closed (S3-2): the
+        // pending code must not open the console to the network.
         let endpoints = router
             .clone()
             .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
             .await?;
-        assert_eq!(endpoints.status(), StatusCode::OK);
+        assert_eq!(endpoints.status(), StatusCode::UNAUTHORIZED);
         assert!(!gate.is_guarded());
 
         // ...the claim binds the code, sets the password, opens a session,
@@ -11478,8 +11655,8 @@ mod tests {
             .ok_or("the session cookie is malformed")?
             .to_owned();
 
-        // The console is guarded from this request on: the claim's own
-        // session works, a sessionless request is refused.
+        // The claim opens the product surface to its own session; a
+        // sessionless request is refused.
         let closed = router
             .clone()
             .oneshot(Request::get("/api/v1/endpoints").body(Body::empty())?)
@@ -11519,6 +11696,146 @@ mod tests {
             )
             .await?;
         assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// S3-2 regression: the pending-bootstrap window must not open the
+    /// product surface. While the one-time code is unconsumed every
+    /// `GuardedOnly` route is refused without a session — credential,
+    /// endpoint, and audit surfaces stay closed on any binding, loopback
+    /// or not — and the claim opens them to its own session. The claim
+    /// flow itself is Public and keeps working throughout.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn bootstrap_pending_window_does_not_open_the_guarded_surface()
+    -> Result<(), Box<dyn Error>> {
+        let state = seeded_auth_state();
+        state.seed_bootstrap_code("ABCD2345EFGH6789JKLM");
+        let gate = AuthGate::open();
+        let router = test_router_with_policy(state, AuthPolicy::PendingBootstrap(gate.clone()));
+
+        // Before the claim the GuardedOnly surface is refused...
+        for (method, path) in [
+            (Method::GET, "/api/v1/audit"),
+            (Method::POST, "/api/v1/credentials"),
+            (Method::POST, "/api/v1/endpoints"),
+        ] {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        // ...while the claim surface stays open: `me` still reports the
+        // pending signal that drives the first-run screen.
+        let me = router
+            .clone()
+            .oneshot(Request::get("/api/v1/auth/me").body(Body::empty())?)
+            .await?;
+        assert_eq!(me.status(), StatusCode::OK);
+        let body = json_body(me).await?;
+        assert_eq!(body["bootstrap_pending"], true);
+
+        // The claim binds the code, sets the password, and opens a
+        // session; the same three routes then reach their handlers with
+        // it. The mock's store and gateway boundaries fail behind the
+        // middleware — 503, 500, and 502 are the handlers' own answers,
+        // which is exactly the proof that the auth gate let them through.
+        let claim = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "ABCD2345EFGH6789JKLM", "password": "first product password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(claim.status(), StatusCode::OK);
+        assert!(gate.is_guarded(), "the claim must arm the gate");
+        let cookie = claim
+            .headers()
+            .get(SET_COOKIE)
+            .ok_or("the claim must set the session cookie")?
+            .to_str()?
+            .split(';')
+            .next()
+            .ok_or("the session cookie is malformed")?
+            .to_owned();
+        let claim_body = json_body(claim).await?;
+        let csrf = claim_body
+            .get("csrf_token")
+            .and_then(Value::as_str)
+            .ok_or("the claim must carry the CSRF token")?
+            .to_owned();
+
+        let audit = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            audit.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the audit query must reach its handler with the claim session"
+        );
+        let credentials = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/credentials")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"name": "bmc", "username": "root", "password": "secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            credentials.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the credential route must reach its handler with the claim session"
+        );
+        let endpoints = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/endpoints")
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(
+                        r#"{"display_name": "Rack A BMC", "address": "https://127.0.0.1:443", "trust": {"mode": "system_ca"}, "credential_id": "00000000-0000-0000-0000-000000000000"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            endpoints.status(),
+            StatusCode::BAD_GATEWAY,
+            "the enrollment route must reach its handler with the claim session"
+        );
+
+        // The pending signal flips off for the claim's session, so the
+        // first-run screen yields to the console.
+        let me = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/me")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(me.status(), StatusCode::OK);
+        let body = json_body(me).await?;
+        assert_eq!(body["bootstrap_pending"], false);
+        assert_eq!(body["authenticated"], true);
         Ok(())
     }
 
@@ -12297,6 +12614,65 @@ mod tests {
         // The scoped Operator cannot request another site's view explicitly.
         let response = fetch_center_sites_filtered(&router, &operator_cookie, site_b).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    /// S3-1 regression: the center tracking view is every-role readable
+    /// (§16.1), so a signed-in Viewer must see the command structure without
+    /// the §10 account password.
+    #[tokio::test]
+    async fn the_viewer_center_operations_view_never_exposes_account_passwords()
+    -> Result<(), Box<dyn Error>> {
+        let auth = AuthTestState::default();
+        auth.seed_principal("viewer", "viewer secret phrase", Role::Viewer);
+        let state = CenterTestState::default();
+        let site = InstanceId::generate();
+        let endpoint = EndpointId::generate();
+        let secret = "viewer-must-never-read-this-center-password";
+        let command = RedfishCommand::Account(AccountCommand::UpdateAccountPassword(
+            UpdateAccountPassword::new(
+                AccountId::parse("jane")?,
+                AccountPassword::parse(secret.to_owned())?,
+            ),
+        ));
+        state.seed_operation(CenterOperationView::new(
+            OperationId::generate(),
+            Some(site),
+            endpoint,
+            command,
+            Some("/redfish/v1/AccountService/Accounts/jane".to_owned()),
+            OperationState::Queued,
+            Some("admin".to_owned()),
+            Some(OffsetDateTime::UNIX_EPOCH + Duration::minutes(15)),
+            OffsetDateTime::UNIX_EPOCH,
+        ))?;
+        let router = test_center_router_with_auth(auth.clone(), state);
+        let (cookie, _csrf) =
+            sign_in_center(&router, &auth, "viewer", "viewer secret phrase").await?;
+
+        let response = router
+            .oneshot(
+                Request::get("/api/v1/center/operations")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await?;
+        let text = serde_json::to_string(&body)?;
+        assert!(
+            !text.contains(secret),
+            "a Viewer must never read the password through the center operations view"
+        );
+        assert_eq!(
+            body["operations"][0]["command"]["Account"]["UpdateAccountPassword"]["account_id"],
+            json!("jane"),
+            "the non-secret command structure stays visible"
+        );
+        assert_eq!(
+            body["operations"][0]["command"]["Account"]["UpdateAccountPassword"]["password"],
+            json!("[REDACTED]")
+        );
         Ok(())
     }
 

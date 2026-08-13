@@ -178,6 +178,25 @@ impl OperationStore for SqliteStore {
         })
     }
 
+    fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::apply_transition_if_current(
+                self,
+                operation_id,
+                expected_state,
+                new_state,
+                occurred_at,
+            )
+            .await
+        })
+    }
+
     fn record_failure_kind(
         &self,
         operation_id: OperationId,
@@ -441,6 +460,13 @@ impl rutilus_application::CenterOutbox for SqliteStore {
         Box::pin(async move { SqliteStore::list_pending_outbox(self, instance_id, limit).await })
     }
 
+    fn list_offers(
+        &self,
+        instance_id: InstanceId,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Box::pin(async move { SqliteStore::list_outbox_entries(self, instance_id).await })
+    }
+
     fn acknowledge(
         &self,
         entry_id: OutboxEntryId,
@@ -580,6 +606,17 @@ impl CenterProjectionRepository for SqliteStore {
     ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
             SqliteStore::declare_center_artifact(self, artifact, site)
+                .await
+                .map_err(CenterProjectionRepositoryError::Artifact)
+        })
+    }
+
+    fn find_artifact_site(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> BoundaryFuture<'_, Result<Option<InstanceId>, Self::Error>> {
+        Box::pin(async move {
+            SqliteStore::find_artifact_site(self, artifact_id)
                 .await
                 .map_err(CenterProjectionRepositoryError::Artifact)
         })

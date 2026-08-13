@@ -260,7 +260,7 @@ fn expected_projection(index: usize, site_id: InstanceId) -> ExpectedProjection 
         endpoint_id: EndpointId::generate(),
         display_name: format!("E-{index:04}"),
         address: format!("https://198.51.{}.{}/redfish", index / 256, index % 256),
-        health: ["ok", "degraded", "unknown"][index % 3].to_owned(),
+        health: ["ok", "unknown"][index % 2].to_owned(),
         refresh_generation: projection_generation(index),
         site_id,
     }
@@ -1160,5 +1160,92 @@ async fn five_thousand_endpoint_projections_round_trip_at_the_center() -> Result
     );
 
     store.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn older_generation_frames_cannot_overwrite_a_newer_projection() -> Result<(), Box<dyn Error>>
+{
+    let (directory, store) = open_store().await?;
+    let base = OffsetDateTime::now_utc();
+    let site = SiteInstance::new(
+        InstanceId::generate(),
+        String::from("Site Generation"),
+        InstanceKind::Site,
+        base,
+    );
+    store.create_instance(&site).await?;
+    let site_id = site.id();
+    let endpoint_id = EndpointId::generate();
+    let expected = ExpectedProjection {
+        endpoint_id,
+        display_name: String::from("Rack A PDU"),
+        address: String::from("https://192.0.2.10"),
+        health: String::from("ok"),
+        refresh_generation: 3,
+        site_id,
+    };
+    assert_eq!(
+        store
+            .upsert_endpoint_projection(&projection_write(&expected, 3, "ok"), site_id, base)
+            .await?,
+        ProjectionWriteOutcome::Applied
+    );
+
+    // A frame of an older inventory cut is absorbed whole: its generation
+    // must never overwrite the newer `refresh_generation`/`health`, the same
+    // semantics as the per-generation detail snapshots.
+    assert!(matches!(
+        store
+            .upsert_endpoint_projection(
+                &projection_write(&expected, 2, "degraded"),
+                site_id,
+                base + Duration::SECOND,
+            )
+            .await,
+        Ok(ProjectionWriteOutcome::Ignored {
+            reason: ProjectionIgnoreReason::StaleGeneration
+        })
+    ));
+    let listed = store.list_projected_endpoints(Some(site_id)).await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].refresh_generation(),
+        3,
+        "an older generation frame must not roll back the watermark"
+    );
+    assert_eq!(
+        listed[0].health(),
+        "ok",
+        "an older generation frame must not roll back the health cut"
+    );
+
+    // The same generation re-delivery replaces in place (§15.4), and a
+    // newer generation advances the watermark.
+    assert_eq!(
+        store
+            .upsert_endpoint_projection(
+                &projection_write(&expected, 3, "ok"),
+                site_id,
+                base + Duration::SECOND,
+            )
+            .await?,
+        ProjectionWriteOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .upsert_endpoint_projection(
+                &projection_write(&expected, 4, "ok"),
+                site_id,
+                base + Duration::SECOND * 2,
+            )
+            .await?,
+        ProjectionWriteOutcome::Applied
+    );
+    let listed = store.list_projected_endpoints(Some(site_id)).await?;
+    assert_eq!(listed[0].refresh_generation(), 4);
+
+    store.close().await?;
+    drop(directory);
     Ok(())
 }

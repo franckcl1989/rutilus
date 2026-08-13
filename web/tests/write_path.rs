@@ -478,6 +478,16 @@ impl OperationStore for MockServices {
         Box::pin(async { Err(MockError::Persistence) })
     }
 
+    fn apply_transition_if_current(
+        &self,
+        _operation_id: OperationId,
+        _expected_state: OperationState,
+        _new_state: OperationState,
+        _occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async { Err(MockError::Persistence) })
+    }
+
     fn list_operations(
         &self,
         _state: Option<OperationState>,

@@ -667,9 +667,10 @@ where
         Arc::clone(&state),
         acceptor,
     ));
-    // The §16.2 loopback lifecycle matches the Edge postures: an
-    // unconsumed bootstrap code serves the console open until the first-run
-    // claim arms the gate.
+    // The §16.2 first-run lifecycle matches the Edge postures: an
+    // unconsumed bootstrap code leaves only the claim surface reachable
+    // (the product surface stays closed — S3-2), and the first-run claim
+    // arms the gate.
     let policy = match state.store.has_unconsumed_bootstrap_code().await {
         Ok(true) => rutilus_web::AuthPolicy::PendingBootstrap(rutilus_web::AuthGate::open()),
         Ok(false) => rutilus_web::AuthPolicy::Guarded,

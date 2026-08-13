@@ -332,6 +332,24 @@ async fn the_projection_deduplicates_events_and_records_the_site() -> Result<(),
     let endpoint_id = EndpointId::generate();
     let event_id = EventId::generate();
 
+    // The §15.5 scope check requires the event's endpoint to be a
+    // projection of the reporting site before any record is stored.
+    projection
+        .on_frame(
+            &resolved,
+            1,
+            &EnvelopeMessage::EndpointSnapshot(EndpointSnapshot {
+                endpoint_id: endpoint_id.to_string(),
+                display_name: String::from("Rack A PDU"),
+                address: String::from("https://192.0.2.10"),
+                trust: TlsTrust::SystemCa as i32,
+                refresh_generation: 1,
+                resources: Vec::new(),
+                health: String::from("ok"),
+            }),
+            base,
+        )
+        .await?;
     let batch = EventBatch {
         events: vec![EventRecord {
             event_id: event_id.to_string(),
@@ -405,20 +423,22 @@ async fn the_projection_assembles_artifacts_and_verifies_the_digest() -> Result<
             base,
         )
         .await?;
-    for (index, chunk) in bytes.chunks(4).enumerate() {
-        projection
-            .on_frame(
-                &resolved,
-                2 + index as u64,
-                &EnvelopeMessage::ArtifactChunk(ArtifactChunk {
-                    artifact_id: artifact_id.to_string(),
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    data: chunk.to_vec(),
-                }),
-                base + Duration::SECOND,
-            )
-            .await?;
-    }
+    // The wire contract positions chunk `i` at the byte range
+    // `[i * CENTER_ARTIFACT_CHUNK_SIZE, (i + 1) * CENTER_ARTIFACT_CHUNK_SIZE)`,
+    // so a payload shorter than one transfer chunk travels as a single
+    // chunk with index 0.
+    projection
+        .on_frame(
+            &resolved,
+            2,
+            &EnvelopeMessage::ArtifactChunk(ArtifactChunk {
+                artifact_id: artifact_id.to_string(),
+                index: 0,
+                data: bytes.clone(),
+            }),
+            base + Duration::SECOND,
+        )
+        .await?;
     let row = artifact::Entity::find_by_id(artifact_id.into_uuid())
         .one(&store.database)
         .await?

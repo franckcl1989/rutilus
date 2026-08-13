@@ -441,15 +441,27 @@ where
     /// work, so the original attempt's start fact and the monitor's terminal
     /// fact already bracket the lifecycle.
     ///
+    /// Every terminal judgement step is persisted with compare-and-set
+    /// semantics against the state the judge observed before its re-read
+    /// ([`Self::recover_step_if_current`]): the judgement events are legal
+    /// from every in-flight state, so a concurrent driver that advanced the
+    /// operation while the re-read was in flight keeps its progress, and the
+    /// stale judgement is refused through the recovery guard instead of
+    /// overwriting it.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::OperationNotFound`] for an unknown id,
     /// [`ExecutorError::NotRecoverable`] when the operation is not in
-    /// `Running` or `Verifying`, [`ExecutorError::EmptyTargets`] for a
-    /// corrupt zero-target row, and the store, remote-task, verification, and
-    /// audit boundary errors with their sources chained. A failed judgement
-    /// re-read still persists the operation's honest terminal state
-    /// (`Unknown`) before the error is returned.
+    /// `Running` or `Verifying` — including a second driver that advanced
+    /// the operation while this judgement's re-read was in flight: the
+    /// compare-and-set terminal step is refused and the concurrent driver's
+    /// state stands, reported with the state the domain observed —
+    /// [`ExecutorError::EmptyTargets`] for a corrupt zero-target row, and
+    /// the store, remote-task, verification, and audit boundary errors with
+    /// their sources chained. A failed judgement re-read still persists the
+    /// operation's honest terminal state (`Unknown`) before the error is
+    /// returned, unless the state moved while the re-read was in flight.
     pub async fn recover_operation(
         &self,
         operation_id: OperationId,
@@ -566,12 +578,20 @@ where
                 //
                 // The terminal step must not clobber a state another driver
                 // advanced while this judge was in flight: `OutcomeUnknown`
-                // is a legal transition from `WaitingRemote` too, so the
-                // judge re-checks the state and reports the race through the
-                // recovery guard instead of overwriting it.
-                self.refuse_if_no_longer_running(operation_id).await?;
+                // is a legal transition from `WaitingRemote` and `Verifying`
+                // too, so the judge's terminal write is compare-and-set — it
+                // lands only while the operation is still `Running`, the
+                // state the judge observed before its re-read. A driver that
+                // moved the operation in the meantime keeps its progress; the
+                // race is reported through the recovery guard instead of
+                // being overwritten.
                 let final_operation = self
-                    .recover_step(engine, operation_id, OperationEvent::OutcomeUnknown)
+                    .recover_step_if_current(
+                        engine,
+                        operation_id,
+                        OperationState::Running,
+                        OperationEvent::OutcomeUnknown,
+                    )
                     .await?;
                 self.record_failure(
                     started,
@@ -590,9 +610,18 @@ where
                 // requests confirmable as not delivered. The operation is
                 // therefore recorded `Failed`, never re-dispatched; the
                 // verification is `Inconclusive` because the product cannot
-                // prove whether the write was ever delivered.
+                // prove whether the write was ever delivered. `Failed` is a
+                // legal transition from `WaitingRemote` and `Verifying` too,
+                // so the terminal write is compare-and-set on the `Running`
+                // state the judge observed — a driver that moved the
+                // operation in the meantime keeps its progress.
                 let final_operation = self
-                    .recover_step(engine, operation_id, OperationEvent::Failed)
+                    .recover_step_if_current(
+                        engine,
+                        operation_id,
+                        OperationState::Running,
+                        OperationEvent::Failed,
+                    )
                     .await?;
                 self.record_failure(
                     started,
@@ -605,9 +634,17 @@ where
             Err(source) => {
                 // §13.5: a failed re-read proves nothing about the
                 // possibly-landed write, so the outcome cannot be confirmed
-                // and the operation is recorded Unknown.
-                self.recover_step(engine, operation_id, OperationEvent::OutcomeUnknown)
-                    .await?;
+                // and the operation is recorded Unknown — compare-and-set on
+                // the `Running` state the judge observed, exactly like the
+                // other terminal judgement arms, so a concurrent driver's
+                // progress is never overwritten by the stale verdict.
+                self.recover_step_if_current(
+                    engine,
+                    operation_id,
+                    OperationState::Running,
+                    OperationEvent::OutcomeUnknown,
+                )
+                .await?;
                 self.record_failure(
                     started,
                     AuditFailure::CoreResourceReadFailed,
@@ -617,47 +654,6 @@ where
                 Err(ExecutorError::Verifier(source))
             }
         }
-    }
-
-    /// The recovery guard of the unverifiable-judgement arm: refuses when
-    /// the operation is no longer `Running`.
-    ///
-    /// [`OperationEvent::OutcomeUnknown`] is a legal transition from
-    /// `WaitingRemote` too (the domain accepts it from every in-flight
-    /// state), so a driver that moved the operation while this judge was in
-    /// flight would otherwise be silently overwritten with `Unknown` — the
-    /// Task tracking of a concurrently accepted write would be lost. The
-    /// judge re-reads the operation and reports the race through the
-    /// recovery contract's own guard, exactly like the invalid-transition
-    /// defense of the other judgement arms. The re-read and the persisted
-    /// step are two store reads, so a move between them still races; the
-    /// window matches the existing race defense of the other arms and is
-    /// closed atomically by the persistence layer's own step transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutorError::OperationNotFound`] when the operation is
-    /// gone and [`ExecutorError::NotRecoverable`] when the operation is no
-    /// longer `Running`, with the state the domain reported.
-    async fn refuse_if_no_longer_running(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<(), ExecutorErrorOf<Store, Gateway, Audit>> {
-        let Some(operation) = self
-            .store
-            .find_operation(operation_id)
-            .await
-            .map_err(ExecutorError::Store)?
-        else {
-            return Err(ExecutorError::OperationNotFound(operation_id));
-        };
-        if operation.state() != OperationState::Running {
-            return Err(ExecutorError::NotRecoverable {
-                operation_id,
-                state: operation.state(),
-            });
-        }
-        Ok(())
     }
 
     /// Builds and appends the §16.3 start fact before any pre-flight work.
@@ -826,11 +822,83 @@ where
                     operation_id,
                     state: source.from_state(),
                 },
+                // `apply` never reports StateChanged (that verdict is raised
+                // only by the compare-and-set `apply_if_current`); the arm
+                // exists only because `EngineError` is a closed enum, mapping
+                // the race onto the same defensive guard.
+                EngineError::StateChanged {
+                    operation_id,
+                    observed,
+                    ..
+                } => ExecutorError::NotQueued {
+                    operation_id,
+                    state: observed,
+                },
                 EngineError::Store(source) => ExecutorError::Store(source),
                 // `apply` never reports EmptyTargets (the engine rejects empty
                 // target lists at create time) or the batch-creation limit
                 // (that verdict is raised only by `create_batch`); the arms
                 // exist only because `EngineError` is a closed enum.
+                EngineError::EmptyTargets | EngineError::TooManyTargets { .. } => {
+                    ExecutorError::EmptyTargets(operation_id)
+                }
+            })
+    }
+
+    /// Persists one §13.2 state step with compare-and-set semantics: the
+    /// step lands only while the operation is still in `expected_state` —
+    /// the state the caller observed before its external re-read.
+    ///
+    /// The judgement events of the recovery path (`OutcomeUnknown`, `Failed`)
+    /// are legal transitions from every in-flight state, so a plain step
+    /// cannot tell the caller's stale verdict from a concurrent driver's
+    /// fresh one: a driver that moved the operation while the re-read was in
+    /// flight would otherwise be silently overwritten — the Task tracking of
+    /// a concurrently accepted write, or the in-flight confirmation of the
+    /// same write — with a terminal state the stale re-read picked. The step
+    /// re-verifies the expected state at write time, atomically with the
+    /// write (the store's compare-and-set contract, closed by the engine's
+    /// [`OperationEngine::apply_if_current`]), so a move between the
+    /// caller's observation and its write is refused as
+    /// [`ExecutorError::NotQueued`] with the state the domain reported —
+    /// the concurrent driver's progress stands, and the race is recorded
+    /// like any other per-operation failure.
+    ///
+    /// # Errors
+    ///
+    /// Same vocabulary as [`Self::apply_step`], with the moved-state race
+    /// reported through the same guard, carrying the observed state.
+    async fn apply_step_if_current(
+        &self,
+        engine: &OperationEngine<&Store>,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        event: OperationEvent,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
+        engine
+            .apply_if_current(operation_id, expected_state, event, self.clock.now())
+            .await
+            .map_err(|error| match error {
+                EngineError::NotFound(_) => ExecutorError::OperationNotFound(operation_id),
+                EngineError::StateChanged {
+                    operation_id,
+                    observed,
+                    ..
+                } => ExecutorError::NotQueued {
+                    operation_id,
+                    state: observed,
+                },
+                EngineError::InvalidTransition {
+                    operation_id,
+                    source,
+                } => ExecutorError::NotQueued {
+                    operation_id,
+                    state: source.from_state(),
+                },
+                EngineError::Store(source) => ExecutorError::Store(source),
+                // `apply_if_current` never reports EmptyTargets or the
+                // batch-creation limit; the arms exist only because
+                // `EngineError` is a closed enum.
                 EngineError::EmptyTargets | EngineError::TooManyTargets { .. } => {
                     ExecutorError::EmptyTargets(operation_id)
                 }
@@ -858,6 +926,30 @@ where
         event: OperationEvent,
     ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
         self.apply_step(engine, operation_id, event)
+            .await
+            .map_err(guard_recovery_race)
+    }
+
+    /// Persists one §13.2 step on the recovery path with compare-and-set
+    /// semantics: the step lands only while the operation is still in
+    /// `expected_state` — the state the judge observed before its §13.5
+    /// re-read ([`Self::apply_step_if_current`], with the race verdict
+    /// renamed for the recovery contract).
+    ///
+    /// # Errors
+    ///
+    /// Same vocabulary as [`Self::recover_step`], with the moved-state race
+    /// reported as [`ExecutorError::NotRecoverable`] carrying the observed
+    /// state — the concurrent driver's progress stands, honestly classified,
+    /// and is never overwritten.
+    async fn recover_step_if_current(
+        &self,
+        engine: &OperationEngine<&Store>,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        event: OperationEvent,
+    ) -> Result<Operation, ExecutorErrorOf<Store, Gateway, Audit>> {
+        self.apply_step_if_current(engine, operation_id, expected_state, event)
             .await
             .map_err(guard_recovery_race)
     }
@@ -2250,6 +2342,46 @@ mod tests {
                 let mut rows = self.rows.lock().map_err(|_| MockError::Events)?;
                 let row = rows.get(&operation_id).ok_or(MockError::Store)?;
                 if row.is_terminal() {
+                    return Err(MockError::Store);
+                }
+                let row = rows.get_mut(&operation_id).ok_or(MockError::Store)?;
+                *row = Operation::try_from_parts(
+                    row.id(),
+                    row.source(),
+                    row.targets().to_vec(),
+                    row.command(),
+                    new_state,
+                    row.created_at(),
+                    occurred_at,
+                )
+                .map_err(|_| MockError::Store)?;
+                Ok(())
+            })
+        }
+
+        fn apply_transition_if_current(
+            &self,
+            operation_id: OperationId,
+            expected_state: OperationState,
+            new_state: OperationState,
+            occurred_at: OffsetDateTime,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(Call::ApplyTransition(operation_id, new_state));
+                if self.consume_failure(MockStoreFailure::Write)? {
+                    return Err(MockError::Store);
+                }
+                let mut rows = self.rows.lock().map_err(|_| MockError::Events)?;
+                let row = rows.get(&operation_id).ok_or(MockError::Store)?;
+                // The compare-and-set contract: the write lands only while
+                // the persisted state still equals the expected one — a
+                // concurrent driver's step (or a terminal row, which can
+                // never be the expected in-flight state) is a conflict that
+                // never writes.
+                if row.state() != expected_state || row.is_terminal() {
                     return Err(MockError::Store);
                 }
                 let row = rows.get_mut(&operation_id).ok_or(MockError::Store)?;
@@ -4520,9 +4652,10 @@ mod tests {
         let operation = parked_operation(endpoint_id, OperationState::Running)?;
         store.insert(operation.clone())?;
         // A second driver moved the operation to WaitingRemote between the
-        // executor's own read (find 1) and the engine's judgement-step read
-        // (find 2): ExecutionAccepted is invalid from WaitingRemote, so the
-        // recovery step is rejected with the recovery contract's own guard.
+        // executor's own read (find 1) and the compare-and-set judgement
+        // step's read (find 2): the `OutcomeUnknown` judgement is
+        // conditional on the `Running` state the judge observed, so the step
+        // is refused with the recovery contract's own guard.
         store.arm_find_race(2, OperationState::WaitingRemote)?;
         let gateway = FakeGateway::new(
             Ok(CommandOutcome::Accepted),
@@ -4541,7 +4674,10 @@ mod tests {
             }) if operation_id == operation.id()
         ));
         // The judgement re-read ran and the attempt's start fact landed
-        // before the raced step; the raced step itself was never persisted.
+        // before the compare-and-set step; the step itself — an
+        // `OutcomeUnknown` conditional on the `Running` state the judge
+        // observed — was refused, and the concurrent driver's Task tracking
+        // was never overwritten.
         assert_eq!(
             applied_states(&store.recorded_calls()?).len(),
             0,
@@ -4553,6 +4689,103 @@ mod tests {
             1,
             "the judgement re-read ran before the raced step"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_judgement_is_refused_when_the_operation_advanced_to_verifying()
+    -> Result<(), Box<dyn Error>> {
+        // The C1-2 race: while the judge's re-read was in flight, a
+        // concurrent driver confirmed the same write — the operation moved
+        // from `Running` into `Verifying` (or all the way to `Succeeded`).
+        // `OutcomeUnknown` is a legal transition from `Verifying` too, so a
+        // plain step would silently overwrite the in-flight confirmation
+        // with a stale `Unknown`; the compare-and-set judgement step refuses
+        // instead, and the confirmed progress stands.
+        for advanced in [OperationState::Verifying, OperationState::Succeeded] {
+            let endpoint_id = EndpointId::generate();
+            let store =
+                FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+            let operation = parked_operation(endpoint_id, OperationState::Running)?;
+            store.insert(operation.clone())?;
+            // The executor's own read is find 1; the compare-and-set step's
+            // read is find 2, which reports the already-advanced operation.
+            store.arm_find_race(2, advanced)?;
+            let gateway = FakeGateway::new(
+                Ok(CommandOutcome::Accepted),
+                Ok(VerificationVerdict::Confirmed),
+            );
+            let audit = MockAudit::succeed();
+            let executor = executor(&store, &gateway, &audit);
+
+            let result = executor.recover_operation(operation.id()).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(ExecutorError::NotRecoverable {
+                        operation_id,
+                        state: observed,
+                    }) if operation_id == operation.id() && observed == advanced
+                ),
+                "a judgement onto a {advanced} operation must be refused"
+            );
+            assert_eq!(
+                applied_states(&store.recorded_calls()?).len(),
+                0,
+                "the refused judgement must not persist an Unknown step"
+            );
+            assert_eq!(
+                audit.recorded_events()?.len(),
+                1,
+                "only the attempt's start fact landed"
+            );
+            assert_eq!(
+                gateway.recorded_calls()?.len(),
+                1,
+                "the judgement re-read ran before the refused step"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_mismatch_judgement_is_refused_when_task_tracking_resumed()
+    -> Result<(), Box<dyn Error>> {
+        // The C1-2 race on the `Mismatched` arm: while the judge's re-read
+        // was in flight, a concurrent driver resumed Task tracking
+        // (`WaitingRemote`). `Failed` is a legal transition from
+        // `WaitingRemote` too, so a plain step would clobber the resumed
+        // polling with a stale failure; the compare-and-set judgement step
+        // refuses instead, and the Task tracking stands.
+        let endpoint_id = EndpointId::generate();
+        let store = FakeStore::new(Some(endpoint(endpoint_id)?), supported_systems_capability());
+        let operation = parked_operation(endpoint_id, OperationState::Running)?;
+        store.insert(operation.clone())?;
+        store.arm_find_race(2, OperationState::WaitingRemote)?;
+        let gateway = FakeGateway::new(
+            Ok(CommandOutcome::Accepted),
+            Ok(VerificationVerdict::Mismatched),
+        );
+        let audit = MockAudit::succeed();
+        let executor = executor(&store, &gateway, &audit);
+
+        let result = executor.recover_operation(operation.id()).await;
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::NotRecoverable {
+                operation_id,
+                state: OperationState::WaitingRemote,
+            }) if operation_id == operation.id()
+        ));
+        assert_eq!(
+            applied_states(&store.recorded_calls()?).len(),
+            0,
+            "the refused judgement must not persist a Failed step"
+        );
+        assert_eq!(audit.recorded_events()?.len(), 1);
+        assert_eq!(gateway.recorded_calls()?.len(), 1);
         Ok(())
     }
 

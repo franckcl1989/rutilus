@@ -476,8 +476,11 @@ async fn feature_list_migration_preserves_rows_and_down_restores_the_prior_allow
         "the pre-existing decode-failure record must survive the rebuild"
     );
 
-    // Down one migration: the exact pre-migration constraint shapes return.
-    // The rows stored under the newly allow-listed codes cannot be
+    // Down through the feature-list alignment migration: the exact
+    // pre-migration constraint shapes return. Everything registered after
+    // it unwinds first (the step count is the registration tail, so the
+    // test stays correct however later slices extend the registration
+    // list). The rows stored under the newly allow-listed codes cannot be
     // represented by the restored constraints, so they are removed first —
     // exactly what a real downgrade must do with rows that only the newer
     // schema can hold (the rebuild copies every remaining row into the
@@ -490,7 +493,8 @@ async fn feature_list_migration_preserves_rows_and_down_restores_the_prior_allow
         .filter(resource_decode_failure::Column::Feature.is_in(ELEVEN_NEW_DECODE_FAILURE_CODES))
         .exec(&database)
         .await?;
-    Migrator::down(&database, Some(1)).await?;
+    let steps = rollback_steps_to("m20260812_000002_resource_feature_lists")?;
+    Migrator::down(&database, Some(steps)).await?;
 
     for code in TEN_NEW_RESOURCE_CODES {
         assert!(
@@ -638,4 +642,15 @@ async fn seed_decode_failure(
     .insert(database)
     .await?;
     Ok(())
+}
+
+/// The number of registered migrations to roll back so the named migration
+/// is included in the rollback: everything registered after it, plus itself.
+fn rollback_steps_to(name: &str) -> Result<u32, Box<dyn Error>> {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("feature-list alignment migration is not registered")?;
+    Ok(u32::try_from(migrations.len() - position)?)
 }

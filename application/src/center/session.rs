@@ -654,7 +654,9 @@ where
     /// sequence accepted so far. A transport failure mid-flush abandons
     /// only the wire position: the unacknowledged entries stay pending and
     /// the next connection re-sends them (at-least-once delivery; the site
-    /// deduplicates by operation id, §15.4).
+    /// deduplicates by operation id, §15.4). An offer past its §15.6 TTL is
+    /// retired instead of sent — the site would only refuse it, so the
+    /// queue must not re-send it forever.
     async fn flush_outbox(
         &mut self,
         sent: &mut VecDeque<(OutboxEntryId, i64)>,
@@ -665,6 +667,7 @@ where
             .list_pending(self.site.instance_id(), self.options.flush_limit)
             .await
             .map_err(CenterInboundEngineError::Outbox)?;
+        let now = self.clock.now();
         for entry in pending {
             // An entry already delivered on this connection is not sent
             // again: the acknowledgement retires it, and a dropped
@@ -710,6 +713,25 @@ where
                 );
                 continue;
             };
+            // The §15.6 offer TTL: an offer past its expiry can no longer
+            // be accepted by the site, so the flush retires the row instead
+            // of re-sending it forever — a site that was offline past the
+            // TTL would only refuse it. The domain outbox has no expired
+            // state, so the retirement is the queue-level termination.
+            if let Some(expires_at) = offer_expiry(&message)
+                && now > expires_at
+            {
+                tracing::warn!(
+                    "site {}: retiring outbox entry {}: the offer expired at {expires_at}",
+                    self.site.instance_id(),
+                    entry.id()
+                );
+                self.outbox
+                    .acknowledge(entry.id(), now)
+                    .await
+                    .map_err(CenterInboundEngineError::Outbox)?;
+                continue;
+            }
             envelope.sequence = wire_sequence;
             envelope.acked_sequence = peer_acked;
             envelope.message = Some(message);
@@ -747,6 +769,21 @@ where
                 .map_err(CenterInboundEngineError::Outbox)?;
         }
         Ok(())
+    }
+}
+
+/// The §15.6 offer expiry of one pending message: `Some(expires_at)` for
+/// an [`EnvelopeMessage::OperationOffer`], `None` for every other envelope.
+/// An offer whose expiry cannot be parsed reports the epoch — an unreadable
+/// TTL is treated as past (fail closed, the mirror of the site's §15.6
+/// recheck).
+fn offer_expiry(message: &EnvelopeMessage) -> Option<OffsetDateTime> {
+    match message {
+        EnvelopeMessage::OperationOffer(offer) => Some(
+            OffsetDateTime::from_unix_timestamp(offer.expires_at_unix)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        ),
+        _ => None,
     }
 }
 
@@ -1037,8 +1074,15 @@ mod tests {
             }
         }
 
-        /// Seeds one pending offer entry carrying the given wire sequence.
-        fn seed_offer(&self, sequence: u64, site: InstanceId, now: OffsetDateTime) {
+        /// Seeds one pending offer entry carrying the given wire sequence
+        /// and §15.6 expiry.
+        fn seed_offer(
+            &self,
+            sequence: u64,
+            site: InstanceId,
+            now: OffsetDateTime,
+            expires_at_unix: i64,
+        ) {
             let envelope = Envelope {
                 sequence,
                 acked_sequence: 0,
@@ -1049,7 +1093,7 @@ mod tests {
                         site_id: site.to_string(),
                         command_json: b"{}".to_vec(),
                         target: String::from("/redfish/v1/Systems/1"),
-                        expires_at_unix: 0,
+                        expires_at_unix,
                         actor_context: String::from("principal-1"),
                     },
                 )),
@@ -1140,6 +1184,24 @@ mod tests {
             })
         }
 
+        fn list_offers(
+            &self,
+            instance_id: InstanceId,
+        ) -> BoundaryFuture<'_, Result<Vec<rutilus_domain::OutboxEntry>, Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self
+                    .entries
+                    .lock()
+                    .map_err(|_| MockCenterError)?
+                    .iter()
+                    .filter(|entry| entry.instance_id() == instance_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(rutilus_domain::OutboxEntry::sequence);
+                Ok(rows)
+            })
+        }
+
         fn acknowledge(
             &self,
             entry_id: rutilus_domain::OutboxEntryId,
@@ -1218,7 +1280,12 @@ mod tests {
         let (session, mut outbound_rx, inbound_tx) = ChannelInboundSession::channel();
         let outbox = MockOutbox::new();
         let base = base_time();
-        outbox.seed_offer(1, site.instance_id(), base);
+        outbox.seed_offer(
+            1,
+            site.instance_id(),
+            base,
+            (base + Duration::minutes(15)).unix_timestamp(),
+        );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
         registry.mark_connected(site.clone(), base)?;
@@ -1294,8 +1361,18 @@ mod tests {
         let (session, mut outbound_rx, inbound_tx) = ChannelInboundSession::channel();
         let outbox = MockOutbox::new();
         let base = base_time();
-        outbox.seed_offer(1, site.instance_id(), base);
-        outbox.seed_offer(2, site.instance_id(), base);
+        outbox.seed_offer(
+            1,
+            site.instance_id(),
+            base,
+            (base + Duration::minutes(15)).unix_timestamp(),
+        );
+        outbox.seed_offer(
+            2,
+            site.instance_id(),
+            base,
+            (base + Duration::minutes(15)).unix_timestamp(),
+        );
         let consumer = RecorderConsumer::new();
         let registry = Arc::new(CenterSessionRegistry::new());
         registry.mark_connected(site.clone(), base)?;
@@ -1363,6 +1440,66 @@ mod tests {
         drop(inbound_tx);
         task.await.map_err(std::io::Error::other)??;
         assert!(!registry.is_online(site.instance_id()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_offers_are_retired_and_live_offers_are_still_sent()
+    -> Result<(), Box<dyn Error>> {
+        let site = resolved_site();
+        let (session, mut outbound_rx, inbound_tx) = ChannelInboundSession::channel();
+        let outbox = MockOutbox::new();
+        let base = base_time();
+        // The first offer expired a minute ago (§15.6 TTL); the second is
+        // still actionable when the connection opens.
+        outbox.seed_offer(1, site.instance_id(), base, base.unix_timestamp() - 60);
+        outbox.seed_offer(
+            2,
+            site.instance_id(),
+            base,
+            (base + Duration::minutes(15)).unix_timestamp(),
+        );
+        let consumer = RecorderConsumer::new();
+        let registry = Arc::new(CenterSessionRegistry::new());
+        registry.mark_connected(site.clone(), base)?;
+        let engine = CenterInboundEngine::new(
+            session,
+            outbox.clone(),
+            consumer.clone(),
+            Arc::clone(&registry),
+            FixedClock(base + Duration::SECOND),
+            site.clone(),
+            CenterInboundOptions::default(),
+        );
+        let task = tokio::spawn(engine.run(std::future::pending::<()>()));
+
+        // Only the live offer travels on the connection; the expired one
+        // was retired by the flush, so it is never re-sent.
+        let first = outbound_rx.recv().await.ok_or("no offer frame")?;
+        assert_eq!(first.sequence, 2);
+        assert!(matches!(
+            first.message,
+            Some(EnvelopeMessage::OperationOffer(_))
+        ));
+        assert_eq!(outbox.pending_sequences(site.instance_id()), vec![2]);
+
+        // The site's piggybacked acknowledgement retires the live offer.
+        inbound_tx.send(Envelope {
+            sequence: 5,
+            acked_sequence: 2,
+            message: Some(EnvelopeMessage::EventBatch(
+                rutilus_center_protocol::EventBatch { events: Vec::new() },
+            )),
+        })?;
+        let ack = outbound_rx.recv().await.ok_or("no ack frame")?;
+        assert!(matches!(
+            ack.message,
+            Some(EnvelopeMessage::Ack(rutilus_center_protocol::Ack {
+                sequence: 5
+            }))
+        ));
+        assert!(outbox.pending_sequences(site.instance_id()).is_empty());
+        task.abort();
         Ok(())
     }
 }

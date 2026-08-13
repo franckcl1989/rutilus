@@ -62,10 +62,10 @@ use rutilus_web::{
     AuditEventQuery, AuthGate, AuthPolicy, AuthServices, CenterServices, IssuedSessionTokens,
     ProductServices, WebProductInfo, router_with_auth,
 };
-use secrecy::{SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{net::TcpListener, sync::oneshot, task::spawn_blocking};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -579,6 +579,24 @@ impl AuthServices for StandaloneState {
     fn verify_password(&self, hash: &Argon2IdHash, password: &SecretString) -> bool {
         verify_password(hash, password)
     }
+    fn verify_password_async<'a>(
+        &'a self,
+        hash: &'a Argon2IdHash,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, bool> {
+        // §7.8: the Argon2id derivation (64 MiB, 3 passes, 1 lane — the
+        // domain constants the value object pins) runs on the blocking pool,
+        // never on a worker thread. The `JoinError` arm fails closed: a
+        // panicked worker is a wrong-password verdict, which is also the
+        // fail-closed choice for the login rate limiter.
+        let hash = hash.clone();
+        let password = SecretString::from(password.expose_secret().to_owned());
+        Box::pin(async move {
+            spawn_blocking(move || verify_password(&hash, &password))
+                .await
+                .unwrap_or(false)
+        })
+    }
     fn verify_totp(
         &self,
         secret: &SecretBox<[u8; rutilus_domain::TOTP_SECRET_LENGTH]>,
@@ -590,6 +608,22 @@ impl AuthServices for StandaloneState {
     }
     fn hash_password(&self, password: &SecretString) -> Result<Argon2IdHash, Self::Error> {
         hash_password(password).map_err(StandaloneAuthError::Hash)
+    }
+    fn hash_password_async<'a>(
+        &'a self,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<Argon2IdHash, Self::Error>> {
+        // §7.8: the Argon2id derivation runs on the blocking pool, never on
+        // a worker thread. A panicked worker surfaces as a boundary error —
+        // the handlers treat it as the 500 the derivation failure already
+        // is.
+        let password = SecretString::from(password.expose_secret().to_owned());
+        Box::pin(async move {
+            spawn_blocking(move || hash_password(&password))
+                .await
+                .map_err(StandaloneAuthError::HashWorker)?
+                .map_err(StandaloneAuthError::Hash)
+        })
     }
     fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
         hash_bootstrap_code(code)
@@ -626,6 +660,8 @@ pub enum StandaloneAuthError {
     Bootstrap(#[source] BootstrapRepositoryError),
     #[error("password derivation failed: {0}")]
     Hash(#[source] PasswordHashError),
+    #[error("the password derivation worker task failed: {0}")]
+    HashWorker(#[source] tokio::task::JoinError),
     #[error("session token issuance failed: {0}")]
     Tokens(#[source] SessionTokenError),
 }
@@ -675,6 +711,22 @@ impl OperationStore for StandaloneState {
         <SqliteStore as OperationStore>::apply_transition(
             &self.store,
             operation_id,
+            new_state,
+            occurred_at,
+        )
+    }
+
+    fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+        <SqliteStore as OperationStore>::apply_transition_if_current(
+            &self.store,
+            operation_id,
+            expected_state,
             new_state,
             occurred_at,
         )
@@ -1675,11 +1727,12 @@ where
         Arc::clone(&services),
         retention,
     ));
-    // The §16.2 loopback lifecycle: while an unconsumed bootstrap code
-    // exists the console serves open (the first-run claim must be
-    // reachable), and the claim itself arms the gate; a store that already
-    // consumed its code starts guarded. The Site posture arms the same
-    // policy from the same bootstrap state.
+    // The §16.2 first-run lifecycle: while an unconsumed bootstrap code
+    // exists the console serves only the claim surface (the bootstrap
+    // endpoint, `me`, and the static console are Public; the product
+    // surface stays closed — S3-2), and the claim itself arms the gate; a
+    // store that already consumed its code starts guarded. The Site
+    // posture arms the same policy from the same bootstrap state.
     let policy = match services.store.has_unconsumed_bootstrap_code().await {
         Ok(true) => AuthPolicy::PendingBootstrap(AuthGate::open()),
         Ok(false) => AuthPolicy::Guarded,

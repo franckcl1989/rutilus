@@ -643,6 +643,18 @@ where
                     operation_id,
                     state: source.from_state(),
                 },
+                // `apply` never reports StateChanged (that verdict is raised
+                // only by the compare-and-set `apply_if_current`); the arm
+                // exists only because `EngineError` is a closed enum, mapping
+                // the moved state onto the same defensive guard.
+                EngineError::StateChanged {
+                    operation_id,
+                    observed,
+                    ..
+                } => TaskMonitorError::NotWaitingRemote {
+                    operation_id,
+                    state: observed,
+                },
                 EngineError::Store(source) => TaskMonitorError::Store(source),
                 // `apply` never reports EmptyTargets (the engine rejects
                 // empty target lists at create time) or the batch-creation
@@ -1087,6 +1099,45 @@ mod tests {
                 let mut rows = self.operations.lock().map_err(|_| MockError::Events)?;
                 let row = rows.get(&operation_id).ok_or(MockError::Store)?;
                 if row.is_terminal() {
+                    return Err(MockError::Store);
+                }
+                let row = rows.get_mut(&operation_id).ok_or(MockError::Store)?;
+                *row = Operation::try_from_parts(
+                    row.id(),
+                    row.source(),
+                    row.targets().to_vec(),
+                    row.command(),
+                    new_state,
+                    row.created_at(),
+                    occurred_at,
+                )
+                .map_err(|_| MockError::Store)?;
+                Ok(())
+            })
+        }
+
+        fn apply_transition_if_current(
+            &self,
+            operation_id: OperationId,
+            expected_state: OperationState,
+            new_state: OperationState,
+            occurred_at: OffsetDateTime,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| MockError::Events)?
+                    .push(StoreCall::ApplyTransition(operation_id, new_state));
+                if self.consume_failure(FailureKind::OperationWrite)? {
+                    return Err(MockError::Store);
+                }
+                let mut rows = self.operations.lock().map_err(|_| MockError::Events)?;
+                let row = rows.get(&operation_id).ok_or(MockError::Store)?;
+                // The compare-and-set contract: the write lands only while
+                // the persisted state still equals the expected one — the
+                // monitor never issues a conditional step, so this arm is
+                // unreachable here, but the boundary contract holds.
+                if row.state() != expected_state || row.is_terminal() {
                     return Err(MockError::Store);
                 }
                 let row = rows.get_mut(&operation_id).ok_or(MockError::Store)?;

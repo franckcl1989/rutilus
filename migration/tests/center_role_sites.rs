@@ -164,10 +164,12 @@ async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<
     .insert(&database)
     .await?;
 
-    // Unwind the feature-list alignment and decode-failure migrations plus
-    // the center-role-sites migration; the down of 000010's successor must
-    // restore the 000010-era shape.
-    Migrator::down(&database, Some(3)).await?;
+    // Unwind every migration registered after the center-data-sites slice;
+    // the down of 000010's successor must restore the 000010-era shape. The
+    // step count is the registration tail after the named migration, so the
+    // test stays correct however later slices extend the registration list.
+    let steps = migrations_after("m20260810_000001_center_data_sites")?;
+    Migrator::down(&database, Some(steps)).await?;
     let applied = Migrator::get_applied_migrations(&database).await?;
     assert_eq!(
         applied.last().map(sea_orm_migration::Migration::name),
@@ -266,6 +268,15 @@ async fn center_role_sites_down_restores_the_unscoped_shape() -> Result<(), Box<
     drop(database);
     drop(directory);
     Ok(())
+}
+
+/// The number of registered migrations after the named migration.
+fn migrations_after(name: &str) -> Result<u32, Box<dyn Error>> {
+    let position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("center data sites migration is not registered")?;
+    Ok(u32::try_from(Migrator::migrations().len() - position - 1)?)
 }
 
 async fn connect() -> Result<(tempfile::TempDir, DatabaseConnection), Box<dyn Error>> {

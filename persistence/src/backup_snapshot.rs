@@ -201,20 +201,35 @@ pub enum RestoreCompatibility {
 /// Checks a backup database's applied migrations against this binary's
 /// migration stack (design §20.2 "check Product and Schema version").
 ///
-/// The backup bytes are staged in a temporary file and opened read-only, so
-/// the check never touches the live data directory.
+/// The backup bytes — the main database file and, when the snapshot carried
+/// one, its durable WAL sidecar — are staged in a fresh temporary directory
+/// and opened there, so the check never touches the live data directory.
+/// The pair is opened with the store's own connect options (read-write, WAL
+/// mode): a WAL-mode snapshot's recent commits may live only in the WAL, and
+/// `SQLite` replays the WAL on the first read — a read-only open could not
+/// build the WAL index for a fresh staging directory, so the applied count
+/// is read after the replay, exactly as the live store would see it. The
+/// `NewerSchema` gate and the pending count therefore reflect the snapshot's
+/// true state, never a stale main file.
 ///
 /// # Errors
 ///
 /// Returns [`RestoreCheckError`] when the backup cannot be staged or the
-/// read-only inspection fails.
+/// inspection fails.
 pub async fn restore_compatibility(
     database: &[u8],
+    wal: Option<&[u8]>,
 ) -> Result<RestoreCompatibility, RestoreCheckError> {
-    let staging = NamedTempFile::new().map_err(RestoreCheckError::Stage)?;
-    write_and_sync(staging.as_file(), database).map_err(RestoreCheckError::Stage)?;
+    let staging = tempfile::tempdir().map_err(RestoreCheckError::Stage)?;
+    let database_path = staging.path().join("rutilus.db");
+    write_and_sync_file(&database_path, database).map_err(RestoreCheckError::Stage)?;
+    if let Some(wal) = wal {
+        write_and_sync_file(&sidecar_path(&database_path, WAL_SIDECAR_SUFFIX), wal)
+            .map_err(RestoreCheckError::Stage)?;
+    }
 
-    let mut options = crate::sqlite_read_only_connect_options(staging.path());
+    let mut options =
+        crate::sqlite_connect_options(&database_path, crate::SqliteSettings::default());
     options.sqlx_logging(false);
     let database = sea_orm::Database::connect(options)
         .await
@@ -333,6 +348,12 @@ fn write_and_sync(mut file: &File, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Writes `bytes` to `path` and synchronizes the file.
+fn write_and_sync_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let file = fs::File::create(path)?;
+    write_and_sync(&file, bytes)
+}
+
 /// Removes a stale `SQLite` sidecar, treating absence as success.
 fn remove_stale_sidecar(path: &Path) -> Result<(), RestoreError> {
     match fs::remove_file(path) {
@@ -417,11 +438,11 @@ pub enum RestoreError {
 pub enum RestoreCheckError {
     #[error("failed to stage the backup database for inspection: {0}")]
     Stage(#[source] io::Error),
-    #[error("failed to open the staged backup database read-only: {0}")]
+    #[error("failed to open the staged backup database: {0}")]
     Connect(#[source] DbErr),
     #[error("failed to inspect the staged backup database: {0}")]
     Inspect(#[source] DbErr),
-    #[error("failed to close the read-only backup inspection: {0}")]
+    #[error("failed to close the staged backup database: {0}")]
     Close(#[source] DbErr),
 }
 
@@ -591,7 +612,7 @@ mod tests {
         partial.close().await?;
         let partial_bytes = std::fs::read(&partial_path)?;
 
-        let compatibility = restore_compatibility(&partial_bytes).await?;
+        let compatibility = restore_compatibility(&partial_bytes, None).await?;
         assert_eq!(
             compatibility,
             RestoreCompatibility::Compatible {
@@ -600,7 +621,7 @@ mod tests {
         );
 
         // A backup from a newer product carries an applied migration this
-        // binary does not know; the read-only inspection must report it.
+        // binary does not know; the staged inspection must report it.
         let newer_path = directory.path().join("newer.db");
         let mut options =
             crate::sqlite_connect_options(&newer_path, crate::SqliteSettings::default());
@@ -618,14 +639,56 @@ mod tests {
         newer.close().await?;
         let newer_bytes = std::fs::read(&newer_path)?;
 
-        let compatibility = restore_compatibility(&newer_bytes).await?;
+        let compatibility = restore_compatibility(&newer_bytes, None).await?;
         assert!(matches!(
             compatibility,
             RestoreCompatibility::NewerSchema {
-                backup_applied: 24,
-                supported: 23
+                backup_applied: 26,
+                supported: 25
             }
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compatibility_replays_the_wal_before_reading_the_applied_migrations()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("live.db");
+        let store = SqliteStore::open(&database_path).await?;
+        // A migration row lives only in the WAL while the store is open: the
+        // close-time checkpoint that would move the frames into the main
+        // file has not run, so the main file alone is stale.
+        sea_orm_migration::seaql_migrations::Entity::insert(
+            sea_orm_migration::seaql_migrations::ActiveModel {
+                version: Set(String::from("m20990101_000001_from_the_future")),
+                applied_at: Set(1_000_000_000_i64),
+            },
+        )
+        .exec(&store.database)
+        .await?;
+        let snapshot = store.consistent_snapshot().await?;
+        assert!(snapshot.wal().is_some(), "the open store must have a WAL");
+        let wal = snapshot.wal().ok_or("snapshot without a WAL")?;
+
+        // The main file alone cannot see the WAL-only migration: the check
+        // would report a compatible schema and miss the future row entirely
+        // (the defect this test pins).
+        let stale = restore_compatibility(snapshot.database(), None).await?;
+        assert!(matches!(stale, RestoreCompatibility::Compatible { .. }));
+
+        // With the WAL staged beside the main file, the check replays it and
+        // reads the true applied state: every real migration plus the future
+        // row, which the `NewerSchema` gate must refuse.
+        let replayed = restore_compatibility(snapshot.database(), Some(wal)).await?;
+        assert_eq!(
+            replayed,
+            RestoreCompatibility::NewerSchema {
+                backup_applied: Migrator::migrations().len() + 1,
+                supported: Migrator::migrations().len(),
+            }
+        );
+        store.close().await?;
         Ok(())
     }
 }

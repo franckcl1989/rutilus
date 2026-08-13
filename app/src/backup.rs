@@ -281,7 +281,7 @@ pub async fn restore_backup(
         database_entry.content().to_vec(),
         wal_entry.map(|entry| entry.content().to_vec()),
     );
-    let compatibility = restore_compatibility(snapshot.database())
+    let compatibility = restore_compatibility(snapshot.database(), snapshot.wal())
         .await
         .map_err(BackupError::RestoreCheck)?;
     let pending_migrations = match compatibility {
@@ -349,10 +349,12 @@ async fn restore_data_phase(
     let restored = restore_data_directory_files(paths, backup)?;
 
     // §20.2 verification: the restored database must be byte-identical to
-    // the verified package snapshot and must open read-only with a known
-    // schema before the restore is reported complete. The staged read-only
-    // inspection applies no migrations; pending migrations still apply at
-    // the next real open.
+    // the verified package snapshot and must replay with a known schema
+    // before the restore is reported complete. The staged inspection
+    // applies no migrations; pending migrations still apply at the next
+    // real open. The restored WAL is read back from disk and checked
+    // alongside the main file, so the verification sees exactly what the
+    // next open will replay — a WAL-only migration row cannot be missed.
     let restored_database =
         fs::read(paths.database_path()).map_err(|source| BackupError::ReadRestored {
             path: paths.database_path().to_path_buf(),
@@ -361,7 +363,22 @@ async fn restore_data_phase(
     if restored_database != snapshot.database() {
         return Err(BackupError::RestoredDatabaseDiffers);
     }
-    restore_compatibility(&restored_database)
+    let restored_wal = match snapshot.wal() {
+        Some(_) => {
+            // The `SQLite` WAL sidecar lives next to the database file as
+            // `<name>-wal`; `with_extension` replaces the `.db` suffix, so
+            // `rutilus.db` -> `rutilus.db-wal`, the exact sidecar name.
+            let wal_path = paths.database_path().with_extension("db-wal");
+            Some(
+                fs::read(&wal_path).map_err(|source| BackupError::ReadRestored {
+                    path: wal_path,
+                    source,
+                })?,
+            )
+        }
+        None => None,
+    };
+    restore_compatibility(&restored_database, restored_wal.as_deref())
         .await
         .map_err(BackupError::RestoreCheck)?;
 

@@ -218,7 +218,8 @@ rutilus backup restore [--portable] PATH
 ```
 
 - 不实现自动后台自更新（§20.3）；
-- 当前数据库 Schema 版本：23 个 Migration（`migration/src/`，2026-08-05 至 2026-08-12 的 23 个文件：`m20260805_*` 11 + `m20260807_*` 8 + `m20260810_*` 2 + `m20260812_000001_resource_decode_failures` + `m20260812_000002_resource_feature_lists`）；备份快照的已应用/支持计数由测试钉死（`persistence/src/backup_snapshot.rs:624-627`：backup_applied 24 / supported 23，备份含未来迁移时恢复拒绝）；
+- 当前数据库 Schema 版本：25 个 Migration（`migration/src/`，2026-08-05 至 2026-08-13 的 25 个文件：`m20260805_*` 11 + `m20260807_*` 8 + `m20260810_*` 2 + `m20260812_*` 2 + `m20260813_000001_audit_center_actions` + `m20260813_000002_endpoint_health_checks`）；备份快照的已应用/支持计数由测试钉死（`persistence/src/backup_snapshot.rs`：backup_applied 26 / supported 25，备份含未来迁移时恢复拒绝）；
+- 迁移前恢复备份保留最近 3 份（`persistence/src/migration_backup.rs` `PRE_MIGRATION_BACKUP_RETENTION`）：每次成功提交新备份后按名称（`pre-migration-<uuid v7>` 时间序）裁剪更旧的完整备份并移除未完成目录（创建失败意味着本次打开未迁移，复制状态仍是活数据库）；裁剪尽力而为，失败只多留副本、不阻断打开；
 - Migration 只允许 DDL（`CREATE`/`ALTER`/`DROP`/`PRAGMA` 开头），数据搬迁通过 SeaQuery 表达，
   该边界由 `migration/tests/bare_sql_gate.rs` 机械检查（§7.3）；
 - 升级前可用 `rutilus doctor` 确认当前实例健康。

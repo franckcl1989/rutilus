@@ -184,15 +184,17 @@ async fn lenovo_family_migration_extends_the_feature_allow_list() -> Result<(), 
         .filter(resource::Column::Feature.eq("lenovo-security-service"))
         .exec(&database)
         .await?;
-    // Down seven migrations only: `down(None)` would unwind the whole
-    // history and drop the `resources` table the assertions below seed into,
-    // while this test only needs the Lenovo follow-up undone. The decode
-    // failure migration (000012), the 000013 feature-list alignment, the
-    // audit execute-operation migration (000008), the center tables
-    // migration (000009), and the two 0.7.0 center site-scoping migrations
-    // (000010/000011) registered above it unwind first, so the restore lands
-    // on the exact 000003-with-000001 allow-list the test asserts.
-    Migrator::down(&database, Some(7)).await?;
+    // Down only the migrations stacked after the product-users slice:
+    // `down(None)` would unwind the whole history and drop the `resources`
+    // table the assertions below seed into, while this test only needs the
+    // Lenovo follow-up undone. Everything registered after 000005 unwinds
+    // first (the 0.7.0 center slices, the audit slices, the feature-list
+    // alignment, and this batch's additions), so the restore lands on the
+    // exact pre-Lenovo allow-list the test asserts. The step count is the
+    // registration tail after the named migration, so the test stays
+    // correct however later slices extend the registration list.
+    let steps = migrations_after("m20260807_000005_product_users")?;
+    Migrator::down(&database, Some(steps)).await?;
     assert!(
         seed_resource(
             &database,
@@ -284,4 +286,13 @@ async fn seed_snapshot(
     .insert(database)
     .await?;
     Ok(())
+}
+
+/// The number of registered migrations after the named migration.
+fn migrations_after(name: &str) -> Result<u32, Box<dyn Error>> {
+    let position = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or("product users migration is not registered")?;
+    Ok(u32::try_from(Migrator::migrations().len() - position - 1)?)
 }

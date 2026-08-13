@@ -30,13 +30,14 @@ use rutilus_application::{
     TlsIdentityObservation, TlsIdentityProbe,
 };
 use rutilus_domain::{
-    AccountCommand, Artifact, ArtifactId, ArtifactState, AuditActor, AuditEvent, BatchOperation,
-    BatchOperationId, Credential, CredentialId, CredentialUsername, CredentialVersionId,
-    DeploymentPosture, Endpoint, EndpointAddress, EndpointCapabilityObservation,
-    EndpointDisplayName, EndpointId, Event, InstanceId, Operation, OperationId, OperationSource,
-    OperationState, OperationTarget, PrincipalId, RedfishCommand, ResetType, ResourceODataId,
-    ResourceSnapshot, SeriesKey, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
-    TelemetrySeriesId, TlsCertificate, TlsTrust,
+    AccountCommand, AccountPassword, AccountUserName, Artifact, ArtifactId, ArtifactState,
+    AuditActor, AuditEvent, BatchOperation, BatchOperationId, CreateAccount, Credential,
+    CredentialId, CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint,
+    EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event,
+    InstanceId, Operation, OperationId, OperationSource, OperationState, OperationTarget,
+    PrincipalId, RedfishCommand, ResetType, ResourceODataId, ResourceSnapshot, RoleId, SeriesKey,
+    SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsCertificate,
+    TlsTrust,
 };
 use rutilus_web::{
     AuditEventQuery, CenterEndpointView, CenterOperationRefusal, CenterOperationView,
@@ -217,6 +218,41 @@ impl OperationStore for MockServices {
                 .ok_or(MockError::Persistence)?
                 .clone();
             if row.is_terminal() {
+                return Err(MockError::Persistence);
+            }
+            let updated = Operation::try_from_parts(
+                row.id(),
+                row.source(),
+                row.targets().to_vec(),
+                row.command(),
+                new_state,
+                row.created_at(),
+                occurred_at,
+            )
+            .map_err(|_| MockError::Persistence)?;
+            state.operations.insert(operation_id, updated);
+            Ok(())
+        })
+    }
+
+    fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().map_err(|_| MockError::Lock)?;
+            let row = state
+                .operations
+                .get(&operation_id)
+                .ok_or(MockError::Persistence)?
+                .clone();
+            // The conditional transition writes only when the persisted state
+            // is exactly the driver's expected in-flight state; a conflict
+            // never writes anything (the driver's racing-state contract).
+            if row.state() != expected_state {
                 return Err(MockError::Persistence);
             }
             let updated = Operation::try_from_parts(
@@ -751,7 +787,8 @@ async fn submits_an_operation_and_echoes_the_queued_projection() -> Result<(), B
 }
 
 #[tokio::test]
-async fn submits_an_account_operation_and_echoes_the_typed_command() -> Result<(), Box<dyn Error>> {
+async fn submits_an_account_operation_and_echoes_a_redacted_command() -> Result<(), Box<dyn Error>>
+{
     let state = Arc::new(Mutex::new(MockState::default()));
     let endpoint = managed_endpoint()?;
     state
@@ -762,7 +799,9 @@ async fn submits_an_account_operation_and_echoes_the_typed_command() -> Result<(
     let router = test_router(MockServices::new(Arc::clone(&state)));
 
     // An account creation rides the same typed command boundary as every
-    // other §7.5 family: the route persists the payload verbatim.
+    // other §7.5 family: the route persists the payload verbatim, but the
+    // echoed projection replaces the §10 password with the fixed redaction
+    // marker (S3-1) — the secret never returns on the response wire.
     let response = post_json(
         &router,
         "/api/v1/operations",
@@ -783,11 +822,15 @@ async fn submits_an_account_operation_and_echoes_the_typed_command() -> Result<(
         body["command"],
         json!({ "Account": { "CreateAccount": {
             "user_name": "jane",
-            "password": "initial-secret",
+            "password": "[REDACTED]",
             "role_id": "Operator"
         } } })
     );
     assert_eq!(body["state"], "queued");
+    assert!(
+        !serde_json::to_string(&body)?.contains("initial-secret"),
+        "the response wire must never carry the submitted password"
+    );
 
     {
         let state = state.lock().map_err(|_| MockError::Lock)?;
@@ -809,6 +852,144 @@ async fn submits_an_account_operation_and_echoes_the_typed_command() -> Result<(
         assert_eq!(create.user_name().as_str(), "jane");
         assert_eq!(create.password().expose_secret(), "initial-secret");
         assert_eq!(create.role_id().as_str(), "Operator");
+    }
+    Ok(())
+}
+
+/// S3-1 regression: the Viewer-readable history routes — the operation
+/// listing, the operation detail, and the batch report — project the command
+/// structure but never the §10 account password, while the persisted
+/// operations keep the full secret for execution.
+// The walk covers the listing, the detail, and the batch report (parent and
+// children), so the line count is the coverage.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn operation_history_routes_never_expose_account_passwords() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let services = MockServices::new(Arc::clone(&state));
+    let router = test_router(services.clone());
+
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let secret = "history-must-never-echo-this";
+    let create = RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+        AccountUserName::parse("jane")?,
+        AccountPassword::parse(secret.to_owned())?,
+        RoleId::parse("Operator")?,
+    )));
+    let operation = Operation::try_from_parts(
+        OperationId::generate(),
+        OperationSource::Standalone,
+        vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+        create.clone(),
+        OperationState::Succeeded,
+        now,
+        now,
+    )?;
+    services.create_operation(&operation).await?;
+    let batch = BatchOperation::new(
+        BatchOperationId::generate(),
+        OperationSource::Site,
+        create,
+        now,
+    );
+    let child = Operation::try_from_parts(
+        OperationId::generate(),
+        OperationSource::Site,
+        vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+        batch.command(),
+        OperationState::Succeeded,
+        now,
+        now,
+    )?;
+    services.create_batch(&batch, &[child]).await?;
+
+    // The listing (RoleMask::ANY) keeps the command shape, redacts the secret.
+    let listed = get(&router, "/api/v1/operations").await?;
+    assert_eq!(listed.status(), axum::http::StatusCode::OK);
+    let body = json_body(listed).await?;
+    let listed_operations = body["operations"]
+        .as_array()
+        .ok_or("operations must be a list")?;
+    assert_eq!(listed_operations.len(), 2);
+    for operation in listed_operations {
+        let text = serde_json::to_string(operation)?;
+        assert!(
+            !text.contains(secret),
+            "the listing must never carry the password plaintext"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "the redaction marker must stand in for the password"
+        );
+        assert_eq!(
+            operation["command"]["Account"]["CreateAccount"]["user_name"], "jane",
+            "the non-secret command structure stays visible"
+        );
+    }
+
+    // The detail pins the exact redacted command shape.
+    let detail = get(&router, &format!("/api/v1/operations/{}", operation.id())).await?;
+    assert_eq!(detail.status(), axum::http::StatusCode::OK);
+    let body = json_body(detail).await?;
+    assert_eq!(
+        body["command"],
+        json!({ "Account": { "CreateAccount": {
+            "user_name": "jane",
+            "password": "[REDACTED]",
+            "role_id": "Operator"
+        } } })
+    );
+    assert!(
+        !serde_json::to_string(&body)?.contains(secret),
+        "the operation detail must never carry the password plaintext"
+    );
+
+    // The batch report redacts the parent command and every child projection.
+    let report = get(&router, &format!("/api/v1/batches/{}", batch.id())).await?;
+    assert_eq!(report.status(), axum::http::StatusCode::OK);
+    let body = json_body(report).await?;
+    assert!(
+        !serde_json::to_string(&body)?.contains(secret),
+        "the batch report must never carry the password plaintext"
+    );
+    assert_eq!(
+        body["command"]["Account"]["CreateAccount"]["password"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        body["children"][0]["command"]["Account"]["CreateAccount"]["password"], "[REDACTED]",
+        "the batch children are ordinary operation projections and redact too"
+    );
+    assert_eq!(
+        body["children"][0]["command"]["Account"]["CreateAccount"]["user_name"],
+        "jane"
+    );
+
+    // The persisted commands keep the full secret for execution recovery.
+    {
+        let state = state.lock().map_err(|_| MockError::Lock)?;
+        let stored = state
+            .operations
+            .get(&operation.id())
+            .ok_or("the submitted operation must be persisted")?;
+        let RedfishCommand::Account(AccountCommand::CreateAccount(create)) = stored.command()
+        else {
+            return Err(io::Error::other(
+                "the persisted command must be the submitted account creation",
+            )
+            .into());
+        };
+        assert_eq!(
+            create.password().expose_secret(),
+            secret,
+            "the persisted command must keep the password for execution"
+        );
     }
     Ok(())
 }

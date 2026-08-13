@@ -12,6 +12,13 @@ const BACKUP_DIRECTORY_NAME: &str = "backups";
 const MIGRATION_DIRECTORY_NAME: &str = "migrations";
 const COMPLETE_MARKER_NAME: &str = "complete.rut";
 const COMPLETE_MARKER: &[u8] = b"RUTILUS-SQLITE-BACKUP-1";
+/// The directory-name prefix of every pre-migration recovery backup; the
+/// retention pruner only ever touches directories with this prefix.
+const MIGRATION_BACKUP_PREFIX: &str = "pre-migration-";
+/// How many of the most recent complete pre-migration recovery backups are
+/// kept; each new committed backup prunes the complete backups beyond this
+/// bound and every incomplete directory (see [`prune_retention`]).
+const PRE_MIGRATION_BACKUP_RETENTION: usize = 3;
 
 /// One immutable recovery directory committed before a pending migration runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,7 +28,8 @@ pub struct MigrationBackup {
 
 impl MigrationBackup {
     /// Copies the closed `SQLite` database and any durable `WAL` into a unique
-    /// recovery directory, synchronizing every file before a completion marker.
+    /// recovery directory, synchronizing every file before a completion marker,
+    /// then prunes the older recovery directories to the retention bound.
     ///
     /// # Errors
     ///
@@ -40,7 +48,7 @@ impl MigrationBackup {
             path: backup_root.clone(),
             source,
         })?;
-        let path = backup_root.join(format!("pre-migration-{}", Uuid::now_v7()));
+        let path = backup_root.join(format!("{MIGRATION_BACKUP_PREFIX}{}", Uuid::now_v7()));
         fs::create_dir(&path).map_err(|source| MigrationBackupError::CreateDirectory {
             path: path.clone(),
             source,
@@ -52,6 +60,9 @@ impl MigrationBackup {
             copy_required_file(&wal_path, &path)?;
         }
         commit_backup(&path)?;
+        // The new backup is committed and durable before any older one is
+        // removed: at every instant at least one complete backup exists.
+        prune_retention(&backup_root, PRE_MIGRATION_BACKUP_RETENTION);
         Ok(Self { path })
     }
 
@@ -143,6 +154,54 @@ fn commit_backup(backup_directory: &Path) -> Result<(), MigrationBackupError> {
             path: marker_path,
             source,
         })
+}
+
+/// Keeps the `retained` most recent complete recovery directories and
+/// removes everything older, plus every incomplete directory.
+///
+/// The pruner runs after a new backup committed (never before), so the new
+/// backup is one of the retained complete directories and the recovery
+/// contract — the most recent pre-migration state — is always intact. The
+/// directories are ordered by name: the `pre-migration-<uuid v7>` names
+/// sort lexicographically in creation order, exactly like the migration
+/// files' `mYYYYMMDD_HHMMSS` naming. Incomplete directories (no completion
+/// marker) are always removed: a failed `create` aborts the open before any
+/// migration runs, so the copied state is still the live database and the
+/// new complete backup supersedes every partial copy.
+///
+/// The pruning is best-effort and never fails the open: the committed
+/// backup is the value the caller needs, and a stale directory that cannot
+/// be removed only means more recovery copies than the bound — the safe
+/// failure direction.
+fn prune_retention(backup_root: &Path, retained: usize) {
+    let Ok(entries) = fs::read_dir(backup_root) else {
+        return;
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with(MIGRATION_BACKUP_PREFIX) {
+            candidates.push((name, path));
+        }
+    }
+    // Newest first: the uuid v7 in the name sorts chronologically.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut complete_seen = 0_usize;
+    for (_name, path) in candidates {
+        let complete = path.join(COMPLETE_MARKER_NAME).is_file();
+        if !complete || complete_seen >= retained {
+            // Best-effort by contract; a removal failure is ignored.
+            let _ = fs::remove_dir_all(&path);
+            continue;
+        }
+        complete_seen += 1;
+    }
 }
 
 fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
@@ -300,6 +359,109 @@ mod tests {
                 .exists()
         );
         Ok(())
+    }
+
+    #[test]
+    fn prunes_complete_backups_beyond_the_retention_bound() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("rutilus.db");
+        fs::write(&database, b"sqlite-main")?;
+
+        // The first four backups all survive while the bound is not
+        // exceeded; the fifth pushes the two oldest out, newest first.
+        let created = (0..5)
+            .map(|_| MigrationBackup::create(&database).map(|backup| backup.path.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let survivors = migration_backup_directories(directory.path())?;
+        assert_eq!(
+            survivors.len(),
+            PRE_MIGRATION_BACKUP_RETENTION,
+            "only the newest complete backups may survive"
+        );
+        let mut newest_first = created[2..].to_vec();
+        newest_first.reverse();
+        assert_eq!(
+            newest_first, survivors,
+            "the newest backups must be the survivors"
+        );
+        assert!(
+            !created[0].exists() && !created[1].exists(),
+            "the two oldest backups must be pruned"
+        );
+        for survivor in &survivors {
+            assert!(survivor.join(COMPLETE_MARKER_NAME).is_file());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_successful_backup_removes_incomplete_directories() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("rutilus.db");
+        fs::write(&database, b"sqlite-main")?;
+        // An interrupted create leaves a directory without the completion
+        // marker; the next successful backup supersedes it (the failed
+        // create aborted the open, so no migration ran and the copied state
+        // is still the live database).
+        let root = directory
+            .path()
+            .join(BACKUP_DIRECTORY_NAME)
+            .join(MIGRATION_DIRECTORY_NAME);
+        fs::create_dir_all(&root)?;
+        let incomplete = root.join(format!("{MIGRATION_BACKUP_PREFIX}{}", Uuid::now_v7()));
+        fs::create_dir(&incomplete)?;
+        fs::write(incomplete.join("rutilus.db"), b"partial copy")?;
+
+        MigrationBackup::create(&database)?;
+
+        let survivors = migration_backup_directories(directory.path())?;
+        assert_eq!(survivors.len(), 1);
+        assert!(survivors[0].join(COMPLETE_MARKER_NAME).is_file());
+        assert!(
+            !incomplete.exists(),
+            "the incomplete directory must be pruned by the successful backup"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_backup_never_prunes() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("rutilus.db");
+        // One committed backup occupies the root before the failing create.
+        fs::write(&database, b"sqlite-main")?;
+        let existing = MigrationBackup::create(&database)?;
+
+        // The create fails before any new backup commits (the source is a
+        // directory), so the retention pruner must not run: no directory
+        // can disappear behind a failed open.
+        let database_directory = directory.path().join("database-directory");
+        fs::create_dir(&database_directory)?;
+        assert!(matches!(
+            MigrationBackup::create(&database_directory),
+            Err(MigrationBackupError::SourceNotRegular { .. })
+        ));
+        assert!(
+            existing.path().is_dir(),
+            "a failed create must never prune committed backups"
+        );
+        Ok(())
+    }
+
+    /// The committed pre-migration backup directories, newest first.
+    fn migration_backup_directories(
+        data_directory: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, Box<dyn Error>> {
+        let root = data_directory
+            .join(BACKUP_DIRECTORY_NAME)
+            .join(MIGRATION_DIRECTORY_NAME);
+        let mut names = fs::read_dir(&root)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort_by(|a, b| b.cmp(a));
+        Ok(names.into_iter().map(|name| root.join(name)).collect())
     }
 
     #[test]

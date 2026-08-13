@@ -191,6 +191,26 @@ impl SqliteStore {
         Ok(Some(domain))
     }
 
+    /// Reads the owning site of one stored artifact row (§15.5); `None` for
+    /// an unknown id or a row without a site association (the center-side
+    /// declare path always stamps the site).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactRepositoryError::Database`] when the query fails.
+    pub async fn find_artifact_site(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<Option<InstanceId>, ArtifactRepositoryError> {
+        let model = artifact::Entity::find_by_id(artifact_id.into_uuid())
+            .one(&self.database)
+            .await
+            .map_err(ArtifactRepositoryError::Database)?;
+        Ok(model
+            .and_then(|model| model.site_id)
+            .map(InstanceId::from_uuid))
+    }
+
     /// Lists every artifact in one lifecycle phase, in declaration order.
     ///
     /// The one-phase filter backs the §0.4.0 recovery scan — every upload

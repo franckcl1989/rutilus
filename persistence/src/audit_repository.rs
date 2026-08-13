@@ -503,7 +503,7 @@ pub enum StoredAuditEventError {
 mod tests {
     use std::error::Error;
 
-    use rutilus_domain::{AuditTlsTrust, DeploymentPosture};
+    use rutilus_domain::{AuditTlsTrust, DeploymentPosture, PrincipalId};
     use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
     use time::{Duration, OffsetDateTime};
 
@@ -740,5 +740,96 @@ mod tests {
             AuditAction::EnrollEndpoint,
             AuditRedfishOperation::ProbeCoreCapabilities,
         )
+    }
+
+    #[tokio::test]
+    async fn center_console_events_persist_through_the_real_schema() -> Result<(), Box<dyn Error>> {
+        // The three 0.7.0 center-console shapes the web handlers record (the
+        // `audit` recorder assertions in `web/src/lib.rs`) now persist
+        // through the real schema: binding registration and revocation under
+        // the product target and the `manage-center-bindings` permission,
+        // and the §15.6 dispatch under the endpoint target and the
+        // `dispatch-center-operations` permission. The 000013 migration
+        // widened the `audit_events` CHECKs to these exact shapes, so a
+        // failed append here would mean the web-visible actions still cannot
+        // be persisted.
+        let directory = tempfile::tempdir()?;
+        let store = SqliteStore::open(directory.path().join("rutilus.db")).await?;
+        let now = OffsetDateTime::now_utc();
+        let principal_id = PrincipalId::generate();
+        let second = AuditSequence::FIRST.next()?;
+        for (action, permission, target) in [
+            (
+                AuditAction::RegisterSiteBinding,
+                ProductPermission::ManageCenterBindings,
+                AuditTarget::Product,
+            ),
+            (
+                AuditAction::RevokeSiteBinding,
+                ProductPermission::ManageCenterBindings,
+                AuditTarget::Product,
+            ),
+            (
+                AuditAction::DispatchCenterOperation,
+                ProductPermission::DispatchCenterOperations,
+                AuditTarget::Endpoint(EndpointId::generate()),
+            ),
+        ] {
+            let context = AuditOperationContext::try_new_with_actor_principal(
+                AuditOperationId::generate(),
+                AuditActor::User,
+                DeploymentPosture::Center,
+                target,
+                AuditParameterSummary::EndpointRefresh,
+                permission,
+                action,
+                AuditRedfishOperation::None,
+                Some(principal_id),
+            )?;
+            let started = AuditEvent::started(context.clone(), now);
+            let succeeded = AuditEvent::succeeded(context.clone(), second, now)?;
+            store.append_audit_event(&started).await?;
+            store.append_audit_event(&succeeded).await?;
+            assert_eq!(
+                store
+                    .find_audit_operation(started.context().operation_id())
+                    .await?,
+                [started, succeeded]
+            );
+        }
+
+        // The refused-dispatch failure code persists through the same path:
+        // a §15.6 dispatch refused by the center records
+        // `center-request-refused` as its terminal event.
+        let refused_context = AuditOperationContext::try_new_with_actor_principal(
+            AuditOperationId::generate(),
+            AuditActor::User,
+            DeploymentPosture::Center,
+            AuditTarget::Endpoint(EndpointId::generate()),
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::DispatchCenterOperations,
+            AuditAction::DispatchCenterOperation,
+            AuditRedfishOperation::None,
+            Some(principal_id),
+        )?;
+        let started = AuditEvent::started(refused_context.clone(), now);
+        let failed = AuditEvent::failed(
+            refused_context.clone(),
+            second,
+            AuditFailure::CenterRequestRefused,
+            AuditFailureVerification::Rejected,
+            now,
+        )?;
+        store.append_audit_event(&started).await?;
+        store.append_audit_event(&failed).await?;
+        assert_eq!(
+            store
+                .find_audit_operation(started.context().operation_id())
+                .await?,
+            [started, failed]
+        );
+        store.close().await?;
+        drop(directory);
+        Ok(())
     }
 }

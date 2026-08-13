@@ -15,6 +15,14 @@
 //! - the monitor pass resumes every `WaitingRemote` operation through the
 //!   [`TaskMonitor`] — the §13.6 Task polling that continues after a restart.
 //!
+//! The two passes of one tick run concurrently, and the executor pass drives
+//! its operations concurrently (design §13.7 default concurrency: site-global
+//! operations bounded, same-endpoint writes serial): one slow drive — a
+//! hung BMC — never blocks the other endpoints' operations or the §13.6 Task
+//! polling. Same-endpoint serialization is guaranteed by the process-wide
+//! per-endpoint write gate [`endpoint_write_gate`] (design §7.8 "写操作默认
+//! 每个端点串行"), which every drive holds for its whole duration.
+//!
 //! The loop follows the design §7.8 async discipline: it is cancellable
 //! through a [`StopWatch`] (every task has a cancellation token), it never
 //! panics, one failing operation never interrupts the sweep, and it finishes
@@ -22,22 +30,28 @@
 //! failure goes through `tracing::error!` (the §6.2 diagnostic log, on the
 //! app binary's RUST_LOG-filtered stderr subscriber).
 //!
-//! Pacing, backoff, bounded retries, and per-endpoint concurrency are
-//! deliberately later iterations: each sweep is a full re-scan of the store,
-//! so a skipped or failed tick loses nothing.
+//! Pacing, backoff, and bounded retries are deliberately later iterations:
+//! each sweep is a full re-scan of the store, so a skipped or failed tick
+//! loses nothing.
 
-use std::{error::Error, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
+use futures::stream::{self, StreamExt};
 use rutilus_application::{
     ArtifactRepository, AuditEventWriter, BoundaryFuture, CapabilityQueryRepository, Clock,
     CommandExecutor, CommandVerifier, EndpointRefreshRepository, ExecutorError, OperationExecutor,
     TaskMonitor, TaskMonitorError, TaskPoll, TaskReader, UpdateExecutor,
 };
-use rutilus_domain::{Operation, OperationId, OperationState};
+use rutilus_domain::{EndpointId, Operation, OperationId, OperationState};
 use rutilus_operation_engine::{EngineError, OperationEngine, OperationStore, RemoteTaskStore};
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tracing::instrument;
 
 /// The cadence of one full scheduling sweep.
@@ -55,6 +69,58 @@ use tracing::instrument;
 /// feel stuck. Pacing, backoff, and bounded retries are later iterations, so
 /// this is deliberately a single constant, not a configuration surface yet.
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The upper bound of one tick's concurrently driven operations (design
+/// §13.7 default concurrency: "Site 全局操作：有界").
+///
+/// Four concurrent drives bound one sweep's in-flight BMC and persistence
+/// work while still pipelining a large store: the same value as the refresh
+/// batch's [`MAX_CONCURRENT_REFRESHES`](rutilus_application::MAX_CONCURRENT_REFRESHES),
+/// because a drive and a refresh are the same class of multi-request
+/// endpoint work. Same-endpoint drives stay serial regardless of this bound:
+/// every drive additionally passes through its endpoint's one-permit write
+/// gate ([`endpoint_write_gate`], §7.8 "写操作默认每个端点串行").
+const MAX_CONCURRENT_DRIVES: usize = 4;
+
+/// The process-wide registry of per-endpoint operation-write gates (design
+/// §7.8 "写操作默认每个端点串行", §13.7 "同一 Endpoint 写操作：1").
+///
+/// One tick drives its operations concurrently, so two operations on the
+/// same endpoint would otherwise dispatch to the same BMC at the same time.
+/// Every drive of one endpoint — execution or recovery, across any number of
+/// concurrent sweeps — passes through the same one-permit gate, so the
+/// endpoint's BMC writes are serial while different endpoints progress in
+/// parallel. The permit is held for the whole drive (pre-flight, dispatch,
+/// verification re-read, and the persisted steps), exactly like the refresh
+/// batch holds its endpoint gate for the whole refresh.
+///
+/// Entries are intentionally retained for the process lifetime: a gate must
+/// never be dropped while a drive holds its permit, because dropping the
+/// registry's last `Arc` would free the semaphore and admit a concurrent
+/// drive of the same endpoint. The registry therefore holds at most one
+/// entry per managed endpoint the process has ever driven — bounded by the
+/// fleet size.
+static ENDPOINT_WRITE_GATES: OnceLock<Mutex<HashMap<EndpointId, Arc<Semaphore>>>> = OnceLock::new();
+
+/// Returns the process-wide one-permit write gate of one endpoint, or `None`
+/// when the registry cannot be locked.
+///
+/// The gate is created on first use and shared by every drive of the
+/// endpoint. A poisoned registry is the same process-level break as a closed
+/// semaphore, so the caller records the drive as failed instead of driving
+/// the endpoint ungated.
+fn endpoint_write_gate(endpoint_id: EndpointId) -> Option<Arc<Semaphore>> {
+    let mut gates = ENDPOINT_WRITE_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    Some(
+        gates
+            .entry(endpoint_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone(),
+    )
+}
 
 /// The control side of the scheduling-loop stop signal (design §7.8: every
 /// task has a cancellation token).
@@ -284,11 +350,13 @@ pub(crate) async fn run<Store, Executor, Monitor, Time>(
 
 /// One sweep of the scheduling loop.
 ///
-/// # The pass order
+/// # The pass structure
 ///
-/// 1. The executor pass lists the §13.6 recovery states
-///    (`Validating`/`Running`/`WaitingRemote`/`Verifying`) and the new
-///    `Queued` work, then dispatches each operation by its state:
+/// The sweep first lists the §13.6 recovery states
+/// (`Validating`/`Running`/`WaitingRemote`/`Verifying`) and the new `Queued`
+/// work; both lists are snapshots. The two passes then run concurrently:
+///
+/// 1. The executor pass dispatches each listed operation by its state:
 ///    - `Queued` and `Validating` run the execution flow through
 ///      [`OperationDriver::execute_operation`] — fresh work, and the
 ///      crash-resumed validation whose write was provably never issued
@@ -300,17 +368,30 @@ pub(crate) async fn run<Store, Executor, Monitor, Time>(
 ///    - `WaitingRemote` operations are skipped here — the monitor pass owns
 ///      them.
 ///
-///    Both lists are snapshots; the driver rejects any state a second driver
-///    advanced in the meantime, and that rejection is recorded like any
-///    per-operation failure.
+///    The drives run concurrently (design §13.7 default concurrency) under
+///    the [`MAX_CONCURRENT_DRIVES`] global bound, and each drive holds its
+///    endpoint's one-permit write gate ([`endpoint_write_gate`], §7.8) for
+///    its whole duration: one slow drive never blocks the other endpoints'
+///    operations, while same-endpoint drives stay serial. Both lists are
+///    snapshots; the driver rejects any state a second driver advanced in
+///    the meantime, and that rejection is recorded like any per-operation
+///    failure.
 /// 2. The monitor pass lists the `WaitingRemote` operations through
 ///    [`TaskPollDriver::recover_tasks`] (the §13.6 resume scan) and polls
 ///    each with the sweep's shared instant.
 ///
+/// Running the monitor pass concurrently with the executor drives is what
+/// keeps a hung BMC from delaying the §13.6 Task polling: a drive may take
+/// the full HTTP timeout, but the polls of this sweep are issued the moment
+/// the waiting listing is available, not after the slowest drive finishes.
+/// The tick still awaits every drive before returning — the §7.8
+/// structured-drain contract, which also guarantees the next tick never
+/// overlaps this one.
+///
 /// # Failure isolation
 ///
 /// One operation's failure never interrupts the sweep: it is recorded and
-/// the next operation runs. Only a sweep-level failure (a listing) aborts
+/// the other operations run. Only a sweep-level failure (a listing) aborts
 /// the tick, and the loop retries the whole sweep on the next tick. The
 /// sweep itself never panics: every fallible call is handled.
 ///
@@ -319,8 +400,8 @@ pub(crate) async fn run<Store, Executor, Monitor, Time>(
 /// Returns [`TickSweepError::Recovery`] or [`TickSweepError::QueuedListing`]
 /// when a store listing fails before the executor pass, and
 /// [`TickSweepError::MonitorRecovery`] when the monitor's waiting listing
-/// fails before the poll pass. A returned error always leaves at least one
-/// pass undispatched.
+/// fails — the executor drives still drain before the error is returned. A
+/// returned error always leaves at least one pass undispatched.
 async fn run_tick<Store, Executor, Monitor>(
     engine: &OperationEngine<&Store>,
     executor: &Executor,
@@ -342,44 +423,103 @@ where
         .list(Some(OperationState::Queued))
         .await
         .map_err(TickSweepError::QueuedListing)?;
-    for operation in recovered.into_iter().chain(queued) {
+
+    // The executor pass: one drive per operation, dispatched by state. The
+    // terminal states can never appear in either listing, but the arm keeps
+    // the dispatch exhaustive over the whole state vocabulary. Every drive
+    // is a [`drive_one`] future — the endpoint's write gate, then the seam
+    // call — so the whole pass is one homogeneous stream the concurrency
+    // bound applies to.
+    let drives = recovered.into_iter().chain(queued).filter_map(|operation| {
         let operation_id = operation.id();
-        // Dispatch by state: the execution flow owns fresh and resumable
-        // work, the recovery flow owns the states whose write may already
-        // have landed, and the monitor pass owns Task polling. The terminal
-        // states can never appear in either listing, but the arm keeps the
-        // dispatch exhaustive over the whole state vocabulary.
+        let endpoint_id = operation
+            .targets()
+            .first()
+            .map(|target| target.endpoint_id());
         let outcome = match operation.state() {
             OperationState::Queued | OperationState::Validating => {
-                executor.execute_operation(operation_id).await
+                Some(executor.execute_operation(operation_id))
             }
             OperationState::Running | OperationState::Verifying => {
-                executor.recover_operation(operation_id).await
+                Some(executor.recover_operation(operation_id))
             }
             OperationState::WaitingRemote
             | OperationState::Succeeded
             | OperationState::Failed
             | OperationState::Unknown
-            | OperationState::Cancelled => continue,
+            | OperationState::Cancelled => None,
         };
-        if let Err(error) = outcome {
-            // One failed operation never stops the sweep; the next tick
-            // re-lists it and tries again.
-            tracing::error!("operation {operation_id} could not be driven: {error}");
-        }
-    }
+        outcome.map(|outcome| drive_one(outcome, operation_id, endpoint_id))
+    });
 
-    let waiting = monitor
-        .recover_tasks()
-        .await
-        .map_err(TickSweepError::MonitorRecovery)?;
-    for operation in waiting {
-        let operation_id = operation.id();
-        if let Err(error) = monitor.poll_operation(operation_id, now).await {
-            tracing::error!("operation {operation_id} Task poll failed: {error}");
+    // The monitor pass runs concurrently with the executor drives and both
+    // drain before the sweep returns: no drive is ever left running
+    // detached, and a monitor-listing failure is reported only after the
+    // already-dispatched drives have been awaited (§7.8 structured drain).
+    let (_, monitor_result) = tokio::join!(
+        stream::iter(drives)
+            .buffer_unordered(MAX_CONCURRENT_DRIVES)
+            .collect::<Vec<()>>(),
+        async {
+            let waiting = monitor
+                .recover_tasks()
+                .await
+                .map_err(TickSweepError::MonitorRecovery)?;
+            for operation in waiting {
+                let operation_id = operation.id();
+                if let Err(error) = monitor.poll_operation(operation_id, now).await {
+                    tracing::error!("operation {operation_id} Task poll failed: {error}");
+                }
+            }
+            Ok(())
+        },
+    );
+    monitor_result
+}
+
+/// Runs one operation drive: holds the endpoint's one-permit write gate for
+/// the whole drive (design §7.8 "写操作默认每个端点串行"), then awaits the
+/// seam future and records any failure.
+///
+/// The gate is process-wide and never closed, so its acquire can only fail
+/// if the registry itself broke; the drive is then recorded as failed
+/// instead of running the endpoint ungated — the same controlled dead-end
+/// as the refresh batch's coordination failure. A corrupt zero-target row
+/// has no endpoint to gate; the drive proceeds and the driver's own
+/// empty-target defense refuses it.
+async fn drive_one<ErrorType>(
+    outcome: BoundaryFuture<'_, Result<Operation, ErrorType>>,
+    operation_id: OperationId,
+    endpoint_id: Option<EndpointId>,
+) where
+    ErrorType: Error,
+{
+    // The permit is bound here, at the drive's scope, so it is held across
+    // `outcome.await` and released only when the whole drive finishes — the
+    // endpoint's next drive acquires the gate only after this one is done.
+    let _permit = match endpoint_id {
+        Some(endpoint_id) => {
+            let Some(gate) = endpoint_write_gate(endpoint_id) else {
+                tracing::error!(
+                    "operation {operation_id} could not be gated: the write-gate registry is unavailable"
+                );
+                return;
+            };
+            let Ok(permit) = gate.acquire_owned().await else {
+                tracing::error!(
+                    "operation {operation_id} could not be gated: the endpoint write gate is closed"
+                );
+                return;
+            };
+            Some(permit)
         }
+        None => None,
+    };
+    if let Err(error) = outcome.await {
+        // One failed operation never stops the sweep; the next tick re-lists
+        // it and tries again.
+        tracing::error!("operation {operation_id} could not be driven: {error}");
     }
-    Ok(())
 }
 
 /// A controlled failure of one whole sweep.
@@ -410,7 +550,10 @@ mod tests {
         collections::{HashMap, VecDeque},
         error::Error,
         fmt,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration as StdDuration,
     };
 
@@ -447,6 +590,18 @@ mod tests {
             OperationId::generate(),
             OperationSource::Standalone,
             vec![one_target()],
+            one_command(),
+            created_at(),
+        )
+    }
+
+    /// Builds one queued operation targeting exactly `endpoint_id`, so two
+    /// operations can be pinned to the same endpoint.
+    fn queued_operation_on(endpoint_id: EndpointId) -> Operation {
+        Operation::new(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![OperationTarget::new(TargetId::generate(), endpoint_id)],
             one_command(),
             created_at(),
         )
@@ -576,6 +731,18 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
+        fn apply_transition_if_current(
+            &self,
+            _operation_id: OperationId,
+            _expected_state: OperationState,
+            _new_state: OperationState,
+            _occurred_at: OffsetDateTime,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            // The sweep never steps the state machine; the executor owns
+            // that boundary.
+            Box::pin(async move { Ok(()) })
+        }
+
         fn list_operations(
             &self,
             state: Option<OperationState>,
@@ -678,6 +845,8 @@ mod tests {
         calls: Arc<Mutex<Vec<DriverCall>>>,
         script: Arc<Mutex<VecDeque<Result<(), MockError>>>>,
         gate: Option<Arc<Notify>>,
+        gate_for: Option<OperationId>,
+        gate_first: Option<Arc<AtomicUsize>>,
     }
 
     impl FakeExecutor {
@@ -686,6 +855,8 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 script: Arc::new(Mutex::new(VecDeque::from(script))),
                 gate: None,
+                gate_for: None,
+                gate_first: None,
             }
         }
 
@@ -696,6 +867,34 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 script: Arc::new(Mutex::new(VecDeque::from(vec![Ok(())]))),
                 gate: Some(Arc::new(Notify::new())),
+                gate_for: None,
+                gate_first: None,
+            }
+        }
+
+        /// Builds an executor whose drive of exactly `operation_id` blocks
+        /// until the gate fires; every other drive passes through — the
+        /// model of one slow BMC drive next to healthy ones.
+        fn gated_for(operation_id: OperationId) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                script: Arc::new(Mutex::new(VecDeque::from(vec![Ok(()); 2]))),
+                gate: Some(Arc::new(Notify::new())),
+                gate_for: Some(operation_id),
+                gate_first: None,
+            }
+        }
+
+        /// Builds an executor whose first call blocks until the gate fires
+        /// and every later call passes through — the model of one drive
+        /// holding an endpoint gate while another waits on it.
+        fn gated_first() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                script: Arc::new(Mutex::new(VecDeque::from(vec![Ok(()); 2]))),
+                gate: Some(Arc::new(Notify::new())),
+                gate_for: None,
+                gate_first: Some(Arc::new(AtomicUsize::new(1))),
             }
         }
 
@@ -713,8 +912,16 @@ mod tests {
                 // The release future is registered before the call
                 // blocks, so a release fired while the call is in flight
                 // is never lost.
-                let released = gate.notified();
-                released.await;
+                let blocked = match &self.gate_for {
+                    Some(operation_id) => call.operation_id() == *operation_id,
+                    None => match &self.gate_first {
+                        Some(remaining) => remaining.fetch_sub(1, Ordering::SeqCst) > 0,
+                        None => true,
+                    },
+                };
+                if blocked {
+                    gate.notified().await;
+                }
             }
             match self
                 .script
@@ -988,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_reports_the_monitor_recovery_failure_after_the_executor_pass()
+    async fn tick_reports_the_monitor_recovery_failure_alongside_the_executor_pass()
     -> Result<(), Box<dyn Error>> {
         let store = FakeStore::new();
         let queued = queued_operation();
@@ -1013,7 +1220,10 @@ mod tests {
                 .into());
             }
         }
-        // The executor pass completed before the monitor pass failed.
+        // The passes run concurrently, but the sweep still drained the
+        // executor drive before returning: no drive is ever left running
+        // detached (§7.8), and the failed monitor listing aborted the sweep
+        // after the executor pass had already dispatched its work.
         assert_eq!(
             executor.recorded_calls()?,
             [DriverCall::Execute(queued.id())]
@@ -1134,6 +1344,125 @@ mod tests {
             gated.recorded_calls()?.len(),
             1,
             "a second tick started after the stop signal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_slow_drive_never_blocks_other_endpoints_or_task_polling()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let slow = queued_operation();
+        let fast = queued_operation();
+        store.insert(slow.clone())?;
+        store.insert(fast.clone())?;
+        let waiting = parked_operation(OperationState::WaitingRemote)?;
+        store.insert(waiting.clone())?;
+        let executor = FakeExecutor::gated_for(slow.id());
+        let probe = executor.clone();
+        let gate = executor
+            .gate
+            .clone()
+            .ok_or_else(|| std::io::Error::other("the gated fake lost its gate"))?;
+        let monitor = FakeMonitor::new(vec![waiting.clone()], vec![Ok(())]);
+        let monitor_probe = monitor.clone();
+        let waiting_id = waiting.id();
+        let now = created_at() + Duration::SECOND * 4;
+
+        let mut tick = tokio::spawn(async move {
+            run_tick(&OperationEngine::new(&store), &executor, &monitor, now).await
+        });
+
+        // The slow drive blocks inside the fake; the other endpoint's
+        // operation and the §13.6 Task poll must still complete while it is
+        // stuck.
+        for _ in 0..200 {
+            if !monitor_probe.recorded_polls()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let driven = probe.recorded_calls()?;
+        assert!(
+            driven.contains(&DriverCall::Execute(fast.id())),
+            "the other endpoint's operation must be driven while the slow drive is blocked"
+        );
+        assert_eq!(
+            monitor_probe.recorded_polls()?,
+            [(waiting_id, now)],
+            "the Task poll must run while the slow drive is blocked"
+        );
+        // The tick is still in flight: the slow drive has not completed, and
+        // the sweep waits for it only as its own structured drain.
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(80), &mut tick)
+                .await
+                .is_err(),
+            "the tick exited while the slow drive was still blocked"
+        );
+
+        // Releasing the gate lets the slow drive finish and the sweep return.
+        gate.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(2), tick)
+            .await
+            .map_err(|_| std::io::Error::other("the tick did not finish"))?
+            .map_err(|join_error| std::io::Error::other(join_error.to_string()))??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_endpoint_drives_are_serialized_by_the_endpoint_write_gate()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let endpoint_id = EndpointId::generate();
+        let first = queued_operation_on(endpoint_id);
+        let second = queued_operation_on(endpoint_id);
+        store.insert(first.clone())?;
+        store.insert(second.clone())?;
+        let executor = FakeExecutor::gated_first();
+        let probe = executor.clone();
+        let gate = executor
+            .gate
+            .clone()
+            .ok_or_else(|| std::io::Error::other("the gated fake lost its gate"))?;
+        let monitor = FakeMonitor::new(Vec::new(), Vec::new());
+
+        let tick = tokio::spawn(async move {
+            run_tick(
+                &OperationEngine::new(&store),
+                &executor,
+                &monitor,
+                created_at(),
+            )
+            .await
+        });
+
+        // Wait until one drive is recorded and blocked inside the fake.
+        for _ in 0..200 {
+            if !probe.recorded_calls()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        // The first drive holds the endpoint's one-permit write gate, so the
+        // second same-endpoint drive is queued at the gate — its seam call
+        // is not even recorded (§7.8 "写操作默认每个端点串行").
+        assert_eq!(
+            probe.recorded_calls()?.len(),
+            1,
+            "the same-endpoint drive must wait on the endpoint write gate"
+        );
+
+        // Releasing the gate lets the first drive finish and the second run.
+        gate.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(2), tick)
+            .await
+            .map_err(|_| std::io::Error::other("the tick did not finish"))?
+            .map_err(|join_error| std::io::Error::other(join_error.to_string()))??;
+        assert_eq!(
+            probe.recorded_calls()?.len(),
+            2,
+            "the second drive must run after the first released the gate"
         );
         Ok(())
     }

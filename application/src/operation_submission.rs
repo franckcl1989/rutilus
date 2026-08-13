@@ -407,6 +407,36 @@ mod tests {
             })
         }
 
+        fn apply_transition_if_current(
+            &self,
+            operation_id: OperationId,
+            expected_state: OperationState,
+            new_state: OperationState,
+            occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self.rows.lock().map_err(|_| MockError::Store)?;
+                let row = rows.get(&operation_id).ok_or(MockError::Store)?.clone();
+                if row.state() != expected_state {
+                    return Err(MockError::Store);
+                }
+                rows.insert(
+                    operation_id,
+                    Operation::try_from_parts(
+                        row.id(),
+                        row.source(),
+                        row.targets().to_vec(),
+                        row.command(),
+                        new_state,
+                        row.created_at(),
+                        occurred_at,
+                    )
+                    .map_err(|_| MockError::Store)?,
+                );
+                Ok(())
+            })
+        }
+
         fn record_failure_kind(
             &self,
             _operation_id: OperationId,

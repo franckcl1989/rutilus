@@ -5,8 +5,10 @@
 //! - [`AuthPolicy`] — whether the router enforces sessions at all. `Open`
 //!   serves every request without a session (the pre-0.6 behavior, and the
 //!   test default); `Guarded` requires a session on every route except the
-//!   public sign-in surface; `PendingBootstrap` is the Standalone loopback
-//!   lifecycle — open until the first-startup claim succeeds, then guarded.
+//!   public sign-in surface; `PendingBootstrap` is the §16.2 first-run
+//!   lifecycle — only the claim surface (the Public bootstrap endpoint,
+//!   `me`, and the static console) is reachable while the one-time code is
+//!   unconsumed, and the claim arms the gate.
 //! - The session middleware — extracts the `rutilus_session` cookie, looks
 //!   the session up by its SHA-256 token hash, checks expiry and
 //!   revocation, verifies the CSRF token of mutating requests in constant
@@ -139,15 +141,23 @@ pub enum AuthPolicy {
     /// Require a session (and the route's role mask) on every route except
     /// the public sign-in surface.
     Guarded,
-    /// The Standalone loopback lifecycle: open until the first-startup
-    /// bootstrap claim succeeds, then guarded. The gate flips in-process
-    /// when the claim completes, so the console does not need a restart to
-    /// start enforcing sessions.
+    /// The §16.2 first-run lifecycle: while an unconsumed bootstrap code
+    /// exists, only the claim surface — the Public bootstrap endpoint,
+    /// `me`, and the static console — is reachable; the product surface
+    /// (the `GuardedOnly` routes) requires a session from the start
+    /// (S3-2), so the pending code never opens the management console to
+    /// the network. The gate flips in-process when the claim completes,
+    /// marking the transition without a restart.
     PendingBootstrap(AuthGate),
 }
 
 impl AuthPolicy {
-    /// Reports whether this policy currently enforces sessions.
+    /// Reports whether the policy's gate is armed: `Guarded` is always
+    /// armed, `Open` never, and `PendingBootstrap` reports its in-process
+    /// gate. The armed state is not the whole enforcement judgment —
+    /// `PendingBootstrap` enforces the guarded surface from the start,
+    /// armed or not (S3-2) — but the middleware consults it first, so the
+    /// claim's in-process arming stays part of the decision.
     #[must_use]
     pub fn is_guarded(&self) -> bool {
         match self {
@@ -158,10 +168,14 @@ impl AuthPolicy {
     }
 }
 
-/// A shared, process-wide switch between open and guarded enforcement.
+/// The process-wide §16.2 first-run lifecycle latch: starts open while an
+/// unconsumed bootstrap code exists, and the claim arms it, so the running
+/// console records the transition without a restart.
 ///
-/// The gate is consulted on every request, so arming it after the bootstrap
-/// claim immediately starts enforcing sessions on the running console.
+/// The latch feeds [`AuthPolicy::is_guarded`], but enforcement does not
+/// wait for it: the pending-bootstrap lifecycle requires a session on the
+/// guarded surface from the start (S3-2) — arming marks the claim instead
+/// of changing the enforcement decision.
 #[derive(Clone, Debug)]
 pub struct AuthGate(Arc<std::sync::atomic::AtomicBool>);
 
@@ -387,7 +401,31 @@ pub trait AuthServices: Send + Sync {
     ) -> BoundaryFuture<'a, Result<(), Self::Error>>;
 
     /// Verifies a presented password against a stored `argon2id-1` hash.
+    ///
+    /// This is the synchronous form of the boundary: the test doubles
+    /// implement it, and [`Self::verify_password_async`] defaults to it. A
+    /// live request path must never call it directly — the Argon2id work
+    /// (64 MiB, 3 passes, 1 lane) would run on the Tokio worker (§7.8).
     fn verify_password(&self, hash: &Argon2IdHash, password: &SecretString) -> bool;
+
+    /// The async (§7.8) form of [`Self::verify_password`]: the sign-in and
+    /// password-change handlers await this boundary so the Argon2id work can
+    /// run on the blocking pool instead of a worker thread.
+    ///
+    /// The default implementation delegates to [`Self::verify_password`]
+    /// inline — the test doubles inherit it, and it keeps the synchronous
+    /// contract intact for them. Production runtimes must override it and run
+    /// the derivation with `tokio::task::spawn_blocking`; the default must
+    /// not be used on a live request path. A panicked worker fails closed:
+    /// the `JoinError` maps to a wrong-password verdict, which is also the
+    /// fail-closed choice for the login rate limiter.
+    fn verify_password_async<'a>(
+        &'a self,
+        hash: &'a Argon2IdHash,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, bool> {
+        Box::pin(async move { self.verify_password(hash, password) })
+    }
     /// Verifies a presented TOTP code in the RFC 6238 window.
     ///
     /// # Errors
@@ -402,10 +440,33 @@ pub trait AuthServices: Send + Sync {
     ) -> Result<u64, TotpAuthenticatorError>;
     /// Derives a fresh `argon2id-1` hash for a new password.
     ///
+    /// This is the synchronous form of the boundary: the test doubles
+    /// implement it, and [`Self::hash_password_async`] defaults to it. A
+    /// live request path must never call it directly — the Argon2id work
+    /// (64 MiB, 3 passes, 1 lane) would run on the Tokio worker (§7.8).
+    ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] when the derivation cannot complete.
     fn hash_password(&self, password: &SecretString) -> Result<Argon2IdHash, Self::Error>;
+
+    /// The async (§7.8) form of [`Self::hash_password`]: the bootstrap and
+    /// password-change handlers await this boundary so the Argon2id work can
+    /// run on the blocking pool instead of a worker thread.
+    ///
+    /// The default implementation delegates to [`Self::hash_password`]
+    /// inline — the test doubles inherit it, and it keeps the synchronous
+    /// contract intact for them. Production runtimes must override it and run
+    /// the derivation with `tokio::task::spawn_blocking`; the default must
+    /// not be used on a live request path. The `JoinError` of a panicked
+    /// worker maps into [`Self::Error`] like any other derivation failure —
+    /// the handlers treat it as the 500 the boundary failure already is.
+    fn hash_password_async<'a>(
+        &'a self,
+        password: &'a SecretString,
+    ) -> BoundaryFuture<'a, Result<Argon2IdHash, Self::Error>> {
+        Box::pin(async move { self.hash_password(password) })
+    }
     /// Normalizes and hashes a presented bootstrap code for lookup.
     fn hash_bootstrap_code(&self, code: &str) -> [u8; 32];
     /// Issues one session-token/CSRF-token pair.
@@ -505,8 +566,9 @@ enum RouteAccess {
     /// The route requires a session in every mode (sign-out, password
     /// change, administration).
     Always { roles: RoleMask, mutation: bool },
-    /// The route requires a session only when the policy is guarded (the
-    /// product surface).
+    /// The route requires a session when the policy is guarded or
+    /// pending-bootstrap (whether or not the gate has armed); only the
+    /// open policy serves it without a session (the product surface).
     GuardedOnly { roles: RoleMask, mutation: bool },
 }
 
@@ -914,30 +976,61 @@ impl LoginRateLimiter {
         }
     }
 
-    /// Reports whether another attempt is allowed for this username and
-    /// address. The username bound is the more specific one: a blocked
-    /// username is refused even when the address budget remains.
-    fn allows(&self, username: &str, ip: &str, now: Instant) -> bool {
-        Self::allows_key(
+    /// Consumes one budget slot of the username and the address atomically
+    /// (S3-3).
+    ///
+    /// The reservation *is* the rate-limit record: it happens before any
+    /// verification, under one lock acquisition per key, so N concurrent
+    /// attempts can never all pass a stale `allows`-style check and then
+    /// record — the old check-then-act window that let a burst exceed the
+    /// budget. A successful verification must release the slot with
+    /// [`Self::refund`]; a failed or cancelled attempt keeps it, which is
+    /// exactly the failure accounting. The username bound is the more
+    /// specific one: a blocked username is refused even when the address
+    /// budget remains.
+    fn reserve(&self, username: &str, ip: &str, now: Instant) -> bool {
+        let username_key = bounded_username_key(username);
+        if !Self::reserve_key(
             &self.by_username,
-            &bounded_username_key(username),
+            &username_key,
             now,
             USERNAME_FAILURE_LIMIT,
-        ) && Self::allows_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT)
+        ) {
+            return false;
+        }
+        let reserved = if Self::reserve_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT) {
+            true
+        } else {
+            // The address budget refused: release the username slot so the
+            // reservation is all-or-nothing across both budgets.
+            Self::refund_key(&self.by_username, &username_key);
+            false
+        };
+        // The full sweep runs after the compensation, so a bucket the
+        // compensation just emptied is reclaimed by the same sweep that the
+        // insert triggered — the sweep never leaves its own artifact behind.
+        Self::sweep_if_due(&self.by_username, now);
+        Self::sweep_if_due(&self.by_ip, now);
+        reserved
     }
 
-    /// Records one failed attempt for this username and address.
-    fn record_failure(&self, username: &str, ip: &str, now: Instant) {
-        Self::record_key(
-            &self.by_username,
-            &bounded_username_key(username),
-            now,
-            USERNAME_FAILURE_LIMIT,
-        );
-        Self::record_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT);
+    /// Releases one reserved slot of each budget after a successful
+    /// verification (S3-3).
+    ///
+    /// Every entry is either a reserved slot still being verified or a kept
+    /// failure, so removing one entry per successful attempt restores
+    /// exactly the slots the success consumed — the bucket's length always
+    /// ends as the failure count, and the window expiry rule never changes a
+    /// verdict. A missing bucket (a fully expired key the sweep reclaimed)
+    /// is a no-op: the slot it held had already left the window.
+    fn refund(&self, username: &str, ip: &str) {
+        Self::refund_key(&self.by_username, &bounded_username_key(username));
+        Self::refund_key(&self.by_ip, ip);
     }
 
-    fn allows_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) -> bool {
+    /// Consumes one budget slot of one key; `false` when the budget is
+    /// already exhausted (nothing is consumed on a refusal).
+    fn reserve_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) -> bool {
         let Ok(mut guard) = bucket.lock() else {
             return false;
         };
@@ -955,31 +1048,34 @@ impl LoginRateLimiter {
         {
             failures.pop_front();
         }
-        let allowed = failures.len() < limit;
-        Self::prune_if_due(&mut buckets.buckets, &mut buckets.inserts_since_prune, now);
-        allowed
+        let reserved = failures.len() < limit;
+        if reserved {
+            failures.push_back(now);
+        }
+        reserved
     }
 
-    fn record_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) {
+    /// Runs the full sweep of one bucket map once its insert counter crossed
+    /// the threshold (N3). [`LoginRateLimiter::reserve`] calls it for both
+    /// maps after the reservation and its possible compensation settled.
+    fn sweep_if_due(bucket: &Arc<Mutex<BucketMap>>, now: Instant) {
         if let Ok(mut guard) = bucket.lock() {
             let buckets = &mut *guard;
-            let failures = match buckets.buckets.entry(key.to_owned()) {
-                Entry::Vacant(entry) => {
-                    buckets.inserts_since_prune += 1;
-                    entry.insert(VecDeque::new())
-                }
-                Entry::Occupied(entry) => entry.into_mut(),
-            };
-            while failures
-                .front()
-                .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
-            {
-                failures.pop_front();
-            }
-            if failures.len() < limit {
-                failures.push_back(now);
-            }
             Self::prune_if_due(&mut buckets.buckets, &mut buckets.inserts_since_prune, now);
+        }
+    }
+
+    /// Releases one reserved slot of one key: the newest entry, which is a
+    /// reserved-but-unverified slot unless a previous refund already took it
+    /// — in that case the entry belongs to another in-flight attempt, and
+    /// removing it keeps the invariant that every successful attempt removes
+    /// exactly one entry (see [`Self::refund`]).
+    fn refund_key(bucket: &Arc<Mutex<BucketMap>>, key: &str) {
+        if let Ok(mut guard) = bucket.lock() {
+            let buckets = &mut *guard;
+            if let Some(failures) = buckets.buckets.get_mut(key) {
+                failures.pop_back();
+            }
         }
     }
 
@@ -1063,9 +1159,19 @@ where
             next.run(request).await
         }
         RouteAccess::Always { roles, mutation } | RouteAccess::GuardedOnly { roles, mutation } => {
-            // In open mode the product surface is served without a session;
-            // the always-required routes still need one.
-            let requires_session = guarded || matches!(access, RouteAccess::Always { .. });
+            // §16.2 first-run lifecycle (S3-2): the pending-bootstrap
+            // window must not open the product surface. The claim flow —
+            // the bootstrap endpoint, `me`, and the static console — is
+            // entirely Public, so while the one-time code is unconsumed
+            // the only reachable surface is the claim itself: every
+            // GuardedOnly route requires a session from the start,
+            // whether or not the gate has armed. `Open` is the only mode
+            // that serves GuardedOnly without a session (the pre-0.6
+            // console and the test routers); the always-required routes
+            // need a session in every mode.
+            let requires_session = guarded
+                || matches!(state.auth.policy(), AuthPolicy::PendingBootstrap(_))
+                || matches!(access, RouteAccess::Always { .. });
             if !requires_session {
                 request
                     .extensions_mut()
@@ -1211,10 +1317,12 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     for pair in cookie.split(';') {
         let pair = pair.trim();
         if let Some(value) = pair.strip_prefix(name) {
-            return Some(value.strip_prefix('=')?.trim());
-        }
-        if let Some(value) = pair.strip_prefix(&format!("{name}=")) {
-            return Some(value.trim());
+            // A pair that shares the prefix without an '=' is a different
+            // cookie (S3-5): it must not fail the whole scan — the named
+            // cookie may still follow, so the loop keeps scanning.
+            if let Some(value) = value.strip_prefix('=') {
+                return Some(value.trim());
+            }
         }
     }
     None
@@ -1332,7 +1440,11 @@ const DUMMY_HASH: [u8; ARGON2ID_HASH_LENGTH] = [0x2b; ARGON2ID_HASH_LENGTH];
 /// data. The call is bounded by the login rate limiter (5 failures per
 /// username, 20 per address, per 15-minute window), so the dummy cannot
 /// become a denial-of-service lever.
-fn dummy_password_verification<Services>(services: &Services, password: &SecretString)
+///
+/// The verification runs through the async boundary (§7.8), so the dummy
+/// Argon2id work lands on the blocking pool exactly like the real branch —
+/// never on a worker thread.
+async fn dummy_password_verification<Services>(services: &Services, password: &SecretString)
 where
     Services: AuthServices,
 {
@@ -1342,7 +1454,7 @@ where
     let Ok(dummy) = Argon2IdHash::from_parts(&DUMMY_SALT, &DUMMY_HASH) else {
         return;
     };
-    let _ = services.verify_password(&dummy, password);
+    let _ = services.verify_password_async(&dummy, password).await;
 }
 
 /// Whether a presented password satisfies the product password policy (B1).
@@ -1398,8 +1510,13 @@ where
     let ip = request_ip(&connect_info);
     let username = request.username();
     let rate_now = Instant::now();
-    let rate_limited = !state.auth.rate_limiter.allows(username, &ip, rate_now);
-    if rate_limited {
+    // S3-3: the budget is consumed atomically *before* any verification —
+    // the reservation is the record. A success refunds its slots below;
+    // every failure keeps them, so N concurrent attempts can never all pass
+    // a stale check-then-act `allows` anymore. A request cancelled while
+    // awaiting keeps its reservation until the window slides — the
+    // fail-closed choice for a budget, and self-inflicted at worst.
+    if !state.auth.rate_limiter.reserve(username, &ip, rate_now) {
         // B2 (security batch): a limiter refusal writes no audit event.
         // §16.3 audits login *outcomes* — attempts that ran; a request the
         // limiter refused before any verification never attempted one, and
@@ -1416,10 +1533,8 @@ where
     }
 
     let Ok(name) = PrincipalName::parse(username) else {
-        state
-            .auth
-            .rate_limiter
-            .record_failure(username, &ip, rate_now);
+        // The reservation already consumed the rate-limit budget (S3-3); the
+        // failure keeps it — there is nothing to record separately.
         record_login_failure(&state, None, now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
@@ -1435,11 +1550,7 @@ where
         // difference would let an attacker enumerate valid usernames. One
         // dummy Argon2id verification balances the two paths; the failure
         // handling below stays identical either way.
-        dummy_password_verification(state.services.as_ref(), request.password());
-        state
-            .auth
-            .rate_limiter
-            .record_failure(username, &ip, rate_now);
+        dummy_password_verification(state.services.as_ref(), request.password()).await;
         record_login_failure(&state, None, now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
@@ -1451,11 +1562,7 @@ where
         // Argon2id verification (the same cost equalizer as the
         // unknown-username branch) balances the disabled branch against the
         // wrong-password branch; the failure handling below stays identical.
-        dummy_password_verification(state.services.as_ref(), request.password());
-        state
-            .auth
-            .rate_limiter
-            .record_failure(username, &ip, rate_now);
+        dummy_password_verification(state.services.as_ref(), request.password()).await;
         record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     }
@@ -1471,22 +1578,16 @@ where
         // answer "this username exists" observably faster than the
         // wrong-password branch. One dummy Argon2id verification balances
         // the branch; the failure handling below stays identical.
-        dummy_password_verification(state.services.as_ref(), request.password());
-        state
-            .auth
-            .rate_limiter
-            .record_failure(username, &ip, rate_now);
+        dummy_password_verification(state.services.as_ref(), request.password()).await;
         record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     };
+    // §7.8: the verification runs on the blocking pool, never on a worker.
     if !state
         .services
-        .verify_password(credential.hash(), request.password())
+        .verify_password_async(credential.hash(), request.password())
+        .await
     {
-        state
-            .auth
-            .rate_limiter
-            .record_failure(username, &ip, rate_now);
         record_login_failure(&state, Some(principal.id()), now).await;
         return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
     }
@@ -1500,10 +1601,6 @@ where
         .find(|authenticator| authenticator.state() == rutilus_domain::TotpState::Active)
     {
         let Some(code) = request.totp_code() else {
-            state
-                .auth
-                .rate_limiter
-                .record_failure(username, &ip, rate_now);
             record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         };
@@ -1513,10 +1610,6 @@ where
             now,
             authenticator.last_used_step(),
         ) else {
-            state
-                .auth
-                .rate_limiter
-                .record_failure(username, &ip, rate_now);
             record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         };
@@ -1529,14 +1622,14 @@ where
             .ok()
             .unwrap_or(false)
         {
-            state
-                .auth
-                .rate_limiter
-                .record_failure(username, &ip, rate_now);
             record_login_failure(&state, Some(principal.id()), now).await;
             return json_error(StatusCode::UNAUTHORIZED, "sign-in failed".to_owned());
         }
     }
+    // The password (and TOTP) verification succeeded: release the reserved
+    // budget slots so the success never counts against the 15-minute window
+    // (S3-3). Every failure branch above kept its reservation instead.
+    state.auth.rate_limiter.refund(username, &ip);
     let Ok(tokens) = state.services.issue_tokens() else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -1703,7 +1796,8 @@ where
         }
         None => None,
     };
-    let Ok(hash) = state.services.hash_password(request.password()) else {
+    // §7.8: the derivation runs on the blocking pool, never on a worker.
+    let Ok(hash) = state.services.hash_password_async(request.password()).await else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let Ok(credential) = PasswordCredential::try_from_parts(principal.id(), hash, now) else {
@@ -1748,8 +1842,10 @@ where
         )
         .await;
     }
-    // The claim is the point of no return for the loopback lifecycle: the
-    // console starts enforcing sessions from this request on.
+    // The claim is the point of no return for the first-run lifecycle:
+    // the gate arms here — enforcement of the guarded surface was already
+    // in force from startup (S3-2), and this request's session is the
+    // first one that can pass it.
     if let AuthPolicy::PendingBootstrap(gate) = &state.auth.policy {
         gate.arm();
     }
@@ -1801,16 +1897,23 @@ where
             "password change failed".to_owned(),
         );
     };
+    // §7.8: the verification and the derivation run on the blocking pool,
+    // never on a worker.
     if !state
         .services
-        .verify_password(credential.hash(), request.current_password())
+        .verify_password_async(credential.hash(), request.current_password())
+        .await
     {
         return json_error(
             StatusCode::UNAUTHORIZED,
             "password change failed".to_owned(),
         );
     }
-    let Ok(hash) = state.services.hash_password(request.new_password()) else {
+    let Ok(hash) = state
+        .services
+        .hash_password_async(request.new_password())
+        .await
+    else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     };
     let Ok(updated) = PasswordCredential::try_from_parts(principal_id, hash, now) else {
@@ -2412,9 +2515,13 @@ fn json_ok<Body: IntoResponse>(body: Body) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::Body, http::Request};
+    use rutilus_domain::DeploymentPosture;
     use secrecy::ExposeSecret;
+    use tower::ServiceExt;
 
     use super::*;
+    use crate::WebProductInfo;
 
     #[test]
     fn role_masks_follow_the_section_16_1_matrix() {
@@ -2747,6 +2854,28 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, HeaderValue::from_static("other=1"));
         assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), None);
+        // S3-5: a pair that shares the prefix without an '=' is a different
+        // cookie — it must be skipped, not end the whole scan, so the named
+        // cookie that follows still parses.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("rutilus_sessionXYZ=1; rutilus_session=abc123"),
+        );
+        assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), Some("abc123"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("rutilus_session; rutilus_session=abc123"),
+        );
+        assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), Some("abc123"));
+        // The same-prefix pair alone is still not the named cookie.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("rutilus_sessionXYZ=1; rutilus_session"),
+        );
+        assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), None);
     }
 
     #[test]
@@ -2770,38 +2899,124 @@ mod tests {
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
 
+        // Each reservation below is kept (the failure path never refunds),
+        // so the budgets exhaust exactly like recorded failures.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.allows("admin", "192.0.2.10", now));
-            limiter.record_failure("admin", "192.0.2.10", now);
+            assert!(limiter.reserve("admin", "192.0.2.10", now));
         }
         assert!(
-            !limiter.allows("admin", "192.0.2.10", now),
+            !limiter.reserve("admin", "192.0.2.10", now),
             "the username budget must exhaust"
         );
         assert!(
-            limiter.allows("operator", "192.0.2.10", now),
+            limiter.reserve("operator", "192.0.2.10", now),
             "another username must keep its own budget"
         );
         // The address budget is independent and larger: one address can
         // absorb failures from many usernames, so each iteration attacks
-        // from a fresh username to isolate the address bound.
-        for index in 0..(IP_FAILURE_LIMIT - USERNAME_FAILURE_LIMIT) {
+        // from a fresh username to isolate the address bound. The "operator"
+        // reservation above already holds one address slot, so the loop
+        // fills the remaining budget.
+        for index in 0..(IP_FAILURE_LIMIT - USERNAME_FAILURE_LIMIT - 1) {
             let username = format!("user-{index}");
-            assert!(limiter.allows(&username, "192.0.2.10", now));
-            limiter.record_failure(&username, "192.0.2.10", now);
+            assert!(limiter.reserve(&username, "192.0.2.10", now));
         }
         assert!(
-            !limiter.allows("user-last", "192.0.2.10", now),
+            !limiter.reserve("user-last", "192.0.2.10", now),
             "the address budget must exhaust too"
         );
         assert!(
-            limiter.allows("operator", "192.0.2.20", now),
+            limiter.reserve("operator", "192.0.2.20", now),
             "another address must keep its own budget"
         );
+        // A successful verification returns its slot: refunding one kept
+        // reservation reopens exactly one attempt — the "operator" bucket
+        // already holds its earlier slot, so the refund leaves the budget
+        // at two consumed entries, and the exhaustion count is unchanged.
+        limiter.refund("operator", "192.0.2.20");
+        assert!(
+            limiter.reserve("operator", "192.0.2.20", now),
+            "a refund must restore exactly one slot"
+        );
+        for _ in 0..(USERNAME_FAILURE_LIMIT - 2) {
+            assert!(limiter.reserve("operator", "192.0.2.20", now));
+        }
+        assert!(
+            !limiter.reserve("operator", "192.0.2.20", now),
+            "the refunded slot is consumed again — never more than one extra attempt"
+        );
+        // Refunding an empty budget is a no-op, not a panic.
+        limiter.refund("fresh-user", "192.0.2.99");
 
         // The window slides: an attempt outside the window reopens.
         let later = now + RATE_WINDOW + StdDuration::from_secs(1);
-        assert!(limiter.allows("admin", "192.0.2.10", later));
+        assert!(limiter.reserve("admin", "192.0.2.10", later));
+    }
+
+    #[test]
+    fn rate_limiter_consumes_the_budget_atomically_under_concurrency() -> Result<(), Box<dyn Error>>
+    {
+        // S3-3: the reserve is one locked consumption per key, so N
+        // concurrent attempts can never all pass a stale check-then-act
+        // `allows` and then record — exactly `limit` reservations succeed
+        // no matter how many attempts race. (Under the old allows-then-record
+        // shape every concurrent attempt saw the untouched budget and was
+        // admitted, exceeding the limit by the burst size.)
+        const ATTEMPTS: usize = 24;
+        let limiter = Arc::new(LoginRateLimiter::new());
+        let now = Instant::now();
+        let barrier = Arc::new(std::sync::Barrier::new(ATTEMPTS));
+        let mut handles = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                limiter.reserve("admin", "192.0.2.60", now)
+            }));
+        }
+        let mut granted = 0;
+        for handle in handles {
+            if handle.join().map_err(|_| "a reservation thread panicked")? {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, USERNAME_FAILURE_LIMIT,
+            "the concurrent burst must be capped at the username budget"
+        );
+        // The kept slots stay consumed, and refunds reopen exactly as many
+        // as were given back.
+        assert!(!limiter.reserve("admin", "192.0.2.60", now));
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            limiter.refund("admin", "192.0.2.60");
+        }
+        assert!(limiter.reserve("admin", "192.0.2.60", now));
+
+        // The address budget is atomic the same way: a burst of fresh
+        // usernames from one address admits exactly the IP limit.
+        let barrier = Arc::new(std::sync::Barrier::new(ATTEMPTS));
+        let mut handles = Vec::new();
+        for index in 0..ATTEMPTS {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            let username = format!("burst-{index}");
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                limiter.reserve(&username, "192.0.2.61", now)
+            }));
+        }
+        let mut granted = 0;
+        for handle in handles {
+            if handle.join().map_err(|_| "a reservation thread panicked")? {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, IP_FAILURE_LIMIT,
+            "the concurrent burst must be capped at the address budget"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2816,19 +3031,18 @@ mod tests {
         // invalid variants and the exact valid-length prefix — exhausts one
         // shared bucket, and the map never stores the full wire string.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            assert!(limiter.allows(&format!("{prefix}payload"), "192.0.2.30", now));
-            limiter.record_failure(&format!("{prefix}payload"), "192.0.2.30", now);
+            assert!(limiter.reserve(&format!("{prefix}payload"), "192.0.2.30", now));
         }
         assert!(
-            !limiter.allows(&prefix, "192.0.2.30", now),
+            !limiter.reserve(&prefix, "192.0.2.30", now),
             "the long invalid forms must share the prefix's bucket"
         );
         assert!(
-            !limiter.allows(&format!("{prefix}other"), "192.0.2.30", now),
+            !limiter.reserve(&format!("{prefix}other"), "192.0.2.30", now),
             "a different long invalid form must share the same bounded bucket"
         );
         assert!(
-            limiter.allows("bbbb", "192.0.2.30", now),
+            limiter.reserve("bbbb", "192.0.2.30", now),
             "another prefix keeps its own bucket"
         );
 
@@ -2851,17 +3065,21 @@ mod tests {
         // revisited. Fill the username map with a full threshold of
         // buckets, slide the window, then fill another threshold: the last
         // insert trips the sweep, which must reclaim the expired fill and
-        // land the map back at exactly the fresh fill's size — the bound
+        // land the map back at exactly the fresh working set — the bound
         // is "one window's working set plus the threshold", never an
         // all-time accumulation of distinct keys.
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
+        // The fills run from one address, exactly like a real attack: only
+        // the attempts the address budget admits keep their username slot,
+        // and every attempt beyond the cap is compensated back to an empty
+        // bucket that the sweep reclaims like any other expired one.
         for index in 0..BUCKET_PRUNE_THRESHOLD {
-            limiter.record_failure(&format!("user-{index}"), "192.0.2.10", now);
+            limiter.reserve(&format!("user-{index}"), "192.0.2.10", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
-            limiter.record_failure(&format!("user-{index}"), "192.0.2.10", after);
+            limiter.reserve(&format!("user-{index}"), "192.0.2.10", after);
         }
 
         let buckets = limiter
@@ -2870,8 +3088,13 @@ mod tests {
             .map_err(|_| "the rate limiter mutex must not be poisoned")?;
         assert_eq!(
             buckets.buckets.len(),
-            BUCKET_PRUNE_THRESHOLD,
-            "the sweep must reclaim the expired fill, leaving only the fresh one"
+            IP_FAILURE_LIMIT,
+            "the sweep must reclaim the expired fill and the compensated empty buckets, \
+             leaving only the fresh attempts the address budget admitted"
+        );
+        assert!(
+            buckets.buckets.values().all(|failures| failures.len() == 1),
+            "every surviving bucket is one kept fresh reservation"
         );
         assert!(
             !buckets.buckets.contains_key("user-0"),
@@ -2887,13 +3110,19 @@ mod tests {
             buckets.inserts_since_prune, 0,
             "the sweep must reset the insert counter so the bound recurs"
         );
-        // The per-address map saw one address throughout: it must stay at
-        // one bucket — the sweep never touches an alive bucket.
+        drop(buckets);
+        // The per-address map saw one address throughout: its bucket holds
+        // exactly the fresh fill's admitted attempts — the expired entries
+        // were popped by the access path, never counted or swept away.
         let ip_buckets = limiter
             .by_ip
             .lock()
             .map_err(|_| "the rate limiter mutex must not be poisoned")?;
         assert_eq!(ip_buckets.buckets.len(), 1);
+        assert_eq!(
+            ip_buckets.buckets.get("192.0.2.10").map(VecDeque::len),
+            Some(IP_FAILURE_LIMIT)
+        );
         Ok(())
     }
 
@@ -2907,13 +3136,13 @@ mod tests {
         // Fill the map to one insert below the sweep threshold with stale
         // buckets, then let the window pass.
         for index in 0..(BUCKET_PRUNE_THRESHOLD - 1) {
-            limiter.record_failure(&format!("stale-{index}"), "192.0.2.20", now);
+            limiter.reserve(&format!("stale-{index}"), "192.0.2.20", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         // The first fresh insert trips the sweep while "admin" goes on to
         // hold a full budget at the sweep time.
         for _ in 0..USERNAME_FAILURE_LIMIT {
-            limiter.record_failure("admin", "192.0.2.10", after);
+            limiter.reserve("admin", "192.0.2.10", after);
         }
 
         let buckets = limiter
@@ -2927,43 +3156,50 @@ mod tests {
         );
         drop(buckets);
         assert!(
-            !limiter.allows("admin", "192.0.2.10", after),
+            !limiter.reserve("admin", "192.0.2.10", after),
             "the swept survivor must keep its exhausted budget"
         );
         assert!(
-            limiter.allows("another", "192.0.2.10", after),
+            limiter.reserve("another", "192.0.2.10", after),
             "a fresh username must still open a budget after the sweep"
         );
         assert!(
-            limiter.allows("admin2", "192.0.2.99", after),
+            limiter.reserve("admin2", "192.0.2.99", after),
             "a fresh address must still open a budget after the sweep"
         );
         Ok(())
     }
 
     #[test]
-    fn rate_limiter_prune_reclaims_buckets_created_by_allows_only() -> Result<(), Box<dyn Error>> {
-        // `allows` runs before verification and creates a bucket even for
-        // attempts that never record a failure, so an attacker cycling
-        // distinct usernames grows the map without ever failing a login.
-        // Empty buckets carry no budget, so the sweep must reclaim them
-        // too — the map returns to empty after each full threshold cycle.
+    fn rate_limiter_prune_reclaims_compensated_empty_buckets() -> Result<(), Box<dyn Error>> {
+        // The reserve compensation (S3-3) creates a username bucket even for
+        // attempts the address budget refused — the slot is reserved first,
+        // then given back, leaving an empty bucket. An attacker cycling
+        // distinct usernames from one address grows the map with buckets
+        // that never recorded a failure. Empty buckets carry no budget, so
+        // the sweep must reclaim them too — after each full threshold cycle
+        // the map holds only the live kept entries.
         let limiter = LoginRateLimiter::new();
         let now = Instant::now();
         for index in 0..BUCKET_PRUNE_THRESHOLD {
-            limiter.allows(&format!("user-{index}"), "192.0.2.40", now);
+            limiter.reserve(&format!("user-{index}"), "192.0.2.40", now);
         }
         let after = now + RATE_WINDOW + StdDuration::from_secs(1);
         for index in BUCKET_PRUNE_THRESHOLD..(2 * BUCKET_PRUNE_THRESHOLD) {
-            limiter.allows(&format!("user-{index}"), "192.0.2.40", after);
+            limiter.reserve(&format!("user-{index}"), "192.0.2.40", after);
         }
         let buckets = limiter
             .by_username
             .lock()
             .map_err(|_| "the rate limiter mutex must not be poisoned")?;
+        assert_eq!(
+            buckets.buckets.len(),
+            IP_FAILURE_LIMIT,
+            "only the kept entries of the fresh fill may survive the sweep"
+        );
         assert!(
-            buckets.buckets.is_empty(),
-            "buckets that never recorded a failure must be reclaimed by the sweep"
+            buckets.buckets.values().all(|failures| failures.len() == 1),
+            "every surviving bucket is one kept reservation"
         );
         assert_eq!(buckets.inserts_since_prune, 0);
         Ok(())
@@ -3077,5 +3313,606 @@ mod tests {
         assert!(policy.is_guarded());
         assert!(!AuthPolicy::Open.is_guarded());
         assert!(AuthPolicy::Guarded.is_guarded());
+    }
+
+    // ---- §7.8 worker tests -----------------------------------------------
+    //
+    // The production runtimes run the Argon2id boundaries on the blocking
+    // pool through the async trait forms. The double below implements the
+    // async forms exactly like the Standalone runtime (spawn_blocking) and
+    // records whether a runtime context was current inside the derivation —
+    // a worker thread has one, a blocking-pool thread does not — so the
+    // handlers' off-worker behavior is asserted without any wall-clock
+    // timing.
+
+    /// The deterministic 32-byte fold behind the double's token and
+    /// bootstrap hashing — a test double, so the fold needs no
+    /// cryptographic strength.
+    fn fold_hash(input: &[u8]) -> [u8; 32] {
+        let mut out = [0_u8; 32];
+        for (index, byte) in input.iter().enumerate() {
+            out[index % 32] ^= byte;
+        }
+        out
+    }
+
+    /// A controlled failure of the worker-test services bundle.
+    #[derive(Debug)]
+    struct WorkerTestError;
+
+    impl std::fmt::Display for WorkerTestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("the worker-test auth services are unavailable")
+        }
+    }
+
+    impl Error for WorkerTestError {}
+
+    /// A clock pinned to the epoch, like the other test benches.
+    #[derive(Clone, Copy)]
+    struct WorkerTestClock;
+
+    impl Clock for WorkerTestClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH
+        }
+    }
+
+    /// The in-memory state behind the worker-test services bundle.
+    #[derive(Default)]
+    struct WorkerTestInner {
+        principal: Option<Principal>,
+        credential: Option<PasswordCredential>,
+        bootstrap_code: Option<BootstrapCode>,
+        /// The verdict the double's verification returns (seeded per test).
+        verify_ok: bool,
+        /// How often each boundary ran, and the thread that ran it — the
+        /// §7.8 signal: the test's own thread is the runtime's only worker,
+        /// while the blocking pool runs the derivation on a dedicated
+        /// thread. (Tokio blocking threads enter the runtime context, so
+        /// `Handle::try_current` cannot distinguish them — thread identity
+        /// can.)
+        verify_async_calls: u64,
+        verify_async_thread: Option<std::thread::ThreadId>,
+        verify_sync_calls: u64,
+        hash_async_calls: u64,
+        hash_async_thread: Option<std::thread::ThreadId>,
+        hash_sync_calls: u64,
+        audit_events: Vec<AuditEvent>,
+        token_counter: u64,
+    }
+
+    /// The §7.8 auth-services double: every store boundary is unavailable
+    /// (the tests drive the sign-in and password surfaces, which need none),
+    /// and the crypto boundaries mirror the Standalone runtime's
+    /// `spawn_blocking` execution while recording where they ran.
+    #[derive(Clone)]
+    struct WorkerTestServices {
+        inner: Arc<Mutex<WorkerTestInner>>,
+    }
+
+    impl WorkerTestServices {
+        fn seeded() -> Result<Self, Box<dyn Error>> {
+            let now = OffsetDateTime::UNIX_EPOCH;
+            let Ok(name) = PrincipalName::parse("admin") else {
+                return Err("the fixed worker-test principal name is invalid".into());
+            };
+            let principal = Principal::new(PrincipalId::generate(), name, now);
+            let Ok(hash) = Argon2IdHash::from_parts(
+                &[0x11; ARGON2ID_SALT_LENGTH],
+                &[0x22; ARGON2ID_HASH_LENGTH],
+            ) else {
+                return Err("the fixed worker-test hash parts are invalid".into());
+            };
+            let Ok(credential) = PasswordCredential::try_from_parts(principal.id(), hash, now)
+            else {
+                return Err("the fixed worker-test credential is invalid".into());
+            };
+            let code = BootstrapCode::new(
+                BootstrapCodeId::generate(),
+                fold_hash(b"one-time-code"),
+                now,
+            );
+            Ok(Self {
+                inner: Arc::new(Mutex::new(WorkerTestInner {
+                    principal: Some(principal),
+                    credential: Some(credential),
+                    bootstrap_code: Some(code),
+                    ..WorkerTestInner::default()
+                })),
+            })
+        }
+    }
+
+    /// The §16.2 authentication boundaries of the worker-test double: the
+    /// async crypto forms run on the blocking pool exactly like the
+    /// Standalone runtime and record the runtime-context signal.
+    impl AuthServices for WorkerTestServices {
+        type Error = WorkerTestError;
+
+        fn find_session_by_token_hash<'a>(
+            &'a self,
+            _token_hash: &'a [u8; 32],
+        ) -> BoundaryFuture<'a, Result<Option<Session>, Self::Error>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn create_session<'a>(
+            &'a self,
+            _session: &'a Session,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn touch_session(
+            &self,
+            _session_id: SessionId,
+            _at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn revoke_session(
+            &self,
+            _session_id: SessionId,
+            _at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn revoke_sessions_for_principal(
+            &self,
+            _principal_id: PrincipalId,
+            _at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<u64, Self::Error>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn list_sessions(
+            &self,
+            _principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Vec<Session>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn find_principal(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard
+                    .principal
+                    .as_ref()
+                    .filter(|principal| principal.id() == principal_id)
+                    .cloned())
+            })
+        }
+        fn find_principal_by_name<'a>(
+            &'a self,
+            name: &'a PrincipalName,
+        ) -> BoundaryFuture<'a, Result<Option<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            let name = name.clone();
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard
+                    .principal
+                    .as_ref()
+                    .filter(|principal| principal.name() == &name)
+                    .cloned())
+            })
+        }
+        fn list_principals(&self) -> BoundaryFuture<'_, Result<Vec<Principal>, Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard.principal.iter().cloned().collect())
+            })
+        }
+        fn create_principal<'a>(
+            &'a self,
+            _principal: &'a Principal,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn set_principal_state(
+            &self,
+            _principal_id: PrincipalId,
+            _state: PrincipalState,
+            _at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn assign_role<'a>(
+            &'a self,
+            _assignment: &'a RoleAssignment,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn find_role_assignment(
+            &self,
+            _principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<RoleAssignment>, Self::Error>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn list_role_assignments(
+            &self,
+        ) -> BoundaryFuture<'_, Result<Vec<RoleAssignment>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn find_password_credential(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Option<PasswordCredential>, Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard
+                    .credential
+                    .as_ref()
+                    .filter(|credential| credential.principal_id() == principal_id)
+                    .cloned())
+            })
+        }
+        fn save_password_credential<'a>(
+            &'a self,
+            _credential: &'a PasswordCredential,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list_totp_authenticators(
+            &self,
+            _principal_id: PrincipalId,
+        ) -> BoundaryFuture<'_, Result<Vec<TotpAuthenticator>, Self::Error>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn record_totp_step(
+            &self,
+            _authenticator_id: rutilus_domain::TotpAuthenticatorId,
+            _step: u64,
+        ) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+            Box::pin(async { Ok(true) })
+        }
+        fn find_bootstrap_code_by_hash<'a>(
+            &'a self,
+            code_hash: &'a [u8; 32],
+        ) -> BoundaryFuture<'a, Result<Option<BootstrapCode>, Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            let code_hash = *code_hash;
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard
+                    .bootstrap_code
+                    .as_ref()
+                    .filter(|code| code.code_hash() == &code_hash)
+                    .cloned())
+            })
+        }
+        fn has_unconsumed_bootstrap_code(&self) -> BoundaryFuture<'_, Result<bool, Self::Error>> {
+            Box::pin(async { Ok(false) })
+        }
+        fn consume_bootstrap_code<'a>(
+            &'a self,
+            _code_id: BootstrapCodeId,
+            _used_by: PrincipalId,
+            _password: &'a PasswordCredential,
+            _authenticator: Option<&'a TotpAuthenticator>,
+            _session: &'a Session,
+            _consumed_at: OffsetDateTime,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn verify_password(&self, _hash: &Argon2IdHash, _password: &SecretString) -> bool {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.verify_sync_calls += 1;
+            guard.verify_ok
+        }
+        fn verify_password_async<'a>(
+            &'a self,
+            _hash: &'a Argon2IdHash,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, bool> {
+            // Mirrors the Standalone runtime (§7.8): the verification runs
+            // on the blocking pool, never on the runtime's worker thread —
+            // the recorded thread identity is the deterministic signal. The
+            // presented inputs are deliberately not consulted: the double
+            // only proves where the boundary ran, and calling back into the
+            // synchronous form here would blur the two call counters.
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                // The `JoinError` arm fails closed: a panicked worker is a
+                // wrong-password verdict, like the Standalone runtime.
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.verify_async_calls += 1;
+                    guard.verify_async_thread = Some(std::thread::current().id());
+                    guard.verify_ok
+                })
+                .await
+                .unwrap_or_default()
+            })
+        }
+        fn verify_totp(
+            &self,
+            _secret: &SecretBox<[u8; TOTP_SECRET_LENGTH]>,
+            _code: &str,
+            _now: OffsetDateTime,
+            _last_used_step: Option<u64>,
+        ) -> Result<u64, TotpAuthenticatorError> {
+            Err(TotpAuthenticatorError::InvalidCode)
+        }
+        fn hash_password(&self, _password: &SecretString) -> Result<Argon2IdHash, Self::Error> {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.hash_sync_calls += 1;
+            drop(guard);
+            Argon2IdHash::from_parts(&[0x11; ARGON2ID_SALT_LENGTH], &[0x22; ARGON2ID_HASH_LENGTH])
+                .map_err(|_| WorkerTestError)
+        }
+        fn hash_password_async<'a>(
+            &'a self,
+            _password: &'a SecretString,
+        ) -> BoundaryFuture<'a, Result<Argon2IdHash, Self::Error>> {
+            // Mirrors the Standalone runtime (§7.8): the derivation runs on
+            // the blocking pool, never on the runtime's worker thread — the
+            // recorded thread identity is the deterministic signal. The
+            // presented password is deliberately not consulted (see the
+            // verification override).
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                // The `JoinError` arm surfaces as a boundary error, like the
+                // Standalone runtime's worker-failure mapping.
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.hash_async_calls += 1;
+                    guard.hash_async_thread = Some(std::thread::current().id());
+                    drop(guard);
+                    Argon2IdHash::from_parts(
+                        &[0x11; ARGON2ID_SALT_LENGTH],
+                        &[0x22; ARGON2ID_HASH_LENGTH],
+                    )
+                    .map_err(|_| WorkerTestError)
+                })
+                .await
+                .unwrap_or(Err(WorkerTestError))
+            })
+        }
+        fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
+            fold_hash(code.as_bytes())
+        }
+        fn issue_tokens(&self) -> Result<IssuedSessionTokens, Self::Error> {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.token_counter += 1;
+            let session_wire = format!("session-token-{}", guard.token_counter);
+            let csrf_wire = format!("csrf-token-{}", guard.token_counter);
+            drop(guard);
+            Ok(IssuedSessionTokens::new(
+                session_wire.clone(),
+                fold_hash(session_wire.as_bytes()),
+                csrf_wire.clone(),
+                fold_hash(csrf_wire.as_bytes()),
+            ))
+        }
+        fn token_hash(&self, wire: &str) -> [u8; 32] {
+            fold_hash(wire.as_bytes())
+        }
+    }
+
+    impl AuditEventWriter for WorkerTestServices {
+        type Error = WorkerTestError;
+
+        fn append_audit_event<'a>(
+            &'a self,
+            event: &'a AuditEvent,
+        ) -> BoundaryFuture<'a, Result<(), Self::Error>> {
+            let inner = Arc::clone(&self.inner);
+            let event = event.clone();
+            Box::pin(async move {
+                let mut guard = inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.audit_events.push(event);
+                Ok(())
+            })
+        }
+    }
+
+    /// The `WebState` behind the §7.8 worker tests: a minimal Open router
+    /// with the double's services and a unit gateway — the sign-in and
+    /// password handlers need nothing more.
+    fn worker_test_state(
+        services: WorkerTestServices,
+    ) -> WebState<WorkerTestServices, (), WorkerTestClock> {
+        WebState {
+            product: WebProductInfo::new("0.1.0-test", "0.13.0-test"),
+            actor: AuditActor::LocalOperator,
+            origin: DeploymentPosture::Standalone,
+            auth: AuthState::new(AuthPolicy::Open),
+            services: Arc::new(services),
+            gateway: Arc::new(()),
+            clock: WorkerTestClock,
+        }
+    }
+
+    #[tokio::test]
+    async fn login_runs_password_verification_off_the_async_worker() -> Result<(), Box<dyn Error>> {
+        let services = WorkerTestServices::seeded()?;
+        let state = worker_test_state(services.clone());
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/login",
+                axum::routing::post(login::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(state);
+
+        // Wrong password: the real verification branch.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "admin", "password": "wrong password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        // Unknown username: the MINOR-1 dummy verification branch.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username": "no-such-user", "password": "any password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.verify_async_calls, 2,
+            "each failure branch must run exactly one verification"
+        );
+        assert_ne!(
+            inner.verify_async_thread,
+            Some(std::thread::current().id()),
+            "the Argon2id verification must run on the blocking pool, never on a worker"
+        );
+        assert_eq!(
+            inner.verify_sync_calls, 0,
+            "the sign-in path must never call the synchronous boundary"
+        );
+        assert_eq!(
+            inner.audit_events.len(),
+            4,
+            "each refusal records the started + failed audit pair"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn change_password_runs_verification_and_derivation_off_the_async_worker()
+    -> Result<(), Box<dyn Error>> {
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+        }
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let context = AuthContext {
+            actor: AuditActor::User,
+            actor_principal_id: Some(principal_id),
+            session_id: None,
+            role: None,
+            assignment_site_id: None,
+        };
+        let state = worker_test_state(services.clone());
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(context))
+            .with_state(state);
+
+        let changed = router
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::OK);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(inner.verify_async_calls, 1);
+        assert_eq!(inner.hash_async_calls, 1);
+        assert_ne!(
+            inner.verify_async_thread,
+            Some(std::thread::current().id()),
+            "the verification must run on the blocking pool, never on a worker"
+        );
+        assert_ne!(
+            inner.hash_async_thread,
+            Some(std::thread::current().id()),
+            "the derivation must run on the blocking pool, never on a worker"
+        );
+        assert_eq!(
+            inner.verify_sync_calls + inner.hash_sync_calls,
+            0,
+            "the password-change path must never call the synchronous boundaries"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_runs_password_derivation_off_the_async_worker() -> Result<(), Box<dyn Error>>
+    {
+        let services = WorkerTestServices::seeded()?;
+        let state = worker_test_state(services.clone());
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/bootstrap",
+                axum::routing::post(bootstrap_complete::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .with_state(state);
+
+        let claimed = router
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code": "one-time-code", "password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(claimed.status(), StatusCode::OK);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(inner.hash_async_calls, 1);
+        assert_ne!(
+            inner.hash_async_thread,
+            Some(std::thread::current().id()),
+            "the derivation must run on the blocking pool, never on a worker"
+        );
+        assert_eq!(
+            inner.hash_sync_calls, 0,
+            "the bootstrap path must never call the synchronous boundary"
+        );
+        Ok(())
     }
 }

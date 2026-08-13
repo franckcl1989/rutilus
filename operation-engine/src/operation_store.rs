@@ -29,7 +29,7 @@ pub type ClassifiedBatchChild = (Operation, Option<FailureKind>);
 ///
 /// # Concurrency contract
 ///
-/// All four methods must be safe to call concurrently. Implementations do not
+/// All methods must be safe to call concurrently. Implementations do not
 /// need an internal queue: each method documents the exact atomicity it
 /// requires.
 pub trait OperationStore: Send + Sync {
@@ -73,11 +73,41 @@ pub trait OperationStore: Send + Sync {
     /// freely; per-step recovery of a crashed write is the engine's concern.
     ///
     /// This signature intentionally does not carry the expected previous
-    /// state; if a later iteration needs full compare-and-set semantics, the
-    /// expected state becomes an additional parameter.
+    /// state; a driver that must not overwrite a state it no longer observed
+    /// uses the compare-and-set step [`Self::apply_transition_if_current`]
+    /// instead.
     fn apply_transition(
         &self,
         operation_id: OperationId,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
+
+    /// Persists one state step only while the persisted state still equals
+    /// `expected_state` — the compare-and-set step of [`Self::apply_transition`].
+    ///
+    /// The check and the write are one atomic store operation: a driver that
+    /// observed the operation in `expected_state` and whose step is legal from
+    /// that state gets its write; a driver whose observation went stale (a
+    /// second driver advanced the operation in the meantime) gets a
+    /// conflict-style error and nothing is written. This is what closes the
+    /// two-read race window of a re-read-then-step guard: the state is
+    /// re-verified at write time, inside the same transaction as the write.
+    ///
+    /// # Optimistic concurrency
+    ///
+    /// `occurred_at` and `new_state` are recorded exactly like
+    /// [`Self::apply_transition`]. Implementations MUST return a
+    /// conflict-style error instead of writing when the operation id is
+    /// unknown OR when the persisted state differs from `expected_state` —
+    /// including a terminal state, which can never equal a driver's expected
+    /// in-flight state and can never be overwritten. The conflict error MAY
+    /// carry the observed state so the caller can classify the race honestly.
+    /// A returned error must never have written anything.
+    fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
         new_state: OperationState,
         occurred_at: OffsetDateTime,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
@@ -192,6 +222,22 @@ where
         occurred_at: OffsetDateTime,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
         Store::apply_transition(*self, operation_id, new_state, occurred_at)
+    }
+
+    fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        Store::apply_transition_if_current(
+            *self,
+            operation_id,
+            expected_state,
+            new_state,
+            occurred_at,
+        )
     }
 
     fn record_failure_kind(

@@ -39,8 +39,12 @@ impl SqliteStore {
     /// `endpoints` row, its active address, and its trust mode.
     ///
     /// The write is site-scoped and idempotent: an existing projection of
-    /// another site is refused (the frame is absorbed), and a re-reported
-    /// snapshot replaces the summary in place.
+    /// another site is refused (the frame is absorbed), a frame whose
+    /// refresh generation is older than the stored projection is refused
+    /// (an older inventory cut must never roll back the `refresh_generation`
+    /// and `health` of a newer one — the same semantics as the per-generation
+    /// detail snapshots), and a re-reported snapshot of the same or a newer
+    /// generation replaces the summary in place.
     ///
     /// # Errors
     ///
@@ -81,6 +85,24 @@ impl SqliteStore {
                     .map_err(CenterProjectionRepositoryError::Database)?;
                 return Ok(ProjectionWriteOutcome::Ignored {
                     reason: ProjectionIgnoreReason::EndpointBelongsToOtherSite,
+                });
+            }
+            // The refresh-generation guard: the stored generation is the
+            // watermark of the newest inventory cut the center applied, and
+            // an older frame describes a superseded cut — it must never
+            // overwrite the newer `refresh_generation`/`health`, so the
+            // whole frame is absorbed. A negative stored generation (a row
+            // no current build could have written) is treated as the newest
+            // possible watermark, mirroring the list view, so it is never
+            // clobbered.
+            let stored_generation = u64::try_from(stored.refresh_generation).unwrap_or(u64::MAX);
+            if projection.refresh_generation() < stored_generation {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(CenterProjectionRepositoryError::Database)?;
+                return Ok(ProjectionWriteOutcome::Ignored {
+                    reason: ProjectionIgnoreReason::StaleGeneration,
                 });
             }
             let mut active = stored.clone().into_active_model();

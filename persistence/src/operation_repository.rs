@@ -392,7 +392,10 @@ impl SqliteStore {
     /// restart recovery sweep racing an in-flight execution from overwriting
     /// an already-final result. Non-terminal steps overwrite freely; the
     /// legality of the step itself is the domain state machine's decision,
-    /// which the engine applies before calling this method.
+    /// which the engine applies before calling this method. A driver whose
+    /// step must not land unless the operation is still in the state it
+    /// observed uses the compare-and-set step
+    /// [`Self::apply_transition_if_current`].
     ///
     /// # Errors
     ///
@@ -426,6 +429,79 @@ impl SqliteStore {
             .parse::<OperationState>()
             .map_err(StoredOperationError::InvalidState)
             .map_err(|source| corrupt(operation_id, source))?;
+        if current_state.is_terminal() {
+            return Err(OperationRepositoryError::TerminalConflict {
+                operation_id,
+                state: current_state,
+            });
+        }
+        let mut active = model.into_active_model();
+        active.state = Set(new_state.as_str().to_owned());
+        active.updated_at = Set(occurred_at);
+        active
+            .update(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        transaction
+            .commit()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        Ok(())
+    }
+
+    /// Persists one state step only while the persisted state still equals
+    /// `expected_state` — the compare-and-set twin of [`Self::apply_transition`].
+    ///
+    /// The state check and the write happen inside one write-gated
+    /// transaction, so the expected state is re-verified at write time: a
+    /// driver whose observation went stale (a concurrent driver advanced the
+    /// operation between its read and this step) gets
+    /// [`OperationRepositoryError::StateConflict`] and nothing is written.
+    /// The terminal-state rule of [`Self::apply_transition`] still applies —
+    /// a terminal row can never be the expected state of a driver, and it can
+    /// never be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationRepositoryError::NotFound`] for an unknown id,
+    /// [`OperationRepositoryError::StateConflict`] when the persisted state
+    /// differs from `expected_state` (with the observed state, so the caller
+    /// can classify the race honestly), and [`OperationRepositoryError`]
+    /// variants for coordination or database failures.
+    pub async fn apply_transition_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        new_state: OperationState,
+        occurred_at: OffsetDateTime,
+    ) -> Result<(), OperationRepositoryError> {
+        let _write_permit = self
+            .write_gate
+            .acquire()
+            .await
+            .map_err(OperationRepositoryError::Coordinate)?;
+        let transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(OperationRepositoryError::Database)?;
+        let model = operation::Entity::find_by_id(operation_id.into_uuid())
+            .one(&transaction)
+            .await
+            .map_err(OperationRepositoryError::Database)?
+            .ok_or(OperationRepositoryError::NotFound { operation_id })?;
+        let current_state = model
+            .state
+            .parse::<OperationState>()
+            .map_err(StoredOperationError::InvalidState)
+            .map_err(|source| corrupt(operation_id, source))?;
+        if current_state != expected_state {
+            return Err(OperationRepositoryError::StateConflict {
+                operation_id,
+                expected: expected_state,
+                observed: current_state,
+            });
+        }
         if current_state.is_terminal() {
             return Err(OperationRepositoryError::TerminalConflict {
                 operation_id,
@@ -753,6 +829,15 @@ pub enum OperationRepositoryError {
         operation_id: OperationId,
         state: OperationState,
     },
+    /// The compare-and-set step observed the operation in a state other than
+    /// the expected one: a concurrent driver advanced it, so the conditional
+    /// write was refused and nothing changed.
+    #[error("operation {operation_id} is {observed}, not the expected {expected}")]
+    StateConflict {
+        operation_id: OperationId,
+        expected: OperationState,
+        observed: OperationState,
+    },
     #[error("stored operation {operation_id} is invalid: {source}")]
     Corrupt {
         operation_id: OperationId,
@@ -1018,6 +1103,126 @@ mod tests {
             Err(OperationRepositoryError::TerminalConflict {
                 operation_id: id,
                 state: OperationState::Succeeded,
+            }) if id == operation_id
+        ));
+        let stored = store
+            .find_operation(operation_id)
+            .await?
+            .ok_or("stored operation is missing")?;
+        assert_eq!(stored.state(), OperationState::Succeeded);
+        assert_eq!(stored.updated_at(), succeeded_at);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_transition_if_current_writes_only_while_the_state_is_expected()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let created_at = OffsetDateTime::now_utc();
+        let operation = queued_operation(
+            OperationSource::Site,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
+        store.create_operation(&operation).await?;
+        let operation_id = operation.id();
+
+        let validating_at = created_at + Duration::SECOND;
+        store
+            .apply_transition_if_current(
+                operation_id,
+                OperationState::Queued,
+                OperationState::Validating,
+                validating_at,
+            )
+            .await?;
+        let validating = store
+            .find_operation(operation_id)
+            .await?
+            .ok_or("validating operation is missing")?;
+        assert_eq!(validating.state(), OperationState::Validating);
+        assert_eq!(validating.updated_at(), validating_at);
+
+        // The same step with a stale expected state is refused with the
+        // observed state reported, and the row is left untouched.
+        let stale_at = validating_at + Duration::SECOND;
+        assert!(matches!(
+            store
+                .apply_transition_if_current(
+                    operation_id,
+                    OperationState::Queued,
+                    OperationState::Running,
+                    stale_at,
+                )
+                .await,
+            Err(OperationRepositoryError::StateConflict {
+                operation_id: id,
+                expected: OperationState::Queued,
+                observed: OperationState::Validating,
+            }) if id == operation_id
+        ));
+        let unchanged = store
+            .find_operation(operation_id)
+            .await?
+            .ok_or("stored operation is missing")?;
+        assert_eq!(unchanged.state(), OperationState::Validating);
+        assert_eq!(unchanged.updated_at(), validating_at);
+
+        store.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_transition_if_current_rejects_unknown_ids_and_terminal_rows()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, store) = store_with_directory().await?;
+        let unknown = OperationId::generate();
+        assert!(matches!(
+            store
+                .apply_transition_if_current(
+                    unknown,
+                    OperationState::Running,
+                    OperationState::Unknown,
+                    OffsetDateTime::now_utc(),
+                )
+                .await,
+            Err(OperationRepositoryError::NotFound { operation_id })
+                if operation_id == unknown
+        ));
+
+        let created_at = OffsetDateTime::now_utc();
+        let operation = queued_operation(
+            OperationSource::Standalone,
+            &three_sorted_targets(),
+            one_command(),
+            created_at,
+        );
+        store.create_operation(&operation).await?;
+        let operation_id = operation.id();
+        let succeeded_at = created_at + Duration::SECOND;
+        store
+            .apply_transition(operation_id, OperationState::Succeeded, succeeded_at)
+            .await?;
+        // A terminal row is never the expected state of a driver, and it can
+        // never be overwritten: the conflict names the terminal row.
+        assert!(matches!(
+            store
+                .apply_transition_if_current(
+                    operation_id,
+                    OperationState::Verifying,
+                    OperationState::Failed,
+                    succeeded_at + Duration::SECOND,
+                )
+                .await,
+            Err(OperationRepositoryError::StateConflict {
+                operation_id: id,
+                expected: OperationState::Verifying,
+                observed: OperationState::Succeeded,
             }) if id == operation_id
         ));
         let stored = store

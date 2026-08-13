@@ -96,6 +96,17 @@ pub trait CenterOutbox: Send + Sync {
         limit: u64,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>>;
 
+    /// Lists every outbox entry of one instance, oldest first — the
+    /// center's §15.6 offer scan. The center's durable outbox holds exactly
+    /// the operation offers, acknowledged or not, so the scan rebuilds the
+    /// offer facts — the target site, the target, and the offer expiry —
+    /// that the tracking operation record does not persist; the dispatch
+    /// retry uses it to recognize an undecided operation (§17.5).
+    fn list_offers(
+        &self,
+        instance_id: InstanceId,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>>;
+
     /// Marks one entry acknowledged. The write is idempotent: a repeated
     /// acknowledgement (the center may deliver its `Ack` more than once) is
     /// a successful no-op.
@@ -127,6 +138,13 @@ where
         limit: u64,
     ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
         Outbox::list_pending(*self, instance_id, limit)
+    }
+
+    fn list_offers(
+        &self,
+        instance_id: InstanceId,
+    ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+        Outbox::list_offers(*self, instance_id)
     }
 
     fn acknowledge(
@@ -798,7 +816,12 @@ where
         // The payload record is the received envelope itself: the §9.4
         // typed payload of the inbox row.
         let payload_json = serde_json::to_string(received).map_err(CenterSyncError::Payload)?;
-        let expires_at = OffsetDateTime::from_unix_timestamp(offer.expires_at_unix).unwrap_or(now);
+        // Fail closed: an offer whose expiry cannot be parsed is pinned one
+        // second before the receipt, so the domain's `is_expired` judgment
+        // refuses it like any other expired offer (§15.6) — an unreadable
+        // TTL must never extend an offer's life.
+        let expires_at = OffsetDateTime::from_unix_timestamp(offer.expires_at_unix)
+            .unwrap_or(now - time::Duration::SECOND);
         let entry = InboxEntry::new(
             InboxEntryId::generate(),
             operation_id,
@@ -2081,6 +2104,36 @@ mod tests {
             })
         }
 
+        fn apply_transition_if_current(
+            &self,
+            operation_id: OperationId,
+            expected_state: OperationState,
+            new_state: OperationState,
+            occurred_at: OffsetDateTime,
+        ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self.operations.lock().map_err(|_| MockStoreError)?;
+                let row = rows.get(&operation_id).ok_or(MockStoreError)?.clone();
+                if row.state() != expected_state {
+                    return Err(MockStoreError);
+                }
+                rows.insert(
+                    operation_id,
+                    Operation::try_from_parts(
+                        row.id(),
+                        row.source(),
+                        row.targets().to_vec(),
+                        row.command(),
+                        new_state,
+                        row.created_at(),
+                        occurred_at,
+                    )
+                    .map_err(|_| MockStoreError)?,
+                );
+                Ok(())
+            })
+        }
+
         fn record_failure_kind(
             &self,
             _operation_id: OperationId,
@@ -2625,6 +2678,24 @@ mod tests {
                 pending.sort_by_key(OutboxEntry::sequence);
                 pending.truncate(usize::try_from(limit).map_err(|_| MockOutboxError)?);
                 Ok(pending)
+            })
+        }
+
+        fn list_offers(
+            &self,
+            instance_id: InstanceId,
+        ) -> BoundaryFuture<'_, Result<Vec<OutboxEntry>, Self::Error>> {
+            Box::pin(async move {
+                let mut rows = self
+                    .entries
+                    .lock()
+                    .map_err(|_| MockOutboxError)?
+                    .iter()
+                    .filter(|entry| entry.instance_id() == instance_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(OutboxEntry::sequence);
+                Ok(rows)
             })
         }
 
@@ -3416,6 +3487,54 @@ mod tests {
                 reason: OperationRejectedReason::Expired,
                 detail: String::from("the offer expired before it could be applied"),
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_offer_with_an_unparseable_expiry_is_refused_as_expired()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+        // A timestamp outside the parseable range: the wire field is a
+        // signed 64-bit integer, the `time` crate spans only ±9999 years.
+        let (offer, received) = offer_for(instance_id, endpoint.id(), i64::MAX)?;
+
+        let outcome = engine.handle_offer(&offer, &received).await?;
+        // Fail closed: the unparseable expiry is treated as already past,
+        // exactly like the domain's `is_expired` judgment would refuse it.
+        assert_eq!(
+            outcome,
+            OfferOutcome::Rejected {
+                reason: OperationRejectedReason::Expired,
+                detail: String::from("the offer expired before it could be applied"),
+            }
+        );
+        // The refusal is durable: the reply is queued, the inbox records
+        // it, and the stored entry is pinned before the receipt so a
+        // re-delivered offer stays refused.
+        let messages = outbox.pending_messages()?;
+        let Some(EnvelopeMessage::OperationRejected(rejected)) = messages.first() else {
+            return Err(std::io::Error::other("the reply was not an OperationRejected").into());
+        };
+        assert_eq!(rejected.reason, OperationRejectedReason::Expired as i32);
+        let operation_id: OperationId = offer.operation_id.parse()?;
+        assert_eq!(
+            inbox.entry_state(operation_id)?,
+            Some(InboxEntryState::Rejected)
+        );
+        let entry = CenterInbox::find_by_operation(&inbox, operation_id)
+            .await?
+            .ok_or_else(|| std::io::Error::other("the inbox entry is missing"))?;
+        assert!(
+            entry.expires_at() < now,
+            "an unparseable expiry must pin the entry before the receipt"
         );
         Ok(())
     }

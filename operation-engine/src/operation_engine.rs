@@ -144,9 +144,9 @@ where
     /// Concurrency: the store contract rejects any write onto a terminal
     /// state, so a recovery sweep can never resurrect a finished operation.
     /// Two writers racing on a non-terminal step may both succeed — the last
-    /// write wins and the next read surfaces the persisted truth; a full
-    /// compare-and-set would need the expected state as an additional store
-    /// parameter and is a later iteration.
+    /// write wins and the next read surfaces the persisted truth. A driver
+    /// whose step must not land unless the operation is still in the state it
+    /// observed uses [`Self::apply_if_current`] instead.
     ///
     /// # Errors
     ///
@@ -178,6 +178,88 @@ where
             .apply_transition(operation_id, current.state(), now)
             .await
             .map_err(EngineError::Store)?;
+        Ok(current)
+    }
+
+    /// Advances one operation through the domain state machine and persists
+    /// the resulting state, refusing the step unless the operation is still
+    /// in `expected_state` — the compare-and-set twin of [`Self::apply`].
+    ///
+    /// A driver (for example the §13.5 recovery judge) reads the operation,
+    /// performs a slow external re-read, and then writes a terminal judgement
+    /// whose event is legal from several in-flight states. Without an expected
+    /// state, a concurrent driver that advanced the operation in the meantime
+    /// could be silently overwritten: the judgement event is legal from the
+    /// advanced state too, so the domain cannot tell the stale write from a
+    /// fresh one. This method closes that window: the state read at step time
+    /// must still equal `expected_state`, and the persisted step itself goes
+    /// through the store's atomic conditional write, so a move between the
+    /// read and the write is also refused — never overwritten.
+    ///
+    /// The domain transition is validated against `expected_state` exactly
+    /// like [`Self::apply`] validates against the current state; `now` has
+    /// the same monotonic-clock contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::NotFound`] when the id is unknown,
+    /// [`EngineError::StateChanged`] when the persisted state is no longer
+    /// `expected_state` (the reported `observed` state is the truth a
+    /// re-read of the persisted row established — the race, honestly
+    /// classified), [`EngineError::InvalidTransition`] when the domain
+    /// rejects `event` for `expected_state`, and [`EngineError::Store`] when
+    /// the persistence boundary fails for a reason other than a moved state.
+    pub async fn apply_if_current(
+        &self,
+        operation_id: OperationId,
+        expected_state: OperationState,
+        event: OperationEvent,
+        now: OffsetDateTime,
+    ) -> Result<Operation, EngineError<Store::Error>> {
+        let mut current = self
+            .store
+            .find_operation(operation_id)
+            .await
+            .map_err(EngineError::Store)?
+            .ok_or(EngineError::NotFound(operation_id))?;
+        if current.state() != expected_state {
+            return Err(EngineError::StateChanged {
+                operation_id,
+                expected: expected_state,
+                observed: current.state(),
+            });
+        }
+        current
+            .apply(event, now)
+            .map_err(|source| EngineError::InvalidTransition {
+                operation_id,
+                source,
+            })?;
+        if let Err(source) = self
+            .store
+            .apply_transition_if_current(operation_id, expected_state, current.state(), now)
+            .await
+        {
+            // The store's error type is opaque here, so a CAS conflict is
+            // told apart from a genuine persistence failure by re-reading the
+            // persisted row: a row that no longer holds the expected state is
+            // the race, anything else is the store's own failure.
+            match self
+                .store
+                .find_operation(operation_id)
+                .await
+                .map_err(EngineError::Store)?
+            {
+                Some(row) if row.state() != expected_state => {
+                    return Err(EngineError::StateChanged {
+                        operation_id,
+                        expected: expected_state,
+                        observed: row.state(),
+                    });
+                }
+                _ => return Err(EngineError::Store(source)),
+            }
+        }
         Ok(current)
     }
 
@@ -317,6 +399,20 @@ where
         #[source]
         source: InvalidTransition,
     },
+    /// The operation moved to another state between the caller's observation
+    /// and a compare-and-set step ([`OperationEngine::apply_if_current`]).
+    ///
+    /// The step was refused and nothing was written: `observed` is the
+    /// persisted state the re-check established, so the caller can classify
+    /// the race honestly (for example the recovery contract's
+    /// `NotRecoverable` guard) instead of overwriting the concurrent
+    /// driver's progress.
+    #[error("operation {operation_id} is {observed} and no longer {expected}")]
+    StateChanged {
+        operation_id: OperationId,
+        expected: OperationState,
+        observed: OperationState,
+    },
     /// The persistence boundary failed; carries the store's own error.
     #[error("operation store failed: {0}")]
     Store(#[source] StoreError),
@@ -389,6 +485,7 @@ mod tests {
         calls: Mutex<Vec<Call>>,
         steps: Mutex<Vec<TransitionStep>>,
         fail_next_write: Mutex<bool>,
+        moved_on_cas: Mutex<Option<OperationState>>,
     }
 
     impl FakeStore {
@@ -401,6 +498,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 steps: Mutex::new(Vec::new()),
                 fail_next_write: Mutex::new(false),
+                moved_on_cas: Mutex::new(None),
             }
         }
 
@@ -438,6 +536,19 @@ mod tests {
                 .fail_next_write
                 .lock()
                 .map_err(|_| FakeStoreError::Failure)? = true;
+            Ok(())
+        }
+
+        /// Arms the compare-and-set write to observe the row already moved
+        /// into `state`: the model of a concurrent driver whose step landed
+        /// between the engine's read and the store's conditional write. The
+        /// row genuinely becomes `state` (the concurrent write is real), and
+        /// the CAS write then conflicts instead of landing.
+        fn arm_cas_move(&self, state: OperationState) -> Result<(), FakeStoreError> {
+            *self
+                .moved_on_cas
+                .lock()
+                .map_err(|_| FakeStoreError::Failure)? = Some(state);
             Ok(())
         }
 
@@ -524,6 +635,84 @@ mod tests {
                 let mut rows = self.rows.lock().map_err(|_| FakeStoreError::Failure)?;
                 let row = rows.get(&operation_id).ok_or(FakeStoreError::Conflict)?;
                 if row.is_terminal() {
+                    return Err(FakeStoreError::Conflict);
+                }
+                let row = rows
+                    .get_mut(&operation_id)
+                    .ok_or(FakeStoreError::Conflict)?;
+                *row = Operation::try_from_parts(
+                    row.id(),
+                    row.source(),
+                    row.targets().to_vec(),
+                    row.command(),
+                    new_state,
+                    row.created_at(),
+                    occurred_at,
+                )
+                .map_err(|_| FakeStoreError::Failure)?;
+                self.steps
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(TransitionStep {
+                        operation_id,
+                        new_state,
+                        occurred_at,
+                    });
+                Ok(())
+            })
+        }
+
+        fn apply_transition_if_current(
+            &self,
+            operation_id: OperationId,
+            expected_state: OperationState,
+            new_state: OperationState,
+            occurred_at: OffsetDateTime,
+        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .push(Call::ApplyTransition(operation_id, new_state));
+                if let Some(moved) = self
+                    .moved_on_cas
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                    .take()
+                {
+                    // A concurrent driver's step landed between the engine's
+                    // read and this write: the row now reflects the moved
+                    // state, and the conditional write must conflict.
+                    let mut rows = self.rows.lock().map_err(|_| FakeStoreError::Failure)?;
+                    let row = rows
+                        .get_mut(&operation_id)
+                        .ok_or(FakeStoreError::Conflict)?;
+                    *row = Operation::try_from_parts(
+                        row.id(),
+                        row.source(),
+                        row.targets().to_vec(),
+                        row.command(),
+                        moved,
+                        row.created_at(),
+                        row.updated_at(),
+                    )
+                    .map_err(|_| FakeStoreError::Failure)?;
+                    return Err(FakeStoreError::Conflict);
+                }
+                if *self
+                    .fail_next_write
+                    .lock()
+                    .map_err(|_| FakeStoreError::Failure)?
+                {
+                    return Err(FakeStoreError::Conflict);
+                }
+                let mut rows = self.rows.lock().map_err(|_| FakeStoreError::Failure)?;
+                let row = rows.get(&operation_id).ok_or(FakeStoreError::Conflict)?;
+                // The compare-and-set contract: the write lands only while
+                // the persisted state still equals the expected one — a
+                // concurrent step (or a terminal state, which can never be
+                // the expected in-flight state) is a conflict, never written.
+                if row.state() != expected_state || row.is_terminal() {
                     return Err(FakeStoreError::Conflict);
                 }
                 let row = rows
@@ -979,6 +1168,248 @@ mod tests {
             chain_source.to_string(),
             FakeStoreError::Conflict.to_string()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_if_current_writes_only_while_the_state_is_expected() -> Result<(), Box<dyn Error>>
+    {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+        engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationStarted,
+                now + Duration::SECOND,
+            )
+            .await?;
+        let running = engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationPassed,
+                now + Duration::SECOND * 2,
+            )
+            .await?;
+        assert_eq!(running.state(), OperationState::Running);
+
+        // The step lands while the expected state still holds, exactly like
+        // a plain apply with the state re-checked at write time.
+        let verifying = engine
+            .apply_if_current(
+                created.id(),
+                OperationState::Running,
+                OperationEvent::ExecutionAccepted,
+                now + Duration::SECOND * 3,
+            )
+            .await?;
+        assert_eq!(verifying.state(), OperationState::Verifying);
+        assert_eq!(verifying.updated_at(), now + Duration::SECOND * 3);
+        assert_eq!(
+            store.calls()?,
+            vec![
+                Call::Create(created.id()),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Validating),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Running),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Verifying),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_if_current_refuses_a_stale_expected_state() -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+        let validating = engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationStarted,
+                now + Duration::SECOND,
+            )
+            .await?;
+        assert_eq!(validating.state(), OperationState::Validating);
+
+        // The caller observed Running, but the persisted state is Validating:
+        // the compare-and-set read itself refuses the step, honestly
+        // reporting the observed state, and nothing is written.
+        let error = engine
+            .apply_if_current(
+                created.id(),
+                OperationState::Running,
+                OperationEvent::ExecutionAccepted,
+                now + Duration::SECOND * 2,
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("a stale expected state must be refused"))?;
+        assert!(matches!(
+            error,
+            EngineError::StateChanged {
+                operation_id,
+                expected: OperationState::Running,
+                observed: OperationState::Validating,
+            } if operation_id == created.id()
+        ));
+        assert_eq!(
+            store.calls()?,
+            vec![
+                Call::Create(created.id()),
+                Call::Find(created.id()),
+                Call::ApplyTransition(created.id(), OperationState::Validating),
+                Call::Find(created.id()),
+            ],
+            "a refused compare-and-set step must never write"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_if_current_moves_between_read_and_write_are_refused_as_changed()
+    -> Result<(), Box<dyn Error>> {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+        engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationStarted,
+                now + Duration::SECOND,
+            )
+            .await?;
+        let validating = engine
+            .apply(
+                created.id(),
+                OperationEvent::ValidationPassed,
+                now + Duration::SECOND * 2,
+            )
+            .await?;
+        assert_eq!(validating.state(), OperationState::Running);
+
+        // A second driver advances the operation to Verifying between the
+        // engine's read and the store's conditional write: the CAS write
+        // conflicts because the row no longer holds the expected state, and
+        // the engine's re-read classifies the moved state as the race
+        // instead of a store failure — nothing is overwritten.
+        store.arm_cas_move(OperationState::Verifying)?;
+        let moved = engine
+            .apply_if_current(
+                created.id(),
+                OperationState::Running,
+                OperationEvent::ExecutionAccepted,
+                now + Duration::SECOND * 3,
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("the moved state must be refused"))?;
+        assert!(matches!(
+            moved,
+            EngineError::StateChanged {
+                operation_id,
+                expected: OperationState::Running,
+                observed: OperationState::Verifying,
+            } if operation_id == created.id()
+        ));
+        assert_eq!(
+            store
+                .find_owned(created.id())?
+                .ok_or_else(|| io::Error::other("the operation must be stored"))?
+                .state(),
+            OperationState::Verifying,
+            "the concurrent driver's state must stand untouched"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_if_current_reports_genuine_store_failures_as_store() -> Result<(), Box<dyn Error>>
+    {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let now = OffsetDateTime::now_utc();
+        let created = engine
+            .create(
+                OperationSource::Standalone,
+                vec![one_target()],
+                one_command(),
+                now,
+            )
+            .await?;
+
+        // The armed write failure is a genuine persistence failure, not a
+        // moved state: the re-read still shows the expected state, so the
+        // engine reports the store's own error with its source chain.
+        store.arm_write_failure()?;
+        let error = engine
+            .apply_if_current(
+                created.id(),
+                OperationState::Queued,
+                OperationEvent::ValidationStarted,
+                now + Duration::SECOND,
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("the armed failure must escape"))?;
+        let EngineError::Store(store_error) = &error else {
+            return Err(io::Error::other("expected a store boundary error").into());
+        };
+        assert_eq!(*store_error, FakeStoreError::Conflict);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .ok_or_else(|| io::Error::other("the store error must expose its source"))?
+                .to_string(),
+            FakeStoreError::Conflict.to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_if_current_reports_unknown_operations_as_not_found() -> Result<(), Box<dyn Error>>
+    {
+        let store = FakeStore::new();
+        let engine = OperationEngine::new(&store);
+        let unknown = OperationId::generate();
+
+        let error = engine
+            .apply_if_current(
+                unknown,
+                OperationState::Running,
+                OperationEvent::OutcomeUnknown,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("apply on an unknown id must fail"))?;
+        assert!(matches!(error, EngineError::NotFound(id) if id == unknown));
+        assert_eq!(store.calls()?, vec![Call::Find(unknown)]);
         Ok(())
     }
 

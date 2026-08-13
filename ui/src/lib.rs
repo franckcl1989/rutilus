@@ -11725,12 +11725,16 @@ mod browser {
         };
         decide_auth_screen(());
         let on_auth_success = Callback::new(decide_auth_screen);
-        // A 401 anywhere in the console returns the client to the sign-in
-        // screen (§16.2 session enforcement).
+        // A 401 anywhere in the console re-runs the auth decision (§16.2
+        // session enforcement): a dead session lands on the sign-in
+        // screen, and while the first-run claim is still pending the
+        // shell returns to the bootstrap screen instead (S3-2 — the
+        // product surface is closed until the claim, so the console's
+        // eager data fetches are refused during the bootstrap window).
         Effect::new(move |_| {
             if session_expired_signal().get() {
                 session_expired_signal().set(false);
-                set_auth_screen.set(AuthScreen::Login);
+                decide_auth_screen(());
             }
         });
         let on_logout = move |_| {

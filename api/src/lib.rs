@@ -3612,16 +3612,93 @@ impl OperationTargetResponse {
     }
 }
 
+/// The fixed console-wire replacement for one §10 secret value.
+///
+/// The marker matches the crate's existing redaction convention
+/// (`[REDACTED]` in the secret wrappers' `Debug`), so the console history
+/// reads the same way everywhere a secret is withheld.
+const REDACTED_SECRET_MARKER: &str = "[REDACTED]";
+
+/// Serializes one operation command for a console response with its §10
+/// secrets redacted.
+///
+/// The response projections keep the command structure visible — the console
+/// history renders the family, the payload, and the non-secret fields — but
+/// never the secret: every object member named `password` (the CSDL
+/// `ManagerAccount` `Password` property carried by `CreateAccount` and
+/// `UpdateAccountPassword`) is replaced with the fixed
+/// [`REDACTED_SECRET_MARKER`] on the wire.
+///
+/// The redaction exists only on the response wire: the domain's own
+/// `Serialize` stays lossless, because the persisted command columns and the
+/// center queue envelopes are encrypted at rest from that serialization
+/// (§4.4) and crash recovery and re-delivery read it back. This helper is
+/// therefore applied exclusively to the response projections of this crate
+/// — never to the submission requests and never to
+/// `rutilus_domain::RedfishCommand` itself.
+///
+/// The redaction is deliberately asymmetric — not a round trip: the response
+/// projections keep `Deserialize` alongside `Serialize`, so the redacted wire
+/// reads back into a command whose secret member holds the literal
+/// `"[REDACTED]"` placeholder. The console's production wasm deserializes
+/// these projections (the submission acknowledgement and the history render
+/// both parse the wire), not only the crate's tests, so the placeholder is a
+/// reachable value. Consumers must treat it as a display-only echo: never
+/// resubmit it as a live command and never re-serialize it as the persisted
+/// secret. The console renders only the fixed command labels and never the
+/// password value.
+fn serialize_redacted_command<S>(command: &RedfishCommand, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let value = serde_json::to_value(command).map_err(serde::ser::Error::custom)?;
+    redact_password_members(value).serialize(serializer)
+}
+
+/// Recursively replaces every object member named `password` with the fixed
+/// redaction marker, preserving the rest of the command tree.
+///
+/// The key name is the whole boundary of the redaction: any future member
+/// named `password` is redacted automatically, while a future secret field
+/// carried under any other key name would not be and needs a synchronized
+/// extension here.
+fn redact_password_members(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(members) => serde_json::Value::Object(
+            members
+                .into_iter()
+                .map(|(key, member)| {
+                    if key == "password" {
+                        (
+                            key,
+                            serde_json::Value::String(REDACTED_SECRET_MARKER.to_owned()),
+                        )
+                    } else {
+                        (key, redact_password_members(member))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_password_members).collect())
+        }
+        other => other,
+    }
+}
+
 /// One persisted operation projection for the console (§13.1).
 ///
 /// The command echoes the submitted typed write in its canonical serde shape,
-/// so the console renders exactly what will be dispatched (§13.3 step 7).
+/// so the console renders exactly what will be dispatched (§13.3 step 7) —
+/// with the §10 account passwords replaced by the fixed redaction marker
+/// (S3-1): the history shows the command structure, never the secret.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationResponse {
     operation_id: Uuid,
     source: OperationSourceResponse,
     targets: Vec<OperationTargetResponse>,
+    #[serde(serialize_with = "serialize_redacted_command")]
     command: RedfishCommand,
     state: OperationStateResponse,
     #[serde(with = "time::serde::rfc3339")]
@@ -3698,12 +3775,14 @@ impl OperationResponse {
 /// endpoint with the operation record that will execute and report its write;
 /// the children are ordinary persisted operations with their own lifecycle,
 /// listed and executed exactly like single submissions. `command` echoes the
-/// typed write every child will dispatch (§13.3 step 7).
+/// typed write every child will dispatch (§13.3 step 7) with the §10 account
+/// passwords replaced by the fixed redaction marker (S3-1).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchOperationResponse {
     batch_id: Uuid,
     source: OperationSourceResponse,
+    #[serde(serialize_with = "serialize_redacted_command")]
     command: RedfishCommand,
     targets: Vec<Uuid>,
     child_operation_ids: Vec<Uuid>,
@@ -3881,11 +3960,14 @@ impl BatchOutcomeCountsResponse {
 ///
 /// The state and the outcome buckets are server-derived facts: the console
 /// renders them as-is and never infers a batch verdict from the children.
+/// The command's §10 account passwords are replaced by the fixed redaction
+/// marker on the wire (S3-1).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchSummaryResponse {
     batch_id: Uuid,
     source: OperationSourceResponse,
+    #[serde(serialize_with = "serialize_redacted_command")]
     command: RedfishCommand,
     state: BatchOperationStateResponse,
     outcomes: BatchOutcomeCountsResponse,
@@ -3977,6 +4059,7 @@ impl BatchListResponse {
 pub struct BatchDetailResponse {
     batch_id: Uuid,
     source: OperationSourceResponse,
+    #[serde(serialize_with = "serialize_redacted_command")]
     command: RedfishCommand,
     state: BatchOperationStateResponse,
     outcomes: BatchOutcomeCountsResponse,
@@ -5614,13 +5697,16 @@ impl CenterEndpointViewListResponse {
 /// actor context, and the offer expiry — come from the durable §15.6 offer
 /// envelope, so they are `None` for an operation whose offer is not on
 /// record. The wire carries the typed command, never a URL, method, headers,
-/// or body.
+/// or body — and the §10 account passwords of that command are replaced by
+/// the fixed redaction marker (S3-1), exactly like the edge history
+/// projections.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CenterOperationResponse {
     operation_id: Uuid,
     site_id: Option<Uuid>,
     endpoint_id: Uuid,
+    #[serde(serialize_with = "serialize_redacted_command")]
     command: RedfishCommand,
     #[serde(default)]
     target: Option<String>,
@@ -10651,6 +10737,132 @@ mod tests {
         Ok(())
     }
 
+    /// Asserts one response projection serializes its command with the
+    /// password plaintext absent, the redaction marker present, and the
+    /// non-secret command structure visible.
+    fn assert_redacted(projection: &impl Serialize, password: &str) -> Result<(), Box<dyn Error>> {
+        let wire = serde_json::to_string(projection)?;
+        assert!(
+            !wire.contains(password),
+            "a response projection must never carry the password plaintext"
+        );
+        assert!(
+            wire.contains("[REDACTED]"),
+            "the redaction marker must stand in for the password"
+        );
+        assert!(
+            wire.contains("jane"),
+            "the non-secret command structure stays visible"
+        );
+        Ok(())
+    }
+
+    /// S3-1 regression: every operation-history response projection serializes
+    /// the command with its §10 account passwords redacted, while the domain's
+    /// own `Serialize` — the input of the §4.4 at-rest command encryption —
+    /// stays lossless.
+    #[test]
+    fn response_projections_redact_account_passwords_and_keep_the_command_shape()
+    -> Result<(), Box<dyn Error>> {
+        let password = "s3cret-value-that-must-never-reach-the-wire";
+        let command = RedfishCommand::Account(AccountCommand::CreateAccount(CreateAccount::new(
+            AccountUserName::parse("jane")?,
+            AccountPassword::parse(password.to_owned())?,
+            RoleId::parse("Operator")?,
+        )));
+
+        // The domain's own Serialize stays lossless: it is the input of the
+        // §4.4 at-rest command encryption, whose decrypt must recover the
+        // full command — password included — for crash recovery and
+        // re-delivery (pinned on the persistence side by
+        // `account_command_passwords_never_land_plaintext_in_the_command_column`).
+        assert!(
+            serde_json::to_string(&command)?.contains(password),
+            "the domain Serialize must keep the password for at-rest encryption"
+        );
+
+        let observed_at = OffsetDateTime::parse("2026-08-05T10:11:12Z", &Rfc3339)?;
+        let operation = OperationResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789f1"),
+            OperationSourceResponse::Standalone,
+            Vec::new(),
+            command.clone(),
+            OperationStateResponse::Queued,
+            observed_at,
+            observed_at,
+        );
+        let batch = BatchOperationResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789f2"),
+            OperationSourceResponse::Site,
+            command.clone(),
+            Vec::new(),
+            Vec::new(),
+            observed_at,
+        );
+        let outcomes = BatchOutcomeCountsResponse::new(1, 0, 0, 0, 0, 1);
+        let summary = BatchSummaryResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789f3"),
+            OperationSourceResponse::Site,
+            command.clone(),
+            BatchOperationStateResponse::Succeeded,
+            outcomes,
+            observed_at,
+        );
+        let detail = BatchDetailResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789f4"),
+            OperationSourceResponse::Site,
+            command.clone(),
+            BatchOperationStateResponse::Succeeded,
+            outcomes,
+            observed_at,
+            vec![operation.clone()],
+        );
+        let center = CenterOperationResponse::new(
+            uuid!("01989abc-def0-7abc-8def-0123456789f5"),
+            None,
+            uuid!("01989abc-def0-7abc-8def-0123456789f6"),
+            command,
+            Some("/redfish/v1/AccountService/Accounts/jane".to_owned()),
+            OperationStateResponse::Queued,
+            Some("admin".to_owned()),
+            None,
+            observed_at,
+        );
+
+        assert_redacted(&operation, password)?;
+        assert_redacted(&batch, password)?;
+        assert_redacted(&summary, password)?;
+        assert_redacted(&detail, password)?;
+        assert_redacted(&center, password)?;
+
+        // The exact redacted wire shape is pinned for the operation detail.
+        assert_eq!(
+            serde_json::to_value(&operation)?["command"],
+            json!({ "Account": { "CreateAccount": {
+                "user_name": "jane",
+                "password": "[REDACTED]",
+                "role_id": "Operator"
+            } } })
+        );
+        // ... and for the batch detail's summary and its children, which are
+        // ordinary operation projections.
+        let detail_value = serde_json::to_value(&detail)?;
+        assert_eq!(
+            detail_value["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]")
+        );
+        assert_eq!(
+            detail_value["children"][0]["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]")
+        );
+        // ... and for the center tracking view.
+        assert_eq!(
+            serde_json::to_value(&center)?["command"]["Account"]["CreateAccount"]["password"],
+            json!("[REDACTED]")
+        );
+        Ok(())
+    }
+
     #[test]
     fn batch_operation_contract_pins_the_submission_acknowledgement() -> Result<(), Box<dyn Error>>
     {
@@ -11339,24 +11551,22 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<OverviewResponse>(envelope).is_ok());
-        assert!(
-            serde_json::from_value::<OverviewResponse>(json!({
-                "endpoints": { "total": 1, "with_current_snapshot": 1, "awaiting_first_refresh": 0 },
-                "vendors": [{ "vendor": "ACME", "count": 1 }],
-                "health": [{ "level": "ok", "count": 1 }],
-                "firmware": {
-                    "endpoints_with_inventory": 1,
-                    "entries": 1,
-                    "distinct_versions": 1
-                },
-                "capabilities": { "observed_entries": 1, "supported_entries": 1 },
-                "running_operations": 0,
-                "recent_events": [],
-                "freshness": [{ "bucket": "within_one_hour", "count": 1 }],
-                "extra": true
-            }))
-            .is_err()
-        );
+        assert!(serde_json::from_value::<OverviewResponse>(json!({
+            "endpoints": { "total": 1, "with_current_snapshot": 1, "awaiting_first_refresh": 0 },
+            "vendors": [{ "vendor": "ACME", "count": 1 }],
+            "health": [{ "level": "ok", "count": 1 }],
+            "firmware": {
+                "endpoints_with_inventory": 1,
+                "entries": 1,
+                "distinct_versions": 1
+            },
+            "capabilities": { "observed_entries": 1, "supported_entries": 1 },
+            "running_operations": 0,
+            "recent_events": [],
+            "freshness": [{ "bucket": "within_one_hour", "count": 1 }],
+            "extra": true
+        }))
+        .is_err());
         assert!(
             serde_json::from_value::<OverviewHealthCountResponse>(json!({
                 "level": "degraded",

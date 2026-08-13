@@ -231,12 +231,16 @@ async fn center_data_sites_down_restores_the_original_table_shapes() -> Result<(
     }
     .insert(&database)
     .await?;
-    // Unwind the feature-list alignment migration, the decode-failure
-    // migration, plus the two 0.7.0 S5 migrations; the down of 000010 must
-    // restore the 000009-era shapes.
-    Migrator::down(&database, Some(4)).await?;
+    // Unwind every migration registered after the center-tables slice; the
+    // down of 000010 must restore the 000009-era shapes. The step count is
+    // the registration tail after the named migration, so the test stays
+    // correct however later slices extend the registration list.
+    let steps = migrations_after("m20260807_000009_center_tables")?;
+    Migrator::down(&database, Some(steps)).await?;
     let applied = Migrator::get_applied_migrations(&database).await?;
-    assert_eq!(applied.len(), 19);
+    let expected_applied =
+        u32::try_from(registration_position("m20260807_000009_center_tables")? + 1)?;
+    assert_eq!(applied.len(), usize::try_from(expected_applied)?);
     assert_eq!(
         applied.last().map(sea_orm_migration::Migration::name),
         Some("m20260807_000009_center_tables")
@@ -422,6 +426,20 @@ async fn center_data_sites_down_restores_the_original_table_shapes() -> Result<(
     drop(database);
     drop(directory);
     Ok(())
+}
+
+/// The registration position of the named migration.
+fn registration_position(name: &str) -> Result<usize, Box<dyn Error>> {
+    Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == name)
+        .ok_or_else(|| format!("migration {name} is not registered").into())
+}
+
+/// The number of registered migrations after the named migration.
+fn migrations_after(name: &str) -> Result<u32, Box<dyn Error>> {
+    let position = registration_position(name)?;
+    Ok(u32::try_from(Migrator::migrations().len() - position - 1)?)
 }
 
 async fn connect() -> Result<(tempfile::TempDir, DatabaseConnection), Box<dyn Error>> {
