@@ -17,7 +17,7 @@ const CENTER_TABLES: [&str; 5] = [
 
 #[tokio::test]
 async fn center_tables_migration_creates_and_drops_the_five_tables() -> Result<(), Box<dyn Error>> {
-    let database = connect().await?;
+    let (_directory, database) = connect().await?;
 
     // Idempotency: the migration history replays cleanly twice, so an
     // interrupted upgrade can resume without a half-created schema.
@@ -40,7 +40,7 @@ async fn center_tables_migration_creates_and_drops_the_five_tables() -> Result<(
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn center_tables_constraints_and_foreign_keys_hold() -> Result<(), Box<dyn Error>> {
-    let database = connect().await?;
+    let (_directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
     let now = OffsetDateTime::now_utc();
 
@@ -460,11 +460,21 @@ async fn assert_tables(
     Ok(())
 }
 
-async fn connect() -> Result<DatabaseConnection, Box<dyn Error>> {
+/// Opens one database in a fresh temporary directory.
+///
+/// The `TempDir` is returned with the connection so it outlives `connect`:
+/// dropping it here would unlink the database file while the pool's eager
+/// connection still holds it open — harmless on Windows (an open file cannot
+/// be deleted), but on Linux the unlink succeeds and the first write
+/// statement then fails while creating the rollback journal (the journal
+/// open stats the journal path (database path plus "-journal"), which no longer exists, surfacing as
+/// `SQLITE_IOERR_FSTAT` / "disk I/O error" on CI).
+async fn connect() -> Result<(tempfile::TempDir, DatabaseConnection), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database_path = directory.path().join("rutilus.db");
     let normalized_path = database_path.to_string_lossy().replace('\\', "/");
     let mut options = ConnectOptions::new(format!("sqlite://{normalized_path}?mode=rwc"));
     options.max_connections(1);
-    Ok(Database::connect(options).await?)
+    let database = Database::connect(options).await?;
+    Ok((directory, database))
 }

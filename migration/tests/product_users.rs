@@ -25,7 +25,7 @@ const PRODUCT_USERS_MIGRATION: &str = "m20260807_000005_product_users";
 
 #[tokio::test]
 async fn product_users_migration_creates_and_drops_the_six_tables() -> Result<(), Box<dyn Error>> {
-    let database = connect().await?;
+    let (_directory, database) = connect().await?;
 
     Migrator::up(&database, None).await?;
     Migrator::up(&database, None).await?;
@@ -46,7 +46,7 @@ async fn product_users_migration_creates_and_drops_the_six_tables() -> Result<()
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn product_users_constraints_and_cascades_hold() -> Result<(), Box<dyn Error>> {
-    let database = connect().await?;
+    let (_directory, database) = connect().await?;
     Migrator::up(&database, None).await?;
     let now = OffsetDateTime::now_utc();
 
@@ -336,7 +336,7 @@ async fn product_users_constraints_and_cascades_hold() -> Result<(), Box<dyn Err
 #[tokio::test]
 async fn audit_rebuild_preserves_rows_and_pins_the_actor_principal_pair()
 -> Result<(), Box<dyn Error>> {
-    let database = connect().await?;
+    let (_directory, database) = connect().await?;
 
     // Apply only the pre-rebuild migrations: the audit table still has the
     // original actor vocabulary, which the legacy row proves.
@@ -534,13 +534,23 @@ async fn assert_tables(
     Ok(())
 }
 
-async fn connect() -> Result<DatabaseConnection, Box<dyn Error>> {
+/// Opens one database in a fresh temporary directory.
+///
+/// The `TempDir` is returned with the connection so it outlives `connect`:
+/// dropping it here would unlink the database file while the pool's eager
+/// connection still holds it open — harmless on Windows (an open file cannot
+/// be deleted), but on Linux the unlink succeeds and the first write
+/// statement then fails while creating the rollback journal (the journal
+/// open stats the journal path (database path plus "-journal"), which no longer exists, surfacing as
+/// `SQLITE_IOERR_FSTAT` / "disk I/O error" on CI).
+async fn connect() -> Result<(tempfile::TempDir, DatabaseConnection), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database_path = directory.path().join("rutilus.db");
     let normalized_path = database_path.to_string_lossy().replace('\\', "/");
     let mut options = ConnectOptions::new(format!("sqlite://{normalized_path}?mode=rwc"));
     options.max_connections(1);
-    Ok(Database::connect(options).await?)
+    let database = Database::connect(options).await?;
+    Ok((directory, database))
 }
 
 fn now() -> OffsetDateTime {
