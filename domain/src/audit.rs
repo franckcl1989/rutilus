@@ -287,6 +287,13 @@ stable_audit_codes! {
         // wrong password, a wrong or replayed TOTP code, or a rate-limited
         // refusal (§16.2 "登录失败限速").
         AuthenticationFailed => "authentication-failed",
+        // A password change or administrator-issued password set succeeded,
+        // but the mandatory §16.2 session revocation failed — the change is
+        // not rolled back, and the audit records which step actually failed
+        // (B3, security batch). `AuthenticationFailed` would name the wrong
+        // fact: the presented credential was accepted; the revocation of
+        // the old sessions is the step that failed.
+        SessionRevocationFailed => "session-revocation-failed",
         // The §13.3 step 2 capability pre-flight proved the endpoint cannot
         // serve the write: the required capability is not compiled, not
         // advertised, schema-incompatible, or read-only. The refusal is a
@@ -473,6 +480,10 @@ pub struct AuditOperationContext {
     action: AuditAction,
     redfish_operation: AuditRedfishOperation,
     actor_principal_id: Option<PrincipalId>,
+    /// The principal a `User`-actor action changes, when the action names a
+    /// subject distinct from the actor (S3-4): the administrator-issued
+    /// password set records the user whose credential it replaced.
+    target_principal_id: Option<PrincipalId>,
 }
 
 impl AuditOperationContext {
@@ -706,6 +717,7 @@ impl AuditOperationContext {
             action,
             redfish_operation,
             actor_principal_id,
+            target_principal_id: None,
         })
     }
 
@@ -756,6 +768,27 @@ impl AuditOperationContext {
     #[must_use]
     pub const fn actor_principal_id(&self) -> Option<PrincipalId> {
         self.actor_principal_id
+    }
+
+    /// Names the principal a `User`-actor action changes (S3-4).
+    ///
+    /// The administrator-issued password set is audited under the acting
+    /// administrator as actor and the user whose credential was replaced as
+    /// the target — an audit reader must see both who acted and who the
+    /// action was about. The value is `None` for every other action of the
+    /// current vocabulary: it is attached by the web handler at the one
+    /// site that names a distinct subject, after the constructor's
+    /// consistency matrix has checked the action shape.
+    #[must_use]
+    pub fn with_target_principal(mut self, target_principal_id: PrincipalId) -> Self {
+        self.target_principal_id = Some(target_principal_id);
+        self
+    }
+
+    /// Returns the principal the action changes, when the action names one.
+    #[must_use]
+    pub const fn target_principal_id(&self) -> Option<PrincipalId> {
+        self.target_principal_id
     }
 }
 
@@ -1173,6 +1206,7 @@ mod tests {
             AuditFailure::CsvInvalid,
             AuditFailure::EndpointImportRowFailed,
             AuditFailure::AuthenticationFailed,
+            AuditFailure::SessionRevocationFailed,
             AuditFailure::CapabilityUnsupported,
         ]);
         assert_eq!(
@@ -1331,8 +1365,66 @@ mod tests {
         let (failure, expected) = (AuditFailure::AuthenticationFailed, "authentication-failed");
         assert_eq!(failure.as_str(), expected);
         assert_eq!(expected.parse(), Ok(failure));
+        let (failure, expected) = (
+            AuditFailure::SessionRevocationFailed,
+            "session-revocation-failed",
+        );
+        assert_eq!(failure.as_str(), expected);
+        assert_eq!(expected.parse(), Ok(failure));
         assert_eq!(AuditActor::User.as_str(), "user");
         assert_eq!("user".parse(), Ok(AuditActor::User));
+    }
+
+    #[test]
+    fn contexts_can_name_a_distinct_target_principal() -> Result<(), Box<dyn Error>> {
+        // S3-4: the administrator-issued password set is audited under the
+        // acting administrator as actor and the user whose credential was
+        // replaced as the target, so an audit reader sees both who acted
+        // and who the action was about.
+        let actor = PrincipalId::generate();
+        let target = PrincipalId::generate();
+        let context = AuditOperationContext::try_new_with_actor_principal(
+            AuditOperationId::generate(),
+            AuditActor::User,
+            DeploymentPosture::Site,
+            AuditTarget::Product,
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::Authenticate,
+            AuditAction::ChangePassword,
+            AuditRedfishOperation::None,
+            Some(actor),
+        )?;
+        assert_eq!(
+            context.target_principal_id(),
+            None,
+            "the constructor must not invent a target"
+        );
+        let context = context.with_target_principal(target);
+        assert_eq!(context.actor_principal_id(), Some(actor));
+        assert_eq!(context.target_principal_id(), Some(target));
+        // The target is operation-level metadata: it rides every event of
+        // the operation, started and terminal alike.
+        let now = OffsetDateTime::now_utc();
+        let started = AuditEvent::started(context.clone(), now);
+        let terminal = AuditSequence::FIRST.next()?;
+        let succeeded = AuditEvent::succeeded(context, terminal, now)?;
+        assert_eq!(started.context().target_principal_id(), Some(target));
+        assert_eq!(succeeded.context().target_principal_id(), Some(target));
+        // A distinct target is never implied for an action that names no
+        // subject distinct from its actor.
+        let login = AuditOperationContext::try_new_with_actor_principal(
+            AuditOperationId::generate(),
+            AuditActor::User,
+            DeploymentPosture::Site,
+            AuditTarget::Product,
+            AuditParameterSummary::EndpointRefresh,
+            ProductPermission::Authenticate,
+            AuditAction::Login,
+            AuditRedfishOperation::None,
+            Some(actor),
+        )?;
+        assert_eq!(login.target_principal_id(), None);
+        Ok(())
     }
 
     #[test]

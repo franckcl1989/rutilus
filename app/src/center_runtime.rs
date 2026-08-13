@@ -44,11 +44,12 @@ use std::{
 };
 
 use rutilus_application::{
-    BoundaryFuture, CenterBindingFlow, CenterBindingFlowError, CenterBindingRepository,
-    CenterDispatchError, CenterFrameProcessor, CenterInboundEngine, CenterInboundOptions,
-    CenterInboundSession, CenterOperationDispatch, CenterOperationRequest, CenterOperationTracking,
-    CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock, DisconnectOnDrop,
-    InstanceRepository, IssuedSiteCertificate, OperationStore, SiteCertificateIssuer,
+    AdmissionRejection, BoundaryFuture, CenterBindingFlow, CenterBindingFlowError,
+    CenterBindingRepository, CenterDispatchError, CenterFrameProcessor, CenterInboundEngine,
+    CenterInboundOptions, CenterInboundSession, CenterOperationDispatch, CenterOperationRequest,
+    CenterOperationTracking, CenterProjection, CenterSessionAdmission, CenterTrustAnchor, Clock,
+    DisconnectOnDrop, InstanceRepository, IssuedSiteCertificate, OperationStore,
+    SiteCertificateIssuer,
 };
 use rutilus_center_protocol::{Envelope, EnvelopeMessage, OperationOffer};
 use rutilus_domain::{
@@ -748,6 +749,68 @@ fn center_banner(console_url: &str, acceptor: &CenterAcceptor) -> String {
     )
 }
 
+/// The throttle window of the refused-connection warn (W3S-8): within one
+/// window, the first refusal of each class is a warn and every repeat a
+/// debug — so a peer that hammers the listener with refused connections
+/// cannot storm the log, while each class's first refusal keeps its
+/// diagnostic value.
+const REFUSAL_WARN_WINDOW: time::Duration = time::Duration::seconds(60);
+
+/// One class of admission rejection, for the refused-connection warn
+/// throttle: each class keeps its own window, so one class's repeats never
+/// suppress the other classes' first warns.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RejectionClass {
+    /// The certificate matches no bound binding.
+    UnknownSite,
+    /// The certificate disagrees with its binding record (S3b audit item
+    /// 1).
+    Identity,
+    /// The `Hello` declared a different instance than the binding record
+    /// (C5-10).
+    HelloIdentityMismatch,
+}
+
+impl RejectionClass {
+    fn of(reason: &AdmissionRejection) -> Self {
+        match reason {
+            AdmissionRejection::UnknownSite => Self::UnknownSite,
+            AdmissionRejection::Identity(_) => Self::Identity,
+            AdmissionRejection::HelloIdentityMismatch { .. } => Self::HelloIdentityMismatch,
+        }
+    }
+}
+
+/// The refused-connection warn throttle of one accept loop (W3S-8): the
+/// first refusal of each class within one [`REFUSAL_WARN_WINDOW`] is a
+/// warn, every repeat a debug. The state is a plain field of the accept
+/// loop — the loop is a single task, so no synchronization is needed — and
+/// the elapsed check saturates, so a regressed product clock can never
+/// re-open a window early.
+#[derive(Clone, Debug, Default)]
+struct RefusalWarnThrottle {
+    last_warned_at: HashMap<RejectionClass, OffsetDateTime>,
+}
+
+impl RefusalWarnThrottle {
+    /// Reports one refused connection: `true` when it should be a warn —
+    /// the first refusal of its class in the window, or the window elapsed
+    /// since the last warn — and `false` when it is a throttled debug
+    /// repeat.
+    fn report(&mut self, class: RejectionClass, now: OffsetDateTime) -> bool {
+        let within_window = self
+            .last_warned_at
+            .get(&class)
+            .is_some_and(|last| now.saturating_sub(REFUSAL_WARN_WINDOW) <= *last);
+        if within_window {
+            false
+        } else {
+            self.last_warned_at.insert(class, now);
+            true
+        }
+    }
+}
+
 /// The center's inbound accept loop: one admission and engine task per
 /// accepted connection, until the stop watch fires, then every in-flight
 /// connection is joined.
@@ -769,6 +832,11 @@ async fn run_center_accept_loop(
     // One admission resolver shared by every accept: it reads the store,
     // which the accept loop owns for its whole lifetime.
     let admission = CenterSessionAdmission::new(&state.store);
+    // The refused-connection warn throttle (W3S-8): a peer that hammers
+    // the listener with refused connections must not storm the log, while
+    // each rejection class's first warn per window keeps its diagnostic
+    // value.
+    let mut refusal_warn_throttle = RefusalWarnThrottle::default();
     loop {
         tokio::select! {
             () = stop.stopped() => break,
@@ -793,7 +861,20 @@ async fn run_center_accept_loop(
                         // The site received its refusal answer already;
                         // one refused site is one client's problem and the
                         // listener keeps accepting (§15.7 local autonomy).
-                        tracing::warn!("center refused the connection: {reason}");
+                        // The report is throttled (W3S-8): the first
+                        // refusal of each class within one 60-second window
+                        // is a warn and every repeat a debug, so a peer
+                        // that hammers the listener with refused
+                        // connections cannot storm the log while each
+                        // class's first refusal keeps its diagnostic value
+                        // (an operator who enables debug sees every
+                        // refusal).
+                        let class = RejectionClass::of(&reason);
+                        if refusal_warn_throttle.report(class, SystemClock.now()) {
+                            tracing::warn!("center refused the connection: {reason}");
+                        } else {
+                            tracing::debug!("center refused the connection: {reason}");
+                        }
                     }
                     Err(error) => {
                         // One failed handshake is one client's problem; the
@@ -963,6 +1044,44 @@ mod tests {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    #[test]
+    fn refused_connection_warns_are_throttled_to_once_per_window_per_class() {
+        // W3S-8: the first refusal of each class within one 60-second
+        // window is a warn and every repeat a debug, so a peer that
+        // hammers the listener with refused connections cannot storm the
+        // log with one warn per connection. The window is per class, so
+        // one class's repeats never suppress the other classes' first
+        // warns, and each class warns again once the window elapses.
+        let base = OffsetDateTime::UNIX_EPOCH;
+        let mut throttle = RefusalWarnThrottle::default();
+        let mismatch = RejectionClass::HelloIdentityMismatch;
+        let unknown = RejectionClass::UnknownSite;
+
+        assert!(
+            throttle.report(mismatch, base),
+            "the first refusal of a class is a warn"
+        );
+        assert!(
+            !throttle.report(mismatch, base + Duration::SECOND),
+            "a repeat within the window is a debug"
+        );
+        assert!(
+            throttle.report(unknown, base + Duration::SECOND),
+            "the other class's first refusal is a warn: the windows are per class"
+        );
+        assert!(
+            throttle.report(mismatch, base + Duration::seconds(61)),
+            "once the window elapses, the first refusal of the class warns again"
+        );
+        // A regressed product clock must not re-open a window: the elapsed
+        // check saturates, so an earlier `now` still counts as within the
+        // window of the last warn.
+        assert!(
+            !throttle.report(mismatch, base + Duration::seconds(30)),
+            "a regressed clock still counts as within the window"
+        );
     }
 
     #[tokio::test]

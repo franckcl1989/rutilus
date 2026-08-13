@@ -34,10 +34,10 @@ use rutilus_domain::{
     AuditActor, AuditEvent, BatchOperation, BatchOperationId, CreateAccount, Credential,
     CredentialId, CredentialUsername, CredentialVersionId, DeploymentPosture, Endpoint,
     EndpointAddress, EndpointCapabilityObservation, EndpointDisplayName, EndpointId, Event,
-    InstanceId, Operation, OperationId, OperationSource, OperationState, OperationTarget,
-    PrincipalId, RedfishCommand, ResetType, ResourceODataId, ResourceSnapshot, RoleId, SeriesKey,
-    SystemCommand, TargetId, TelemetrySample, TelemetrySeries, TelemetrySeriesId, TlsCertificate,
-    TlsTrust,
+    FailureKind, InstanceId, Operation, OperationId, OperationSource, OperationState,
+    OperationTarget, PrincipalId, RedfishCommand, ResetType, ResourceODataId, ResourceSnapshot,
+    RoleId, SeriesKey, SystemCommand, TargetId, TelemetrySample, TelemetrySeries,
+    TelemetrySeriesId, TlsCertificate, TlsTrust,
 };
 use rutilus_web::{
     AuditEventQuery, CenterEndpointView, CenterOperationRefusal, CenterOperationView,
@@ -55,6 +55,15 @@ struct MockState {
     operations: HashMap<OperationId, Operation>,
     batches: HashMap<BatchOperationId, BatchOperation>,
     batch_children: HashMap<BatchOperationId, Vec<Operation>>,
+    /// The recorded §13.7 failure classifications, read back through
+    /// `find_failure_kind` like the production column.
+    //
+    // `FailureKind` is a zero-sized enum today (its single variant carries
+    // no data), but the value is deliberately not a set: the boundary
+    // records and reads a *kind*, and a future second variant must keep the
+    // mock faithful.
+    #[allow(clippy::zero_sized_map_values)]
+    failure_kinds: HashMap<OperationId, FailureKind>,
 }
 
 /// Implements every application boundary behind the injected services bundle,
@@ -343,12 +352,35 @@ impl OperationStore for MockServices {
 
     fn record_failure_kind(
         &self,
-        _operation_id: OperationId,
-        _kind: rutilus_domain::FailureKind,
+        operation_id: OperationId,
+        kind: FailureKind,
     ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
-        // The submission paths never classify failures; the executor's
-        // refusal path owns that write, so this stub is unreachable here.
-        Box::pin(async { Ok(()) })
+        // The executor's refusal path owns the write in production; the
+        // history-route tests record through the same boundary so the
+        // classified listing reads a real classification (E3-4).
+        Box::pin(async move {
+            self.state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .failure_kinds
+                .insert(operation_id, kind);
+            Ok(())
+        })
+    }
+
+    fn find_failure_kind(
+        &self,
+        operation_id: OperationId,
+    ) -> BoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .map_err(|_| MockError::Lock)?
+                .failure_kinds
+                .get(&operation_id)
+                .copied())
+        })
     }
 
     fn list_batch_children(
@@ -1415,6 +1447,87 @@ async fn reads_one_operation_detail() -> Result<(), Box<dyn Error>> {
         axum::http::StatusCode::BAD_REQUEST,
         "a malformed operation id must be rejected"
     );
+    Ok(())
+}
+
+/// E3-4: the history list and the single-operation detail carry the
+/// persisted §13.7 failure classification on the wire, so the console
+/// renders a provably-unsupported refusal instead of an ordinary failure —
+/// and an unclassified failed operation still projects `null`.
+#[tokio::test]
+async fn list_and_detail_carry_the_failure_classification() -> Result<(), Box<dyn Error>> {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let endpoint = managed_endpoint()?;
+    state
+        .lock()
+        .map_err(|_| MockError::Lock)?
+        .endpoints
+        .push(endpoint.clone());
+    let services = MockServices::new(Arc::clone(&state));
+    let router = test_router(services.clone());
+
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let failed = Operation::try_from_parts(
+        OperationId::generate(),
+        OperationSource::Standalone,
+        vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+        RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+        OperationState::Failed,
+        now,
+        now,
+    )?;
+    services.create_operation(&failed).await?;
+    services
+        .record_failure_kind(failed.id(), FailureKind::CapabilityUnsupported)
+        .await?;
+
+    // The listing projects the classification on the failed row with its
+    // exact console value.
+    let listed = get(&router, "/api/v1/operations").await?;
+    assert_eq!(listed.status(), axum::http::StatusCode::OK);
+    let body = json_body(listed).await?;
+    let rows = body["operations"]
+        .as_array()
+        .ok_or("operations must be a list")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["state"], "failed");
+    assert_eq!(rows[0]["failure_kind"], "capability_unsupported");
+
+    // The detail carries the same classification.
+    let detail = get(&router, &format!("/api/v1/operations/{}", failed.id())).await?;
+    assert_eq!(detail.status(), axum::http::StatusCode::OK);
+    let body = json_body(detail).await?;
+    assert_eq!(body["state"], "failed");
+    assert_eq!(body["failure_kind"], "capability_unsupported");
+
+    // An ordinary failed operation with no recorded kind projects `null` on
+    // both routes.
+    let ordinary = Operation::try_from_parts(
+        OperationId::generate(),
+        OperationSource::Standalone,
+        vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+        RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+        OperationState::Failed,
+        now,
+        now + Duration::SECOND,
+    )?;
+    services.create_operation(&ordinary).await?;
+    let listed = get(&router, "/api/v1/operations").await?;
+    let body = json_body(listed).await?;
+    let rows = body["operations"]
+        .as_array()
+        .ok_or("operations must be a list")?;
+    assert_eq!(rows.len(), 2);
+    let classified_row = rows
+        .iter()
+        .find(|row| row["operation_id"] == failed.id().to_string())
+        .ok_or("the classified row must be listed")?;
+    assert_eq!(classified_row["failure_kind"], "capability_unsupported");
+    let ordinary_row = rows
+        .iter()
+        .find(|row| row["operation_id"] == ordinary.id().to_string())
+        .ok_or("the ordinary row must be listed")?;
+    assert_eq!(ordinary_row["failure_kind"], json!(null));
     Ok(())
 }
 

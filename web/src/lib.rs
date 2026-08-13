@@ -2300,14 +2300,13 @@ where
         ) => return uncached_status(StatusCode::INTERNAL_SERVER_ERROR),
     };
     let mut response = Json(OperationListResponse::new(
-        // TODO(E3-4): `OperationSubmission::list` does not surface the
-        // per-operation failure classification, so the history list rows
-        // project no kind. Threading the read through the submission use
-        // case (one `find_failure_kind` per row, or a classified listing
-        // read) fills the wire without any response-shape change.
+        // Each row pairs with its persisted §13.7 classification (E3-4):
+        // `OperationSubmission::list` reads one `find_failure_kind` per row,
+        // so the history list renders a provably-unsupported refusal instead
+        // of an ordinary failure without any response-shape change.
         operations
             .iter()
-            .map(|operation| project_operation(operation, None))
+            .map(|(operation, kind)| project_operation(operation, *kind))
             .collect(),
     ))
     .into_response();
@@ -2334,11 +2333,10 @@ where
     };
     let submission = OperationSubmission::new(state.services.as_ref(), state.services.as_ref());
     match submission.find(operation_id).await {
-        // TODO(E3-4): `OperationSubmission::find` does not surface
-        // `find_failure_kind`, so the single-operation read projects no
-        // kind. Threading the classification read through the submission use
-        // case fills the wire without any response-shape change.
-        Ok(Some(operation)) => json_ok(Json(project_operation(&operation, None))),
+        // The single-operation read pairs with its persisted §13.7
+        // classification (E3-4), so the detail renders a
+        // provably-unsupported refusal instead of an ordinary failure.
+        Ok(Some((operation, kind))) => json_ok(Json(project_operation(&operation, kind))),
         Ok(None) => uncached_status(StatusCode::NOT_FOUND),
         Err(SubmissionError::Store(_)) => uncached_status(StatusCode::SERVICE_UNAVAILABLE),
         // The submission verdicts cannot occur from a single-record read; only
@@ -4082,6 +4080,12 @@ fn project_center_endpoint(endpoint: &CenterEndpointView) -> CenterEndpointViewR
 }
 
 /// Projects one center operation onto its console wire shape (§15.6).
+///
+/// The tracking state is the record's derived phase. TODO(W3C-3): a
+/// `failed-unsupported` receipt (E3-4) tracks as a plain `failed` — the
+/// console state vocabulary has no unsupported phase and no classification
+/// field, so the tracking view cannot surface the classification without a
+/// vocabulary addition; tracked with the W3C-3 batch.
 fn project_center_operation(operation: &CenterOperationView) -> CenterOperationResponse {
     CenterOperationResponse::new(
         operation.operation_id().into_uuid(),

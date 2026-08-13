@@ -69,7 +69,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, oneshot},
+    sync::{Semaphore, SemaphorePermit, oneshot},
     task::spawn_blocking,
 };
 use tokio_util::sync::CancellationToken;
@@ -103,18 +103,64 @@ const AUDIT_TAIL_EVENTS: usize = 1024;
 /// blocking pool's other work.
 const MAX_CONCURRENT_PASSWORD_DERIVATIONS: usize = 4;
 
+/// The cap on requests waiting behind the derivation gate (W3S-1).
+///
+/// The slot semaphore alone bounds the *running* derivations; the waiters
+/// were unbounded — every concurrent request whose derivation had to queue
+/// kept its full request state in the gate with no limit on how many could
+/// pile up. This cap bounds the *queue*: at most
+/// [`MAX_QUEUED_PASSWORD_DERIVATIONS`] requests wait for a slot, and a
+/// request arriving past the cap is refused honestly (a fail-closed
+/// verification verdict or a [`StandaloneAuthError::HashGateBusy`]
+/// boundary error) instead of joining an unbounded queue. The two bounds
+/// together mean at most `MAX_CONCURRENT_PASSWORD_DERIVATIONS + MAX_QUEUED_PASSWORD_DERIVATIONS`
+/// requests are ever inside the gate.
+const MAX_QUEUED_PASSWORD_DERIVATIONS: usize = 8;
+
 /// The process-wide derivation gate of [`MAX_CONCURRENT_PASSWORD_DERIVATIONS`].
 ///
 /// One gate serves every posture (Standalone, Site, Center) and every
 /// authenticated instance in the process — the runtime lock guarantees a
 /// single instance anyway, and a process-wide gate is exactly what the
 /// memory bound means. The permit is acquired before the `spawn_blocking`
-/// dispatch and held until the derivation completes, so at most the
+/// dispatch and moves into the blocking task itself, so at most the
 /// constant's worth of blocking-pool threads are ever busy with Argon2id
 /// work; excess callers wait in the gate, occupying no blocking-pool
 /// thread.
 static PASSWORD_DERIVATION_SLOTS: Semaphore =
     Semaphore::const_new(MAX_CONCURRENT_PASSWORD_DERIVATIONS);
+
+/// The bounded wait queue in front of the derivation gate (W3S-1).
+///
+/// [`acquire_derivation_slot`] takes one permit before waiting for a slot,
+/// so the number of requests waiting behind [`PASSWORD_DERIVATION_SLOTS`]
+/// is capped at [`MAX_QUEUED_PASSWORD_DERIVATIONS`] and every further
+/// request is refused immediately instead of queueing without bound.
+static PASSWORD_DERIVATION_QUEUE: Semaphore = Semaphore::const_new(MAX_QUEUED_PASSWORD_DERIVATIONS);
+
+/// Acquires one derivation slot behind the bounded queue (W3S-1).
+///
+/// The queue permit is taken with `try_acquire`, so a request arriving when
+/// [`MAX_QUEUED_PASSWORD_DERIVATIONS`] others are already waiting is
+/// refused right away — `None` — rather than joining an unbounded queue.
+/// The queue permit is held only for the wait: it bounds the waiters, while
+/// the returned slot permit bounds the running derivations.
+async fn acquire_derivation_slot() -> Option<SemaphorePermit<'static>> {
+    let Ok(queue_permit) = PASSWORD_DERIVATION_QUEUE.try_acquire() else {
+        return None;
+    };
+    // At most MAX_QUEUED_PASSWORD_DERIVATIONS requests can be waiting
+    // here, so the wait for a slot is bounded; the semaphore is never
+    // closed, and the fail-closed arm is a totality courtesy.
+    let Ok(permit) = PASSWORD_DERIVATION_SLOTS.acquire().await else {
+        return None;
+    };
+    // The queue permit bounds the waiters, never the running derivations:
+    // it is released as soon as the slot is acquired, so a freed slot can
+    // admit the next waiter.
+    drop(queue_permit);
+    Some(permit)
+}
 
 /// The bounded grace period for in-flight HTTP requests once a shutdown
 /// signal resolves (N2-2): the server stops accepting and gives the
@@ -654,15 +700,27 @@ impl AuthServices for StandaloneState {
         //
         // P4-12: the derivation gate is acquired *before* the blocking-pool
         // dispatch, so a sign-in burst queues here instead of running more
-        // than `MAX_CONCURRENT_PASSWORD_DERIVATIONS` derivations at once;
-        // the permit is held until the derivation completes.
+        // than `MAX_CONCURRENT_PASSWORD_DERIVATIONS` derivations at once.
+        // W3S-1: the wait queue is bounded — a request past the cap fails
+        // closed exactly like a panicked worker, the established
+        // fail-closed verdict of this boundary.
+        //
+        // W3N-1: the permit moves into the blocking task and comes back in
+        // its payload, so a cancelled request cannot release it while the
+        // derivation still runs — the slot stays occupied until the
+        // derivation completes, as the gate's contract states.
         let hash = hash.clone();
         let password = SecretString::from(password.expose_secret().to_owned());
         Box::pin(async move {
-            let _permit = PASSWORD_DERIVATION_SLOTS.acquire().await;
-            spawn_blocking(move || verify_password(&hash, &password))
-                .await
-                .unwrap_or(false)
+            let Some(permit) = acquire_derivation_slot().await else {
+                return false;
+            };
+            spawn_blocking(move || {
+                let verdict = verify_password(&hash, &password);
+                (permit, verdict)
+            })
+            .await
+            .is_ok_and(|(_permit, verdict)| verdict)
         })
     }
     fn verify_totp(
@@ -689,14 +747,27 @@ impl AuthServices for StandaloneState {
         // P4-12: the derivation gate is acquired *before* the blocking-pool
         // dispatch, exactly like [`Self::verify_password_async`], so the
         // bootstrap-claim and password-change derivations queue behind the
-        // same cap; the permit is held until the derivation completes.
+        // same cap. W3S-1: the wait queue is bounded — a request past the
+        // cap is refused with [`StandaloneAuthError::HashGateBusy`], which
+        // the web handlers surface as the 503 the exhausted capacity is.
+        //
+        // W3N-1: the permit moves into the blocking task and comes back in
+        // its payload, so a cancelled request cannot release it while the
+        // derivation still runs — the slot stays occupied until the
+        // derivation completes, as the gate's contract states.
         let password = SecretString::from(password.expose_secret().to_owned());
         Box::pin(async move {
-            let _permit = PASSWORD_DERIVATION_SLOTS.acquire().await;
-            spawn_blocking(move || hash_password(&password))
-                .await
-                .map_err(StandaloneAuthError::HashWorker)?
-                .map_err(StandaloneAuthError::Hash)
+            let Some(permit) = acquire_derivation_slot().await else {
+                return Err(StandaloneAuthError::HashGateBusy);
+            };
+            spawn_blocking(move || {
+                let derived = hash_password(&password);
+                (permit, derived)
+            })
+            .await
+            .map(|(_permit, derived)| derived)
+            .map_err(StandaloneAuthError::HashWorker)?
+            .map_err(StandaloneAuthError::Hash)
         })
     }
     fn hash_bootstrap_code(&self, code: &str) -> [u8; 32] {
@@ -717,6 +788,14 @@ impl AuthServices for StandaloneState {
         // row carries, so the lookup refuses it without a dedicated error.
         SessionToken::from_base64url(wire).map_or([0_u8; 32], |token| token.hash())
     }
+
+    /// The bounded derivation queue is the only boundary failure the web
+    /// layer must distinguish: [`Self::Error`] would otherwise be opaque to
+    /// the generic handlers, and the exhausted-capacity refusal deserves
+    /// the 503 it is, not the 500 a failed derivation is (W3S-1).
+    fn is_derivation_gate_busy(&self, error: &Self::Error) -> bool {
+        matches!(error, StandaloneAuthError::HashGateBusy)
+    }
 }
 
 /// A controlled failure of the §16.2 authentication boundaries.
@@ -736,6 +815,8 @@ pub enum StandaloneAuthError {
     Hash(#[source] PasswordHashError),
     #[error("the password derivation worker task failed: {0}")]
     HashWorker(#[source] tokio::task::JoinError),
+    #[error("the password derivation gate is at capacity; try again later")]
+    HashGateBusy,
     #[error("session token issuance failed: {0}")]
     Tokens(#[source] SessionTokenError),
 }
@@ -2309,6 +2390,13 @@ mod tests {
 
     use super::*;
 
+    /// The derivation-gate tests share the process-wide
+    /// [`PASSWORD_DERIVATION_SLOTS`] and [`PASSWORD_DERIVATION_QUEUE`]
+    /// semaphores, so they serialize through this lock instead of racing
+    /// each other's permits (a test holding the queue would refuse another
+    /// test's queued derivation).
+    static GATE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Every Redfish gateway boundary reports a controlled failure so the
     /// loopback serving test never opens a socket or loads platform trust.
     #[derive(Clone, Copy)]
@@ -2701,6 +2789,7 @@ mod tests {
     /// without bound.
     #[tokio::test]
     async fn password_derivations_queue_beyond_the_concurrency_cap() -> Result<(), Box<dyn Error>> {
+        let _gate = GATE_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir()?;
         let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
         let unlock = unlock("correct local unlock phrase")?;
@@ -2788,6 +2877,181 @@ mod tests {
             "every queued derivation must complete once slots free"
         );
 
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// W3S-1: the derivation queue is bounded — a request arriving when
+    /// [`MAX_QUEUED_PASSWORD_DERIVATIONS`] others already wait is refused
+    /// honestly (a fail-closed verification verdict, a
+    /// [`StandaloneAuthError::HashGateBusy`] derivation error) instead of
+    /// joining an unbounded queue, and a freed queue slot admits exactly
+    /// one next request.
+    #[tokio::test]
+    async fn derivation_gate_refuses_when_the_bounded_queue_is_full() -> Result<(), Box<dyn Error>>
+    {
+        let _gate = GATE_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+
+        let password: SecretString = "correct horse battery staple".to_owned().into();
+        let Ok(hash) =
+            Argon2IdHash::from_parts(&[0x11; ARGON2ID_SALT_LENGTH], &[0x22; ARGON2ID_HASH_LENGTH])
+        else {
+            return Err("the fixed derivation-hash parts are invalid".into());
+        };
+
+        // Fill the queue: hold every queue permit so no derivation can
+        // enqueue behind the slots.
+        let mut queue_holds = Vec::new();
+        for _ in 0..MAX_QUEUED_PASSWORD_DERIVATIONS {
+            let Ok(permit) = PASSWORD_DERIVATION_QUEUE.try_acquire() else {
+                return Err("the derivation queue is closed".into());
+            };
+            queue_holds.push(permit);
+        }
+
+        // Both boundary forms refuse honestly: the verification fails
+        // closed, the derivation surfaces the gate refusal the web layer
+        // can recognize.
+        let verified = instance.state.verify_password_async(&hash, &password).await;
+        assert!(
+            !verified,
+            "a full derivation queue must fail the verification closed"
+        );
+        let derived = instance.state.hash_password_async(&password).await;
+        let Err(error) = derived else {
+            return Err("a full derivation queue must refuse the derivation".into());
+        };
+        assert!(
+            matches!(error, StandaloneAuthError::HashGateBusy),
+            "the derivation refusal must carry the gate-busy classification"
+        );
+        assert!(
+            instance.state.is_derivation_gate_busy(&error),
+            "the runtime must report the gate refusal to the web layer"
+        );
+        assert!(
+            !instance
+                .state
+                .is_derivation_gate_busy(&StandaloneAuthError::Hash(
+                    PasswordHashError::InvalidHashParts
+                )),
+            "a real derivation failure must not be reported as a gate refusal"
+        );
+
+        // Freeing one queue slot admits exactly one next request, which
+        // runs the full derivation once the slot is free — the boundary
+        // completing with a derived hash is the assertion.
+        queue_holds.pop();
+        let _derived = tokio::time::timeout(
+            Duration::from_secs(30),
+            instance.state.hash_password_async(&password),
+        )
+        .await
+        .map_err(|_| io::Error::other("the derivation never ran after the queue freed"))??;
+
+        instance.close().await?;
+        drop(directory);
+        Ok(())
+    }
+
+    /// W3N-1: the gate permit rides inside the `spawn_blocking` task, so a
+    /// cancelled request cannot release its slot while the derivation
+    /// still runs — the slot stays occupied until the derivation
+    /// completes, exactly as the gate's contract states.
+    #[tokio::test]
+    async fn a_cancelled_derivation_keeps_its_gate_slot_until_the_work_completes()
+    -> Result<(), Box<dyn Error>> {
+        let _gate = GATE_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir()?;
+        let paths = RuntimePaths::from_root(directory.path().join("instance"))?;
+        let unlock = unlock("correct local unlock phrase")?;
+        initialize_standalone(&paths, &unlock).await?;
+        let instance = StandaloneInstance::open(&paths, &unlock).await?;
+
+        let password: SecretString = "correct horse battery staple".to_owned().into();
+        // Hold every slot but one, so the spawned derivation takes the
+        // last one.
+        let mut held = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_PASSWORD_DERIVATIONS - 1) {
+            let Ok(permit) = PASSWORD_DERIVATION_SLOTS.acquire().await else {
+                return Err("the derivation gate is closed".into());
+            };
+            held.push(permit);
+        }
+        let state = Arc::clone(&instance.state);
+        let password = SecretString::from(password.expose_secret().to_owned());
+        let task = tokio::spawn(async move {
+            let _ = state.hash_password_async(&password).await;
+        });
+
+        // Wait until the derivation holds the last slot: while it is still
+        // queued, a probe acquire succeeds and is released again; once the
+        // derivation is in flight, the probe times out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(10),
+                PASSWORD_DERIVATION_SLOTS.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => drop(permit),
+                Ok(Err(_)) => return Err("the derivation gate is closed".into()),
+                Err(_elapsed) => break,
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("the spawned derivation never took the last gate slot".into());
+            }
+        }
+
+        // Cancel the request while its derivation runs.
+        task.abort();
+
+        // The slot must stay occupied until the derivation completes: a
+        // fresh acquire inside a short probe window cannot succeed.
+        let probe = tokio::time::timeout(
+            Duration::from_millis(30),
+            PASSWORD_DERIVATION_SLOTS.acquire(),
+        )
+        .await;
+        match probe {
+            Ok(Ok(_permit)) => {
+                return Err(
+                    "the cancelled request released its gate slot before the derivation completed"
+                        .into(),
+                );
+            }
+            Ok(Err(_)) => return Err("the derivation gate is closed".into()),
+            Err(_elapsed) => {}
+        }
+
+        // The derivation finishes on the blocking pool, releases its slot,
+        // and only then does a fresh acquire succeed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let freed = loop {
+            match tokio::time::timeout(
+                Duration::from_millis(20),
+                PASSWORD_DERIVATION_SLOTS.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => break permit,
+                Ok(Err(_)) => return Err("the derivation gate is closed".into()),
+                Err(_elapsed) => {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the cancelled derivation never released its gate slot".into());
+                    }
+                }
+            }
+        };
+        drop(freed);
+        drop(held);
         instance.close().await?;
         drop(directory);
         Ok(())

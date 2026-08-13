@@ -37,6 +37,25 @@
 //! words (`AFTER INSERT`, `INSTEAD OF UPDATE`, the `WHEN` clause) appear
 //! before `BEGIN` and are not DML.
 //!
+//! The `AS SELECT` family is checked in every spelling the `SQLite`
+//! select-stmt allows: the plain pair, the parenthesized form (`CREATE
+//! TABLE x AS (SELECT ...)`, a select-stmt may be wrapped in parentheses),
+//! and the CTE form (`CREATE TABLE x AS WITH cte AS (...) SELECT ...`, the
+//! WITH-clause-headed select-stmt). The no-space spellings on the `AS` side
+//! (`AS(SELECT`, `AS(WITH`) are recognized too, where a whitespace split
+//! would otherwise hide the pair in one word.
+//!
+//! Two spelling families are registered residues of this scan. A bare
+//! `VALUES (...)` is also a select-stmt, so the `AS VALUES` data copies
+//! `CREATE TABLE t AS VALUES (1)`, `CREATE TABLE t AS (VALUES (1))`, and
+//! `CREATE TABLE t AS(VALUES (1))` are legal CTAS that pass unflagged. And
+//! the mirrored no-space spellings on the `SELECT` side — `AS SELECT(1)`,
+//! `AS SELECT*FROM` — are missed too: the word-level match is the exact
+//! word `SELECT`, so a `SELECT` glued to a following `(` or `*` never
+//! matches (pre-existing, the mirror of the `AS`-side glue recognized
+//! above). No statement in the current tree holds either family, so both
+//! boundaries are registered, not expanded.
+//!
 //! The embedded-DML scan first strips SQL comments (`--` line comments and
 //! `/* ... */` block comments; see [`strip_sql_comments`]), so a comment
 //! between the shape's words can no longer hide it — `CREATE TABLE x AS --
@@ -45,10 +64,25 @@
 //! word-level and therefore has a registered false-positive boundary: a
 //! quoted SQL string literal that contains a spaced word sequence (`CHECK
 //! (a <> ' AS SELECT ')`, `DEFAULT 'TRIGGER BEGIN SELECT END'`) reads like
-//! the embedded shape. Quoted literals are preserved verbatim by the
-//! stripper — a `--` or `/*` inside a literal is text, not a comment — so
-//! the boundary stands unchanged. No statement in the current tree holds
-//! such a literal, so the boundary is registered, not expanded.
+//! the embedded shape. The new spellings widen the same boundary: a literal
+//! holding a spaced `AS ( SELECT` or `AS WITH ... SELECT` sequence (`CHECK
+//! (a <> ' AS ( SELECT ')`) reads like the new shapes, while a sequence
+//! glued to the quotes (`'AS ( SELECT'`) does not form the pair. Quoted
+//! literals are preserved verbatim by the stripper — a `--` or `/*` inside
+//! a literal is text, not a comment — so the boundary stands unchanged.
+//! Outside quoted literals the new shapes have no false-positive surface
+//! per the `SQLite` grammar: in DDL the `AS` keyword is followed either by
+//! the select-stmt (`CREATE TABLE/VIEW ... AS`) or by a type name (a column
+//! type, `CAST(x AS TEXT)`), never by `(` in another role except the
+//! generated-column `AS (expr)` form (`GENERATED ALWAYS AS (a + b)`), where
+//! `SQLite` forbids subqueries in generated-column expressions so no
+//! `SELECT` can sit in that slot, and never by `WITH` in another role. The
+//! false-positive residue is keyword-as-identifier DDL (a column named
+//! `AS`): the spaced `CREATE TABLE t ( AS WITH , b INT CHECK (b IN (SELECT
+//! ...)))` reads like the CTE shape though no `WITH` clause is meant — the
+//! glued `(AS WITH, ...)` spelling cannot trigger it, the `(` gluing to the
+//! `AS` and the `,` to the `WITH`. No statement in the current tree holds
+//! any of these, so the boundary is registered, not expanded.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -314,6 +348,46 @@ fn strip_sql_comments(statement: &str) -> String {
     stripped
 }
 
+/// Whether `word` is the `AS` keyword, optionally glued to a following `(`
+/// (`AS(SELECT`), which a whitespace split would otherwise hide in one word.
+fn is_as_word(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].eq_ignore_ascii_case(&b'a')
+        && bytes[1].eq_ignore_ascii_case(&b's')
+        && (bytes.len() == 2 || bytes[2] == b'(')
+}
+
+/// Classifies the token right after `AS`: the plain `AS SELECT` pair, the
+/// parenthesized `AS ( SELECT` form, or the `AS WITH ... SELECT` CTE form —
+/// the last by scanning `rest` (the word stream after the `WITH`) for the
+/// `SELECT` that every WITH-clause select-stmt must contain.
+fn as_select_clause(cand: &str, rest: &[&str], statement: &str) -> Option<String> {
+    if cand.eq_ignore_ascii_case("SELECT") {
+        return Some(format!(
+            "the `AS SELECT` clause copies data through raw SQL: {statement}"
+        ));
+    }
+    let bare = cand.trim_start_matches('(').trim_end_matches(')');
+    if cand.starts_with('(') && bare.eq_ignore_ascii_case("SELECT") {
+        return Some(format!(
+            "the parenthesized `AS ( SELECT` clause copies data through raw SQL: {statement}"
+        ));
+    }
+    if bare.eq_ignore_ascii_case("WITH")
+        && rest.iter().any(|word| {
+            word.trim_start_matches('(')
+                .trim_end_matches(')')
+                .eq_ignore_ascii_case("SELECT")
+        })
+    {
+        return Some(format!(
+            "the `AS WITH ... SELECT` CTE clause copies data through raw SQL: {statement}"
+        ));
+    }
+    None
+}
+
 /// Whether a statement that passed the first-word gate still embeds DML past
 /// its first word. Two shapes are recognized, both word-delimited and
 /// case-insensitive like `first_keyword`:
@@ -321,7 +395,12 @@ fn strip_sql_comments(statement: &str) -> String {
 /// - `CREATE ... AS SELECT`: the CTAS data copy (`CREATE TABLE x AS SELECT`)
 ///   or the `CREATE VIEW v AS SELECT` row query — a raw-SQL data copy
 ///   bypasses the `SeaQuery` builder the §7.3 carve-out requires for
-///   rebuilds, and a raw view definition bypasses it for reads.
+///   rebuilds, and a raw view definition bypasses it for reads. The scan
+///   covers every spelling of the `SQLite` select-stmt after `AS`: the plain
+///   pair, the parenthesized form (`CREATE TABLE x AS (SELECT ...)`), and
+///   the CTE form (`CREATE TABLE x AS WITH cte AS (...) SELECT ...`); the
+///   no-space spellings (`AS(SELECT`, `AS(WITH`) are recognized too, where
+///   a whitespace split would hide the pair in one word.
 /// - `CREATE TRIGGER ... BEGIN ... END`: DML words (`INSERT`, `UPDATE`,
 ///   `DELETE`, `SELECT`, ...) inside the trigger body. Only the words
 ///   between the first `BEGIN` and the first `END` after it count: the
@@ -329,30 +408,59 @@ fn strip_sql_comments(statement: &str) -> String {
 ///   `WHEN` clause) legitimately contains DML words before `BEGIN`.
 ///
 /// The scan runs on the [`strip_sql_comments`]-stripped statement, so SQL
-/// comments cannot hide a shape: a comment between `AS` and `SELECT`, or
+/// comments cannot hide a shape: a comment between `AS` and `(SELECT`, or
 /// between `BEGIN` and a body DML word, is removed before the words are
-/// compared (`CREATE TABLE x AS -- comment\n SELECT ...` is caught), and
-/// comment content itself never reads like DML (`/* AS SELECT */` inside a
-/// statement flags nothing).
+/// compared (`CREATE TABLE x AS -- comment\n (SELECT ...)` is caught), and
+/// comment content itself never reads like DML (`/* AS ( SELECT */` inside
+/// a statement flags nothing).
 ///
 /// The word-level scan has a registered false-positive boundary on quoted
 /// SQL string literals: a literal that contains a spaced word sequence reads
 /// like the embedded shape (`CHECK (a <> ' AS SELECT ')`, `DEFAULT 'TRIGGER
-/// BEGIN SELECT END'`). The stripper preserves quoted literals verbatim —
-/// `--`/`/*` inside a literal is text, not a comment — so the boundary
-/// stands: a quoted `'AS -- SELECT'` (comment marker inside the literal) is
-/// not treated as a comment and does not form the adjacent pair. No
-/// statement in the current tree holds such a literal, so the boundary is
-/// documented, not expanded.
+/// BEGIN SELECT END'`). The new spellings widen the same boundary — a
+/// literal holding a spaced `AS ( SELECT` or `AS WITH ... SELECT` sequence
+/// (`' AS ( SELECT '`) reads like the shape, while a sequence glued to the
+/// quotes (`'AS ( SELECT'`) does not form the pair. The stripper preserves
+/// quoted literals verbatim — `--`/`/*` inside a literal is text, not a
+/// comment — so the boundary stands: a quoted `'AS -- SELECT'` (comment
+/// marker inside the literal) is not treated as a comment and does not form
+/// the adjacent pair. Outside literals, per the `SQLite` grammar, `AS` in DDL
+/// is followed by the select-stmt or by a type name (a column type,
+/// `CAST(x AS TEXT)`), never by `(` or `WITH` in another role — so the
+/// parenthesized and CTE shapes have no false-positive surface in real DDL,
+/// apart from keyword-as-identifier usage (a column named `AS`: `CREATE
+/// TABLE t (AS WITH, b INT CHECK (b IN (SELECT ...)))` reads like the CTE
+/// shape). No statement in the current tree holds such a literal, so the
+/// boundary is documented, not expanded.
 fn ddl_embedded_dml(statement: &str) -> Option<String> {
     let statement = strip_sql_comments(statement);
     let words: Vec<&str> = statement.split_whitespace().collect();
-    for pair in words.windows(2) {
-        if pair[0].eq_ignore_ascii_case("AS") && pair[1].eq_ignore_ascii_case("SELECT") {
-            return Some(format!(
-                "the `AS SELECT` clause copies data through raw SQL: {statement}"
-            ));
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        if !is_as_word(word) {
+            i += 1;
+            continue;
         }
+        // `AS(SELECT ...)` glues the opening paren to the keyword: the
+        // remainder of the word is the token that follows `AS`.
+        let glued = word.get(2..).filter(|fragment| !fragment.is_empty());
+        let mut j = i + 1;
+        while j < words.len() && words[j].bytes().all(|b| b == b'(') {
+            j += 1;
+        }
+        let next = words.get(j).copied();
+        let rest = if glued.is_some() {
+            &words[i + 1..]
+        } else {
+            &words[j + 1..]
+        };
+        for cand in [glued, next].into_iter().flatten() {
+            if let Some(reason) = as_select_clause(cand, rest, &statement) {
+                return Some(reason);
+            }
+        }
+        i += 1;
     }
     if !words
         .iter()
@@ -659,15 +767,37 @@ fn ddl_embedded_dml_is_flagged() {
         "CREATE TRIGGER t AFTER DELETE ON a BEGIN INSERT INTO log VALUES ('x'); END;",
         "CREATE TRIGGER t INSTEAD OF UPDATE ON v WHEN new.a > 1 \
          BEGIN DELETE FROM t2 WHERE id = new.id; END;",
+        // Parenthesized and CTE spellings of the AS SELECT shape: the SQLite
+        // select-stmt after `AS` may itself be parenthesized or headed by a
+        // `WITH` clause — both valid, both raw-SQL data copies.
+        "CREATE TABLE t AS (SELECT * FROM src);",
+        "CREATE VIEW v AS (SELECT id FROM users);",
+        "create table t as (select * from src);",
+        "CREATE TABLE t AS ( SELECT * FROM src );",
+        "CREATE TABLE t AS((SELECT * FROM src));",
+        "CREATE TABLE t AS(SELECT * FROM src);",
+        "CREATE TABLE t AS (WITH cte AS (SELECT 1) SELECT * FROM cte);",
+        "CREATE TABLE t AS WITH cte AS (SELECT 1) SELECT * FROM cte;",
+        "CREATE VIEW v AS WITH cte AS (SELECT 1) SELECT * FROM cte;",
+        "CREATE TABLE t AS WITH cte AS (VALUES (1)) SELECT * FROM cte;",
         // Comment-split shapes: a SQL comment between the shape's words used
         // to hide the pair/body from the word window. The `--` and `/* */`
-        // forms are stripped before the scan, so the split form is caught.
+        // forms are stripped before the scan, so the split form is caught,
+        // including between `AS` and the parenthesized/CTE select-stmt.
         "CREATE TABLE audit_backup AS -- the data copy\nSELECT * FROM audit;",
         "CREATE TABLE audit_backup AS /* inline comment */ SELECT * FROM audit;",
         "CREATE VIEW v AS/*no spaces around the comment*/SELECT id FROM users;",
         "CREATE TABLE t AS -- one comment\n -- then another\n SELECT 1;",
+        "CREATE TABLE t AS -- cte\n WITH cte2 AS (SELECT 1) SELECT * FROM cte2;",
+        "CREATE TABLE t AS -- c\n (SELECT * FROM src);",
         "CREATE TRIGGER t AFTER INSERT ON a BEGIN -- the insert\n \
          INSERT INTO log VALUES ('x');\nEND;",
+        // The registered quoted-literal boundary, extended to the new
+        // spellings: a spaced word sequence inside a literal reads like the
+        // shape (quoted text, not DML — flagged by design; no statement in
+        // the tree holds such a literal).
+        "CREATE TABLE pairs (a TEXT CHECK (a <> ' AS ( SELECT '), b TEXT);",
+        "CREATE TABLE pairs (a TEXT CHECK (a <> ' AS WITH SELECT '), b TEXT);",
     ];
     for statement in flagged {
         assert!(
@@ -695,6 +825,15 @@ fn ddl_embedded_dml_is_flagged() {
         // boundary, including comment markers inside the quotes.
         "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS -- SELECT'), b TEXT);",
         "CREATE TABLE pairs (a TEXT CHECK (a <> 'AS /* x */ SELECT'), b TEXT);",
+        // The new spellings must not widen the carve-out's real shapes: an
+        // `AS` that is followed by a type name, not a select-stmt; the
+        // new-shape sequences glued to the quotes (the boundary is the
+        // spaced sequence, so these form no pair); and keyword-as-identifier
+        // DDL whose `AS WITH` is followed by no SELECT.
+        "CREATE TABLE t (a TEXT CHECK (CAST(a AS TEXT) <> 'x'), b TEXT);",
+        "CREATE TABLE t (a TEXT CHECK (a <> 'AS ( SELECT'), b TEXT);",
+        "CREATE TABLE t (a TEXT CHECK (a <> 'AS WITH SELECT'), b TEXT);",
+        "CREATE TABLE t (AS WITH, b INT);",
     ];
     for statement in clean {
         assert!(

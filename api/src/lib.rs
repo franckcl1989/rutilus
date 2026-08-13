@@ -3710,8 +3710,13 @@ fn redact_password_members(value: serde_json::Value) -> serde_json::Value {
 /// `failure_kind` carries the §13.7 classification of a `Failed` operation
 /// (E3-4): the console can render a provably-unsupported refusal instead of
 /// an ordinary failure.
+///
+/// The response direction never rejects unknown fields (W3C-1): an additive
+/// field in a newer payload must not break a console built before the field
+/// existed, so the wire tolerates keys this build does not know — strict
+/// `deny_unknown_fields` stays with the request DTOs, where rejecting an
+/// unknown input is the honest verdict.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct OperationResponse {
     operation_id: Uuid,
     source: OperationSourceResponse,
@@ -3724,9 +3729,11 @@ pub struct OperationResponse {
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
     /// The §13.7 failure classification, `None` for every operation that is
-    /// not a classified failure. `#[serde(default)]` keeps older wire readers
-    /// compatible with the enriched projection, exactly like the additive
-    /// offer fields of [`CenterOperationResponse`].
+    /// not a classified failure. `#[serde(default)]` lets a reader of an
+    /// older payload (without the key) parse the enriched projection, and
+    /// the response direction never rejects unknown fields (W3C-1), so a
+    /// reader built before the field existed keeps parsing a newer payload —
+    /// exactly like the additive offer fields of [`CenterOperationResponse`].
     #[serde(default)]
     failure_kind: Option<FailureKindResponse>,
 }
@@ -3811,6 +3818,11 @@ impl OperationResponse {
 /// listed and executed exactly like single submissions. `command` echoes the
 /// typed write every child will dispatch (§13.3 step 7) with the §10 account
 /// passwords replaced by the fixed redaction marker (S3-1).
+///
+/// This acknowledgement is the one response DTO that keeps the strict
+/// `deny_unknown_fields` boundary (W3C-1): the batch ack has never made the
+/// additive tolerance promise the other response envelopes carry, so an
+/// unknown key stays an honest rejection rather than a tolerated additive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchOperationResponse {
@@ -3880,8 +3892,11 @@ impl BatchOperationResponse {
 }
 
 /// Stable envelope for one operation listing, optionally filtered by state.
+///
+/// The response direction never rejects unknown fields (W3C-1): a console
+/// built before a newer additive envelope field existed must keep parsing
+/// the listing.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct OperationListResponse {
     operations: Vec<OperationResponse>,
 }
@@ -5808,8 +5823,12 @@ impl CenterEndpointViewListResponse {
 /// or body — and the §10 account passwords of that command are replaced by
 /// the fixed redaction marker (S3-1), exactly like the edge history
 /// projections.
+///
+/// The response direction never rejects unknown fields (W3C-1): the
+/// `target`/`actor`/`ttl_expires_at` additions above default to `None` for
+/// older payloads, and an additive field in a newer payload must not break
+/// a console built before it existed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CenterOperationResponse {
     operation_id: Uuid,
     site_id: Option<Uuid>,
@@ -10901,19 +10920,21 @@ mod tests {
             serde_json::from_value::<OperationResponse>(serde_json::to_value(&response)?)?,
             response
         );
-        assert!(
-            serde_json::from_value::<OperationResponse>(json!({
-                "operation_id": operation_id,
-                "source": "standalone",
-                "targets": [],
-                "command": { "System": { "Reset": "On" } },
-                "state": "waiting_remote",
-                "created_at": "2026-08-05T10:11:12Z",
-                "updated_at": "2026-08-05T10:11:12Z",
-                "next_page": null
-            }))
-            .is_err()
-        );
+        // The response direction tolerates unknown fields (W3C-1): an
+        // additive field in a newer payload must never break a console built
+        // before it existed, so an extra key parses and is ignored.
+        let enriched = serde_json::from_value::<OperationResponse>(json!({
+            "operation_id": operation_id,
+            "source": "standalone",
+            "targets": [],
+            "command": { "System": { "Reset": "On" } },
+            "state": "waiting_remote",
+            "created_at": "2026-08-05T10:11:12Z",
+            "updated_at": "2026-08-05T10:11:12Z",
+            "next_page": null
+        }))?;
+        assert_eq!(enriched.state(), OperationStateResponse::WaitingRemote);
+        assert_eq!(enriched.failure_kind(), None);
         Ok(())
     }
 
@@ -10946,13 +10967,79 @@ mod tests {
             serde_json::from_value::<OperationListResponse>(json!({ "operations": [] }))?,
             OperationListResponse::new(Vec::new())
         );
-        assert!(
+        // The response direction tolerates unknown fields (W3C-1): an extra
+        // envelope key in a newer payload parses and is ignored.
+        assert_eq!(
             serde_json::from_value::<OperationListResponse>(json!({
                 "operations": [],
                 "total": 0
-            }))
-            .is_err()
+            }))?,
+            OperationListResponse::new(Vec::new())
         );
+        Ok(())
+    }
+
+    /// W3C-1: the operation-history and center-tracking response DTOs never
+    /// reject unknown fields, so a console built before an additive field
+    /// existed keeps parsing a newer payload — the compatibility direction
+    /// the additive projections actually promise. Strict rejection stays
+    /// with the request DTOs, where an unknown input is the honest verdict.
+    #[test]
+    fn response_dtos_parse_payloads_carrying_unknown_fields() -> Result<(), Box<dyn Error>> {
+        let operation_id = uuid!("01989abc-def0-7abc-8def-0123456789d6");
+
+        // The operation projection parses a payload enriched with fields
+        // this build does not know; the known fields keep their values.
+        let operation = serde_json::from_value::<OperationResponse>(json!({
+            "operation_id": operation_id,
+            "source": "standalone",
+            "targets": [],
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "state": "failed",
+            "created_at": "2026-08-05T10:11:12Z",
+            "updated_at": "2026-08-05T10:11:12Z",
+            "failure_kind": "capability_unsupported",
+            "future_detail": { "unknown": true }
+        }))?;
+        assert_eq!(
+            operation.failure_kind(),
+            Some(FailureKindResponse::CapabilityUnsupported)
+        );
+        assert_eq!(operation.state(), OperationStateResponse::Failed);
+
+        // The list envelope parses a newer payload too.
+        let list = serde_json::from_value::<OperationListResponse>(json!({
+            "operations": [
+                {
+                    "operation_id": operation_id,
+                    "source": "standalone",
+                    "targets": [],
+                    "command": { "System": { "Reset": "PowerCycle" } },
+                    "state": "failed",
+                    "created_at": "2026-08-05T10:11:12Z",
+                    "updated_at": "2026-08-05T10:11:12Z"
+                }
+            ],
+            "page": { "next": null }
+        }))?;
+        assert_eq!(list.operations().len(), 1);
+
+        // The center tracking view parses a payload carrying an additive
+        // field, exactly like the `target`/`actor`/`ttl_expires_at`
+        // additions it already tolerated.
+        let center = serde_json::from_value::<CenterOperationResponse>(json!({
+            "operation_id": operation_id,
+            "site_id": null,
+            "endpoint_id": "01989abc-def0-7abc-8def-0123456789ab",
+            "command": { "System": { "Reset": "PowerCycle" } },
+            "target": "/redfish/v1/Systems/1",
+            "state": "failed",
+            "actor": null,
+            "ttl_expires_at": null,
+            "created_at": "2026-08-05T10:11:12Z",
+            "future_summary": "failed-unsupported"
+        }))?;
+        assert_eq!(center.state(), OperationStateResponse::Failed);
         Ok(())
     }
 

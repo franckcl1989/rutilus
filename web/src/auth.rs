@@ -19,9 +19,13 @@
 //!   mutation flag, so the §16.1 role model is a declarative table instead
 //!   of scattered checks.
 //! - The in-process login rate limiter (§16.2 "登录失败限速"): 5 failures
-//!   per username and 20 per client address in a 15-minute window, with
-//!   periodic pruning of expired buckets so the maps stay memory-bounded
-//!   under distributed attacks (security-review N3).
+//!   per username — counted per presenting address, so a distributed
+//!   attack cannot lock a username out (W3S-4) — and 20 per client address
+//!   in a 15-minute window, with periodic pruning of expired buckets so
+//!   the maps stay memory-bounded under distributed attacks
+//!   (security-review N3). The credential-change path carries the same
+//!   budgets so one session cannot flood the Argon2id derivation gate
+//!   (W3S-1).
 //! - The sign-in, sign-out, bootstrap-claim, password-change, `me`, and
 //!   administration handlers.
 //!
@@ -103,7 +107,10 @@ pub(crate) const MIN_PASSWORD_CHARS: usize = 12;
 
 /// Rate-limit window (§16.2 "登录失败限速").
 const RATE_WINDOW: StdDuration = StdDuration::from_mins(15);
-/// Sign-in failures allowed per username in one window.
+/// Sign-in failures allowed per username — counted per presenting address
+/// (W3S-4), so failures spread across addresses cannot lock a username
+/// out while the single-address brute-force bound stays intact — in one
+/// window.
 pub(crate) const USERNAME_FAILURE_LIMIT: usize = 5;
 /// Sign-in failures allowed per client address in one window.
 const IP_FAILURE_LIMIT: usize = 20;
@@ -421,7 +428,11 @@ pub trait AuthServices: Send + Sync {
     /// fail-closed choice for the login rate limiter. The embedding runtime
     /// also bounds how many derivations it dispatches at once (each
     /// allocates the pinned 64 MiB), so a burst of sign-in attempts queues
-    /// behind that bound instead of multiplying the memory (P4-12).
+    /// behind that bound instead of multiplying the memory (P4-12); the
+    /// wait queue is bounded too, and a request past the cap fails closed
+    /// with the same wrong-password verdict (W3S-1). The gate permit rides
+    /// inside the blocking task, so a cancelled request cannot release its
+    /// slot while the derivation still runs (W3N-1).
     fn verify_password_async<'a>(
         &'a self,
         hash: &'a Argon2IdHash,
@@ -465,7 +476,12 @@ pub trait AuthServices: Send + Sync {
     /// worker maps into [`Self::Error`] like any other derivation failure —
     /// the handlers treat it as the 500 the boundary failure already is. The
     /// embedding runtime bounds the dispatched derivations through the same
-    /// gate as [`Self::verify_password_async`] (P4-12).
+    /// gate as [`Self::verify_password_async`] (P4-12); a request past the
+    /// bounded wait queue fails with the gate-busy error that
+    /// [`Self::is_derivation_gate_busy`] names, and the handlers surface it
+    /// as the 503 the exhausted capacity is (W3S-1). The gate permit rides
+    /// inside the blocking task, so a cancelled request cannot release its
+    /// slot while the derivation still runs (W3N-1).
     fn hash_password_async<'a>(
         &'a self,
         password: &'a SecretString,
@@ -482,6 +498,20 @@ pub trait AuthServices: Send + Sync {
     fn issue_tokens(&self) -> Result<IssuedSessionTokens, Self::Error>;
     /// Hashes a presented session or CSRF token for lookup and comparison.
     fn token_hash(&self, wire: &str) -> [u8; 32];
+
+    /// Reports whether one boundary failure means the password-derivation
+    /// gate refused the request because its bounded wait queue was full
+    /// (W3S-1).
+    ///
+    /// The generic handlers cannot match on [`Self::Error`], so the runtime
+    /// that can refuse through the gate names the refusal here, and the
+    /// handlers surface it as the 503 the exhausted derivation capacity is
+    /// — not the 500 a failed derivation is. The default is `false`: the
+    /// test doubles and the runtimes without the bounded gate never report
+    /// it.
+    fn is_derivation_gate_busy(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// One freshly issued token pair (§16.2).
@@ -932,9 +962,20 @@ fn table_covers(method: &Method, path: &str, scope: crate::ConsoleScope) -> bool
 
 /// Resolves the authorization of one request path under one console scope.
 fn route_access(method: &Method, path: &str, scope: crate::ConsoleScope) -> RouteAccess {
+    // W3F-2: axum answers HEAD through the GET handlers (the router's `get`
+    // entries match HEAD as the read it stands for), so the authorization
+    // table — which names GET — must resolve a HEAD request exactly like
+    // the GET it stands for. Without the mapping, a HEAD probe of a
+    // guarded surface would fall through to the public fallback and answer
+    // without a session.
+    let table_method = if *method == Method::HEAD {
+        Method::GET
+    } else {
+        method.clone()
+    };
     // Every other path — static assets, the UI shell, and the fallback — is
     // public: the console must load before a session exists.
-    table_entry(method, path, scope).unwrap_or(RouteAccess::Public)
+    table_entry(&table_method, path, scope).unwrap_or(RouteAccess::Public)
 }
 
 /// The shared prefix of every center management route.
@@ -945,6 +986,11 @@ const CENTER_SURFACE_PREFIX: &str = "/api/v1/center";
 pub(crate) struct AuthState {
     policy: AuthPolicy,
     rate_limiter: LoginRateLimiter,
+    /// The credential-change rate limiter (W3S-1): the same
+    /// per-subject/per-address budgets as the sign-in surface, applied to
+    /// the password-change path, so one authenticated session cannot flood
+    /// the Argon2id derivation gate with password changes.
+    password_change_limiter: LoginRateLimiter,
 }
 
 impl AuthState {
@@ -952,6 +998,7 @@ impl AuthState {
         Self {
             policy,
             rate_limiter: LoginRateLimiter::new(),
+            password_change_limiter: LoginRateLimiter::new(),
         }
     }
 
@@ -962,6 +1009,14 @@ impl AuthState {
 
 /// The §16.2 in-process sign-in rate limiter: 5 failures per username and
 /// 20 per client address in a 15-minute sliding window.
+///
+/// The per-username budget counts only the attempts from the presenting
+/// address (W3S-4): each bucket entry records the address it came from, so
+/// 5 distinct addresses × 1 failure each no longer locks a username out
+/// for the window — an attack distributed across addresses is bounded by
+/// the per-address budget (20 per address) instead. The single-address
+/// semantics are unchanged: 5 failures from one address still exhaust that
+/// address's username budget.
 ///
 /// Both bucket maps are memory-bounded (security-review N3): a bucket is
 /// only removed once every entry has left the window, so without a
@@ -977,9 +1032,13 @@ struct LoginRateLimiter {
 }
 
 /// One rate-limit bucket map with the bookkeeping that bounds its size.
+///
+/// Every entry records the presenting address beside its instant: the
+/// per-username map needs it for the W3S-4 same-address count, and the
+/// per-address map stores it for the same entry shape.
 #[derive(Debug)]
 struct BucketMap {
-    buckets: HashMap<String, VecDeque<Instant>>,
+    buckets: HashMap<String, VecDeque<(Instant, String)>>,
     /// New keys inserted since the last full sweep; reaching
     /// [`BUCKET_PRUNE_THRESHOLD`] triggers one.
     inserts_since_prune: usize,
@@ -1016,15 +1075,16 @@ impl LoginRateLimiter {
     /// budget remains.
     fn reserve(&self, username: &str, ip: &str, now: Instant) -> bool {
         let username_key = bounded_username_key(username);
-        if !Self::reserve_key(
+        if !Self::reserve_username_key(
             &self.by_username,
             &username_key,
+            ip,
             now,
             USERNAME_FAILURE_LIMIT,
         ) {
             return false;
         }
-        let reserved = if Self::reserve_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT) {
+        let reserved = if Self::reserve_ip_key(&self.by_ip, ip, now, IP_FAILURE_LIMIT) {
             true
         } else {
             // The address budget refused: release the username slot so the
@@ -1054,31 +1114,80 @@ impl LoginRateLimiter {
         Self::refund_key(&self.by_ip, ip);
     }
 
-    /// Consumes one budget slot of one key; `false` when the budget is
-    /// already exhausted (nothing is consumed on a refusal).
-    fn reserve_key(bucket: &Arc<Mutex<BucketMap>>, key: &str, now: Instant, limit: usize) -> bool {
+    /// Consumes one budget slot of the per-username key; `false` when the
+    /// budget is already exhausted (nothing is consumed on a refusal).
+    ///
+    /// W3S-4: only the entries recorded from the *presenting* address count
+    /// toward the limit, so a username cannot be locked out by failures
+    /// spread across many addresses — the per-address budget bounds those
+    /// instead. The single-address semantics are unchanged: `limit`
+    /// failures from one address still exhaust that address's username
+    /// budget.
+    fn reserve_username_key(
+        bucket: &Arc<Mutex<BucketMap>>,
+        key: &str,
+        ip: &str,
+        now: Instant,
+        limit: usize,
+    ) -> bool {
         let Ok(mut guard) = bucket.lock() else {
             return false;
         };
-        let buckets = &mut *guard;
-        let failures = match buckets.buckets.entry(key.to_owned()) {
+        let failures = Self::bucket(&mut guard, key);
+        Self::prune_front(failures, now);
+        let reserved = failures
+            .iter()
+            .filter(|(_, entry_ip)| entry_ip == ip)
+            .count()
+            < limit;
+        if reserved {
+            failures.push_back((now, ip.to_owned()));
+        }
+        reserved
+    }
+
+    /// Consumes one budget slot of the per-address key; `false` when the
+    /// budget is already exhausted.
+    fn reserve_ip_key(
+        bucket: &Arc<Mutex<BucketMap>>,
+        key: &str,
+        now: Instant,
+        limit: usize,
+    ) -> bool {
+        let Ok(mut guard) = bucket.lock() else {
+            return false;
+        };
+        let failures = Self::bucket(&mut guard, key);
+        Self::prune_front(failures, now);
+        let reserved = failures.len() < limit;
+        if reserved {
+            failures.push_back((now, key.to_owned()));
+        }
+        reserved
+    }
+
+    /// Returns the bucket of one key, creating it with the insert
+    /// bookkeeping that bounds the map (N3).
+    fn bucket<'a>(buckets: &'a mut BucketMap, key: &str) -> &'a mut VecDeque<(Instant, String)> {
+        match buckets.buckets.entry(key.to_owned()) {
             Entry::Vacant(entry) => {
                 buckets.inserts_since_prune += 1;
                 entry.insert(VecDeque::new())
             }
             Entry::Occupied(entry) => entry.into_mut(),
-        };
+        }
+    }
+
+    /// Pops every entry that has left the window from the front of one
+    /// bucket. Entries are pushed in non-decreasing time order, so the
+    /// front is always the oldest.
+    fn prune_front(failures: &mut VecDeque<(Instant, String)>, now: Instant) {
         while failures
             .front()
-            .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
+            .is_some_and(|(at, _)| now.duration_since(*at) >= RATE_WINDOW)
         {
             failures.pop_front();
         }
-        let reserved = failures.len() < limit;
-        if reserved {
-            failures.push_back(now);
-        }
-        reserved
     }
 
     /// Runs the full sweep of one bucket map once its insert counter crossed
@@ -1096,6 +1205,12 @@ impl LoginRateLimiter {
     /// — in that case the entry belongs to another in-flight attempt, and
     /// removing it keeps the invariant that every successful attempt removes
     /// exactly one entry (see [`Self::refund`]).
+    ///
+    /// In the per-username map, entries also carry the address that recorded
+    /// them, so under multi-IP interleaving the freed slot may shift across
+    /// addresses by at most one entry — an accounting approximation
+    /// inherited from the predecessor, exact when a single address uses the
+    /// username.
     fn refund_key(bucket: &Arc<Mutex<BucketMap>>, key: &str) {
         if let Ok(mut guard) = bucket.lock() {
             let buckets = &mut *guard;
@@ -1109,7 +1224,7 @@ impl LoginRateLimiter {
     /// [`BUCKET_PRUNE_THRESHOLD`] buckets since the last one. Only vacant
     /// inserts can grow the map, so only they are counted (N3).
     fn prune_if_due(
-        buckets: &mut HashMap<String, VecDeque<Instant>>,
+        buckets: &mut HashMap<String, VecDeque<(Instant, String)>>,
         inserts_since_prune: &mut usize,
         now: Instant,
     ) {
@@ -1124,14 +1239,9 @@ impl LoginRateLimiter {
     /// applies the same expiry rule as the access path, so a bucket is
     /// reclaimed only when the next access would empty it anyway, and the
     /// limit verdicts are untouched.
-    fn prune_expired(buckets: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
+    fn prune_expired(buckets: &mut HashMap<String, VecDeque<(Instant, String)>>, now: Instant) {
         buckets.retain(|_, failures| {
-            while failures
-                .front()
-                .is_some_and(|at| now.duration_since(*at) >= RATE_WINDOW)
-            {
-                failures.pop_front();
-            }
+            Self::prune_front(failures, now);
             !failures.is_empty()
         });
     }
@@ -1823,8 +1933,9 @@ where
         None => None,
     };
     // §7.8: the derivation runs on the blocking pool, never on a worker.
-    let Ok(hash) = state.services.hash_password_async(request.password()).await else {
-        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let hash = match state.services.hash_password_async(request.password()).await {
+        Ok(hash) => hash,
+        Err(error) => return derivation_failure_response(state.services.as_ref(), &error),
     };
     let Ok(credential) = PasswordCredential::try_from_parts(principal.id(), hash, now) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1889,9 +2000,21 @@ where
 }
 
 /// The §16.2 password-change handler.
+///
+/// The path costs two Argon2id derivations (the current-password
+/// verification and the new-password derivation), so it is rate limited
+/// like the sign-in surface (W3S-1): the same per-subject and per-address
+/// budgets in the same 15-minute window, with a successful change
+/// releasing its slots exactly like a successful sign-in.
+///
+/// The handler is the declarative change flow — budget, lookup,
+/// verification, derivation, persistence, revocation, audit — so the line
+/// count is inherent to the steps it coordinates.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn change_password<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
+    connect_info: MaybeClientAddr,
     Json(request): Json<SetPasswordRequest>,
 ) -> Response
 where
@@ -1911,6 +2034,24 @@ where
             "a valid session is required".to_owned(),
         );
     };
+    // W3S-1: the budget is consumed atomically *before* any verification,
+    // exactly like the sign-in surface (S3-3) — a success refunds its slots
+    // below, and every failure keeps them, so one session cannot flood the
+    // Argon2id derivation gate with password changes.
+    let ip = request_ip(&connect_info);
+    let rate_now = Instant::now();
+    if !state
+        .auth
+        .password_change_limiter
+        .reserve(&principal_id.to_string(), &ip, rate_now)
+    {
+        // B2 (security batch): a limiter refusal writes no audit event —
+        // the 429 itself is the record, exactly like the sign-in surface.
+        return json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many password-change attempts; try again later".to_owned(),
+        );
+    }
     let Some(credential) = state
         .services
         .find_password_credential(principal_id)
@@ -1935,12 +2076,19 @@ where
             "password change failed".to_owned(),
         );
     }
-    let Ok(hash) = state
+    // The credential verification succeeded: release the reserved budget
+    // slots so a successful change never counts against the window (S3-3).
+    state
+        .auth
+        .password_change_limiter
+        .refund(&principal_id.to_string(), &ip);
+    let hash = match state
         .services
         .hash_password_async(request.new_password())
         .await
-    else {
-        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    {
+        Ok(hash) => hash,
+        Err(error) => return derivation_failure_response(state.services.as_ref(), &error),
     };
     let Ok(updated) = PasswordCredential::try_from_parts(principal_id, hash, now) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1968,6 +2116,8 @@ where
         // 失效). The password change already succeeded and is not rolled
         // back; the failure is surfaced as an explicit 500 and recorded as
         // a failed change-password outcome so the partial state is visible.
+        // The failure names the step that actually failed — the session
+        // revocation — never the authentication, which was accepted (W3S-2).
         record_outcome(
             &state,
             AuditActor::User,
@@ -1976,9 +2126,10 @@ where
             AuditAction::ChangePassword,
             false,
             Some((
-                AuditFailure::AuthenticationFailed,
+                AuditFailure::SessionRevocationFailed,
                 AuditFailureVerification::Inconclusive,
             )),
+            None,
             now,
         )
         .await;
@@ -2365,6 +2516,10 @@ where
 /// an unknown principal answers 404 like [`set_user_state`] and
 /// [`assign_user_role`], and §16.2 "密码或角色变化撤销旧 Session" revokes the
 /// principal's sessions so the new password applies from the next sign-in.
+/// The success and failure records name the target principal whose
+/// credential was replaced beside the acting administrator (S3-4), and the
+/// unknown-principal branch runs one dummy derivation so its 404 costs the
+/// same as the known-principal path (W3S-5).
 pub(crate) async fn set_user_password<Services, Gateway, Time>(
     State(state): State<WebState<Services, Gateway, Time>>,
     context: axum::extract::Extension<AuthContext>,
@@ -2396,17 +2551,29 @@ where
         .flatten()
         .is_none()
     {
+        // W3S-5: this branch must not return observably faster than the
+        // known-principal branch — the timing difference would let an
+        // authenticated administrator distinguish an existing principal
+        // from a missing one. One dummy Argon2id derivation (the same §7.8
+        // boundary and gate as the real branch, over the presented
+        // password) balances the two paths; the verdict is discarded — the
+        // 404 stands either way.
+        let _ = state
+            .services
+            .hash_password_async(request.new_password())
+            .await;
         return json_error(
             StatusCode::NOT_FOUND,
             "the principal does not exist".to_owned(),
         );
     }
-    let Ok(hash) = state
+    let hash = match state
         .services
         .hash_password_async(request.new_password())
         .await
-    else {
-        return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
+    {
+        Ok(hash) => hash,
+        Err(error) => return derivation_failure_response(state.services.as_ref(), &error),
     };
     let Ok(updated) = PasswordCredential::try_from_parts(principal_id, hash, now) else {
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -2434,7 +2601,10 @@ where
         // 失效). The password set already succeeded and is not rolled back;
         // the failure is surfaced as an explicit 500 and recorded as a
         // failed change-password outcome so the partial state is visible —
-        // the same shape as the self password-change path.
+        // the same shape as the self password-change path. The failure
+        // names the step that actually failed — the session revocation —
+        // never the authentication, which was accepted (W3S-2), and the
+        // event names the principal the set targeted (S3-4).
         record_outcome(
             &state,
             context.actor(),
@@ -2443,21 +2613,24 @@ where
             AuditAction::ChangePassword,
             false,
             Some((
-                AuditFailure::AuthenticationFailed,
+                AuditFailure::SessionRevocationFailed,
                 AuditFailureVerification::Inconclusive,
             )),
+            Some(principal_id),
             now,
         )
         .await;
         return uncached_status(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    record_management_event(
+    record_outcome(
         &state,
         context.actor(),
         context.actor_principal_id(),
         ProductPermission::Authenticate,
         AuditAction::ChangePassword,
         true,
+        None,
+        Some(principal_id),
         now,
     )
     .await;
@@ -2496,18 +2669,23 @@ fn domain_role(role: RoleResponse) -> Role {
 
 /// Builds one audit operation context for an authentication or management
 /// action (§16.3).
+///
+/// `target_principal_id` names the principal the action changes when it is
+/// distinct from the actor — the administrator-issued password set records
+/// the user whose credential was replaced (S3-4).
 fn audit_context<Services, Gateway, Time>(
     state: &WebState<Services, Gateway, Time>,
     actor: AuditActor,
     actor_principal_id: Option<PrincipalId>,
     permission: ProductPermission,
     action: AuditAction,
+    target_principal_id: Option<PrincipalId>,
 ) -> Result<AuditOperationContext, AuditOperationContextError>
 where
     Services: AuditEventWriter + AuthServices,
     Time: Clock,
 {
-    AuditOperationContext::try_new_with_actor_principal(
+    let context = AuditOperationContext::try_new_with_actor_principal(
         AuditOperationId::generate(),
         actor,
         state.origin,
@@ -2517,7 +2695,11 @@ where
         action,
         AuditRedfishOperation::None,
         actor_principal_id,
-    )
+    )?;
+    Ok(match target_principal_id {
+        Some(target) => context.with_target_principal(target),
+        None => context,
+    })
 }
 
 /// Records a failed sign-in: `started` then `failed`, so the audit trail
@@ -2551,6 +2733,7 @@ async fn record_login_failure<Services, Gateway, Time>(
             AuditFailure::AuthenticationFailed,
             AuditFailureVerification::Rejected,
         )),
+        None,
         now,
     )
     .await;
@@ -2572,6 +2755,7 @@ async fn record_login_success<Services, Gateway, Time>(
         ProductPermission::Authenticate,
         AuditAction::Login,
         true,
+        None,
         None,
         now,
     )
@@ -2600,6 +2784,7 @@ async fn record_management_event<Services, Gateway, Time>(
         action,
         succeeded,
         None,
+        None,
         now,
     )
     .await;
@@ -2607,6 +2792,9 @@ async fn record_management_event<Services, Gateway, Time>(
 
 /// Appends the `started` event and one terminal event of an audited
 /// authentication or management action.
+///
+/// `target_principal_id` names the principal the action changes when it is
+/// distinct from the actor (S3-4) — every other caller passes `None`.
 ///
 /// An audit append failure never fails the request: the boundary is
 /// best-effort on the sign-in path, exactly like the product boundaries.
@@ -2619,12 +2807,20 @@ async fn record_outcome<Services, Gateway, Time>(
     action: AuditAction,
     succeeded: bool,
     failure: Option<(AuditFailure, AuditFailureVerification)>,
+    target_principal_id: Option<PrincipalId>,
     now: OffsetDateTime,
 ) where
     Services: AuditEventWriter + AuthServices,
     Time: Clock,
 {
-    let Ok(context) = audit_context(state, actor, actor_principal_id, permission, action) else {
+    let Ok(context) = audit_context(
+        state,
+        actor,
+        actor_principal_id,
+        permission,
+        action,
+        target_principal_id,
+    ) else {
         return;
     };
     let started = AuditEvent::started(context.clone(), now);
@@ -2651,10 +2847,28 @@ fn json_ok<Body: IntoResponse>(body: Body) -> Response {
     response
 }
 
+/// Maps one password-derivation boundary failure to its response (W3S-1).
+///
+/// The generic handlers cannot match on [`Services::Error`], so the runtime
+/// reports the bounded-gate refusal through
+/// [`AuthServices::is_derivation_gate_busy`]: that refusal is the server's
+/// exhausted derivation capacity and answers 503, while every other
+/// derivation failure stays the 500 the boundary failure already is.
+fn derivation_failure_response<Services>(services: &Services, error: &Services::Error) -> Response
+where
+    Services: AuthServices,
+{
+    if services.is_derivation_gate_busy(error) {
+        uncached_status(StatusCode::SERVICE_UNAVAILABLE)
+    } else {
+        uncached_status(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{body::Body, http::Request};
-    use rutilus_domain::DeploymentPosture;
+    use rutilus_domain::{AuditOutcome, AuditVerification, DeploymentPosture};
     use secrecy::ExposeSecret;
     use tower::ServiceExt;
 
@@ -3453,15 +3667,16 @@ mod tests {
             "another address must keep its own budget"
         );
         // A successful verification returns its slot: refunding one kept
-        // reservation reopens exactly one attempt — the "operator" bucket
-        // already holds its earlier slot, so the refund leaves the budget
-        // at two consumed entries, and the exhaustion count is unchanged.
+        // reservation reopens exactly one attempt of the presenting
+        // address (W3S-4 — the earlier reservation from "192.0.2.10" never
+        // counted against this address's budget), and the budget still
+        // exhausts at the limit.
         limiter.refund("operator", "192.0.2.20");
         assert!(
             limiter.reserve("operator", "192.0.2.20", now),
             "a refund must restore exactly one slot"
         );
-        for _ in 0..(USERNAME_FAILURE_LIMIT - 2) {
+        for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
             assert!(limiter.reserve("operator", "192.0.2.20", now));
         }
         assert!(
@@ -3474,6 +3689,57 @@ mod tests {
         // The window slides: an attempt outside the window reopens.
         let later = now + RATE_WINDOW + StdDuration::from_secs(1);
         assert!(limiter.reserve("admin", "192.0.2.10", later));
+    }
+
+    #[test]
+    fn rate_limiter_username_budget_counts_only_the_presenting_address() {
+        // W3S-4: the per-username budget counts only the failures from the
+        // presenting address, so a username cannot be locked out by
+        // failures spread across many addresses — the per-address budget
+        // bounds those instead. Five distinct addresses × one failure each
+        // must not lock the username; the single-address semantics are
+        // unchanged.
+        let limiter = LoginRateLimiter::new();
+        let now = Instant::now();
+        for index in 0..USERNAME_FAILURE_LIMIT {
+            assert!(limiter.reserve("admin", &format!("192.0.2.{index}"), now));
+        }
+        assert!(
+            limiter.reserve("admin", "192.0.2.100", now),
+            "a fresh address must not inherit other addresses' failures"
+        );
+        // The single-address semantics: five failures from one address
+        // still exhaust that address's username budget...
+        for _ in 0..(USERNAME_FAILURE_LIMIT - 1) {
+            assert!(limiter.reserve("admin", "192.0.2.100", now));
+        }
+        assert!(
+            !limiter.reserve("admin", "192.0.2.100", now),
+            "the same address must still exhaust at the username limit"
+        );
+        // ...and a refund still reopens exactly one slot of the presenting
+        // address.
+        limiter.refund("admin", "192.0.2.100");
+        assert!(
+            limiter.reserve("admin", "192.0.2.100", now),
+            "a refund must restore exactly one slot of the presenting address"
+        );
+        assert!(
+            limiter.reserve("admin", "192.0.2.101", now),
+            "another fresh address is still admitted"
+        );
+        // The per-address budget stays a global count per address: the
+        // distributed fill above consumed one slot per address, and the
+        // five "admin" reservations from this address still count — one
+        // address can fill its own 20-slot budget across usernames.
+        for index in 0..(IP_FAILURE_LIMIT - USERNAME_FAILURE_LIMIT) {
+            let username = format!("user-{index}");
+            assert!(limiter.reserve(&username, "192.0.2.100", now));
+        }
+        assert!(
+            !limiter.reserve("user-last", "192.0.2.100", now),
+            "the address budget must exhaust at the limit"
+        );
     }
 
     #[test]
@@ -3732,7 +3998,8 @@ mod tests {
     fn prune_expired_reclaims_only_buckets_whose_entries_left_the_window() {
         // Every entry is recorded at or after `start` and swept at `soon`
         // (one second later) or `later` (one second past the window), so
-        // all ages are built from additions only.
+        // all ages are built from additions only. Each entry also records
+        // the presenting address (W3S-4), which the sweep ignores.
         let start = Instant::now();
         let soon = start + StdDuration::from_secs(1);
         let later = start + RATE_WINDOW + StdDuration::from_secs(1);
@@ -3740,6 +4007,7 @@ mod tests {
         // The straddling bucket's fresh failure, recorded one second
         // inside the window at sweep time.
         let fresh = start + RATE_WINDOW;
+        let address = |ip: &str| ip.to_owned();
 
         // The empty table sweeps to an empty table.
         let mut buckets = HashMap::new();
@@ -3750,11 +4018,17 @@ mod tests {
         // entry), and a single expired bucket is reclaimed (swept one
         // second past the window).
         let mut buckets = HashMap::new();
-        buckets.insert("alive".to_owned(), VecDeque::from([expired]));
+        buckets.insert(
+            "alive".to_owned(),
+            VecDeque::from([(expired, address("192.0.2.1"))]),
+        );
         LoginRateLimiter::prune_expired(&mut buckets, soon);
         assert!(buckets.contains_key("alive"));
         let mut buckets = HashMap::new();
-        buckets.insert("dead".to_owned(), VecDeque::from([expired]));
+        buckets.insert(
+            "dead".to_owned(),
+            VecDeque::from([(expired, address("192.0.2.1"))]),
+        );
         LoginRateLimiter::prune_expired(&mut buckets, later);
         assert!(buckets.is_empty());
 
@@ -3763,7 +4037,13 @@ mod tests {
         // as the access path would: the fresh failure still counts toward
         // the budget instead of being wiped with the expired one.
         let mut buckets = HashMap::new();
-        buckets.insert("straddling".to_owned(), VecDeque::from([expired, fresh]));
+        buckets.insert(
+            "straddling".to_owned(),
+            VecDeque::from([
+                (expired, address("192.0.2.1")),
+                (fresh, address("192.0.2.1")),
+            ]),
+        );
         LoginRateLimiter::prune_expired(&mut buckets, later);
         assert_eq!(
             buckets.get("straddling").map(VecDeque::len),
@@ -3773,13 +4053,16 @@ mod tests {
         assert!(
             buckets
                 .get("straddling")
-                .is_some_and(|failures| failures.contains(&fresh))
+                .is_some_and(|failures| failures.contains(&(fresh, address("192.0.2.1"))))
         );
 
         // An all-expired table returns to empty.
         let mut buckets = HashMap::new();
         for index in 0..8 {
-            buckets.insert(format!("dead-{index}"), VecDeque::from([expired]));
+            buckets.insert(
+                format!("dead-{index}"),
+                VecDeque::from([(expired, address("192.0.2.1"))]),
+            );
         }
         LoginRateLimiter::prune_expired(&mut buckets, later);
         assert!(buckets.is_empty());
@@ -3904,8 +4187,20 @@ mod tests {
         principal: Option<Principal>,
         credential: Option<PasswordCredential>,
         bootstrap_code: Option<BootstrapCode>,
+        /// The session the token-hash lookup resolves (seeded per test for
+        /// the middleware-level authorization tests).
+        session: Option<Session>,
+        /// The role assignment the lookup resolves (seeded per test for
+        /// the middleware-level authorization tests).
+        role_assignment: Option<RoleAssignment>,
         /// The verdict the double's verification returns (seeded per test).
         verify_ok: bool,
+        /// Whether the session-revocation boundary succeeds (seeded per
+        /// test: the revocation-failure audits need it to fail).
+        revocation_ok: bool,
+        /// Whether the derivation-gate refusal signal reports busy (the
+        /// W3S-1 response-mapping tests flip it).
+        derivation_gate_busy: bool,
         /// How often each boundary ran, and the thread that ran it — the
         /// §7.8 signal: the test's own thread is the runtime's only worker,
         /// while the blocking pool runs the derivation on a dedicated
@@ -3958,6 +4253,10 @@ mod tests {
                     principal: Some(principal),
                     credential: Some(credential),
                     bootstrap_code: Some(code),
+                    // The seeded double serves the successful-change tests,
+                    // so the revocation boundary succeeds unless a test
+                    // flips the flag for the failure audits.
+                    revocation_ok: true,
                     ..WorkerTestInner::default()
                 })),
             })
@@ -3972,9 +4271,18 @@ mod tests {
 
         fn find_session_by_token_hash<'a>(
             &'a self,
-            _token_hash: &'a [u8; 32],
+            token_hash: &'a [u8; 32],
         ) -> BoundaryFuture<'a, Result<Option<Session>, Self::Error>> {
-            Box::pin(async { Ok(None) })
+            let inner = Arc::clone(&self.inner);
+            let token_hash = *token_hash;
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard
+                    .session
+                    .as_ref()
+                    .filter(|session| session.token_hash() == &token_hash)
+                    .cloned())
+            })
         }
         fn create_session<'a>(
             &'a self,
@@ -4001,7 +4309,15 @@ mod tests {
             _principal_id: PrincipalId,
             _at: OffsetDateTime,
         ) -> BoundaryFuture<'_, Result<u64, Self::Error>> {
-            Box::pin(async { Ok(0) })
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                if guard.revocation_ok {
+                    Ok(0)
+                } else {
+                    Err(WorkerTestError)
+                }
+            })
         }
         fn list_sessions(
             &self,
@@ -4069,7 +4385,11 @@ mod tests {
             &self,
             _principal_id: PrincipalId,
         ) -> BoundaryFuture<'_, Result<Option<RoleAssignment>, Self::Error>> {
-            Box::pin(async { Ok(None) })
+            let inner = Arc::clone(&self.inner);
+            Box::pin(async move {
+                let guard = inner.lock().map_err(|_| WorkerTestError)?;
+                Ok(guard.role_assignment.clone())
+            })
         }
         fn list_role_assignments(
             &self,
@@ -4243,6 +4563,13 @@ mod tests {
         }
         fn token_hash(&self, wire: &str) -> [u8; 32] {
             fold_hash(wire.as_bytes())
+        }
+
+        fn is_derivation_gate_busy(&self, _error: &Self::Error) -> bool {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .derivation_gate_busy
         }
     }
 
@@ -4453,6 +4780,527 @@ mod tests {
             inner.hash_sync_calls, 0,
             "the bootstrap path must never call the synchronous boundary"
         );
+        Ok(())
+    }
+
+    // ---- W3S-1 credential-change budgets ---------------------------------
+    //
+    // The password-change path costs two Argon2id derivations per request,
+    // so it carries the same §16.2 budgets as the sign-in surface: a flood
+    // of failed changes from one session cannot starve the derivation gate.
+
+    #[tokio::test]
+    async fn change_password_is_rate_limited_like_sign_in() -> Result<(), Box<dyn Error>> {
+        // Failed changes keep their reservation (verify_ok = false), so
+        // the sixth failure in the window is refused before any
+        // verification — the sign-in surface's S3-3 accounting, applied to
+        // the credential-change path.
+        let services = WorkerTestServices::seeded()?;
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let context = AuthContext {
+            actor: AuditActor::User,
+            actor_principal_id: Some(principal_id),
+            session_id: None,
+            role: None,
+            assignment_site_id: None,
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(context))
+            .with_state(worker_test_state(services.clone()));
+        let body =
+            r#"{"current_password": "wrong password", "new_password": "a brand new password"}"#;
+        for _ in 0..USERNAME_FAILURE_LIMIT {
+            let refused = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/password")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A successful change refunds its slots, so the same principal can
+        // change its password repeatedly without ever hitting the budget —
+        // exactly like the sign-in surface's refund (S3-3).
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+        }
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let context = AuthContext {
+            actor: AuditActor::User,
+            actor_principal_id: Some(principal_id),
+            session_id: None,
+            role: None,
+            assignment_site_id: None,
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(context))
+            .with_state(worker_test_state(services));
+        let body = r#"{"current_password": "correct horse battery staple", "new_password": "a brand new password"}"#;
+        for _ in 0..=USERNAME_FAILURE_LIMIT {
+            let changed = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/auth/password")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(
+                changed.status(),
+                StatusCode::OK,
+                "a successful change must refund its budget slots"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn derivation_failure_mapping_distinguishes_the_gate_refusal() -> Result<(), Box<dyn Error>> {
+        // W3S-1: the bounded-gate refusal is the server's exhausted
+        // derivation capacity and answers 503; every other derivation
+        // failure stays the 500 the boundary failure already is.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.derivation_gate_busy = true;
+        }
+        assert_eq!(
+            derivation_failure_response(&services, &WorkerTestError).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.derivation_gate_busy = false;
+        }
+        assert_eq!(
+            derivation_failure_response(&services, &WorkerTestError).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        Ok(())
+    }
+
+    // ---- W3S-2 target-principal audit and truthful failure classes ------
+
+    /// The authenticated administrator context of the set-password tests:
+    /// a User actor distinct from the target principal, so the audit must
+    /// name the two separately.
+    fn admin_context(actor_principal_id: PrincipalId) -> AuthContext {
+        AuthContext {
+            actor: AuditActor::User,
+            actor_principal_id: Some(actor_principal_id),
+            session_id: None,
+            role: None,
+            assignment_site_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_password_set_records_the_target_principal() -> Result<(), Box<dyn Error>> {
+        // S3-4: the set-password success record names the acting
+        // administrator as actor and the user whose credential was
+        // replaced as the target.
+        let services = WorkerTestServices::seeded()?;
+        let target_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let admin_id = PrincipalId::generate();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/password",
+                axum::routing::post(set_user_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(admin_id)))
+            .with_state(worker_test_state(services.clone()));
+
+        let set = router
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{target_id}/password"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(set.status(), StatusCode::OK);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.audit_events.len(),
+            2,
+            "the set must append start + terminal"
+        );
+        for event in &inner.audit_events {
+            assert_eq!(
+                event.context().actor_principal_id(),
+                Some(admin_id),
+                "the acting administrator must be the event's actor"
+            );
+            assert_eq!(
+                event.context().target_principal_id(),
+                Some(target_id),
+                "the set must name the principal whose credential was replaced"
+            );
+            assert_eq!(event.context().action(), AuditAction::ChangePassword);
+        }
+        assert_eq!(inner.audit_events[1].outcome(), AuditOutcome::Succeeded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_password_set_records_the_revocation_failure_truthfully()
+    -> Result<(), Box<dyn Error>> {
+        // W3S-2: a failed revocation after a successful set is audited
+        // under the failure class that names the failing step — never
+        // `AuthenticationFailed`, which would claim the presented
+        // administrator's authentication failed.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.revocation_ok = false;
+        }
+        let target_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let admin_id = PrincipalId::generate();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/password",
+                axum::routing::post(set_user_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(admin_id)))
+            .with_state(worker_test_state(services.clone()));
+
+        let set = router
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{target_id}/password"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(set.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(inner.audit_events.len(), 2);
+        assert_eq!(
+            inner.audit_events[1].outcome().failure(),
+            Some(AuditFailure::SessionRevocationFailed),
+            "the revocation failure must be classified by the step that failed"
+        );
+        assert_eq!(
+            inner.audit_events[1].outcome().verification(),
+            Some(AuditVerification::Inconclusive)
+        );
+        assert_eq!(
+            inner.audit_events[1].context().actor_principal_id(),
+            Some(admin_id)
+        );
+        assert_eq!(
+            inner.audit_events[1].context().target_principal_id(),
+            Some(target_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn password_change_records_a_revocation_failure_truthfully() -> Result<(), Box<dyn Error>>
+    {
+        // W3S-2: the self password-change path classifies its revocation
+        // failure the same truthful way — the failure names the failing
+        // step, never the authentication, which was accepted.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner.verify_ok = true;
+            inner.revocation_ok = false;
+        }
+        let principal_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/auth/password",
+                axum::routing::post(change_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(principal_id)))
+            .with_state(worker_test_state(services.clone()));
+
+        let changed = router
+            .oneshot(
+                Request::post("/api/v1/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"current_password": "correct horse battery staple", "new_password": "a brand new password"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(changed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(inner.audit_events.len(), 2);
+        assert_eq!(
+            inner.audit_events[1].outcome().failure(),
+            Some(AuditFailure::SessionRevocationFailed)
+        );
+        assert_eq!(
+            inner.audit_events[1].context().actor_principal_id(),
+            Some(principal_id),
+            "a self change is its own subject"
+        );
+        assert_eq!(
+            inner.audit_events[1].context().target_principal_id(),
+            None,
+            "a self change names no target distinct from its actor"
+        );
+        Ok(())
+    }
+
+    // ---- W3S-5 set-password timing equalizer ------------------------------
+
+    #[tokio::test]
+    async fn unknown_principal_password_set_runs_one_dummy_derivation() -> Result<(), Box<dyn Error>>
+    {
+        // The unknown-principal branch must not return observably faster
+        // than the known-principal branch: the timing difference would let
+        // an authenticated administrator distinguish an existing principal
+        // from a missing one. One dummy derivation balances the two paths —
+        // the call-count symmetry is the structural guarantee that they
+        // cost the same, exactly like the MINOR-1 sign-in equalizer.
+        let services = WorkerTestServices::seeded()?;
+        let target_id = {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            inner
+                .principal
+                .as_ref()
+                .map(Principal::id)
+                .ok_or("the worker-test principal must be seeded")?
+        };
+        let admin_id = PrincipalId::generate();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/admin/users/{principal_id}/password",
+                axum::routing::post(set_user_password::<WorkerTestServices, (), WorkerTestClock>),
+            )
+            .layer(axum::Extension(admin_context(admin_id)))
+            .with_state(worker_test_state(services.clone()));
+
+        // The unknown principal answers 404 — and its branch ran exactly
+        // one derivation, the same count the known-principal branch
+        // produces below.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/admin/users/00000000-0000-0000-0000-000000000000/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        {
+            let inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            assert_eq!(
+                inner.hash_async_calls, 1,
+                "the unknown-principal branch must run one dummy derivation"
+            );
+        }
+
+        let set = router
+            .oneshot(
+                Request::post(format!("/api/v1/admin/users/{target_id}/password"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"new_password": "a fresh replacement secret"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(set.status(), StatusCode::OK);
+        let inner = services
+            .inner
+            .lock()
+            .map_err(|_| "the worker-test mutex must not be poisoned")?;
+        assert_eq!(
+            inner.hash_async_calls, 2,
+            "the known-principal branch must cost the same single derivation"
+        );
+        Ok(())
+    }
+
+    // ---- W3F-2 HEAD authorization ----------------------------------------
+
+    #[tokio::test]
+    async fn head_requests_resolve_through_the_get_authorization_entry()
+    -> Result<(), Box<dyn Error>> {
+        // axum answers HEAD through the GET handlers, so the authorization
+        // table must resolve a HEAD request exactly like the GET it stands
+        // for: a sessionless HEAD probe of the administration surface must
+        // not fall through to the public fallback, and a sessioned one
+        // passes like the GET it mirrors.
+        let services = WorkerTestServices::seeded()?;
+        {
+            let mut inner = services
+                .inner
+                .lock()
+                .map_err(|_| "the worker-test mutex must not be poisoned")?;
+            let principal = inner
+                .principal
+                .clone()
+                .ok_or("the worker-test principal must be seeded")?;
+            let now = OffsetDateTime::UNIX_EPOCH;
+            inner.session = Some(Session::new(
+                SessionId::generate(),
+                principal.id(),
+                fold_hash(b"head-session-token"),
+                [0x33; 32],
+                now,
+                now + Duration::hours(8),
+            ));
+            inner.role_assignment = Some(RoleAssignment::new(
+                principal.id(),
+                Role::Administrator,
+                Some(principal.id()),
+                now,
+                None,
+            ));
+        }
+        let state = worker_test_state(services);
+        let router = axum::Router::new()
+            .route("/api/v1/admin/users", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware::<WorkerTestServices, (), WorkerTestClock>,
+            ))
+            .with_state(state);
+
+        // A sessionless HEAD probe is refused like the GET it mirrors.
+        let refused = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/admin/users")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        // The GET itself is refused the same way — the two methods resolve
+        // through the same authorization entry.
+        let refused_get = router
+            .clone()
+            .oneshot(Request::get("/api/v1/admin/users").body(Body::empty())?)
+            .await?;
+        assert_eq!(refused_get.status(), StatusCode::UNAUTHORIZED);
+
+        // A sessioned HEAD passes the guard like the GET it mirrors.
+        let allowed = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/v1/admin/users")
+                    .header("cookie", "rutilus_session=head-session-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(allowed.status(), StatusCode::OK);
         Ok(())
     }
 }

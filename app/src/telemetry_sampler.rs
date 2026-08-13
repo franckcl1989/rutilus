@@ -50,12 +50,14 @@
 //!
 //! A clock anomaly that persists across sweeps is the one failure that would
 //! otherwise storm the log: every endpoint of every sweep would record the
-//! same monotonic-guard refusal. The application use case deduplicates
-//! consecutive refusals ([`TelemetrySampler::is_refusal_repeated`]), and the
-//! loop levels its logging accordingly: the first refusal of an anomaly is an
-//! error, and every repeat is a `tracing::warn!` noting that the refusal
-//! persists until the clock catches up. A refusal the clock recovers from is
-//! over — the next anomaly is a fresh error again.
+//! same monotonic-guard refusal. The application use case returns the
+//! consecutive-refusal verdict with every call — whether the failure repeats
+//! the refusal of the call before it, decided atomically with the refusal
+//! record (W3N-4) — and the loop levels its logging accordingly: the first
+//! refusal of an anomaly is an error, and every repeat is a `tracing::warn!`
+//! noting that the refusal persists until the clock catches up. A refusal
+//! the clock recovers from is over — the next anomaly is a fresh error
+//! again.
 
 use std::{error::Error, fmt, time::Duration};
 
@@ -213,40 +215,39 @@ impl Error for TelemetryRetentionError {}
 /// and must never interpret the use case's verdicts itself. The seam keeps
 /// the loop testable with scripted fakes and erases the sampling error
 /// vocabulary into one opaque failure that the loop records and moves on
-/// from. The one exception is [`TelemetryDriver::is_refusal_repeated`]: a
+/// from. The one exception is the consecutive-refusal verdict: a
 /// clock-anomaly refusal that persists across sweeps would otherwise storm
-/// the log with one identical error per endpoint per sweep, so the seam
-/// exposes only the dedupe verdict — the failure just seen repeats the
-/// refusal of the call before it — and the loop levels its logging without
-/// ever seeing the error vocabulary.
+/// the log with one identical error per endpoint per sweep, so every call
+/// returns the dedupe verdict beside its result — whether the failure just
+/// seen repeats the clock refusal of the call before it — and the loop
+/// levels its logging without ever seeing the error vocabulary. The verdict
+/// is decided by the driver atomically with the refusal record (W3N-4), so
+/// a concurrent caller can never change the verdict between a call and the
+/// loop's read of its result.
 pub(crate) trait TelemetryDriver: Send + Sync {
     /// The driver's controlled failure type; only its `Display` is used.
     type Error: Error + Send + Sync + 'static;
 
     /// Samples one endpoint's current metric values into the store.
+    ///
+    /// Returns the sampling result and the consecutive-refusal verdict of
+    /// the call: `true` only when the failure repeats the clock refusal of
+    /// the call before it — so the loop can log the first refusal of an
+    /// anomaly as an error and each repeat as a warn. The verdict is
+    /// `false` for an accepted call, a failure that is not a clock refusal,
+    /// and the first refusal of an anomaly.
     fn sample_endpoint(
         &self,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
-    ) -> BoundaryFuture<'_, Result<EndpointSampling, Self::Error>>;
+    ) -> BoundaryFuture<'_, (Result<EndpointSampling, Self::Error>, bool)>;
 
-    /// Prunes every sample older than the retention window.
+    /// Prunes every sample older than the retention window, returning the
+    /// same consecutive-refusal verdict as [`Self::sample_endpoint`].
     fn prune_history(
         &self,
         retention: time::Duration,
-    ) -> BoundaryFuture<'_, Result<(), Self::Error>>;
-
-    /// Whether the most recent sampling or prune call repeated the clock
-    /// refusal of the call before it — the consecutive-refusal dedupe signal
-    /// (see the module doc).
-    ///
-    /// The loop consults this after a failed call to level its logging: the
-    /// first refusal of a clock anomaly is an operational error, and each
-    /// consecutive repeat is a warn that the refusal persists until the
-    /// clock catches up. The verdict is `false` after an accepted call or a
-    /// failure that is not a clock refusal, so the loop can consult it after
-    /// any failed call.
-    fn is_refusal_repeated(&self) -> bool;
+    ) -> BoundaryFuture<'_, (Result<(), Self::Error>, bool)>;
 }
 
 /// The application sampling use case behind the driver seam.
@@ -262,19 +263,15 @@ where
         &self,
         endpoint_id: EndpointId,
         now: OffsetDateTime,
-    ) -> BoundaryFuture<'_, Result<EndpointSampling, Self::Error>> {
+    ) -> BoundaryFuture<'_, (Result<EndpointSampling, Self::Error>, bool)> {
         Box::pin(async move { TelemetrySampler::sample_endpoint(self, endpoint_id, now).await })
     }
 
     fn prune_history(
         &self,
         retention: time::Duration,
-    ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+    ) -> BoundaryFuture<'_, (Result<(), Self::Error>, bool)> {
         Box::pin(async move { TelemetrySampler::prune_history(self, retention).await })
-    }
-
-    fn is_refusal_repeated(&self) -> bool {
-        TelemetrySampler::is_refusal_repeated(self)
     }
 }
 
@@ -350,10 +347,10 @@ pub(crate) async fn run<Driver, Lister, Time>(
 ///
 /// A monotonic-guard refusal that persists across sweeps is recorded once
 /// per anomaly: the first refusal is an error, and each consecutive repeat
-/// (the driver's `is_refusal_repeated` verdict) is a warn noting that the
-/// refusal persists until the clock catches up — so a sustained clock
-/// regression cannot storm the log with one identical error per endpoint per
-/// sweep.
+/// (the verdict each call returns beside its result, W3N-4) is a warn
+/// noting that the refusal persists until the clock catches up — so a
+/// sustained clock regression cannot storm the log with one identical error
+/// per endpoint per sweep.
 async fn run_tick<Driver, Lister>(
     driver: &Driver,
     lister: &Lister,
@@ -371,8 +368,9 @@ async fn run_tick<Driver, Lister>(
         }
     };
     for endpoint_id in endpoints {
-        if let Err(error) = driver.sample_endpoint(endpoint_id, now).await {
-            if driver.is_refusal_repeated() {
+        let (result, refusal_repeated) = driver.sample_endpoint(endpoint_id, now).await;
+        if let Err(error) = result {
+            if refusal_repeated {
                 tracing::warn!(
                     "telemetry sampling still refused for endpoint {endpoint_id}: {error}; \
                      refusing every sweep until the product clock catches up"
@@ -382,8 +380,9 @@ async fn run_tick<Driver, Lister>(
             }
         }
     }
-    if let Err(error) = driver.prune_history(retention).await {
-        if driver.is_refusal_repeated() {
+    let (result, refusal_repeated) = driver.prune_history(retention).await;
+    if let Err(error) = result {
+        if refusal_repeated {
             tracing::warn!(
                 "telemetry history pruning still refused: {error}; \
                  refusing every sweep until the product clock catches up"
@@ -434,7 +433,8 @@ mod tests {
         prune_retentions: Arc<Mutex<Vec<time::Duration>>>,
         failures: Arc<Mutex<HashMap<EndpointId, usize>>>,
         gate: Option<Arc<Notify>>,
-        /// The scriptable verdict behind [`TelemetryDriver::is_refusal_repeated`].
+        /// The scriptable consecutive-refusal verdict every call returns
+        /// beside its result.
         ///
         /// Mock failures are scripted per-endpoint faults, never clock
         /// refusals, so the default `false` levels every failure as a fresh
@@ -480,19 +480,11 @@ mod tests {
     impl TelemetryDriver for FakeDriver {
         type Error = MockError;
 
-        fn is_refusal_repeated(&self) -> bool {
-            // Mock failures are scripted per-endpoint faults, never clock
-            // refusals, so the verdict is scripted through the
-            // `refusal_repeated` flag instead of derived from the failures
-            // themselves.
-            self.refusal_repeated
-        }
-
         fn sample_endpoint(
             &self,
             endpoint_id: EndpointId,
             _now: OffsetDateTime,
-        ) -> BoundaryFuture<'_, Result<EndpointSampling, Self::Error>> {
+        ) -> BoundaryFuture<'_, (Result<EndpointSampling, Self::Error>, bool)> {
             Box::pin(async move {
                 // The call is recorded before the gate blocks, so a recorded
                 // sample that never completes is exactly the in-flight one.
@@ -518,16 +510,20 @@ mod tests {
                     } else {
                         failures.insert(endpoint_id, remaining - 1);
                     }
-                    return Err(MockError::Store);
+                    // Mock failures are scripted per-endpoint faults, never
+                    // clock refusals, so the verdict is scripted through the
+                    // `refusal_repeated` flag instead of derived from the
+                    // failures themselves.
+                    return (Err(MockError::Store), self.refusal_repeated);
                 }
-                Ok(EndpointSampling::new(1, 1))
+                (Ok(EndpointSampling::new(1, 1)), self.refusal_repeated)
             })
         }
 
         fn prune_history(
             &self,
             retention: time::Duration,
-        ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
+        ) -> BoundaryFuture<'_, (Result<(), Self::Error>, bool)> {
             Box::pin(async move {
                 self.calls
                     .lock()
@@ -537,7 +533,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(retention);
-                Ok(())
+                (Ok(()), self.refusal_repeated)
             })
         }
     }

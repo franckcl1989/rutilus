@@ -32,9 +32,10 @@ use rutilus_center_protocol::{
     OperationProgress, OperationRejected,
 };
 use rutilus_domain::{
-    EndpointId, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId, Operation,
-    OperationEvent, OperationId, OperationSource, OperationState, OperationTarget, OutboxEntry,
-    OutboxEntryId, PrincipalId, RedfishCommand, ResourceODataId, Role, RoleAssignment, TargetId,
+    EndpointId, FailureKind, InboxEntry, InboxEntryId, InboxEntryState, InboxEvent, InstanceId,
+    Operation, OperationEvent, OperationId, OperationSource, OperationState, OperationTarget,
+    OutboxEntry, OutboxEntryId, PrincipalId, RedfishCommand, ResourceODataId, Role, RoleAssignment,
+    TargetId,
 };
 use rutilus_operation_engine::OperationStore;
 use thiserror::Error;
@@ -419,7 +420,11 @@ where
     ///   know at all was never enqueued, and a fresh id cannot
     ///   double-execute anything. The repair for the offerless record
     ///   alone runs only for a single candidate, where no other operation
-    ///   could own the retry.
+    ///   could own the retry — and the same history judgment governs the
+    ///   single candidate, so a different-target dispatch is never
+    ///   blind-merged into its id (F1, W3F-1) and an in-flight or
+    ///   scan-truncated offer returns in flight or re-delivers under the
+    ///   same id exactly like the multi-candidate path (W3F-5).
     ///
     /// The tracking scan queries every candidate state on the state index
     /// (`ix_operations_state`, §13.6) instead of listing the whole table,
@@ -478,6 +483,28 @@ where
         let facts = entries.iter().filter_map(offer_facts).collect::<Vec<_>>();
         if candidates.len() == 1 && !facts.iter().any(|fact| fact.operation_id == candidates[0]) {
             let operation_id = candidates[0];
+            // The single-candidate repair read (W3F-1, W3F-5): the
+            // candidate is resolved against the full offer history with
+            // exactly the judgment the multi-candidate path applies — the
+            // retry must never blind-merge a different-target dispatch
+            // into the existing id, and an in-flight or scan-truncated
+            // offer returns in flight or re-delivers under the same id as
+            // the documentation promises. Only a record the history does
+            // not know at all was never enqueued — the offer a failed
+            // dispatch stranded — and its offer is delivered now; a
+            // history-known candidate whose offers target a different
+            // resource is a different operation on the same endpoint and
+            // command, and the retry starts fresh below.
+            let history = self.offer_history(request.site_id).await?;
+            if let Some(dispatched) = self
+                .resolve_candidate(request, operation_id, &facts, Some(&history), now)
+                .await?
+            {
+                return Ok(Some(dispatched));
+            }
+            if history.iter().any(|fact| fact.operation_id == operation_id) {
+                return Ok(None);
+            }
             tracing::warn!(
                 "site {}: delivering the offer a failed dispatch stranded for operation \
                  {operation_id}",
@@ -692,6 +719,13 @@ enum ReplyTarget {
     Running,
     /// The site refused the offer or the operation failed.
     Failed,
+    /// The site reports a provable endpoint-side limitation: this write's
+    /// capability is unsupported (E3-4). The domain state machine has no
+    /// unsupported state, so the tracking record lands in the honest
+    /// terminal [`OperationState::Failed`] while the classification is
+    /// recorded as the operation's §13.7 failure kind — the receipt stays
+    /// distinct from an ordinary failure.
+    Unsupported,
     /// The site cancelled the operation and can prove that it stopped.
     Cancelled,
     /// The site cannot prove the operation's final result.
@@ -713,7 +747,10 @@ impl ReplyTarget {
                 OperationEvent::ValidationStarted,
                 OperationEvent::ValidationPassed,
             ],
-            Self::Failed => &[OperationEvent::Failed],
+            // `Unsupported` lands in the same honest terminal state (E3-4):
+            // the domain state machine has no unsupported state, and the
+            // receipt path records the classification separately.
+            Self::Failed | Self::Unsupported => &[OperationEvent::Failed],
             Self::Cancelled => &[OperationEvent::CancellationRequested],
             Self::Unknown => &[
                 OperationEvent::ValidationStarted,
@@ -848,6 +885,22 @@ where
                 // the center never credits the reply.
                 self.record_reply(site, envelope, operation_id, now).await?;
                 return Ok(());
+            }
+            // E3-4: a `failed-unsupported` receipt is classified as the
+            // operation's §13.7 failure kind. The kind is written before
+            // the state transition — the same ordering as the site's
+            // refusal path (`operation_executor`), so a crash between the
+            // two writes leaves either an unclassified failure or an
+            // orphaned kind on a non-terminal row, both harmless per the
+            // `OperationStore::record_failure_kind` contract. The write is
+            // unconditional on the credited path: the kind is a fact of
+            // the reply being credited, and a re-delivered receipt
+            // re-records the same value idempotently.
+            if target == ReplyTarget::Unsupported {
+                self.store
+                    .record_failure_kind(operation_id, FailureKind::CapabilityUnsupported)
+                    .await
+                    .map_err(CenterOperationTrackingError::Operation)?;
             }
             // The state machine is the idempotency point: the events that
             // do not apply (the record is already at the target or
@@ -1012,6 +1065,26 @@ fn reply_operation_id(message: Option<&EnvelopeMessage>) -> Option<OperationId> 
     operation_id.parse().ok()
 }
 
+/// The `OperationCompleted` summary prefix of the E3-4 refusal
+/// classification: a `Failed` operation whose persisted §13.7 failure kind
+/// is `capability-unsupported` is summarized as `failed-unsupported` by the
+/// site (`CenterSync::completed_summary` in `application/src/center_sync.rs`;
+/// the `OperationCompleted.summary` contract in
+/// `center-protocol/proto/rutilus/center/v1/center.proto`), so the center's
+/// receipt can recognize the endpoint-side limitation instead of letting the
+/// unparseable summary fall through to the plain failure. The recognition is
+/// a value addition to the existing summary field, never a wire change.
+///
+/// The console tracking response cannot surface the classification yet:
+/// `CenterOperationResponse` has no unsupported phase in its state
+/// vocabulary and no classification field, and the wire is fixed, so the
+/// tracking view keeps reporting the plain `failed` phase — the vocabulary
+/// addition is tracked by the existing TODO(W3C-3) at
+/// `web/src/lib.rs:4084`. Within the center's domain layer the
+/// classification survives on the tracking record (the §13.7 failure kind
+/// the receipt path records) and in the durable receipt payload.
+const UNSUPPORTED_SUMMARY_PREFIX: &str = "failed-unsupported";
+
 /// The tracking target of one reply message.
 fn reply_target(message: Option<&EnvelopeMessage>) -> Option<ReplyTarget> {
     match message {
@@ -1026,12 +1099,21 @@ fn reply_target(message: Option<&EnvelopeMessage>) -> Option<ReplyTarget> {
                 // The wire contract distinguishes the terminal outcomes
                 // within the existing fields: the site reports its stable
                 // operation state code in the summary, so the receipt must
-                // not collapse `Unknown` and `Cancelled` into `Failed`. A
-                // summary that names no stable state is a plain failure.
-                match completed.summary.parse::<OperationState>() {
-                    Ok(OperationState::Cancelled) => Some(ReplyTarget::Cancelled),
-                    Ok(OperationState::Unknown) => Some(ReplyTarget::Unknown),
-                    _ => Some(ReplyTarget::Failed),
+                // not collapse `Unknown` and `Cancelled` into `Failed`.
+                // The E3-4 refusal vocabulary is recognized before the
+                // stable-state parse — a summary carrying the
+                // `failed-unsupported` prefix is the capability
+                // classification (see [`UNSUPPORTED_SUMMARY_PREFIX`]) —
+                // and a summary that names no stable state is a plain
+                // failure.
+                if completed.summary.starts_with(UNSUPPORTED_SUMMARY_PREFIX) {
+                    Some(ReplyTarget::Unsupported)
+                } else {
+                    match completed.summary.parse::<OperationState>() {
+                        Ok(OperationState::Cancelled) => Some(ReplyTarget::Cancelled),
+                        Ok(OperationState::Unknown) => Some(ReplyTarget::Unknown),
+                        _ => Some(ReplyTarget::Failed),
+                    }
                 }
             }
         }
@@ -1173,6 +1255,9 @@ mod tests {
     #[derive(Clone)]
     struct MockDispatchState {
         operations: Arc<Mutex<HashMap<OperationId, Operation>>>,
+        // The persisted §13.7 failure-kind code string, mirroring the
+        // `operations.failure_kind` column of the real store.
+        failure_kinds: Arc<Mutex<HashMap<OperationId, String>>>,
         endpoint: Arc<Mutex<Option<(EndpointId, InstanceId)>>>,
         endpoints: Arc<Mutex<Vec<EndpointProjectionWrite>>>,
         resources: Arc<Mutex<Vec<(EndpointId, String)>>>,
@@ -1187,6 +1272,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 operations: Arc::new(Mutex::new(HashMap::new())),
+                failure_kinds: Arc::new(Mutex::new(HashMap::new())),
                 endpoint: Arc::new(Mutex::new(None)),
                 endpoints: Arc::new(Mutex::new(Vec::new())),
                 resources: Arc::new(Mutex::new(Vec::new())),
@@ -1488,10 +1574,46 @@ mod tests {
 
         fn record_failure_kind(
             &self,
-            _operation_id: OperationId,
-            _kind: FailureKind,
+            operation_id: OperationId,
+            kind: FailureKind,
         ) -> OperationBoundaryFuture<'_, Result<(), Self::Error>> {
-            Box::pin(async move { Ok(()) })
+            Box::pin(async move {
+                // The persistence store refuses an unknown id (`NotFound`);
+                // the mock mirrors the contract.
+                if !self
+                    .state
+                    .operations
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .contains_key(&operation_id)
+                {
+                    return Err(MockStoreError);
+                }
+                self.state
+                    .failure_kinds
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .insert(operation_id, kind.as_str().to_owned());
+                Ok(())
+            })
+        }
+
+        fn find_failure_kind(
+            &self,
+            operation_id: OperationId,
+        ) -> OperationBoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+            Box::pin(async move {
+                // A stored code this build cannot classify is a corrupt
+                // row, exactly like the persistence store's read.
+                self.state
+                    .failure_kinds
+                    .lock()
+                    .map_err(|_| MockStoreError)?
+                    .get(&operation_id)
+                    .map(|code| code.parse::<FailureKind>())
+                    .transpose()
+                    .map_err(|_| MockStoreError)
+            })
         }
 
         fn list_operations(
@@ -2561,8 +2683,11 @@ mod tests {
         // (§15.4), but no reply has landed yet — the operation is still
         // undecided. The idempotency scan reads only pending offers, so
         // the acked row is delivered history and is never decrypted for a
-        // retry; the retry re-delivers the same operation id, which the
-        // site's §17.5 idempotency absorbs with its recorded state.
+        // retry; the history read resolves the single candidate exactly
+        // like the multi-candidate path (W3F-5): the offer is still
+        // actionable, so the retry returns the operation in flight with
+        // its original expiry — nothing is re-sent under the id the site
+        // already processed (§17.5 idempotency).
         let entries = state.entries_owned();
         assert_eq!(entries.len(), 1);
         store
@@ -2575,6 +2700,7 @@ mod tests {
             )
             .await?;
         assert_eq!(retry.operation_id(), first.operation_id());
+        assert_eq!(retry.expires_at(), first.expires_at());
         let entries = state.entries_owned();
         assert_eq!(
             entries
@@ -2589,8 +2715,8 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.state() == OutboxEntryState::Pending)
                 .count(),
-            1,
-            "the retry delivers one fresh offer under the same id"
+            0,
+            "an in-flight offer is returned in flight, never re-delivered"
         );
         assert_eq!(
             state.operations.lock().map_err(|_| MockStoreError)?.len(),
@@ -2742,6 +2868,129 @@ mod tests {
             state.operations.lock().map_err(|_| MockStoreError)?.len(),
             2,
             "no third tracking record is created"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_single_candidate_repair_never_merges_a_different_target_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        // W3F-1: A(X) is in flight — its offer was acknowledged by the
+        // site with the reply lost — when Y, the same endpoint and command
+        // with a different target, is dispatched. The single-candidate
+        // repair must verify the candidate's target against the offer
+        // history before reusing its id: Y is a different operation
+        // (§17.5 keys the target), so it starts fresh instead of being
+        // silently merged into X's id — a merged offer would never execute
+        // (the site answers the duplicate X under its recorded state).
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        state
+            .resources
+            .lock()
+            .map_err(|_| MockStoreError)?
+            .push((endpoint_id, String::from("/redfish/v1/Chassis/1")));
+
+        // A(X): the /Systems/1 dispatch, whose offer the site acknowledges
+        // without ever answering — the in-flight, reply-lost scenario.
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        let entries = state.entries_owned();
+        assert_eq!(entries.len(), 1);
+        store
+            .acknowledge(entries[0].id(), now + Duration::SECOND)
+            .await?;
+
+        // Y: the same endpoint and command with another target. The retry
+        // must not merge Y into X's id: a fresh id is minted, its own
+        // offer is delivered, and X's tracking record stays untouched.
+        let second = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Chassis/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        assert_ne!(second.operation_id(), first.operation_id());
+        let offers = state.offers_owned();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[1].target, "/redfish/v1/Chassis/1");
+        assert_eq!(offers[1].operation_id, second.operation_id().to_string());
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            2,
+            "the different-target dispatch is its own tracking record"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_single_candidate_repair_revives_an_expired_acked_offer_under_the_same_id()
+    -> Result<(), Box<dyn Error>> {
+        // W3F-5: the single-candidate repair resolves against the full
+        // offer history like a multi-candidate retry — an acknowledged
+        // offer past its §15.6 TTL is retired and re-delivered under the
+        // same id, the same §17.5 key, never a second identity.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+
+        let first = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        // The site processed the offer and acknowledged the frame; the
+        // reply is lost, and the retry comes only after the offer's TTL
+        // passed.
+        let entries = state.entries_owned();
+        assert_eq!(entries.len(), 1);
+        store
+            .acknowledge(entries[0].id(), now + Duration::SECOND)
+            .await?;
+        let retry_at = now + CENTER_OFFER_TTL + Duration::SECOND;
+        let retry = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                retry_at,
+            )
+            .await?;
+        assert_eq!(retry.operation_id(), first.operation_id());
+        assert_eq!(retry.expires_at(), retry_at + CENTER_OFFER_TTL);
+        let entries = state.entries_owned();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Acked)
+                .count(),
+            1,
+            "the stale offer row stays retired history"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.state() == OutboxEntryState::Pending)
+                .count(),
+            1,
+            "the retry delivers one fresh offer under the same id"
+        );
+        assert_eq!(
+            state.operations.lock().map_err(|_| MockStoreError)?.len(),
+            1,
+            "no second tracking record is created"
         );
         Ok(())
     }
@@ -3065,6 +3314,175 @@ mod tests {
                 .ok_or("the tracking record is missing")?
                 .state(),
             OperationState::Failed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reply_target_recognizes_the_unsupported_summary_prefix() {
+        let completed = |summary: &str, succeeded: bool| {
+            Some(EnvelopeMessage::OperationCompleted(OperationCompleted {
+                operation_id: String::new(),
+                succeeded,
+                summary: summary.to_owned(),
+            }))
+        };
+        // E3-4: the `failed-unsupported` summary prefix is the capability
+        // classification — recognized exactly, and with a detail suffix.
+        assert_eq!(
+            reply_target(completed("failed-unsupported", false).as_ref()),
+            Some(ReplyTarget::Unsupported)
+        );
+        assert_eq!(
+            reply_target(completed("failed-unsupported: reset is not supported", false).as_ref()),
+            Some(ReplyTarget::Unsupported)
+        );
+        // The stable-state codes keep their own classifications, and a
+        // summary naming no stable state is a plain failure.
+        assert_eq!(
+            reply_target(completed("failed", false).as_ref()),
+            Some(ReplyTarget::Failed)
+        );
+        assert_eq!(
+            reply_target(completed("cancelled", false).as_ref()),
+            Some(ReplyTarget::Cancelled)
+        );
+        assert_eq!(
+            reply_target(completed("unknown", false).as_ref()),
+            Some(ReplyTarget::Unknown)
+        );
+        // The unsupported vocabulary never overrides a successful outcome.
+        assert_eq!(
+            reply_target(completed("failed-unsupported", true).as_ref()),
+            Some(ReplyTarget::Succeeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_receipt_tracks_distinct_from_a_plain_failure()
+    -> Result<(), Box<dyn Error>> {
+        // E3-4/W3C-3: the site's `failed-unsupported` summary is a `Failed`
+        // operation whose persisted §13.7 failure kind is
+        // `capability-unsupported`. The center's receipt must not collapse
+        // it into an ordinary failure: the tracking record lands in the
+        // honest terminal `Failed` (the domain state machine has no
+        // unsupported state) and carries the classification as its failure
+        // kind, where a plain failure stays unclassified.
+        let (store, state) = MockDispatchStore::new();
+        let dispatch = CenterOperationDispatch::new(store.clone(), store.clone(), store.clone());
+        let now = base_time();
+        let site = InstanceId::generate();
+        let endpoint_id = EndpointId::generate();
+        let actor = PrincipalId::generate();
+        seed_dispatch_route(&state, site, endpoint_id, actor, now)?;
+        let tracking = CenterOperationTracking::new(store.clone(), store.clone());
+
+        // The unsupported report arrives with the accepted reply lost (the
+        // §15.6 heal path): the terminal report still lands, healing the
+        // lagging record, and the receipt row is born at the `Completed`
+        // phase carrying the report's envelope verbatim.
+        let unsupported = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now,
+            )
+            .await?;
+        complete_reply(
+            &tracking,
+            site,
+            unsupported.operation_id(),
+            "failed-unsupported",
+            now + Duration::SECOND,
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(unsupported.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Failed
+        );
+        assert_eq!(
+            store.find_failure_kind(unsupported.operation_id()).await?,
+            Some(FailureKind::CapabilityUnsupported)
+        );
+
+        // The plain failure lands in the same honest terminal state without
+        // any classification.
+        let plain = dispatch
+            .dispatch(
+                &request(site, endpoint_id, "/redfish/v1/Systems/1", actor)?,
+                now + Duration::seconds(2),
+            )
+            .await?;
+        accept_reply(
+            &tracking,
+            site,
+            plain.operation_id(),
+            now + Duration::seconds(3),
+        )
+        .await?;
+        complete_reply(
+            &tracking,
+            site,
+            plain.operation_id(),
+            "failed",
+            now + Duration::seconds(4),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(plain.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Failed
+        );
+        assert_eq!(store.find_failure_kind(plain.operation_id()).await?, None);
+
+        // The durable receipts keep the distinction legible in the audit
+        // trail: the unsupported receipt is born at the `Completed` phase
+        // with the report's envelope (the `failed-unsupported` vocabulary),
+        // while the plain receipt's payload is the acceptance that led it —
+        // neither carries the refusal vocabulary.
+        let receipts = state.inbox_entries_owned();
+        assert_eq!(receipts.len(), 2);
+        let unsupported_receipt = receipts
+            .iter()
+            .find(|entry| entry.operation_id() == unsupported.operation_id())
+            .ok_or("the unsupported receipt is missing")?;
+        let plain_receipt = receipts
+            .iter()
+            .find(|entry| entry.operation_id() == plain.operation_id())
+            .ok_or("the plain receipt is missing")?;
+        assert_eq!(unsupported_receipt.state(), InboxEntryState::Completed);
+        assert_eq!(plain_receipt.state(), InboxEntryState::Completed);
+        assert!(
+            unsupported_receipt
+                .payload_json()
+                .contains("failed-unsupported")
+        );
+        assert!(!plain_receipt.payload_json().contains("failed-unsupported"));
+
+        // A re-delivered unsupported receipt is absorbed: the record stays
+        // terminal and the classification is re-recorded idempotently.
+        complete_reply(
+            &tracking,
+            site,
+            unsupported.operation_id(),
+            "failed-unsupported",
+            now + Duration::seconds(5),
+        )
+        .await?;
+        assert_eq!(
+            state
+                .find_operation_owned(unsupported.operation_id())
+                .ok_or("the tracking record is missing")?
+                .state(),
+            OperationState::Failed
+        );
+        assert_eq!(
+            store.find_failure_kind(unsupported.operation_id()).await?,
+            Some(FailureKind::CapabilityUnsupported)
         );
         Ok(())
     }

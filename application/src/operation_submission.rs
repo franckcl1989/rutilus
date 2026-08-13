@@ -29,8 +29,8 @@
 use std::{collections::BTreeSet, error::Error};
 
 use rutilus_domain::{
-    BatchOperation, EndpointId, Operation, OperationId, OperationSource, OperationState,
-    OperationTarget, RedfishCommand,
+    BatchOperation, EndpointId, FailureKind, Operation, OperationId, OperationSource,
+    OperationState, OperationTarget, RedfishCommand,
 };
 use rutilus_operation_engine::{EngineError, MAX_BATCH_TARGETS, OperationEngine, OperationStore};
 use thiserror::Error;
@@ -193,43 +193,77 @@ where
         Ok(())
     }
 
-    /// Lists persisted operations, optionally filtered by exact state.
+    /// Lists persisted operations, optionally filtered by exact state, each
+    /// paired with its persisted §13.7 failure classification (E3-4).
     ///
     /// The optional filter is forwarded unchanged to the engine; `None` lists
     /// every operation. Batch reporting (design section 13.7) filters per
-    /// state to summarize outcomes.
+    /// state to summarize outcomes. Each row is paired with the kind its
+    /// operation is classified with — `None` for every operation that is not
+    /// a classified failure — read through the store boundary's
+    /// [`OperationStore::find_failure_kind`], so the console history renders
+    /// a provably-unsupported refusal instead of an ordinary failure. One
+    /// classification read per row keeps the bounded console listing honest
+    /// without a new classified-listing boundary.
     ///
     /// # Errors
     ///
     /// Returns [`SubmissionError::Store`] when the engine cannot read the
-    /// operation store.
+    /// operation store or a classification lookup fails.
     pub async fn list(
         &self,
         state: Option<OperationState>,
-    ) -> Result<Vec<Operation>, SubmissionError<Store::Error, Lookup::Error>> {
+    ) -> Result<Vec<(Operation, Option<FailureKind>)>, SubmissionError<Store::Error, Lookup::Error>>
+    {
         let engine = OperationEngine::new(&self.store);
-        engine.list(state).await.map_err(SubmissionError::Store)
+        let operations = engine.list(state).await.map_err(SubmissionError::Store)?;
+        let mut classified = Vec::with_capacity(operations.len());
+        for operation in operations {
+            let kind = self
+                .store
+                .find_failure_kind(operation.id())
+                .await
+                .map_err(|source| SubmissionError::Store(EngineError::Store(source)))?;
+            classified.push((operation, kind));
+        }
+        Ok(classified)
     }
 
-    /// Reads one operation by id; `None` when the id is unknown.
+    /// Reads one operation by id, paired with its persisted §13.7 failure
+    /// classification (E3-4); `None` when the id is unknown.
     ///
     /// The engine has no single-record read (its `apply` path reads before a
     /// transition), so this use case forwards the id to the store boundary
-    /// directly — the same read the engine itself relies on. The raw store
-    /// failure is wrapped in the engine's `Store` verdict so the submission
-    /// error surface stays one variant per boundary.
+    /// directly — the same read the engine itself relies on — and reads the
+    /// classification through [`OperationStore::find_failure_kind`]. The raw
+    /// store failures are wrapped in the engine's `Store` verdict so the
+    /// submission error surface stays one variant per boundary.
     ///
     /// # Errors
     ///
-    /// Returns [`SubmissionError::Store`] when the operation store read fails.
+    /// Returns [`SubmissionError::Store`] when the operation store read or
+    /// the classification lookup fails.
     pub async fn find(
         &self,
         operation_id: OperationId,
-    ) -> Result<Option<Operation>, SubmissionError<Store::Error, Lookup::Error>> {
-        self.store
+    ) -> Result<
+        Option<(Operation, Option<FailureKind>)>,
+        SubmissionError<Store::Error, Lookup::Error>,
+    > {
+        let Some(operation) = self
+            .store
             .find_operation(operation_id)
             .await
-            .map_err(|source| SubmissionError::Store(EngineError::Store(source)))
+            .map_err(|source| SubmissionError::Store(EngineError::Store(source)))?
+        else {
+            return Ok(None);
+        };
+        let kind = self
+            .store
+            .find_failure_kind(operation_id)
+            .await
+            .map_err(|source| SubmissionError::Store(EngineError::Store(source)))?;
+        Ok(Some((operation, kind)))
     }
 }
 
@@ -302,6 +336,15 @@ mod tests {
         rows: Mutex<HashMap<OperationId, Operation>>,
         batch_rows: Mutex<HashMap<BatchOperationId, BatchOperation>>,
         batch_children: Mutex<HashMap<BatchOperationId, Vec<Operation>>>,
+        /// The recorded §13.7 failure classifications, read back through
+        /// `find_failure_kind` like the production column.
+        //
+        // `FailureKind` is a zero-sized enum today (its single variant
+        // carries no data), but the value is deliberately not a set: the
+        // boundary records and reads a *kind*, and a future second variant
+        // must keep the mock faithful.
+        #[allow(clippy::zero_sized_map_values)]
+        failure_kinds: Mutex<HashMap<OperationId, FailureKind>>,
     }
 
     impl MockStore {
@@ -310,6 +353,10 @@ mod tests {
                 rows: Mutex::new(HashMap::new()),
                 batch_rows: Mutex::new(HashMap::new()),
                 batch_children: Mutex::new(HashMap::new()),
+                // The kind-valued map shape mirrors the boundary (see the
+                // field's allow); the lint would prefer a set.
+                #[allow(clippy::zero_sized_map_values)]
+                failure_kinds: Mutex::new(HashMap::new()),
             }
         }
 
@@ -439,12 +486,33 @@ mod tests {
 
         fn record_failure_kind(
             &self,
-            _operation_id: OperationId,
-            _kind: rutilus_domain::FailureKind,
+            operation_id: OperationId,
+            kind: rutilus_domain::FailureKind,
         ) -> BoundaryFuture<'_, Result<(), Self::Error>> {
-            // The submission paths never classify failures; the executor's
-            // refusal path owns that write, so this stub is unreachable here.
-            Box::pin(async move { Ok(()) })
+            // The executor's refusal path owns the write in production; the
+            // query tests record through the same boundary so the classified
+            // listing reads a real classification.
+            Box::pin(async move {
+                self.failure_kinds
+                    .lock()
+                    .map_err(|_| MockError::Store)?
+                    .insert(operation_id, kind);
+                Ok(())
+            })
+        }
+
+        fn find_failure_kind(
+            &self,
+            operation_id: OperationId,
+        ) -> BoundaryFuture<'_, Result<Option<FailureKind>, Self::Error>> {
+            Box::pin(async move {
+                Ok(self
+                    .failure_kinds
+                    .lock()
+                    .map_err(|_| MockError::Store)?
+                    .get(&operation_id)
+                    .copied())
+            })
         }
 
         fn list_operations(
@@ -749,20 +817,84 @@ mod tests {
         assert_eq!(all.len(), 2);
         let queued_only = submission.list(Some(OperationState::Queued)).await?;
         assert_eq!(queued_only.len(), 1);
-        assert_eq!(queued_only[0], queued);
+        assert_eq!(queued_only[0].0, queued);
+        assert_eq!(queued_only[0].1, None);
         let succeeded_only = submission.list(Some(OperationState::Succeeded)).await?;
         assert_eq!(succeeded_only.len(), 1);
-        assert_eq!(succeeded_only[0], succeeded);
+        assert_eq!(succeeded_only[0].0, succeeded);
+        assert_eq!(succeeded_only[0].1, None);
         assert_eq!(
             submission.list(Some(OperationState::Failed)).await?,
             Vec::new()
         );
 
-        assert_eq!(submission.find(queued.id()).await?, Some(queued));
+        assert_eq!(submission.find(queued.id()).await?, Some((queued, None)));
         assert_eq!(
             submission.find(OperationId::generate()).await?,
             None,
             "an unknown operation id must read back as None"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_and_find_carry_the_persisted_failure_classification() -> Result<(), Box<dyn Error>>
+    {
+        let store = MockStore::new();
+        let endpoint = managed_endpoint()?;
+        let lookup = MockLookup {
+            endpoints: vec![endpoint.clone()],
+            fail_lookup: false,
+        };
+        let submission = OperationSubmission::new(&store, &lookup);
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let target = OperationTarget::new(TargetId::generate(), endpoint.id());
+        let failed = Operation::try_from_parts(
+            OperationId::generate(),
+            OperationSource::Standalone,
+            vec![target],
+            one_command(),
+            OperationState::Failed,
+            now,
+            now + Duration::SECOND,
+        )?;
+        store.create_operation(&failed).await?;
+        store
+            .record_failure_kind(failed.id(), FailureKind::CapabilityUnsupported)
+            .await?;
+
+        // The listing carries the recorded kind per row (E3-4), so the
+        // console history renders the provably-unsupported refusal instead
+        // of an ordinary failure.
+        let listed = submission.list(None).await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, failed);
+        assert_eq!(listed[0].1, Some(FailureKind::CapabilityUnsupported));
+        // The single-record read carries the same classification.
+        assert_eq!(
+            submission.find(failed.id()).await?,
+            Some((failed, Some(FailureKind::CapabilityUnsupported)))
+        );
+
+        // An operation without a recorded classification reads back as
+        // `None`, exactly like the unclassified rows of the batch path.
+        let succeeded = Operation::try_from_parts(
+            OperationId::generate(),
+            OperationSource::Site,
+            vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+            one_command(),
+            OperationState::Succeeded,
+            now,
+            now + Duration::SECOND,
+        )?;
+        store.create_operation(&succeeded).await?;
+        assert_eq!(
+            submission.find(succeeded.id()).await?,
+            Some((succeeded.clone(), None))
+        );
+        assert_eq!(
+            submission.list(Some(OperationState::Succeeded)).await?,
+            vec![(succeeded, None)]
         );
         Ok(())
     }

@@ -8163,6 +8163,13 @@ fn wire_command_summary(command: &RedfishCommand) -> CommandSummaryProjection {
 }
 
 /// Projects one wire operation onto its list card.
+///
+/// The card deliberately renders only the lifecycle-phase badge: the wire
+/// now carries the §13.7 failure classification (`failure_kind`, E3-4), so
+/// a provably-unsupported refusal could render its own badge, but the
+/// console cut shows the failure phase and defers the classification badge
+/// to the next iteration — the honest limitation is the rendering, not the
+/// wire, which the fetch layer already parses.
 #[cfg(any(target_arch = "wasm32", test))]
 impl From<&OperationResponse> for OperationCardProjection {
     fn from(response: &OperationResponse) -> Self {

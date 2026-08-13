@@ -298,6 +298,19 @@ jobs:
           # covers target/ wholesale) — so the pinned 0.2.126 binary is
           # restored on later runs instead of recompiled from scratch. That
           # is the existing mitigation for the per-run install cost.
+          #
+          # Supply-chain integrity (W3S-9, 2026-08-13): the install has no
+          # explicit checksum because cargo already verifies one — every
+          # package downloaded from crates.io is checked against the SHA-256
+          # published in the registry index (served over HTTPS) before it
+          # builds, and a mismatch fails the install. That is the same
+          # integrity chain every Cargo.lock dependency of the workspace
+          # relies on; this binary is additionally pinned to 0.2.126, the
+          # exact workspace wasm-bindgen version. The output-level backstop
+          # is the `diff -q` below: the generated web assets must match the
+          # checked-in files byte-identically, so a tampered or mismatched
+          # toolchain fails this step instead of silently shipping different
+          # artifacts.
           cargo install wasm-bindgen-cli --version 0.2.126 --locked --root target/rutilus-tools
           target/rutilus-tools/bin/wasm-bindgen --target web --no-typescript \
             --out-dir target/wasm-assets --out-name rutilus_ui \
@@ -465,19 +478,27 @@ jobs:
       # would silently embed the `dev` fallback instead (app/src/main.rs)
       # (H4 audit MINOR 1).
       RUTILUS_GIT_COMMIT: ${{ github.sha }}
-      # Step-level `if:` conditions cannot reference `secrets` directly
-      # (GitHub Actions restriction: Unrecognized named-value: 'secrets').
-      # Job-level env mappings below are the official workaround: the step
-      # `if:` guards read `env.<NAME> != ''` (the sign-material checks below)
-      # instead of `secrets.<NAME> != ''`. Values are evaluated at job start,
-      # before any step runs.
-      RUTILUS_WINDOWS_CERT_B64: ${{ secrets.RUTILUS_WINDOWS_CERT_B64 }}
-      RUTILUS_WINDOWS_CERT_THUMBPRINT: ${{ secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT }}
-      RUTILUS_MAC_CERT_ID: ${{ secrets.RUTILUS_MAC_CERT_ID }}
-      RUTILUS_NOTARY_KEY_ID: ${{ secrets.RUTILUS_NOTARY_KEY_ID }}
-      RUTILUS_NOTARY_KEY_B64: ${{ secrets.RUTILUS_NOTARY_KEY_B64 }}
-      RUTILUS_NOTARY_TEAM_ID: ${{ secrets.RUTILUS_NOTARY_TEAM_ID }}
-      RUTILUS_LINUX_SIGN_KEY_B64: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 }}
+      # Sign-material presence flags (W3S-10, 2026-08-13): step-level `if:`
+      # conditions cannot reference `secrets` directly (GitHub Actions
+      # restriction: Unrecognized named-value: 'secrets'), and a step's own
+      # `env` is evaluated only when the step RUNS, so it is not visible to
+      # the step's `if:` — job-level env is the only presence signal the
+      # guards can read. The job-level mappings therefore carry ONLY the
+      # presence of each secret (`true`/`false` strings, evaluated at job
+      # start), never the secret value: the raw material (PFX, .p8, minisign
+      # key) is confined to the materialize/sign steps, which re-declare
+      # their secrets at step level below, and no other step of the job —
+      # checkout, builds, staging, checksums — holds the signing secrets in
+      # its process environment. Absent secrets evaluate to the empty
+      # string, so the flags are exactly as reliable as the former
+      # `env.<NAME> != ''` guards they replace.
+      RUTILUS_WINDOWS_CERT_B64_CONFIGURED: ${{ secrets.RUTILUS_WINDOWS_CERT_B64 != '' }}
+      RUTILUS_WINDOWS_CERT_THUMBPRINT_CONFIGURED: ${{ secrets.RUTILUS_WINDOWS_CERT_THUMBPRINT != '' }}
+      RUTILUS_MAC_CERT_ID_CONFIGURED: ${{ secrets.RUTILUS_MAC_CERT_ID != '' }}
+      RUTILUS_NOTARY_KEY_ID_CONFIGURED: ${{ secrets.RUTILUS_NOTARY_KEY_ID != '' }}
+      RUTILUS_NOTARY_KEY_B64_CONFIGURED: ${{ secrets.RUTILUS_NOTARY_KEY_B64 != '' }}
+      RUTILUS_NOTARY_TEAM_ID_CONFIGURED: ${{ secrets.RUTILUS_NOTARY_TEAM_ID != '' }}
+      RUTILUS_LINUX_SIGN_KEY_B64_CONFIGURED: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -585,7 +606,7 @@ jobs:
       # the password: a password without a certificate cannot sign anything,
       # so it alone must not gate the step.
       - name: Materialize Windows signing certificate (PFX)
-        if: ${{ runner.os == 'Windows' && env.RUTILUS_WINDOWS_CERT_B64 != '' }}
+        if: ${{ runner.os == 'Windows' && env.RUTILUS_WINDOWS_CERT_B64_CONFIGURED == 'true' }}
         shell: pwsh
         env:
           RUTILUS_WINDOWS_CERT_B64: ${{ secrets.RUTILUS_WINDOWS_CERT_B64 }}
@@ -596,7 +617,7 @@ jobs:
           $pfxPath = Join-Path $env:RUNNER_TEMP 'rutilus-windows-cert.pfx'
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String(($env:RUTILUS_WINDOWS_CERT_B64 -replace '\s', '')))
       - name: Sign (Windows Authenticode)
-        if: ${{ runner.os == 'Windows' && (env.RUTILUS_WINDOWS_CERT_B64 != '' || env.RUTILUS_WINDOWS_CERT_THUMBPRINT != '') }}
+        if: ${{ runner.os == 'Windows' && (env.RUTILUS_WINDOWS_CERT_B64_CONFIGURED == 'true' || env.RUTILUS_WINDOWS_CERT_THUMBPRINT_CONFIGURED == 'true') }}
         shell: pwsh
         env:
           # Empty in thumbprint-only mode — the script then ignores the PFX
@@ -610,7 +631,7 @@ jobs:
       # --- macOS Developer ID + notarization (certificate injection point:
       # set the RUTILUS_MAC_CERT_ID and RUTILUS_NOTARY_* secrets) ------------
       - name: Materialize notary API key (.p8)
-        if: ${{ runner.os == 'macOS' && env.RUTILUS_NOTARY_KEY_B64 != '' }}
+        if: ${{ runner.os == 'macOS' && env.RUTILUS_NOTARY_KEY_B64_CONFIGURED == 'true' }}
         env:
           RUTILUS_NOTARY_KEY_B64: ${{ secrets.RUTILUS_NOTARY_KEY_B64 }}
         run: |
@@ -620,7 +641,7 @@ jobs:
           # any line-wrapping in the stored base64.
           printf '%s' "$RUTILUS_NOTARY_KEY_B64" | tr -d '[:space:]' | base64 -D > "$RUNNER_TEMP/rutilus-notary-key.p8"
       - name: Sign (macOS Developer ID)
-        if: ${{ runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID != '' }}
+        if: ${{ runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID_CONFIGURED == 'true' }}
         env:
           RUTILUS_MAC_CERT_ID: ${{ secrets.RUTILUS_MAC_CERT_ID }}
         run: bash scripts/sign-macos.sh release/rutilus-${{ github.ref_name }}-${{ matrix.suffix }}
@@ -629,7 +650,7 @@ jobs:
       # staged artifact), hence the MAC_CERT_ID guard on top of the notary
       # secrets.
       - name: Notarize and staple (macOS)
-        if: ${{ runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID != '' && env.RUTILUS_NOTARY_KEY_ID != '' && env.RUTILUS_NOTARY_KEY_B64 != '' && env.RUTILUS_NOTARY_TEAM_ID != '' }}
+        if: ${{ runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID_CONFIGURED == 'true' && env.RUTILUS_NOTARY_KEY_ID_CONFIGURED == 'true' && env.RUTILUS_NOTARY_KEY_B64_CONFIGURED == 'true' && env.RUTILUS_NOTARY_TEAM_ID_CONFIGURED == 'true' }}
         env:
           RUTILUS_NOTARY_KEY_ID: ${{ secrets.RUTILUS_NOTARY_KEY_ID }}
           RUTILUS_NOTARY_KEY: ${{ secrets.RUTILUS_NOTARY_KEY_B64 != '' && format('{0}/rutilus-notary-key.p8', runner.temp) || '' }}
@@ -643,7 +664,7 @@ jobs:
       # minisign is packaged in Ubuntu universe (apt) and Homebrew. The
       # choice of minisign over gpg is documented in scripts/sign-linux.sh.
       - name: Materialize Linux signing key (minisign)
-        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64_CONFIGURED == 'true' }}
         env:
           RUTILUS_LINUX_SIGN_KEY_B64: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 }}
         run: |
@@ -651,14 +672,14 @@ jobs:
           # into $RUNNER_TEMP (GNU base64 -d; tr strips any line-wrapping).
           printf '%s' "$RUTILUS_LINUX_SIGN_KEY_B64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/rutilus-linux-sign.key"
       - name: Install minisign
-        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64_CONFIGURED == 'true' }}
         run: |
           if ! command -v minisign >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y minisign
           fi
       - name: Sign (Linux, minisign detached)
-        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64 != '' }}
+        if: ${{ runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64_CONFIGURED == 'true' }}
         env:
           RUTILUS_LINUX_SIGN_KEY: ${{ secrets.RUTILUS_LINUX_SIGN_KEY_B64 != '' && format('{0}/rutilus-linux-sign.key', runner.temp) || '' }}
           RUTILUS_LINUX_SIGN_PASSWORD: ${{ secrets.RUTILUS_LINUX_SIGN_PASSWORD }}
@@ -673,7 +694,7 @@ jobs:
       # OS is configured; on macOS the notary key alone cannot sign, so
       # MAC_CERT_ID stays the sign-mode indicator.
       - name: Signing skipped (no certificate configured)
-        if: ${{ (runner.os == 'Windows' && env.RUTILUS_WINDOWS_CERT_B64 == '' && env.RUTILUS_WINDOWS_CERT_THUMBPRINT == '') || (runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID == '') || (runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64 == '') }}
+        if: ${{ (runner.os == 'Windows' && env.RUTILUS_WINDOWS_CERT_B64_CONFIGURED == 'false' && env.RUTILUS_WINDOWS_CERT_THUMBPRINT_CONFIGURED == 'false') || (runner.os == 'macOS' && env.RUTILUS_MAC_CERT_ID_CONFIGURED == 'false') || (runner.os == 'Linux' && env.RUTILUS_LINUX_SIGN_KEY_B64_CONFIGURED == 'false') }}
         run: 'echo "signing skipped: certificate not configured"'
 
       # --- SBOM (workspace-wide; generated once on the x86_64 linux job) ----

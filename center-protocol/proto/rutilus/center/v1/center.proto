@@ -312,13 +312,20 @@ message OperationRejected {
   string detail = 3;
 }
 
-// Why the site refused an `OperationOffer`: the §15.6 re-checks plus
-// authorization and command-validity checks. The §15.6 checklist lists
-// endpoint existence, capability presence, credential validity, target
-// state applicability, and expiration; `NOT_AUTHORIZED` and
-// `INVALID_COMMAND` extend it with the operator-authorization and
-// command-validity checks the site performs before acceptance.
+// Why the site refused an `OperationOffer`. The site performs the §15.6
+// re-checks — endpoint existence, capability presence, credential
+// validity, target state applicability, and expiration — plus the
+// command-validity check (`INVALID_COMMAND`). `NOT_AUTHORIZED` is retained
+// from the §15.6 design checklist as reserved vocabulary: the site
+// performs no operator-authorization check today, so no producer emits
+// that code in this build; any addition to the vocabulary is a value
+// addition, never a wire change.
 enum OperationRejectedReason {
+  // The proto3 zero value: decoded when the field is absent. The site also
+  // sends it deliberately as a sentinel — a duplicate offer that was
+  // already rejected and cannot be revived, when the re-checks now pass —
+  // carrying the explanation in `detail`; the receiver treats zero like
+  // every other non-specific refusal.
   OPERATION_REJECTED_REASON_UNSPECIFIED = 0;
   // The endpoint no longer exists on the site.
   OPERATION_REJECTED_REASON_ENDPOINT_MISSING = 1;
@@ -330,7 +337,9 @@ enum OperationRejectedReason {
   OPERATION_REJECTED_REASON_TARGET_STATE_CHANGED = 4;
   // The offer expired before the site could check it.
   OPERATION_REJECTED_REASON_EXPIRED = 5;
-  // The actor is no longer authorized for this operation.
+  // Reserved §15.6 vocabulary: the actor is no longer authorized for this
+  // operation. The site performs no operator-authorization check in this
+  // build, so no producer emits this code today.
   OPERATION_REJECTED_REASON_NOT_AUTHORIZED = 6;
   // The command is not valid for the current endpoint state.
   OPERATION_REJECTED_REASON_INVALID_COMMAND = 7;
@@ -356,8 +365,15 @@ message OperationCompleted {
   // Whether the operation achieved its result.
   bool succeeded = 2;
 
-  // Summary of the outcome, for example the verified result or the
-  // failure reason.
+  // The site's stable terminal `OperationState::as_str` code (for example
+  // `succeeded`, `failed`, `cancelled`, `unknown`), extended with the
+  // refusal vocabulary: a `Failed` operation whose persisted §13.7 failure
+  // classification is `capability-unsupported` is summarized as
+  // `failed-unsupported` (audit follow-up E3-4), so the center can
+  // distinguish the endpoint-side limitation from an ordinary failure. The
+  // center's receipt treats a summary that names no stable state as a plain
+  // `Failed` outcome; any addition to this vocabulary is a value addition,
+  // never a wire change.
   string summary = 3;
 }
 

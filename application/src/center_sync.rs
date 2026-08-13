@@ -598,18 +598,21 @@ where
         Stop: Future<Output = ()> + Send,
     {
         tokio::pin!(stop);
-        // The consecutive `not-bound` refusal count (audit follow-up F4):
-        // only consecutive refusals converge — a successful connection or
-        // any other failure resets the count, because the convergence
-        // verdict is the center consistently saying the site is not bound.
+        // The `not-bound` refusal count (audit follow-up F4): a
+        // successful connection or a different verdict resets it, and a
+        // generic failure — an unreachable center, a dropped handshake —
+        // carries no verdict about the binding and no longer resets it
+        // (W3N-5): the convergence verdict is the center consistently
+        // saying the site is not bound, and a flaky transport must not
+        // postpone that verdict forever.
         let mut consecutive_not_bound: u64 = 0;
-        // The consecutive `identity-mismatch` refusal count (audit
-        // follow-up E3-2, C5-10): the same consecutive-refusal verdict,
-        // kept separate from `not-bound` because the two refusals mean
-        // different things — one says the binding is not in force (the
-        // runtime converges), the other says the declared identity
-        // disagrees with the binding (the runtime stops without touching
-        // the binding).
+        // The `identity-mismatch` refusal count (audit follow-up E3-2,
+        // C5-10): the same verdict-accumulation semantics as `not-bound`,
+        // kept separate because the two refusals mean different things —
+        // one
+        // says the binding is not in force (the runtime converges), the
+        // other says the declared identity disagrees with the binding (the
+        // runtime stops without touching the binding).
         let mut consecutive_identity_mismatch: u64 = 0;
         loop {
             let session = tokio::select! {
@@ -661,8 +664,20 @@ where
                                 return Err(CenterSyncError::IdentityMismatch);
                             }
                         } else {
-                            consecutive_not_bound = 0;
-                            consecutive_identity_mismatch = 0;
+                            // A generic failure carries no verdict about
+                            // the binding: the counters answer what the
+                            // center says, and an unreachable center or a
+                            // dropped handshake says nothing (W3N-5). Not
+                            // resetting keeps a flaky transport from
+                            // postponing the convergence forever — the
+                            // trade-off is that the count is no longer
+                            // strictly consecutive in wall-clock terms: it
+                            // counts the same-verdict refusals since the
+                            // last successful connection or the last
+                            // different verdict, ignoring the noise in
+                            // between. A successful connection still
+                            // resets both, because the center accepted the
+                            // site and the binding is in force.
                         }
                         // §15.3: a center without a common protocol version
                         // rejects the negotiation, and an unreachable center
@@ -1131,6 +1146,15 @@ where
     /// carries the current state. When no operation exists, the acceptance
     /// never happened — the crash window between the inbox insert and the
     /// operation create — and the rechecks run again.
+    ///
+    /// Both answer paths keep the entry's phase truthful about the
+    /// operation's facts: a `Received` entry with an existing operation is
+    /// the crash window between the operation create and the entry advance,
+    /// repaired to the in-flight phase (W3N-2) — so a re-delivered offer's
+    /// later `Accepted` is always legal and the site's tracking reflects
+    /// the execution — and the in-progress reply records the reported
+    /// state in the progress map (W3N-3), so the next connection does not
+    /// re-send the same progress.
     async fn reply_to_in_progress_duplicate(
         &self,
         offer: &OperationOffer,
@@ -1177,6 +1201,26 @@ where
                 },
             ))
             .await?;
+            // W3N-2: the operation exists, so the offer was accepted — the
+            // entry's phase must say so. The crash window (the operation
+            // created before the entry advanced) leaves the entry
+            // `Received`; advancing it to the in-flight phase here keeps
+            // the site's tracking truthful about the execution facts and
+            // makes every later re-delivery's `Accepted` legal. The advance
+            // is an idempotent no-op for an entry already accepted.
+            self.inbox
+                .advance(operation_id, InboxEvent::Accepted)
+                .await
+                .map_err(CenterSyncError::Inbox)?;
+            // W3N-3: the reply is recorded in the progress map after a
+            // successful enqueue — a failed queue write leaves the state
+            // unreported for the next connection, exactly like the
+            // reconnect report's map write — so the next connection does
+            // not re-send the progress the center just received.
+            self.last_progress
+                .lock()
+                .map_err(|_| CenterSyncError::ProgressTracking)?
+                .insert(operation_id, Some(operation.state()));
         }
         Ok(OfferOutcome::DuplicateProgress)
     }
@@ -4013,6 +4057,162 @@ mod tests {
         Ok(())
     }
 
+    /// The duplicate-offer progress reply is recorded in the progress map
+    /// (audit follow-up W3N-3): a re-delivered offer answers with the
+    /// operation's current state, and the next connection's report must not
+    /// re-send the same progress — the center just received it.
+    #[tokio::test]
+    async fn a_duplicate_offer_progress_is_not_replayed_after_a_reconnect()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+        let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
+        assert_eq!(
+            engine.handle_offer(&offer, &received).await?,
+            OfferOutcome::Accepted
+        );
+        // The redelivered offer (the center's TTL retirement) arrives
+        // before the state was ever reported: the duplicate answer queues
+        // the progress and records it as reported.
+        assert_eq!(
+            engine.handle_offer(&offer, &received).await?,
+            OfferOutcome::DuplicateProgress
+        );
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages.get(1),
+            Some(EnvelopeMessage::OperationProgress(progress))
+                if progress.operation_id == offer.operation_id
+        ));
+        // The reconnect report re-reads the unchanged operation: the
+        // recorded state was already reported, so nothing is re-sent.
+        engine.report_center_operations().await?;
+        assert_eq!(
+            outbox.pending_messages()?.len(),
+            2,
+            "the duplicate-offer progress must not be replayed"
+        );
+        Ok(())
+    }
+
+    /// The TTL retirement race (audit follow-up W3N-2): the center
+    /// re-delivers an offer under the same id while the site's reply for
+    /// the first delivery is in flight. When the redelivery lands while
+    /// the entry is still in the crash-window `Received` phase, the
+    /// duplicate answer repairs the entry to the in-flight phase — the
+    /// operation exists, so it was accepted — and the final adjudication
+    /// stays correct: one execution, the terminal report delivered exactly
+    /// once, the entry closed, and every later re-delivery answered from
+    /// the recorded outcome.
+    #[tokio::test]
+    async fn a_redelivered_offer_after_ttl_retirement_adjudicates_the_operation_cleanly()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let instance_id = InstanceId::generate();
+        let (store, endpoint) = fully_prepared_store(now)?;
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = engine_over(&store, &outbox, &inbox, &cursor, &events, instance_id, now);
+        let (offer, received) = offer_for(instance_id, endpoint.id(), now.unix_timestamp() + 3600)?;
+        let operation_id: OperationId = offer.operation_id.parse()?;
+        // The previous run's crash window: the operation was accepted and
+        // persisted, but the entry never advanced past `Received` — the
+        // redelivery lands with the reply for the first delivery in
+        // flight.
+        store
+            .create_operation(&Operation::new(
+                operation_id,
+                OperationSource::Center,
+                vec![OperationTarget::new(TargetId::generate(), endpoint.id())],
+                RedfishCommand::System(SystemCommand::Reset(ResetType::PowerCycle)),
+                now,
+            ))
+            .await
+            .map_err(std::io::Error::other)?;
+        CenterInbox::insert(
+            &inbox,
+            &InboxEntry::new(
+                InboxEntryId::generate(),
+                operation_id,
+                instance_id,
+                serde_json::to_string(&received).map_err(std::io::Error::other)?,
+                now + time::Duration::seconds(3600),
+                now,
+            ),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+
+        // The redelivered offer is answered with the recorded state, and
+        // the crash-window entry repairs to the in-flight phase: the
+        // site's tracking reflects that the operation was accepted.
+        assert_eq!(
+            engine.handle_offer(&offer, &received).await?,
+            OfferOutcome::DuplicateProgress
+        );
+        assert_eq!(
+            inbox.entry_state(operation_id)?,
+            Some(InboxEntryState::Accepted),
+            "the duplicate answer must repair the crash-window entry phase"
+        );
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(EnvelopeMessage::OperationProgress(progress))
+                if progress.operation_id == offer.operation_id
+        ));
+
+        // The operation completes locally; the report delivers the
+        // terminal outcome exactly once and closes the entry — no
+        // transition conflict, the adjudication is final.
+        store
+            .apply_transition(
+                operation_id,
+                OperationState::Succeeded,
+                now + time::Duration::SECOND,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        engine.report_center_operations().await?;
+        assert_eq!(
+            inbox.entry_state(operation_id)?,
+            Some(InboxEntryState::Completed)
+        );
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages.get(1),
+            Some(EnvelopeMessage::OperationCompleted(completed))
+                if completed.succeeded && completed.operation_id == offer.operation_id
+        ));
+
+        // A further re-delivery is answered from the recorded outcome and
+        // nothing executes a second time.
+        assert_eq!(
+            engine.handle_offer(&offer, &received).await?,
+            OfferOutcome::DuplicateProgress
+        );
+        assert_eq!(store.operations_owned()?.len(), 1);
+        let messages = outbox.pending_messages()?;
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages.get(2),
+            Some(EnvelopeMessage::OperationCompleted(completed))
+                if completed.succeeded && completed.operation_id == offer.operation_id
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn result_reporting_reports_active_operations_as_progress()
     -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -5615,6 +5815,115 @@ mod tests {
             })
             .await;
         assert!(matches!(outcome, Err(CenterSyncError::IdentityMismatch)));
+        Ok(())
+    }
+
+    /// The connect-verdict of one scripted attempt: a classified refusal
+    /// (`not-bound` or `identity-mismatch`) or a generic failure that
+    /// carries no verdict about the binding.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConnectVerdict {
+        NotBound,
+        Generic,
+        IdentityMismatch,
+    }
+
+    /// A transport whose connect fails with a scripted verdict sequence,
+    /// so a test can mix classified refusals with generic failures — the
+    /// classification the engine reads is the verdict of the last attempt.
+    struct ScriptedVerdictTransport {
+        verdicts: Mutex<std::collections::VecDeque<ConnectVerdict>>,
+        last: Arc<Mutex<ConnectVerdict>>,
+    }
+
+    impl ScriptedVerdictTransport {
+        fn new(verdicts: Vec<ConnectVerdict>) -> Self {
+            Self {
+                verdicts: Mutex::new(verdicts.into()),
+                last: Arc::new(Mutex::new(ConnectVerdict::Generic)),
+            }
+        }
+    }
+
+    impl CenterTransport for ScriptedVerdictTransport {
+        type Session = ChannelSession;
+        type Error = MockCenterError;
+
+        fn connect(&self) -> crate::BoundaryFuture<'_, Result<Self::Session, Self::Error>> {
+            Box::pin(async move {
+                let verdict = self
+                    .verdicts
+                    .lock()
+                    .map_err(|_| MockCenterError)?
+                    .pop_front()
+                    .unwrap_or(ConnectVerdict::Generic);
+                *self.last.lock().map_err(|_| MockCenterError)? = verdict;
+                Err(MockCenterError)
+            })
+        }
+
+        fn is_not_bound(&self, _error: &Self::Error) -> bool {
+            self.last
+                .lock()
+                .is_ok_and(|verdict| *verdict == ConnectVerdict::NotBound)
+        }
+
+        fn is_identity_mismatch(&self, _error: &Self::Error) -> bool {
+            self.last
+                .lock()
+                .is_ok_and(|verdict| *verdict == ConnectVerdict::IdentityMismatch)
+        }
+    }
+
+    /// A generic failure does not reset the `not-bound` convergence count
+    /// (audit follow-up W3N-5): the counters answer what the center says
+    /// about the binding, and an unreachable center or a dropped handshake
+    /// says nothing — resetting on it would let a flaky transport postpone
+    /// the convergence forever. The script: two `not-bound` refusals, a
+    /// generic failure, one more `not-bound` — the third reachable verdict
+    /// is the third `not-bound`, so the engine converges.
+    #[tokio::test]
+    async fn generic_failures_do_not_reset_the_not_bound_convergence_count()
+    -> Result<(), Box<dyn Error>> {
+        let transport = ScriptedVerdictTransport::new(vec![
+            ConnectVerdict::NotBound,
+            ConnectVerdict::NotBound,
+            ConnectVerdict::Generic,
+            ConnectVerdict::NotBound,
+        ]);
+        let store = MockEngineStore::new();
+        let instance_id = InstanceId::generate();
+        let outbox = MockOutbox::new(instance_id);
+        let inbox = MockInbox::new();
+        let cursor = MockCursor::new();
+        let events = MockEventTail::new(Vec::new());
+        let engine = CenterSync::new(
+            transport,
+            &store,
+            &outbox,
+            &inbox,
+            &cursor,
+            &events,
+            FixedClock(OffsetDateTime::UNIX_EPOCH),
+            instance_id,
+            CenterSyncOptions {
+                not_bound_abort_after: Some(3),
+                ..engine_options()
+            },
+        );
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // The timeout bounds the run: without the fix the generic failure
+        // resets the count and the engine retries forever, which must fail
+        // the test instead of hanging the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.run(async move {
+                let _ = stop_rx.await;
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("the engine never converged"))?;
+        assert!(matches!(outcome, Err(CenterSyncError::NotBound)));
         Ok(())
     }
 

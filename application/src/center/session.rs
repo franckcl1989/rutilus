@@ -109,15 +109,19 @@ pub enum AdmissionRejection {
 const DECLARED_IDENTITY_LOG_LIMIT: usize = 64;
 
 /// Sanitizes one wire-declared identity for the logs: the C0 controls,
-/// DEL, and the C1 controls (U+0080–U+009F) are escaped (`\n` becomes
-/// `\x0a`, the CSI `\x9b` becomes `\x9b`) and the escaped value is
-/// truncated to [`DECLARED_IDENTITY_LOG_LIMIT`] characters with an
-/// ellipsis, so an arbitrarily hostile declaration never carries raw
+/// DEL, the C1 controls (U+0080–U+009F), and the bidi control characters
+/// (U+200E/U+200F, U+202A–U+202E, U+2066–U+2069) are escaped (`\n` becomes
+/// the two-character text `\x0a`, the CSI U+009B the text `\x9b`, the
+/// right-to-left override U+202E the text `\u{202e}`) and the escaped
+/// value is truncated to [`DECLARED_IDENTITY_LOG_LIMIT`] characters with
+/// an ellipsis, so an arbitrarily hostile declaration never carries raw
 /// control sequences into the log stream — a raw C1 CSI would otherwise
-/// smuggle a terminal escape command past the C0 escape. The honest bound
-/// identity — read from the binding record, never from the wire — stays
-/// beside the sanitized declaration, so the both-identities diagnostic
-/// value survives.
+/// smuggle a terminal escape command past the C0 escape, and a raw bidi
+/// control (W3S-3) would reorder the rendered direction of the
+/// both-identities diagnosis, letting the declaration display a different
+/// identity than the one stored. The honest bound identity — read from
+/// the binding record, never from the wire — stays beside the sanitized
+/// declaration, so the both-identities diagnostic value survives.
 fn sanitize_declared_identity(declared: &str) -> String {
     let mut sanitized = String::with_capacity(declared.len().min(DECLARED_IDENTITY_LOG_LIMIT));
     for ch in declared.chars() {
@@ -128,6 +132,14 @@ fn sanitize_declared_identity(declared: &str) -> String {
         let escaped = match ch {
             '\u{0}'..='\u{1f}' | '\u{7f}' | '\u{80}'..='\u{9f}' => {
                 format!("\\x{:02x}", ch as u32)
+            }
+            // W3S-3: the bidi class — LRM/RLM (U+200E/U+200F), the
+            // embeddings and overrides with their pop (U+202A–U+202E), and
+            // the isolates with their pop (U+2066–U+2069). Each is escaped
+            // as `\u{XXXX}`, the C0/C1-style form for code points beyond
+            // the two-digit `\x` range.
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                format!("\\u{{{:x}}}", ch as u32)
             }
             _ => ch.to_string(),
         };
@@ -1138,6 +1150,62 @@ mod tests {
         let rendered = honest.to_string();
         assert!(rendered.contains(site.to_string().as_str()));
         assert!(!rendered.contains('\\') && !rendered.contains('…'));
+    }
+
+    #[test]
+    fn declared_identity_sanitization_escapes_every_bidi_control_character() {
+        // W3S-3: the bidi control characters — LRM/RLM (U+200E/U+200F),
+        // the embeddings and overrides with their pop (U+202A–U+202E), and
+        // the isolates with their pop (U+2066–U+2069) — reorder the
+        // rendered direction of adjacent text, so a hostile declaration
+        // could spoof the both-identities diagnosis in the log. Each of
+        // the eleven is escaped as `\u{XXXX}` by the sanitizer, before the
+        // truncation.
+        let expected = [
+            ('\u{200e}', "\\u{200e}"),
+            ('\u{200f}', "\\u{200f}"),
+            ('\u{202a}', "\\u{202a}"),
+            ('\u{202b}', "\\u{202b}"),
+            ('\u{202c}', "\\u{202c}"),
+            ('\u{202d}', "\\u{202d}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2066}', "\\u{2066}"),
+            ('\u{2067}', "\\u{2067}"),
+            ('\u{2068}', "\\u{2068}"),
+            ('\u{2069}', "\\u{2069}"),
+        ];
+        for (codepoint, escaped) in expected {
+            assert_eq!(
+                sanitize_declared_identity(&codepoint.to_string()),
+                escaped,
+                "the bidi control {codepoint:?} is escaped as {escaped}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hello_identity_mismatch_display_keeps_bidi_controls_escaped() {
+        // W3S-3 at the display level: a declaration embedding bidi
+        // controls in otherwise normal text never renders any raw bidi
+        // character — the C0/C1 escape is no good if a bidi control can
+        // still reorder the rendered diagnosis.
+        let site = InstanceId::generate();
+        let declared = format!("host{}\u{202e}", "x".repeat(30));
+        let reason = AdmissionRejection::HelloIdentityMismatch {
+            declared,
+            bound: site,
+        };
+        let rendered = reason.to_string();
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "the right-to-left override must never reach the log raw"
+        );
+        assert!(
+            rendered.contains("\\u{202e}"),
+            "the right-to-left override is escaped as \\u{{202e}}"
+        );
+        assert!(rendered.contains(site.to_string().as_str()));
+        assert!(!rendered.contains('…'), "the declaration fits the bound");
     }
 
     #[test]
