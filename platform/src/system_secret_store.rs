@@ -140,13 +140,18 @@ async fn platform_unprotect(_payload: &[u8]) -> Result<Vec<u8>, SystemSecretStor
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::unused_async)]
 async fn platform_protect(plaintext: &[u8]) -> Result<Vec<u8>, SystemSecretStoreError> {
     // Linux has no OS keychain: the 0600 envelope file (written and checked
     // by SystemMasterKeyFile) is the protection, so the bytes pass through.
+    // The async signature mirrors the Windows and macOS twins, which must
+    // await `spawn_blocking`; the pass-through keeps the unlock flow uniform
+    // and the `SystemSecretStore` call sites cfg-free.
     Ok(plaintext.to_vec())
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::unused_async)]
 async fn platform_unprotect(payload: &[u8]) -> Result<Vec<u8>, SystemSecretStoreError> {
     Ok(payload.to_vec())
 }

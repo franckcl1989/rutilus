@@ -125,7 +125,7 @@ impl SystemMasterKeyFile {
                 source: SystemMasterKeyEnvelopeError::EnvelopeTooLong,
             });
         }
-        require_private_permissions(&self.path, metadata.permissions())?;
+        require_private_permissions(&self.path, &metadata.permissions())?;
         let mut file = File::open(&self.path).map_err(|source| SystemMasterKeyFileError::Open {
             path: self.path.clone(),
             source,
@@ -141,7 +141,7 @@ impl SystemMasterKeyFile {
                 path: self.path.clone(),
             });
         }
-        require_private_permissions(&self.path, opened_metadata.permissions())?;
+        require_private_permissions(&self.path, &opened_metadata.permissions())?;
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| {
             SystemMasterKeyFileError::Envelope {
                 path: self.path.clone(),
@@ -197,7 +197,7 @@ fn restrict_temporary_permissions(_path: &Path) -> Result<(), SystemMasterKeyFil
 #[cfg(unix)]
 fn require_private_permissions(
     path: &Path,
-    permissions: fs::Permissions,
+    permissions: &fs::Permissions,
 ) -> Result<(), SystemMasterKeyFileError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -216,7 +216,7 @@ fn require_private_permissions(
 #[allow(clippy::unnecessary_wraps)]
 fn require_private_permissions(
     _path: &Path,
-    _permissions: fs::Permissions,
+    _permissions: &fs::Permissions,
 ) -> Result<(), SystemMasterKeyFileError> {
     Ok(())
 }
